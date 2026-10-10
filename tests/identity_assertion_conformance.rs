@@ -33,6 +33,9 @@ impl EnterpriseExtension for FakeExtension {
             tenant: Some(self.tenant_context(&principal)?),
             principal,
             credential_kind: CredentialKind::HumanSession,
+            space: None,
+            space_role: None,
+            act: None,
             scopes: vec!["sekai.read".into(), "sekai.write".into()],
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
@@ -88,6 +91,9 @@ fn assertion_path_matches_in_process_extension_authorization() {
             subject: in_process.principal.subject.clone(),
             credential_id: in_process.principal.credential_id.clone(),
             credential_kind: "human_session".into(),
+            space: None,
+            space_role: None,
+            act: None,
             tenant_id: in_process
                 .tenant
                 .as_ref()
@@ -121,6 +127,9 @@ fn conformance_kit_names_each_failure_class() {
         subject: "subject-a".into(),
         credential_id: "credential-a".into(),
         credential_kind: "human_session".into(),
+        space: None,
+        space_role: None,
+        act: None,
         tenant_id: None,
         scopes: vec!["sekai.read".into()],
         expires_at: 100,

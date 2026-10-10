@@ -15,7 +15,7 @@ use sha2::Sha256;
 
 use crate::enterprise::{
     AuthenticatedContext, AuthenticatedPrincipal, CredentialKind, IDENTITY_EXTENSION_VERSION,
-    TenantContext,
+    SpaceRole, TenantContext,
 };
 
 pub const IDENTITY_ASSERTION_VERSION: &str = "sekai.identity-assertion/v1";
@@ -59,6 +59,12 @@ pub struct IdentityAssertion {
     pub credential_id: String,
     pub credential_kind: String,
     pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_role: Option<SpaceRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<String>,
     pub scopes: Vec<String>,
     pub expires_at: i64,
     pub nonce: String,
@@ -162,7 +168,7 @@ impl AssertionAuthority {
             _ => return Err(AssertionReject::Issuer),
         };
         let subject = assertion.subject.clone();
-        Ok(AuthenticatedContext {
+        let context = AuthenticatedContext {
             contract_version: IDENTITY_EXTENSION_VERSION,
             principal: AuthenticatedPrincipal {
                 subject: assertion.subject,
@@ -172,11 +178,18 @@ impl AssertionAuthority {
             tenant: assertion
                 .tenant_id
                 .map(|tenant_id| TenantContext { tenant_id, subject }),
+            space: assertion.space,
+            space_role: assertion.space_role,
+            act: assertion.act,
             scopes: assertion.scopes,
             issuer: assertion.issuer,
             resource: assertion.audience,
             expires_at: assertion.expires_at,
-        })
+        };
+        context
+            .authorize_space(crate::enterprise::NamespaceAction::Read)
+            .map_err(|_| AssertionReject::ScopeEscalation)?;
+        Ok(context)
     }
 }
 
@@ -204,6 +217,9 @@ mod tests {
             subject: "subject-a".into(),
             credential_id: "credential-a".into(),
             credential_kind: "human_session".into(),
+            space: None,
+            space_role: None,
+            act: None,
             tenant_id: Some("tenant-test".into()),
             scopes: vec!["sekai.read".into(), "sekai.write".into()],
             expires_at,
@@ -214,8 +230,15 @@ mod tests {
     #[test]
     fn valid_assertion_fills_authenticated_context() {
         let authority = authority();
-        let token = authority.sign(&claims("n1", 100)).unwrap();
+        let mut claims = claims("n1", 100);
+        claims.space = Some("space-a".into());
+        claims.space_role = Some(SpaceRole::Approver);
+        claims.act = Some("origin-user".into());
+        let token = authority.sign(&claims).unwrap();
         let context = authority.verify(&token, 50, None).unwrap();
+        assert_eq!(context.space.as_deref(), Some("space-a"));
+        assert_eq!(context.space_role, Some(SpaceRole::Approver));
+        assert_eq!(context.act.as_deref(), Some("origin-user"));
         assert_eq!(context.principal.subject, "subject-a");
         assert_eq!(context.principal.credential_id, "credential-a");
         assert_eq!(context.scopes, ["sekai.read", "sekai.write"]);

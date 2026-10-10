@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-pub const IDENTITY_EXTENSION_VERSION: &str = "sekai.identity-extension/v1";
+pub const IDENTITY_EXTENSION_VERSION: &str = "sekai.identity-extension/v2";
 pub const AUTHORIZATION_SERVER_METADATA_VERSION: &str = "RFC8414";
 pub const PROTECTED_RESOURCE_METADATA_VERSION: &str = "RFC9728";
 
@@ -61,6 +61,15 @@ pub enum CredentialKind {
     Machine,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceRole {
+    Viewer,
+    Editor,
+    Approver,
+    Administrator,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedPrincipal {
     pub subject: String,
@@ -77,6 +86,9 @@ pub struct AuthenticatedContext {
     pub principal: AuthenticatedPrincipal,
     pub credential_kind: CredentialKind,
     pub tenant: Option<TenantContext>,
+    pub space: Option<String>,
+    pub space_role: Option<SpaceRole>,
+    pub act: Option<String>,
     pub scopes: Vec<String>,
     pub issuer: String,
     pub resource: String,
@@ -89,11 +101,63 @@ impl AuthenticatedContext {
             contract_version: IDENTITY_EXTENSION_VERSION,
             principal,
             credential_kind: CredentialKind::Machine,
+            space: None,
+            space_role: None,
+            act: None,
             tenant: None,
             scopes: Vec::new(),
             issuer: "sekai:community".into(),
             resource: "sekai:control-plane".into(),
             expires_at: i64::MAX,
+        }
+    }
+
+    pub fn authorize_space(&self, action: NamespaceAction) -> Result<(), ExtensionError> {
+        if self
+            .space
+            .as_ref()
+            .is_some_and(|space| space.trim().is_empty())
+            || (self.space_role.is_some() && self.space.is_none())
+            || (self.space.is_some()
+                && self
+                    .tenant
+                    .as_ref()
+                    .is_none_or(|tenant| tenant.tenant_id.trim().is_empty()))
+            || self
+                .act
+                .as_ref()
+                .is_some_and(|actor| actor.trim().is_empty() || actor == &self.principal.subject)
+        {
+            return Err(ExtensionError::PermissionDenied);
+        }
+        if self.space.is_none() {
+            return Ok(());
+        }
+        let permitted = match action {
+            NamespaceAction::Read => self.space_role.is_some(),
+            NamespaceAction::Write => matches!(
+                self.space_role,
+                Some(SpaceRole::Editor | SpaceRole::Administrator)
+            ),
+        };
+        if permitted {
+            Ok(())
+        } else {
+            Err(ExtensionError::PermissionDenied)
+        }
+    }
+
+    pub fn authorize_space_approval(&self) -> Result<(), ExtensionError> {
+        self.authorize_space(NamespaceAction::Read)?;
+        if self.space.is_none()
+            || matches!(
+                self.space_role,
+                Some(SpaceRole::Approver | SpaceRole::Administrator)
+            )
+        {
+            Ok(())
+        } else {
+            Err(ExtensionError::PermissionDenied)
         }
     }
 
@@ -327,6 +391,7 @@ pub trait EnterpriseExtension: Send + Sync {
         namespace: &str,
         action: NamespaceAction,
     ) -> Result<(), ExtensionError> {
+        context.authorize_space(action)?;
         if context.credential_kind == CredentialKind::HumanSession {
             let permitted = match action {
                 NamespaceAction::Read => context
@@ -401,6 +466,9 @@ mod tests {
                 tenant: Some(self.tenant_context(&principal)?),
                 principal,
                 credential_kind: CredentialKind::HumanSession,
+                space: None,
+                space_role: None,
+                act: None,
                 scopes: vec!["sekai.read".into(), "sekai.write".into()],
                 issuer: "https://issuer.test".into(),
                 resource: "https://sekai.test".into(),
@@ -480,6 +548,39 @@ mod tests {
                 "unexpected runtime method: {method}"
             );
         }
+    }
+
+    #[test]
+    fn space_roles_bound_existing_grants_without_changing_unscoped_behavior() {
+        let mut context = FakeExtension.authenticate_context("test-token").unwrap();
+        assert!(context.authorize_space(NamespaceAction::Write).is_ok());
+        assert!(context.authorize_space_approval().is_ok());
+        context.space = Some("space-a".into());
+        for (role, can_write, can_approve) in [
+            (SpaceRole::Viewer, false, false),
+            (SpaceRole::Editor, true, false),
+            (SpaceRole::Approver, false, true),
+            (SpaceRole::Administrator, true, true),
+        ] {
+            context.space_role = Some(role);
+            assert!(context.authorize_space(NamespaceAction::Read).is_ok());
+            assert_eq!(
+                context.authorize_space(NamespaceAction::Write).is_ok(),
+                can_write
+            );
+            assert_eq!(context.authorize_space_approval().is_ok(), can_approve);
+            assert_eq!(
+                FakeExtension
+                    .authorize_authenticated_context(&context, "allowed", NamespaceAction::Write)
+                    .is_ok(),
+                can_write
+            );
+        }
+        context.space_role = None;
+        assert!(context.authorize_space(NamespaceAction::Read).is_err());
+        context.space = None;
+        context.space_role = Some(SpaceRole::Viewer);
+        assert!(context.authorize_space(NamespaceAction::Read).is_err());
     }
 
     #[test]

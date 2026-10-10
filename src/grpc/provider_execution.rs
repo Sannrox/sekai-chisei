@@ -721,6 +721,9 @@ mod tests {
                 credential_id: format!("credential:{tenant_id}"),
             },
             credential_kind: crate::enterprise::CredentialKind::Machine,
+            space: None,
+            space_role: None,
+            act: None,
             tenant: Some(crate::enterprise::TenantContext {
                 tenant_id: tenant_id.into(),
                 subject: "service:managed-shikigami".into(),

@@ -52,6 +52,7 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     pub ontology_digest: String,
     pub autonomous_envelope_id: String,
     pub policy_context: PrincipalPolicyContext,
+    pub delegating_actor: Option<String>,
     pub budget_already_reserved: bool,
 }
 
@@ -320,6 +321,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             type_id: request.type_id,
             version: request.version,
             principal: actor.to_string(),
+            delegating_actor: request.delegating_actor,
             parameters_json: request.parameters_json,
             request_digest,
             idempotency_key: request.idempotency_key,
@@ -852,6 +854,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             ("request_digest".into(), stored.request_digest.clone()),
             ("idempotency_key".into(), stored.idempotency_key.clone()),
         ]);
+        if let Some(actor) = stored.delegating_actor.as_ref() {
+            intent_attributes.insert("act".into(), actor.clone());
+        }
         if !evidence_ids.is_empty() {
             intent_attributes.insert("evidence_submission_ids".into(), evidence_ids.join(","));
         }
@@ -993,6 +998,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             ("budget_decision".into(), stored.budget_decision.clone()),
             ("parameters_untrusted".into(), "true".into()),
         ]);
+        if let Some(actor) = stored.delegating_actor.as_ref() {
+            evidence.insert("act".into(), actor.clone());
+        }
         if let Some(applied) = applied_object {
             evidence.insert("object_id".into(), applied.object_id.clone());
             evidence.insert("object_kind".into(), applied.object_kind.clone());
@@ -1337,6 +1345,7 @@ mod tests {
             ontology_digest: String::new(),
             autonomous_envelope_id: String::new(),
             policy_context: PrincipalPolicyContext::default(),
+            delegating_actor: Some("origin-user".into()),
             budget_already_reserved: false,
         }
     }
@@ -1383,6 +1392,29 @@ mod tests {
             .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
             .unwrap();
         assert!(admitted.instance.system_one_fill_json.is_empty());
+        let receipt = db
+            .get_operation_receipt(&admitted.instance.operation_id)
+            .unwrap()
+            .unwrap();
+        let intent = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .unwrap();
+        assert_eq!(intent.actor, "alice");
+        assert_eq!(
+            intent.attributes.get("act").map(String::as_str),
+            Some("origin-user")
+        );
+        let audit = db
+            .list_decisions(&audit::DecisionFilter {
+                actor: Some("alice".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(audit.iter().any(
+            |decision| decision.evidence.get("act").map(String::as_str) == Some("origin-user")
+        ));
         assert_eq!(admitted.instance.budget_decision, "not_configured");
     }
 
@@ -1671,6 +1703,7 @@ mod tests {
                     ontology_digest: ONTOLOGY_DIGEST.into(),
                     autonomous_envelope_id: String::new(),
                     policy_context: PrincipalPolicyContext::default(),
+                    delegating_actor: None,
                     budget_already_reserved: false,
                 },
                 "alice",
@@ -1840,6 +1873,7 @@ mod tests {
             ontology_digest: ONTOLOGY_DIGEST.into(),
             autonomous_envelope_id: String::new(),
             policy_context: PrincipalPolicyContext::default(),
+            delegating_actor: None,
             budget_already_reserved: false,
         }
     }
@@ -2849,6 +2883,7 @@ mod tests {
             namespace: "acme".into(),
             type_id: "customer.record.create".into(),
             version: "1".into(),
+            delegating_actor: None,
             principal: "alice".into(),
             parameters_json: r#"{"object_id":"rec-7"}"#.into(),
             request_digest: crate::sekai::action_instance::compute_request_digest(

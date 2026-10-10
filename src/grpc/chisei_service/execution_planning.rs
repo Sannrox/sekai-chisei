@@ -561,22 +561,12 @@ impl ChiseiServiceImpl {
         .map_err(|_| unavailable())
     }
 
-    pub(super) fn record_planned_operation(
-        &self,
-        plan: &ExecutionPlan,
-        actor: &str,
-    ) -> Result<(), String> {
-        self.record_planned_operation_with_routing(plan, actor, false)
-    }
-
-    /// Records the planned operation's receipt. The route event names the
-    /// routing profile and mode that served the plan and whether the caller
-    /// pinned it (#1094).
-    pub(super) fn record_planned_operation_with_routing(
+    pub(super) fn record_planned_operation_with_identity(
         &self,
         plan: &ExecutionPlan,
         actor: &str,
         routing_pinned: bool,
+        identity_context: Option<&crate::enterprise::AuthenticatedContext>,
     ) -> Result<(), String> {
         let input = plan
             .input
@@ -957,6 +947,24 @@ impl ChiseiServiceImpl {
             ));
             (Some(started), Vec::new())
         };
+        if let Some(context) = identity_context
+            && let Some(intent) = events
+                .iter_mut()
+                .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+        {
+            if let Some(actor) = context.act.as_ref() {
+                intent.attributes.insert("act".into(), actor.clone());
+            }
+            if let Some(space) = context.space.as_ref() {
+                intent.attributes.insert("space".into(), space.clone());
+            }
+            if let Some(role) = context.space_role {
+                intent.attributes.insert(
+                    "space_role".into(),
+                    format!("{role:?}").to_ascii_lowercase(),
+                );
+            }
+        }
         let receipt = OperationReceipt {
             version: OPERATION_RECEIPT_VERSION.into(),
             operation_id,
