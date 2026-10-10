@@ -9100,6 +9100,90 @@ async fn execute_plan_stream_rejects_after_policy_flips_sensitive() {
 }
 
 #[tokio::test]
+async fn execute_plan_stream_refuses_when_planning_delegator_is_disabled() {
+    let svc = memory_service();
+    svc.db
+        .runtime()
+        .create_principal_credential(
+            "origin-user",
+            &crate::gateway_keys::hash_gateway_key("delegator-secret"),
+            1,
+        )
+        .unwrap();
+    svc.db
+        .runtime()
+        .ensure_team_namespace("alpha", "origin-user", Role::Editor, "local")
+        .unwrap();
+
+    let plan = svc
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(ExecutionInput {
+                request_id: "task-delegator-disabled".into(),
+                namespace: "alpha".into(),
+                spec: "do ordinary streamed work".into(),
+                preferred_model: "native-default".into(),
+                preferred_runtime: "kiro".into(),
+                user_id: "user-1".into(),
+                max_tokens: 512,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert!(plan.executable);
+
+    let mut receipt = svc
+        .db
+        .get_operation_receipt(&plan.plan_id)
+        .unwrap()
+        .expect("planning receipt");
+    receipt
+        .events
+        .iter_mut()
+        .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+        .expect("intent")
+        .attributes
+        .insert("act".into(), "origin-user".into());
+    svc.db.runtime().put_operation_receipt(&receipt).unwrap();
+    svc.db
+        .runtime()
+        .revoke_principal_credential("origin-user")
+        .unwrap();
+
+    let error = match svc
+        .execute_plan_stream(Request::new(ExecutePlanRequest {
+            plan: Some(plan.clone()),
+        }))
+        .await
+    {
+        Ok(_) => panic!("disabled planning delegator executed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), crate::enterprise::DELEGATOR_DISABLED);
+
+    let receipt = svc
+        .db
+        .get_operation_receipt(&plan.plan_id)
+        .unwrap()
+        .expect("refused execution receipt");
+    assert!(receipt.events.iter().any(|event| {
+        event.kind == ReceiptEventKind::OutcomeRecorded
+            && event.attributes.get("status").map(String::as_str) == Some("denied")
+            && event
+                .attributes
+                .get("completion_reason")
+                .map(String::as_str)
+                == Some(crate::enterprise::DELEGATOR_DISABLED)
+    }));
+}
+
+#[tokio::test]
 async fn execute_plan_rejects_external_plan_without_egress_decisions() {
     let svc = memory_service();
     let plan = ExecutionPlan {

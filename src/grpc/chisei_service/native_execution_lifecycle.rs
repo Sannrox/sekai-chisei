@@ -140,6 +140,28 @@ impl ChiseiServiceImpl {
             context.as_ref(),
             &input.namespace,
         )?;
+        match crate::sekai::delegating_principal::revalidate_planning_delegator_at_apply(
+            self.db.runtime(),
+            &plan.plan_id,
+            &input.namespace,
+        ) {
+            Ok(()) => {}
+            Err(crate::sekai::delegating_principal::DelegatorApplyError::Refused(reason)) => {
+                {
+                    let mut plans = self
+                        .planned_executions
+                        .lock()
+                        .expect("planned executions poisoned");
+                    plans.remove(&requested_plan.plan_id);
+                }
+                record_failed_operation_on(self.db.runtime(), &plan, &actor, reason.as_str())
+                    .map_err(Status::internal)?;
+                return Err(Status::failed_precondition(reason.as_str()));
+            }
+            Err(crate::sekai::delegating_principal::DelegatorApplyError::Internal(error)) => {
+                return Err(Status::internal(error));
+            }
+        }
         {
             let mut plans = self
                 .planned_executions

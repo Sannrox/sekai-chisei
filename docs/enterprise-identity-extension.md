@@ -56,7 +56,11 @@ access on its own. Unknown roles and incomplete space authority fail closed.
 It is attribution, never an additional policy principal or a replacement for
 the credential subject. Action admission receipts and audit evidence retain
 `act`; model planning receipts retain `act`, space, and role. No bearer secret
-is retained. Revalidating delegation at apply and claim remains #1402.
+is retained. Apply of claimed action work and planned execution re-validates the
+`act` retained on the admitted instance or planning receipt against current
+enablement, tenant membership, and the grant the work needs, and records
+`delegator_disabled`, `delegator_not_member`, or `delegator_grant_missing`
+on the receipt. Claim-time re-validation remains the runtime-claim client.
 
 ## Discovery metadata
 

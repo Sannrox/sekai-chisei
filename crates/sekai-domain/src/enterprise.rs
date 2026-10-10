@@ -178,6 +178,56 @@ impl AuthenticatedContext {
     }
 }
 
+/// Machine-readable apply-time refusal when `act` can no longer authorize work.
+pub const DELEGATOR_DISABLED: &str = "delegator_disabled";
+pub const DELEGATOR_NOT_MEMBER: &str = "delegator_not_member";
+pub const DELEGATOR_GRANT_MISSING: &str = "delegator_grant_missing";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatorApplyRefusal {
+    Disabled,
+    NotMember,
+    GrantMissing,
+}
+
+impl DelegatorApplyRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => DELEGATOR_DISABLED,
+            Self::NotMember => DELEGATOR_NOT_MEMBER,
+            Self::GrantMissing => DELEGATOR_GRANT_MISSING,
+        }
+    }
+}
+
+/// Live facts about the delegating principal, loaded at apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegatingPrincipalState {
+    pub enabled: bool,
+    pub tenant_member: bool,
+    pub holds_needed_grant: bool,
+}
+
+/// Re-validate `act` at apply. Absent or empty `act` is a no-op.
+pub fn revalidate_delegating_principal(
+    act: Option<&str>,
+    state: DelegatingPrincipalState,
+) -> Result<(), DelegatorApplyRefusal> {
+    if act.is_none_or(|actor| actor.trim().is_empty()) {
+        return Ok(());
+    }
+    if !state.enabled {
+        return Err(DelegatorApplyRefusal::Disabled);
+    }
+    if !state.tenant_member {
+        return Err(DelegatorApplyRefusal::NotMember);
+    }
+    if !state.holds_needed_grant {
+        return Err(DelegatorApplyRefusal::GrantMissing);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRequest {
     pub state: String,
@@ -419,6 +469,24 @@ pub trait EnterpriseExtension: Send + Sync {
         action: NamespaceAction,
     ) -> Result<(), ExtensionError>;
 
+    /// Re-validate a named delegating actor (`act`) at apply.
+    ///
+    /// Default: unavailable. Community apply uses principal credentials and
+    /// namespace grants when no extension is installed. An installed extension
+    /// must implement this so enterprise enablement, membership, and grants
+    /// are authoritative.
+    fn authorize_delegating_principal(
+        &self,
+        principal: &str,
+        namespace: &str,
+        action: NamespaceAction,
+    ) -> Result<(), ExtensionError> {
+        let _ = (principal, namespace, action);
+        Err(ExtensionError::Unavailable(
+            "delegating principal revalidation is not implemented".into(),
+        ))
+    }
+
     /// Resolve a tenant-scoped model-provider credential (#118).
     ///
     /// Default: unavailable. Enterprise distributions must implement this so
@@ -595,6 +663,86 @@ mod tests {
         assert_eq!(context.resource, "sekai:control-plane");
         assert!(context.tenant.is_none());
         assert!(context.scopes.is_empty());
+    }
+
+    #[test]
+    fn apply_revalidation_fails_closed_for_disabled_member_and_grant() {
+        let present = Some("origin-user");
+        assert!(
+            revalidate_delegating_principal(
+                None,
+                DelegatingPrincipalState {
+                    enabled: false,
+                    tenant_member: false,
+                    holds_needed_grant: false,
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            revalidate_delegating_principal(
+                Some("  "),
+                DelegatingPrincipalState {
+                    enabled: false,
+                    tenant_member: false,
+                    holds_needed_grant: false,
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            revalidate_delegating_principal(
+                present,
+                DelegatingPrincipalState {
+                    enabled: false,
+                    tenant_member: true,
+                    holds_needed_grant: true,
+                },
+            ),
+            Err(DelegatorApplyRefusal::Disabled)
+        );
+        assert_eq!(
+            revalidate_delegating_principal(
+                present,
+                DelegatingPrincipalState {
+                    enabled: true,
+                    tenant_member: false,
+                    holds_needed_grant: false,
+                },
+            ),
+            Err(DelegatorApplyRefusal::NotMember)
+        );
+        assert_eq!(
+            revalidate_delegating_principal(
+                present,
+                DelegatingPrincipalState {
+                    enabled: true,
+                    tenant_member: true,
+                    holds_needed_grant: false,
+                },
+            ),
+            Err(DelegatorApplyRefusal::GrantMissing)
+        );
+        assert!(
+            revalidate_delegating_principal(
+                present,
+                DelegatingPrincipalState {
+                    enabled: true,
+                    tenant_member: true,
+                    holds_needed_grant: true,
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(DelegatorApplyRefusal::Disabled.as_str(), DELEGATOR_DISABLED);
+        assert_eq!(
+            DelegatorApplyRefusal::NotMember.as_str(),
+            DELEGATOR_NOT_MEMBER
+        );
+        assert_eq!(
+            DelegatorApplyRefusal::GrantMissing.as_str(),
+            DELEGATOR_GRANT_MISSING
+        );
     }
 
     #[test]

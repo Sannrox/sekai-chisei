@@ -6,11 +6,13 @@
 //! storage-error classification behind one interface.
 
 use crate::db::runtime_db::RuntimeDb;
+use crate::enterprise::DelegatorApplyRefusal;
 use crate::sekai::action_effect::{
-    ACK_OUTCOME_FAILED, ACK_OUTCOME_PARKED, ActionEffect, EFFECT_STATUS_COMPLETED,
-    EFFECT_STATUS_FAILED,
+    ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, ACK_OUTCOME_PARKED, ActionEffect,
+    EFFECT_STATUS_COMPLETED, EFFECT_STATUS_FAILED,
 };
 use crate::sekai::audit;
+use crate::sekai::delegating_principal::{DelegatorApplyError, revalidate_delegator_at_apply};
 use crate::sekai::parked_work::{ActionWorkContinuation, ActionWorkPark};
 use sekai_provider::receipt::{
     OperationReceipt, OperationReceiptEvent, ReceiptArtifact, ReceiptEventKind,
@@ -182,6 +184,34 @@ impl<'a> ActionWorkLifecycle<'a> {
                 "invalid artifact: failed acknowledgements cannot attach an artifact".into(),
             ));
         }
+        if command.outcome == ACK_OUTCOME_COMPLETED {
+            let already_completed = self
+                .db
+                .get_action_effect(command.effect_id)
+                .map_err(ActionWorkLifecycleError::Internal)?
+                .is_some_and(|effect| effect.status == EFFECT_STATUS_COMPLETED);
+            if !already_completed
+                && let Some(reason) = self.delegator_apply_refusal(command.effect_id)?
+            {
+                let stored = self
+                    .db
+                    .ack_action_work(
+                        command.effect_id,
+                        command.runtime_id,
+                        command.claim_generation,
+                        command.fencing_token,
+                        ACK_OUTCOME_FAILED,
+                        reason.as_str(),
+                        now_ms,
+                    )
+                    .map_err(classify_ack_error)?;
+                self.record_delegator_refusal_receipt(&stored, command.runtime_id, reason, now_ms)?;
+                self.record_ack_audit(&stored, actor, command.runtime_id, now_ms);
+                return Err(ActionWorkLifecycleError::FailedPrecondition(
+                    reason.as_str().into(),
+                ));
+            }
+        }
         // Fail closed before releasing the claim when a different artifact is
         // already bound. The locked harvest re-checks before writing.
         if let Some(incoming) = artifact.as_ref()
@@ -254,6 +284,87 @@ impl<'a> ActionWorkLifecycle<'a> {
                 now_ms,
             )
             .map_err(classify_report_error)
+    }
+
+    fn delegator_apply_refusal(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<DelegatorApplyRefusal>, ActionWorkLifecycleError> {
+        let Some(effect) = self
+            .db
+            .get_action_effect(effect_id)
+            .map_err(ActionWorkLifecycleError::Internal)?
+        else {
+            return Ok(None);
+        };
+        let Some(instance) = self
+            .db
+            .get_action_instance(&effect.instance_id)
+            .map_err(ActionWorkLifecycleError::Internal)?
+        else {
+            return Ok(None);
+        };
+        match revalidate_delegator_at_apply(
+            self.db,
+            instance.delegating_actor.as_deref(),
+            &instance.namespace,
+        ) {
+            Ok(()) => Ok(None),
+            Err(DelegatorApplyError::Refused(reason)) => Ok(Some(reason)),
+            Err(DelegatorApplyError::Internal(error)) => {
+                Err(ActionWorkLifecycleError::Internal(error))
+            }
+        }
+    }
+
+    fn record_delegator_refusal_receipt(
+        &self,
+        effect: &ActionEffect,
+        runtime_id: &str,
+        reason: DelegatorApplyRefusal,
+        now_ms: i64,
+    ) -> Result<(), ActionWorkLifecycleError> {
+        match self
+            .db
+            .update_operation_receipt(&effect.operation_id, |receipt| {
+                if receipt
+                    .events
+                    .iter()
+                    .any(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+                {
+                    return Ok(());
+                }
+                let parent = receipt
+                    .events
+                    .last()
+                    .map(|event| event.event_id.clone())
+                    .unwrap_or_else(|| format!("{}:intent", effect.operation_id));
+                receipt.events.push(OperationReceiptEvent {
+                    event_id: format!("{}:outcome", effect.operation_id),
+                    operation_id: effect.operation_id.clone(),
+                    parent_event_id: Some(parent),
+                    timestamp_ms: now_ms,
+                    kind: ReceiptEventKind::OutcomeRecorded,
+                    surface: ReceiptEventKind::OutcomeRecorded.surface(),
+                    actor: runtime_id.to_string(),
+                    references: Vec::new(),
+                    attributes: BTreeMap::from([
+                        ("outcome".into(), "denied".into()),
+                        ("reason".into(), reason.as_str().into()),
+                        ("effect_id".into(), effect.effect_id.clone()),
+                        ("instance_id".into(), effect.instance_id.clone()),
+                    ]),
+                });
+                receipt.completed_at_ms = Some(now_ms);
+                receipt.uncovered_surfaces.clear();
+                Ok(())
+            }) {
+            Ok(_) => Ok(()),
+            Err(error) if error.contains("operation receipt") && error.contains("not found") => {
+                Ok(())
+            }
+            Err(error) => Err(ActionWorkLifecycleError::Internal(error)),
+        }
     }
 
     fn harvest_ack_receipt(
@@ -708,10 +819,13 @@ fn classify_report_error(error: String) -> ActionWorkLifecycleError {
 mod tests {
     use super::*;
     use crate::db::runtime_db::RuntimeDb;
+    use crate::enterprise::{DELEGATOR_DISABLED, DELEGATOR_GRANT_MISSING, DELEGATOR_NOT_MEMBER};
     use crate::sekai::action_effect::{
         ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, plan_effects_for_admit,
     };
+    use crate::sekai::action_instance::{ActionInstance, STATUS_ADMITTED};
     use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
+    use crate::sekai::security::{Grant, Role};
     use sekai_provider::receipt::{
         OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptArtifact,
         ReceiptSurface, UncoveredSurface,
@@ -1499,6 +1613,158 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+        );
+    }
+
+    const DELEGATOR: &str = "origin-user";
+
+    fn seed_delegated_apply_path() -> (RuntimeDb, ActionEffect, Grant) {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect(&db);
+        seed_open_receipt(&db, &effect);
+        db.create_principal_credential(
+            DELEGATOR,
+            &crate::gateway_keys::hash_gateway_key("delegator-secret"),
+            1,
+        )
+        .unwrap();
+        let (_, grants) = db
+            .ensure_team_namespace("acme", DELEGATOR, Role::Editor, "local")
+            .unwrap();
+        let grant = grants
+            .into_iter()
+            .find(|grant| grant.principal == DELEGATOR)
+            .expect("namespace grant");
+        db.put_action_instance(&ActionInstance {
+            instance_id: effect.instance_id.clone(),
+            namespace: effect.namespace.clone(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            principal: "runtime".into(),
+            delegating_actor: Some(DELEGATOR.into()),
+            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+            request_digest: "digest-1".into(),
+            idempotency_key: "idem-delegated".into(),
+            operation_id: effect.operation_id.clone(),
+            status: STATUS_ADMITTED.into(),
+            deny_reason: String::new(),
+            evidence_submission_ids: Vec::new(),
+            policy_decision: "allow".into(),
+            budget_decision: "allow".into(),
+            created_at_ms: 10,
+            decided_at_ms: 10,
+            system_one_fill_json: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
+            autonomous_envelope_id: String::new(),
+        })
+        .unwrap();
+        (db, effect, grant)
+    }
+
+    fn receipt_reason(db: &RuntimeDb, operation_id: &str) -> Option<String> {
+        db.get_operation_receipt(operation_id)
+            .unwrap()
+            .unwrap()
+            .events
+            .into_iter()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .and_then(|event| event.attributes.get("reason").cloned())
+    }
+
+    fn apply_completed(
+        db: &RuntimeDb,
+        effect: &ActionEffect,
+        claimed: &ActionEffect,
+    ) -> Result<AckedActionWork, ActionWorkLifecycleError> {
+        ActionWorkLifecycle::new(db).ack(
+            ack_completed(&effect.effect_id, claimed, ""),
+            "operator",
+            200,
+        )
+    }
+
+    #[test]
+    fn apply_succeeds_when_delegator_is_still_authorized() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        let acked = apply_completed(&db, &effect, &claimed).unwrap();
+        assert_eq!(acked.effect.status, EFFECT_STATUS_COMPLETED);
+    }
+
+    #[test]
+    fn completed_ack_replays_after_delegator_is_disabled() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        apply_completed(&db, &effect, &claimed).unwrap();
+        db.revoke_principal_credential(DELEGATOR).unwrap();
+        let replayed = apply_completed(&db, &effect, &claimed).unwrap();
+        assert_eq!(replayed.effect.status, EFFECT_STATUS_COMPLETED);
+    }
+
+    #[test]
+    fn claim_still_succeeds_after_delegator_is_disabled() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        db.revoke_principal_credential(DELEGATOR).unwrap();
+        let claimed = claim_effect(&db, &effect);
+        assert_eq!(claimed.status, "claimed");
+    }
+
+    #[test]
+    fn apply_refuses_when_delegator_is_disabled() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        db.revoke_principal_credential(DELEGATOR).unwrap();
+        let error = apply_completed(&db, &effect, &claimed).unwrap_err();
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_DISABLED.into())
+        );
+        assert_eq!(
+            receipt_reason(&db, &effect.operation_id).as_deref(),
+            Some(DELEGATOR_DISABLED)
+        );
+        let stored = db.get_action_effect(&effect.effect_id).unwrap().unwrap();
+        assert_eq!(stored.status, EFFECT_STATUS_FAILED);
+    }
+
+    #[test]
+    fn apply_refuses_when_delegator_is_not_a_member() {
+        let (db, effect, grant) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        db.delete_grant(&grant.id).unwrap();
+        let error = apply_completed(&db, &effect, &claimed).unwrap_err();
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_NOT_MEMBER.into())
+        );
+        assert_eq!(
+            receipt_reason(&db, &effect.operation_id).as_deref(),
+            Some(DELEGATOR_NOT_MEMBER)
+        );
+    }
+
+    #[test]
+    fn apply_refuses_when_delegator_grant_is_missing() {
+        let (db, effect, grant) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        db.create_grant(&Grant {
+            id: grant.id,
+            object_id: grant.object_id,
+            principal: grant.principal,
+            role: Role::Viewer,
+            created: grant.created,
+        })
+        .unwrap();
+        let error = apply_completed(&db, &effect, &claimed).unwrap_err();
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_GRANT_MISSING.into())
+        );
+        assert_eq!(
+            receipt_reason(&db, &effect.operation_id).as_deref(),
+            Some(DELEGATOR_GRANT_MISSING)
         );
     }
 }
