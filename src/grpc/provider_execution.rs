@@ -838,39 +838,31 @@ mod tests {
         assert_eq!(credential.secret.expose(), "synthetic-unscoped-secret");
     }
 
-    fn with_env(name: &str, value: &str, body: impl FnOnce()) {
-        let previous = std::env::var(name).ok();
-        unsafe { std::env::set_var(name, value) };
-        body();
-        unsafe {
-            match previous {
-                Some(previous) => std::env::set_var(name, previous),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-
     #[test]
     fn community_runtime_uses_instance_key_for_tenant_callers() {
         let db = RuntimeDb::Sqlite(Arc::new(
             crate::db::sekai::SekaiDb::new(":memory:").unwrap(),
         ));
         let registry = crate::provider_profile::ProviderRegistry::built_in();
-        with_env("OPENAI_API_KEY", "sk-community-instance", || {
-            let credential = execution_provider_credential(
-                Some(ExecutionAuthentication {
-                    db: &db,
-                    context: Some(&tenant_context("tenant-a")),
-                }),
-                &registry,
-                "openai/gpt-5.5",
-            )
-            .unwrap()
-            .unwrap();
-            assert!(credential.tenant_id.is_none());
-            assert_eq!(credential.secret.expose(), "sk-community-instance");
-            assert_eq!(credential.credential_id, "env:OPENAI_API_KEY");
-        });
+        crate::provider_credentials::with_test_env(
+            "OPENAI_API_KEY",
+            "sk-community-instance",
+            || {
+                let credential = execution_provider_credential(
+                    Some(ExecutionAuthentication {
+                        db: &db,
+                        context: Some(&tenant_context("tenant-a")),
+                    }),
+                    &registry,
+                    "openai/gpt-5.5",
+                )
+                .unwrap()
+                .unwrap();
+                assert!(credential.tenant_id.is_none());
+                assert_eq!(credential.secret.expose(), "sk-community-instance");
+                assert_eq!(credential.credential_id, "env:OPENAI_API_KEY");
+            },
+        );
     }
 
     #[test]
@@ -883,20 +875,24 @@ mod tests {
             .unwrap(),
         ));
         let registry = crate::provider_profile::ProviderRegistry::built_in();
-        with_env("OPENAI_API_KEY", "sk-enterprise-fallback", || {
-            let credential = execution_provider_credential(
-                Some(ExecutionAuthentication {
-                    db: &db,
-                    context: Some(&tenant_context("tenant-c")),
-                }),
-                &registry,
-                "openai/gpt-5.5",
-            )
-            .unwrap()
-            .unwrap();
-            assert!(credential.tenant_id.is_none());
-            assert_eq!(credential.secret.expose(), "sk-enterprise-fallback");
-        });
+        crate::provider_credentials::with_test_env(
+            "OPENAI_API_KEY",
+            "sk-enterprise-fallback",
+            || {
+                let credential = execution_provider_credential(
+                    Some(ExecutionAuthentication {
+                        db: &db,
+                        context: Some(&tenant_context("tenant-c")),
+                    }),
+                    &registry,
+                    "openai/gpt-5.5",
+                )
+                .unwrap()
+                .unwrap();
+                assert!(credential.tenant_id.is_none());
+                assert_eq!(credential.secret.expose(), "sk-enterprise-fallback");
+            },
+        );
     }
 
     #[test]
