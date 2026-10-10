@@ -444,6 +444,11 @@ pub(super) fn request_tenant_context(
         .extensions()
         .get::<crate::enterprise::AuthenticatedContext>()
     {
+        if db.enterprise_extension().is_some() && context.tenant.is_none() {
+            return Err(Status::unauthenticated(
+                "enterprise tenant context required",
+            ));
+        }
         return Ok(Some(context.clone()));
     }
     if db.enterprise_extension().is_some() {

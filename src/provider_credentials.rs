@@ -243,6 +243,32 @@ pub fn resolution_failure_message(error: &ExtensionError) -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) fn with_test_env(name: &str, value: &str, body: impl FnOnce()) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    struct Restore<'a> {
+        name: &'a str,
+        previous: Option<std::ffi::OsString>,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+    let _restore = Restore {
+        name,
+        previous: std::env::var_os(name),
+    };
+    unsafe { std::env::set_var(name, value) };
+    body();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -289,22 +315,10 @@ mod tests {
         assert!(!msg.contains("sk-"));
     }
 
-    fn with_env(name: &str, value: &str, body: impl FnOnce()) {
-        let previous = std::env::var(name).ok();
-        unsafe { std::env::set_var(name, value) };
-        body();
-        unsafe {
-            match previous {
-                Some(previous) => std::env::set_var(name, previous),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-
     #[test]
     fn community_env_resolver_uses_instance_key_for_tenant_callers() {
         let resolver = ProcessEnvProviderCredentialResolver;
-        with_env("OPENAI_API_KEY", "sk-instance-test", || {
+        crate::provider_credentials::with_test_env("OPENAI_API_KEY", "sk-instance-test", || {
             let resolved = resolver
                 .resolve(&tenant_context("tenant-a", "alice"), "openai")
                 .unwrap();
@@ -330,16 +344,20 @@ mod tests {
     #[test]
     fn resolve_helper_falls_back_to_instance_key_when_enterprise_has_no_row() {
         let store = MemoryTenantProviderCredentialResolver::new();
-        with_env("OPENAI_API_KEY", "sk-instance-fallback", || {
-            let resolved = resolve_provider_credential(
-                Some(&store),
-                &tenant_context("tenant-a", "alice"),
-                "openai",
-            )
-            .unwrap();
-            assert_eq!(resolved.secret.expose(), "sk-instance-fallback");
-            assert!(resolved.tenant_id.is_none());
-        });
+        crate::provider_credentials::with_test_env(
+            "OPENAI_API_KEY",
+            "sk-instance-fallback",
+            || {
+                let resolved = resolve_provider_credential(
+                    Some(&store),
+                    &tenant_context("tenant-a", "alice"),
+                    "openai",
+                )
+                .unwrap();
+                assert_eq!(resolved.secret.expose(), "sk-instance-fallback");
+                assert!(resolved.tenant_id.is_none());
+            },
+        );
     }
 
     #[test]
