@@ -844,6 +844,7 @@ fn source_ingestion_benchmark(
                     })?;
                 } else {
                     let context = PrincipalPolicyContext {
+                        delegated_subject: None,
                         subjects: vec!["viewer".into()],
                         scopes: vec![],
                     };

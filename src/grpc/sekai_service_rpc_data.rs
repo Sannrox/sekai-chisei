@@ -855,7 +855,7 @@ pub(super) async fn list_object_changes(
                     kind,
                     &schema,
                     &service.security,
-                    &principals,
+                    &principal_policy_context_from(&principals, tenant_context.as_ref()),
                     property_policy.as_ref(),
                 )
             } else {

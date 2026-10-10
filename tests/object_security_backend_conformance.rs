@@ -160,6 +160,7 @@ fn exercise(db: RuntimeDb, namespace: &str) {
     )
     .unwrap();
     let alice = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["alice".into()],
         scopes: vec![],
     };
@@ -230,7 +231,18 @@ fn exercise(db: RuntimeDb, namespace: &str) {
             .unwrap()
             .is_none()
     );
+    let delegated = PrincipalPolicyContext {
+        subjects: vec!["service-a".into()],
+        scopes: vec!["documents:read".into()],
+        delegated_subject: Some("alice".into()),
+    };
+    assert!(
+        db.get_object_with_policy_context(&object_id(namespace, "a"), &delegated)
+            .unwrap()
+            .is_none()
+    );
     let authorized_scope = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["nobody".into()],
         scopes: vec!["documents:read".into()],
     };
@@ -243,6 +255,57 @@ fn exercise(db: RuntimeDb, namespace: &str) {
         db.get_object_with_policy_context(&object_id(namespace, "c"), &authorized_scope)
             .unwrap()
             .is_none()
+    );
+
+    let mut delegated_policy = scoped.clone();
+    delegated_policy.rules.push(ObjectSecurityRule {
+        operation: ObjectSecurityOperation::Read,
+        predicates: vec![ObjectSecurityPredicate::SubjectEqualsProperty {
+            property: "owner".into(),
+        }],
+    });
+    let revision = db
+        .put_object_security_policy(&delegated_policy, "root", "put-delegated", 11)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("document".into(), revision.revision_digest)]),
+        "root",
+        "activate-delegated",
+        12,
+    )
+    .unwrap();
+    assert!(
+        db.get_object_with_policy_context(&object_id(namespace, "a"), &delegated)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.get_object_with_policy_context(&object_id(namespace, "b"), &delegated)
+            .unwrap()
+            .is_none()
+    );
+    let unscoped_service = PrincipalPolicyContext {
+        scopes: Vec::new(),
+        ..delegated.clone()
+    };
+    assert!(
+        db.get_object_with_policy_context(&object_id(namespace, "a"), &unscoped_service)
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(
+        delegated.digest().unwrap(),
+        unscoped_service.digest().unwrap()
+    );
+    assert_ne!(
+        delegated.digest().unwrap(),
+        PrincipalPolicyContext {
+            delegated_subject: Some("bob".into()),
+            ..delegated.clone()
+        }
+        .digest()
+        .unwrap()
     );
 
     let write = ObjectSecurityPolicy {
@@ -295,10 +358,12 @@ fn exercise(db: RuntimeDb, namespace: &str) {
         .unwrap()
         .unwrap();
     let alice = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["alice".into()],
         scopes: Vec::new(),
     };
     let bob = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["bob".into()],
         scopes: Vec::new(),
     };
@@ -437,6 +502,7 @@ fn exercise_row_scoped_query_paths(db: &RuntimeDb, namespace: &str) {
     .unwrap();
 
     let alice = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["alice".into()],
         scopes: vec![],
     };
@@ -629,6 +695,7 @@ fn exercise_property_level_reads(db: &RuntimeDb, namespace: &str) {
     .unwrap();
 
     let alice = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["alice".into()],
         scopes: vec![],
     };
@@ -826,6 +893,7 @@ fn exercise_value_instance_access(db: &RuntimeDb, namespace: &str) {
     .unwrap();
 
     let alice = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["alice".into()],
         scopes: vec![],
     };
@@ -1293,6 +1361,7 @@ fn sqlite_unactivated_namespace_keeps_broad_unfiltered_listing() {
             &["alice"],
             &[],
             &PrincipalPolicyContext {
+                delegated_subject: None,
                 subjects: vec!["alice".into()],
                 scopes: vec![],
             },
@@ -1428,6 +1497,7 @@ fn sqlite_property_grants_omit_hidden_values_and_deny_ungranted_filters() {
     .unwrap();
 
     let alice = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["alice".into()],
         scopes: vec![],
     };

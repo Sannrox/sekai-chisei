@@ -6,6 +6,14 @@ use crate::sekai::object_set::{
     ObjectSetTraversal as DomainObjectSetTraversal,
 };
 
+const INDEX_SCAN_BATCH_SIZE: i32 = 256;
+
+struct ObjectSetAuthority<'a> {
+    principals: &'a [String],
+    tenant_context: Option<&'a RequestEnterpriseContext>,
+    purpose: Option<&'a crate::sekai::purpose_authorization::PurposePresentation>,
+}
+
 impl SekaiServiceImpl {
     pub(super) async fn evaluate_visible_object_set(
         &self,
@@ -16,6 +24,11 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let authority = ObjectSetAuthority {
+            principals: &principals,
+            tenant_context: tenant_context.as_ref(),
+            purpose: purpose.as_ref(),
+        };
         let inner = req.into_inner();
         let descriptor = parse_object_set_descriptor(
             inner
@@ -89,6 +102,7 @@ impl SekaiServiceImpl {
             ensure_property_query_allowed(
                 &schema,
                 &principals,
+                tenant_context.as_ref(),
                 bound.filter.kind.as_deref().unwrap_or_default(),
                 queried_properties.clone(),
             )?;
@@ -109,6 +123,7 @@ impl SekaiServiceImpl {
                 ensure_property_query_allowed(
                     &schema,
                     &principals,
+                    tenant_context.as_ref(),
                     leaf_kind,
                     [aggregation.property.clone()],
                 )?;
@@ -164,8 +179,7 @@ impl SekaiServiceImpl {
             return self.evaluate_aggregated_object_set(
                 &bound,
                 &hops,
-                &principals,
-                tenant_context.as_ref(),
+                &authority,
                 inner.required_freshness_ms,
                 now_millis(),
             );
@@ -181,9 +195,9 @@ impl SekaiServiceImpl {
                 &bound,
                 inner.required_freshness_ms,
                 filter.offset,
-                &principal_context_digest,
-                &policy_activation_digest,
+                (&principal_context_digest, &policy_activation_digest),
                 now_millis(),
+                &authority,
             );
         }
         let (near, total) = list_objects_with_marking(
@@ -251,10 +265,11 @@ impl SekaiServiceImpl {
         bound: &BoundObjectSet,
         required_freshness_ms: i64,
         offset: i32,
-        principal_context_digest: &str,
-        policy_activation_digest: &str,
+        cursor_authority: (&str, &str),
         now_ms: i64,
+        authority: &ObjectSetAuthority<'_>,
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
+        let (principal_context_digest, policy_activation_digest) = cursor_authority;
         let status = self
             .db
             .runtime()
@@ -283,29 +298,73 @@ impl SekaiServiceImpl {
             },
             offset,
         };
-        let members = self
-            .db
-            .runtime()
-            .list_visible_index_members(&bound.descriptor.namespace, &bound.descriptor.kind, &query)
-            .map_err(Status::internal)?;
-        let total = self
-            .db
-            .runtime()
-            .count_visible_index_members(&bound.descriptor.namespace, &bound.descriptor.kind)
-            .map_err(Status::internal)?;
-        let objects: Vec<domain::Object> = members
-            .iter()
-            .map(|member| domain::Object {
-                id: member.object_id.clone(),
-                kind: member.kind.clone(),
-                name: member.source_key.clone(),
-                namespace: member.namespace.clone(),
-                external_id: member.source_key.clone(),
-                properties: member.properties.clone().into_iter().collect(),
-                created: status.indexed_at_ms,
-                updated: status.indexed_at_ms,
-            })
-            .collect();
+        let mut objects = Vec::new();
+        let total = if authority.tenant_context.is_some() {
+            let page_limit = query.limit;
+            let mut scan = crate::sekai::dataset::RowQuery { offset: 0, ..query };
+            let mut meter =
+                crate::sekai::object_set::CostMeter::new(bound.descriptor.cost_limit.clone());
+            let mut total: i32 = 0;
+            loop {
+                meter.charge(0).map_err(map_object_set_error)?;
+                scan.limit = (meter.limit.max_rows_scanned - meter.rows)
+                    .saturating_add(1)
+                    .clamp(1, INDEX_SCAN_BATCH_SIZE);
+                let members = self
+                    .db
+                    .runtime()
+                    .list_visible_index_members(
+                        &bound.descriptor.namespace,
+                        &bound.descriptor.kind,
+                        &scan,
+                    )
+                    .map_err(Status::internal)?;
+                let scanned = members.len() as i32;
+                meter.charge(scanned).map_err(map_object_set_error)?;
+                for member in members {
+                    if let Some(object) =
+                        self.visible_index_object(&member, authority, status.indexed_at_ms)?
+                    {
+                        if total >= offset.max(0) && objects.len() < page_limit as usize {
+                            objects.push(self.resolve_computed_for_response(
+                                object,
+                                authority.principals,
+                                authority.tenant_context,
+                                authority.purpose,
+                            )?);
+                        }
+                        total = total.saturating_add(1);
+                    }
+                    meter.charge(0).map_err(map_object_set_error)?;
+                }
+                if scanned < scan.limit {
+                    break;
+                }
+                scan.offset = scan.offset.saturating_add(scanned);
+            }
+            total
+        } else {
+            let members = self
+                .db
+                .runtime()
+                .list_visible_index_members(
+                    &bound.descriptor.namespace,
+                    &bound.descriptor.kind,
+                    &query,
+                )
+                .map_err(Status::internal)?;
+            for member in members {
+                if let Some(object) =
+                    self.authorized_index_object(&member, authority, status.indexed_at_ms)?
+                {
+                    objects.push(object);
+                }
+            }
+            self.db
+                .runtime()
+                .count_visible_index_members(&bound.descriptor.namespace, &bound.descriptor.kind)
+                .map_err(Status::internal)?
+        };
         let returned = objects.len() as i32;
         let next_offset = offset.saturating_add(returned);
         let next_page_token = if next_offset < total && returned > 0 {
@@ -332,6 +391,74 @@ impl SekaiServiceImpl {
             authority: false,
             aggregates: Vec::new(),
         }))
+    }
+
+    fn authorized_index_object(
+        &self,
+        member: &crate::sekai::object_type_index::ObjectTypeIndexMember,
+        authority: &ObjectSetAuthority<'_>,
+        indexed_at_ms: i64,
+    ) -> Result<Option<domain::Object>, Status> {
+        let Some(object) = self.visible_index_object(member, authority, indexed_at_ms)? else {
+            return Ok(None);
+        };
+        if authority.tenant_context.is_none() {
+            return Ok(Some(object));
+        }
+        self.resolve_computed_for_response(
+            object,
+            authority.principals,
+            authority.tenant_context,
+            authority.purpose,
+        )
+        .map(Some)
+    }
+
+    fn visible_index_object(
+        &self,
+        member: &crate::sekai::object_type_index::ObjectTypeIndexMember,
+        authority: &ObjectSetAuthority<'_>,
+        indexed_at_ms: i64,
+    ) -> Result<Option<domain::Object>, Status> {
+        let snapshot = domain::Object {
+            id: member.object_id.clone(),
+            kind: member.kind.clone(),
+            name: member.source_key.clone(),
+            namespace: member.namespace.clone(),
+            external_id: member.source_key.clone(),
+            properties: member.properties.clone().into_iter().collect(),
+            created: indexed_at_ms,
+            updated: indexed_at_ms,
+        };
+        if authority.tenant_context.is_none() {
+            return Ok(Some(snapshot));
+        }
+        let live = self
+            .db
+            .runtime()
+            .get_object(&member.object_id)
+            .map_err(Status::internal)?;
+        let authorized = live.unwrap_or_else(|| snapshot.clone());
+        match require_visible_read_root(
+            self.db.runtime(),
+            &self.security,
+            authorized,
+            authority.principals,
+            authority.tenant_context,
+            "evaluate_object_set",
+            authority.purpose,
+        ) {
+            Ok(_) => Ok(Some(snapshot)),
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::NotFound | tonic::Code::PermissionDenied
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(status) => Err(status),
+        }
     }
 
     fn require_hop_projection_ready(
@@ -493,19 +620,26 @@ impl SekaiServiceImpl {
         &self,
         bound: &BoundObjectSet,
         hops: &[crate::sekai::object_set::ObjectSetTraversal],
-        principals: &[String],
-        tenant_context: Option<&RequestEnterpriseContext>,
+        authority: &ObjectSetAuthority<'_>,
         required_freshness_ms: i64,
         now_ms: i64,
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
+        let constrained = authority.tenant_context.is_some();
+        let engine = if constrained {
+            crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
+        } else {
+            self.object_index_engine
+        };
+        let dual_read = self.object_index_dual_read && !constrained;
+        let log_dual_read = self.object_log_dual_read.enabled && !constrained;
         let mut meter =
             crate::sekai::object_set::CostMeter::new(bound.descriptor.cost_limit.clone());
-        if self.object_index_dual_read && bound.descriptor.cost_limit.max_rows_scanned <= 0 {
+        if dual_read && bound.descriptor.cost_limit.max_rows_scanned <= 0 {
             return Err(Status::failed_precondition(
                 "object index dual-read requires max_rows_scanned",
             ));
         }
-        if self.object_log_dual_read.enabled && bound.descriptor.cost_limit.max_rows_scanned <= 0 {
+        if log_dual_read && bound.descriptor.cost_limit.max_rows_scanned <= 0 {
             return Err(Status::failed_precondition(
                 "object-log dual-read requires max_rows_scanned",
             ));
@@ -517,6 +651,12 @@ impl SekaiServiceImpl {
             aggregate_plan_properties(&aggregation, &bound.descriptor.property_filters, &[]);
         let needed_leaf = aggregate_plan_properties(&aggregation, &[], &[]);
         let needed_nested = aggregate_plan_properties(&aggregation, &[], hops);
+        let read_properties = aggregate_read_properties(
+            &bound.descriptor.kind,
+            &aggregation,
+            &bound.descriptor.property_filters,
+            hops,
+        );
         let mut layers = Vec::new();
         let mut kind = bound.descriptor.kind.clone();
         let empty = crate::sekai::dataset::RowQuery::default();
@@ -550,14 +690,13 @@ impl SekaiServiceImpl {
                 return Err(Status::failed_precondition("object type index is stale"));
             }
             let load_members = index == 0
-                || self.object_index_engine
-                    == crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
-                || self.object_index_dual_read;
+                || engine == crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
+                || dual_read;
             if !load_members {
                 layers.push(Vec::new());
                 continue;
             }
-            let query = if index == 0 {
+            let mut query = if index == 0 {
                 crate::sekai::dataset::RowQuery {
                     filters: bound
                         .descriptor
@@ -579,23 +718,61 @@ impl SekaiServiceImpl {
             } else {
                 needed_nested.as_slice()
             };
-            let members = self
-                .db
-                .runtime()
-                .list_visible_index_members_projected(
-                    &bound.descriptor.namespace,
+            if constrained && let Some(properties) = read_properties.get(kind.as_str()) {
+                let schema = self
+                    .schema_definitions
+                    .snapshot()
+                    .map_err(map_schema_definition_lifecycle_error)?;
+                ensure_property_query_allowed(
+                    &schema,
+                    authority.principals,
+                    authority.tenant_context,
                     &kind,
-                    &query,
-                    Some(needed),
-                )
-                .map_err(Status::internal)?;
-            meter
-                .charge(members.len() as i32)
-                .map_err(map_object_set_error)?;
-            layers.push(members);
+                    properties.iter().cloned(),
+                )?;
+                ensure_property_grant_query_allowed(
+                    self.db.runtime(),
+                    Some(&bound.descriptor.namespace),
+                    Some(&kind),
+                    properties,
+                )?;
+            }
+            let mut visible = Vec::new();
+            loop {
+                meter.charge(0).map_err(map_object_set_error)?;
+                query.limit = (meter.limit.max_rows_scanned - meter.rows)
+                    .saturating_add(1)
+                    .clamp(1, INDEX_SCAN_BATCH_SIZE);
+                let members = self
+                    .db
+                    .runtime()
+                    .list_visible_index_members_projected(
+                        &bound.descriptor.namespace,
+                        &kind,
+                        &query,
+                        if constrained { None } else { Some(needed) },
+                    )
+                    .map_err(Status::internal)?;
+                let scanned = members.len() as i32;
+                meter.charge(scanned).map_err(map_object_set_error)?;
+                for mut member in members {
+                    if let Some(object) =
+                        self.authorized_index_object(&member, authority, status.indexed_at_ms)?
+                    {
+                        member.properties = object.properties.into_iter().collect();
+                        visible.push(member);
+                    }
+                    meter.charge(0).map_err(map_object_set_error)?;
+                }
+                if scanned < query.limit {
+                    break;
+                }
+                query.offset = query.offset.saturating_add(scanned);
+            }
+            layers.push(visible);
         }
         self.require_hop_projection_ready(bound, hops)?;
-        let projected = if self.object_index_engine
+        let projected = if engine
             == crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection
         {
             Some(self.hop_projection_paths(bound, hops, &layers[0], &mut meter, &needed_leaf)?)
@@ -604,27 +781,21 @@ impl SekaiServiceImpl {
         };
         let mut paths: Vec<Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>> =
             layers[0].iter().map(|member| vec![member]).collect();
-        if self.object_index_engine
-            == crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
-            || self.object_index_dual_read
+        if engine == crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
+            || dual_read
         {
             for (hop_index, hop) in hops.iter().enumerate() {
                 paths = crate::sekai::object_index_engine::join_paths_nested(
                     paths,
                     &layers[hop_index + 1],
                     &hop.join_property,
-                );
-                if self.object_index_engine
-                    == crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
-                {
-                    meter
-                        .charge(paths.len() as i32)
-                        .map_err(map_object_set_error)?;
-                }
+                    &mut meter,
+                )
+                .map_err(map_object_set_error)?;
             }
         }
         if let Some(projected) = projected.as_ref()
-            && self.object_index_dual_read
+            && dual_read
         {
             let projected_sig = crate::sekai::object_index_engine::path_signature(
                 &projected
@@ -638,7 +809,7 @@ impl SekaiServiceImpl {
                 ));
             }
         }
-        if self.object_log_dual_read.enabled
+        if log_dual_read
             && crate::sekai::object_log::should_fetch_canary_policies(
                 &self.object_log_dual_read,
                 &bound.descriptor,
@@ -649,32 +820,7 @@ impl SekaiServiceImpl {
         {
             let mut kinds = vec![bound.descriptor.kind.as_str()];
             kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
-            // What this evaluate reads on each kind: root filters and
-            // grouping, each hop's join property on its far kind, and the sum
-            // property on the leaf.
-            let mut read =
-                std::collections::BTreeMap::<&str, std::collections::BTreeSet<String>>::new();
-            let root_read = read.entry(bound.descriptor.kind.as_str()).or_default();
-            root_read.extend(
-                bound
-                    .descriptor
-                    .property_filters
-                    .iter()
-                    .map(|filter| filter.key.clone()),
-            );
-            if !aggregation.group_by.is_empty() {
-                root_read.insert(aggregation.group_by.clone());
-            }
-            for hop in hops {
-                read.entry(hop.far_kind.as_str())
-                    .or_default()
-                    .insert(hop.join_property.clone());
-            }
-            if !aggregation.property.is_empty() {
-                read.entry(kinds[kinds.len() - 1])
-                    .or_default()
-                    .insert(aggregation.property.clone());
-            }
+            let read = &read_properties;
             let schema = self
                 .schema_definitions
                 .snapshot()
@@ -757,7 +903,6 @@ impl SekaiServiceImpl {
         };
         let aggregates = crate::sekai::object_set::aggregate_groups(&rows, &aggregation.function)
             .map_err(map_object_set_error)?;
-        let _ = (principals, tenant_context);
         Ok(Response::new(EvaluateObjectSetResponse {
             contract_version: bound.descriptor.contract_version.clone(),
             definition_digest: bound.descriptor.definition_digest.clone(),
@@ -776,6 +921,33 @@ impl SekaiServiceImpl {
                 .collect(),
         }))
     }
+}
+
+fn aggregate_read_properties<'a>(
+    root_kind: &'a str,
+    aggregation: &crate::sekai::object_set::ObjectSetAggregation,
+    filters: &[crate::domain::PropertyFilter],
+    hops: &'a [crate::sekai::object_set::ObjectSetTraversal],
+) -> std::collections::BTreeMap<&'a str, std::collections::BTreeSet<String>> {
+    let mut read = std::collections::BTreeMap::<&str, std::collections::BTreeSet<String>>::new();
+    let root = read.entry(root_kind).or_default();
+    root.extend(filters.iter().map(|filter| filter.key.clone()));
+    if !aggregation.group_by.is_empty() {
+        root.insert(aggregation.group_by.clone());
+    }
+    for hop in hops {
+        let properties = read.entry(hop.far_kind.as_str()).or_default();
+        if !hop.join_property.is_empty() {
+            properties.insert(hop.join_property.clone());
+        }
+    }
+    if !aggregation.function.eq_ignore_ascii_case("count") && !aggregation.property.is_empty() {
+        let leaf_kind = hops.last().map_or(root_kind, |hop| hop.far_kind.as_str());
+        read.entry(leaf_kind)
+            .or_default()
+            .insert(aggregation.property.clone());
+    }
+    read
 }
 
 fn aggregate_plan_properties(
@@ -810,11 +982,12 @@ fn aggregate_path_row(
     leaf: &crate::sekai::object_type_index::ObjectTypeIndexMember,
     aggregation: &crate::sekai::object_set::ObjectSetAggregation,
 ) -> (String, Option<f64>) {
+    // group_by is planned and granted on the root kind. Reading it from the
+    // leaf would skip that kind's property grants.
     let group = root
         .properties
         .get(&aggregation.group_by)
         .cloned()
-        .or_else(|| leaf.properties.get(&aggregation.group_by).cloned())
         .unwrap_or_else(|| root.source_key.clone());
     let value = if aggregation.function.eq_ignore_ascii_case("count") {
         Some(1.0)
@@ -1027,6 +1200,59 @@ mod tests {
             group_by: String::new(),
         };
         assert!(aggregate_plan_properties(&count, &[], &[]).is_empty());
+        let hops = [crate::sekai::object_set::ObjectSetTraversal {
+            far_kind: "Shipment".into(),
+            join_property: "order_id".into(),
+            ..Default::default()
+        }];
+        let planned = aggregate_read_properties("Customer", &aggregation, &filters, &hops);
+        assert!(planned["Customer"].contains("region"));
+        assert!(planned["Customer"].contains("tier"));
+        assert!(!planned["Shipment"].contains("region"));
+        assert!(planned["Shipment"].contains("amount"));
+        assert!(planned["Shipment"].contains("order_id"));
+    }
+
+    #[test]
+    fn aggregate_path_row_groups_by_root_not_leaf() {
+        let root = crate::sekai::object_type_index::ObjectTypeIndexMember {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            object_id: "Customer:c1".into(),
+            properties: std::collections::BTreeMap::from([("region".into(), "eu".into())]),
+            content_hash: String::new(),
+            hidden: false,
+            from_edit: false,
+        };
+        let leaf = crate::sekai::object_type_index::ObjectTypeIndexMember {
+            namespace: "sales".into(),
+            kind: "Shipment".into(),
+            source_key: "s1".into(),
+            object_id: "Shipment:s1".into(),
+            properties: std::collections::BTreeMap::from([
+                ("region".into(), "west".into()),
+                ("amount".into(), "10".into()),
+            ]),
+            content_hash: String::new(),
+            hidden: false,
+            from_edit: false,
+        };
+        let aggregation = crate::sekai::object_set::ObjectSetAggregation {
+            function: "sum".into(),
+            property: "amount".into(),
+            group_by: "region".into(),
+        };
+        assert_eq!(
+            aggregate_path_row(&root, &leaf, &aggregation),
+            ("eu".into(), Some(10.0))
+        );
+        let mut root_without_region = root.clone();
+        root_without_region.properties.remove("region");
+        assert_eq!(
+            aggregate_path_row(&root_without_region, &leaf, &aggregation),
+            ("c1".into(), Some(10.0))
+        );
     }
 
     fn service() -> SekaiServiceImpl {
@@ -1721,6 +1947,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluate_object_set_index_hides_live_marking_from_delegated_human() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "service-a");
+        grant_namespace(&svc, "sales", "human-a");
+        let digest = seed_sales_definition(&svc);
+        index_kind(
+            &svc,
+            &digest,
+            "Customer",
+            "ds-c",
+            "customer_id",
+            &[("region", "region")],
+            vec![hashmap(&[
+                ("customer_id", "c1"),
+                ("region", "eu"),
+                ("hidden", "0"),
+            ])],
+        );
+        let object_id = "Customer:c1";
+        for (principal, role) in [
+            ("service-a", security::Role::Admin),
+            ("human-a", security::Role::Viewer),
+        ] {
+            let grant = security::Grant {
+                id: format!("indexed-marking-{principal}"),
+                object_id: object_id.into(),
+                principal: principal.into(),
+                role,
+                created: 1,
+            };
+            svc.db.runtime().create_grant(&grant).unwrap();
+            svc.security.add_grant(&grant);
+        }
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: object_id.into(),
+                kind: "Customer".into(),
+                name: "c1".into(),
+                namespace: "sales".into(),
+                external_id: "c1".into(),
+                properties: std::collections::HashMap::from([(
+                    crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "restricted".into(),
+                )]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        for (actor, ceiling) in [("service-a", "restricted"), ("human-a", "public")] {
+            let profile = domain::Object {
+                id: format!("profile-{actor}"),
+                kind: crate::sekai::markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: actor.into(),
+                namespace: String::new(),
+                external_id: crate::sekai::markings::principal_profile_external_id(actor),
+                properties: std::collections::HashMap::from([
+                    (
+                        crate::sekai::markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                        ceiling.into(),
+                    ),
+                    (
+                        crate::sekai::markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                        "true".into(),
+                    ),
+                ]),
+                created: 1,
+                updated: 1,
+            };
+            svc.db.runtime().create_object(&profile).unwrap();
+            let grant = security::Grant {
+                id: format!("profile-grant-{actor}"),
+                object_id: profile.id,
+                principal: "root".into(),
+                role: security::Role::Admin,
+                created: 1,
+            };
+            svc.db.runtime().create_grant(&grant).unwrap();
+            svc.security.add_grant(&grant);
+        }
+        let descriptor = ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest,
+            cost_limit: Some(ObjectSetCostLimit {
+                max_rows_scanned: 100,
+                max_depth: 3,
+                max_time_ms: 0,
+            }),
+            ..Default::default()
+        };
+        for (actor, expected) in [(None, 1), (Some("human-a"), 0)] {
+            let mut context = crate::enterprise::AuthenticatedContext::machine(
+                crate::enterprise::AuthenticatedPrincipal {
+                    subject: "service-a".into(),
+                    credential_id: "service-credential".into(),
+                },
+            );
+            context.act = actor.map(str::to_string);
+            let mut request = Request::new(EvaluateObjectSetRequest {
+                descriptor: Some(descriptor.clone()),
+                ..Default::default()
+            });
+            request.extensions_mut().insert(context);
+            let result = svc.evaluate_object_set(request).await.unwrap().into_inner();
+            assert_eq!(result.total, expected, "act={actor:?}");
+            assert_eq!(result.members.len(), expected as usize, "act={actor:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_object_set_index_fails_closed_on_authorization_outage() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_definition(&svc);
+        index_kind(
+            &svc,
+            &digest,
+            "Customer",
+            "ds-c-outage",
+            "customer_id",
+            &[("region", "region")],
+            vec![hashmap(&[
+                ("customer_id", "c1"),
+                ("region", "eu"),
+                ("hidden", "0"),
+            ])],
+        );
+        svc.db
+            .runtime()
+            .conn()
+            .execute(
+                "INSERT INTO sekai_classification_lattices
+                 (namespace, contract_version, digest, lattice_json, created_by, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                ("sales", "v1", "stale", "{", "root", 1_i64),
+            )
+            .unwrap();
+        let context = crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "alice".into(),
+                credential_id: "service-credential".into(),
+            },
+        );
+        let mut request = Request::new(EvaluateObjectSetRequest {
+            descriptor: Some(ObjectSetDescriptor {
+                contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                definition_digest: digest,
+                cost_limit: Some(ObjectSetCostLimit {
+                    max_rows_scanned: 100,
+                    max_depth: 3,
+                    max_time_ms: 0,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(context);
+        let err = svc.evaluate_object_set(request).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("unavailable"));
+    }
+
+    #[tokio::test]
     async fn evaluate_object_set_two_hop_aggregates_without_hidden_leakage() {
         let mut svc = service();
         assert_eq!(
@@ -1779,6 +2173,263 @@ mod tests {
         assert_eq!(page.aggregates[0].count, 1);
         assert!(page.members.is_empty());
         assert!(!page.authority);
+
+        grant_namespace(&svc, "sales", "service-a");
+        grant_namespace(&svc, "sales", "human-a");
+        let grant = security::Grant {
+            id: "indexed-service-grant".into(),
+            object_id: "Customer:c1".into(),
+            principal: "service-a".into(),
+            role: security::Role::Admin,
+            created: 1,
+        };
+        svc.db.runtime().create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+        let mut allowed_descriptor = None;
+        for aggregation in [false, true] {
+            let mut desc = ObjectSetDescriptor {
+                contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                definition_digest: page.definition_digest.clone(),
+                ..Default::default()
+            };
+            if aggregation {
+                desc.hops = vec![ObjectSetTraversal {
+                    relation: "placed".into(),
+                    direction: "outgoing".into(),
+                    far_kind: "Order".into(),
+                    join_property: "customer_id".into(),
+                }];
+                desc.aggregation = Some(ObjectSetAggregation {
+                    function: "count".into(),
+                    group_by: "region".into(),
+                    ..Default::default()
+                });
+                desc.cost_limit = Some(ObjectSetCostLimit {
+                    max_rows_scanned: 100,
+                    max_depth: 3,
+                    max_time_ms: 0,
+                });
+            }
+            allowed_descriptor = Some(desc.clone());
+            for (actor, expected) in [(None, 1), (Some("human-a"), 0)] {
+                let mut context = crate::enterprise::AuthenticatedContext::machine(
+                    crate::enterprise::AuthenticatedPrincipal {
+                        subject: "service-a".into(),
+                        credential_id: "service-credential".into(),
+                    },
+                );
+                context.act = actor.map(str::to_string);
+                let mut request = Request::new(EvaluateObjectSetRequest {
+                    descriptor: Some(desc.clone()),
+                    ..Default::default()
+                });
+                request.extensions_mut().insert(context.clone());
+                let result = svc.evaluate_object_set(request).await.unwrap().into_inner();
+                assert_eq!(
+                    result.total, expected,
+                    "aggregation={aggregation}, act={actor:?}"
+                );
+            }
+        }
+
+        svc.db
+            .runtime()
+            .append_rows(
+                "ds-c",
+                &[hashmap(&[
+                    ("customer_id", "c-denied"),
+                    ("region", "eu"),
+                    ("hidden", "0"),
+                ])],
+            )
+            .unwrap();
+        svc.db
+            .runtime()
+            .apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        let denied_grant = security::Grant {
+            id: "indexed-other-grant".into(),
+            object_id: "Customer:c-denied".into(),
+            principal: "other-human".into(),
+            role: security::Role::Viewer,
+            created: 1,
+        };
+        svc.db.runtime().create_grant(&denied_grant).unwrap();
+        svc.security.add_grant(&denied_grant);
+        let mut limited = ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: page.definition_digest.clone(),
+            limit: 1,
+            cost_limit: Some(ObjectSetCostLimit {
+                max_rows_scanned: 1,
+                max_depth: 3,
+                max_time_ms: 0,
+            }),
+            ..Default::default()
+        };
+        let context = crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "service-a".into(),
+                credential_id: "service-credential".into(),
+            },
+        );
+        let mut request = Request::new(EvaluateObjectSetRequest {
+            descriptor: Some(limited.clone()),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(context.clone());
+        assert_eq!(
+            svc.evaluate_object_set(request).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        limited.cost_limit.as_mut().unwrap().max_rows_scanned = 100;
+        let mut request = Request::new(EvaluateObjectSetRequest {
+            descriptor: Some(limited),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(context);
+        let limited_page = svc.evaluate_object_set(request).await.unwrap().into_inner();
+        assert_eq!(limited_page.total, 1);
+        assert_eq!(limited_page.members.len(), 1);
+        assert_eq!(limited_page.members[0].id, "Customer:c1");
+
+        let mut join_limited = allowed_descriptor.clone().unwrap();
+        join_limited.cost_limit.as_mut().unwrap().max_rows_scanned = 4;
+        let mut request = Request::new(EvaluateObjectSetRequest {
+            descriptor: Some(join_limited),
+            ..Default::default()
+        });
+        request
+            .extensions_mut()
+            .insert(crate::enterprise::AuthenticatedContext::machine(
+                crate::enterprise::AuthenticatedPrincipal {
+                    subject: "service-a".into(),
+                    credential_id: "service-credential".into(),
+                },
+            ));
+        let denied = svc.evaluate_object_set(request).await.unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+        assert!(denied.message().contains("max_rows_scanned"));
+
+        let human_grant = security::Grant {
+            id: "indexed-human-grant".into(),
+            principal: "human-a".into(),
+            ..grant.clone()
+        };
+        svc.db.runtime().create_grant(&human_grant).unwrap();
+        svc.security.add_grant(&human_grant);
+        let mut context = crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "service-a".into(),
+                credential_id: "service-credential".into(),
+            },
+        );
+        context.act = Some("human-a".into());
+        let mut request = Request::new(EvaluateObjectSetRequest {
+            descriptor: allowed_descriptor.clone(),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(context.clone());
+        assert_eq!(
+            svc.evaluate_object_set(request)
+                .await
+                .unwrap()
+                .into_inner()
+                .total,
+            1
+        );
+
+        let mut policies = BTreeMap::new();
+        for kind in ["Customer", "Order", "Shipment"] {
+            svc.db
+                .runtime()
+                .create_object(&domain::Object {
+                    id: format!("policy-sentinel-{kind}"),
+                    kind: kind.into(),
+                    name: kind.into(),
+                    namespace: "sales".into(),
+                    external_id: String::new(),
+                    properties: std::collections::HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        let kinds = svc
+            .db
+            .runtime()
+            .list_objects(&domain::ListFilter {
+                namespace: Some("sales".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|object| object.kind)
+            .collect::<std::collections::BTreeSet<_>>();
+        for kind in kinds {
+            let properties = match kind.as_str() {
+                "Customer" => Some(vec!["region"]),
+                "Order" => Some(vec!["customer_id"]),
+                "Shipment" => Some(vec!["order_id", "amount"]),
+                _ => None,
+            };
+            let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+                contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION
+                    .into(),
+                namespace: "sales".into(),
+                kind: kind.clone(),
+                rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                    operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                    predicates: vec![
+                        crate::sekai::object_security::ObjectSecurityPredicate::AllowAll,
+                    ],
+                }],
+                property_grants: properties.map(|properties| {
+                    properties
+                        .into_iter()
+                        .map(|property| crate::sekai::object_security::PropertyGrant {
+                            property: property.into(),
+                            access: crate::sekai::object_security::PropertyGrantAccess::Read,
+                        })
+                        .collect()
+                }),
+                value_instance_grants: None,
+                required_purpose: None,
+            };
+            let revision = svc
+                .db
+                .runtime()
+                .put_object_security_policy(&policy, "root", &format!("put-index-{kind}"), 100)
+                .unwrap();
+            policies.insert(kind, revision.revision_digest);
+        }
+        svc.db
+            .runtime()
+            .activate_object_security_policies(
+                "sales",
+                &policies,
+                "root",
+                "activate-index-grants",
+                101,
+            )
+            .unwrap();
+        let mut request = Request::new(EvaluateObjectSetRequest {
+            descriptor: allowed_descriptor,
+            ..Default::default()
+        });
+        request.extensions_mut().insert(context);
+        assert_eq!(
+            svc.evaluate_object_set(request)
+                .await
+                .unwrap()
+                .into_inner()
+                .total,
+            1
+        );
 
         let mut projected = service();
         grant_namespace(&projected, "sales", "alice");

@@ -2,9 +2,10 @@
 //!
 //! `hop-projection` is the shipping default: a rebuildable join-key
 //! projection from the #889 envelope. `nested-loop` is the original
-//! in-process scan, kept as an explicit debug engine. Neither is object
-//! authority. Switching engines is a rebuild of the join projection.
+//! in-process scan, also used for bounded joins over authorized members.
+//! Neither is object authority. Switching engines is a rebuild of the join projection.
 
+use crate::sekai::object_set::{CostMeter, ObjectSetError};
 use crate::sekai::object_type_index::ObjectTypeIndexMember;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -58,26 +59,29 @@ pub fn join_paths_nested<'a>(
     paths: Vec<Vec<&'a ObjectTypeIndexMember>>,
     children: &'a [ObjectTypeIndexMember],
     join_property: &str,
-) -> Vec<Vec<&'a ObjectTypeIndexMember>> {
+    meter: &mut CostMeter,
+) -> Result<Vec<Vec<&'a ObjectTypeIndexMember>>, ObjectSetError> {
     if join_property.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut next = Vec::new();
     for path in &paths {
         let parent = path[path.len() - 1];
         for child in children {
+            meter.charge(1)?;
             let matched = child
                 .properties
                 .get(join_property)
                 .is_some_and(|value| value == &parent.source_key || value == &parent.object_id);
             if matched {
+                meter.charge(1)?;
                 let mut joined = path.clone();
                 joined.push(child);
                 next.push(joined);
             }
         }
     }
-    next
+    Ok(next)
 }
 
 pub fn join_paths_hash<'a>(
@@ -218,7 +222,13 @@ mod tests {
         ];
         let roots: Vec<Vec<&ObjectTypeIndexMember>> =
             customers.iter().map(|member| vec![member]).collect();
-        let nested = join_paths_nested(roots.clone(), &orders, "customer_id");
+        let nested = join_paths_nested(
+            roots.clone(),
+            &orders,
+            "customer_id",
+            &mut CostMeter::new(Default::default()),
+        )
+        .unwrap();
         let hashed = join_paths_hash(roots, &orders, "customer_id");
         assert_eq!(path_signature(&nested), path_signature(&hashed));
         assert_eq!(nested.len(), 1);

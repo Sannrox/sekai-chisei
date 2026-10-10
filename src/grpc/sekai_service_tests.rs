@@ -2561,6 +2561,29 @@ fn activated_direct_read_error_hides_only_permission_denials() {
     );
 }
 
+#[test]
+fn read_root_hides_denials_and_preserves_outages() {
+    assert_eq!(
+        hide_read_root_as_missing(Status::permission_denied("access denied")).code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        hide_read_root_as_missing(Status::unauthenticated(
+            "enterprise tenant context required"
+        ))
+        .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        hide_read_root_as_missing(Status::unavailable("object authorization unavailable")).code(),
+        tonic::Code::Unavailable
+    );
+    assert_eq!(
+        hide_read_root_as_missing(Status::internal("policy store failed")).code(),
+        tonic::Code::Internal
+    );
+}
+
 #[tokio::test]
 async fn activated_get_object_hides_acl_and_marking_denials_as_missing() {
     for (id, namespace, properties, acl_denied) in [
@@ -11930,4 +11953,392 @@ async fn action_instance_reads_require_entitlement_and_target_visibility() {
         .await
         .unwrap_err();
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn delegated_service_intersects_acl_properties_and_marking_clearance() {
+    let svc = service();
+    let mut schema_type = widget_schema_type();
+    schema_type.properties.push(PropertyDef {
+        name: "secret_note".into(),
+        r#type: "string".into(),
+        classification: "sensitive".into(),
+        ..Default::default()
+    });
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(schema_type),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let mut object = widget_object(
+        "delegated-widget",
+        HashMap::from([
+            ("name".into(), "widget".into()),
+            ("secret_note".into(), "private value".into()),
+        ]),
+    );
+    object.namespace = "delegated-read".into();
+    svc.db
+        .runtime()
+        .create_object(&from_proto_obj(&object))
+        .unwrap();
+    grant_object_role(&svc, &object.id, "service-a", security::Role::Admin);
+    grant_object_role(&svc, &object.id, "human-a", security::Role::Editor);
+    let context = crate::enterprise::AuthenticatedContext::machine(
+        crate::enterprise::AuthenticatedPrincipal {
+            subject: "service-a".into(),
+            credential_id: "service-credential".into(),
+        },
+    );
+    let mut denied_service = context.clone();
+    denied_service.principal.subject = "service-b".into();
+    denied_service.act = Some("human-a".into());
+    let mut request = Request::new(GetObjectRequest {
+        id: object.id.clone(),
+    });
+    request.extensions_mut().insert(denied_service);
+    assert!(svc.get_object(request).await.is_err());
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            actor: Some("service-b".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.target_id == object.id
+                && decision.outcome == "deny"
+                && decision.evidence.get("act").map(String::as_str) == Some("human-a"))
+    );
+    for (actor, expected_secret) in [(None, "private value"), (Some("human-a"), REDACTED_VALUE)] {
+        let mut request = Request::new(GetObjectRequest {
+            id: object.id.clone(),
+        });
+        let mut delegated = context.clone();
+        delegated.act = actor.map(str::to_string);
+        request.extensions_mut().insert(delegated);
+        // Metadata cannot substitute another user's grants.
+        request
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        let response = svc
+            .get_object(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(response.properties["secret_note"], expected_secret);
+    }
+    svc.db
+        .runtime()
+        .record_object_change(&audit::ObjectChange {
+            id: "delegated-secret-change".into(),
+            object_id: object.id.clone(),
+            field: "properties.secret_note".into(),
+            old_value: "old private value".into(),
+            new_value: "private value".into(),
+            changed_by: "service-a".into(),
+            timestamp: 1,
+        })
+        .unwrap();
+    for (actor, expected_value) in [(None, "private value"), (Some("human-a"), REDACTED_VALUE)] {
+        let mut delegated = context.clone();
+        delegated.act = actor.map(str::to_string);
+        let mut request = Request::new(ListObjectChangesRequest {
+            object_id: object.id.clone(),
+            limit: 10,
+            offset: 0,
+        });
+        request.extensions_mut().insert(delegated);
+        let response = svc.list_object_changes(request).await.unwrap().into_inner();
+        let change = response
+            .changes
+            .iter()
+            .find(|change| change.field == "properties.secret_note")
+            .unwrap();
+        assert_eq!(change.new_value, expected_value);
+    }
+    grant_object_role(&svc, &object.id, "root", security::Role::Admin);
+    for (actor, allowed) in [(None, true), (Some("human-a"), false)] {
+        let mut delegated = context.clone();
+        delegated.principal.subject = "root".into();
+        delegated.act = actor.map(str::to_string);
+        let mut request = Request::new(FindByPropertyRequest {
+            kind: "widget".into(),
+            key: "secret_note".into(),
+            value: "private value".into(),
+        });
+        request.extensions_mut().insert(delegated);
+        assert_eq!(svc.find_by_property(request).await.is_ok(), allowed);
+    }
+
+    let mut updated = object.clone();
+    updated
+        .properties
+        .insert("secret_note".into(), "overwritten".into());
+    let mut request = Request::new(UpdateObjectRequest {
+        object: Some(updated),
+        lease_precondition: None,
+    });
+    let mut delegated = context.clone();
+    delegated.act = Some("human-a".into());
+    request.extensions_mut().insert(delegated);
+    svc.update_object(request).await.unwrap();
+    assert_eq!(
+        svc.db
+            .runtime()
+            .get_object(&object.id)
+            .unwrap()
+            .unwrap()
+            .properties["secret_note"],
+        "private value"
+    );
+
+    let mut denied = context.clone();
+    denied.act = Some("human-without-grants".into());
+    let mut request = Request::new(GetObjectRequest {
+        id: object.id.clone(),
+    });
+    request.extensions_mut().insert(denied);
+    assert!(svc.get_object(request).await.is_err());
+
+    for (actor, ceiling) in [("service-a", "restricted"), ("human-a", "public")] {
+        let profile = domain::Object {
+            id: format!("profile-{actor}"),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: actor.into(),
+            namespace: String::new(),
+            external_id: markings::principal_profile_external_id(actor),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    ceiling.into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 1,
+            updated: 1,
+        };
+        svc.db.runtime().create_object(&profile).unwrap();
+        grant_object_role(&svc, &profile.id, "root", security::Role::Admin);
+    }
+    object.properties.insert(
+        markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+        "restricted".into(),
+    );
+    svc.db
+        .runtime()
+        .update_object(&from_proto_obj(&object))
+        .unwrap();
+    for (actor, allowed) in [(None, true), (Some("human-a"), false)] {
+        let mut request = Request::new(GetObjectRequest {
+            id: object.id.clone(),
+        });
+        let mut delegated = context.clone();
+        delegated.act = actor.map(str::to_string);
+        request.extensions_mut().insert(delegated);
+        assert_eq!(svc.get_object(request).await.is_ok(), allowed);
+        let mut request = Request::new(ListObjectsRequest {
+            filter: Some(ListFilter {
+                namespace: object.namespace.clone(),
+                kind: "widget".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut delegated = context.clone();
+        delegated.act = actor.map(str::to_string);
+        request.extensions_mut().insert(delegated);
+        let response = svc.list_objects(request).await.unwrap().into_inner();
+        assert_eq!(response.total, i32::from(allowed));
+        assert_eq!(response.objects.len(), usize::from(allowed));
+    }
+    let audit = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            actor: Some("service-a".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|decision| decision.action == "policy.delegated"
+                && decision.actor == "service-a"
+                && decision.evidence.get("act").map(String::as_str) == Some("human-a"))
+    );
+}
+
+#[tokio::test]
+async fn delegated_service_requires_human_namespace_membership() {
+    let svc = service();
+    grant_source_namespace(&svc, "delegated-team", "service-a", security::Role::Admin);
+    let mut object = from_proto_obj(&widget_object("team-widget", HashMap::new()));
+    object.namespace = "delegated-team".into();
+    svc.db.runtime().create_object(&object).unwrap();
+    let mut context = crate::enterprise::AuthenticatedContext::machine(
+        crate::enterprise::AuthenticatedPrincipal {
+            subject: "service-a".into(),
+            credential_id: "service-credential".into(),
+        },
+    );
+    for (actor, allowed) in [(None, true), (Some("human-a"), false)] {
+        context.act = actor.map(str::to_string);
+        let mut request = Request::new(GetObjectRequest {
+            id: object.id.clone(),
+        });
+        request.extensions_mut().insert(context.clone());
+        assert_eq!(svc.get_object(request).await.is_ok(), allowed);
+    }
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            actor: Some("service-a".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.target_id == "delegated-team"
+                && decision.outcome == "deny"
+                && decision.evidence.get("act").map(String::as_str) == Some("human-a"))
+    );
+    grant_source_namespace(&svc, "delegated-team", "human-a", security::Role::Viewer);
+    context.act = Some("human-a".into());
+    let mut request = Request::new(GetObjectRequest {
+        id: object.id.clone(),
+    });
+    request.extensions_mut().insert(context.clone());
+    assert!(svc.get_object(request).await.is_ok());
+    let mut denied_service = context.clone();
+    denied_service.principal.subject = "service-b".into();
+    let mut request = Request::new(GetObjectRequest {
+        id: object.id.clone(),
+    });
+    request.extensions_mut().insert(denied_service);
+    assert!(svc.get_object(request).await.is_err());
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            actor: Some("service-b".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.target_id == "delegated-team"
+                && decision.outcome == "deny"
+                && decision.evidence.get("act").map(String::as_str) == Some("human-a"))
+    );
+    let decision = decide_object_access(
+        svc.db.runtime(),
+        &object,
+        &["service-a".into()],
+        Some(&context),
+        crate::sekai::object_security::ObjectSecurityOperation::Update,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        decision.outcome,
+        crate::sekai::policy_decision::PolicyOutcome::Deny
+    );
+}
+
+#[tokio::test]
+async fn delegated_service_requires_human_admin_for_policy_input_changes() {
+    let svc = service();
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let mut object = widget_object(
+        "policy-widget",
+        HashMap::from([("name".into(), "widget".into())]),
+    );
+    object.namespace = "delegated-policy".into();
+    svc.db
+        .runtime()
+        .create_object(&from_proto_obj(&object))
+        .unwrap();
+    grant_object_role(&svc, &object.id, "service-a", security::Role::Admin);
+    grant_object_role(&svc, &object.id, "human-a", security::Role::Editor);
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy::from_canonical_input(&serde_json::to_vec(&serde_json::json!({
+        "contract_version":"sekai.object-security-policy/v1", "namespace":"delegated-policy", "kind":"widget",
+        "rules":[
+            {"operation":"read","predicates":[{"kind":"subject_equals_property","property":"name"}]},
+            {"operation":"update","predicates":[{"kind":"allow_all"}]}
+        ]
+    })).unwrap()).unwrap();
+    let revision = svc
+        .db
+        .runtime()
+        .put_object_security_policy(&policy, "root", "put-admin-policy", 1)
+        .unwrap();
+    svc.db
+        .runtime()
+        .activate_object_security_policies(
+            "delegated-policy",
+            &std::collections::BTreeMap::from([("widget".into(), revision.revision_digest)]),
+            "root",
+            "activate-admin-policy",
+            2,
+        )
+        .unwrap();
+    let mut context = crate::enterprise::AuthenticatedContext::machine(
+        crate::enterprise::AuthenticatedPrincipal {
+            subject: "service-a".into(),
+            credential_id: "service-credential".into(),
+        },
+    );
+    for (actor, allowed) in [(Some("human-a"), false), (None, true)] {
+        let mut updated = object.clone();
+        updated.properties.insert("name".into(), "changed".into());
+        context.act = actor.map(str::to_string);
+        let mut request = Request::new(UpdateObjectRequest {
+            object: Some(updated),
+            lease_precondition: None,
+        });
+        request.extensions_mut().insert(context.clone());
+        assert_eq!(svc.update_object(request).await.is_ok(), allowed);
+    }
+    context.act = Some("human-a".into());
+    let mut request = Request::new(GetObjectRequest {
+        id: object.id.clone(),
+    });
+    request.extensions_mut().insert(context);
+    assert_eq!(
+        svc.get_object(request).await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    let audit = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            actor: Some("service-a".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(audit.iter().any(|decision| decision.outcome == "deny"
+        && decision.evidence.get("operation").map(String::as_str) == Some("read")
+        && decision.evidence.get("act").map(String::as_str) == Some("human-a")));
 }

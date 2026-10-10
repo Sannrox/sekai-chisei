@@ -197,3 +197,22 @@ Contract acceptance, crate publication, consumer conformance, and migration
 approval are separate evidence. Merging this proposal alone proves none of the
 runtime or publication obligations. Accountable maintainer sign-off is required
 before this record becomes accepted and dependent changes adopt it.
+
+### Service identity and delegated policy
+
+A service identity is never a user identity. Without `act`, authorization uses
+only the authenticated service subject and its grants. It cannot acquire a
+human's row, property, or marking grants by presenting that human's identifier
+in request metadata.
+
+For a delegated call, the trusted credential validator must resolve `act` to a
+human subject. Authorization requires both the service's authority and the
+human's authority: row predicates, object ACLs, restricted properties, and
+marking clearances use intersection, never union. Policy property and value
+grants remain additional ceilings. Human scopes are not inferred from service
+scopes; predicates requiring an unavailable human scope deny access.
+
+Delegated policy audit records retain the service as actor and the human as
+`act`, including denied decisions. Durable action audit and receipt evidence
+retain the same subjects. Token issuance and contract-crate publication remain
+separate work; this rule does not claim either is complete.

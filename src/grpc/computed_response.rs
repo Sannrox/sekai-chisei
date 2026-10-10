@@ -92,7 +92,7 @@ impl SekaiServiceImpl {
                 Status::internal(error)
             }
         })?;
-        let object = self
+        let mut object = self
             .db
             .runtime()
             .project_object_property_grants(object)
@@ -103,6 +103,14 @@ impl SekaiServiceImpl {
                     Status::unavailable("object authorization unavailable")
                 }
             })?;
+        if let Some(actor) = tenant_context.and_then(|context| context.act.as_ref()) {
+            object = redact_restricted_properties(
+                object,
+                &schema,
+                &self.security,
+                std::slice::from_ref(actor),
+            );
+        }
         Ok(redact_restricted_properties(
             object,
             &schema,

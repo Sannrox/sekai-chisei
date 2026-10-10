@@ -372,6 +372,7 @@ mod tests {
             "action.operator",
         );
         let invoker = PrincipalPolicyContext {
+            delegated_subject: None,
             subjects: vec!["alice".into()],
             scopes: vec!["action.operator".into()],
         };

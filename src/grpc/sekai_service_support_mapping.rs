@@ -222,10 +222,17 @@ pub(super) fn enforce_property_grant_mutation(
 pub(super) fn ensure_property_query_allowed(
     schema: &schema::SchemaRegistry,
     principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
     kind: &str,
     properties: impl IntoIterator<Item = String>,
 ) -> Result<(), Status> {
-    if principals_can_query_restricted_properties(principals) {
+    if principals_can_query_restricted_properties(principals)
+        && tenant_context
+            .and_then(|context| context.act.as_ref())
+            .is_none_or(|actor| {
+                principals_can_query_restricted_properties(std::slice::from_ref(actor))
+            })
+    {
         return Ok(());
     }
     let restricted = restricted_property_names_for_kind(schema, kind);
@@ -309,7 +316,7 @@ pub(super) fn redact_object_change_values(
     kind: &str,
     schema: &schema::SchemaRegistry,
     security: &SecurityChecker,
-    principals: &[String],
+    context: &crate::sekai::object_security::PrincipalPolicyContext,
     policy: Option<&crate::sekai::object_security::ObjectSecurityPolicy>,
 ) -> ObjectChange {
     let object = domain::Object {
@@ -322,7 +329,10 @@ pub(super) fn redact_object_change_values(
         created: 0,
         updated: 0,
     };
-    let restricted = if can_read_restricted_properties(security, &object, principals) {
+    let restricted = if can_read_restricted_properties(security, &object, &context.subjects)
+        && context.delegated_subject.as_ref().is_none_or(|actor| {
+            can_read_restricted_properties(security, &object, std::slice::from_ref(actor))
+        }) {
         std::collections::HashSet::new()
     } else {
         restricted_property_names_for_kind(schema, kind)

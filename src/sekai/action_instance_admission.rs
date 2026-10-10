@@ -1389,7 +1389,7 @@ mod tests {
         let db = setup();
         let admission = ActionInstanceAdmission::new(&db, None);
         let admitted = admission
-            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .admit(request(r#"{"runtime":"shikigami"}"#), "service-a", 10)
             .unwrap();
         assert!(admitted.instance.system_one_fill_json.is_empty());
         let receipt = db
@@ -1401,14 +1401,14 @@ mod tests {
             .iter()
             .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
             .unwrap();
-        assert_eq!(intent.actor, "alice");
+        assert_eq!(intent.actor, "service-a");
         assert_eq!(
             intent.attributes.get("act").map(String::as_str),
             Some("origin-user")
         );
         let audit = db
             .list_decisions(&audit::DecisionFilter {
-                actor: Some("alice".into()),
+                actor: Some("service-a".into()),
                 ..Default::default()
             })
             .unwrap();

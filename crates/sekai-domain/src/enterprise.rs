@@ -88,6 +88,7 @@ pub struct AuthenticatedContext {
     pub tenant: Option<TenantContext>,
     pub space: Option<String>,
     pub space_role: Option<SpaceRole>,
+    /// Human subject resolved by the trusted validator; never an unverified routing hint.
     pub act: Option<String>,
     pub scopes: Vec<String>,
     pub issuer: String,

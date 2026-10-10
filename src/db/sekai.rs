@@ -835,9 +835,8 @@ impl SekaiDb {
         context: &PrincipalPolicyContext,
     ) -> Result<Option<Object>, String> {
         let context = context.clone().normalized();
-        let subjects =
-            serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?;
-        let scopes = serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?;
+        let subjects = context.sql_subjects();
+        let scopes = context.sql_scopes();
         self.conn()
             .query_row(
                 &format!(
@@ -2034,8 +2033,8 @@ fn build_marking_visibility_filter(
 
 fn policy_context_json(context: &PrincipalPolicyContext) -> Result<(String, String), String> {
     let context = context.clone().normalized();
-    let subjects = serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?;
-    let scopes = serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?;
+    let subjects = context.sql_subjects();
+    let scopes = context.sql_scopes();
     Ok((subjects, scopes))
 }
 
@@ -2047,8 +2046,8 @@ fn build_sqlite_object_security_filter(
         return Ok((String::new(), Vec::new()));
     };
     let context = context.clone().normalized();
-    let subjects = serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?;
-    let scopes = serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?;
+    let subjects = context.sql_subjects();
+    let scopes = context.sql_scopes();
     Ok((
         sqlite_object_security_filter(start_param),
         vec![Box::new(subjects), Box::new(scopes)],
@@ -2064,7 +2063,9 @@ pub(crate) fn sqlite_object_security_filter(start_param: usize) -> String {
                 SELECT 1 FROM sekai_object_security_activations activation
                 WHERE activation.namespace = sekai_objects.namespace
             )
-            OR EXISTS (
+            OR NOT EXISTS (
+                SELECT 1 FROM json_each(?{subjects}) authority
+                WHERE NOT EXISTS (
                 SELECT 1
                 FROM sekai_object_security_active_policies active
                 JOIN sekai_object_security_rules rule
@@ -2081,13 +2082,13 @@ pub(crate) fn sqlite_object_security_filter(start_param: usize) -> String {
                       AND CASE predicate.predicate_kind
                         WHEN 'allow_all' THEN 0
                         WHEN 'subject_equals_property' THEN NOT EXISTS (
-                            SELECT 1 FROM json_each(?{subjects}) subject
+                            SELECT 1 FROM json_each(authority.value) subject
                             WHERE subject.value=json_extract(
                                 sekai_objects.properties, '$.' || predicate.property_key
                             )
                         )
                         WHEN 'required_scope_equals' THEN NOT EXISTS (
-                            SELECT 1 FROM json_each(?{scopes}) scope
+                            SELECT 1 FROM json_each(json_extract(?{scopes}, '$[' || authority.key || ']')) scope
                             WHERE scope.value=predicate.fixed_value
                         )
                         WHEN 'property_equals' THEN
@@ -2097,6 +2098,7 @@ pub(crate) fn sqlite_object_security_filter(start_param: usize) -> String {
                         ELSE 1
                       END
                   )
+                )
             )
         )"
     )

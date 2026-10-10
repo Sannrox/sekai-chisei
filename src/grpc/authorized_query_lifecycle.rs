@@ -23,8 +23,17 @@ impl SekaiServiceImpl {
             .db
             .runtime()
             .get_object_with_policy_context(&id, &policy_context)
-            .map_err(Status::internal)?
-            .ok_or(Status::not_found("not found"))?;
+            .map_err(Status::internal)?;
+        let Some(obj) = obj else {
+            record_delegated_policy_decision(
+                self.db.runtime(),
+                &policy_context,
+                &id,
+                crate::sekai::object_security::ObjectSecurityOperation::Read,
+                crate::sekai::policy_decision::PolicyOutcome::Deny,
+            )?;
+            return Err(Status::not_found("not found"));
+        };
         let namespace = obj.namespace.clone();
         require_purpose_for_kind(
             self.db.runtime(),
@@ -228,6 +237,7 @@ impl SekaiServiceImpl {
             ensure_property_query_allowed(
                 &schema,
                 &principals,
+                tenant_context.as_ref(),
                 filter.kind.as_deref().unwrap_or_default(),
                 queried_properties.clone(),
             )?;
@@ -488,7 +498,13 @@ impl SekaiServiceImpl {
                 .schema_definitions
                 .snapshot()
                 .map_err(map_schema_definition_lifecycle_error)?;
-            ensure_property_query_allowed(&schema, &principals, &r.kind, [r.key.clone()])?;
+            ensure_property_query_allowed(
+                &schema,
+                &principals,
+                tenant_context.as_ref(),
+                &r.kind,
+                [r.key.clone()],
+            )?;
             ensure_property_grant_query_allowed(
                 self.db.runtime(),
                 None,
@@ -805,6 +821,7 @@ impl SekaiServiceImpl {
             ensure_property_query_allowed(
                 &schema,
                 &principals,
+                tenant_context.as_ref(),
                 &start.kind,
                 queried_properties.clone(),
             )?;
@@ -819,6 +836,7 @@ impl SekaiServiceImpl {
                 ensure_property_query_allowed(
                     &schema,
                     &principals,
+                    tenant_context.as_ref(),
                     kind,
                     queried_properties.clone(),
                 )?;
@@ -863,6 +881,18 @@ impl SekaiServiceImpl {
                     purpose.as_ref(),
                 )
                 .map_err(|status| status.to_string())?
+                {
+                    return Ok(None);
+                }
+                if let Some(actor) = tenant_context
+                    .as_ref()
+                    .and_then(|context| context.act.as_ref())
+                    && !object_passes_marking(
+                        self.db.runtime(),
+                        object,
+                        std::slice::from_ref(actor),
+                    )
+                    .map_err(|status| status.to_string())?
                 {
                     return Ok(None);
                 }
