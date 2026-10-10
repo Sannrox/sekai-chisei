@@ -1669,6 +1669,10 @@ message ReconcileWorkUnitsResponse {
   int32 reservations_released = 2;
   repeated ReconciliationDetail details = 3;
 }
+// Credential administration records are not authenticated request authority.
+// The shared identity target contract is documented in ADR 0099; adoption and
+// tenant binding are separate migrations. Never infer authority from a request
+// tenant_id or change existing field numbers when extending this protocol.
 message CredentialRecord {
   string id = 1;
   string principal = 2;
