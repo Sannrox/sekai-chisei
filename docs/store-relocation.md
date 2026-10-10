@@ -12,6 +12,11 @@ writers are refused only for the short fenced catch-up at the end.
 
 ## Before you start
 
+When upgrading to 1.2.1 or later, run relocation with the target version's
+`sekaictl`. Its Chisei destination initialization includes external-action
+reservations, authorizations, releases, and blast-radius claims. Older relocation
+tools may refuse stores that contain these runtime-created tables.
+
 Take a copy of the pre-relocate files. That copy is the rollback point:
 relocate changes the source from the moment it starts (capture tables and
 triggers), so the live source is not a clean rollback copy. Writers do not
