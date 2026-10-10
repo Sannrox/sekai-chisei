@@ -481,6 +481,8 @@ pub(super) async fn get_action_instance(
     req: Request<GetActionInstanceRequest>,
 ) -> Result<Response<GetActionInstanceResponse>, Status> {
     let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let policy_context = principal_policy_context(&req);
     let inner = req.into_inner();
     let stored = if !inner.instance_id.trim().is_empty() {
         service
@@ -508,7 +510,25 @@ pub(super) async fn get_action_instance(
             "instance_id, operation_id, or (namespace, idempotency_key) required",
         ));
     };
-    authorize_action_instance_read(service, &principals, &stored.namespace)?;
+    authorize_action_instance_read(
+        service,
+        &principals,
+        &stored.namespace,
+        tenant_context.as_ref(),
+    )?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &stored.namespace,
+        false,
+    )?;
+    authorize_action_instance_visibility(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &policy_context,
+        &stored,
+    )?;
     Ok(Response::new(GetActionInstanceResponse {
         instance: Some(to_proto_action_instance(&stored)),
     }))
@@ -518,11 +538,24 @@ pub(super) async fn list_action_instances(
     req: Request<ListActionInstancesRequest>,
 ) -> Result<Response<ListActionInstancesResponse>, Status> {
     let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let policy_context = principal_policy_context(&req);
     let inner = req.into_inner();
     if inner.namespace.trim().is_empty() {
         return Err(Status::invalid_argument("namespace required"));
     }
-    authorize_action_instance_read(service, &principals, &inner.namespace)?;
+    authorize_action_instance_read(
+        service,
+        &principals,
+        &inner.namespace,
+        tenant_context.as_ref(),
+    )?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )?;
     let type_id = if inner.type_id.trim().is_empty() {
         None
     } else {
@@ -538,21 +571,135 @@ pub(super) async fn list_action_instances(
     } else {
         inner.limit as usize
     };
-    let instances = service
-        .db
-        .runtime()
-        .list_action_instances(&inner.namespace, type_id, status, limit)
-        .map_err(Status::internal)?
-        .iter()
-        .map(to_proto_action_instance)
-        .collect();
+    let limit = limit.clamp(1, 500);
+    let mut offset = 0;
+    let mut instances = Vec::new();
+    loop {
+        let stored = service
+            .db
+            .runtime()
+            .list_action_instances_page(&inner.namespace, type_id, status, 100, offset)
+            .map_err(Status::internal)?;
+        let exhausted = stored.len() < 100;
+        offset += stored.len();
+        for instance in &stored {
+            match authorize_action_instance_visibility(
+                service,
+                &principals,
+                tenant_context.as_ref(),
+                &policy_context,
+                instance,
+            ) {
+                Ok(()) => instances.push(to_proto_action_instance(instance)),
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        tonic::Code::PermissionDenied | tonic::Code::NotFound
+                    ) => {}
+                Err(status) => return Err(status),
+            }
+            if instances.len() == limit {
+                break;
+            }
+        }
+        if exhausted || instances.len() == limit {
+            break;
+        }
+    }
     Ok(Response::new(ListActionInstancesResponse { instances }))
 }
+
+fn authorize_action_instance_visibility(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    instance: &crate::sekai::action_instance::ActionInstance,
+) -> Result<(), Status> {
+    let denied = || Status::permission_denied("action instance unavailable");
+    let definition = service
+        .db
+        .runtime()
+        .get_governed_action_type(&instance.namespace, &instance.type_id, &instance.version)
+        .map_err(Status::internal)?;
+    let entitled = principal_matches(&instance.principal, principals)
+        || authorize_namespace_action_admin(service, principals, &instance.namespace).is_ok()
+        || definition.as_ref().is_some_and(|definition| {
+            principals
+                .iter()
+                .any(|principal| definition.approvers.contains(principal))
+        });
+    if !entitled {
+        return Err(denied());
+    }
+    if let Some(object_id) = action_instance_target_object_id(&instance.parameters_json) {
+        let target_exists = service
+            .db
+            .runtime()
+            .get_object(&object_id)
+            .map_err(Status::internal)?
+            .is_some();
+        if target_exists {
+            visible_action_object(
+                service,
+                principals,
+                tenant_context,
+                policy_context,
+                &instance.namespace,
+                &object_id,
+            )?;
+        } else if !definition.as_ref().is_some_and(|definition| {
+            definition.object_mutation == crate::sekai::governed_action_type::OBJECT_MUTATION_CREATE
+        }) {
+            return Err(denied());
+        }
+    }
+    Ok(())
+}
+
+fn action_instance_target_object_id(parameters_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("object_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+}
+fn authorize_action_effect_read(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    effect: &crate::sekai::action_effect::ActionEffect,
+) -> Result<(), Status> {
+    let instance = service
+        .db
+        .runtime()
+        .get_action_instance(&effect.instance_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::permission_denied("action effect unavailable"))?;
+    if instance.namespace != effect.namespace {
+        return Err(Status::permission_denied("action effect unavailable"));
+    }
+    authorize_action_instance_read(service, principals, &instance.namespace, tenant_context)?;
+    authorize_action_instance_visibility(
+        service,
+        principals,
+        tenant_context,
+        &principal_policy_context_from(principals, tenant_context),
+        &instance,
+    )
+}
+
 pub(super) async fn get_action_effect(
     service: &SekaiServiceImpl,
     req: Request<GetActionEffectRequest>,
 ) -> Result<Response<GetActionEffectResponse>, Status> {
     let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     if inner.effect_id.trim().is_empty() {
         return Err(Status::invalid_argument("effect_id required"));
@@ -563,7 +710,13 @@ pub(super) async fn get_action_effect(
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
-    authorize_action_instance_read(service, &principals, &stored.namespace)?;
+    authorize_action_instance_read(
+        service,
+        &principals,
+        &stored.namespace,
+        tenant_context.as_ref(),
+    )?;
+    authorize_action_effect_read(service, &principals, tenant_context.as_ref(), &stored)?;
     Ok(Response::new(GetActionEffectResponse {
         effect: Some(to_proto_action_effect(&stored)),
     }))
@@ -576,6 +729,7 @@ pub(super) async fn list_action_effects(
     use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
 
     let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let effects = if !inner.instance_id.trim().is_empty() {
         let listed = service
@@ -584,7 +738,12 @@ pub(super) async fn list_action_effects(
             .list_action_effects_for_instance(&inner.instance_id)
             .map_err(Status::internal)?;
         if let Some(first) = listed.first() {
-            authorize_action_instance_read(service, &principals, &first.namespace)?;
+            authorize_action_instance_read(
+                service,
+                &principals,
+                &first.namespace,
+                tenant_context.as_ref(),
+            )?;
         } else {
             require_authenticated(&principals)?;
         }
@@ -593,7 +752,12 @@ pub(super) async fn list_action_effects(
         && (inner.kind.is_empty() || inner.kind == EFFECT_KIND_RUNTIME_DISPATCH)
         && (inner.status.is_empty() || inner.status == EFFECT_STATUS_PENDING)
     {
-        authorize_action_instance_read(service, &principals, &inner.namespace)?;
+        authorize_action_instance_read(
+            service,
+            &principals,
+            &inner.namespace,
+            tenant_context.as_ref(),
+        )?;
         let limit = if inner.limit == 0 {
             100
         } else {
@@ -609,8 +773,20 @@ pub(super) async fn list_action_effects(
             "instance_id or namespace (pending runtime_dispatch) required",
         ));
     };
+    let mut visible = Vec::new();
+    for effect in &effects {
+        match authorize_action_effect_read(service, &principals, tenant_context.as_ref(), effect) {
+            Ok(()) => visible.push(to_proto_action_effect(effect)),
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::PermissionDenied | tonic::Code::NotFound
+                ) => {}
+            Err(status) => return Err(status),
+        }
+    }
     Ok(Response::new(ListActionEffectsResponse {
-        effects: effects.iter().map(to_proto_action_effect).collect(),
+        effects: visible,
     }))
 }
 pub(super) async fn list_claimable_action_work(
@@ -618,11 +794,17 @@ pub(super) async fn list_claimable_action_work(
     req: Request<ListClaimableActionWorkRequest>,
 ) -> Result<Response<ListClaimableActionWorkResponse>, Status> {
     let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     if inner.namespace.trim().is_empty() {
         return Err(Status::invalid_argument("namespace required"));
     }
-    authorize_action_instance_read(service, &principals, &inner.namespace)?;
+    authorize_action_instance_read(
+        service,
+        &principals,
+        &inner.namespace,
+        tenant_context.as_ref(),
+    )?;
     let runtime = if crate::sekai::action_effect::runtime_id_is_blank(&inner.runtime_id) {
         None
     } else {

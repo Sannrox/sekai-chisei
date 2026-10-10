@@ -3801,10 +3801,23 @@ impl RuntimeDb {
         status: Option<&str>,
         limit: usize,
     ) -> Result<Vec<crate::sekai::action_instance::ActionInstance>, String> {
+        self.list_action_instances_page(namespace, type_id, status, limit, 0)
+    }
+
+    pub fn list_action_instances_page(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::sekai::action_instance::ActionInstance>, String> {
         match self {
-            Self::Sqlite(db) => db.list_action_instances(namespace, type_id, status, limit),
+            Self::Sqlite(db) => {
+                db.list_action_instances_page(namespace, type_id, status, limit, offset)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.list_action_instances(namespace, type_id, status, limit)
+                db.list_action_instances_page(namespace, type_id, status, limit, offset)
             }),
         }
     }

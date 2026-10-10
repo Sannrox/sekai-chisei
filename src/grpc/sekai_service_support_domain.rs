@@ -1620,9 +1620,11 @@ pub(super) fn authorize_action_instance_read(
     service: &SekaiServiceImpl,
     principals: &[String],
     namespace: &str,
+    tenant_context: Option<&RequestEnterpriseContext>,
 ) -> Result<(), Status> {
     require_authenticated(principals)?;
     check_team_namespace(service.db.runtime(), principals, namespace, false)?;
+    enforce_namespace_tenant_context(service.db.runtime(), tenant_context, namespace, false)?;
     Ok(())
 }
 

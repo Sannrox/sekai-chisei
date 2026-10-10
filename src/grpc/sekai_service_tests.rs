@@ -11748,3 +11748,107 @@ async fn create_function_rejects_conflicting_pipeline_representations() {
         assert!(error.message().contains("conflicting pipeline step"));
     }
 }
+
+#[tokio::test]
+async fn action_instance_reads_enforce_authenticated_tenant() {
+    let svc = enterprise_service();
+    let instance = action_read_fixture("other-tenant");
+    svc.db.runtime().put_action_instance(&instance).unwrap();
+    let get = svc
+        .get_action_instance(with_tenant_context(GetActionInstanceRequest {
+            instance_id: instance.instance_id.clone(),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(get.unwrap_err().code(), tonic::Code::PermissionDenied);
+    let list = svc
+        .list_action_instances(with_tenant_context(ListActionInstancesRequest {
+            namespace: instance.namespace,
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(list.unwrap_err().code(), tonic::Code::PermissionDenied);
+}
+
+fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::ActionInstance {
+    crate::sekai::action_instance::ActionInstance {
+        instance_id: "private-instance".into(),
+        namespace: namespace.into(),
+        type_id: "review".into(),
+        version: "1".into(),
+        principal: "owner".into(),
+        parameters_json: r#"{"summary":"private payload"}"#.into(),
+        request_digest: "digest".into(),
+        idempotency_key: "private-key".into(),
+        operation_id: "private-operation".into(),
+        status: "parked".into(),
+        deny_reason: String::new(),
+        evidence_submission_ids: vec![],
+        policy_decision: "require_approval".into(),
+        budget_decision: "allow".into(),
+        created_at_ms: 1,
+        decided_at_ms: 0,
+        system_one_fill_json: String::new(),
+        parked_object_digest: String::new(),
+        decided_by: String::new(),
+        approval_decision: String::new(),
+        autonomous_envelope_id: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn action_instance_reads_require_entitlement_and_target_visibility() {
+    let svc = service();
+    seed_lineage_object(&svc, "restricted-target", "acme");
+    grant_object_role(&svc, "restricted-target", "owner", security::Role::Viewer);
+    let mut instance = action_read_fixture("acme");
+    instance.parameters_json = r#"{"object_id":"restricted-target","title":"pending"}"#.into();
+    svc.db.runtime().put_action_instance(&instance).unwrap();
+
+    for principal in ["owner", "outsider"] {
+        let get = svc
+            .get_action_instance(with_named_principal(
+                GetActionInstanceRequest {
+                    instance_id: instance.instance_id.clone(),
+                    ..Default::default()
+                },
+                principal,
+            ))
+            .await;
+        let list = svc
+            .list_action_instances(with_named_principal(
+                ListActionInstancesRequest {
+                    namespace: "acme".into(),
+                    ..Default::default()
+                },
+                principal,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        if principal == "owner" {
+            assert_eq!(
+                get.unwrap().into_inner().instance.unwrap().parameters_json,
+                instance.parameters_json
+            );
+            assert_eq!(list.instances.len(), 1);
+        } else {
+            assert_eq!(get.unwrap_err().code(), tonic::Code::PermissionDenied);
+            assert!(list.instances.is_empty());
+        }
+    }
+    // Entitlement alone cannot disclose a target whose grant was revoked.
+    instance.principal = "outsider".into();
+    svc.db.runtime().put_action_instance(&instance).unwrap();
+    let denied = svc
+        .get_action_instance(with_named_principal(
+            GetActionInstanceRequest {
+                instance_id: instance.instance_id,
+                ..Default::default()
+            },
+            "outsider",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+}

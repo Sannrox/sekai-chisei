@@ -334,8 +334,20 @@ impl SekaiDb {
         status: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ActionInstance>, String> {
+        self.list_action_instances_page(namespace, type_id, status, limit, 0)
+    }
+
+    pub fn list_action_instances_page(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ActionInstance>, String> {
         self.migrate_action_instances()?;
         let limit = limit.clamp(1, 500);
+        let offset = i64::try_from(offset).map_err(|_| "action instance offset overflow")?;
         let type_filter = type_id.filter(|t| !t.trim().is_empty());
         let status_filter = status.filter(|s| !s.trim().is_empty());
         let conn = self.conn();
@@ -346,13 +358,14 @@ impl SekaiDb {
                     .prepare(
                         "SELECT body_json FROM sekai_action_instances
                          WHERE namespace = ?1 AND type_id = ?2 AND status = ?3
-                         ORDER BY created_at_ms DESC LIMIT ?4",
+                         ORDER BY created_at_ms DESC, instance_id DESC LIMIT ?4 OFFSET ?5",
                     )
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
-                    .query_map(params![namespace, type_id, status, limit as i64], |row| {
-                        row.get(0)
-                    })
+                    .query_map(
+                        params![namespace, type_id, status, limit as i64, offset],
+                        |row| row.get(0),
+                    )
                     .map_err(|e| e.to_string())?;
                 for row in rows {
                     bodies.push(row.map_err(|e| e.to_string())?);
@@ -363,11 +376,13 @@ impl SekaiDb {
                     .prepare(
                         "SELECT body_json FROM sekai_action_instances
                          WHERE namespace = ?1 AND type_id = ?2
-                         ORDER BY created_at_ms DESC LIMIT ?3",
+                         ORDER BY created_at_ms DESC, instance_id DESC LIMIT ?3 OFFSET ?4",
                     )
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
-                    .query_map(params![namespace, type_id, limit as i64], |row| row.get(0))
+                    .query_map(params![namespace, type_id, limit as i64, offset], |row| {
+                        row.get(0)
+                    })
                     .map_err(|e| e.to_string())?;
                 for row in rows {
                     bodies.push(row.map_err(|e| e.to_string())?);
@@ -378,11 +393,13 @@ impl SekaiDb {
                     .prepare(
                         "SELECT body_json FROM sekai_action_instances
                          WHERE namespace = ?1 AND status = ?2
-                         ORDER BY created_at_ms DESC LIMIT ?3",
+                         ORDER BY created_at_ms DESC, instance_id DESC LIMIT ?3 OFFSET ?4",
                     )
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
-                    .query_map(params![namespace, status, limit as i64], |row| row.get(0))
+                    .query_map(params![namespace, status, limit as i64, offset], |row| {
+                        row.get(0)
+                    })
                     .map_err(|e| e.to_string())?;
                 for row in rows {
                     bodies.push(row.map_err(|e| e.to_string())?);
@@ -393,11 +410,11 @@ impl SekaiDb {
                     .prepare(
                         "SELECT body_json FROM sekai_action_instances
                          WHERE namespace = ?1
-                         ORDER BY created_at_ms DESC LIMIT ?2",
+                         ORDER BY created_at_ms DESC, instance_id DESC LIMIT ?2 OFFSET ?3",
                     )
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
-                    .query_map(params![namespace, limit as i64], |row| row.get(0))
+                    .query_map(params![namespace, limit as i64, offset], |row| row.get(0))
                     .map_err(|e| e.to_string())?;
                 for row in rows {
                     bodies.push(row.map_err(|e| e.to_string())?);
