@@ -1033,6 +1033,15 @@ impl SekaiDb {
         namespace: &str,
         limit: usize,
     ) -> Result<Vec<ActionEffect>, String> {
+        self.list_pending_runtime_dispatch_effects_page(namespace, limit, None)
+    }
+
+    pub fn list_pending_runtime_dispatch_effects_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<ActionEffect>, String> {
         self.migrate_action_effects()?;
         let limit = limit.clamp(1, 500) as i64;
         let conn = self.conn();
@@ -1040,7 +1049,8 @@ impl SekaiDb {
             .prepare(
                 "SELECT body_json FROM sekai_action_effects
                  WHERE namespace = ?1 AND kind = ?2 AND status = ?3
-                 ORDER BY created_at_ms
+                   AND (?5 IS NULL OR (created_at_ms, effect_id) > (?5, ?6))
+                 ORDER BY created_at_ms, effect_id
                  LIMIT ?4",
             )
             .map_err(|e| e.to_string())?;
@@ -1050,7 +1060,9 @@ impl SekaiDb {
                     namespace,
                     EFFECT_KIND_RUNTIME_DISPATCH,
                     EFFECT_STATUS_PENDING,
-                    limit
+                    limit,
+                    cursor.map(|key| key.0),
+                    cursor.map(|key| key.1)
                 ],
                 |row| row.get::<_, String>(0),
             )
@@ -1115,22 +1127,40 @@ impl SekaiDb {
         now_ms: i64,
         limit: usize,
     ) -> Result<Vec<ActionEffect>, String> {
+        self.list_claimable_action_work_page(namespace, runtime_id, now_ms, limit, None)
+    }
+
+    pub fn list_claimable_action_work_page(
+        &self,
+        namespace: &str,
+        runtime_id: Option<&str>,
+        now_ms: i64,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<ActionEffect>, String> {
         self.migrate_action_effects()?;
         let limit = limit.clamp(1, 500);
+
         // Load candidates then filter claimable (lease expiry is time-dependent).
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT body_json FROM sekai_action_effects
                  WHERE namespace = ?1 AND kind = ?2
-                 ORDER BY created_at_ms
-                 LIMIT 2000",
+                   AND (?3 IS NULL OR (created_at_ms, effect_id) > (?3, ?4))
+                 ORDER BY created_at_ms, effect_id",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![namespace, EFFECT_KIND_RUNTIME_DISPATCH], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                params![
+                    namespace,
+                    EFFECT_KIND_RUNTIME_DISPATCH,
+                    cursor.map(|key| key.0),
+                    cursor.map(|key| key.1)
+                ],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for row in rows {
@@ -2398,6 +2428,50 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.effect_id, effects[0].effect_id);
+    }
+
+    #[test]
+    fn effect_cursor_keeps_remaining_work_after_earlier_rows_are_claimed() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for id in ["cursor-a", "cursor-b", "cursor-c"] {
+            let effects = plan_effects_for_admit(
+                id,
+                "acme",
+                id,
+                &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+                r#"{"runtime":"worker"}"#,
+                10,
+                false,
+            )
+            .unwrap();
+            db.put_action_effects(&effects).unwrap();
+        }
+        let first = db
+            .list_pending_runtime_dispatch_effects_page("acme", 1, None)
+            .unwrap()
+            .remove(0);
+        db.claim_action_work(&first.effect_id, "worker", "claim-first", 1000, 100)
+            .unwrap();
+        let cursor = Some((first.created_at_ms, first.effect_id.as_str()));
+        let pending = db
+            .list_pending_runtime_dispatch_effects_page("acme", 10, cursor)
+            .unwrap();
+        let claimable = db
+            .list_claimable_action_work_page("acme", Some("worker"), 100, 10, cursor)
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(claimable.len(), 2);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|effect| &effect.effect_id)
+                .collect::<Vec<_>>(),
+            claimable
+                .iter()
+                .map(|effect| &effect.effect_id)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(pending[0].effect_id, pending[1].effect_id);
     }
 
     #[test]

@@ -3863,10 +3863,21 @@ impl RuntimeDb {
         namespace: &str,
         limit: usize,
     ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
+        self.list_pending_runtime_dispatch_effects_page(namespace, limit, None)
+    }
+
+    pub fn list_pending_runtime_dispatch_effects_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
         match self {
-            Self::Sqlite(db) => db.list_pending_runtime_dispatch_effects(namespace, limit),
+            Self::Sqlite(db) => {
+                db.list_pending_runtime_dispatch_effects_page(namespace, limit, cursor)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.list_pending_runtime_dispatch_effects(namespace, limit)
+                db.list_pending_runtime_dispatch_effects_page(namespace, limit, cursor)
             }),
         }
     }
@@ -3878,10 +3889,23 @@ impl RuntimeDb {
         now_ms: i64,
         limit: usize,
     ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
+        self.list_claimable_action_work_page(namespace, runtime_id, now_ms, limit, None)
+    }
+
+    pub fn list_claimable_action_work_page(
+        &self,
+        namespace: &str,
+        runtime_id: Option<&str>,
+        now_ms: i64,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
         match self {
-            Self::Sqlite(db) => db.list_claimable_action_work(namespace, runtime_id, now_ms, limit),
+            Self::Sqlite(db) => {
+                db.list_claimable_action_work_page(namespace, runtime_id, now_ms, limit, cursor)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.list_claimable_action_work(namespace, runtime_id, now_ms, limit)
+                db.list_claimable_action_work_page(namespace, runtime_id, now_ms, limit, cursor)
             }),
         }
     }

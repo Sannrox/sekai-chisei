@@ -800,6 +800,15 @@ impl PostgresDb {
         namespace: &str,
         limit: usize,
     ) -> Result<Vec<ActionEffect>, String> {
+        self.list_pending_runtime_dispatch_effects_page(namespace, limit, None)
+    }
+
+    pub fn list_pending_runtime_dispatch_effects_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<ActionEffect>, String> {
         let limit = limit.clamp(1, 500) as i64;
         let kind = EFFECT_KIND_RUNTIME_DISPATCH;
         let status = EFFECT_STATUS_PENDING;
@@ -808,9 +817,17 @@ impl PostgresDb {
             .query(
                 "SELECT body_json FROM sekai_action_effects
                  WHERE namespace = $1 AND kind = $2 AND status = $3
-                 ORDER BY created_at_ms
+                   AND ($5::bigint IS NULL OR (created_at_ms, effect_id) > ($5, $6))
+                 ORDER BY created_at_ms, effect_id
                  LIMIT $4",
-                &[&namespace, &kind, &status, &limit],
+                &[
+                    &namespace,
+                    &kind,
+                    &status,
+                    &limit,
+                    &cursor.map(|key| key.0),
+                    &cursor.map(|key| key.1),
+                ],
             )
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
@@ -860,44 +877,67 @@ impl PostgresDb {
         now_ms: i64,
         limit: usize,
     ) -> Result<Vec<ActionEffect>, String> {
+        self.list_claimable_action_work_page(namespace, runtime_id, now_ms, limit, None)
+    }
+
+    pub fn list_claimable_action_work_page(
+        &self,
+        namespace: &str,
+        runtime_id: Option<&str>,
+        now_ms: i64,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<ActionEffect>, String> {
         let limit = limit.clamp(1, 500);
         let kind = EFFECT_KIND_RUNTIME_DISPATCH;
-        let rows = self
-            .connection()?
-            .query(
-                "SELECT body_json FROM sekai_action_effects
-                 WHERE namespace = $1 AND kind = $2
-                 ORDER BY created_at_ms
-                 LIMIT 2000",
-                &[&namespace, &kind],
-            )
-            .map_err(|e| e.to_string())?;
+        let mut cursor = cursor.map(|key| (key.0, key.1.to_owned()));
+        let mut conn = self.connection()?;
         let mut out = Vec::new();
-        for row in rows {
-            let body: String = row.get(0);
-            let effect: ActionEffect = serde_json::from_str(&body)
-                .map_err(|e| format!("corrupt action effect body: {e}"))?;
-            if !effect.is_claimable_at(now_ms) {
-                continue;
-            }
-            if let Some(runtime_id) = runtime_id.filter(|r| !runtime_id_is_blank(r)) {
-                let payload: serde_json::Value =
-                    serde_json::from_str(&effect.payload_json).unwrap_or(serde_json::json!({}));
-                let runtime = payload
-                    .get("runtime")
-                    .and_then(|v| v.as_str())
-                    .filter(|runtime| !runtime_id_is_blank(runtime))
-                    .unwrap_or("default");
-                if runtime != runtime_id {
+        loop {
+            let rows = conn
+                .query(
+                    "SELECT body_json FROM sekai_action_effects
+                 WHERE namespace = $1 AND kind = $2
+                   AND ($3::bigint IS NULL OR (created_at_ms, effect_id) > ($3, $4))
+                 ORDER BY created_at_ms, effect_id LIMIT 500",
+                    &[
+                        &namespace,
+                        &kind,
+                        &cursor.as_ref().map(|key| key.0),
+                        &cursor.as_ref().map(|key| key.1.as_str()),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            let exhausted = rows.len() < 500;
+            for row in rows {
+                let body: String = row.get(0);
+                let effect: ActionEffect = serde_json::from_str(&body)
+                    .map_err(|e| format!("corrupt action effect body: {e}"))?;
+                cursor = Some((effect.created_at_ms, effect.effect_id.clone()));
+                if !effect.is_claimable_at(now_ms) {
                     continue;
                 }
+                if let Some(runtime_id) = runtime_id.filter(|r| !runtime_id_is_blank(r)) {
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&effect.payload_json).unwrap_or(serde_json::json!({}));
+                    let runtime = payload
+                        .get("runtime")
+                        .and_then(|v| v.as_str())
+                        .filter(|runtime| !runtime_id_is_blank(runtime))
+                        .unwrap_or("default");
+                    if runtime != runtime_id {
+                        continue;
+                    }
+                }
+                out.push(effect);
+                if out.len() == limit {
+                    return Ok(out);
+                }
             }
-            out.push(effect);
-            if out.len() >= limit {
-                break;
+            if exhausted {
+                return Ok(out);
             }
         }
-        Ok(out)
     }
 
     pub fn claim_action_work(

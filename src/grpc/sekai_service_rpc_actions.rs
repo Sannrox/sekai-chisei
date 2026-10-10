@@ -763,11 +763,47 @@ pub(super) async fn list_action_effects(
         } else {
             inner.limit as usize
         };
-        service
-            .db
-            .runtime()
-            .list_pending_runtime_dispatch_effects(&inner.namespace, limit)
-            .map_err(Status::internal)?
+        let limit = limit.clamp(1, 500);
+        let mut effects = Vec::new();
+        let mut cursor: Option<(i64, String)> = None;
+        loop {
+            let candidates = service
+                .db
+                .runtime()
+                .list_pending_runtime_dispatch_effects_page(
+                    &inner.namespace,
+                    100,
+                    cursor.as_ref().map(|key| (key.0, key.1.as_str())),
+                )
+                .map_err(Status::internal)?;
+            let exhausted = candidates.len() < 100;
+            cursor = candidates
+                .last()
+                .map(|effect| (effect.created_at_ms, effect.effect_id.clone()));
+            for effect in candidates {
+                match authorize_action_effect_read(
+                    service,
+                    &principals,
+                    tenant_context.as_ref(),
+                    &effect,
+                ) {
+                    Ok(()) => effects.push(effect),
+                    Err(status)
+                        if matches!(
+                            status.code(),
+                            tonic::Code::PermissionDenied | tonic::Code::NotFound
+                        ) => {}
+                    Err(status) => return Err(status),
+                }
+                if effects.len() == limit {
+                    break;
+                }
+            }
+            if exhausted || effects.len() == limit {
+                break;
+            }
+        }
+        effects
     } else {
         return Err(Status::invalid_argument(
             "instance_id or namespace (pending runtime_dispatch) required",
@@ -815,12 +851,40 @@ pub(super) async fn list_claimable_action_work(
     } else {
         inner.limit as usize
     };
-    let effects = ActionWorkLifecycle::new(service.db.runtime())
-        .list_claimable(&inner.namespace, runtime, now_millis(), limit)
-        .map_err(action_work_lifecycle_status)?
-        .iter()
-        .map(to_proto_action_effect)
-        .collect();
+    let now = now_millis();
+    let limit = limit.clamp(1, 500);
+    let mut effects = Vec::new();
+    let mut cursor: Option<(i64, String)> = None;
+    loop {
+        let candidates = service
+            .db
+            .runtime()
+            .list_claimable_action_work_page(
+                &inner.namespace,
+                runtime,
+                now,
+                100,
+                cursor.as_ref().map(|key| (key.0, key.1.as_str())),
+            )
+            .map_err(Status::internal)?;
+        let exhausted = candidates.len() < 100;
+        cursor = candidates
+            .last()
+            .map(|effect| (effect.created_at_ms, effect.effect_id.clone()));
+        for effect in &candidates {
+            if authorize_action_effect_read(service, &principals, tenant_context.as_ref(), effect)
+                .is_ok()
+            {
+                effects.push(to_proto_action_effect(effect));
+            }
+            if effects.len() == limit {
+                break;
+            }
+        }
+        if exhausted || effects.len() == limit {
+            break;
+        }
+    }
     Ok(Response::new(ListClaimableActionWorkResponse { effects }))
 }
 pub(super) async fn claim_action_work(
