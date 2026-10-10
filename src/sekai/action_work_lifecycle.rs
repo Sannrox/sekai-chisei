@@ -93,18 +93,6 @@ impl<'a> ActionWorkLifecycle<'a> {
         Self { db }
     }
 
-    pub(crate) fn list_claimable(
-        &self,
-        namespace: &str,
-        runtime_id: Option<&str>,
-        now_ms: i64,
-        limit: usize,
-    ) -> Result<Vec<ActionEffect>, ActionWorkLifecycleError> {
-        self.db
-            .list_claimable_action_work(namespace, runtime_id, now_ms, limit)
-            .map_err(ActionWorkLifecycleError::Internal)
-    }
-
     pub(crate) fn claim(
         &self,
         command: ClaimActionWork<'_>,

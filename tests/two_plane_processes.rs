@@ -82,6 +82,16 @@ fn seed_sekai(path: &Path) {
         .runtime()
         .create_principal_credential("operator", &hash_gateway_key(TOKEN), 1)
         .unwrap();
+    store
+        .runtime()
+        .create_grant(&sekai_chisei::sekai::security::Grant {
+            id: "plane-hop-action-reader".into(),
+            object_id: "action".into(),
+            principal: "operator".into(),
+            role: sekai_chisei::sekai::security::Role::Admin,
+            created: 1,
+        })
+        .unwrap();
 }
 
 fn spawn_plane(

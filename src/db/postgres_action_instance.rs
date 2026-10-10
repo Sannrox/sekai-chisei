@@ -72,33 +72,45 @@ impl PostgresDb {
         status: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ActionInstance>, String> {
+        self.list_action_instances_page(namespace, type_id, status, limit, 0)
+    }
+
+    pub fn list_action_instances_page(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ActionInstance>, String> {
         let limit = limit.clamp(1, 500) as i64;
+        let offset = i64::try_from(offset).map_err(|_| "action instance offset overflow")?;
         let type_filter = type_id.filter(|t| !t.trim().is_empty());
         let status_filter = status.filter(|s| !s.trim().is_empty());
         let rows = match (type_filter, status_filter) {
             (Some(type_id), Some(status)) => self.connection()?.query(
                 "SELECT body_json FROM sekai_action_instances
                  WHERE namespace = $1 AND type_id = $2 AND status = $3
-                 ORDER BY created_at_ms DESC LIMIT $4",
-                &[&namespace, &type_id, &status, &limit],
+                 ORDER BY created_at_ms DESC, instance_id DESC LIMIT $4 OFFSET $5",
+                &[&namespace, &type_id, &status, &limit, &offset],
             ),
             (Some(type_id), None) => self.connection()?.query(
                 "SELECT body_json FROM sekai_action_instances
                  WHERE namespace = $1 AND type_id = $2
-                 ORDER BY created_at_ms DESC LIMIT $3",
-                &[&namespace, &type_id, &limit],
+                 ORDER BY created_at_ms DESC, instance_id DESC LIMIT $3 OFFSET $4",
+                &[&namespace, &type_id, &limit, &offset],
             ),
             (None, Some(status)) => self.connection()?.query(
                 "SELECT body_json FROM sekai_action_instances
                  WHERE namespace = $1 AND status = $2
-                 ORDER BY created_at_ms DESC LIMIT $3",
-                &[&namespace, &status, &limit],
+                 ORDER BY created_at_ms DESC, instance_id DESC LIMIT $3 OFFSET $4",
+                &[&namespace, &status, &limit, &offset],
             ),
             (None, None) => self.connection()?.query(
                 "SELECT body_json FROM sekai_action_instances
                  WHERE namespace = $1
-                 ORDER BY created_at_ms DESC LIMIT $2",
-                &[&namespace, &limit],
+                 ORDER BY created_at_ms DESC, instance_id DESC LIMIT $2 OFFSET $3",
+                &[&namespace, &limit, &offset],
             ),
         }
         .map_err(|e| e.to_string())?;
