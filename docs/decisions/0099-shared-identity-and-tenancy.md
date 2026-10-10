@@ -1,6 +1,6 @@
 # ADR 0099: Shared identity and tenancy contract
 
-- Status: proposed
+- Status: accepted (effective on merge)
 - Date: 2026-10-10
 - Owners: @Sannrox
 - Source: [Issue #1397](https://github.com/Sannrox/sekai-chisei/issues/1397)
