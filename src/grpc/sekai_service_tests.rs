@@ -152,7 +152,7 @@ fn optional_ontology_revision_pin_is_absent_or_current() {
 }
 
 #[test]
-fn community_request_is_authorized_by_installed_enterprise_extension() {
+fn tenantless_context_is_rejected_by_installed_enterprise_extension() {
     let db = RuntimeDb::Sqlite(Arc::new(
         SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
             .unwrap(),
@@ -167,15 +167,72 @@ fn community_request_is_authorized_by_installed_enterprise_extension() {
             },
         ));
 
-    let context = request_tenant_context(&db, &request).unwrap().unwrap();
-    assert!(context.tenant.is_none());
-    assert!(enforce_namespace_tenant_context(&db, Some(&context), "community", true).is_ok());
     assert_eq!(
-        enforce_namespace_tenant_context(&db, Some(&context), "tenant-private", false)
-            .unwrap_err()
-            .code(),
-        tonic::Code::PermissionDenied
+        request_tenant_context(&db, &request).unwrap_err().code(),
+        tonic::Code::Unauthenticated
     );
+}
+
+#[test]
+fn enterprise_rejects_community_credentials_on_every_rpc() {
+    use tonic::service::Interceptor;
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    )));
+    db.create_principal_credential(
+        "machine-a",
+        &crate::gateway_keys::hash_gateway_key("machine-token"),
+        1,
+    )
+    .unwrap();
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::new(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        crate::db::store::SekaiStore::from_shared_runtime(db),
+    );
+    let mut local = crate::grpc::LocalOrTokenAuthInterceptor {
+        local: crate::grpc::LocalInterceptor::new(true),
+        token: interceptor.clone(),
+    };
+    for (service, protocol) in [
+        (
+            "sekai.SekaiService",
+            include_str!("../../proto/sekai.proto"),
+        ),
+        (
+            "chisei.ChiseiService",
+            include_str!("../../proto/chisei.proto"),
+        ),
+    ] {
+        for method in protocol.lines().filter_map(|line| {
+            line.trim()
+                .strip_prefix("rpc ")
+                .and_then(|rpc| rpc.split_once('(').map(|(name, _)| name.trim()))
+        }) {
+            let mut request = Request::new(());
+            request.metadata_mut().insert(
+                "authorization",
+                MetadataValue::from_static("Bearer machine-token"),
+            );
+            request
+                .extensions_mut()
+                .insert(tonic::GrpcMethod::new(service, method));
+            assert_eq!(
+                interceptor.call(request).unwrap_err().code(),
+                tonic::Code::Unauthenticated,
+                "{service}/{method}"
+            );
+            let mut request = Request::new(());
+            request
+                .extensions_mut()
+                .insert(tonic::GrpcMethod::new(service, method));
+            assert_eq!(
+                local.call(request).unwrap_err().code(),
+                tonic::Code::Unauthenticated,
+                "local {service}/{method}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -168,6 +168,12 @@ fn finish_authenticated(
     authenticated_context: crate::enterprise::AuthenticatedContext,
     enterprise_scoped: bool,
 ) -> Result<Request<()>, Status> {
+    if enterprise_scoped && authenticated_context.tenant.is_none() {
+        reject_unauthorized();
+        return Err(Status::unauthenticated(
+            "enterprise tenant context required",
+        ));
+    }
     authenticated_context
         .authorize_space(crate::enterprise::NamespaceAction::Read)
         .map_err(|_| Status::unauthenticated("invalid space authority"))?;
@@ -267,7 +273,8 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                             reject_unauthorized();
                             assertion_reject_status(reject)
                         })?;
-                    let enterprise_scoped = authenticated_context.tenant.is_some();
+                    let enterprise_scoped = self.db.runtime().enterprise_extension().is_some()
+                        || authenticated_context.tenant.is_some();
                     return finish_authenticated(req, authenticated_context, enterprise_scoped);
                 }
                 None if tenant_header.is_some() => {
@@ -307,7 +314,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                 }
                 (context, true)
             }
-            Some(Err(crate::enterprise::ExtensionError::CredentialNotFound)) | None => {
+            None => {
                 let credential = self.resolve_credential(&token).ok_or_else(|| {
                     reject_unauthorized();
                     Status::unauthenticated("invalid token")
@@ -419,7 +426,9 @@ struct LocalOrTokenAuthInterceptor {
 
 impl tonic::service::Interceptor for LocalOrTokenAuthInterceptor {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
-        if req.metadata().get("authorization").is_some() {
+        if req.metadata().get("authorization").is_some()
+            || self.token.db.runtime().enterprise_extension().is_some()
+        {
             self.token.call(req)
         } else {
             self.local.call(req)

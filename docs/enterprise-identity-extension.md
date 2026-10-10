@@ -19,6 +19,12 @@ lifecycle. Both produce the same internal context without making their issuance
 semantics interchangeable. Community principal credentials do not activate
 enterprise identity behavior.
 
+When an enterprise extension is installed, every authenticated context must
+include a tenant. Static community or gateway credentials are rejected until
+they are replaced or explicitly bound to a tenant by the extension.
+Single-tenant community installations without an extension retain their
+existing credential behavior.
+
 Implementations must validate state, nonce, exact redirect URI, issuer,
 audience/resource, PKCE, expiry, single-use authorization codes, credential
 revocation, current membership, and current tenant status on the relevant
@@ -69,6 +75,13 @@ traces, errors, or diagnostics. Stable opaque credential identifiers may be
 used for attribution and revocation checks.
 
 ## Compatibility
+
+GATE:mig: before adopting tenant-required authentication, bind each service
+credential to a tenant in extension-owned storage and update clients to use
+that credential. Tenant-less assertions must likewise be reissued with a
+validated tenant. Community credential storage is not a fallback when the
+extension cannot authenticate a token. No graph or protocol migration is
+required.
 
 GATE:break: `v2` changes the Rust context shape. Extension implementations must
 populate the optional fields and advertise `sekai.identity-extension/v2`.
