@@ -269,6 +269,28 @@ impl ChiseiServiceImpl {
             context.as_ref(),
             &input.namespace,
         )?;
+        match crate::sekai::delegating_principal::revalidate_planning_delegator_at_apply(
+            self.db.runtime(),
+            &execution.plan_id,
+            &input.namespace,
+        ) {
+            Ok(()) => {}
+            Err(crate::sekai::delegating_principal::DelegatorApplyError::Refused(reason)) => {
+                {
+                    let mut plans = self
+                        .planned_content_executions
+                        .lock()
+                        .expect("planned content executions poisoned");
+                    plans.remove(requested_plan_id);
+                }
+                record_failed_operation_on(self.db.runtime(), &execution, &actor, reason.as_str())
+                    .map_err(Status::internal)?;
+                return Err(Status::failed_precondition(reason.as_str()));
+            }
+            Err(crate::sekai::delegating_principal::DelegatorApplyError::Internal(error)) => {
+                return Err(Status::internal(error));
+            }
+        }
         let domain_messages = resolve_content_messages(&plan, resolved_parts)?;
 
         let namespace = input.namespace.trim().to_string();
