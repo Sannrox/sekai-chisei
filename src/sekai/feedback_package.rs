@@ -539,6 +539,7 @@ mod tests {
             ontology_digest: ONTOLOGY_DIGEST.into(),
             autonomous_envelope_id: String::new(),
             policy_context: PrincipalPolicyContext::default(),
+            delegating_actor: None,
             budget_already_reserved: false,
         }
     }

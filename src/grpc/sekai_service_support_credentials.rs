@@ -459,6 +459,15 @@ pub(super) fn enforce_namespace_tenant_context(
     namespace: &str,
     write: bool,
 ) -> Result<(), Status> {
+    if let Some(context) = tenant_context {
+        context
+            .authorize_space(if write {
+                crate::enterprise::NamespaceAction::Write
+            } else {
+                crate::enterprise::NamespaceAction::Read
+            })
+            .map_err(extension_status)?;
+    }
     let Some(extension) = db.enterprise_extension() else {
         return Ok(());
     };

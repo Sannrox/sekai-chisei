@@ -2448,6 +2448,7 @@ mod tests {
                 type_id: "type-1043".into(),
                 version: "1".into(),
                 principal: "root".into(),
+                delegating_actor: None,
                 parameters_json: "{}".into(),
                 request_digest: format!("digest-{instance_id}"),
                 idempotency_key: format!("idem-{instance_id}"),

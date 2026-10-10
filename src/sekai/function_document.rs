@@ -454,6 +454,7 @@ fn park_extraction(
                 ontology_digest: action.ontology_digest.clone(),
                 autonomous_envelope_id: String::new(),
                 policy_context: PrincipalPolicyContext::default(),
+                delegating_actor: None,
                 budget_already_reserved: false,
             },
             actor,

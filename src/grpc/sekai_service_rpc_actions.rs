@@ -179,6 +179,9 @@ pub(super) async fn submit_action_instance(
         ontology_digest: inner.ontology_digest,
         autonomous_envelope_id: String::new(),
         policy_context,
+        delegating_actor: tenant_context
+            .as_ref()
+            .and_then(|context| context.act.clone()),
         budget_already_reserved: false,
     };
     let outcome = span.in_scope(|| {
@@ -223,6 +226,11 @@ pub(super) async fn decide_action_instance(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    if let Some(context) = tenant_context.as_ref() {
+        context
+            .authorize_space_approval()
+            .map_err(extension_status)?;
+    }
     let access_denied = || Status::permission_denied(DECISION_ACCESS_DENIED);
     // An approval binds to one credentialed subject (#1140). Self-asserted
     // identities from the local or insecure transport, comma-listed
@@ -240,7 +248,7 @@ pub(super) async fn decide_action_instance(
         service.db.runtime(),
         tenant_context.as_ref(),
         &instance.namespace,
-        true,
+        false,
     )
     .map_err(|_| access_denied())?;
     // ADR 0089: a named approver decides on authentication, tenant, and

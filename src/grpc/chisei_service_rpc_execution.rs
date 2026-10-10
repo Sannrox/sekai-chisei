@@ -105,7 +105,12 @@ pub(super) async fn plan_execution(
                 .map_err(Status::internal)?;
         }
         service
-            .record_planned_operation_with_routing(&plan, &actor, !pinned.is_empty())
+            .record_planned_operation_with_identity(
+                &plan,
+                &actor,
+                !pinned.is_empty(),
+                context.as_ref(),
+            )
             .map_err(Status::internal)?;
         service.cache_plan_for_enterprise_authority(
             plan.clone(),
@@ -249,7 +254,7 @@ pub(super) async fn plan_content_execution(
                 .map_err(Status::internal)?;
         }
         service
-            .record_planned_operation(execution_plan, &actor)
+            .record_planned_operation_with_identity(execution_plan, &actor, false, context.as_ref())
             .map_err(Status::internal)?;
         service.cache_content_plan(
             plan.clone(),

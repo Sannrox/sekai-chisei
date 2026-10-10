@@ -178,6 +178,9 @@ impl EnterpriseExtension for FakeIdentityExtension {
                 credential_id: "credential-1".into(),
             },
             credential_kind: CredentialKind::HumanSession,
+            space: None,
+            space_role: None,
+            act: None,
             tenant: Some(TenantContext {
                 tenant_id: "tenant-1".into(),
                 subject: "human:alice".into(),

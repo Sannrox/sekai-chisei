@@ -411,6 +411,7 @@ mod tests {
             ontology_digest: String::new(),
             autonomous_envelope_id: String::new(),
             policy_context: Default::default(),
+            delegating_actor: None,
             budget_already_reserved: false,
         }
     }

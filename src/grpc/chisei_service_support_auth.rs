@@ -736,6 +736,9 @@ pub(super) fn require_execution_namespace_access_with_context(
     namespace: &str,
 ) -> Result<(), Status> {
     if let Some(context) = context {
+        context
+            .authorize_space(crate::enterprise::NamespaceAction::Write)
+            .map_err(enterprise_execution_status)?;
         let scope_permitted = match context.credential_kind {
             crate::enterprise::CredentialKind::Machine => context
                 .scopes

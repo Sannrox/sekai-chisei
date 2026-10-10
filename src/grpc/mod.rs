@@ -168,6 +168,35 @@ fn finish_authenticated(
     authenticated_context: crate::enterprise::AuthenticatedContext,
     enterprise_scoped: bool,
 ) -> Result<Request<()>, Status> {
+    authenticated_context
+        .authorize_space(crate::enterprise::NamespaceAction::Read)
+        .map_err(|_| Status::unauthenticated("invalid space authority"))?;
+    if let Some((_, method)) = rpc_identity::request_rpc_method(&req) {
+        if method == "DecideActionInstance" {
+            authenticated_context
+                .authorize_space_approval()
+                .map_err(|_| Status::permission_denied("space approval denied"))?;
+        } else if crate::store_relocate::is_mutating_rpc(method)
+            && !matches!(
+                method,
+                "FindByExternalId"
+                    | "FindByProperty"
+                    | "Traverse"
+                    | "QueryRows"
+                    | "ResolveInvariantSet"
+                    | "RetrieveContext"
+                    | "DiscoverCapabilities"
+            )
+        {
+            authenticated_context
+                .authorize_space(crate::enterprise::NamespaceAction::Write)
+                .map_err(|_| Status::permission_denied("space write denied"))?;
+        }
+    } else if authenticated_context.space.is_some() {
+        return Err(Status::permission_denied(
+            "space-scoped RPC identity required",
+        ));
+    }
     let principal = authenticated_context.principal.subject.clone();
     let credential_id = authenticated_context.principal.credential_id.clone();
     if !valid_single_principal(&principal) {
@@ -349,6 +378,13 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ApplyDefinitionBranchEdit"
             | "GetGovernedFactVersion"
             | "ResolveInvariantSet"
+            | "SubmitActionInstance"
+            | "DecideActionInstance"
+            | "GetActionInstance"
+            | "ListActionInstances"
+            | "GetActionEffect"
+            | "ListActionEffects"
+            | "ListClaimableActionWork"
             | "PlanExecution"
             | "ExecutePlanStream"
             | "PlanContentExecution"
@@ -1340,6 +1376,9 @@ mod tests {
             subject: "subject-a".into(),
             credential_id: "credential-a".into(),
             credential_kind: "human_session".into(),
+            space: None,
+            space_role: None,
+            act: None,
             tenant_id: None,
             scopes: vec!["sekai.read".into(), "sekai.write".into()],
             expires_at,
@@ -1364,6 +1403,51 @@ mod tests {
             MetadataValue::try_from(format!("Bearer {token}")).expect("bearer metadata"),
         );
         request
+    }
+
+    #[test]
+    fn signed_space_roles_constrain_mutations_and_approval_rpc() {
+        use crate::enterprise::SpaceRole;
+        for (role, method, allowed) in [
+            (SpaceRole::Viewer, "CreateObject", false),
+            (SpaceRole::Viewer, "GetObject", true),
+            (SpaceRole::Editor, "CreateObject", true),
+            (SpaceRole::Editor, "DecideActionInstance", false),
+            (SpaceRole::Approver, "DecideActionInstance", true),
+            (SpaceRole::Approver, "CreateObject", false),
+            (SpaceRole::Administrator, "CreateObject", true),
+        ] {
+            let authority = test_assertion_authority();
+            let mut claims = test_assertion_claims(
+                &uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now().timestamp() + 60,
+            );
+            claims.tenant_id = Some("tenant-test".into());
+            claims.space = Some("space-a".into());
+            claims.space_role = Some(role);
+            claims.act = Some("origin-user".into());
+            let token = authority.sign(&claims).unwrap();
+            let mut interceptor = interceptor_with_authority(authority);
+            let mut request = bearer_request(&token);
+            request
+                .extensions_mut()
+                .insert(tonic::GrpcMethod::new("sekai.SekaiService", method));
+            let result = interceptor.call(request);
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "{role:?} {method}: {:?}",
+                result.as_ref().err()
+            );
+            if let Ok(request) = result {
+                let context = request
+                    .extensions()
+                    .get::<crate::enterprise::AuthenticatedContext>()
+                    .unwrap();
+                assert_eq!(context.principal.subject, "subject-a");
+                assert_eq!(context.act.as_deref(), Some("origin-user"));
+            }
+        }
     }
 
     #[test]
@@ -1538,6 +1622,9 @@ mod tests {
                     tenant: Some(self.tenant_context(&principal)?),
                     principal,
                     credential_kind: crate::enterprise::CredentialKind::HumanSession,
+                    space: None,
+                    space_role: None,
+                    act: None,
                     scopes: vec!["sekai.read".into()],
                     issuer: "https://issuer.test".into(),
                     resource: "https://sekai.test".into(),

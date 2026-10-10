@@ -1,6 +1,6 @@
 # Enterprise identity extension contract
 
-The public crate defines `sekai.identity-extension/v1` as a backend-neutral
+The public crate defines `sekai.identity-extension/v2` as a backend-neutral
 composition boundary. It is an interface for a separately distributed identity
 implementation, not an OAuth or OpenID Connect server in the community binary.
 
@@ -8,7 +8,7 @@ implementation, not an OAuth or OpenID Connect server in the community binary.
 
 An extension validates a human session or access credential and returns one
 `AuthenticatedContext`. The context binds the principal, credential kind,
-optional tenant, scopes, issuer, protected resource, and expiry. HTTP and gRPC
+optional tenant, space, space role, delegating actor (`act`), scopes, issuer, protected resource, and expiry. HTTP and gRPC
 normalize authenticated callers to this type. Caller-provided principal or
 tenant headers are removed or ignored and cannot select authority.
 
@@ -37,6 +37,21 @@ enterprise plans remain bound to the authenticated tenant (or to the
 credential for an unscoped enterprise context), in addition to the principal
 subject.
 
+## Space roles and delegation
+
+A signed assertion may carry `space`, `space_role`, and `act`. Absent space
+keeps the existing tenant and namespace authorization path. A role requires a
+non-empty space; a space requires a role. Roles constrain existing grants:
+viewer permits reads, editor permits writes, approver permits approval, and
+administrator permits all three. A role does not grant object or namespace
+access on its own. Unknown roles and incomplete space authority fail closed.
+
+`act` names one originating actor, distinct from the authenticated subject.
+It is attribution, never an additional policy principal or a replacement for
+the credential subject. Action admission receipts and audit evidence retain
+`act`; model planning receipts retain `act`, space, and role. No bearer secret
+is retained. Revalidating delegation at apply and claim remains #1402.
+
 ## Discovery metadata
 
 The contract can describe RFC 8414 authorization-server metadata and RFC 9728
@@ -55,9 +70,15 @@ used for attribution and revocation checks.
 
 ## Compatibility
 
-Adopting `v1` requires an implementation to provide `authenticate_context`;
+GATE:break: `v2` changes the Rust context shape. Extension implementations must
+populate the optional fields and advertise `sekai.identity-extension/v2`.
+Older extension versions fail closed. The existing assertion wire version
+accepts optional fields additively; assertions without them keep their prior
+behavior. No protocol field numbers change.
+
+Adopting the context contract requires an implementation to provide `authenticate_context`;
 there is no compatibility adapter that guesses scopes or expiry from the older
-principal-only hook. Adding optional methods within `v1` is allowed when their
+principal-only hook. Adding optional methods within `v2` is allowed when their
 default is fail-closed/unavailable. Changing field meaning, validation
 requirements, or authority derivation requires a new contract version. The community SQLite
 runtime installs no extension, stores no enterprise sessions or OAuth state,

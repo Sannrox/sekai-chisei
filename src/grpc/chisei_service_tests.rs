@@ -1582,6 +1582,9 @@ fn managed_execution_context_for_tenant(
             credential_id: "credential:managed-shikigami".into(),
         },
         credential_kind: crate::enterprise::CredentialKind::Machine,
+        space: None,
+        space_role: None,
+        act: None,
         tenant: Some(crate::enterprise::TenantContext {
             tenant_id: tenant_id.into(),
             subject: "service:managed-shikigami".into(),
@@ -7332,7 +7335,8 @@ fn planned_receipt_pins_external_evidence_and_memory_provenance() {
         ..Default::default()
     };
 
-    svc.record_planned_operation(&plan, "agent:test").unwrap();
+    svc.record_planned_operation_with_identity(&plan, "agent:test", false, None)
+        .unwrap();
     let receipt = svc
         .db
         .get_operation_receipt(&plan.plan_id)
@@ -10219,7 +10223,8 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
         context_truncated: false,
         ..Default::default()
     };
-    svc.record_planned_operation(&plan, "local").unwrap();
+    svc.record_planned_operation_with_identity(&plan, "local", false, None)
+        .unwrap();
     svc.cache_plan(plan.clone());
 
     let mut request = Request::new(ExecutePlanRequest {
@@ -10305,7 +10310,7 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
         .as_mut()
         .expect("plan input")
         .request_id = "lookup-regressed-req".into();
-    svc.record_planned_operation(&regressed_plan, "local")
+    svc.record_planned_operation_with_identity(&regressed_plan, "local", false, None)
         .unwrap();
     svc.cache_plan(regressed_plan.clone());
 

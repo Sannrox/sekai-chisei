@@ -29,6 +29,8 @@ pub struct ActionInstance {
     pub type_id: String,
     pub version: String,
     pub principal: String,
+    #[serde(default)]
+    pub delegating_actor: Option<String>,
     /// JSON object. Untrusted user/producer content — never treated as instructions.
     pub parameters_json: String,
     pub request_digest: String,
@@ -637,6 +639,7 @@ mod tests {
             type_id: "review.intake".into(),
             version: "1.0.0".into(),
             principal: "tester".into(),
+            delegating_actor: None,
             parameters_json: r#"{"summary":"hello"}"#.into(),
             request_digest: compute_request_digest(
                 "acme",
