@@ -91,7 +91,11 @@ impl AssertionAuthority {
             audience: audience.into(),
             key: key.into(),
             clock_skew_secs: DEFAULT_SKEW_SECS,
-            allowed_scopes: BTreeSet::from(["sekai.read".into(), "sekai.write".into()]),
+            allowed_scopes: BTreeSet::from([
+                "sekai.discover".into(),
+                "sekai.read".into(),
+                "sekai.write".into(),
+            ]),
             replayed: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -187,7 +191,7 @@ impl AssertionAuthority {
             expires_at: assertion.expires_at,
         };
         context
-            .authorize_space(crate::enterprise::NamespaceAction::Read)
+            .authorize_space(crate::enterprise::NamespaceAction::Discover)
             .map_err(|_| AssertionReject::ScopeEscalation)?;
         Ok(context)
     }
@@ -252,6 +256,29 @@ mod tests {
             Some("tenant-test")
         );
         assert_eq!(context.contract_version, IDENTITY_EXTENSION_VERSION);
+    }
+
+    #[test]
+    fn discoverer_assertion_verifies_below_read() {
+        let authority = authority();
+        let mut claims = claims(&uuid::Uuid::new_v4().to_string(), 100);
+        claims.space = Some("space-a".into());
+        claims.space_role = Some(SpaceRole::Discoverer);
+        claims.act = Some("origin-user".into());
+        claims.scopes = vec!["sekai.discover".into()];
+        let token = authority.sign(&claims).unwrap();
+        let context = authority.verify(&token, 50, None).unwrap();
+        assert_eq!(context.space_role, Some(SpaceRole::Discoverer));
+        assert!(
+            context
+                .authorize_space(crate::enterprise::NamespaceAction::Discover)
+                .is_ok()
+        );
+        assert!(
+            context
+                .authorize_space(crate::enterprise::NamespaceAction::Read)
+                .is_err()
+        );
     }
 
     #[test]

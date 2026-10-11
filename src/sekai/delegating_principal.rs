@@ -62,7 +62,7 @@ pub(crate) fn current_delegating_principal_state(
             .any(|credential| credential.status == "active");
     let tenant_member = principal_can_access_namespace(db, principal, namespace)?;
     let holds_needed_grant = match needed {
-        NamespaceAction::Read => tenant_member,
+        NamespaceAction::Discover | NamespaceAction::Read => tenant_member,
         NamespaceAction::Write => principal_can_write_namespace(db, principal, namespace)?,
     };
     Ok(DelegatingPrincipalState {

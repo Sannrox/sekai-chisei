@@ -373,23 +373,185 @@ pub(super) fn load_classification_lattice(
     db.get_classification_lattice(namespace)
         .map_err(|_| Status::unavailable("classification lattice unavailable"))
 }
+pub(super) fn catalog_object_passes_marking(
+    db: &RuntimeDb,
+    object_id: &str,
+    principals: &[String],
+) -> Result<bool, Status> {
+    if object_id.is_empty() {
+        return Ok(true);
+    }
+    match db.get_object(object_id).map_err(Status::internal)? {
+        Some(object) => object_passes_marking(db, &object, principals),
+        None => Ok(true),
+    }
+}
+
+pub(super) fn scoped_catalog_context(tenant_context: Option<&RequestEnterpriseContext>) -> bool {
+    tenant_context.is_some_and(|context| context.tenant.is_some() || context.space.is_some())
+}
+
+pub(super) fn catalog_actor_subject(
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Option<&String> {
+    let context = tenant_context?;
+    let actor = context.act.as_ref().filter(|actor| !actor.is_empty())?;
+    (actor != &context.principal.subject).then_some(actor)
+}
+
+pub(super) fn catalog_subjects_pass_marking(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object_id: &str,
+    principals: &[String],
+) -> bool {
+    if !catalog_object_passes_marking(db, object_id, principals).unwrap_or(false) {
+        return false;
+    }
+    match catalog_actor_subject(tenant_context) {
+        Some(actor) => catalog_object_passes_marking(db, object_id, std::slice::from_ref(actor))
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+pub(super) fn catalog_binding_discoverable(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object_id: &str,
+    principals: &[String],
+) -> bool {
+    if object_id.is_empty() {
+        return !scoped_catalog_context(tenant_context);
+    }
+    if !catalog_subjects_pass_marking(db, tenant_context, object_id, principals) {
+        return false;
+    }
+    if !catalog_actor_passes_acl(security, tenant_context, object_id) {
+        return false;
+    }
+    match db.get_object(object_id) {
+        Ok(Some(object)) => {
+            enforce_namespace_tenant_context_for(
+                db,
+                tenant_context,
+                &object.namespace,
+                crate::enterprise::NamespaceAction::Discover,
+            )
+            .is_ok()
+                && catalog_object_policy_visible(db, &object, principals, tenant_context)
+        }
+        Ok(None) => !scoped_catalog_context(tenant_context),
+        Err(_) => false,
+    }
+}
+
+pub(super) fn catalog_actor_passes_acl(
+    security: &SecurityChecker,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object_id: &str,
+) -> bool {
+    catalog_actor_subject(tenant_context)
+        .is_none_or(|actor| check_read(security, object_id, std::slice::from_ref(actor)).is_ok())
+}
+
+/// Catalog listings hide a bound object when its object policy denies
+/// visibility or cannot be evaluated.
+pub(super) fn catalog_object_policy_visible(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> bool {
+    match evaluate_active_object_policy(
+        db,
+        object,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+        None,
+    ) {
+        Ok(Some(false)) | Err(_) => false,
+        Ok(_) => true,
+    }
+}
+
 pub(super) fn object_passes_marking(
     db: &RuntimeDb,
     object: &domain::Object,
     principals: &[String],
 ) -> Result<bool, Status> {
+    Ok(
+        evaluate_object_marking(db, object, principals, "visibility")?.decision
+            != markings::MarkingDecision::Deny,
+    )
+}
+
+fn namespace_object(db: &RuntimeDb, namespace: &str) -> Result<Option<domain::Object>, Status> {
+    db.find_by_external_id(&format!("namespace:{namespace}"))
+        .map_err(Status::internal)
+}
+
+fn deny_unmarked_for_namespace(db: &RuntimeDb, namespace: &str) -> Result<bool, Status> {
+    Ok(markings::deny_unmarked_enabled(
+        markings::env_deny_unmarked(),
+        markings::namespace_deny_unmarked(namespace_object(db, namespace)?.as_ref()),
+    ))
+}
+
+fn principal_has_explicit_object_grant(
+    db: &RuntimeDb,
+    object_id: &str,
+    principals: &[String],
+) -> Result<bool, Status> {
+    let grants = db.list_grants(object_id).map_err(Status::internal)?;
+    if grants.is_empty() {
+        return Ok(false);
+    }
+    Ok(grants
+        .iter()
+        .any(|grant| principals.contains(&grant.principal)))
+}
+
+fn evaluate_object_marking(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    operation_id: &str,
+) -> Result<markings::MarkingCheckResult, Status> {
     if markings::object_marking_token(object).is_none() {
-        return Ok(true);
+        let deny_unmarked = deny_unmarked_for_namespace(db, &object.namespace)?;
+        let trusted = principals
+            .iter()
+            .any(|principal| markings::is_trusted_service_principal(principal));
+        let explicit_grant = principal_has_explicit_object_grant(db, &object.id, principals)?;
+        let decision_id = format!(
+            "marking:{operation_id}:{}",
+            uuid::Uuid::new_v4().as_simple()
+        );
+        return Ok(markings::MarkingCheckResult {
+            decision: markings::unmarked_access_decision(deny_unmarked, trusted, explicit_grant),
+            decision_id,
+            object_classification: None,
+            principal_ceiling: None,
+            detail: if deny_unmarked {
+                "deny_unmarked hides unmarked objects without an explicit grant".into()
+            } else {
+                "object has no classification marking".into()
+            },
+        });
     }
     let lattice = load_classification_lattice(db, &object.namespace)?;
     let authority = resolve_principal_authority(db, principals)?;
-    let result = crate::sekai::classification_lattice::evaluate_lattice_access(
-        "visibility",
-        markings::object_marking_token(object),
-        &authority,
-        lattice.as_ref(),
-    );
-    Ok(result.decision != markings::MarkingDecision::Deny)
+    Ok(
+        crate::sekai::classification_lattice::evaluate_lattice_access(
+            operation_id,
+            markings::object_marking_token(object),
+            &authority,
+            lattice.as_ref(),
+        ),
+    )
 }
 pub(super) fn object_is_visible(
     db: &RuntimeDb,
@@ -419,6 +581,7 @@ pub(super) fn object_is_visible_for(
         && check_team_namespace(db, principals, &object.namespace, false).is_ok()
         && enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
         && check_read(security, &object.id, principals).is_ok()
+        && object_passes_marking(db, object, principals).unwrap_or(false)
         && object_passes_security_policy(db, object, principals, tenant_context, operation, None)
             .unwrap_or(false)
 }
@@ -739,11 +902,36 @@ pub(super) fn require_visible_read_root(
     operation_id: &str,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
+    enforce_namespace_tenant_context_for(
+        db,
+        tenant_context,
+        &object.namespace,
+        crate::enterprise::NamespaceAction::Read,
+    )
+    .map_err(hide_read_root_as_missing)?;
+    require_visible_object_contents(
+        db,
+        security,
+        object,
+        principals,
+        tenant_context,
+        operation_id,
+        purpose,
+    )
+}
+
+pub(super) fn require_visible_object_contents(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation_id: &str,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
     if is_reserved_governance_kind(&object.kind) {
         return Err(Status::not_found("not found"));
     }
-    enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false)
-        .map_err(hide_read_root_as_missing)?;
     check_team_namespace(db, principals, &object.namespace, false)?;
     check_object_acl_with_audit(
         db,
@@ -904,6 +1092,9 @@ where
         }
         let page_len = page.len() as i32;
         for object in page {
+            if !object_passes_marking(db, &object, principals)? {
+                continue;
+            }
             if !object_passes_security_policy(
                 db,
                 &object,
@@ -966,26 +1157,7 @@ pub(super) fn enforce_object_marking_access(
     principals: &[String],
     operation_id: &str,
 ) -> Result<markings::MarkingCheckResult, Status> {
-    if markings::object_marking_token(object).is_none() {
-        return Ok(markings::MarkingCheckResult {
-            decision: markings::MarkingDecision::NotApplicable,
-            decision_id: format!(
-                "marking:{operation_id}:{}",
-                uuid::Uuid::new_v4().as_simple()
-            ),
-            object_classification: None,
-            principal_ceiling: None,
-            detail: "object has no classification marking".into(),
-        });
-    }
-    let lattice = load_classification_lattice(db, &object.namespace)?;
-    let authority = resolve_principal_authority(db, principals)?;
-    let result = crate::sekai::classification_lattice::evaluate_lattice_access(
-        operation_id,
-        markings::object_marking_token(object),
-        &authority,
-        lattice.as_ref(),
-    );
+    let result = evaluate_object_marking(db, object, principals, operation_id)?;
     if result.decision == markings::MarkingDecision::Deny {
         // Generic denial — do not leak marking details to unauthorized callers.
         return Err(Status::permission_denied("access denied"));

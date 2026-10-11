@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Optional `deny_unmarked` hides unmarked objects unless the caller is a
+  trusted service or holds an explicit object ACL grant. Default stays
+  fail-open. Enable with namespace property `deny_unmarked=true` or
+  `SEKAI_DENY_UNMARKED=1`. `sekaictl admin access unmarked list|apply`
+  reports unmarked objects per namespace and can write a default marking
+  (`GATE:mig`, #1399).
+- Policy understands a discover permission below read. Discoverer space
+  roles and human `sekai.discover` list and describe namespaces, object
+  types, and datasets (filtered by marking ceiling and object policy) and
+  are refused for object reads, queries, aggregates, and counts. Credential
+  scopes apply with or without an installed enterprise extension (#1405).
 - An LLM function may bind a governed document `extracted_text` rendition.
   Caller-held text must match the pinned digest. Produced objects inherit
   the document classification and carry `derived_from` lineage to a

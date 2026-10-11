@@ -775,11 +775,16 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
         assertion.scopes = scopes;
         assertion.tenant_id = Some(tenant.into());
         let token = authority.sign(&assertion).unwrap();
-        let authenticated = interceptor
-            .call(request(&token, "GetPublishedDefinitionRevision"))
-            .unwrap();
+        let authenticated = interceptor.call(request(&token, "GetPublishedDefinitionRevision"));
+        if nonce == "missing-scope" {
+            assert_eq!(
+                authenticated.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+            continue;
+        }
         assert_eq!(
-            svc.get_published_definition_revision(read(authenticated, namespace))
+            svc.get_published_definition_revision(read(authenticated.unwrap(), namespace))
                 .await
                 .unwrap_err()
                 .code(),
@@ -2585,6 +2590,164 @@ fn read_root_hides_denials_and_preserves_outages() {
 }
 
 #[tokio::test]
+async fn deny_unmarked_denies_unmarked_reads_and_keeps_marked_rules() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "namespace-ns".into(),
+            kind: "namespace".into(),
+            name: "ns".into(),
+            namespace: "ns".into(),
+            external_id: "namespace:ns".into(),
+            properties: HashMap::from([(markings::DENY_UNMARKED_PROPERTY.into(), "true".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "unmarked-open".into(),
+            kind: "artifact".into(),
+            name: "open".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:unmarked-open".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "unmarked-granted".into(),
+            kind: "artifact".into(),
+            name: "granted".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:unmarked-granted".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    grant_object_role(&svc, "unmarked-granted", "alice", security::Role::Viewer);
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "marked-confidential".into(),
+            kind: "artifact".into(),
+            name: "secret".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:marked-confidential".into(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+
+    let unmarked_denied = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "unmarked-open".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(unmarked_denied.code(), tonic::Code::PermissionDenied);
+
+    let granted = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "unmarked-granted".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(granted.object.unwrap().id, "unmarked-granted");
+
+    let marked_denied = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "marked-confidential".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(marked_denied.code(), tonic::Code::PermissionDenied);
+
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "principal-alice-deny-unmarked".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "alice".into(),
+            namespace: "ns".into(),
+            external_id: markings::principal_profile_external_id("alice"),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    grant_object_role(
+        &svc,
+        "principal-alice-deny-unmarked",
+        "root",
+        security::Role::Admin,
+    );
+    let marked_allowed = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "marked-confidential".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(marked_allowed.object.unwrap().id, "marked-confidential");
+
+    let listed = svc
+        .list_objects(with_named_principal(
+            ListObjectsRequest {
+                filter: Some(ListFilter {
+                    namespace: "ns".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let listed_ids: Vec<&str> = listed
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect();
+    assert!(!listed_ids.contains(&"unmarked-open"));
+    assert!(listed_ids.contains(&"unmarked-granted"));
+    assert!(listed_ids.contains(&"marked-confidential"));
+}
+
+#[tokio::test]
 async fn activated_get_object_hides_acl_and_marking_denials_as_missing() {
     for (id, namespace, properties, acl_denied) in [
         (
@@ -3601,6 +3764,492 @@ async fn dataset_rpc_round_trip() {
         .unwrap()
         .into_inner();
     assert_eq!(queried.rows.len(), 1);
+}
+
+#[tokio::test]
+async fn list_datasets_omits_bindings_above_marking_ceiling() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "marked-dataset-object".into(),
+            kind: "artifact".into(),
+            name: "secret-metrics".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:marked-dataset".into(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&dataset::Dataset {
+            id: "marked-ds".into(),
+            name: "secret-metrics".into(),
+            columns: vec![],
+            object_id: "marked-dataset-object".into(),
+            created: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&dataset::Dataset {
+            id: "open-ds".into(),
+            name: "open-metrics".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+    let denied = svc
+        .list_datasets(with_named_principal(ListDatasetsRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    let denied_ids: Vec<&str> = denied
+        .datasets
+        .iter()
+        .map(|dataset| dataset.id.as_str())
+        .collect();
+    assert!(denied_ids.contains(&"open-ds"));
+    assert!(!denied_ids.contains(&"marked-ds"));
+
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "principal-alice-dataset".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "alice".into(),
+            namespace: "ns".into(),
+            external_id: markings::principal_profile_external_id("alice"),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    grant_object_role(
+        &svc,
+        "principal-alice-dataset",
+        "root",
+        security::Role::Admin,
+    );
+    let allowed = svc
+        .list_datasets(with_named_principal(ListDatasetsRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    let allowed_ids: Vec<&str> = allowed
+        .datasets
+        .iter()
+        .map(|dataset| dataset.id.as_str())
+        .collect();
+    assert!(allowed_ids.contains(&"open-ds"));
+    assert!(allowed_ids.contains(&"marked-ds"));
+}
+
+#[tokio::test]
+async fn list_schema_types_omits_marked_catalog_objects_above_ceiling() {
+    let svc = service();
+    grant_schema_admin(&svc);
+    svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+        r#type: Some(widget_schema_type()),
+    }))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: schema_object_id("widget"),
+            kind: "schema_type".into(),
+            name: "widget".into(),
+            namespace: "ns".into(),
+            external_id: "schema:widget".into(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let denied = svc
+        .list_schema_types(with_named_principal(ListSchemaTypesRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !denied
+            .types
+            .iter()
+            .any(|object_type| object_type.kind == "widget")
+    );
+
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "principal-alice-schema".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "alice".into(),
+            namespace: "ns".into(),
+            external_id: markings::principal_profile_external_id("alice"),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    grant_object_role(
+        &svc,
+        "principal-alice-schema",
+        "root",
+        security::Role::Admin,
+    );
+    let allowed = svc
+        .list_schema_types(with_named_principal(ListSchemaTypesRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        allowed
+            .types
+            .iter()
+            .any(|object_type| object_type.kind == "widget")
+    );
+}
+
+#[tokio::test]
+async fn catalog_listings_omit_bindings_when_object_policy_cannot_be_evaluated() {
+    let svc = service();
+    grant_schema_admin(&svc);
+    svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+        r#type: Some(widget_schema_type()),
+    }))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: schema_object_id("widget"),
+            kind: "schema_type".into(),
+            name: "widget".into(),
+            namespace: "ns".into(),
+            external_id: "schema:widget".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "policy-outage-object".into(),
+            kind: "artifact".into(),
+            name: "metrics".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:policy-outage".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&dataset::Dataset {
+            id: "policy-outage-ds".into(),
+            name: "metrics".into(),
+            columns: vec![],
+            object_id: "policy-outage-object".into(),
+            created: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&dataset::Dataset {
+            id: "unbound-ds".into(),
+            name: "global".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .conn()
+        .execute(
+            "INSERT INTO sekai_classification_lattices
+             (namespace, contract_version, digest, lattice_json, created_by, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            ("ns", "v1", "stale", "{", "root", 1_i64),
+        )
+        .unwrap();
+
+    let datasets = svc
+        .list_datasets(with_named_principal(ListDatasetsRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    let dataset_ids: Vec<&str> = datasets
+        .datasets
+        .iter()
+        .map(|dataset| dataset.id.as_str())
+        .collect();
+    assert!(dataset_ids.contains(&"unbound-ds"));
+    assert!(!dataset_ids.contains(&"policy-outage-ds"));
+
+    let types = svc
+        .list_schema_types(with_named_principal(ListSchemaTypesRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !types
+            .types
+            .iter()
+            .any(|object_type| object_type.kind == "widget")
+    );
+    assert!(
+        types
+            .types
+            .iter()
+            .any(|object_type| object_type.kind == "namespace")
+    );
+}
+
+fn discoverer_context(subject: &str) -> crate::enterprise::AuthenticatedContext {
+    crate::enterprise::AuthenticatedContext {
+        contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+        principal: crate::enterprise::AuthenticatedPrincipal {
+            subject: subject.into(),
+            credential_id: "credential-a".into(),
+        },
+        credential_kind: crate::enterprise::CredentialKind::HumanSession,
+        tenant: Some(crate::enterprise::TenantContext {
+            tenant_id: "tenant-test".into(),
+            subject: subject.into(),
+        }),
+        space: Some("space-a".into()),
+        space_role: Some(crate::enterprise::SpaceRole::Discoverer),
+        act: Some("origin-user".into()),
+        scopes: vec!["sekai.discover".into()],
+        issuer: "https://issuer.test".into(),
+        resource: "https://sekai.test".into(),
+        expires_at: i64::MAX,
+    }
+}
+
+fn with_discoverer<T>(payload: T, subject: &str) -> Request<T> {
+    let mut req = with_named_principal(payload, subject);
+    req.extensions_mut().insert(discoverer_context(subject));
+    req
+}
+
+#[tokio::test]
+async fn discoverer_lists_catalog_and_is_denied_object_reads() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "catalog-bound".into(),
+            kind: "artifact".into(),
+            name: "metrics".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:catalog-bound".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&dataset::Dataset {
+            id: "bound-ds".into(),
+            name: "metrics".into(),
+            columns: vec![],
+            object_id: "catalog-bound".into(),
+            created: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&dataset::Dataset {
+            id: "unbound-ds".into(),
+            name: "global".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+
+    let listed = svc
+        .list_schema_types(with_discoverer(ListSchemaTypesRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        listed
+            .types
+            .iter()
+            .any(|object_type| object_type.kind == "namespace")
+    );
+
+    let datasets = svc
+        .list_datasets(with_discoverer(ListDatasetsRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<&str> = datasets
+        .datasets
+        .iter()
+        .map(|dataset| dataset.id.as_str())
+        .collect();
+    assert!(ids.contains(&"bound-ds"));
+    assert!(!ids.contains(&"unbound-ds"));
+
+    let read = svc
+        .get_object(with_discoverer(
+            GetObjectRequest {
+                id: "catalog-bound".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        read.code() == tonic::Code::PermissionDenied || read.code() == tonic::Code::NotFound,
+        "{read:?}"
+    );
+
+    let mut community = with_named_principal(ListDatasetsRequest {}, "alice");
+    community
+        .extensions_mut()
+        .insert(crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "alice".into(),
+                credential_id: "credential-a".into(),
+            },
+        ));
+    let community_ids: Vec<String> = svc
+        .list_datasets(community)
+        .await
+        .unwrap()
+        .into_inner()
+        .datasets
+        .into_iter()
+        .map(|dataset| dataset.id)
+        .collect();
+    assert!(community_ids.iter().any(|id| id == "unbound-ds"));
+    assert!(community_ids.iter().any(|id| id == "bound-ds"));
+
+    grant_schema_admin(&svc);
+    svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+        r#type: Some(widget_schema_type()),
+    }))
+    .await
+    .unwrap();
+    let scoped_types = svc
+        .list_schema_types(with_discoverer(ListSchemaTypesRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        scoped_types
+            .types
+            .iter()
+            .any(|object_type| object_type.kind == "namespace" && object_type.is_builtin)
+    );
+    assert!(
+        !scoped_types
+            .types
+            .iter()
+            .any(|object_type| object_type.kind == "widget")
+    );
+
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "marked-catalog-bound".into(),
+            kind: "artifact".into(),
+            name: "secret-metrics".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:marked-catalog".into(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&dataset::Dataset {
+            id: "marked-bound-ds".into(),
+            name: "secret-metrics".into(),
+            columns: vec![],
+            object_id: "marked-catalog-bound".into(),
+            created: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "principal-alice-discover".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "alice".into(),
+            namespace: "ns".into(),
+            external_id: markings::principal_profile_external_id("alice"),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    grant_object_role(
+        &svc,
+        "principal-alice-discover",
+        "root",
+        security::Role::Admin,
+    );
+    let delegated = svc
+        .list_datasets(with_discoverer(ListDatasetsRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !delegated
+            .datasets
+            .iter()
+            .any(|dataset| dataset.id == "marked-bound-ds")
+    );
 }
 
 #[tokio::test]

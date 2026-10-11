@@ -26,7 +26,8 @@ inspect it through `GetClassificationLattice`. Those RPCs are classified
 parent edges (child → more-dominant parents), and explicit incomparable pairs.
 Dominance is reachability from the marking to the caller’s sealed ceiling.
 
-- **Unmarked objects** (missing or empty `access_marking`): no extra check.
+- **Unmarked objects** (missing or empty `access_marking`): no extra check
+  unless `deny_unmarked` is on.
 - **Unactivated namespaces**: unknown tokens stay unmarked; only the evidence
   ordinal enforces clearance.
 - **Activated lattices**: unknown tokens, stale digest or namespace identity,
@@ -50,7 +51,13 @@ Objects may set property **`access_marking`** to a lattice token.
 schema property redaction classes and free-form domain fields.)
 
 - **Unmarked objects** (missing or empty value): no extra check
-  (migration fail-open for existing data).
+  (migration fail-open for existing data) unless `deny_unmarked` is on.
+- **`deny_unmarked`**: optional fail-closed switch. Set namespace property
+  `deny_unmarked=true` on `namespace:<name>`, or set `SEKAI_DENY_UNMARKED=1`.
+  When on, unmarked reads and list rows are denied unless the principal is a
+  trusted service (`root`, `local`, `chisei-gateway`) or holds an explicit
+  object ACL grant. Empty ACL remains world-open, not an explicit grant.
+  Marked objects keep the existing clearance rules. The default stays fail-open.
 - **Marked objects**: principal must present a ceiling that dominates the
   marking, or be a trusted service principal. Otherwise read and action
   targeting fail closed with generic `access denied`.
@@ -100,14 +107,19 @@ leaking classification details in the RPC error.
 
 1. Existing unmarked data continues to work without principal profiles.
 2. Operators mark sensitive objects with `access_marking`.
-3. Create `principal:<actor>` profiles with ceilings and purpose allow-lists
+   `sekaictl admin access unmarked list --namespace <name>` reports unmarked
+   objects. `sekaictl admin access unmarked apply --namespace <name>
+   --marking <token>` writes that token onto unmarked objects only.
+3. Turn on `deny_unmarked` only after unmarked data that must stay readable
+   is marked or granted. Turning it on without that step hides the data.
+4. Create `principal:<actor>` profiles with ceilings and purpose allow-lists
    before marking objects or purpose-gating actions that those principals use.
-4. Purpose-gated action types only block callers once `required_purpose` is set
+5. Purpose-gated action types only block callers once `required_purpose` is set
    on the action type definition.
-5. Purpose-bound reads require an activated object-security policy that names
+6. Purpose-bound reads require an activated object-security policy that names
    `required_purpose` plus a live `sekai.purpose-authorization/v1`. Principal
    `allowed_purposes` alone are not read authority.
-6. Operators who need compartments or extra tokens publish
+7. Operators who need compartments or extra tokens publish
    `sekai.classification-lattice/v1` before marking objects with those tokens.
 
 ## Residual risks (v1)

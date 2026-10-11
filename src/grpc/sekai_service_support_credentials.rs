@@ -466,14 +466,30 @@ pub(super) fn enforce_namespace_tenant_context(
     namespace: &str,
     write: bool,
 ) -> Result<(), Status> {
+    enforce_namespace_tenant_context_for(
+        db,
+        tenant_context,
+        namespace,
+        if write {
+            crate::enterprise::NamespaceAction::Write
+        } else {
+            crate::enterprise::NamespaceAction::Read
+        },
+    )
+}
+
+pub(super) fn enforce_namespace_tenant_context_for(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<(), Status> {
+    let write = action == crate::enterprise::NamespaceAction::Write;
     let result = (|| {
         if let Some(context) = tenant_context {
+            context.authorize_space(action).map_err(extension_status)?;
             context
-                .authorize_space(if write {
-                    crate::enterprise::NamespaceAction::Write
-                } else {
-                    crate::enterprise::NamespaceAction::Read
-                })
+                .authorize_credential_scope(action)
                 .map_err(extension_status)?;
         }
         if let Some(context) = tenant_context
@@ -494,11 +510,6 @@ pub(super) fn enforce_namespace_tenant_context(
             return Err(Status::unauthenticated(
                 "enterprise authenticated context required",
             ));
-        };
-        let action = if write {
-            crate::enterprise::NamespaceAction::Write
-        } else {
-            crate::enterprise::NamespaceAction::Read
         };
         extension
             .authorize_authenticated_context(context, namespace, action)

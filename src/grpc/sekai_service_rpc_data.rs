@@ -230,6 +230,7 @@ pub(super) async fn list_datasets(
 ) -> Result<Response<ListDatasetsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let datasets = service
         .db
         .runtime()
@@ -245,6 +246,13 @@ pub(super) async fn list_datasets(
                 false,
             )
             .is_ok()
+                && catalog_binding_discoverable(
+                    service.db.runtime(),
+                    &service.security,
+                    tenant_context.as_ref(),
+                    &dataset.object_id,
+                    &principals,
+                )
         })
         .collect::<Vec<_>>()
         .iter()
