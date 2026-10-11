@@ -59,6 +59,13 @@ Upgrade notes:
 - Indexed `EvaluateObjectSet` authorizes the live object and fails closed on authorization outages (#1422).
 - No store schema migration. A binary or image rollback to 1.2.1 restores prior identity behavior.
 
+## 1.2.1
+
+Upgrade notes:
+
+- Store relocation initializes external-action reservations, authorizations, releases, and blast-radius claims on the Chisei destination. Relocate with this tag's `sekaictl` when those tables already exist (#1414).
+- The Git tag, GitHub release, `sekai` archives, and GHCR image are `v1.2.1`. Crate metadata, `compatibility.json`, and `deploy/tenkai.toml` on this tag still report `1.2.0`.
+
 ## 1.2.0
 
 Upgrade notes:
