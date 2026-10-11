@@ -2590,6 +2590,164 @@ fn read_root_hides_denials_and_preserves_outages() {
 }
 
 #[tokio::test]
+async fn deny_unmarked_denies_unmarked_reads_and_keeps_marked_rules() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "namespace-ns".into(),
+            kind: "namespace".into(),
+            name: "ns".into(),
+            namespace: "ns".into(),
+            external_id: "namespace:ns".into(),
+            properties: HashMap::from([(markings::DENY_UNMARKED_PROPERTY.into(), "true".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "unmarked-open".into(),
+            kind: "artifact".into(),
+            name: "open".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:unmarked-open".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "unmarked-granted".into(),
+            kind: "artifact".into(),
+            name: "granted".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:unmarked-granted".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    grant_object_role(&svc, "unmarked-granted", "alice", security::Role::Viewer);
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "marked-confidential".into(),
+            kind: "artifact".into(),
+            name: "secret".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:marked-confidential".into(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+
+    let unmarked_denied = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "unmarked-open".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(unmarked_denied.code(), tonic::Code::PermissionDenied);
+
+    let granted = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "unmarked-granted".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(granted.object.unwrap().id, "unmarked-granted");
+
+    let marked_denied = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "marked-confidential".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(marked_denied.code(), tonic::Code::PermissionDenied);
+
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "principal-alice-deny-unmarked".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "alice".into(),
+            namespace: "ns".into(),
+            external_id: markings::principal_profile_external_id("alice"),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    grant_object_role(
+        &svc,
+        "principal-alice-deny-unmarked",
+        "root",
+        security::Role::Admin,
+    );
+    let marked_allowed = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "marked-confidential".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(marked_allowed.object.unwrap().id, "marked-confidential");
+
+    let listed = svc
+        .list_objects(with_named_principal(
+            ListObjectsRequest {
+                filter: Some(ListFilter {
+                    namespace: "ns".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let listed_ids: Vec<&str> = listed
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect();
+    assert!(!listed_ids.contains(&"unmarked-open"));
+    assert!(listed_ids.contains(&"unmarked-granted"));
+    assert!(listed_ids.contains(&"marked-confidential"));
+}
+
+#[tokio::test]
 async fn activated_get_object_hides_acl_and_marking_denials_as_missing() {
     for (id, namespace, properties, acl_denied) in [
         (
