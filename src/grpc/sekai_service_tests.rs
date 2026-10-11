@@ -775,11 +775,16 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
         assertion.scopes = scopes;
         assertion.tenant_id = Some(tenant.into());
         let token = authority.sign(&assertion).unwrap();
-        let authenticated = interceptor
-            .call(request(&token, "GetPublishedDefinitionRevision"))
-            .unwrap();
+        let authenticated = interceptor.call(request(&token, "GetPublishedDefinitionRevision"));
+        if nonce == "missing-scope" {
+            assert_eq!(
+                authenticated.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+            continue;
+        }
         assert_eq!(
-            svc.get_published_definition_revision(read(authenticated, namespace))
+            svc.get_published_definition_revision(read(authenticated.unwrap(), namespace))
                 .await
                 .unwrap_err()
                 .code(),
