@@ -1577,6 +1577,7 @@ fn managed_execution_context_for_tenant(
 ) -> crate::enterprise::AuthenticatedContext {
     crate::enterprise::AuthenticatedContext {
         contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+        home_tenant: None,
         principal: crate::enterprise::AuthenticatedPrincipal {
             subject: "service:managed-shikigami".into(),
             credential_id: "credential:managed-shikigami".into(),

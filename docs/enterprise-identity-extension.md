@@ -80,6 +80,27 @@ credential-bearing metadata in logs, graph facts, audit payloads, metrics,
 traces, errors, or diagnostics. Stable opaque credential identifiers may be
 used for attribution and revocation checks.
 
+## Guests: home and acting tenant
+
+`tenant` is the acting tenant: the tenant whose namespaces a context
+addresses. `home_tenant` names the principal's own tenant when it differs; a
+context with a non-empty `home_tenant` other than the acting tenant is a
+guest. A home tenant without a non-empty acting tenant, or an empty home
+tenant, fails closed. Same-tenant contexts leave `home_tenant` unset and keep
+today's behavior.
+
+Guests are denied by default (#1432). Core admits a guest only on the
+namespace object RPCs that make a per-namespace decision (get, list, create,
+update, delete object), and there only when the installed extension's
+`authorize_guest_namespace` allows that namespace and action. Its default is
+`PermissionDenied`, and core calls it directly, so an overridden
+`authorize_authenticated_context` cannot admit a guest by accident. Guests
+never approve. Without an extension a guest is always denied. Every guest
+decision, allowed or denied, is audited as `tenant.guest_access` with the
+principal, home tenant, acting tenant, space, the namespace (or the RPC, when
+the interceptor rejects it first), and the operation. A denied
+guest read looks like a missing object.
+
 ## Compatibility
 
 GATE:mig: before adopting tenant-required authentication, bind each service
@@ -94,6 +115,12 @@ populate the optional fields and advertise `sekai.identity-extension/v2`.
 Older extension versions fail closed. The existing assertion wire version
 accepts optional fields additively; assertions without them keep their prior
 behavior. No protocol field numbers change.
+
+GATE:break: `home_tenant` (#1432) is a new Rust field on the `v2` context.
+Extensions that build `AuthenticatedContext` must set it (`None` keeps
+same-tenant behavior). No existing field changes meaning, the default guest
+hook fails closed, and no protocol field numbers change, so the contract
+version stays `v2`.
 
 Adopting the context contract requires an implementation to provide `authenticate_context`;
 there is no compatibility adapter that guesses scopes or expiry from the older

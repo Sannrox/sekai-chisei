@@ -30,6 +30,7 @@ impl EnterpriseExtension for FakeExtension {
         let principal = self.authenticate_bearer(bearer_token)?;
         Ok(AuthenticatedContext {
             contract_version: IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
             tenant: Some(self.tenant_context(&principal)?),
             principal,
             credential_kind: CredentialKind::HumanSession,

@@ -86,7 +86,11 @@ pub struct AuthenticatedContext {
     pub contract_version: &'static str,
     pub principal: AuthenticatedPrincipal,
     pub credential_kind: CredentialKind,
+    /// Acting tenant: the tenant whose namespaces this context addresses.
     pub tenant: Option<TenantContext>,
+    /// The principal's home tenant when it differs from the acting tenant
+    /// (a guest). `None` means the principal belongs to the acting tenant.
+    pub home_tenant: Option<String>,
     pub space: Option<String>,
     pub space_role: Option<SpaceRole>,
     /// Human subject resolved by the trusted validator; never an unverified routing hint.
@@ -107,6 +111,7 @@ impl AuthenticatedContext {
             space_role: None,
             act: None,
             tenant: None,
+            home_tenant: None,
             scopes: Vec::new(),
             issuer: "sekai:community".into(),
             resource: "sekai:control-plane".into(),
@@ -114,7 +119,25 @@ impl AuthenticatedContext {
         }
     }
 
+    /// The home tenant of a guest context: one whose principal belongs to a
+    /// tenant other than the acting tenant. `None` for same-tenant contexts.
+    pub fn guest_home_tenant(&self) -> Option<&str> {
+        let home = self.home_tenant.as_deref()?;
+        let acting = self.tenant.as_ref().map(|tenant| tenant.tenant_id.as_str());
+        (acting != Some(home)).then_some(home)
+    }
+
     pub fn authorize_space(&self, action: NamespaceAction) -> Result<(), ExtensionError> {
+        // A home tenant is only meaningful next to a non-empty acting tenant.
+        if self.home_tenant.as_ref().is_some_and(|home| {
+            home.trim().is_empty()
+                || self
+                    .tenant
+                    .as_ref()
+                    .is_none_or(|tenant| tenant.tenant_id.trim().is_empty())
+        }) {
+            return Err(ExtensionError::PermissionDenied);
+        }
         if self
             .space
             .as_ref()
@@ -185,8 +208,12 @@ impl AuthenticatedContext {
         }
     }
 
+    /// Guests never approve; approval stays with the acting tenant's members.
     pub fn authorize_space_approval(&self) -> Result<(), ExtensionError> {
         self.authorize_space(NamespaceAction::Read)?;
+        if self.guest_home_tenant().is_some() {
+            return Err(ExtensionError::PermissionDenied);
+        }
         if self.space.is_none()
             || matches!(
                 self.space_role,
@@ -486,10 +513,29 @@ pub trait EnterpriseExtension: Send + Sync {
     ) -> Result<(), ExtensionError> {
         context.authorize_space(action)?;
         context.authorize_credential_scope(action)?;
+        if context.guest_home_tenant().is_some() {
+            return self.authorize_guest_namespace(context, namespace, action);
+        }
         match context.tenant.as_ref() {
             Some(tenant) => self.authorize_namespace(tenant, namespace, action),
             None => self.authorize_unscoped_namespace(&context.principal, namespace, action),
         }
+    }
+
+    /// Decide whether a guest context (see
+    /// [`AuthenticatedContext::guest_home_tenant`]) may act on a namespace of
+    /// its acting tenant. Default: denied, so cross-tenant access stays off
+    /// until an extension opts in explicitly. Core calls this for every guest
+    /// namespace decision, even when `authorize_authenticated_context` is
+    /// overridden.
+    fn authorize_guest_namespace(
+        &self,
+        context: &AuthenticatedContext,
+        namespace: &str,
+        action: NamespaceAction,
+    ) -> Result<(), ExtensionError> {
+        let _ = (context, namespace, action);
+        Err(ExtensionError::PermissionDenied)
     }
 
     /// Decide whether a credential authenticated by the community store may
@@ -563,6 +609,7 @@ mod tests {
             let principal = self.authenticate_bearer(bearer_token)?;
             Ok(AuthenticatedContext {
                 contract_version: IDENTITY_EXTENSION_VERSION,
+                home_tenant: None,
                 tenant: Some(self.tenant_context(&principal)?),
                 principal,
                 credential_kind: CredentialKind::HumanSession,
@@ -632,6 +679,62 @@ mod tests {
             extension.authorize_namespace(&context, "other", NamespaceAction::Write),
             Err(ExtensionError::PermissionDenied)
         );
+    }
+
+    #[test]
+    fn guest_contexts_fail_closed_unless_the_extension_opts_in() {
+        let extension = FakeExtension;
+        let member = extension.authenticate_context("test-token").unwrap();
+        let guest = AuthenticatedContext {
+            home_tenant: Some("tenant-home".into()),
+            ..member.clone()
+        };
+        assert_eq!(member.guest_home_tenant(), None);
+        assert_eq!(guest.guest_home_tenant(), Some("tenant-home"));
+        // Naming the acting tenant as home is not a guest.
+        let own = AuthenticatedContext {
+            home_tenant: Some("tenant-test".into()),
+            ..member.clone()
+        };
+        assert_eq!(own.guest_home_tenant(), None);
+
+        // `authorize_namespace` would allow `allowed`; the guest path does not.
+        for action in [
+            NamespaceAction::Discover,
+            NamespaceAction::Read,
+            NamespaceAction::Write,
+        ] {
+            assert!(
+                extension
+                    .authorize_authenticated_context(&member, "allowed", action)
+                    .is_ok()
+            );
+            assert_eq!(
+                extension.authorize_authenticated_context(&guest, "allowed", action),
+                Err(ExtensionError::PermissionDenied)
+            );
+        }
+        assert!(member.authorize_space_approval().is_ok());
+        assert_eq!(
+            guest.authorize_space_approval(),
+            Err(ExtensionError::PermissionDenied)
+        );
+
+        for malformed in [
+            AuthenticatedContext {
+                home_tenant: Some(" ".into()),
+                ..member.clone()
+            },
+            AuthenticatedContext {
+                tenant: None,
+                ..guest.clone()
+            },
+        ] {
+            assert_eq!(
+                malformed.authorize_space(NamespaceAction::Discover),
+                Err(ExtensionError::PermissionDenied)
+            );
+        }
     }
 
     #[test]

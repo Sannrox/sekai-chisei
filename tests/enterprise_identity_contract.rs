@@ -173,6 +173,7 @@ impl EnterpriseExtension for FakeIdentityExtension {
         code.used = true;
         let context = AuthenticatedContext {
             contract_version: IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
             principal: AuthenticatedPrincipal {
                 subject: "human:alice".into(),
                 credential_id: "credential-1".into(),
