@@ -48,6 +48,17 @@
 - Pipeline implement and evaluable checks reuse the same per-request type cache as property filtering, so context assembly does not re-list schema types per object (#1262).
 - Governed transforms are a Sekai in-process class on both community backends: put a JobSpec, run a `projection`, inspect the run receipt. `sekaictl admin transform` and Console `/transforms` are the operator path. RPCs stay experimental (ADR 0097, #1287).
 
+## 1.3.0
+
+Upgrade notes:
+
+- Enterprise identity extensions require a tenant on every authenticated context. Bind or replace tenantless service and gateway credentials before upgrade. Community installs without an extension keep existing credential behavior (#1418).
+- Identity extension implementers must advertise `sekai.identity-extension/v2` and populate space, space role, and `act`. Older extension versions fail closed. Protocol field numbers are unchanged ([ADR 0099](docs/decisions/0099-shared-identity-and-tenancy.md), #1415, #1417).
+- Delegated apply re-checks the retained `act` principal. Disabled, removed, or under-privileged delegators refuse with `delegator_disabled`, `delegator_not_member`, or `delegator_grant_missing`. Missing planning receipt, action effect, or action instance also refuses apply (#1419, #1423). Claim-time re-validation remains open (#1421).
+- Delegated calls use the service subject, or the intersection of service and human row, property, ACL, and marking authority when `act` is present (#1422).
+- Indexed `EvaluateObjectSet` authorizes the live object and fails closed on authorization outages (#1422).
+- No store schema migration. A binary or image rollback to 1.2.1 restores prior identity behavior.
+
 ## 1.2.0
 
 Upgrade notes:
