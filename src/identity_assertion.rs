@@ -174,6 +174,7 @@ impl AssertionAuthority {
         let subject = assertion.subject.clone();
         let context = AuthenticatedContext {
             contract_version: IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
             principal: AuthenticatedPrincipal {
                 subject: assertion.subject,
                 credential_id: assertion.credential_id,

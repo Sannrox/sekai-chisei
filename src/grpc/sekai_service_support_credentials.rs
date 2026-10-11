@@ -503,6 +503,11 @@ pub(super) fn enforce_namespace_tenant_context_for(
             )?;
             check_team_namespace(db, std::slice::from_ref(actor), namespace, write)?;
         }
+        if let Some(context) = tenant_context
+            && context.guest_home_tenant().is_some()
+        {
+            return authorize_guest(db, context, namespace, action);
+        }
         let Some(extension) = db.enterprise_extension() else {
             return Ok(());
         };
@@ -515,6 +520,19 @@ pub(super) fn enforce_namespace_tenant_context_for(
             .authorize_authenticated_context(context, namespace, action)
             .map_err(extension_status)
     })();
+    // The final outcome, including denials from the checks before the hook.
+    if let Some(context) = tenant_context
+        && context.guest_home_tenant().is_some()
+    {
+        crate::grpc::record_guest_access(
+            db,
+            context,
+            namespace,
+            &format!("{action:?}").to_lowercase(),
+            result.is_ok(),
+        )
+        .map_err(Status::internal)?;
+    }
     if result.is_err() {
         record_delegated_policy_decision(
             db,
@@ -530,6 +548,22 @@ pub(super) fn enforce_namespace_tenant_context_for(
     }
     result
 }
+/// Cross-tenant (guest) namespace decision (#1432): only an installed
+/// extension's explicit guest authorization admits it.
+fn authorize_guest(
+    db: &RuntimeDb,
+    context: &RequestEnterpriseContext,
+    namespace: &str,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<(), Status> {
+    match db.enterprise_extension() {
+        Some(extension) => extension
+            .authorize_guest_namespace(context, namespace, action)
+            .map_err(extension_status),
+        None => Err(Status::permission_denied("enterprise authorization denied")),
+    }
+}
+
 pub(super) fn extension_status(error: crate::enterprise::ExtensionError) -> Status {
     match error {
         crate::enterprise::ExtensionError::CredentialNotFound => {

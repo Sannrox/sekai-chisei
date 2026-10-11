@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The identity contract distinguishes the acting tenant from a guest's home
+  tenant (`AuthenticatedContext.home_tenant`). Guest contexts are denied
+  unless an installed extension's `authorize_guest_namespace` admits the
+  namespace and action (default deny); they reach only the namespace object
+  RPCs and never approve. Every guest decision is audited with both tenants.
+  Extensions must set the new field (`GATE:break`, #1432).
+
 - Derived transform outputs inherit the union of input object and row
   `access_marking` values. Unknown input markings fail closed with no output
   write. Marked runs require a bound output dataset object. Receipts record

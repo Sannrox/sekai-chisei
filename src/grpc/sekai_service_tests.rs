@@ -35,6 +35,7 @@ impl crate::enterprise::EnterpriseExtension for TestEnterpriseExtension {
         let principal = self.authenticate_bearer(bearer_token)?;
         Ok(crate::enterprise::AuthenticatedContext {
             contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
             tenant: Some(self.tenant_context(&principal)?),
             principal,
             credential_kind: crate::enterprise::CredentialKind::HumanSession,
@@ -95,6 +96,7 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
         .extensions_mut()
         .insert(crate::enterprise::AuthenticatedContext {
             contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
             principal: crate::enterprise::AuthenticatedPrincipal {
                 subject: "subject-a".into(),
                 credential_id: "credential-a".into(),
@@ -273,6 +275,7 @@ fn enterprise_service() -> SekaiServiceImpl {
 fn test_tenant_context() -> crate::enterprise::AuthenticatedContext {
     crate::enterprise::AuthenticatedContext {
         contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+        home_tenant: None,
         principal: crate::enterprise::AuthenticatedPrincipal {
             subject: "subject-a".into(),
             credential_id: "credential-a".into(),
@@ -4359,6 +4362,7 @@ async fn catalog_listings_omit_bindings_when_object_policy_cannot_be_evaluated()
 fn discoverer_context(subject: &str) -> crate::enterprise::AuthenticatedContext {
     crate::enterprise::AuthenticatedContext {
         contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+        home_tenant: None,
         principal: crate::enterprise::AuthenticatedPrincipal {
             subject: subject.into(),
             credential_id: "credential-a".into(),
@@ -13310,4 +13314,250 @@ async fn delegated_service_requires_human_admin_for_policy_input_changes() {
     assert!(audit.iter().any(|decision| decision.outcome == "deny"
         && decision.evidence.get("operation").map(String::as_str) == Some("read")
         && decision.evidence.get("act").map(String::as_str) == Some("human-a")));
+}
+
+/// Guest of `tenant-test` whose home tenant is `tenant-home` (#1432).
+fn guest_context() -> crate::enterprise::AuthenticatedContext {
+    crate::enterprise::AuthenticatedContext {
+        home_tenant: Some("tenant-home".into()),
+        scopes: vec!["sekai.read".into(), "sekai.write".into()],
+        ..test_tenant_context()
+    }
+}
+
+/// Opts guests in for namespace `shared` only, on any action.
+struct GuestSharedExtension;
+
+impl crate::enterprise::EnterpriseExtension for GuestSharedExtension {
+    fn authenticate_bearer(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authenticate_bearer(bearer_token)
+    }
+
+    fn authenticate_context(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError> {
+        let issued = TestEnterpriseExtension.authenticate_context(bearer_token)?;
+        Ok(crate::enterprise::AuthenticatedContext {
+            expires_at: i64::MAX,
+            issuer: issued.issuer,
+            resource: issued.resource,
+            ..guest_context()
+        })
+    }
+
+    fn tenant_context(
+        &self,
+        principal: &crate::enterprise::AuthenticatedPrincipal,
+    ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.tenant_context(principal)
+    }
+
+    fn authorize_namespace(
+        &self,
+        context: &crate::enterprise::TenantContext,
+        namespace: &str,
+        action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authorize_namespace(context, namespace, action)
+    }
+
+    fn authorize_guest_namespace(
+        &self,
+        context: &crate::enterprise::AuthenticatedContext,
+        namespace: &str,
+        _action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        (context.guest_home_tenant() == Some("tenant-home") && namespace == "shared")
+            .then_some(())
+            .ok_or(crate::enterprise::ExtensionError::PermissionDenied)
+    }
+
+    fn authorize_unscoped_namespace(
+        &self,
+        principal: &crate::enterprise::AuthenticatedPrincipal,
+        namespace: &str,
+        action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authorize_unscoped_namespace(principal, namespace, action)
+    }
+}
+
+fn guest_decisions(db: &RuntimeDb) -> Vec<crate::sekai::audit::Decision> {
+    db.list_decisions(&crate::sekai::decision_ledger::DecisionFilter {
+        action: Some("tenant.guest_access".into()),
+        limit: 100,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn guest_contexts_are_denied_by_default_and_look_missing() {
+    let svc = enterprise_service();
+    seed_lineage_object(&svc, "tenant-object", "allowed");
+    let get = |id: &str| {
+        let mut req = with_named_principal(GetObjectRequest { id: id.into() }, "subject-a");
+        req.extensions_mut().insert(guest_context());
+        req
+    };
+    let existing = svc.get_object(get("tenant-object")).await.unwrap_err();
+    let missing = svc.get_object(get("no-such-object")).await.unwrap_err();
+    assert_eq!(existing.code(), missing.code());
+    assert_eq!(existing.code(), tonic::Code::NotFound);
+
+    let mut list = with_named_principal(
+        ListObjectsRequest {
+            filter: Some(ListFilter {
+                namespace: "allowed".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "subject-a",
+    );
+    list.extensions_mut().insert(guest_context());
+    let listed = svc.list_objects(list).await;
+    assert!(
+        listed.as_ref().map_or(true, |response| {
+            response.get_ref().objects.is_empty() && response.get_ref().total == 0
+        }),
+        "{listed:?}"
+    );
+
+    let db = svc.db.runtime();
+    for action in [
+        crate::enterprise::NamespaceAction::Discover,
+        crate::enterprise::NamespaceAction::Read,
+        crate::enterprise::NamespaceAction::Write,
+    ] {
+        assert!(
+            enforce_namespace_tenant_context_for(db, Some(&guest_context()), "allowed", action)
+                .is_err()
+        );
+    }
+    // The same principal acting in its own tenant is unaffected.
+    assert!(
+        enforce_namespace_tenant_context(db, Some(&test_tenant_context()), "allowed", false)
+            .is_ok()
+    );
+
+    let decisions = guest_decisions(db);
+    assert!(!decisions.is_empty());
+    assert!(decisions.iter().all(|decision| decision.outcome == "denied"
+        && decision.evidence["home_tenant"] == "tenant-home"
+        && decision.evidence["acting_tenant"] == "tenant-test"));
+}
+
+#[test]
+fn guest_access_needs_explicit_extension_opt_in() {
+    let community = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+    assert!(
+        enforce_namespace_tenant_context(&community, Some(&guest_context()), "shared", false)
+            .is_err()
+    );
+
+    let db = RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(GuestSharedExtension)))
+            .unwrap(),
+    ));
+    assert!(enforce_namespace_tenant_context(&db, Some(&guest_context()), "shared", false).is_ok());
+    assert!(enforce_namespace_tenant_context(&db, Some(&guest_context()), "shared", true).is_ok());
+    assert!(
+        enforce_namespace_tenant_context(&db, Some(&guest_context()), "allowed", false).is_err()
+    );
+
+    // A denial from the space check before the guest hook is audited too.
+    let viewer = crate::enterprise::AuthenticatedContext {
+        space: Some("space-a".into()),
+        space_role: Some(crate::enterprise::SpaceRole::Viewer),
+        ..guest_context()
+    };
+    assert!(enforce_namespace_tenant_context(&db, Some(&viewer), "shared", true).is_err());
+
+    let decisions = guest_decisions(&db);
+    let outcome = |namespace: &str| {
+        decisions
+            .iter()
+            .filter(|decision| decision.target_id == namespace)
+            .map(|decision| decision.outcome.as_str())
+            .collect::<Vec<_>>()
+    };
+    let mut shared = outcome("shared");
+    shared.sort_unstable();
+    assert_eq!(shared, ["allowed", "allowed", "denied"]);
+    assert_eq!(outcome("allowed"), ["denied"]);
+    assert!(decisions.iter().any(|decision| decision.evidence["space"] == "space-a"
+        && decision.outcome == "denied"));
+    assert!(
+        decisions
+            .iter()
+            .all(|decision| decision.actor == "subject-a"
+                && decision.evidence["home_tenant"] == "tenant-home"
+                && decision.evidence["acting_tenant"] == "tenant-test")
+    );
+}
+
+#[test]
+fn guest_credentials_reach_only_namespace_checked_rpcs() {
+    use tonic::service::Interceptor;
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(GuestSharedExtension)))
+            .unwrap(),
+    )));
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::new(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        crate::db::store::SekaiStore::from_shared_runtime(db.clone()),
+    );
+    let guest_rpcs = [
+        "GetObject",
+        "ListObjects",
+        "CreateObject",
+        "UpdateObject",
+        "DeleteObject",
+    ];
+    for (service, protocol) in [
+        (
+            "sekai.SekaiService",
+            include_str!("../../proto/sekai.proto"),
+        ),
+        (
+            "chisei.ChiseiService",
+            include_str!("../../proto/chisei.proto"),
+        ),
+    ] {
+        for method in protocol.lines().filter_map(|line| {
+            line.trim()
+                .strip_prefix("rpc ")
+                .and_then(|rpc| rpc.split_once('(').map(|(name, _)| name.trim()))
+        }) {
+            let mut request = Request::new(());
+            request.metadata_mut().insert(
+                "authorization",
+                MetadataValue::from_static("Bearer enterprise-token"),
+            );
+            request
+                .extensions_mut()
+                .insert(tonic::GrpcMethod::new(service, method));
+            let result = interceptor.call(request);
+            let denied_rpc = format!("{service}/{method}");
+            if service == "sekai.SekaiService" && guest_rpcs.contains(&method) {
+                assert!(result.is_ok(), "{denied_rpc}: {result:?}");
+            } else {
+                assert!(result.is_err(), "{denied_rpc}");
+                assert!(
+                    guest_decisions(&db)
+                        .iter()
+                        .any(|decision| decision.target_id == denied_rpc
+                            && decision.outcome == "denied"
+                            && decision.evidence["home_tenant"] == "tenant-home"
+                            && decision.evidence["acting_tenant"] == "tenant-test"),
+                    "unaudited {denied_rpc}"
+                );
+            }
+        }
+    }
 }

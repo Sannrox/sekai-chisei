@@ -40,6 +40,12 @@ tenants. Request selectors must match authenticated authority and the current
 namespace-to-tenant binding before any read, mutation, or work admission.
 Absent or empty tenant authority denies tenant-scoped operations.
 
+A context names the acting tenant whose namespaces it addresses and, for a
+guest, the principal's different home tenant. The home tenant never changes
+by acting elsewhere, and storage keys stay those of the acting tenant. Guest
+contexts are denied unless an explicit cross-tenant rule admits them, and
+every guest decision is audited with both tenants (#1404).
+
 ### Principal kinds
 
 | Kind | Meaning | Authority constraint |

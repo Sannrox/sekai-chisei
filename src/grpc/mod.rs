@@ -194,6 +194,63 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
     }
 }
 
+/// [`finish_authenticated`], auditing a guest rejected before any namespace
+/// decision. The denial stands even if the audit write fails.
+fn finish_authenticated_audited(
+    db: &crate::db::runtime_db::RuntimeDb,
+    req: Request<()>,
+    authenticated_context: crate::enterprise::AuthenticatedContext,
+    enterprise_scoped: bool,
+) -> Result<Request<()>, Status> {
+    let guest = authenticated_context
+        .guest_home_tenant()
+        .is_some()
+        .then(|| authenticated_context.clone());
+    let rpc = rpc_identity::request_rpc_method(&req)
+        .map(|(service, method)| format!("{service}/{method}"))
+        .unwrap_or_default();
+    let result = finish_authenticated(req, authenticated_context, enterprise_scoped);
+    if let (Some(context), Err(_)) = (&guest, &result) {
+        let _ = record_guest_access(db, context, &rpc, "rpc", false);
+    }
+    result
+}
+
+/// One `tenant.guest_access` audit record for a guest decision (#1432), with
+/// the principal, home and acting tenant, space, target, and operation.
+pub(crate) fn record_guest_access(
+    db: &crate::db::runtime_db::RuntimeDb,
+    context: &crate::enterprise::AuthenticatedContext,
+    target_id: &str,
+    operation: &str,
+    allowed: bool,
+) -> Result<(), String> {
+    let tenant_id = |tenant: Option<&str>| tenant.unwrap_or_default().to_string();
+    db.record_decision(&crate::sekai::audit::Decision {
+        id: format!("guest-access:{}", uuid::Uuid::new_v4().as_simple()),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: context.principal.subject.clone(),
+        action: "tenant.guest_access".into(),
+        reason: "cross-tenant access".into(),
+        target_id: target_id.into(),
+        outcome: if allowed { "allowed" } else { "denied" }.into(),
+        evidence: std::collections::HashMap::from([
+            ("home_tenant".into(), tenant_id(context.guest_home_tenant())),
+            (
+                "acting_tenant".into(),
+                tenant_id(
+                    context
+                        .tenant
+                        .as_ref()
+                        .map(|tenant| tenant.tenant_id.as_str()),
+                ),
+            ),
+            ("space".into(), context.space.clone().unwrap_or_default()),
+            ("operation".into(), operation.into()),
+        ]),
+    })
+}
+
 fn finish_authenticated(
     mut req: Request<()>,
     authenticated_context: crate::enterprise::AuthenticatedContext,
@@ -208,6 +265,14 @@ fn finish_authenticated(
     authenticated_context
         .authorize_space(crate::enterprise::NamespaceAction::Discover)
         .map_err(|_| Status::unauthenticated("invalid space authority"))?;
+    // Guests reach only RPCs whose handlers make a per-namespace guest
+    // decision (#1432); everything else, approval included, stays denied.
+    if authenticated_context.guest_home_tenant().is_some()
+        && rpc_identity::request_rpc_method(&req)
+            .is_none_or(|(service, method)| !guest_namespace_rpc(service, method))
+    {
+        return Err(Status::permission_denied("enterprise authorization denied"));
+    }
     if let Some((_, method)) = rpc_identity::request_rpc_method(&req) {
         if method == "DecideActionInstance" {
             authenticated_context
@@ -308,7 +373,12 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                         })?;
                     let enterprise_scoped = self.db.runtime().enterprise_extension().is_some()
                         || authenticated_context.tenant.is_some();
-                    return finish_authenticated(req, authenticated_context, enterprise_scoped);
+                    return finish_authenticated_audited(
+                        self.db.runtime(),
+                        req,
+                        authenticated_context,
+                        enterprise_scoped,
+                    );
                 }
                 None if tenant_header.is_some() => {
                     reject_unauthorized();
@@ -369,12 +439,25 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                 return Err(Status::unauthenticated("invalid token"));
             }
         };
-        finish_authenticated(req, authenticated_context, enterprise_scoped)
+        finish_authenticated_audited(
+            self.db.runtime(),
+            req,
+            authenticated_context,
+            enterprise_scoped,
+        )
     }
 }
 
 fn valid_single_principal(principal: &str) -> bool {
     !principal.is_empty() && principal.trim() == principal && !principal.contains(',')
+}
+
+fn guest_namespace_rpc(service: &str, method: &str) -> bool {
+    service == "sekai.SekaiService"
+        && matches!(
+            method,
+            "GetObject" | "ListObjects" | "CreateObject" | "UpdateObject" | "DeleteObject"
+        )
 }
 
 fn enterprise_namespace_rpc(service: &str, method: &str) -> bool {
@@ -1729,6 +1812,7 @@ mod tests {
                 let principal = self.authenticate_bearer(bearer_token)?;
                 Ok(crate::enterprise::AuthenticatedContext {
                     contract_version: self.contract_version(),
+                    home_tenant: None,
                     tenant: Some(self.tenant_context(&principal)?),
                     principal,
                     credential_kind: crate::enterprise::CredentialKind::HumanSession,

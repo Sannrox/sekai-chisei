@@ -716,6 +716,7 @@ mod tests {
     fn tenant_context(tenant_id: &str) -> crate::enterprise::AuthenticatedContext {
         crate::enterprise::AuthenticatedContext {
             contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
             principal: crate::enterprise::AuthenticatedPrincipal {
                 subject: "service:managed-shikigami".into(),
                 credential_id: format!("credential:{tenant_id}"),
