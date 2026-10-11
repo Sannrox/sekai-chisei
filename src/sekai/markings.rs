@@ -7,7 +7,7 @@
 //!
 //! Migration posture:
 //! - **Unmarked** objects and actions without `required_purpose` impose no
-//!   extra check (fail open for legacy data).
+//!   extra check (fail open for legacy data) unless `deny_unmarked` is on.
 //! - **Marked** objects and purpose-gated actions fail closed when the
 //!   principal lacks a sufficient clearance or purpose allow-list entry.
 
@@ -30,6 +30,10 @@ pub const PRINCIPAL_PROFILE_EXTERNAL_ID_PREFIX: &str = "principal:";
 pub const PRINCIPAL_PROFILE_KIND: &str = "principal_profile";
 /// Property set to `"true"` when a credential admin sealed the profile.
 pub const PRINCIPAL_PROFILE_SEALED_PROPERTY: &str = "sealed_by_credential_admin";
+/// Deployment-wide fail-closed switch for objects with no `access_marking`.
+pub const DENY_UNMARKED_ENV: &str = "SEKAI_DENY_UNMARKED";
+/// Namespace object property that enables `deny_unmarked` for that namespace.
+pub const DENY_UNMARKED_PROPERTY: &str = "deny_unmarked";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalAuthority {
@@ -129,6 +133,83 @@ pub fn object_marking_token(object: &Object) -> Option<&str> {
         .get(OBJECT_CLASSIFICATION_PROPERTY)
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
+}
+
+pub fn truthy_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+pub fn env_deny_unmarked() -> bool {
+    std::env::var(DENY_UNMARKED_ENV)
+        .ok()
+        .is_some_and(|value| truthy_flag(&value))
+}
+
+pub fn namespace_deny_unmarked(namespace_object: Option<&Object>) -> bool {
+    namespace_object
+        .and_then(|object| object.properties.get(DENY_UNMARKED_PROPERTY))
+        .is_some_and(|value| truthy_flag(value))
+}
+
+pub fn deny_unmarked_enabled(env: bool, namespace: bool) -> bool {
+    env || namespace
+}
+
+/// Unmarked objects stay fail-open unless `deny_unmarked` is on.
+/// Trusted service principals and an explicit object ACL grant still pass.
+pub fn unmarked_access_decision(
+    deny_unmarked: bool,
+    trusted: bool,
+    explicit_grant: bool,
+) -> MarkingDecision {
+    if !deny_unmarked {
+        MarkingDecision::NotApplicable
+    } else if trusted || explicit_grant {
+        MarkingDecision::Allow
+    } else {
+        MarkingDecision::Deny
+    }
+}
+
+/// True when `access_marking` is missing or empty.
+pub fn object_is_unmarked(object: &Object) -> bool {
+    object_marking_token(object).is_none()
+}
+
+/// One unmarked object for the migration report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnmarkedObjectReport {
+    pub id: String,
+    pub namespace: String,
+    pub kind: String,
+    pub name: String,
+    pub external_id: String,
+}
+
+pub fn unmarked_object_report(object: &Object) -> Option<UnmarkedObjectReport> {
+    object_is_unmarked(object).then(|| UnmarkedObjectReport {
+        id: object.id.clone(),
+        namespace: object.namespace.clone(),
+        kind: object.kind.clone(),
+        name: object.name.clone(),
+        external_id: object.external_id.clone(),
+    })
+}
+
+/// Write a default `access_marking` onto an unmarked object.
+/// Returns true when the object was unmarked and is now marked.
+pub fn apply_default_marking(object: &mut Object, marking: &str) -> Result<bool, String> {
+    let token = parse_classification(marking)?.as_str().to_string();
+    if object_marking_token(object).is_some() {
+        return Ok(false);
+    }
+    object
+        .properties
+        .insert(OBJECT_CLASSIFICATION_PROPERTY.to_string(), token);
+    Ok(true)
 }
 
 /// Parse a principal authority snapshot from a principal profile object.
@@ -374,6 +455,72 @@ mod tests {
             &authority(None, &[]),
         );
         assert_eq!(result.decision, MarkingDecision::NotApplicable);
+    }
+
+    #[test]
+    fn deny_unmarked_hides_world_readable_unmarked_objects() {
+        assert_eq!(
+            unmarked_access_decision(false, false, false),
+            MarkingDecision::NotApplicable
+        );
+        assert_eq!(
+            unmarked_access_decision(true, false, false),
+            MarkingDecision::Deny
+        );
+        assert_eq!(
+            unmarked_access_decision(true, true, false),
+            MarkingDecision::Allow
+        );
+        assert_eq!(
+            unmarked_access_decision(true, false, true),
+            MarkingDecision::Allow
+        );
+        assert!(namespace_deny_unmarked(Some(&Object {
+            id: "namespace-ns".into(),
+            kind: "namespace".into(),
+            name: "ns".into(),
+            namespace: "ns".into(),
+            external_id: "namespace:ns".into(),
+            properties: HashMap::from([(DENY_UNMARKED_PROPERTY.into(), "true".into())]),
+            created: 0,
+            updated: 0,
+        })));
+        assert!(!namespace_deny_unmarked(Some(&Object {
+            id: "namespace-ns".into(),
+            kind: "namespace".into(),
+            name: "ns".into(),
+            namespace: "ns".into(),
+            external_id: "namespace:ns".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })));
+    }
+
+    #[test]
+    fn apply_default_marking_marks_unmarked_and_leaves_marked() {
+        let mut unmarked = Object {
+            id: "open".into(),
+            kind: "artifact".into(),
+            name: "open".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:open".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        };
+        assert!(object_is_unmarked(&unmarked));
+        assert_eq!(unmarked_object_report(&unmarked).unwrap().id, "open");
+        assert!(apply_default_marking(&mut unmarked, "internal").unwrap());
+        assert_eq!(object_marking_token(&unmarked), Some("internal"));
+        assert!(!object_is_unmarked(&unmarked));
+        assert!(unmarked_object_report(&unmarked).is_none());
+        assert!(!apply_default_marking(&mut unmarked, "restricted").unwrap());
+        assert_eq!(object_marking_token(&unmarked), Some("internal"));
+        assert_eq!(
+            apply_default_marking(&mut unmarked, "not-a-marking").unwrap_err(),
+            "unknown classification marking: not-a-marking"
+        );
     }
 
     #[test]

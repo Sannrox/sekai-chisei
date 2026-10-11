@@ -67,6 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     match args[0].as_str() {
         "credential" => run_credential_command(args.into_iter().skip(1).collect()).await,
+        "unmarked" => {
+            sekai_chisei::unmarked_cli::run_unmarked_command(args.into_iter().skip(1).collect())
+        }
         "gateway" => run_gateway_command(args.into_iter().skip(1).collect()).await,
         "action" => {
             sekai_chisei::action_cli::run_action_command(args.into_iter().skip(1).collect()).await
@@ -479,6 +482,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         args.get(2).map(String::as_str),
     ) {
         (Some("access"), Some("credential")) => ("credential", 3),
+        (Some("access"), Some("unmarked")) => ("unmarked", 3),
         (Some("access"), Some("team")) => ("team", 3),
         (Some("gateway"), _) => ("gateway", 2),
         (Some("governance"), Some("action")) => ("action", 3),
@@ -665,6 +669,7 @@ fn print_admin_usage() {
          \n\
          Access:\n\
            sekaictl admin access credential ...\n\
+           sekaictl admin access unmarked ...\n\
            sekaictl admin access team ...\n\
          \n\
          Gateway:\n\
@@ -749,6 +754,7 @@ fn print_admin_usage() {
 fn expert_usage(command: &str) -> Option<String> {
     match command {
         "credential" => Some(credential_usage().to_string()),
+        "unmarked" => Some(sekai_chisei::unmarked_cli::usage().to_string()),
         "gateway" => Some(gateway_usage()),
         "action" => Some(sekai_chisei::action_cli::usage().to_string()),
         "memory" => Some(sekai_chisei::memory_cli::usage().to_string()),
@@ -852,6 +858,7 @@ mod tests {
     fn expands_every_canonical_admin_path_to_the_existing_dispatcher() {
         for (canonical, expected) in [
             (vec!["access", "credential"], "credential"),
+            (vec!["access", "unmarked"], "unmarked"),
             (vec!["access", "team"], "team"),
             (vec!["gateway"], "gateway"),
             (vec!["governance", "action"], "action"),
@@ -912,6 +919,7 @@ mod tests {
     fn every_admin_target_has_command_specific_help() {
         for command in [
             "credential",
+            "unmarked",
             "team",
             "gateway",
             "action",

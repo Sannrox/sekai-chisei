@@ -482,18 +482,76 @@ pub(super) fn object_passes_marking(
     object: &domain::Object,
     principals: &[String],
 ) -> Result<bool, Status> {
+    Ok(
+        evaluate_object_marking(db, object, principals, "visibility")?.decision
+            != markings::MarkingDecision::Deny,
+    )
+}
+
+fn namespace_object(db: &RuntimeDb, namespace: &str) -> Result<Option<domain::Object>, Status> {
+    db.find_by_external_id(&format!("namespace:{namespace}"))
+        .map_err(Status::internal)
+}
+
+fn deny_unmarked_for_namespace(db: &RuntimeDb, namespace: &str) -> Result<bool, Status> {
+    Ok(markings::deny_unmarked_enabled(
+        markings::env_deny_unmarked(),
+        markings::namespace_deny_unmarked(namespace_object(db, namespace)?.as_ref()),
+    ))
+}
+
+fn principal_has_explicit_object_grant(
+    db: &RuntimeDb,
+    object_id: &str,
+    principals: &[String],
+) -> Result<bool, Status> {
+    let grants = db.list_grants(object_id).map_err(Status::internal)?;
+    if grants.is_empty() {
+        return Ok(false);
+    }
+    Ok(grants
+        .iter()
+        .any(|grant| principals.contains(&grant.principal)))
+}
+
+fn evaluate_object_marking(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    operation_id: &str,
+) -> Result<markings::MarkingCheckResult, Status> {
     if markings::object_marking_token(object).is_none() {
-        return Ok(true);
+        let deny_unmarked = deny_unmarked_for_namespace(db, &object.namespace)?;
+        let trusted = principals
+            .iter()
+            .any(|principal| markings::is_trusted_service_principal(principal));
+        let explicit_grant = principal_has_explicit_object_grant(db, &object.id, principals)?;
+        let decision_id = format!(
+            "marking:{operation_id}:{}",
+            uuid::Uuid::new_v4().as_simple()
+        );
+        return Ok(markings::MarkingCheckResult {
+            decision: markings::unmarked_access_decision(deny_unmarked, trusted, explicit_grant),
+            decision_id,
+            object_classification: None,
+            principal_ceiling: None,
+            detail: if deny_unmarked {
+                "deny_unmarked hides unmarked objects without an explicit grant".into()
+            } else {
+                "object has no classification marking".into()
+            },
+        });
     }
     let lattice = load_classification_lattice(db, &object.namespace)?;
     let authority = resolve_principal_authority(db, principals)?;
-    let result = crate::sekai::classification_lattice::evaluate_lattice_access(
-        "visibility",
-        markings::object_marking_token(object),
-        &authority,
-        lattice.as_ref(),
-    );
-    Ok(result.decision != markings::MarkingDecision::Deny)
+    Ok(
+        crate::sekai::classification_lattice::evaluate_lattice_access(
+            operation_id,
+            markings::object_marking_token(object),
+            &authority,
+            lattice.as_ref(),
+        ),
+    )
 }
 pub(super) fn object_is_visible(
     db: &RuntimeDb,
@@ -523,6 +581,7 @@ pub(super) fn object_is_visible_for(
         && check_team_namespace(db, principals, &object.namespace, false).is_ok()
         && enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
         && check_read(security, &object.id, principals).is_ok()
+        && object_passes_marking(db, object, principals).unwrap_or(false)
         && object_passes_security_policy(db, object, principals, tenant_context, operation, None)
             .unwrap_or(false)
 }
@@ -1033,6 +1092,9 @@ where
         }
         let page_len = page.len() as i32;
         for object in page {
+            if !object_passes_marking(db, &object, principals)? {
+                continue;
+            }
             if !object_passes_security_policy(
                 db,
                 &object,
@@ -1095,26 +1157,7 @@ pub(super) fn enforce_object_marking_access(
     principals: &[String],
     operation_id: &str,
 ) -> Result<markings::MarkingCheckResult, Status> {
-    if markings::object_marking_token(object).is_none() {
-        return Ok(markings::MarkingCheckResult {
-            decision: markings::MarkingDecision::NotApplicable,
-            decision_id: format!(
-                "marking:{operation_id}:{}",
-                uuid::Uuid::new_v4().as_simple()
-            ),
-            object_classification: None,
-            principal_ceiling: None,
-            detail: "object has no classification marking".into(),
-        });
-    }
-    let lattice = load_classification_lattice(db, &object.namespace)?;
-    let authority = resolve_principal_authority(db, principals)?;
-    let result = crate::sekai::classification_lattice::evaluate_lattice_access(
-        operation_id,
-        markings::object_marking_token(object),
-        &authority,
-        lattice.as_ref(),
-    );
+    let result = evaluate_object_marking(db, object, principals, operation_id)?;
     if result.decision == markings::MarkingDecision::Deny {
         // Generic denial — do not leak marking details to unauthorized callers.
         return Err(Status::permission_denied("access denied"));

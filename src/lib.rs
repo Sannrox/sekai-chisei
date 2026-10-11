@@ -20,6 +20,7 @@ pub mod transform_cli;
 pub use sekai_provider::cost_estimate;
 pub mod credential_cli;
 pub mod db;
+pub mod unmarked_cli;
 pub use sekai_domain::domain;
 pub mod domain_admin;
 pub use sekai_domain::enterprise;
