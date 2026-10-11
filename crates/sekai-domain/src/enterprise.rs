@@ -71,6 +71,31 @@ pub enum SpaceRole {
     Administrator,
 }
 
+/// What a host tenant granted one guest on one namespace (#1433). The host
+/// tenant chooses both; the guest's home-tenant authority never widens them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestGrant {
+    pub role: SpaceRole,
+    /// Highest `access_marking` the guest may see or write in the namespace.
+    /// Core evaluates this against the namespace's activated lattice when one
+    /// exists, otherwise against the default evidence ordinal.
+    pub marking_ceiling: String,
+}
+
+impl GuestGrant {
+    /// Discover needs any role, read a viewer role or above, write an editor
+    /// or administrator. Approver adds nothing: guests never approve.
+    pub fn permits(&self, action: NamespaceAction) -> bool {
+        match action {
+            NamespaceAction::Discover => true,
+            NamespaceAction::Read => !matches!(self.role, SpaceRole::Discoverer),
+            NamespaceAction::Write => {
+                matches!(self.role, SpaceRole::Editor | SpaceRole::Administrator)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedPrincipal {
     pub subject: String,
@@ -514,7 +539,12 @@ pub trait EnterpriseExtension: Send + Sync {
         context.authorize_space(action)?;
         context.authorize_credential_scope(action)?;
         if context.guest_home_tenant().is_some() {
-            return self.authorize_guest_namespace(context, namespace, action);
+            let grant = self.authorize_guest_namespace(context, namespace, action)?;
+            return if grant.permits(action) {
+                Ok(())
+            } else {
+                Err(ExtensionError::PermissionDenied)
+            };
         }
         match context.tenant.as_ref() {
             Some(tenant) => self.authorize_namespace(tenant, namespace, action),
@@ -522,18 +552,20 @@ pub trait EnterpriseExtension: Send + Sync {
         }
     }
 
-    /// Decide whether a guest context (see
-    /// [`AuthenticatedContext::guest_home_tenant`]) may act on a namespace of
-    /// its acting tenant. Default: denied, so cross-tenant access stays off
-    /// until an extension opts in explicitly. Core calls this for every guest
-    /// namespace decision, even when `authorize_authenticated_context` is
-    /// overridden.
+    /// The host tenant's current grant for a guest context (see
+    /// [`AuthenticatedContext::guest_home_tenant`]) on a namespace of its
+    /// acting tenant. Default: denied, so cross-tenant access stays off until
+    /// an extension opts in explicitly. Core calls this on every guest
+    /// decision, even when `authorize_authenticated_context` is overridden,
+    /// and enforces the returned role and marking ceiling itself. It is asked
+    /// again on every request, so a revoked or narrowed grant applies to the
+    /// next one.
     fn authorize_guest_namespace(
         &self,
         context: &AuthenticatedContext,
         namespace: &str,
         action: NamespaceAction,
-    ) -> Result<(), ExtensionError> {
+    ) -> Result<GuestGrant, ExtensionError> {
         let _ = (context, namespace, action);
         Err(ExtensionError::PermissionDenied)
     }

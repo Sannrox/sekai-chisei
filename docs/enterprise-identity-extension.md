@@ -92,14 +92,28 @@ today's behavior.
 Guests are denied by default (#1432). Core admits a guest only on the
 namespace object RPCs that make a per-namespace decision (get, list, create,
 update, delete object), and there only when the installed extension's
-`authorize_guest_namespace` allows that namespace and action. Its default is
-`PermissionDenied`, and core calls it directly, so an overridden
+`authorize_guest_namespace` returns a host grant for that namespace. Its
+default is `PermissionDenied`, and core calls it directly, so an overridden
 `authorize_authenticated_context` cannot admit a guest by accident. Guests
-never approve. Without an extension a guest is always denied. Every guest
-decision, allowed or denied, is audited as `tenant.guest_access` with the
-principal, home tenant, acting tenant, space, the namespace (or the RPC, when
-the interceptor rejects it first), and the operation. A denied
-guest read looks like a missing object.
+never approve.
+
+The extension owns guest membership: who the host tenant admitted, by which
+host administrator, and when it was revoked (#1433). It returns a
+`GuestGrant` with the host-chosen `role` and `marking_ceiling`; core enforces
+both. Discover needs any role, read a viewer role or above, write an editor
+or administrator. An object whose `access_marking` the ceiling does not
+cover, or whose token is unknown, is missing to the guest on get, excluded
+from list results and totals, and refused on create, update, and delete, even
+when the guest's own profile allows more. Coverage uses the namespace's
+activated classification lattice when one exists, otherwise the default
+evidence ordinal. Core asks for the grant on every request and caches
+nothing, so a revoked or narrowed grant applies to the next request. An RPC
+added to the guest allowlist must apply the same ceiling check. Without an
+extension a guest is always denied. Every guest decision, allowed or denied,
+is audited as `tenant.guest_access` with the principal, home tenant, acting
+tenant, space, the namespace (or the RPC, when the interceptor rejects it
+first), and the operation. Ceiling denials use operation `ceiling` and the
+object id. A denied guest read looks like a missing object.
 
 ## Compatibility
 

@@ -122,6 +122,14 @@ impl SekaiServiceImpl {
         }
         let domain_object = from_proto_obj(&object);
         validate_written_access_marking(self.db.runtime(), &domain_object)?;
+        if !guest_object_permitted(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &domain_object,
+            crate::enterprise::NamespaceAction::Write,
+        )? {
+            return Err(Status::permission_denied("access denied"));
+        }
         let mutation = precondition.as_ref().map_or_else(
             || ObjectMutation::direct(self.db.runtime()),
             |precondition| {
@@ -375,6 +383,14 @@ impl SekaiServiceImpl {
         }
         let mut domain_object = from_proto_obj(&object);
         validate_written_access_marking(self.db.runtime(), &domain_object)?;
+        if !guest_object_permitted(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &domain_object,
+            crate::enterprise::NamespaceAction::Write,
+        )? {
+            return Err(Status::permission_denied("access denied"));
+        }
         let request_object = domain_object.clone();
         let mutation = precondition.as_ref().map_or_else(
             || ObjectMutation::direct(self.db.runtime()),

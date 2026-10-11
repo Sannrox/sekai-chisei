@@ -583,6 +583,13 @@ pub(super) fn object_is_visible_for(
     !is_reserved_governance_kind(&object.kind)
         && check_team_namespace(db, principals, &object.namespace, false).is_ok()
         && enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
+        && guest_object_permitted(
+            db,
+            tenant_context,
+            object,
+            crate::enterprise::NamespaceAction::Read,
+        )
+        .unwrap_or(false)
         && check_read(security, &object.id, principals).is_ok()
         && object_passes_marking(db, object, principals).unwrap_or(false)
         && object_passes_security_policy(db, object, principals, tenant_context, operation, None)
@@ -650,6 +657,14 @@ pub(super) fn enforce_object_operation_access(
     operation_id: &str,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<markings::MarkingCheckResult, Status> {
+    let action = if operation == crate::sekai::object_security::ObjectSecurityOperation::Read {
+        crate::enterprise::NamespaceAction::Read
+    } else {
+        crate::enterprise::NamespaceAction::Write
+    };
+    if !guest_object_permitted(db, tenant_context, object, action)? {
+        return Err(Status::permission_denied("access denied"));
+    }
     let decision =
         decide_object_access(db, object, principals, tenant_context, operation, purpose)?;
     let record = crate::sekai::policy_decision::PolicyDecisionRecord {
@@ -932,7 +947,14 @@ pub(super) fn require_visible_object_contents(
     operation_id: &str,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
-    if is_reserved_governance_kind(&object.kind) {
+    if is_reserved_governance_kind(&object.kind)
+        || !guest_object_permitted(
+            db,
+            tenant_context,
+            &object,
+            crate::enterprise::NamespaceAction::Read,
+        )?
+    {
         return Err(Status::not_found("not found"));
     }
     check_team_namespace(db, principals, &object.namespace, false)?;
@@ -1095,7 +1117,14 @@ where
         }
         let page_len = page.len() as i32;
         for object in page {
-            if !object_passes_marking(db, &object, principals)? {
+            if !object_passes_marking(db, &object, principals)?
+                || !guest_object_permitted(
+                    db,
+                    tenant_context,
+                    &object,
+                    crate::enterprise::NamespaceAction::Read,
+                )?
+            {
                 continue;
             }
             if !object_passes_security_policy(
