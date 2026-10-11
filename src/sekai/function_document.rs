@@ -19,17 +19,18 @@ use crate::sekai::action_instance_admission::{
 use crate::sekai::action_policy::ActionDecision;
 use crate::sekai::document::{
     CONTENT_SCHEME_DIGEST, DOCUMENT_UNAVAILABLE, DocumentRetrieve, FIELD_CONTENT_REF,
-    FIELD_METADATA, FIELD_RENDITIONS, RENDITION_EXTRACTED_TEXT, content_digest_for,
+    FIELD_METADATA, FIELD_RENDITIONS, RENDITION_EXTRACTED_TEXT, content_digest_for, is_expired,
     retrieve_document,
 };
 use crate::sekai::function::{
     Function, FunctionBudget, FunctionHost, FunctionInvocation, LlmStepHost, PipelineStep,
     invoke_with_llm, validate_function,
 };
+use crate::sekai::governed_action_type::{GovernedActionType, OBJECT_MUTATION_CREATE};
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 use crate::sekai::object_security::PrincipalPolicyContext;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 pub const EXTRACTED_TEXT_PARAM: &str = "extracted_text";
 pub const LINEAGE_DOCUMENT_ID: &str = "lineage_document_id";
@@ -37,7 +38,6 @@ pub const LINEAGE_PARENT_CONTENT_DIGEST: &str = "lineage_parent_content_digest";
 pub const LINEAGE_RENDITION_DIGEST: &str = "lineage_rendition_digest";
 pub const DOCUMENT_OBJECT_KIND: &str = "document";
 pub const CONFIDENCE_FIELD: &str = "confidence_micros";
-const MAX_PROPERTIES_JSON_BYTES: usize = 1_024;
 
 /// Graph object id for a governed document's lineage stub.
 pub fn document_lineage_object_id(namespace: &str, document_id: &str) -> String {
@@ -200,8 +200,7 @@ pub fn extract_from_rendition(
         updated: now_ms,
     };
     if (confidence as u32) < llm.minimum_confidence_micros {
-        let instance =
-            park_extraction(db, actor, namespace, now_ms, &action, &object, &invocation)?;
+        let instance = park_extraction(db, actor, namespace, now_ms, &action, &object)?;
         return Ok(FunctionDocumentExtract::Parked {
             instance: Box::new(instance),
             invocation,
@@ -254,7 +253,12 @@ fn object_properties(structured: &serde_json::Value) -> Result<HashMap<String, S
         if matches!(key.as_str(), "id" | "name" | CONFIDENCE_FIELD) {
             continue;
         }
-        if key == OBJECT_CLASSIFICATION_PROPERTY || key.starts_with("lineage_") {
+        // `object_id` and `notify_delivery` are Action control parameters
+        // when a low-confidence extraction parks.
+        if key == OBJECT_CLASSIFICATION_PROPERTY
+            || key.starts_with("lineage_")
+            || matches!(key.as_str(), "object_id" | "notify_delivery")
+        {
             return Err(format!(
                 "function document extract property {key} is reserved"
             ));
@@ -298,14 +302,133 @@ fn persist_extracted_object(
         now_ms,
     )?;
     db.create_object_with_audit(object, actor)?;
+    link_derived_from(db, object, lineage_id, now_ms)
+}
+
+fn link_derived_from(
+    db: &RuntimeDb,
+    object: &Object,
+    lineage_id: String,
+    now_ms: i64,
+) -> Result<(), String> {
+    let id = format!("link:{}:{lineage_id}", object.id);
+    if db.get_link(&id)?.is_some() {
+        return Ok(());
+    }
     db.create_link(&Link {
-        id: format!("link:{}:{lineage_id}", object.id),
+        id,
         from_id: object.id.clone(),
         to_id: lineage_id,
         relation: REL_DERIVED_FROM.into(),
         created: now_ms,
-    })?;
+    })
+}
+
+/// Document lineage an object claims through its `lineage_*` properties.
+struct ClaimedLineage<'a> {
+    document_id: &'a str,
+    parent_content_digest: &'a str,
+    rendition_digest: &'a str,
+    classification: &'a str,
+}
+
+fn claimed_lineage(object: &Object) -> Result<Option<ClaimedLineage<'_>>, String> {
+    let Some(document_id) = object.properties.get(LINEAGE_DOCUMENT_ID) else {
+        return Ok(None);
+    };
+    let field = |key: &str| {
+        object
+            .properties
+            .get(key)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("document lineage requires {key}"))
+    };
+    Ok(Some(ClaimedLineage {
+        document_id,
+        parent_content_digest: field(LINEAGE_PARENT_CONTENT_DIGEST)?,
+        rendition_digest: field(LINEAGE_RENDITION_DIGEST)?,
+        classification: field(OBJECT_CLASSIFICATION_PROPERTY)?,
+    }))
+}
+
+/// Pre-write check for an object written through a governed Action that
+/// claims document lineage, such as a granted parked extraction (#1383).
+/// The claim must still match the live document, its classification, and
+/// an `extracted_text` rendition, so a grant cannot write stale lineage.
+/// Like the above-threshold path, this reads before the write commits: an
+/// object derived from a document deleted in between is the same as one
+/// written just before the delete, and a stub id taken in between leaves
+/// the link to completion rather than widening the grant transaction.
+pub(crate) fn validate_lineage_write(
+    db: &RuntimeDb,
+    object: &Object,
+    now_ms: i64,
+) -> Result<(), String> {
+    let Some(claim) = claimed_lineage(object)? else {
+        return Ok(());
+    };
+    let document = db
+        .get_governed_document(&object.namespace, claim.document_id)?
+        .filter(|document| document.deleted_at_ms == 0 && !is_expired(document, now_ms))
+        .ok_or_else(|| DOCUMENT_UNAVAILABLE.to_string())?;
+    if document.content_digest != claim.parent_content_digest
+        || document.classification != claim.classification
+    {
+        return Err("document lineage does not match the document".into());
+    }
+    let rendition_matches = db
+        .list_governed_renditions(&object.namespace, claim.document_id)?
+        .iter()
+        .any(|rendition| {
+            rendition.class == RENDITION_EXTRACTED_TEXT
+                && rendition.parent_content_digest == claim.parent_content_digest
+                && rendition.content_ref.digest == claim.rendition_digest
+        });
+    if !rendition_matches {
+        return Err("document lineage does not match an extracted_text rendition".into());
+    }
+    // Completion runs after the write commits, so refuse here what it could
+    // never repair: an incompatible object holding the stub id.
+    let lineage_id = document_lineage_object_id(&object.namespace, claim.document_id);
+    if object.id == lineage_id {
+        return Err("document lineage stub id is reserved".into());
+    }
+    if let Some(existing) = db.get_object(&lineage_id)? {
+        check_lineage_stub(
+            &existing,
+            &object.namespace,
+            claim.document_id,
+            claim.parent_content_digest,
+            claim.classification,
+        )?;
+    }
     Ok(())
+}
+
+/// Post-write completion for an object validated by
+/// [`validate_lineage_write`]: ensures the document stub and the
+/// `derived_from` link. Idempotent, so an admission replay finishes a link
+/// an interrupted write skipped.
+pub(crate) fn complete_lineage_write(
+    db: &RuntimeDb,
+    actor: &str,
+    object: &Object,
+    now_ms: i64,
+) -> Result<(), String> {
+    let Some(claim) = claimed_lineage(object)? else {
+        return Ok(());
+    };
+    let lineage_id = ensure_document_lineage_object(
+        db,
+        actor,
+        &object.namespace,
+        claim.document_id,
+        claim.parent_content_digest,
+        claim.classification,
+        now_ms,
+    )?;
+    link_derived_from(db, object, lineage_id, now_ms)
 }
 
 fn ensure_document_lineage_object(
@@ -320,28 +443,13 @@ fn ensure_document_lineage_object(
     let lineage_id = document_lineage_object_id(namespace, document_id);
     match db.get_object(&lineage_id)? {
         Some(existing) => {
-            if existing.kind != DOCUMENT_OBJECT_KIND
-                || existing.namespace != namespace
-                || existing
-                    .properties
-                    .get(LINEAGE_DOCUMENT_ID)
-                    .map(String::as_str)
-                    != Some(document_id)
-                || existing
-                    .properties
-                    .get(LINEAGE_PARENT_CONTENT_DIGEST)
-                    .map(String::as_str)
-                    != Some(parent_content_digest)
-                || existing
-                    .properties
-                    .get(OBJECT_CLASSIFICATION_PROPERTY)
-                    .map(String::as_str)
-                    != Some(classification)
-            {
-                return Err(
-                    "function document extract lineage object does not match the document".into(),
-                );
-            }
+            check_lineage_stub(
+                &existing,
+                namespace,
+                document_id,
+                parent_content_digest,
+                classification,
+            )?;
         }
         None => {
             db.create_object_with_audit(
@@ -369,12 +477,31 @@ fn ensure_document_lineage_object(
     Ok(lineage_id)
 }
 
+fn check_lineage_stub(
+    existing: &Object,
+    namespace: &str,
+    document_id: &str,
+    parent_content_digest: &str,
+    classification: &str,
+) -> Result<(), String> {
+    let prop = |key: &str| existing.properties.get(key).map(String::as_str);
+    if existing.kind != DOCUMENT_OBJECT_KIND
+        || existing.namespace != namespace
+        || prop(LINEAGE_DOCUMENT_ID) != Some(document_id)
+        || prop(LINEAGE_PARENT_CONTENT_DIGEST) != Some(parent_content_digest)
+        || prop(OBJECT_CLASSIFICATION_PROPERTY) != Some(classification)
+    {
+        return Err("function document extract lineage object does not match the document".into());
+    }
+    Ok(())
+}
+
 fn require_approval_policy(
     db: &RuntimeDb,
     actor: &str,
     namespace: &str,
     action: &FunctionDocumentAction,
-) -> Result<(), String> {
+) -> Result<GovernedActionType, String> {
     let type_def =
         db.require_enabled_governed_action_type(namespace, &action.type_id, &action.version)?;
     let policy_project = if type_def.policy_scope.trim().is_empty() {
@@ -390,7 +517,7 @@ fn require_approval_policy(
     if decision != ActionDecision::RequireApproval {
         return Err("function document extract requires require_approval".into());
     }
-    Ok(())
+    Ok(type_def)
 }
 
 fn park_extraction(
@@ -400,47 +527,33 @@ fn park_extraction(
     now_ms: i64,
     action: &FunctionDocumentAction,
     object: &Object,
-    invocation: &FunctionInvocation,
 ) -> Result<ActionInstance, String> {
-    require_approval_policy(db, actor, namespace, action)?;
-    let confidence: u32 = object
+    let type_def = require_approval_policy(db, actor, namespace, action)?;
+    // A grant writes the object through the type's own create mutation, so
+    // refuse a type whose grant would write nothing or another kind.
+    if type_def.object_kind.trim() != object.kind
+        || type_def.object_mutation.trim() != OBJECT_MUTATION_CREATE
+    {
+        return Err(format!(
+            "function document extract action must create {} objects on grant",
+            object.kind
+        ));
+    }
+    // Parameters are the object's own properties, so the granted create
+    // writes the same object, classification and lineage included.
+    let mut parameters = serde_json::Map::new();
+    parameters.insert("object_id".into(), object.id.clone().into());
+    parameters.insert("name".into(), object.name.clone().into());
+    for (key, value) in &object.properties {
+        parameters.insert(key.clone(), value.clone().into());
+    }
+    let confidence: u64 = object
         .properties
         .get(CONFIDENCE_FIELD)
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| "function document extract confidence_micros is missing".to_string())?;
-    let properties_json = serde_json::to_string(&BTreeMap::from_iter(
-        object
-            .properties
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone())),
-    ))
-    .map_err(|error| format!("function document extract properties_json: {error}"))?;
-    if properties_json.len() > MAX_PROPERTIES_JSON_BYTES {
-        return Err("function document extract properties_json exceeds parameter limit".into());
-    }
-    let parameters = serde_json::json!({
-        "object_id": object.id,
-        "name": object.name,
-        "object_kind": object.kind,
-        "confidence_micros": confidence,
-        "lineage_document_id": object
-            .properties
-            .get(LINEAGE_DOCUMENT_ID)
-            .cloned()
-            .unwrap_or_default(),
-        "lineage_parent_content_digest": object
-            .properties
-            .get(LINEAGE_PARENT_CONTENT_DIGEST)
-            .cloned()
-            .unwrap_or_default(),
-        "lineage_rendition_digest": object
-            .properties
-            .get(LINEAGE_RENDITION_DIGEST)
-            .cloned()
-            .unwrap_or_default(),
-        "properties_json": properties_json,
-        "input_digest": invocation.receipt.input_digest,
-    });
+    parameters.insert(CONFIDENCE_FIELD.into(), confidence.into());
+    let parameters = serde_json::Value::Object(parameters);
     let outcome = ActionInstanceAdmission::new(db, None)
         .admit(
             ActionInstanceAdmissionRequest {
@@ -483,7 +596,8 @@ mod tests {
         GovernedDocument, TYPE_REVISION_V1, admit_document, attach_rendition,
     };
     use crate::sekai::function::{FuncParam, FunctionBudget, FunctionHost, LlmStep, PipelineStep};
-    use crate::sekai::governed_action_type::{EFFECT_KIND_NOTIFY, GovernedActionType};
+    use crate::sekai::governed_action_type::EFFECT_KIND_NOTIFY;
+    use crate::sekai::governed_action_type::{GovernedActionType, OBJECT_MUTATION_CREATE};
     use crate::sekai::markings::{
         PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY, PRINCIPAL_PROFILE_KIND,
         PRINCIPAL_PROFILE_SEALED_PROPERTY, principal_profile_external_id,
@@ -496,6 +610,7 @@ mod tests {
     const ONTOLOGY_DIGEST: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const EXTRACTED: &str = "Invoice ACME 40.00";
+    const EXTRACT_PARAMETER_SCHEMA: &str = r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"},"vendor":{"type":"string"},"confidence_micros":{"type":"integer","minimum":0,"maximum":1000000},"access_marking":{"type":"string"},"lineage_document_id":{"type":"string"},"lineage_parent_content_digest":{"type":"string"},"lineage_rendition_digest":{"type":"string"}},"required":["object_id","confidence_micros","access_marking","lineage_document_id","lineage_parent_content_digest","lineage_rendition_digest"],"additionalProperties":false}"#;
 
     struct RecordingHost {
         output: serde_json::Value,
@@ -631,6 +746,19 @@ mod tests {
     }
 
     fn seed_action(runtime: &RuntimeDb) {
+        seed_action_creating(runtime, "invoice", OBJECT_MUTATION_CREATE);
+    }
+
+    fn seed_action_creating(runtime: &RuntimeDb, object_kind: &str, object_mutation: &str) {
+        runtime
+            .upsert_object_type(&crate::sekai::schema::ObjectType {
+                kind: "invoice".into(),
+                description: "Extracted invoice".into(),
+                properties: vec![],
+                is_builtin: false,
+                implements: vec![],
+            })
+            .unwrap();
         runtime
             .put_governed_action_type(
                 GovernedActionType {
@@ -638,12 +766,12 @@ mod tests {
                     type_id: "function.extract_object".into(),
                     version: "1".into(),
                     description: "park a low-confidence extraction".into(),
-                    parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"},"object_kind":{"type":"string"},"confidence_micros":{"type":"integer","minimum":0,"maximum":1000000},"lineage_document_id":{"type":"string"},"lineage_parent_content_digest":{"type":"string"},"lineage_rendition_digest":{"type":"string"},"properties_json":{"type":"string","maxLength":1024},"input_digest":{"type":"string"}},"required":["object_id","object_kind","confidence_micros","lineage_document_id","lineage_parent_content_digest","lineage_rendition_digest","properties_json"],"additionalProperties":false}"#.into(),
+                    parameter_schema_json: EXTRACT_PARAMETER_SCHEMA.into(),
                     allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
                     policy_scope: String::new(),
                     budget_scope: String::new(),
-                    object_kind: String::new(),
-                    object_mutation: String::new(),
+                    object_kind: object_kind.into(),
+                    object_mutation: object_mutation.into(),
                     enabled: true,
                     created_by: String::new(),
                     created_at_ms: 0,
@@ -800,14 +928,9 @@ mod tests {
         assert!(runtime.get_object("inv-low").unwrap().is_none());
         let parameters: serde_json::Value =
             serde_json::from_str(&instance.parameters_json).unwrap();
-        assert_eq!(parameters["object_kind"], "invoice");
+        assert_eq!(parameters["vendor"], "ACME");
         assert_eq!(parameters["confidence_micros"], 100_000);
-        assert!(
-            parameters["properties_json"]
-                .as_str()
-                .unwrap()
-                .contains("ACME")
-        );
+        assert_eq!(parameters[OBJECT_CLASSIFICATION_PROPERTY], "internal");
         let inbox = runtime
             .list_action_instances("records", None, Some(STATUS_PARKED), 10)
             .unwrap();
@@ -926,6 +1049,203 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("require_approval"));
         assert!(runtime.get_object("inv-low").unwrap().is_none());
+        assert!(
+            runtime
+                .list_action_instances("records", None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn grant(runtime: &RuntimeDb, instance_id: &str) -> ActionInstance {
+        use crate::sekai::action_instance::DECISION_GRANT;
+        use crate::sekai::action_instance_admission::ActionInstanceDecisionRequest;
+        ActionInstanceAdmission::new(runtime, None)
+            .decide(
+                ActionInstanceDecisionRequest {
+                    instance_id: instance_id.into(),
+                    decision: DECISION_GRANT.into(),
+                    reason: String::new(),
+                    decider_principals: vec!["approver".into()],
+                    decider_is_namespace_admin: true,
+                },
+                "approver",
+                3_000,
+            )
+            .unwrap()
+            .instance
+    }
+
+    fn park_low_confidence(runtime: &RuntimeDb) -> Box<ActionInstance> {
+        let (result, _) = extract(
+            runtime,
+            &extract_function(800_000),
+            EXTRACTED,
+            serde_json::json!({
+                "id": "inv-low",
+                "vendor": "ACME",
+                "confidence_micros": 100_000
+            }),
+        )
+        .unwrap();
+        let FunctionDocumentExtract::Parked { instance, .. } = result else {
+            panic!("expected parked action");
+        };
+        instance
+    }
+
+    #[test]
+    fn granting_a_parked_extraction_writes_the_object_with_classification_and_lineage() {
+        let runtime = db();
+        let text_digest = admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        let instance = park_low_confidence(&runtime);
+        assert_eq!(grant(&runtime, &instance.instance_id).status, "admitted");
+
+        let object = runtime.get_object("inv-low").unwrap().unwrap();
+        assert_eq!(object.kind, "invoice");
+        let props = &object.properties;
+        assert_eq!(props["vendor"], "ACME");
+        assert_eq!(props[CONFIDENCE_FIELD], "100000");
+        assert_eq!(props[OBJECT_CLASSIFICATION_PROPERTY], "internal");
+        assert_eq!(props[LINEAGE_DOCUMENT_ID], "doc:invoice");
+        assert_eq!(props[LINEAGE_RENDITION_DIGEST], text_digest);
+        assert!(!props.contains_key("properties_json"));
+        let lineage_id = document_lineage_object_id("records", "doc:invoice");
+        let lineage = runtime.get_lineage("inv-low", 8).unwrap();
+        assert!(
+            lineage
+                .nodes
+                .iter()
+                .any(|item| item.object.id == lineage_id)
+        );
+        let link = runtime
+            .get_link(&format!("link:inv-low:{lineage_id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.relation, REL_DERIVED_FROM);
+
+        // A retried grant finishes a link an interrupted completion skipped.
+        runtime.delete_link(&link.id).unwrap();
+        assert_eq!(grant(&runtime, &instance.instance_id).status, "admitted");
+        assert!(runtime.get_link(&link.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn extracted_action_control_keys_are_reserved() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        let mut function = extract_function(800_000);
+        if let PipelineStep::Llm(step) = &mut function.pipeline[0] {
+            step.output_schema = r#"{"type":"object","properties":{"id":{"type":"string"},"vendor":{"type":"string"},"confidence_micros":{"type":"integer"}},"required":["id","vendor","confidence_micros"],"additionalProperties":true}"#.into();
+        }
+        for key in ["object_id", "notify_delivery"] {
+            let error = extract(
+                &runtime,
+                &function,
+                EXTRACTED,
+                serde_json::json!({
+                    "id": "inv-low",
+                    "vendor": "ACME",
+                    "confidence_micros": 100_000,
+                    key: "other"
+                }),
+            )
+            .unwrap_err();
+            assert!(error.contains("reserved"), "{key}: {error}");
+        }
+        assert!(
+            runtime
+                .list_action_instances("records", None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn grant_after_the_document_is_deleted_fails_closed_without_writing() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        let instance = park_low_confidence(&runtime);
+        crate::sekai::document::delete_document(
+            &runtime,
+            "analyst",
+            "records",
+            "doc:invoice",
+            2_500,
+        )
+        .unwrap();
+        use crate::sekai::action_instance::DECISION_GRANT;
+        use crate::sekai::action_instance_admission::ActionInstanceDecisionRequest;
+        let result = ActionInstanceAdmission::new(&runtime, None).decide(
+            ActionInstanceDecisionRequest {
+                instance_id: instance.instance_id.clone(),
+                decision: DECISION_GRANT.into(),
+                reason: String::new(),
+                decider_principals: vec!["approver".into()],
+                decider_is_namespace_admin: true,
+            },
+            "approver",
+            3_000,
+        );
+        assert!(result.is_err(), "{result:?}");
+        assert!(runtime.get_object("inv-low").unwrap().is_none());
+    }
+
+    #[test]
+    fn grant_refuses_an_incompatible_lineage_stub_before_writing() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        let instance = park_low_confidence(&runtime);
+        runtime
+            .create_object(&Object {
+                id: document_lineage_object_id("records", "doc:invoice"),
+                kind: "invoice".into(),
+                name: "squatter".into(),
+                namespace: "records".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 2_500,
+                updated: 2_500,
+            })
+            .unwrap();
+        use crate::sekai::action_instance::DECISION_GRANT;
+        use crate::sekai::action_instance_admission::ActionInstanceDecisionRequest;
+        let result = ActionInstanceAdmission::new(&runtime, None).decide(
+            ActionInstanceDecisionRequest {
+                instance_id: instance.instance_id.clone(),
+                decision: DECISION_GRANT.into(),
+                reason: String::new(),
+                decider_principals: vec!["approver".into()],
+                decider_is_namespace_admin: true,
+            },
+            "approver",
+            3_000,
+        );
+        assert!(result.is_err(), "{result:?}");
+        assert!(runtime.get_object("inv-low").unwrap().is_none());
+    }
+
+    #[test]
+    fn park_refuses_a_type_whose_grant_writes_nothing() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action_creating(&runtime, "", "");
+        let error = extract(
+            &runtime,
+            &extract_function(800_000),
+            EXTRACTED,
+            serde_json::json!({
+                "id": "inv-low",
+                "vendor": "ACME",
+                "confidence_micros": 100_000
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("must create invoice objects"), "{error}");
         assert!(
             runtime
                 .list_action_instances("records", None, None, 10)

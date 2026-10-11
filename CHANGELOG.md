@@ -9,6 +9,10 @@
   `LlmStep.minimum_confidence_micros` parks a `require_approval` Action
   instead of writing the object. Scores and thresholds above 1_000_000 fail
   closed. `LlmStep` gains additive field 5 for the threshold (#1326).
+  The parked Action type must create the extracted kind. Granting it writes
+  the same object, classification and `derived_from` lineage included,
+  after re-checking the lineage against the live document and rendition
+  (#1383).
 - LLM function revisions are a governed evaluation subject. A fixture set is
   invoked, each output is retained as evidence at the union of input markings,
   and the existing `stochastic_model/v1` rubric scores it. A score below the
