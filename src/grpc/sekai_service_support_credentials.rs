@@ -548,19 +548,78 @@ pub(super) fn enforce_namespace_tenant_context_for(
     }
     result
 }
-/// Cross-tenant (guest) namespace decision (#1432): only an installed
-/// extension's explicit guest authorization admits it.
+/// Cross-tenant (guest) namespace decision (#1432): only a host grant from
+/// the installed extension whose role permits `action` admits it.
 fn authorize_guest(
     db: &RuntimeDb,
     context: &RequestEnterpriseContext,
     namespace: &str,
     action: crate::enterprise::NamespaceAction,
 ) -> Result<(), Status> {
-    match db.enterprise_extension() {
-        Some(extension) => extension
-            .authorize_guest_namespace(context, namespace, action)
-            .map_err(extension_status),
-        None => Err(Status::permission_denied("enterprise authorization denied")),
+    guest_grant(db, context, namespace, action).map(|_| ())
+}
+
+fn guest_grant(
+    db: &RuntimeDb,
+    context: &RequestEnterpriseContext,
+    namespace: &str,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<crate::enterprise::GuestGrant, Status> {
+    let denied = || Status::permission_denied("enterprise authorization denied");
+    let grant = db
+        .enterprise_extension()
+        .ok_or_else(denied)?
+        .authorize_guest_namespace(context, namespace, action)
+        .map_err(extension_status)?;
+    grant.permits(action).then_some(grant).ok_or_else(denied)
+}
+
+/// Whether a guest may see (`Read`) or write (`Write`) this object: the host
+/// grant's marking ceiling must cover its `access_marking` (#1433). An
+/// activated lattice uses dominance; otherwise the evidence ordinal.
+/// Unparsable or unknown tokens fail closed. Non-guests always pass here.
+pub(super) fn guest_object_permitted(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: &domain::Object,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<bool, Status> {
+    let Some(context) = tenant_context.filter(|context| context.guest_home_tenant().is_some())
+    else {
+        return Ok(true);
+    };
+    let grant = match guest_grant(db, context, &object.namespace, action) {
+        Ok(grant) => grant,
+        Err(status) if status.code() == tonic::Code::PermissionDenied => return Ok(false),
+        Err(status) => return Err(status),
+    };
+    let permitted = guest_ceiling_covers(db, object, &grant.marking_ceiling)?;
+    if !permitted {
+        crate::grpc::record_guest_access(db, context, &object.id, "ceiling", false)
+            .map_err(Status::internal)?;
+    }
+    Ok(permitted)
+}
+
+fn guest_ceiling_covers(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    ceiling: &str,
+) -> Result<bool, Status> {
+    let Some(marking) = markings::object_marking_token(object) else {
+        return Ok(true);
+    };
+    match load_classification_lattice(db, &object.namespace)? {
+        Some(lattice) => Ok(lattice.dominates(ceiling, marking).unwrap_or(false)),
+        None => {
+            let (Ok(ceiling), Ok(marking)) = (
+                markings::parse_classification(ceiling),
+                markings::parse_classification(marking),
+            ) else {
+                return Ok(false);
+            };
+            Ok(marking <= ceiling)
+        }
     }
 }
 

@@ -13325,8 +13325,21 @@ fn guest_context() -> crate::enterprise::AuthenticatedContext {
     }
 }
 
-/// Opts guests in for namespace `shared` only, on any action.
-struct GuestSharedExtension;
+/// Host grant for guests on namespace `shared` only; `None` revokes it.
+struct GuestSharedExtension(std::sync::Mutex<Option<crate::enterprise::GuestGrant>>);
+
+impl GuestSharedExtension {
+    fn granting(role: crate::enterprise::SpaceRole, ceiling: &str) -> Self {
+        Self(std::sync::Mutex::new(Some(crate::enterprise::GuestGrant {
+            role,
+            marking_ceiling: ceiling.into(),
+        })))
+    }
+
+    fn editor() -> Self {
+        Self::granting(crate::enterprise::SpaceRole::Editor, "restricted")
+    }
+}
 
 impl crate::enterprise::EnterpriseExtension for GuestSharedExtension {
     fn authenticate_bearer(
@@ -13370,9 +13383,10 @@ impl crate::enterprise::EnterpriseExtension for GuestSharedExtension {
         context: &crate::enterprise::AuthenticatedContext,
         namespace: &str,
         _action: crate::enterprise::NamespaceAction,
-    ) -> Result<(), crate::enterprise::ExtensionError> {
-        (context.guest_home_tenant() == Some("tenant-home") && namespace == "shared")
-            .then_some(())
+    ) -> Result<crate::enterprise::GuestGrant, crate::enterprise::ExtensionError> {
+        let grant = self.0.lock().unwrap().clone();
+        grant
+            .filter(|_| context.guest_home_tenant() == Some("tenant-home") && namespace == "shared")
             .ok_or(crate::enterprise::ExtensionError::PermissionDenied)
     }
 
@@ -13461,8 +13475,11 @@ fn guest_access_needs_explicit_extension_opt_in() {
     );
 
     let db = RuntimeDb::Sqlite(Arc::new(
-        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(GuestSharedExtension)))
-            .unwrap(),
+        SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(GuestSharedExtension::editor())),
+        )
+        .unwrap(),
     ));
     assert!(enforce_namespace_tenant_context(&db, Some(&guest_context()), "shared", false).is_ok());
     assert!(enforce_namespace_tenant_context(&db, Some(&guest_context()), "shared", true).is_ok());
@@ -13505,8 +13522,11 @@ fn guest_access_needs_explicit_extension_opt_in() {
 fn guest_credentials_reach_only_namespace_checked_rpcs() {
     use tonic::service::Interceptor;
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
-        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(GuestSharedExtension)))
-            .unwrap(),
+        SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(GuestSharedExtension::editor())),
+        )
+        .unwrap(),
     )));
     let mut interceptor = crate::grpc::TokenAuthInterceptor::new(
         Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
@@ -13560,4 +13580,306 @@ fn guest_credentials_reach_only_namespace_checked_rpcs() {
             }
         }
     }
+}
+
+fn guest_service(extension: Arc<GuestSharedExtension>) -> SekaiServiceImpl {
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension)).unwrap(),
+    )));
+    SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
+}
+
+fn seed_marked(svc: &SekaiServiceImpl, id: &str, marking: &str) {
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: id.into(),
+            kind: "widget".into(),
+            name: id.into(),
+            namespace: "shared".into(),
+            external_id: format!("widget:{id}"),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                marking.into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+}
+
+fn pin_guest_profile(svc: &SekaiServiceImpl, ceiling: &str) {
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "profile-subject-a".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "subject-a".into(),
+            namespace: "shared".into(),
+            external_id: markings::principal_profile_external_id("subject-a"),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    ceiling.into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    grant_object_role(svc, "profile-subject-a", "root", security::Role::Admin);
+}
+
+fn guest_get(id: &str) -> Request<GetObjectRequest> {
+    let mut req = with_named_principal(GetObjectRequest { id: id.into() }, "subject-a");
+    req.extensions_mut().insert(guest_context());
+    req
+}
+
+#[test]
+fn guest_role_bounds_the_namespace_action() {
+    let viewer = Arc::new(GuestSharedExtension::granting(
+        crate::enterprise::SpaceRole::Viewer,
+        "restricted",
+    ));
+    let svc = guest_service(viewer.clone());
+    let db = svc.db.runtime();
+    let guest = guest_context();
+    assert!(enforce_namespace_tenant_context(db, Some(&guest), "shared", false).is_ok());
+    assert!(enforce_namespace_tenant_context(db, Some(&guest), "shared", true).is_err());
+    let discoverer =
+        GuestSharedExtension::granting(crate::enterprise::SpaceRole::Discoverer, "restricted");
+    *viewer.0.lock().unwrap() = discoverer.0.lock().unwrap().clone();
+    assert!(
+        enforce_namespace_tenant_context_for(
+            db,
+            Some(&guest),
+            "shared",
+            crate::enterprise::NamespaceAction::Discover
+        )
+        .is_ok()
+    );
+    assert!(enforce_namespace_tenant_context(db, Some(&guest), "shared", false).is_err());
+}
+
+#[tokio::test]
+async fn guest_is_capped_by_the_host_ceiling_and_revocation_is_next_request() {
+    let extension = Arc::new(GuestSharedExtension::granting(
+        crate::enterprise::SpaceRole::Viewer,
+        "internal",
+    ));
+    let svc = guest_service(extension.clone());
+    seed_marked(&svc, "w-internal", "internal");
+    seed_marked(&svc, "w-confidential", "confidential");
+    // The guest's own profile would allow restricted; the host grant caps it.
+    pin_guest_profile(&svc, "restricted");
+
+    assert_eq!(
+        svc.get_object(guest_get("w-internal"))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap()
+            .id,
+        "w-internal"
+    );
+    let above = svc
+        .get_object(guest_get("w-confidential"))
+        .await
+        .unwrap_err();
+    let missing = svc
+        .get_object(guest_get("no-such-object"))
+        .await
+        .unwrap_err();
+    assert_eq!(above.code(), tonic::Code::NotFound);
+    assert_eq!(above.code(), missing.code());
+
+    let mut list = with_named_principal(
+        ListObjectsRequest {
+            filter: Some(ListFilter {
+                namespace: "shared".into(),
+                kind: "widget".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "subject-a",
+    );
+    list.extensions_mut().insert(guest_context());
+    let listed = svc.list_objects(list).await.unwrap().into_inner();
+    let ids: Vec<_> = listed
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect();
+    assert_eq!(ids, ["w-internal"]);
+    assert_eq!(listed.total, 1);
+
+    let decisions = guest_decisions(svc.db.runtime());
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.target_id == "w-confidential"
+                && decision.outcome == "denied"
+                && decision.evidence["operation"] == "ceiling"
+                && decision.evidence["home_tenant"] == "tenant-home"
+                && decision.evidence["acting_tenant"] == "tenant-test"),
+        "{decisions:?}"
+    );
+
+    *extension.0.lock().unwrap() = None;
+    assert_eq!(
+        svc.get_object(guest_get("w-internal"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+}
+
+#[test]
+fn guest_writes_stay_under_role_and_ceiling() {
+    let svc = guest_service(Arc::new(GuestSharedExtension::granting(
+        crate::enterprise::SpaceRole::Editor,
+        "internal",
+    )));
+    let db = svc.db.runtime();
+    let guest = guest_context();
+    let object = |marking: &str| domain::Object {
+        id: "w".into(),
+        kind: "widget".into(),
+        name: "w".into(),
+        namespace: "shared".into(),
+        external_id: String::new(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            marking.into(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    let write = crate::enterprise::NamespaceAction::Write;
+    assert!(guest_object_permitted(db, Some(&guest), &object("internal"), write).unwrap());
+    assert!(!guest_object_permitted(db, Some(&guest), &object("confidential"), write).unwrap());
+    // Unknown markings fail closed for guests.
+    assert!(!guest_object_permitted(db, Some(&guest), &object("secret-ish"), write).unwrap());
+    // Non-guests are not affected by guest grants.
+    assert!(
+        guest_object_permitted(
+            db,
+            Some(&test_tenant_context()),
+            &object("restricted"),
+            write
+        )
+        .unwrap()
+    );
+}
+
+fn shared_health_lattice() -> crate::sekai::classification_lattice::ClassificationLattice {
+    crate::sekai::classification_lattice::ClassificationLattice {
+        contract_version: crate::sekai::classification_lattice::CLASSIFICATION_LATTICE_VERSION
+            .into(),
+        namespace: "shared".into(),
+        tokens: vec![
+            "public".into(),
+            "internal".into(),
+            "confidential".into(),
+            "secret".into(),
+            "health".into(),
+        ],
+        parents: BTreeMap::from([
+            ("public".into(), vec!["internal".into()]),
+            ("internal".into(), vec!["confidential".into()]),
+            ("confidential".into(), vec!["secret".into()]),
+            ("health".into(), vec!["secret".into()]),
+        ]),
+        incomparable: vec![("confidential".into(), "health".into())],
+    }
+}
+
+#[tokio::test]
+async fn guest_ceiling_follows_activated_lattice() {
+    let extension = Arc::new(GuestSharedExtension::granting(
+        crate::enterprise::SpaceRole::Editor,
+        "secret",
+    ));
+    let svc = guest_service(extension.clone());
+    seed_marked(&svc, "w-health", "health");
+    pin_guest_profile(&svc, "secret");
+    // Custom tokens are unknown on the default ordinal.
+    assert_eq!(
+        svc.get_object(guest_get("w-health"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+
+    svc.db
+        .runtime()
+        .put_classification_lattice(&shared_health_lattice(), "root", 10)
+        .unwrap();
+    assert_eq!(
+        svc.get_object(guest_get("w-health"))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap()
+            .id,
+        "w-health"
+    );
+
+    *extension.0.lock().unwrap() = Some(crate::enterprise::GuestGrant {
+        role: crate::enterprise::SpaceRole::Editor,
+        marking_ceiling: "confidential".into(),
+    });
+    assert_eq!(
+        svc.get_object(guest_get("w-health"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    let write = crate::enterprise::NamespaceAction::Write;
+    let health = domain::Object {
+        id: "w-health".into(),
+        kind: "widget".into(),
+        name: "w-health".into(),
+        namespace: "shared".into(),
+        external_id: String::new(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "health".into(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    assert!(
+        !guest_object_permitted(svc.db.runtime(), Some(&guest_context()), &health, write).unwrap()
+    );
+    *extension.0.lock().unwrap() = Some(crate::enterprise::GuestGrant {
+        role: crate::enterprise::SpaceRole::Editor,
+        marking_ceiling: "secret".into(),
+    });
+    assert!(
+        guest_object_permitted(svc.db.runtime(), Some(&guest_context()), &health, write).unwrap()
+    );
+
+    let decisions = guest_decisions(svc.db.runtime());
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|decision| decision.target_id == "w-health"
+                && decision.outcome == "denied"
+                && decision.evidence["operation"] == "ceiling")
+            .count(),
+        3,
+        "{decisions:?}"
+    );
 }

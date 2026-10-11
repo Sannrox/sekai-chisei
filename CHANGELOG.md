@@ -8,6 +8,14 @@
   namespace and action (default deny); they reach only the namespace object
   RPCs and never approve. Every guest decision is audited with both tenants.
   Extensions must set the new field (`GATE:break`, #1432).
+- `authorize_guest_namespace` returns the host tenant's `GuestGrant`: a
+  role and a marking ceiling. Guests get only that role and never see or
+  write objects the ceiling does not cover, whatever their home authority.
+  An activated namespace lattice evaluates the ceiling with dominance;
+  otherwise the evidence ordinal. Ceiling denials are audited. Grants are
+  asked for on every request, so revocation applies to the next one.
+  Extensions implementing the hook must return the grant (`GATE:break`,
+  #1433).
 
 - Derived transform outputs inherit the union of input object and row
   `access_marking` values. Unknown input markings fail closed with no output
