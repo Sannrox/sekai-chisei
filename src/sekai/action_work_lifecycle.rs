@@ -185,14 +185,21 @@ impl<'a> ActionWorkLifecycle<'a> {
             ));
         }
         if command.outcome == ACK_OUTCOME_COMPLETED {
-            let already_completed = self
+            let stored_effect = self
                 .db
                 .get_action_effect(command.effect_id)
-                .map_err(ActionWorkLifecycleError::Internal)?
+                .map_err(ActionWorkLifecycleError::Internal)?;
+            let already_completed = stored_effect
+                .as_ref()
                 .is_some_and(|effect| effect.status == EFFECT_STATUS_COMPLETED);
             if !already_completed
                 && let Some(reason) = self.delegator_apply_refusal(command.effect_id)?
             {
+                if stored_effect.is_none() {
+                    return Err(ActionWorkLifecycleError::FailedPrecondition(
+                        reason.as_str().into(),
+                    ));
+                }
                 let stored = self
                     .db
                     .ack_action_work(
@@ -295,14 +302,14 @@ impl<'a> ActionWorkLifecycle<'a> {
             .get_action_effect(effect_id)
             .map_err(ActionWorkLifecycleError::Internal)?
         else {
-            return Ok(None);
+            return Ok(Some(DelegatorApplyRefusal::RecordMissing));
         };
         let Some(instance) = self
             .db
             .get_action_instance(&effect.instance_id)
             .map_err(ActionWorkLifecycleError::Internal)?
         else {
-            return Ok(None);
+            return Ok(Some(DelegatorApplyRefusal::RecordMissing));
         };
         match revalidate_delegator_at_apply(
             self.db,
@@ -819,7 +826,9 @@ fn classify_report_error(error: String) -> ActionWorkLifecycleError {
 mod tests {
     use super::*;
     use crate::db::runtime_db::RuntimeDb;
-    use crate::enterprise::{DELEGATOR_DISABLED, DELEGATOR_GRANT_MISSING, DELEGATOR_NOT_MEMBER};
+    use crate::enterprise::{
+        DELEGATOR_DISABLED, DELEGATOR_GRANT_MISSING, DELEGATOR_NOT_MEMBER, DELEGATOR_RECORD_MISSING,
+    };
     use crate::sekai::action_effect::{
         ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, plan_effects_for_admit,
     };
@@ -1766,5 +1775,52 @@ mod tests {
             receipt_reason(&db, &effect.operation_id).as_deref(),
             Some(DELEGATOR_GRANT_MISSING)
         );
+    }
+
+    #[test]
+    fn apply_refuses_when_action_instance_is_missing() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        db.delete_action_instance(&effect.instance_id).unwrap();
+        let error = apply_completed(&db, &effect, &claimed).unwrap_err();
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_RECORD_MISSING.into())
+        );
+        assert_eq!(
+            receipt_reason(&db, &effect.operation_id).as_deref(),
+            Some(DELEGATOR_RECORD_MISSING)
+        );
+        let stored = db.get_action_effect(&effect.effect_id).unwrap().unwrap();
+        assert_eq!(stored.status, EFFECT_STATUS_FAILED);
+    }
+
+    #[test]
+    fn apply_refuses_when_action_effect_is_missing() {
+        let db = RuntimeDb::memory();
+        let error = ActionWorkLifecycle::new(&db)
+            .ack(
+                AckActionWork {
+                    effect_id: "missing-effect",
+                    runtime_id: "shikigami",
+                    claim_generation: 1,
+                    fencing_token: "fence",
+                    outcome: ACK_OUTCOME_COMPLETED,
+                    reason: "done",
+                    request_id: "",
+                    checkpoint_store_id: "",
+                    checkpoint_ref: "",
+                    checkpoint_digest: "",
+                    artifact_json: "",
+                },
+                "operator",
+                200,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_RECORD_MISSING.into())
+        );
+        assert!(db.get_action_effect("missing-effect").unwrap().is_none());
     }
 }
