@@ -38,6 +38,12 @@ pub struct ConnectorCertification {
     pub signature_hex: String,
     pub test_suite_digest: String,
     pub test_result_digest: String,
+    /// Version of `sekai-source-sdk` the connector was certified against.
+    #[serde(default)]
+    pub sdk_version: String,
+    /// Digest of the conformance suite bound to that SDK version.
+    #[serde(default)]
+    pub conformance_suite_digest: String,
     pub connector_digest: String,
     pub certification_digest: String,
     #[serde(default)]
@@ -76,6 +82,11 @@ struct CertificationPin<'a> {
     public_key_hex: &'a str,
     test_suite_digest: &'a str,
     test_result_digest: &'a str,
+    // Omitted when empty so pre-SDK v1 signatures keep their digest.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    sdk_version: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    conformance_suite_digest: &'a str,
 }
 
 pub fn connector_digest_for(certification: &ConnectorCertification) -> Result<String, String> {
@@ -109,6 +120,8 @@ pub fn certification_digest_for(
             public_key_hex: &certification.public_key_hex,
             test_suite_digest: &certification.test_suite_digest,
             test_result_digest: &certification.test_result_digest,
+            sdk_version: &certification.sdk_version,
+            conformance_suite_digest: &certification.conformance_suite_digest,
         })?
     ))
 }
@@ -188,6 +201,8 @@ pub fn verify_connector(
         || certified.signature_hex != submitted.signature_hex
         || certified.test_suite_digest != submitted.test_suite_digest
         || certified.test_result_digest != submitted.test_result_digest
+        || certified.sdk_version != submitted.sdk_version
+        || certified.conformance_suite_digest != submitted.conformance_suite_digest
         || (!submitted.connector_digest.is_empty()
             && submitted.connector_digest != connector_digest)
         || (!submitted.certification_digest.is_empty()
@@ -257,6 +272,12 @@ fn validate_certification(
     if !digest_token(&certification.signer_digest)
         || !digest_token(&certification.test_suite_digest)
         || !digest_token(&certification.test_result_digest)
+        || !digest_token(&certification.conformance_suite_digest)
+    {
+        return Err(CONNECTOR_UNAVAILABLE.into());
+    }
+    if certification.sdk_version != sekai_source_sdk::SDK_VERSION
+        || certification.conformance_suite_digest != sekai_source_sdk::conformance_suite_digest()
     {
         return Err(CONNECTOR_UNAVAILABLE.into());
     }
@@ -315,6 +336,8 @@ fn replay_or_conflict(
         || existing.signature_hex != incoming.signature_hex
         || existing.test_suite_digest != incoming.test_suite_digest
         || existing.test_result_digest != incoming.test_result_digest
+        || existing.sdk_version != incoming.sdk_version
+        || existing.conformance_suite_digest != incoming.conformance_suite_digest
         || existing.predecessor_id != incoming.predecessor_id
         || existing.revocation != REVOCATION_NONE
         || !existing.superseded_by.is_empty()
@@ -482,6 +505,8 @@ mod tests {
             signature_hex: String::new(),
             test_suite_digest: digest(4),
             test_result_digest: digest(5),
+            sdk_version: sekai_source_sdk::SDK_VERSION.into(),
+            conformance_suite_digest: sekai_source_sdk::conformance_suite_digest(),
             connector_digest: String::new(),
             certification_digest: String::new(),
             revocation: String::new(),
@@ -532,6 +557,72 @@ mod tests {
             &certification(),
         )
         .unwrap();
+        assert_eq!(certified.sdk_version, sekai_source_sdk::SDK_VERSION);
+        assert_eq!(
+            certified.conformance_suite_digest,
+            sekai_source_sdk::conformance_suite_digest()
+        );
+    }
+
+    #[test]
+    fn certify_rejects_unbound_sdk_version() {
+        let runtime = db();
+        let mut unbound = certification();
+        unbound.sdk_version = "0.0.0".into();
+        sign(&mut unbound);
+        assert_eq!(
+            certify_connector(&runtime, "reviewer", &unbound, 1_000).unwrap_err(),
+            CONNECTOR_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn empty_sdk_pins_keep_pre_sdk_certification_digest() {
+        let mut legacy = certification();
+        legacy.sdk_version.clear();
+        legacy.conformance_suite_digest.clear();
+        let connector_digest = connector_digest_for(&legacy).unwrap();
+        let actual = certification_digest_for(&legacy, &connector_digest).unwrap();
+
+        #[derive(Serialize)]
+        struct PreSdkPin<'a> {
+            contract_version: &'a str,
+            certification_id: &'a str,
+            namespace: &'a str,
+            owner: &'a str,
+            connector_id: &'a str,
+            predecessor_id: &'a str,
+            connector_digest: &'a str,
+            signer_id: &'a str,
+            signer_digest: &'a str,
+            public_key_hex: &'a str,
+            test_suite_digest: &'a str,
+            test_result_digest: &'a str,
+        }
+        let expected = format!(
+            "sha256:{}",
+            crate::shomei::digest_serializable(&PreSdkPin {
+                contract_version: &legacy.contract_version,
+                certification_id: &legacy.certification_id,
+                namespace: &legacy.namespace,
+                owner: &legacy.owner,
+                connector_id: &legacy.connector_id,
+                predecessor_id: &legacy.predecessor_id,
+                connector_digest: &connector_digest,
+                signer_id: &legacy.signer_id,
+                signer_digest: &legacy.signer_digest,
+                public_key_hex: &legacy.public_key_hex,
+                test_suite_digest: &legacy.test_suite_digest,
+                test_result_digest: &legacy.test_result_digest,
+            })
+            .unwrap()
+        );
+        assert_eq!(actual, expected);
+        assert_ne!(
+            certification_digest_for(&certification(), &connector_digest).unwrap(),
+            expected,
+            "bound SDK pins must change the certification digest"
+        );
     }
 
     #[test]

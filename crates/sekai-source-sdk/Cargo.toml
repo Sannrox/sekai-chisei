@@ -1,0 +1,21 @@
+[package]
+name = "sekai-source-sdk"
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Versioned source-adapter SDK, outbox, snapshot/change-feed runners, and conformance kit."
+repository = "https://github.com/Sannrox/sekai-chisei"
+readme = "README.md"
+keywords = ["sekai", "source-adapter", "conformance"]
+categories = ["api-bindings"]
+
+[dependencies]
+fs2 = "0.4.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+tempfile = "3"
