@@ -163,6 +163,37 @@ fn assertion_reject_status(reject: crate::identity_assertion::AssertionReject) -
     }
 }
 
+/// Catalog metadata RPCs a discover-only space role may call.
+fn is_discover_rpc(method: &str) -> bool {
+    let name = method.rsplit('/').next().unwrap_or(method);
+    matches!(
+        name,
+        "ListSchemaTypes" | "ListDatasets" | "DescribeObjectAction"
+    )
+}
+
+fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
+    let name = method.rsplit('/').next().unwrap_or(method);
+    if crate::store_relocate::is_mutating_rpc(name)
+        && !matches!(
+            name,
+            "FindByExternalId"
+                | "FindByProperty"
+                | "Traverse"
+                | "QueryRows"
+                | "ResolveInvariantSet"
+                | "RetrieveContext"
+                | "DiscoverCapabilities"
+        )
+    {
+        crate::enterprise::NamespaceAction::Write
+    } else if is_discover_rpc(name) {
+        crate::enterprise::NamespaceAction::Discover
+    } else {
+        crate::enterprise::NamespaceAction::Read
+    }
+}
+
 fn finish_authenticated(
     mut req: Request<()>,
     authenticated_context: crate::enterprise::AuthenticatedContext,
@@ -175,28 +206,30 @@ fn finish_authenticated(
         ));
     }
     authenticated_context
-        .authorize_space(crate::enterprise::NamespaceAction::Read)
+        .authorize_space(crate::enterprise::NamespaceAction::Discover)
         .map_err(|_| Status::unauthenticated("invalid space authority"))?;
     if let Some((_, method)) = rpc_identity::request_rpc_method(&req) {
         if method == "DecideActionInstance" {
             authenticated_context
                 .authorize_space_approval()
                 .map_err(|_| Status::permission_denied("space approval denied"))?;
-        } else if crate::store_relocate::is_mutating_rpc(method)
-            && !matches!(
-                method,
-                "FindByExternalId"
-                    | "FindByProperty"
-                    | "Traverse"
-                    | "QueryRows"
-                    | "ResolveInvariantSet"
-                    | "RetrieveContext"
-                    | "DiscoverCapabilities"
-            )
-        {
             authenticated_context
-                .authorize_space(crate::enterprise::NamespaceAction::Write)
-                .map_err(|_| Status::permission_denied("space write denied"))?;
+                .authorize_credential_scope(crate::enterprise::NamespaceAction::Read)
+                .map_err(|_| Status::permission_denied("space read denied"))?;
+        } else {
+            let action = rpc_namespace_action(method);
+            if action != crate::enterprise::NamespaceAction::Discover {
+                authenticated_context.authorize_space(action).map_err(|_| {
+                    if action == crate::enterprise::NamespaceAction::Write {
+                        Status::permission_denied("space write denied")
+                    } else {
+                        Status::permission_denied("space read denied")
+                    }
+                })?;
+            }
+            authenticated_context
+                .authorize_credential_scope(action)
+                .map_err(|_| Status::permission_denied("credential scope denied"))?;
         }
     } else if authenticated_context.space.is_some() {
         return Err(Status::permission_denied(
@@ -396,6 +429,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExecutePlanStream"
             | "PlanContentExecution"
             | "ExecuteContentPlanStream"
+            | "ListSchemaTypes"
+            | "ListDatasets"
+            | "DescribeObjectAction"
     )
 }
 
@@ -1415,9 +1451,40 @@ mod tests {
     }
 
     #[test]
+    fn catalog_describe_is_discover_and_content_is_read() {
+        use crate::enterprise::NamespaceAction;
+        assert_eq!(
+            rpc_namespace_action("ListSchemaTypes"),
+            NamespaceAction::Discover
+        );
+        assert_eq!(
+            rpc_namespace_action("ListDatasets"),
+            NamespaceAction::Discover
+        );
+        assert_eq!(
+            rpc_namespace_action("DescribeObjectAction"),
+            NamespaceAction::Discover
+        );
+        assert_eq!(rpc_namespace_action("GetObject"), NamespaceAction::Read);
+        assert_eq!(rpc_namespace_action("QueryRows"), NamespaceAction::Read);
+        assert_eq!(
+            rpc_namespace_action("EvaluateObjectSet"),
+            NamespaceAction::Read
+        );
+        assert_eq!(rpc_namespace_action("CreateObject"), NamespaceAction::Write);
+    }
+
+    #[test]
     fn signed_space_roles_constrain_mutations_and_approval_rpc() {
         use crate::enterprise::SpaceRole;
         for (role, method, allowed) in [
+            (SpaceRole::Discoverer, "ListSchemaTypes", true),
+            (SpaceRole::Discoverer, "ListDatasets", true),
+            (SpaceRole::Discoverer, "DescribeObjectAction", true),
+            (SpaceRole::Discoverer, "GetObject", false),
+            (SpaceRole::Discoverer, "QueryRows", false),
+            (SpaceRole::Discoverer, "EvaluateObjectSet", false),
+            (SpaceRole::Discoverer, "CreateObject", false),
             (SpaceRole::Viewer, "CreateObject", false),
             (SpaceRole::Viewer, "GetObject", true),
             (SpaceRole::Editor, "CreateObject", true),
@@ -1456,6 +1523,40 @@ mod tests {
                 assert_eq!(context.principal.subject, "subject-a");
                 assert_eq!(context.act.as_deref(), Some("origin-user"));
             }
+        }
+    }
+
+    #[test]
+    fn human_discover_scope_does_not_admit_content_reads() {
+        use crate::enterprise::SpaceRole;
+        for (method, allowed) in [
+            ("ListSchemaTypes", true),
+            ("GetObject", false),
+            ("QueryRows", false),
+        ] {
+            let authority = test_assertion_authority();
+            let mut claims = test_assertion_claims(
+                &uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now().timestamp() + 60,
+            );
+            claims.tenant_id = Some("tenant-test".into());
+            claims.space = Some("space-a".into());
+            claims.space_role = Some(SpaceRole::Viewer);
+            claims.act = Some("origin-user".into());
+            claims.scopes = vec!["sekai.discover".into()];
+            let token = authority.sign(&claims).unwrap();
+            let mut interceptor = interceptor_with_authority(authority);
+            let mut request = bearer_request(&token);
+            request
+                .extensions_mut()
+                .insert(tonic::GrpcMethod::new("sekai.SekaiService", method));
+            let result = interceptor.call(request);
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "{method}: {:?}",
+                result.as_ref().err()
+            );
         }
     }
 
@@ -1741,6 +1842,9 @@ mod tests {
             "ResolveInvariantSet",
             "PlanExecution",
             "ExecutePlanStream",
+            "ListSchemaTypes",
+            "ListDatasets",
+            "DescribeObjectAction",
         ] {
             assert!(enterprise_namespace_method(method));
         }

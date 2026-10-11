@@ -457,6 +457,7 @@ pub(super) async fn list_schema_types(
 ) -> Result<Response<ListSchemaTypesResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let types = service
         .schema_definitions
         .refresh_snapshot()
@@ -464,12 +465,43 @@ pub(super) async fn list_schema_types(
         .all()
         .iter()
         .filter(|object_type| {
-            check_read(
-                &service.security,
-                &schema_object_id(&object_type.kind),
-                &principals,
-            )
-            .is_ok()
+            let object_id = schema_object_id(&object_type.kind);
+            check_read(&service.security, &object_id, &principals).is_ok()
+                && catalog_subjects_pass_marking(
+                    service.db.runtime(),
+                    tenant_context.as_ref(),
+                    &object_id,
+                    &principals,
+                )
+                && catalog_actor_passes_acl(&service.security, tenant_context.as_ref(), &object_id)
+                && match service.db.runtime().get_object(&object_id) {
+                    Ok(Some(object)) => {
+                        check_team_namespace(
+                            service.db.runtime(),
+                            &principals,
+                            &object.namespace,
+                            false,
+                        )
+                        .is_ok()
+                            && enforce_namespace_tenant_context_for(
+                                service.db.runtime(),
+                                tenant_context.as_ref(),
+                                &object.namespace,
+                                crate::enterprise::NamespaceAction::Discover,
+                            )
+                            .is_ok()
+                            && catalog_object_policy_visible(
+                                service.db.runtime(),
+                                &object,
+                                &principals,
+                                tenant_context.as_ref(),
+                            )
+                    }
+                    Ok(None) => {
+                        object_type.is_builtin || !scoped_catalog_context(tenant_context.as_ref())
+                    }
+                    Err(_) => false,
+                }
         })
         .map(to_proto_schema_type)
         .collect();

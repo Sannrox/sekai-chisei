@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Policy understands a discover permission below read. Discoverer space
+  roles and human `sekai.discover` list and describe namespaces, object
+  types, and datasets (filtered by marking ceiling and object policy) and
+  are refused for object reads, queries, aggregates, and counts. Credential
+  scopes apply with or without an installed enterprise extension (#1405).
 - An LLM function may bind a governed document `extracted_text` rendition.
   Caller-held text must match the pinned digest. Produced objects inherit
   the document classification and carry `derived_from` lineage to a

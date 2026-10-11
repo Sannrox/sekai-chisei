@@ -64,6 +64,7 @@ pub enum CredentialKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpaceRole {
+    Discoverer,
     Viewer,
     Editor,
     Approver,
@@ -135,11 +136,47 @@ impl AuthenticatedContext {
             return Ok(());
         }
         let permitted = match action {
-            NamespaceAction::Read => self.space_role.is_some(),
+            NamespaceAction::Discover => self.space_role.is_some(),
+            NamespaceAction::Read => matches!(
+                self.space_role,
+                Some(
+                    SpaceRole::Viewer
+                        | SpaceRole::Editor
+                        | SpaceRole::Approver
+                        | SpaceRole::Administrator
+                )
+            ),
             NamespaceAction::Write => matches!(
                 self.space_role,
                 Some(SpaceRole::Editor | SpaceRole::Administrator)
             ),
+        };
+        if permitted {
+            Ok(())
+        } else {
+            Err(ExtensionError::PermissionDenied)
+        }
+    }
+
+    pub fn authorize_credential_scope(
+        &self,
+        action: NamespaceAction,
+    ) -> Result<(), ExtensionError> {
+        if self.credential_kind != CredentialKind::HumanSession {
+            return Ok(());
+        }
+        let permitted = match action {
+            NamespaceAction::Discover => self.scopes.iter().any(|scope| {
+                matches!(
+                    scope.as_str(),
+                    "sekai.discover" | "sekai.read" | "sekai.write"
+                )
+            }),
+            NamespaceAction::Read => self
+                .scopes
+                .iter()
+                .any(|scope| matches!(scope.as_str(), "sekai.read" | "sekai.write")),
+            NamespaceAction::Write => self.scopes.iter().any(|scope| scope == "sekai.write"),
         };
         if permitted {
             Ok(())
@@ -332,8 +369,10 @@ pub struct TenantContext {
     pub subject: String,
 }
 
+/// Namespace permission lattice. `Discover` is strictly below `Read`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceAction {
+    Discover,
     Read,
     Write,
 }
@@ -446,18 +485,7 @@ pub trait EnterpriseExtension: Send + Sync {
         action: NamespaceAction,
     ) -> Result<(), ExtensionError> {
         context.authorize_space(action)?;
-        if context.credential_kind == CredentialKind::HumanSession {
-            let permitted = match action {
-                NamespaceAction::Read => context
-                    .scopes
-                    .iter()
-                    .any(|scope| matches!(scope.as_str(), "sekai.read" | "sekai.write")),
-                NamespaceAction::Write => context.scopes.iter().any(|scope| scope == "sekai.write"),
-            };
-            if !permitted {
-                return Err(ExtensionError::PermissionDenied);
-            }
-        }
+        context.authorize_credential_scope(action)?;
         match context.tenant.as_ref() {
             Some(tenant) => self.authorize_namespace(tenant, namespace, action),
             None => self.authorize_unscoped_namespace(&context.principal, namespace, action),
@@ -628,14 +656,22 @@ mod tests {
         assert!(context.authorize_space(NamespaceAction::Write).is_ok());
         assert!(context.authorize_space_approval().is_ok());
         context.space = Some("space-a".into());
-        for (role, can_write, can_approve) in [
-            (SpaceRole::Viewer, false, false),
-            (SpaceRole::Editor, true, false),
-            (SpaceRole::Approver, false, true),
-            (SpaceRole::Administrator, true, true),
+        for (role, can_discover, can_read, can_write, can_approve) in [
+            (SpaceRole::Discoverer, true, false, false, false),
+            (SpaceRole::Viewer, true, true, false, false),
+            (SpaceRole::Editor, true, true, true, false),
+            (SpaceRole::Approver, true, true, false, true),
+            (SpaceRole::Administrator, true, true, true, true),
         ] {
             context.space_role = Some(role);
-            assert!(context.authorize_space(NamespaceAction::Read).is_ok());
+            assert_eq!(
+                context.authorize_space(NamespaceAction::Discover).is_ok(),
+                can_discover
+            );
+            assert_eq!(
+                context.authorize_space(NamespaceAction::Read).is_ok(),
+                can_read
+            );
             assert_eq!(
                 context.authorize_space(NamespaceAction::Write).is_ok(),
                 can_write
@@ -649,10 +685,60 @@ mod tests {
             );
         }
         context.space_role = None;
+        assert!(context.authorize_space(NamespaceAction::Discover).is_err());
         assert!(context.authorize_space(NamespaceAction::Read).is_err());
         context.space = None;
         context.space_role = Some(SpaceRole::Viewer);
         assert!(context.authorize_space(NamespaceAction::Read).is_err());
+    }
+
+    #[test]
+    fn discover_scope_is_below_read_for_human_sessions() {
+        let mut context = FakeExtension.authenticate_context("test-token").unwrap();
+        context.space = Some("space-a".into());
+        context.space_role = Some(SpaceRole::Discoverer);
+        context.scopes = vec!["sekai.discover".into()];
+        assert!(
+            FakeExtension
+                .authorize_authenticated_context(&context, "allowed", NamespaceAction::Discover)
+                .is_ok()
+        );
+        assert_eq!(
+            FakeExtension.authorize_authenticated_context(
+                &context,
+                "allowed",
+                NamespaceAction::Read
+            ),
+            Err(ExtensionError::PermissionDenied)
+        );
+        assert_eq!(
+            FakeExtension.authorize_authenticated_context(
+                &context,
+                "allowed",
+                NamespaceAction::Write
+            ),
+            Err(ExtensionError::PermissionDenied)
+        );
+        context.space_role = Some(SpaceRole::Viewer);
+        assert_eq!(
+            FakeExtension.authorize_authenticated_context(
+                &context,
+                "allowed",
+                NamespaceAction::Read
+            ),
+            Err(ExtensionError::PermissionDenied)
+        );
+        context.scopes = vec!["sekai.read".into()];
+        assert!(
+            FakeExtension
+                .authorize_authenticated_context(&context, "allowed", NamespaceAction::Discover)
+                .is_ok()
+        );
+        assert!(
+            FakeExtension
+                .authorize_authenticated_context(&context, "allowed", NamespaceAction::Read)
+                .is_ok()
+        );
     }
 
     #[test]

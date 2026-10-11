@@ -303,6 +303,7 @@ pub(super) async fn describe_object_action(
         &policy_context,
         &inner.namespace,
         &inner.object_id,
+        crate::enterprise::NamespaceAction::Discover,
     )?;
     let description = crate::sekai::action_describe_preview::describe_object_action(
         service.db.runtime(),
@@ -331,6 +332,7 @@ pub(super) async fn preview_object_action(
         &policy_context,
         &inner.namespace,
         &inner.object_id,
+        crate::enterprise::NamespaceAction::Read,
     )?;
     let type_def = match crate::sekai::action_describe_preview::load_object_bound_type(
         service.db.runtime(),
@@ -655,6 +657,7 @@ fn authorize_action_instance_visibility(
                 policy_context,
                 &instance.namespace,
                 &object_id,
+                crate::enterprise::NamespaceAction::Read,
             )?;
         } else if !definition.as_ref().is_some_and(|definition| {
             definition.object_mutation == crate::sekai::governed_action_type::OBJECT_MUTATION_CREATE
