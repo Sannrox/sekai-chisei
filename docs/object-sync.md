@@ -8,9 +8,8 @@ Issue/PullRequest remains the catalog-advertised production profile under
 batches with identity `{source}:{instance}#{record_kind}/{immutable_key}`.
 See [ADR 0022](decisions/0022-source-batch-transactions.md),
 [ADR 0021](decisions/0021-defer-second-object-sync-source.md),
-[ADR 0060](decisions/0060-additive-source-type-descriptors.md),
-[ADR 0073](decisions/0073-source-and-action-objects.md), and
-[ADR 0100](decisions/0100-relational-source-family.md). Inbound sync is one
+[ADR 0060](decisions/0060-additive-source-type-descriptors.md), and
+[ADR 0073](decisions/0073-source-and-action-objects.md). Inbound sync is one
 of the two product write paths for typed objects; versioned Actions are the
 other. The sync index is not object authority. The ordered-feed
 design rationale is in
@@ -156,13 +155,7 @@ epoch, a contiguous monotonic sequence, and an authoritative snapshot/feed
 handoff offset. If any guarantee is absent, report the source capability as
 unsupported. GitHub's public Events API is not a supported gapless feed and
 must not be mapped to v2 offsets. A deployment-specific source transport may
-use v2 only when it independently provides all three guarantees. The
-PostgreSQL-first relational profile (`postgres.table`) may advertise
-`change_feed` only when its out-of-process connector maps the logical change
-stream onto those three guarantees; source log position is adapter-private
-resume state, not the plane-owned offset. Snapshot-only relations stay on
-v1 and must not start v2. See
-[ADR 0100](decisions/0100-relational-source-family.md).
+use v2 only when it independently provides all three guarantees.
 
 Snapshot completion still does not imply tombstone-by-absence. Every deletion
 must arrive as an explicit `deleted: true` source record.
@@ -279,12 +272,6 @@ Object-sync identity has two admitted grammars. They share the
   positive canonical decimal number; adapter-side validation is not trusted.
 - A live registered descriptor uses
   `{source}:{instance}#{record_kind}/{immutable_key}`.
-- The first later system of record under ADR 0021 is the PostgreSQL-first
-  relational profile `postgres.table`. One table is one registered record
-  kind. Primary keys, composite keys, tables without a key, snapshot to
-  change-feed handoff, schema drift, quarantine, and health are
-  [ADR 0100](decisions/0100-relational-source-family.md). The connector stays
-  out of process and does not share the control-plane PostgreSQL dest.
 - Object id is derived from `type_digest` plus source identity.
 - Issue and PullRequest share GitHub's repository number space. A pull request
   and its issue number are one identity, and a batch cannot submit both.
@@ -406,10 +393,7 @@ then admit the signed bundle. The plane maps it onto one source batch whose
 idempotency key is the delivery id. Snapshots and ordered feeds remain the
 other collection transports. Ordered synchronization adds no pipeline, transform
 language, plugin runtime, connector marketplace, credential store,
-tombstone-by-absence, unrestricted write-back, or second adapter family. The
-PostgreSQL-first relational profile in
-[ADR 0100](decisions/0100-relational-source-family.md) is a registered source
-under this family, not a second adapter family and not a Chisei connector.
+tombstone-by-absence, unrestricted write-back, or second source.
 
 Governed functions and computed properties do not write derived objects onto a
 type revision and must not invent a sync source id. See

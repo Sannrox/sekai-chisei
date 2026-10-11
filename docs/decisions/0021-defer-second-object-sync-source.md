@@ -89,12 +89,6 @@ kinds stay rejected under `github:{owner}/{repo}#{number}`, and there is no
 second adapter family. See
 [research/817-source-type-admission.md](../research/817-source-type-admission.md).
 
-[Issue #1410](https://github.com/Sannrox/sekai-chisei/issues/1410) /
-[ADR 0100](0100-relational-source-family.md) is the bounded later-source
-decision for a PostgreSQL-first relational profile. It does not supersede this
-ADR: GitHub Issue/PullRequest stays the only code-owned profile, and the
-catalog family stays `source_control.object_sync`.
-
 ## Validation
 
 - `sync_github_record` continues to reject non-GitHub sources and any

@@ -87,7 +87,6 @@ mod policy_decision_pdp;
 mod postgres_bind_hygiene;
 mod product_loop_backend_conformance;
 mod relation_cardinality_adr;
-mod relational_source_family_adr;
 mod replica_conformance_adapter;
 mod replica_safety_budget;
 mod replica_safety_closeout;
@@ -232,7 +231,6 @@ const GROUPED_MODULES: &[&str] = &[
     "postgres_bind_hygiene",
     "product_loop_backend_conformance",
     "relation_cardinality_adr",
-    "relational_source_family_adr",
     "replica_conformance_adapter",
     "replica_safety_budget",
     "replica_safety_closeout",
@@ -368,6 +366,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 116);
+    assert_eq!(GROUPED_MODULES.len(), 114);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

@@ -32,7 +32,7 @@ reference pages.
 | [Epistemic profiles across federation contracts](500-epistemic-federation.md) | Existing signed receipts, provenance, peer-import, and handoff contracts compose without a new federation adapter; see the conformance fixture |
 | [Epistemic RDF/OWL/PROV-O boundary](501-epistemic-rdf-owl-prov-o.md) | Small edge projection with explicit loss metadata; no RDF parser or reasoner in core; see the conformance fixture |
 | [Durable `EpistemicAssertion` resource decision](502-epistemic-assertion-resource.md) | Projection remains sufficient; no new core resource, endpoint, or persistence family without independent unmet requirements |
-| [Second object-sync source](../decisions/0021-defer-second-object-sync-source.md) | GitHub Issue/PR stays the only code-owned profile; later kinds use registered descriptors ([ADR 0060](../decisions/0060-additive-source-type-descriptors.md)); PostgreSQL-first relational profile is [ADR 0100](../decisions/0100-relational-source-family.md) |
+| [Second object-sync source](../decisions/0021-defer-second-object-sync-source.md) | No second source; GitHub Issue/PR identity stays the only inbound sync contract; streaming is transport |
 | [Next query-time entailment constructs](658-query-time-entailment-constructs.md) | Keep the ADR 0001 profile; inverse and disjointness stay metadata; reopen only with unmet demand and PostgreSQL advertising the same profile |
 | [Governed hypothetical overlay after 1.0](660-hypothetical-overlay.md) | Keep the EvaluateScenario removal; hypothesis remains vocabulary, not a live overlay |
 | [Type-bound derived-fact admission](659-derived-fact-admission.md) | Functions stay read-only; derived views stay query-time; no derived-fact kind or digest |
