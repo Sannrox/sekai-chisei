@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `sekaictl admin connectors new <name> --out <dir>` generates a source
+  connector from `crates/sekai-connector-template`: check, discover, and read
+  stubs, a fake source, gRPC transport, outbox commit per batch, and a config
+  that references credentials by environment variable. CI builds a generated
+  connector and runs its conformance tests. `sekai-source-sdk` 1.2.0 adds
+  `build_registered_source_batch` for registered descriptors (#1409).
+
 - Source adapters gain `check` (connectivity, zero records) and `discover`
   (kinds, columns, key candidates, optional profile hints). Discovery drafts
   a source-type descriptor; catalog admission stays a separate review.

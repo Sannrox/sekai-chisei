@@ -1,4 +1,4 @@
-# crate-version: 1.1.0
+# crate-version: 1.2.0
 ADAPTER_GITHUB_OBJECT_SYNC
 ADAPTER_GITHUB_OBJECT_SYNC_VERSION
 ADAPTER_REGISTERED_OBJECT_SYNC
@@ -109,6 +109,7 @@ assert_lifecycle_report
 assert_snapshot_chain
 bind_sync_lineage
 bind_writeback
+build_registered_source_batch
 build_source_batch
 build_source_batch_v2
 column_name_suggests_sensitive
@@ -525,6 +526,7 @@ sdk::SourceSyncTransport::get_source_sync_state(&mut self,&GetSourceSyncStateInp
 sdk::TransportFailure
 sdk::TransportFailure::Ambiguous
 sdk::TransportFailure::Unavailable
+sdk::build_registered_source_batch(&SourceAdapterConfig,&str,&str,&str,i64,Vec<SourceRecord>) -> Result<SourceBatch,String>
 sdk::build_source_batch(&SourceAdapterConfig,&str,&str,i64,Vec<SourceRecord>) -> Result<SourceBatch,String>
 sdk::build_source_batch_v2(&SourceAdapterConfig,&str,&str,i64,Vec<SourceRecord>,SourceDeliveryWindow) -> Result<SourceBatch,String>
 sdk::serialize_source_batch(&SourceBatch) -> Result<Vec<u8>,String>

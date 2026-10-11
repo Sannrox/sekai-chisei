@@ -35,6 +35,7 @@ mod compatibility_matrix;
 mod compatibility_matrix_adr;
 mod concurrent_source_ingestion;
 mod connector_certification_adr;
+mod connector_template;
 mod coordination_backend_conformance;
 mod data_dir_store_layout;
 mod data_quality_rule_adr;
@@ -179,6 +180,7 @@ const GROUPED_MODULES: &[&str] = &[
     "compatibility_matrix_adr",
     "concurrent_source_ingestion",
     "connector_certification_adr",
+    "connector_template",
     "coordination_backend_conformance",
     "data_dir_store_layout",
     "data_quality_rule_adr",
@@ -366,6 +368,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 115);
+    assert_eq!(GROUPED_MODULES.len(), 116);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

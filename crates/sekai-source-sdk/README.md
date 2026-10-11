@@ -5,7 +5,9 @@ Versioned crate for out-of-process source adapters. It exposes the
 runners, `check`/`discover`, and the offline conformance kit.
 
 The control plane re-exports the contract types. Adapters outside this
-repository depend on this crate only.
+repository depend on this crate only. New connectors start from
+`../sekai-connector-template` (`sekaictl admin connectors new`), which the
+workspace builds and tests against this crate on every change.
 
 ```sh
 cargo test -p sekai-source-sdk --locked

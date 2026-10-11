@@ -115,14 +115,23 @@ that crate. Run the out-of-tree example with
 Connector certification (`sekaictl admin connectors certify`) records
 `sdk_version` and `conformance_suite_digest`.
 
+New connectors start from `crates/sekai-connector-template`, a workspace
+crate that builds and runs conformance against the current SDK.
+`sekaictl admin connectors new <name> --out <dir>` copies it with check,
+discover, and read stubs, a fake source, gRPC transport, outbox wiring, and a
+credential-reference config. See the template README.
+
 `object_sync_sdk.rs` builds and serializes replay-compatible
 `sekai.source-batch/v1` snapshots and the version 2 delivery envelope used by
 generation-fenced snapshots and ordered feeds. Its local outbox writes the
 exact normalized batch, including generation, epoch, offset range, and source
 sequences when present, under a cross-process lock with no-replace publication
-and directory fsync before calling a transport. The SDK accepts only the
-code-owned `sekai.source-type-revision/v1` GitHub Issue/PullRequest digest
-`sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`.
+and directory fsync before calling a transport. `build_source_batch` accepts
+only the code-owned `sekai.source-type-revision/v1` GitHub Issue/PullRequest
+digest
+`sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`;
+`build_registered_source_batch` builds v1 batches for a registered
+source-type descriptor (ADR 0060) and refuses the GitHub profile.
 Replay order is deterministic, and only one distinct unresolved batch may
 exist for a namespace/source-instance/type-revision binding; exact re-enqueue
 remains idempotent.

@@ -58,7 +58,8 @@ pub use sdk::{
     FlushEntry, FlushReport, GetSourceSyncStateInput, MAX_QUARANTINE_REASON_BYTES,
     OUTBOX_FORMAT_VERSION, OutboxLimits, SourceAdapterConfig, SourceGenerationStatus, SourceOutbox,
     SourceRunDisposition, SourceRunReport, SourceSyncStateView, SourceSyncTransport,
-    TransportFailure, build_source_batch, build_source_batch_v2, serialize_source_batch,
+    TransportFailure, build_registered_source_batch, build_source_batch, build_source_batch_v2,
+    serialize_source_batch,
 };
 pub use snapshot::{
     DEFAULT_MAX_SNAPSHOT_PAGES_PER_RUN, GenerationSnapshotPage, GenerationSnapshotRead,

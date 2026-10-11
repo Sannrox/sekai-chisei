@@ -69,6 +69,7 @@ pub mod combined_stores;
 pub mod compatibility_cli;
 pub mod compatibility_matrix;
 pub mod connector_certification_cli;
+pub mod connector_template;
 pub mod document_cli;
 pub mod event_stream_cli;
 pub mod image_cli;
