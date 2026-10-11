@@ -558,6 +558,8 @@ message TransformRun {
   int32 rows_out = 12;
   string lineage_parent = 13;
   int64 created_at_ms = 14;
+  string markings_in = 15;
+  string markings_out = 16;
 }
 message RunGovernedTransformResponse {
   TransformRun run = 1;

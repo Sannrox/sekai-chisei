@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Derived transform outputs inherit the union of input object and row
+  `access_marking` values. Unknown input markings fail closed with no output
+  write. Marked runs require a bound output dataset object. Receipts record
+  `markings_in` and `markings_out`. Lowering or removing a marking on object
+  update requires a principal profile `declassify_markings` grant; owner,
+  admin, and trusted service principals do not bypass it. Trusted principals
+  may still declassify when that grant is on their sealed profile. Every
+  declassify decision is audited (`GATE:mig`, #1403).
 - Optional `deny_unmarked` hides unmarked objects unless the caller is a
   trusted service or holds an explicit object ACL grant. Default stays
   fail-open. Enable with namespace property `deny_unmarked=true` or

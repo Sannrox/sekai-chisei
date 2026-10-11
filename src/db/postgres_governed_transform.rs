@@ -5,11 +5,14 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::db::postgres::{PostgresDb, advisory_lock_key, lock_dataset_rows};
+use crate::db::postgres_audit::lock_object_lifecycle;
+use crate::domain::storage_properties_json;
 use crate::sekai::dataset::DatasetRowRecord;
 use crate::sekai::governed_transform::{
     GovernedTransform, TransformRun, bind_checkpoint, checkpoint_after_id, compute_run,
-    fold_output_digest, rows_digest,
+    derive_transform_markings, fold_output_digest, require_bound_output_for_markings, rows_digest,
 };
+use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 
 impl PostgresDb {
     pub fn put_governed_transform(
@@ -92,6 +95,19 @@ impl PostgresDb {
             bind_checkpoint(incremental, stored, &transform.definition_digest);
         let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
         let records = load_row_records(&mut tx, &transform.input_dataset_id, after_id)?;
+        let input_object_id = load_dataset_object_id(&mut tx, &transform.input_dataset_id)?;
+        let input_token = load_object_marking_token(&mut tx, &input_object_id)?;
+        let output_object_id = load_dataset_object_id(&mut tx, &transform.output_dataset_id)?;
+        if !output_object_id.trim().is_empty() {
+            lock_object_lifecycle(&mut tx, &output_object_id)?;
+        }
+        let prior_token = load_object_marking_token(&mut tx, &output_object_id)?;
+        let (markings_in, markings_out) = derive_transform_markings(
+            None,
+            input_token.as_deref(),
+            prior_token.as_deref(),
+            records.iter().map(|(_, row)| row),
+        )?;
         let (mut run, output_rows) = compute_run(
             &transform,
             checkpoint.as_ref(),
@@ -100,6 +116,8 @@ impl PostgresDb {
             now_ms,
             Uuid::new_v4().to_string(),
         );
+        run.markings_in = markings_in;
+        run.markings_out = markings_out;
         if run.quarantined {
             if !incremental {
                 let live: Vec<HashMap<String, String>> =
@@ -113,6 +131,7 @@ impl PostgresDb {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(run);
         }
+        require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
         if !incremental {
             tx.execute(
                 "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
@@ -129,6 +148,7 @@ impl PostgresDb {
         } else {
             rows_digest(&output_rows)
         };
+        stamp_object_marking(&mut tx, &output_object_id, &run.markings_out, now_ms)?;
         insert_transform_run(&mut tx, &run)?;
         tx.execute(
             "INSERT INTO sekai_governed_transform_checkpoint
@@ -158,7 +178,7 @@ impl PostgresDb {
             .query_opt(
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-                        lineage_parent, created_at_ms
+                        lineage_parent, created_at_ms, markings_in, markings_out
                  FROM sekai_governed_transform_run WHERE run_id = $1",
                 &[&run_id],
             )
@@ -195,7 +215,7 @@ impl PostgresDb {
             .query(
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-                        lineage_parent, created_at_ms
+                        lineage_parent, created_at_ms, markings_in, markings_out
                  FROM sekai_governed_transform_run
                  WHERE namespace = $1
                  ORDER BY created_at_ms DESC, run_id DESC
@@ -329,8 +349,8 @@ fn insert_transform_run(
         "INSERT INTO sekai_governed_transform_run
          (run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
           last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-          lineage_parent, created_at_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+          lineage_parent, created_at_ms, markings_in, markings_out)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
         &[
             &run.run_id,
             &run.namespace,
@@ -346,6 +366,8 @@ fn insert_transform_run(
             &run.rows_out,
             &run.lineage_parent,
             &run.created_at_ms,
+            &run.markings_in,
+            &run.markings_out,
         ],
     )
     .map(|_| ())
@@ -370,7 +392,87 @@ fn row_to_run(row: Row) -> Result<TransformRun, String> {
         rows_out: row.get(11),
         lineage_parent: row.get(12),
         created_at_ms: row.get(13),
+        markings_in: row.get(14),
+        markings_out: row.get(15),
     })
+}
+
+fn load_dataset_object_id(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+) -> Result<String, String> {
+    tx.query_opt(
+        "SELECT object_id FROM sekai_datasets WHERE id = $1",
+        &[&dataset_id],
+    )
+    .map_err(|error| error.to_string())?
+    .map(|row| row.get(0))
+    .ok_or_else(|| "dataset not found".into())
+}
+
+fn load_object_marking_token(
+    tx: &mut postgres::Transaction<'_>,
+    object_id: &str,
+) -> Result<Option<String>, String> {
+    if object_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let properties: String = tx
+        .query_opt(
+            "SELECT properties FROM sekai_objects WHERE id = $1",
+            &[&object_id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get(0))
+        .ok_or_else(|| format!("input markings unresolvable: object {object_id} not found"))?;
+    let map: HashMap<String, String> =
+        serde_json::from_str(&properties).map_err(|error| error.to_string())?;
+    Ok(map
+        .get(OBJECT_CLASSIFICATION_PROPERTY)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+fn stamp_object_marking(
+    tx: &mut postgres::Transaction<'_>,
+    object_id: &str,
+    token: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    if object_id.trim().is_empty() {
+        return Ok(());
+    }
+    let properties: String = tx
+        .query_opt(
+            "SELECT properties FROM sekai_objects WHERE id = $1 FOR UPDATE",
+            &[&object_id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get(0))
+        .ok_or_else(|| format!("output markings unresolvable: object {object_id} not found"))?;
+    let mut map: HashMap<String, String> =
+        serde_json::from_str(&properties).map_err(|error| error.to_string())?;
+    if token.trim().is_empty() {
+        map.remove(OBJECT_CLASSIFICATION_PROPERTY);
+    } else {
+        map.insert(
+            OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+            token.to_string(),
+        );
+    }
+    let json = storage_properties_json(&map)?;
+    let changed = tx
+        .execute(
+            "UPDATE sekai_objects SET properties = $1, updated = $2 WHERE id = $3",
+            &[&json, &now_ms, &object_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err(format!(
+            "output markings unresolvable: object {object_id} not found"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -460,5 +562,214 @@ mod tests {
         let listed = db.list_governed_transform_runs("ops", 10).unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].run_id, second.run_id);
+    }
+
+    fn object(id: &str, marking: Option<&str>) -> crate::domain::Object {
+        let mut properties = HashMap::new();
+        if let Some(marking) = marking {
+            properties.insert(OBJECT_CLASSIFICATION_PROPERTY.into(), marking.into());
+        }
+        crate::domain::Object {
+            id: id.into(),
+            kind: "artifact".into(),
+            name: id.into(),
+            namespace: "ops".into(),
+            external_id: format!("artifact:{id}"),
+            properties,
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_transform_unions_input_markings_onto_output_and_receipt() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        let mut input = dataset("in");
+        input.object_id = "in-obj".into();
+        let mut output = dataset("out");
+        output.object_id = "out-obj".into();
+        db.create_object(&object("in-obj", Some("internal")))
+            .unwrap();
+        db.create_object(&object("out-obj", None)).unwrap();
+        db.create_dataset(&input).unwrap();
+        db.create_dataset(&output).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[
+                HashMap::from([
+                    ("id".into(), "1".into()),
+                    ("keep".into(), "yes".into()),
+                    (OBJECT_CLASSIFICATION_PROPERTY.into(), "internal".into()),
+                ]),
+                HashMap::from([
+                    ("id".into(), "2".into()),
+                    ("keep".into(), "yes".into()),
+                    (OBJECT_CLASSIFICATION_PROPERTY.into(), "confidential".into()),
+                ]),
+            ],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(run.markings_in.contains("internal"));
+        assert!(run.markings_in.contains("confidential"));
+        assert_eq!(run.markings_out, "confidential");
+        let stored = db.get_governed_transform_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(stored.markings_out, "confidential");
+        let output_object = db.get_object("out-obj").unwrap().unwrap();
+        assert_eq!(
+            output_object.properties.get(OBJECT_CLASSIFICATION_PROPERTY),
+            Some(&"confidential".to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_full_rebuild_folds_live_output_marking() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        let mut input = dataset("in");
+        input.object_id = "in-obj".into();
+        let mut output = dataset("out");
+        output.object_id = "out-obj".into();
+        db.create_object(&object("in-obj", Some("public"))).unwrap();
+        db.create_object(&object("out-obj", Some("confidential")))
+            .unwrap();
+        db.create_dataset(&input).unwrap();
+        db.create_dataset(&output).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                (OBJECT_CLASSIFICATION_PROPERTY.into(), "public".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert_eq!(run.markings_in, "public");
+        assert_eq!(run.markings_out, "confidential");
+        let output_object = db.get_object("out-obj").unwrap().unwrap();
+        assert_eq!(
+            output_object.properties.get(OBJECT_CLASSIFICATION_PROPERTY),
+            Some(&"confidential".to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_marked_run_without_output_object_fails_closed_without_writing() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                (OBJECT_CLASSIFICATION_PROPERTY.into(), "confidential".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let error = db
+            .run_governed_transform("ops", "t1", false, 20)
+            .unwrap_err();
+        assert!(error.contains("output markings unresolvable"), "{error}");
+        assert!(
+            db.query_dataset_rows("out", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_unknown_input_marking_fails_closed_without_writing_output() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                (OBJECT_CLASSIFICATION_PROPERTY.into(), "secret-sauce".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let error = db
+            .run_governed_transform("ops", "t1", false, 20)
+            .unwrap_err();
+        assert!(error.contains("unknown classification marking"), "{error}");
+        assert!(
+            db.query_dataset_rows("out", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

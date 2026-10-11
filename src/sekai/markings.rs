@@ -24,6 +24,8 @@ pub const OBJECT_CLASSIFICATION_PROPERTY: &str = "access_marking";
 pub const PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY: &str = "classification_ceiling";
 /// Principal profile property: comma-separated or JSON array of purposes.
 pub const PRINCIPAL_ALLOWED_PURPOSES_PROPERTY: &str = "allowed_purposes";
+/// Principal profile property: markings this principal may declassify.
+pub const PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY: &str = "declassify_markings";
 /// Canonical external_id for a principal profile object.
 pub const PRINCIPAL_PROFILE_EXTERNAL_ID_PREFIX: &str = "principal:";
 /// Object kind for principal authority profiles (admin-managed only).
@@ -45,6 +47,10 @@ pub struct PrincipalAuthority {
     pub classification_token: Option<String>,
     /// Empty means no purpose allow-list is configured.
     pub allowed_purposes: BTreeSet<String>,
+    /// Markings this principal may downgrade or remove. Distinct from
+    /// ownership, admin, and trusted-service read bypass.
+    #[serde(default)]
+    pub declassify_markings: BTreeSet<String>,
 }
 
 impl PrincipalAuthority {
@@ -115,7 +121,8 @@ pub fn parse_classification(value: &str) -> Result<EvidenceClassification, Strin
 /// Unknown tokens are ignored (treated as unmarked) so free-form domain values
 /// on legacy objects never fail closed or hide data; only the provisional
 /// lattice tokens enforce clearance. Activated namespace lattices evaluate the
-/// raw token instead; see `object_marking_token`.
+/// raw token instead; see `object_marking_token`. Derivation must use
+/// [`required_object_classification`] so unknown input tokens fail closed.
 pub fn object_classification(object: &Object) -> Result<Option<EvidenceClassification>, String> {
     match object_marking_token(object) {
         None => Ok(None),
@@ -124,6 +131,24 @@ pub fn object_classification(object: &Object) -> Result<Option<EvidenceClassific
             Err(_) => Ok(None),
         },
     }
+}
+
+/// Access marking for derivation. Unknown tokens fail closed.
+pub fn required_object_classification(
+    object: &Object,
+) -> Result<Option<EvidenceClassification>, String> {
+    match object_marking_token(object) {
+        None => Ok(None),
+        Some(value) => parse_optional_classification(value),
+    }
+}
+
+/// Least-upper-bound of input markings on the evidence ordinal.
+/// Missing markings are ignored; unknown tokens fail closed.
+pub fn union_classifications(
+    tokens: impl IntoIterator<Item = Option<EvidenceClassification>>,
+) -> Option<EvidenceClassification> {
+    tokens.into_iter().flatten().max()
 }
 
 /// Raw `access_marking` token when present and non-empty.
@@ -223,6 +248,7 @@ pub fn principal_authority_from_profile(
             classification_ceiling: None,
             classification_token: None,
             allowed_purposes: BTreeSet::new(),
+            declassify_markings: BTreeSet::new(),
         });
     };
     let token = profile
@@ -248,11 +274,19 @@ pub fn principal_authority_from_profile(
         None => BTreeSet::new(),
         Some(raw) => parse_purpose_list(raw)?,
     };
+    let declassify_markings = match profile
+        .properties
+        .get(PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY)
+    {
+        None => BTreeSet::new(),
+        Some(raw) => parse_declassify_markings(raw)?,
+    };
     Ok(PrincipalAuthority {
         principal: principal.into(),
         classification_ceiling: ceiling,
         classification_token: token,
         allowed_purposes: purposes,
+        declassify_markings,
     })
 }
 
@@ -264,6 +298,7 @@ pub fn trusted_service_authority(principal: &str) -> Option<PrincipalAuthority> 
             classification_ceiling: Some(EvidenceClassification::Restricted),
             classification_token: Some(EvidenceClassification::Restricted.as_str().into()),
             allowed_purposes: BTreeSet::new(), // empty allow-list is not consulted for trusted
+            declassify_markings: BTreeSet::new(),
         })
     } else {
         None
@@ -388,6 +423,100 @@ pub fn evaluate_purpose_access(
     }
 }
 
+/// True when `to` is strictly below `from` on the evidence ordinal, including
+/// removing a marking. Raising a marking is not a declassify.
+pub fn is_marking_downgrade(
+    from: Option<EvidenceClassification>,
+    to: Option<EvidenceClassification>,
+) -> bool {
+    match (from, to) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(from), Some(to)) => to < from,
+    }
+}
+
+/// Whether `authority` may lower or remove `from` to `to`.
+///
+/// Owner and admin grants are not consulted. Trusted service principals do
+/// not bypass this gate.
+pub fn evaluate_declassify(
+    operation_id: &str,
+    from: Option<EvidenceClassification>,
+    to: Option<EvidenceClassification>,
+    authority: &PrincipalAuthority,
+) -> MarkingCheckResult {
+    let decision_id = format!(
+        "declassify:{operation_id}:{}",
+        uuid::Uuid::new_v4().as_simple()
+    );
+    let from_token = from.map(|value| value.as_str().to_string());
+    let to_token = to.map(|value| value.as_str().to_string());
+    if !is_marking_downgrade(from, to) {
+        return MarkingCheckResult {
+            decision: MarkingDecision::NotApplicable,
+            decision_id,
+            object_classification: from_token,
+            principal_ceiling: to_token,
+            detail: "marking is not a downgrade".into(),
+        };
+    }
+    let Some(from) = from else {
+        return MarkingCheckResult {
+            decision: MarkingDecision::NotApplicable,
+            decision_id,
+            object_classification: None,
+            principal_ceiling: to_token,
+            detail: "marking is not a downgrade".into(),
+        };
+    };
+    if authority
+        .declassify_markings
+        .iter()
+        .any(|marking| marking == from.as_str())
+    {
+        MarkingCheckResult {
+            decision: MarkingDecision::Allow,
+            decision_id,
+            object_classification: Some(from.as_str().into()),
+            principal_ceiling: to_token,
+            detail: "principal may declassify this marking".into(),
+        }
+    } else {
+        MarkingCheckResult {
+            decision: MarkingDecision::Deny,
+            decision_id,
+            object_classification: Some(from.as_str().into()),
+            principal_ceiling: to_token,
+            detail: "principal is not granted declassify for this marking".into(),
+        }
+    }
+}
+
+fn parse_declassify_markings(raw: &str) -> Result<BTreeSet<String>, String> {
+    let markings = parse_purpose_list(raw)?;
+    let mut parsed = BTreeSet::new();
+    for marking in markings {
+        parsed.insert(parse_declassify_token(&marking)?);
+    }
+    Ok(parsed)
+}
+
+fn parse_declassify_token(marking: &str) -> Result<String, String> {
+    if let Ok(classification) = parse_classification(marking) {
+        return Ok(classification.as_str().to_string());
+    }
+    if marking.is_empty()
+        || marking.len() > 256
+        || !marking
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-.:/".contains(character))
+    {
+        return Err(format!("unknown classification marking: {marking}"));
+    }
+    Ok(marking.to_string())
+}
+
 fn parse_purpose_list(raw: &str) -> Result<BTreeSet<String>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -434,6 +563,7 @@ mod tests {
             classification_ceiling: ceiling,
             classification_token: ceiling.map(|value| value.as_str().into()),
             allowed_purposes: purposes.iter().map(|p| (*p).into()).collect(),
+            declassify_markings: BTreeSet::new(),
         }
     }
 
@@ -573,5 +703,111 @@ mod tests {
         assert_eq!(marking.decision, MarkingDecision::Allow);
         let purpose = evaluate_purpose_access("op9", "any-purpose", &trusted);
         assert_eq!(purpose.decision, MarkingDecision::Allow);
+        let declassify = evaluate_declassify(
+            "op10",
+            Some(EvidenceClassification::Restricted),
+            Some(EvidenceClassification::Public),
+            &trusted,
+        );
+        assert_eq!(declassify.decision, MarkingDecision::Deny);
+    }
+
+    #[test]
+    fn union_of_markings_is_the_most_restrictive() {
+        assert_eq!(
+            union_classifications([
+                Some(EvidenceClassification::Internal),
+                Some(EvidenceClassification::Confidential),
+            ]),
+            Some(EvidenceClassification::Confidential)
+        );
+        assert_eq!(
+            union_classifications([
+                Some(EvidenceClassification::Public),
+                None,
+                Some(EvidenceClassification::Restricted),
+            ]),
+            Some(EvidenceClassification::Restricted)
+        );
+        assert_eq!(union_classifications([None, None]), None);
+        assert_eq!(
+            required_object_classification(&object_with_marking("secret-sauce")).unwrap_err(),
+            "unknown classification marking: secret-sauce"
+        );
+        assert_eq!(
+            required_object_classification(&object_with_marking("internal")).unwrap(),
+            Some(EvidenceClassification::Internal)
+        );
+    }
+
+    #[test]
+    fn declassify_is_distinct_from_trusted_and_unrelated_grants() {
+        assert!(is_marking_downgrade(
+            Some(EvidenceClassification::Confidential),
+            Some(EvidenceClassification::Internal)
+        ));
+        assert!(is_marking_downgrade(
+            Some(EvidenceClassification::Internal),
+            None
+        ));
+        assert!(!is_marking_downgrade(
+            Some(EvidenceClassification::Internal),
+            Some(EvidenceClassification::Confidential)
+        ));
+        assert!(!is_marking_downgrade(
+            None,
+            Some(EvidenceClassification::Public)
+        ));
+        let mut without = authority(Some(EvidenceClassification::Restricted), &[]);
+        without.principal = "owner-admin".into();
+        let deny = evaluate_declassify(
+            "op11",
+            Some(EvidenceClassification::Confidential),
+            Some(EvidenceClassification::Public),
+            &without,
+        );
+        assert_eq!(deny.decision, MarkingDecision::Deny);
+        let mut granted = without.clone();
+        granted
+            .declassify_markings
+            .insert(EvidenceClassification::Confidential.as_str().into());
+        let allow = evaluate_declassify(
+            "op12",
+            Some(EvidenceClassification::Confidential),
+            Some(EvidenceClassification::Public),
+            &granted,
+        );
+        assert_eq!(allow.decision, MarkingDecision::Allow);
+        let other = evaluate_declassify(
+            "op13",
+            Some(EvidenceClassification::Restricted),
+            Some(EvidenceClassification::Internal),
+            &granted,
+        );
+        assert_eq!(other.decision, MarkingDecision::Deny);
+        let mut profile = object_with_marking("internal");
+        profile.kind = PRINCIPAL_PROFILE_KIND.into();
+        profile.properties.insert(
+            PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY.into(),
+            "confidential,restricted".into(),
+        );
+        let parsed = principal_authority_from_profile("alice", Some(&profile)).unwrap();
+        assert!(
+            parsed
+                .declassify_markings
+                .contains(EvidenceClassification::Confidential.as_str())
+        );
+        profile.properties.insert(
+            PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY.into(),
+            "health,secret".into(),
+        );
+        let lattice_tokens = principal_authority_from_profile("alice", Some(&profile)).unwrap();
+        assert!(lattice_tokens.declassify_markings.contains("health"));
+        assert!(lattice_tokens.declassify_markings.contains("secret"));
+        profile.properties.insert(
+            PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY.into(),
+            "not-a-marking!".into(),
+        );
+        assert!(principal_authority_from_profile("alice", Some(&profile)).is_err());
     }
 }

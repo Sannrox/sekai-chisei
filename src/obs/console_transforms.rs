@@ -159,6 +159,8 @@ pub fn render_run(namespace: &str, run: &TransformRun) -> String {
       <tr><th>input_digest</th><td><code>{input}</code></td></tr>
       <tr><th>output_digest</th><td><code>{output}</code></td></tr>
       <tr><th>lineage_parent</th><td><code>{parent}</code></td></tr>
+      <tr><th>markings_in</th><td><code>{markings_in}</code></td></tr>
+      <tr><th>markings_out</th><td><code>{markings_out}</code></td></tr>
       <tr><th>quality_rule</th><td>{quality}</td></tr>
       <tr><th>created_at_ms</th><td>{created}</td></tr>
     </tbody>
@@ -175,6 +177,8 @@ pub fn render_run(namespace: &str, run: &TransformRun) -> String {
         input = escape_html(&run.input_digest),
         output = escape_html(&run.output_digest),
         parent = escape_html(&run.lineage_parent),
+        markings_in = escape_html(&run.markings_in),
+        markings_out = escape_html(&run.markings_out),
         quality = escape_html(&run.quality_rule),
         created = run.created_at_ms,
     )

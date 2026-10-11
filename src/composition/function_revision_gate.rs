@@ -581,6 +581,7 @@ mod tests {
             classification_ceiling: ceiling,
             classification_token: ceiling.map(|value| value.as_str().into()),
             allowed_purposes: Default::default(),
+            declassify_markings: Default::default(),
         }
     }
 

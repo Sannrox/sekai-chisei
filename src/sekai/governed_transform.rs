@@ -83,6 +83,12 @@ pub struct TransformRun {
     pub rows_out: i32,
     pub lineage_parent: String,
     pub created_at_ms: i64,
+    /// Unique input marking tokens for this run, comma-separated.
+    #[serde(default)]
+    pub markings_in: String,
+    /// Union of input markings written on the output, empty when unmarked.
+    #[serde(default)]
+    pub markings_out: String,
 }
 
 impl GovernedTransform {
@@ -263,6 +269,8 @@ pub fn compute_run(
                 .map(|checkpoint| checkpoint.1.clone())
                 .unwrap_or_default(),
             created_at_ms: now_ms,
+            markings_in: String::new(),
+            markings_out: String::new(),
         };
         return (run, Vec::new());
     }
@@ -283,8 +291,60 @@ pub fn compute_run(
             .map(|checkpoint| checkpoint.1.clone())
             .unwrap_or_default(),
         created_at_ms: now_ms,
+        markings_in: String::new(),
+        markings_out: String::new(),
     };
     (run, output_rows)
+}
+
+/// Union input dataset/object/row markings for a transform receipt.
+/// Unknown or incomparable tokens fail closed. The live output marking is
+/// always folded into markings_out so a rebuild cannot strip a stricter stamp.
+pub fn derive_transform_markings<'a>(
+    lattice: Option<&crate::sekai::classification_lattice::ClassificationLattice>,
+    input_object_token: Option<&str>,
+    prior_output_token: Option<&str>,
+    rows: impl IntoIterator<Item = &'a HashMap<String, String>>,
+) -> Result<(String, String), String> {
+    use crate::sekai::classification_lattice::union_input_marking_tokens;
+    use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
+    let mut input_tokens: Vec<Option<String>> = Vec::new();
+    if let Some(token) = input_object_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        input_tokens.push(Some(token.to_string()));
+    }
+    for row in rows {
+        match row.get(OBJECT_CLASSIFICATION_PROPERTY) {
+            None => {}
+            Some(value) if value.trim().is_empty() => {}
+            Some(value) => input_tokens.push(Some(value.trim().to_string())),
+        }
+    }
+    let (markings_in, input_union) =
+        union_input_marking_tokens(lattice, input_tokens.iter().map(|token| token.as_deref()))?;
+    let markings_out = if let Some(prior) = prior_output_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        union_input_marking_tokens(lattice, [input_union.as_deref(), Some(prior)])?.1
+    } else {
+        input_union
+    };
+    Ok((markings_in.join(","), markings_out.unwrap_or_default()))
+}
+
+/// Marked derived output must stamp a bound dataset object. Unbound datasets
+/// are readable without marking clearance.
+pub fn require_bound_output_for_markings(
+    output_object_id: &str,
+    markings_out: &str,
+) -> Result<(), String> {
+    if markings_out.trim().is_empty() || !output_object_id.trim().is_empty() {
+        return Ok(());
+    }
+    Err("output markings unresolvable: dataset has no backing object".into())
 }
 
 pub fn rows_digest(rows: &[HashMap<String, String>]) -> String {
@@ -524,5 +584,48 @@ mod tests {
         assert_eq!(checkpoint_after_id(true, Some(&pin)), 7);
         assert_eq!(checkpoint_after_id(false, Some(&pin)), 0);
         assert_eq!(checkpoint_after_id(true, None), 0);
+    }
+
+    #[test]
+    fn derived_markings_union_rows_and_fail_closed_on_unknown() {
+        let rows = vec![
+            HashMap::from([
+                ("id".into(), "1".into()),
+                (
+                    crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "internal".into(),
+                ),
+            ]),
+            HashMap::from([
+                ("id".into(), "2".into()),
+                (
+                    crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+            ]),
+        ];
+        let (inputs, output) = derive_transform_markings(None, None, None, &rows).unwrap();
+        assert_eq!(inputs, "internal,confidential");
+        assert_eq!(output, "confidential");
+        let (inputs, output) =
+            derive_transform_markings(None, Some("public"), Some("internal"), &[]).unwrap();
+        assert_eq!(inputs, "public");
+        assert_eq!(output, "internal");
+        assert!(
+            derive_transform_markings(
+                None,
+                None,
+                None,
+                &[HashMap::from([(
+                    crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "secret-sauce".into()
+                )])]
+            )
+            .unwrap_err()
+            .contains("unknown classification marking")
+        );
+        assert!(require_bound_output_for_markings("", "confidential").is_err());
+        assert!(require_bound_output_for_markings("out-obj", "confidential").is_ok());
+        assert!(require_bound_output_for_markings("", "").is_ok());
     }
 }
