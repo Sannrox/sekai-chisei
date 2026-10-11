@@ -16,6 +16,7 @@ autotests = false
 members = [
     "crates/chisei-gateway",
     "crates/sekai-admin-client",
+    "crates/sekai-connector-template",
     "crates/sekai-client",
     "crates/sekai-domain",
     "crates/sekai-obs",
@@ -90,7 +91,7 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 sekai-domain = { version = "1.1.0", path = "crates/sekai-domain" }
-sekai-source-sdk = { version = "1.1.0", path = "crates/sekai-source-sdk" }
+sekai-source-sdk = { version = "1.2.0", path = "crates/sekai-source-sdk" }
 sekai-obs = { version = "1.1.0", path = "crates/sekai-obs" }
 sekai-provider = { version = "1.0.0", path = "crates/sekai-provider" }
 sekai-admin-client = { version = "1.0.0", path = "crates/sekai-admin-client" }
@@ -101,6 +102,7 @@ mikura-ingest = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
 fs2 = "0.4.3"
 
 [dev-dependencies]
+sekai-connector-template = { path = "crates/sekai-connector-template" }
 rusqlite = { version = "0.40", features = ["trace"] }
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 # The object-log host the clerk adapter talks to (ADR 0088), same pinned tag.

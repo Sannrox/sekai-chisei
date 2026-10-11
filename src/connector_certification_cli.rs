@@ -1,4 +1,4 @@
-//! sekaictl admin connectors commands (#710).
+//! sekaictl admin connectors commands (#710, #1409).
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
@@ -9,11 +9,12 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin connectors certify --certification <file> [--actor <principal>]\n  sekaictl admin connectors get --namespace <ns> --certification-id <id> [--actor <principal>]\n  sekaictl admin connectors verify --namespace <ns> --certification-id <id> --certification <file> [--actor <principal>]\n  sekaictl admin connectors revoke --namespace <ns> --certification-id <id> --reason <text> [--actor <principal>]"
+    "sekaictl admin connectors new <name> --out <dir> [--sdk-path <checkout>]\n  sekaictl admin connectors certify --certification <file> [--actor <principal>]\n  sekaictl admin connectors get --namespace <ns> --certification-id <id> [--actor <principal>]\n  sekaictl admin connectors verify --namespace <ns> --certification-id <id> --certification <file> [--actor <principal>]\n  sekaictl admin connectors revoke --namespace <ns> --certification-id <id> --reason <text> [--actor <principal>]"
 }
 
 pub async fn run_connectors_command(args: Vec<String>) -> Result<(), BoxErr> {
     match args.first().map(String::as_str) {
+        Some("new") => new_connector(&args[1..]),
         Some("certify") => certify(parse_file_actor(&args[1..])?).await,
         Some("get") => get(parse_get(&args[1..])?).await,
         Some("verify") => verify(parse_verify(&args[1..])?).await,
@@ -26,6 +27,36 @@ async fn open_db() -> Result<std::sync::Arc<crate::db::runtime_db::RuntimeDb>, B
     let cfg = Config::from_env();
     let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
     Ok(backend.database())
+}
+
+/// Generate a connector project from the template. Without `--sdk-path` the
+/// project depends on this repository on GitHub.
+fn new_connector(args: &[String]) -> Result<(), BoxErr> {
+    let name = args
+        .first()
+        .filter(|name| !name.starts_with("--"))
+        .ok_or_else(|| std::io::Error::other(usage()))?;
+    let mut out = None;
+    let mut sdk = crate::connector_template::SdkSource::Repository;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => out = Some(PathBuf::from(require_value(args, i, "--out")?)),
+            "--sdk-path" => {
+                let root = std::path::absolute(require_value(args, i, "--sdk-path")?)?;
+                sdk = crate::connector_template::SdkSource::Checkout(root);
+            }
+            other => return Err(std::io::Error::other(format!("unknown argument {other}")).into()),
+        }
+        i += 2;
+    }
+    let out = out.ok_or_else(|| std::io::Error::other("--out is required"))?;
+    for path in
+        crate::connector_template::generate(name, &out, &sdk).map_err(std::io::Error::other)?
+    {
+        println!("{}", path.display());
+    }
+    Ok(())
 }
 
 struct FileActor {

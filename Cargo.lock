@@ -2547,6 +2547,7 @@ dependencies = [
  "rusqlite",
  "same-file",
  "sekai-admin-client",
+ "sekai-connector-template",
  "sekai-domain",
  "sekai-obs",
  "sekai-ontology",
@@ -2590,6 +2591,20 @@ dependencies = [
  "tonic-prost",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "sekai-connector-template"
+version = "0.1.0"
+dependencies = [
+ "sekai-proto",
+ "sekai-source-sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -2662,7 +2677,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-source-sdk"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "fs2",
  "serde",

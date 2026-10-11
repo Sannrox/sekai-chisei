@@ -1,0 +1,11 @@
+{
+  "target": "http://127.0.0.1:50051",
+  "credential_env": "SEKAI_CREDENTIAL",
+  "namespace": "default",
+  "producer_identity": "connector/example",
+  "source": "example.source",
+  "source_instance": "example",
+  "type_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "outbox_dir": "data/connector-outbox",
+  "source_credential_env": "CONNECTOR_SOURCE_CREDENTIAL"
+}

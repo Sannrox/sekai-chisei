@@ -5,10 +5,11 @@
 //! batch before delivery, and leaves authentication to the RPC transport.
 
 use crate::contract::{
-    ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
-    GITHUB_OBJECT_SYNC_TYPE_DIGEST, MAX_SOURCE_BATCH_RECORDS, SOURCE_BATCH_V2_VERSION,
-    SOURCE_BATCH_VERSION, SOURCE_GITHUB, SourceBatch, SourceDeliveryMode, SourceDeliveryWindow,
-    SourceRecord, SourceSyncGenerationStatus,
+    ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, ADAPTER_REGISTERED_OBJECT_SYNC,
+    ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC, GITHUB_OBJECT_SYNC_TYPE_DIGEST,
+    MAX_SOURCE_BATCH_RECORDS, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION, SOURCE_GITHUB,
+    SourceBatch, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
+    SourceSyncGenerationStatus,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ pub const MAX_QUARANTINE_REASON_BYTES: usize = 64;
 pub struct SourceAdapterConfig {
     pub namespace: String,
     pub producer_identity: String,
-    /// Canonical GitHub `owner/repository`.
+    /// Canonical GitHub `owner/repository`, or the registered source's instance.
     pub source_instance: String,
     pub type_digest: String,
 }
@@ -38,7 +39,7 @@ struct StableBatchIdentity<'a> {
     contract_version: &'static str,
     namespace: &'a str,
     producer_identity: &'a str,
-    source: &'static str,
+    source: &'a str,
     source_instance: &'a str,
     family: &'static str,
     adapter_id: &'static str,
@@ -72,11 +73,60 @@ pub fn build_source_batch(
     current_cursor: &str,
     proposed_next_cursor: &str,
     collected_at_ms: i64,
-    mut records: Vec<SourceRecord>,
+    records: Vec<SourceRecord>,
 ) -> Result<SourceBatch, String> {
     if config.type_digest != GITHUB_OBJECT_SYNC_TYPE_DIGEST {
         return Err("source adapter rejected: unbound_type_revision".into());
     }
+    build_v1_batch(
+        config,
+        SOURCE_GITHUB,
+        ADAPTER_GITHUB_OBJECT_SYNC,
+        ADAPTER_GITHUB_OBJECT_SYNC_VERSION,
+        current_cursor,
+        proposed_next_cursor,
+        collected_at_ms,
+        records,
+    )
+}
+
+/// Builds one deterministic v1 batch for a source admitted through a registered
+/// source-type descriptor (ADR 0060). `config.type_digest` is the admitted
+/// descriptor digest; the plane still refuses unknown or retired descriptors.
+pub fn build_registered_source_batch(
+    config: &SourceAdapterConfig,
+    source: &str,
+    current_cursor: &str,
+    proposed_next_cursor: &str,
+    collected_at_ms: i64,
+    records: Vec<SourceRecord>,
+) -> Result<SourceBatch, String> {
+    if source == SOURCE_GITHUB || config.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        return Err("registered source batches cannot reuse the GitHub profile".into());
+    }
+    build_v1_batch(
+        config,
+        source,
+        ADAPTER_REGISTERED_OBJECT_SYNC,
+        ADAPTER_REGISTERED_OBJECT_SYNC_VERSION,
+        current_cursor,
+        proposed_next_cursor,
+        collected_at_ms,
+        records,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_v1_batch(
+    config: &SourceAdapterConfig,
+    source: &str,
+    adapter_id: &'static str,
+    adapter_version: &'static str,
+    current_cursor: &str,
+    proposed_next_cursor: &str,
+    collected_at_ms: i64,
+    mut records: Vec<SourceRecord>,
+) -> Result<SourceBatch, String> {
     if records.len() > MAX_SOURCE_BATCH_RECORDS {
         return Err("source adapter record count exceeds the batch limit".into());
     }
@@ -96,11 +146,11 @@ pub fn build_source_batch(
         contract_version: SOURCE_BATCH_VERSION,
         namespace: &config.namespace,
         producer_identity: &config.producer_identity,
-        source: SOURCE_GITHUB,
+        source,
         source_instance: &config.source_instance,
         family: FAMILY_OBJECT_SYNC,
-        adapter_id: ADAPTER_GITHUB_OBJECT_SYNC,
-        adapter_version: ADAPTER_GITHUB_OBJECT_SYNC_VERSION,
+        adapter_id,
+        adapter_version,
         type_digest: &config.type_digest,
         current_cursor,
         proposed_next_cursor,
@@ -113,11 +163,11 @@ pub fn build_source_batch(
         contract_version: SOURCE_BATCH_VERSION.into(),
         namespace: config.namespace.clone(),
         producer_identity: config.producer_identity.clone(),
-        source: SOURCE_GITHUB.into(),
+        source: source.into(),
         source_instance: config.source_instance.clone(),
         family: FAMILY_OBJECT_SYNC.into(),
-        adapter_id: ADAPTER_GITHUB_OBJECT_SYNC.into(),
-        adapter_version: ADAPTER_GITHUB_OBJECT_SYNC_VERSION.into(),
+        adapter_id: adapter_id.into(),
+        adapter_version: adapter_version.into(),
         type_digest: config.type_digest.clone(),
         current_cursor: current_cursor.into(),
         proposed_next_cursor: proposed_next_cursor.into(),

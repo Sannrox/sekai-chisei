@@ -41,6 +41,7 @@ jobs:
       - run: cargo test-all
       - run: cargo run -p sekai-source-sdk --example out_of_tree_adapter --locked
       - run: bash scripts/check-source-sdk-api.sh
+      - run: bash scripts/check-connector-template.sh
       - run: ./scripts/validate-ontology-deps.sh
       - run: ./build/release-images.sh
       - run: docker run --rm "$(cat _output/image-tag)" sekaictl --help
