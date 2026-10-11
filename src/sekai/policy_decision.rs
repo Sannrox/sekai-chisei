@@ -562,6 +562,7 @@ mod tests {
 
     fn context(subjects: &[&str], scopes: &[&str]) -> PrincipalPolicyContext {
         PrincipalPolicyContext {
+            delegated_subject: None,
             subjects: subjects.iter().map(|value| (*value).to_string()).collect(),
             scopes: scopes.iter().map(|value| (*value).to_string()).collect(),
         }

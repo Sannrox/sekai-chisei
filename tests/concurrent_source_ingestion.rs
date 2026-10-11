@@ -147,6 +147,7 @@ fn page_visible(db: &RuntimeDb, offset: i32, limit: i32) -> Result<(Vec<String>,
         ..Default::default()
     };
     let context = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec!["viewer".into()],
         scopes: vec![],
     };

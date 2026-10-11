@@ -618,10 +618,8 @@ fn list_namespace_objects_sqlite(
     namespace: &str,
     policy_context: &PrincipalPolicyContext,
 ) -> Result<Vec<Object>, String> {
-    let subjects =
-        serde_json::to_string(&policy_context.subjects).map_err(|error| error.to_string())?;
-    let scopes =
-        serde_json::to_string(&policy_context.scopes).map_err(|error| error.to_string())?;
+    let subjects = policy_context.sql_subjects();
+    let scopes = policy_context.sql_scopes();
     let mut statement = tx
         .prepare(&format!(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated
@@ -654,10 +652,8 @@ fn load_visible_object_sqlite(
     object_id: &str,
     policy_context: &PrincipalPolicyContext,
 ) -> Result<Option<Object>, String> {
-    let subjects =
-        serde_json::to_string(&policy_context.subjects).map_err(|error| error.to_string())?;
-    let scopes =
-        serde_json::to_string(&policy_context.scopes).map_err(|error| error.to_string())?;
+    let subjects = policy_context.sql_subjects();
+    let scopes = policy_context.sql_scopes();
     tx.query_row(
         &format!(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated
@@ -1247,7 +1243,11 @@ fn list_namespace_objects_postgres(
     let rows = tx
         .query(
             &sql,
-            &[&namespace, &policy_context.subjects, &policy_context.scopes],
+            &[
+                &namespace,
+                &policy_context.sql_subjects(),
+                &policy_context.sql_scopes(),
+            ],
         )
         .map_err(|error| error.to_string())?;
     rows.into_iter()
@@ -1279,7 +1279,11 @@ fn load_visible_object_postgres(
     );
     tx.query_opt(
         &sql,
-        &[&object_id, &policy_context.subjects, &policy_context.scopes],
+        &[
+            &object_id,
+            &policy_context.sql_subjects(),
+            &policy_context.sql_scopes(),
+        ],
     )
     .map_err(|error| error.to_string())?
     .map(|row| {

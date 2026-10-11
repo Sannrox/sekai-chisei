@@ -592,6 +592,7 @@ pub(super) async fn simulate_object_policy_change(
         simulated.push(crate::sekai::policy_decision::SimulatedPrincipal {
             principal: principal.clone(),
             context: crate::sekai::object_security::PrincipalPolicyContext {
+                delegated_subject: None,
                 subjects: vec![principal],
                 scopes: Vec::new(),
             }

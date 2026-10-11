@@ -293,6 +293,37 @@ pub(super) fn check_read(
     }
     Ok(())
 }
+pub(super) fn check_object_acl_with_audit(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object_id: &str,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+) -> Result<(), Status> {
+    let result = if matches!(
+        operation,
+        crate::sekai::object_security::ObjectSecurityOperation::Read
+            | crate::sekai::object_security::ObjectSecurityOperation::Traverse
+            | crate::sekai::object_security::ObjectSecurityOperation::Query
+            | crate::sekai::object_security::ObjectSecurityOperation::Export
+    ) {
+        check_read(security, object_id, principals)
+    } else {
+        check_write(security, object_id, principals)
+    };
+    if result.is_err() {
+        record_delegated_policy_decision(
+            db,
+            &principal_policy_context_from(principals, tenant_context),
+            object_id,
+            operation,
+            crate::sekai::policy_decision::PolicyOutcome::Deny,
+        )?;
+    }
+    result
+}
+
 pub(super) fn resolve_principal_authority(
     db: &RuntimeDb,
     principals: &[String],
@@ -415,7 +446,11 @@ pub(super) fn evaluate_active_object_policy(
         (crate::sekai::policy_decision::PolicyOutcome::Allow, _) => Some(true),
         // Marking denials stay on the marking path so they remain
         // PermissionDenied rather than NotFound.
-        (_, Some(crate::sekai::policy_decision::PolicyLayer::Marking)) => None,
+        (_, Some(crate::sekai::policy_decision::PolicyLayer::Marking))
+            if tenant_context.is_none_or(|context| context.act.is_none()) =>
+        {
+            None
+        }
         _ => Some(false),
     })
 }
@@ -428,6 +463,11 @@ pub(super) fn object_passes_security_policy(
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<bool, Status> {
     if is_reserved_governance_kind(&object.kind) {
+        if let Some(actor) = tenant_context.and_then(|context| context.act.as_ref())
+            && !object_passes_marking(db, object, std::slice::from_ref(actor))?
+        {
+            return Ok(false);
+        }
         return object_passes_marking(db, object, principals);
     }
     Ok(
@@ -453,8 +493,12 @@ pub(super) fn enforce_object_operation_access(
     };
     let _ = db.record_policy_decision(&record);
     match (decision.outcome, decision.denied_by) {
-        (crate::sekai::policy_decision::PolicyOutcome::Allow, _)
-        | (_, Some(crate::sekai::policy_decision::PolicyLayer::Marking)) => {
+        (crate::sekai::policy_decision::PolicyOutcome::Allow, _) => {
+            enforce_object_marking_access(db, object, principals, operation_id)
+        }
+        (_, Some(crate::sekai::policy_decision::PolicyLayer::Marking))
+            if tenant_context.is_none_or(|context| context.act.is_none()) =>
+        {
             enforce_object_marking_access(db, object, principals, operation_id)
         }
         _ => Err(Status::permission_denied("access denied")),
@@ -546,8 +590,68 @@ pub(super) fn decide_object_access(
         },
     )
     .map_err(Status::internal)?;
-    Ok(compiled.decide(object))
+    let mut decision = compiled.decide(object);
+    if decision.outcome == crate::sekai::policy_decision::PolicyOutcome::Allow
+        && let Some(actor) = tenant_context.and_then(|context| context.act.as_ref())
+    {
+        let actor_principals = std::slice::from_ref(actor);
+        let security = SecurityChecker::new();
+        security.load(&db.list_grants(&object.id).map_err(Status::internal)?);
+        let write = !matches!(
+            operation,
+            crate::sekai::object_security::ObjectSecurityOperation::Read
+                | crate::sekai::object_security::ObjectSecurityOperation::Traverse
+                | crate::sekai::object_security::ObjectSecurityOperation::Query
+                | crate::sekai::object_security::ObjectSecurityOperation::Export
+        );
+        let acl_allowed = if write {
+            check_write(&security, &object.id, actor_principals).is_ok()
+        } else {
+            check_read(&security, &object.id, actor_principals).is_ok()
+        };
+        if !acl_allowed
+            || check_team_namespace(db, actor_principals, &object.namespace, write).is_err()
+        {
+            decision.outcome = crate::sekai::policy_decision::PolicyOutcome::Deny;
+            decision.denied_by = Some(crate::sekai::policy_decision::PolicyLayer::NamespaceGrant);
+        } else if !object_passes_marking(db, object, actor_principals)? {
+            decision.outcome = crate::sekai::policy_decision::PolicyOutcome::Deny;
+            decision.denied_by = Some(crate::sekai::policy_decision::PolicyLayer::Marking);
+        }
+    }
+    record_delegated_policy_decision(db, &context, &object.id, operation, decision.outcome)?;
+    Ok(decision)
 }
+pub(super) fn record_delegated_policy_decision(
+    db: &RuntimeDb,
+    context: &crate::sekai::object_security::PrincipalPolicyContext,
+    object_id: &str,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+    outcome: crate::sekai::policy_decision::PolicyOutcome,
+) -> Result<(), Status> {
+    let Some(actor) = &context.delegated_subject else {
+        return Ok(());
+    };
+    db.record_decision(&audit::Decision {
+        id: format!("delegated-policy:{}", uuid::Uuid::new_v4().as_simple()),
+        timestamp: now_millis(),
+        actor: context.subjects.first().cloned().unwrap_or_default(),
+        action: "policy.delegated".into(),
+        reason: "delegated authority intersection".into(),
+        target_id: object_id.into(),
+        outcome: outcome.as_str().into(),
+        evidence: HashMap::from([
+            ("act".into(), actor.clone()),
+            ("operation".into(), operation.as_str().into()),
+            (
+                "principal_digest".into(),
+                context.digest().map_err(Status::internal)?,
+            ),
+        ]),
+    })
+    .map_err(Status::internal)
+}
+
 pub(super) fn ensure_policy_driving_update_allowed(
     db: &RuntimeDb,
     security: &SecurityChecker,
@@ -615,8 +719,17 @@ pub(super) fn map_direct_read_visibility_error(activated: bool, status: Status) 
         status
     }
 }
+/// Hide existence-shaped visibility failures as NotFound. Preserve outage
+/// codes so indexed evaluate and other skip-on-missing callers fail closed.
+pub(super) fn hide_read_root_as_missing(status: Status) -> Status {
+    match status.code() {
+        tonic::Code::Unavailable | tonic::Code::Internal => status,
+        _ => Status::not_found("not found"),
+    }
+}
 /// Single-object read root: reserved kinds are observationally missing, tenant
-/// mismatches are missing, and ACL/team/marking failures stay fail-closed.
+/// mismatches are missing, ACL/team/marking denials stay fail-closed, and
+/// authorization outages stay Unavailable/Internal.
 pub(super) fn require_visible_read_root(
     db: &RuntimeDb,
     security: &SecurityChecker,
@@ -630,9 +743,16 @@ pub(super) fn require_visible_read_root(
         return Err(Status::not_found("not found"));
     }
     enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false)
-        .map_err(|_| Status::not_found("not found"))?;
+        .map_err(hide_read_root_as_missing)?;
     check_team_namespace(db, principals, &object.namespace, false)?;
-    check_read(security, &object.id, principals)?;
+    check_object_acl_with_audit(
+        db,
+        security,
+        &object.id,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+    )?;
     if let Some(allowed) = evaluate_active_object_policy(
         db,
         &object,
@@ -641,7 +761,7 @@ pub(super) fn require_visible_read_root(
         crate::sekai::object_security::ObjectSecurityOperation::Read,
         purpose,
     )
-    .map_err(|_| Status::not_found("not found"))?
+    .map_err(hide_read_root_as_missing)?
     {
         if !allowed {
             return Err(Status::not_found("not found"));
@@ -784,7 +904,14 @@ where
         }
         let page_len = page.len() as i32;
         for object in page {
-            if !object_passes_marking(db, &object, principals).unwrap_or(false) {
+            if !object_passes_security_policy(
+                db,
+                &object,
+                principals,
+                tenant_context,
+                crate::sekai::object_security::ObjectSecurityOperation::Read,
+                purpose,
+            )? {
                 continue;
             }
             if !purpose_allows_kind(

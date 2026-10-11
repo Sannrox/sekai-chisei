@@ -302,6 +302,7 @@ pub fn query_geospatial(
         [query.property.as_str()],
     )?;
     let context = PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec![actor.to_string()],
         scopes: Vec::new(),
     }

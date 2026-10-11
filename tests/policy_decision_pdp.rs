@@ -78,6 +78,7 @@ fn principal(name: &str) -> SimulatedPrincipal {
     SimulatedPrincipal {
         principal: name.into(),
         context: PrincipalPolicyContext {
+            delegated_subject: None,
             subjects: vec![name.into()],
             scopes: Vec::new(),
         }
@@ -217,6 +218,7 @@ fn audit_query_returns_allow_and_deny_without_hidden_values() {
         ("bob", PolicyOutcome::Deny),
     ] {
         let ctx = PrincipalPolicyContext {
+            delegated_subject: None,
             subjects: vec![name.into()],
             scopes: Vec::new(),
         }

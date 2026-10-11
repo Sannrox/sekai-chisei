@@ -27,7 +27,9 @@ pub(crate) fn postgres_object_security_filter(subjects: &str, scopes: &str) -> S
                 SELECT 1 FROM sekai_object_security_activations activation
                 WHERE activation.namespace=o.namespace
             )
-            OR EXISTS (
+            OR NOT EXISTS (
+                SELECT 1 FROM jsonb_array_elements({subjects}::text::jsonb) WITH ORDINALITY authority(group_subjects, group_index)
+                WHERE NOT EXISTS (
                 SELECT 1
                 FROM sekai_object_security_active_policies active
                 JOIN sekai_object_security_rules rule
@@ -47,10 +49,10 @@ pub(crate) fn postgres_object_security_filter(subjects: &str, scopes: &str) -> S
                         WHEN predicate.predicate_kind = 'subject_equals_property' THEN NOT (
                             COALESCE(
                                 sekai_jsonb_object(o.properties) ->> predicate.property_key, ''
-                            ) = ANY({subjects})
+                            ) = ANY(ARRAY(SELECT jsonb_array_elements_text(authority.group_subjects)))
                         )
                         WHEN predicate.predicate_kind = 'required_scope_equals' THEN NOT (
-                            predicate.fixed_value = ANY({scopes})
+                            predicate.fixed_value = ANY(ARRAY(SELECT jsonb_array_elements_text({scopes}::text::jsonb -> (authority.group_index::int - 1))))
                         )
                         WHEN predicate.predicate_kind = 'property_equals' THEN
                             COALESCE(
@@ -59,6 +61,7 @@ pub(crate) fn postgres_object_security_filter(subjects: &str, scopes: &str) -> S
                         ELSE TRUE
                       END
                   )
+                )
             )
         )"
     )
@@ -111,7 +114,7 @@ impl PostgresDb {
                      WHERE o.id=$1{}",
                     postgres_object_security_filter("$2", "$3")
                 ),
-                &[&id, &context.subjects, &context.scopes],
+                &[&id, &context.sql_subjects(), &context.sql_scopes()],
             )
             .map_err(|error| error.to_string())?
             .map(row_to_object)
@@ -175,9 +178,9 @@ impl PostgresDb {
             ));
         }
         let context = context.clone().normalized();
-        params.push(Box::new(context.subjects));
+        params.push(Box::new(context.sql_subjects()));
         let subjects = format!("${}", params.len());
-        params.push(Box::new(context.scopes));
+        params.push(Box::new(context.sql_scopes()));
         let scopes = format!("${}", params.len());
         where_parts.push(
             postgres_object_security_filter(&subjects, &scopes)
@@ -315,7 +318,7 @@ impl PostgresDb {
                  ORDER BY o.id",
                 postgres_object_security_filter("$2", "$3")
             ),
-            &[&external_id, &context.subjects, &context.scopes],
+            &[&external_id, &context.sql_subjects(), &context.sql_scopes()],
         )
     }
 
@@ -427,9 +430,9 @@ impl PostgresDb {
         }
         if let Some(context) = policy_context {
             let context = context.clone().normalized();
-            params.push(Box::new(context.subjects));
+            params.push(Box::new(context.sql_subjects()));
             let subjects = format!("${}", params.len());
-            params.push(Box::new(context.scopes));
+            params.push(Box::new(context.sql_scopes()));
             let scopes = format!("${}", params.len());
             where_parts.push(
                 postgres_object_security_filter(&subjects, &scopes)
@@ -556,7 +559,13 @@ impl PostgresDb {
                    AND (sekai_jsonb_object(o.properties) ->> $2) = $3{}",
                 postgres_object_security_filter("$4", "$5")
             ),
-            &[&kind, &key, &value, &context.subjects, &context.scopes],
+            &[
+                &kind,
+                &key,
+                &value,
+                &context.sql_subjects(),
+                &context.sql_scopes(),
+            ],
         )
     }
 
@@ -731,14 +740,22 @@ impl PostgresDb {
         );
         if relation.is_empty() {
             self.connection()?
-                .query(&sql, &[&object_id, &context.subjects, &context.scopes])
+                .query(
+                    &sql,
+                    &[&object_id, &context.sql_subjects(), &context.sql_scopes()],
+                )
                 .map(|rows| rows.into_iter().map(row_to_link).collect())
                 .map_err(|error| error.to_string())
         } else {
             self.connection()?
                 .query(
                     &sql,
-                    &[&object_id, &relation, &context.subjects, &context.scopes],
+                    &[
+                        &object_id,
+                        &relation,
+                        &context.sql_subjects(),
+                        &context.sql_scopes(),
+                    ],
                 )
                 .map(|rows| rows.into_iter().map(row_to_link).collect())
                 .map_err(|error| error.to_string())
@@ -778,11 +795,19 @@ impl PostgresDb {
             postgres_object_security_filter(subjects, scopes)
         );
         if relation.is_empty() {
-            self.query_objects(&sql, &[&object_id, &context.subjects, &context.scopes])
+            self.query_objects(
+                &sql,
+                &[&object_id, &context.sql_subjects(), &context.sql_scopes()],
+            )
         } else {
             self.query_objects(
                 &sql,
-                &[&object_id, &relation, &context.subjects, &context.scopes],
+                &[
+                    &object_id,
+                    &relation,
+                    &context.sql_subjects(),
+                    &context.sql_scopes(),
+                ],
             )
         }
     }

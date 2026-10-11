@@ -82,7 +82,14 @@ impl SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
-        check_write(&self.security, &object.id, &principals)?;
+        check_object_acl_with_audit(
+            self.db.runtime(),
+            &self.security,
+            &object.id,
+            &principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Create,
+        )?;
         enforce_optional_ontology_revision_pin(
             self.db.runtime(),
             revision_pin.as_deref(),
@@ -180,6 +187,17 @@ impl SekaiServiceImpl {
                 &principals,
                 &domain_object,
             )?;
+            if let Some(actor) = tenant_context
+                .as_ref()
+                .and_then(|context| context.act.as_ref())
+            {
+                ensure_restricted_create_properties_allowed(
+                    &schema,
+                    &self.security,
+                    std::slice::from_ref(actor),
+                    &domain_object,
+                )?;
+            }
             drop(schema);
         }
         enforce_property_grant_mutation(self.db.runtime(), None, &mut domain_object)?;
@@ -303,7 +321,14 @@ impl SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
-        check_write(&self.security, &object.id, &principals)?;
+        check_object_acl_with_audit(
+            self.db.runtime(),
+            &self.security,
+            &object.id,
+            &principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Update,
+        )?;
         enforce_optional_ontology_revision_pin(
             self.db.runtime(),
             revision_pin.as_deref(),
@@ -422,6 +447,27 @@ impl SekaiServiceImpl {
                     &mut domain_object,
                 )?;
             }
+            if let Some(actor) = tenant_context
+                .as_ref()
+                .and_then(|context| context.act.as_ref())
+            {
+                if existing.is_some() {
+                    preserve_redacted_restricted_properties(
+                        self.db.runtime(),
+                        &schema,
+                        &self.security,
+                        std::slice::from_ref(actor),
+                        &mut domain_object,
+                    )?;
+                } else {
+                    ensure_restricted_create_properties_allowed(
+                        &schema,
+                        &self.security,
+                        std::slice::from_ref(actor),
+                        &domain_object,
+                    )?;
+                }
+            }
             enforce_property_grant_mutation(
                 self.db.runtime(),
                 existing.as_ref(),
@@ -447,6 +493,25 @@ impl SekaiServiceImpl {
                 &domain_object,
                 &principals,
             )?;
+            if let Some(actor) = tenant_context
+                .as_ref()
+                .and_then(|context| context.act.as_ref())
+            {
+                validate_object_kind_change_access(
+                    self.db.runtime(),
+                    &self.security,
+                    std::slice::from_ref(actor),
+                    existing,
+                    &domain_object,
+                )?;
+                ensure_policy_driving_update_allowed(
+                    self.db.runtime(),
+                    &self.security,
+                    existing,
+                    &domain_object,
+                    std::slice::from_ref(actor),
+                )?;
+            }
         }
         enforce_object_operation_access(
             self.db.runtime(),
@@ -508,6 +573,10 @@ impl SekaiServiceImpl {
                 None,
             )? == Some(false)
         {
+            // Unguarded delete is idempotent for unobservable objects.
+            // Some(false) is the existence-hiding deny used as NotFound on
+            // get/update; missing unguarded deletes already return OK, so
+            // mapping deny to NotFound would leak existence.
             if precondition.is_none() {
                 return Ok(Response::new(GuardedDeleteObjectResponse {}));
             }
@@ -516,7 +585,14 @@ impl SekaiServiceImpl {
         if precondition.is_none() && expected.is_none() {
             return Ok(Response::new(GuardedDeleteObjectResponse {}));
         }
-        check_write(&self.security, &input.id, &principals)?;
+        check_object_acl_with_audit(
+            self.db.runtime(),
+            &self.security,
+            &input.id,
+            &principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Delete,
+        )?;
         if let Some(current) = &expected {
             enforce_optional_ontology_revision_pin(
                 self.db.runtime(),

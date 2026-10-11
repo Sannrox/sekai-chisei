@@ -162,6 +162,7 @@ pub struct ObjectSecurityActivation {
 pub struct PrincipalPolicyContext {
     pub subjects: Vec<String>,
     pub scopes: Vec<String>,
+    pub delegated_subject: Option<String>,
 }
 
 impl PrincipalPolicyContext {
@@ -182,14 +183,38 @@ impl PrincipalPolicyContext {
         self.subjects.dedup();
         self.scopes.sort();
         self.scopes.dedup();
+        self.delegated_subject = self
+            .delegated_subject
+            .take()
+            .map(|value| value.trim().to_string());
         self
+    }
+
+    pub(crate) fn sql_subjects(&self) -> String {
+        let mut groups = vec![self.subjects.clone()];
+        if let Some(actor) = &self.delegated_subject {
+            groups.push(vec![actor.clone()]);
+        }
+        serde_json::json!(groups).to_string()
+    }
+
+    pub(crate) fn sql_scopes(&self) -> String {
+        let mut groups = vec![self.scopes.clone()];
+        if self.delegated_subject.is_some() {
+            groups.push(Vec::new());
+        }
+        serde_json::json!(groups).to_string()
     }
 
     pub fn digest(&self) -> Result<String, String> {
         let normalized = self.clone().normalized();
         canonical_hex_digest(
             "principal_policy_context",
-            &(normalized.subjects, normalized.scopes),
+            &(
+                normalized.subjects,
+                normalized.scopes,
+                normalized.delegated_subject,
+            ),
         )
     }
 }
@@ -419,13 +444,23 @@ impl ObjectSecurityPolicy {
             return false;
         }
         let context = context.clone().normalized();
-        self.rules.iter().any(|rule| {
-            rule.operation == operation
-                && rule
-                    .predicates
-                    .iter()
-                    .all(|predicate| predicate.matches(&context, object))
-        })
+        let allowed = |context: &PrincipalPolicyContext| {
+            self.rules.iter().any(|rule| {
+                rule.operation == operation
+                    && rule
+                        .predicates
+                        .iter()
+                        .all(|predicate| predicate.matches(context, object))
+            })
+        };
+        allowed(&context)
+            && context.delegated_subject.as_ref().is_none_or(|subject| {
+                allowed(&PrincipalPolicyContext {
+                    subjects: vec![subject.clone()],
+                    scopes: Vec::new(),
+                    delegated_subject: None,
+                })
+            })
     }
 
     pub fn policy_driving_properties(&self) -> Vec<String> {
@@ -905,6 +940,7 @@ mod tests {
     #[test]
     fn principal_context_discards_empty_and_anonymous_subjects() {
         let context = PrincipalPolicyContext {
+            delegated_subject: None,
             subjects: vec![
                 String::new(),
                 "  ".into(),
@@ -939,6 +975,7 @@ mod tests {
         ])))
         .unwrap();
         let context = PrincipalPolicyContext {
+            delegated_subject: None,
             subjects: vec!["alice".into()],
             scopes: Vec::new(),
         };
@@ -949,12 +986,34 @@ mod tests {
     }
 
     #[test]
+    fn delegated_policy_requires_service_and_human_constraints() {
+        let policy = ObjectSecurityPolicy::from_canonical_input(&document(serde_json::json!([
+            {"operation":"read","predicates":[{"kind":"subject_equals_property","property":"owner"}]}
+        ])))
+        .unwrap();
+        let object = sample_object("service-a");
+        let service_only = PrincipalPolicyContext {
+            subjects: vec!["service-a".into()],
+            scopes: Vec::new(),
+            delegated_subject: None,
+        };
+        assert!(policy.allows(&service_only, &object, ObjectSecurityOperation::Read));
+        let delegated = PrincipalPolicyContext {
+            subjects: vec!["service-a".into()],
+            scopes: Vec::new(),
+            delegated_subject: Some("human-a".into()),
+        };
+        assert!(!policy.allows(&delegated, &object, ObjectSecurityOperation::Read));
+    }
+
+    #[test]
     fn matching_update_rule_authorizes_current_and_proposed_state() {
         let policy = ObjectSecurityPolicy::from_canonical_input(&document(serde_json::json!([
             {"operation":"update","predicates":[{"kind":"subject_equals_property","property":"owner"}]}
         ])))
         .unwrap();
         let alice = PrincipalPolicyContext {
+            delegated_subject: None,
             subjects: vec!["alice".into()],
             scopes: Vec::new(),
         };

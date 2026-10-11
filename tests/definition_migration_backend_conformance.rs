@@ -24,6 +24,7 @@ use sekai_chisei::sekai::object_security::{
 
 fn ctx(actor: &str) -> PrincipalPolicyContext {
     PrincipalPolicyContext {
+        delegated_subject: None,
         subjects: vec![actor.into()],
         scopes: vec![],
     }

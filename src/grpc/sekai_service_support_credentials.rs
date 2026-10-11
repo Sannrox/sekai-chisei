@@ -218,12 +218,14 @@ pub(super) fn principal_policy_context_from(
         return crate::sekai::object_security::PrincipalPolicyContext {
             subjects: vec![context.principal.subject.clone()],
             scopes: context.scopes.clone(),
+            delegated_subject: context.act.clone(),
         }
         .normalized();
     }
     crate::sekai::object_security::PrincipalPolicyContext {
         subjects: principals.to_vec(),
         scopes: Vec::new(),
+        delegated_subject: None,
     }
     .normalized()
 }
@@ -464,31 +466,58 @@ pub(super) fn enforce_namespace_tenant_context(
     namespace: &str,
     write: bool,
 ) -> Result<(), Status> {
-    if let Some(context) = tenant_context {
-        context
-            .authorize_space(if write {
-                crate::enterprise::NamespaceAction::Write
+    let result = (|| {
+        if let Some(context) = tenant_context {
+            context
+                .authorize_space(if write {
+                    crate::enterprise::NamespaceAction::Write
+                } else {
+                    crate::enterprise::NamespaceAction::Read
+                })
+                .map_err(extension_status)?;
+        }
+        if let Some(context) = tenant_context
+            && let Some(actor) = &context.act
+        {
+            check_team_namespace(
+                db,
+                std::slice::from_ref(&context.principal.subject),
+                namespace,
+                write,
+            )?;
+            check_team_namespace(db, std::slice::from_ref(actor), namespace, write)?;
+        }
+        let Some(extension) = db.enterprise_extension() else {
+            return Ok(());
+        };
+        let Some(context) = tenant_context else {
+            return Err(Status::unauthenticated(
+                "enterprise authenticated context required",
+            ));
+        };
+        let action = if write {
+            crate::enterprise::NamespaceAction::Write
+        } else {
+            crate::enterprise::NamespaceAction::Read
+        };
+        extension
+            .authorize_authenticated_context(context, namespace, action)
+            .map_err(extension_status)
+    })();
+    if result.is_err() {
+        record_delegated_policy_decision(
+            db,
+            &principal_policy_context_from(&[], tenant_context),
+            namespace,
+            if write {
+                crate::sekai::object_security::ObjectSecurityOperation::Update
             } else {
-                crate::enterprise::NamespaceAction::Read
-            })
-            .map_err(extension_status)?;
+                crate::sekai::object_security::ObjectSecurityOperation::Read
+            },
+            crate::sekai::policy_decision::PolicyOutcome::Deny,
+        )?;
     }
-    let Some(extension) = db.enterprise_extension() else {
-        return Ok(());
-    };
-    let Some(context) = tenant_context else {
-        return Err(Status::unauthenticated(
-            "enterprise authenticated context required",
-        ));
-    };
-    let action = if write {
-        crate::enterprise::NamespaceAction::Write
-    } else {
-        crate::enterprise::NamespaceAction::Read
-    };
-    extension
-        .authorize_authenticated_context(context, namespace, action)
-        .map_err(extension_status)
+    result
 }
 pub(super) fn extension_status(error: crate::enterprise::ExtensionError) -> Status {
     match error {
