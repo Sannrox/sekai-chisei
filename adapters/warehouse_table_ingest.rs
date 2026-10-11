@@ -16,18 +16,23 @@
 //!   version, as in a table rewrite) is a source-version conflict, so the
 //!   plane quarantines the batch and the last consistent objects stay.
 //! - Columns marked `hidden` never leave the connector: they are not in record
-//!   properties, payload digests, or display names.
+//!   properties, payload digests, display names, or discovery output.
+//! - `TableStore` implements the SDK check and discover operations (#1408),
+//!   so a discovered table drafts the descriptor its batches admit under.
 
 use sekai_chisei::sekai::source_type_descriptor::{
     ProposedSourceTypeDescriptor, registered_source_id,
 };
 use sekai_source_sdk::{
-    ADAPTER_REGISTERED_OBJECT_SYNC, ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
-    SOURCE_BATCH_VERSION, SourceBatch, SourceRecord, object_id_for,
+    ADAPTER_REGISTERED_OBJECT_SYNC, ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, ColumnProfileHint,
+    ConnectionFailure, DiscoveredColumn, DiscoveredRecordKind, FAMILY_OBJECT_SYNC,
+    PROFILE_RATIO_SCALE, SOURCE_BATCH_VERSION, SOURCE_DISCOVERY_VERSION, SourceBatch,
+    SourceDiscovery, SourceInspector, SourceRecord, column_name_suggests_sensitive, object_id_for,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Registered source name for warehouse tables.
 pub const SOURCE: &str = "warehouse.table";
@@ -58,9 +63,16 @@ pub struct TableSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct TableColumn {
     pub name: String,
+    /// Warehouse column type as declared in the table schema.
+    #[serde(default = "default_data_type")]
+    pub data_type: String,
     /// Restricted columns stay inside the connector.
     #[serde(default)]
     pub hidden: bool,
+}
+
+fn default_data_type() -> String {
+    "string".into()
 }
 
 pub fn parse(bytes: &[u8]) -> Result<TableSnapshot, String> {
@@ -273,6 +285,7 @@ pub fn batch(
 /// commits a new snapshot the connector then ingests (#1085 writeback).
 pub struct TableStore {
     snapshot: std::sync::Mutex<TableSnapshot>,
+    rows_read: AtomicU64,
 }
 
 impl TableStore {
@@ -280,15 +293,25 @@ impl TableStore {
         validate(&snapshot)?;
         Ok(Self {
             snapshot: std::sync::Mutex::new(snapshot),
+            rows_read: AtomicU64::new(0),
         })
     }
 
-    /// The latest committed snapshot.
+    /// The latest committed snapshot. Counts as reading every row.
     pub fn snapshot(&self) -> TableSnapshot {
-        self.snapshot
+        let snapshot = self
+            .snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .clone();
+        self.rows_read
+            .fetch_add(snapshot.rows.len() as u64, Ordering::Relaxed);
+        snapshot
+    }
+
+    /// Rows read through this store so far; conformance proves `check` reads none.
+    pub fn rows_read(&self) -> u64 {
+        self.rows_read.load(Ordering::Relaxed)
     }
 
     /// Stable reference to one row, the same identity ingest admits.
@@ -356,4 +379,62 @@ impl TableStore {
         snapshot.committed_at_ms += 1_000;
         Ok(next)
     }
+}
+
+impl SourceInspector for TableStore {
+    /// The store already holds the connector's credentials and a validated
+    /// schema, so the check succeeds without touching rows.
+    fn check(&mut self) -> Result<(), ConnectionFailure> {
+        Ok(())
+    }
+
+    /// One record kind for the table: visible columns in table order, the
+    /// row key as the only key candidate, and hints profiled from the rows.
+    fn discover(&mut self) -> Result<SourceDiscovery, ConnectionFailure> {
+        let snapshot = self.snapshot();
+        let required = [
+            &snapshot.key_column,
+            &snapshot.display_column,
+            &snapshot.version_column,
+        ];
+        let columns = snapshot
+            .columns
+            .iter()
+            .filter(|column| !column.hidden)
+            .map(|column| DiscoveredColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: !required.contains(&&column.name),
+                profile: profile(&snapshot.rows, &column.name),
+            })
+            .collect();
+        Ok(SourceDiscovery {
+            contract_version: SOURCE_DISCOVERY_VERSION.into(),
+            source: SOURCE.into(),
+            record_kinds: vec![DiscoveredRecordKind {
+                record_kind: snapshot.record_kind.clone(),
+                schema_revision: snapshot.schema_revision.clone(),
+                columns,
+                key_candidates: vec![vec![snapshot.key_column.clone()]],
+            }],
+        })
+    }
+}
+
+/// Distinct and null ratios over the snapshot rows, or none for an empty table.
+fn profile(rows: &[BTreeMap<String, String>], column: &str) -> Option<ColumnProfileHint> {
+    if rows.is_empty() {
+        return None;
+    }
+    let values = rows
+        .iter()
+        .filter_map(|row| row.get(column).filter(|value| !value.is_empty()))
+        .collect::<Vec<_>>();
+    let distinct = values.iter().collect::<BTreeSet<_>>().len();
+    let ratio = |count: usize| (count * usize::from(PROFILE_RATIO_SCALE) / rows.len()) as u16;
+    Some(ColumnProfileHint {
+        distinct_ratio_bp: ratio(distinct),
+        null_ratio_bp: ratio(rows.len() - values.len()),
+        possibly_sensitive: column_name_suggests_sensitive(column),
+    })
 }

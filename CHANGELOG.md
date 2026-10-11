@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Source adapters gain `check` (connectivity, zero records) and `discover`
+  (kinds, columns, key candidates, optional profile hints). Discovery drafts
+  a source-type descriptor; catalog admission stays a separate review.
+  Reference GitHub and warehouse adapters implement both (#1408).
+
 - Source adapters depend on the versioned `sekai-source-sdk` crate for the
   batch builder, outbox, snapshot and change-feed runners, and conformance
   kit. A breaking public-API change without a major bump fails CI. Connector
