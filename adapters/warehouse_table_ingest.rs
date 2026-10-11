@@ -422,13 +422,14 @@ impl SourceInspector for TableStore {
 }
 
 /// Distinct and null ratios over the snapshot rows, or none for an empty table.
+/// A missing cell is null; an empty string is a value, as ingest keeps it.
 fn profile(rows: &[BTreeMap<String, String>], column: &str) -> Option<ColumnProfileHint> {
     if rows.is_empty() {
         return None;
     }
     let values = rows
         .iter()
-        .filter_map(|row| row.get(column).filter(|value| !value.is_empty()))
+        .filter_map(|row| row.get(column))
         .collect::<Vec<_>>();
     let distinct = values.iter().collect::<BTreeSet<_>>().len();
     let ratio = |count: usize| (count * usize::from(PROFILE_RATIO_SCALE) / rows.len()) as u16;

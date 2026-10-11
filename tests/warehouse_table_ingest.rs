@@ -568,3 +568,24 @@ async fn discovered_table_schema_round_trips_into_an_admitted_descriptor() {
         .unwrap();
     assert_eq!(status(&admitted), "COMMITTED", "{admitted:?}");
 }
+
+/// Ingest keeps an empty cell as a value, so discovery profiles only a
+/// missing cell as null.
+#[test]
+fn discovery_profiles_missing_cells_as_null_and_empty_cells_as_values() {
+    let mut table = snapshot("orders-snapshot-1.json");
+    table.rows[0].insert("status".into(), String::new());
+    table.rows[1].remove("status");
+    let mut store = warehouse_table_ingest::TableStore::new(table).unwrap();
+    let discovery = sekai_source_sdk::SourceInspector::discover(&mut store).unwrap();
+    let status = discovery.record_kinds[0]
+        .columns
+        .iter()
+        .find(|column| column.name == "status")
+        .and_then(|column| column.profile)
+        .unwrap();
+    assert_eq!(
+        (status.distinct_ratio_bp, status.null_ratio_bp),
+        (6_666, 3_333)
+    );
+}
