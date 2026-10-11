@@ -840,7 +840,39 @@ mod tests {
         ReceiptSurface, UncoveredSurface,
     };
 
-    fn seed_effect(db: &RuntimeDb) -> ActionEffect {
+    fn seed_admitted_instance(
+        db: &RuntimeDb,
+        effect: &ActionEffect,
+        delegating_actor: Option<&str>,
+    ) {
+        db.put_action_instance(&ActionInstance {
+            instance_id: effect.instance_id.clone(),
+            namespace: effect.namespace.clone(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            principal: "runtime".into(),
+            delegating_actor: delegating_actor.map(str::to_string),
+            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+            request_digest: "digest-1".into(),
+            idempotency_key: format!("idem-{}", effect.effect_id),
+            operation_id: effect.operation_id.clone(),
+            status: STATUS_ADMITTED.into(),
+            deny_reason: String::new(),
+            evidence_submission_ids: Vec::new(),
+            policy_decision: "allow".into(),
+            budget_decision: "allow".into(),
+            created_at_ms: 10,
+            decided_at_ms: 10,
+            system_one_fill_json: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
+            autonomous_envelope_id: String::new(),
+        })
+        .unwrap();
+    }
+
+    fn seed_effect_row(db: &RuntimeDb) -> ActionEffect {
         let effect = plan_effects_for_admit(
             "ai-1",
             "acme",
@@ -854,6 +886,12 @@ mod tests {
         .remove(0);
         db.put_action_effects(std::slice::from_ref(&effect))
             .unwrap();
+        effect
+    }
+
+    fn seed_effect(db: &RuntimeDb) -> ActionEffect {
+        let effect = seed_effect_row(db);
+        seed_admitted_instance(db, &effect, None);
         effect
     }
 
@@ -1629,7 +1667,8 @@ mod tests {
 
     fn seed_delegated_apply_path() -> (RuntimeDb, ActionEffect, Grant) {
         let db = RuntimeDb::memory();
-        let effect = seed_effect(&db);
+        let effect = seed_effect_row(&db);
+        seed_admitted_instance(&db, &effect, Some(DELEGATOR));
         seed_open_receipt(&db, &effect);
         db.create_principal_credential(
             DELEGATOR,
@@ -1644,31 +1683,6 @@ mod tests {
             .into_iter()
             .find(|grant| grant.principal == DELEGATOR)
             .expect("namespace grant");
-        db.put_action_instance(&ActionInstance {
-            instance_id: effect.instance_id.clone(),
-            namespace: effect.namespace.clone(),
-            type_id: "dispatch".into(),
-            version: "1".into(),
-            principal: "runtime".into(),
-            delegating_actor: Some(DELEGATOR.into()),
-            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
-            request_digest: "digest-1".into(),
-            idempotency_key: "idem-delegated".into(),
-            operation_id: effect.operation_id.clone(),
-            status: STATUS_ADMITTED.into(),
-            deny_reason: String::new(),
-            evidence_submission_ids: Vec::new(),
-            policy_decision: "allow".into(),
-            budget_decision: "allow".into(),
-            created_at_ms: 10,
-            decided_at_ms: 10,
-            system_one_fill_json: String::new(),
-            parked_object_digest: String::new(),
-            decided_by: String::new(),
-            approval_decision: String::new(),
-            autonomous_envelope_id: String::new(),
-        })
-        .unwrap();
         (db, effect, grant)
     }
 
