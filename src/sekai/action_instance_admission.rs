@@ -440,7 +440,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             return Err(error);
         }
         if let Some(applied) = &applied_object {
-            crate::sekai::feedback_package::complete_object_write(self.db, &applied.object, now);
+            action_object_mutation::complete_object_write(self.db, &applied.object, actor, now);
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: stored,
@@ -497,15 +497,9 @@ impl<'a> ActionInstanceAdmission<'a> {
         }
 
         if instance.status != STATUS_PARKED {
-            if instance.approval_decision == decision {
-                return Ok(ActionInstanceAdmissionOutcome {
-                    instance,
-                    replay: true,
-                });
-            }
-            return Err(ActionInstanceAdmissionError::FailedPrecondition(
-                "action instance is not awaiting a decision".into(),
-            ));
+            // A repeated decision replays and finishes any post-write
+            // completion an interrupted grant skipped.
+            return self.replay_decided(&instance.instance_id, decision, now);
         }
         let approval = ApprovalRecord {
             decider,
@@ -710,7 +704,12 @@ impl<'a> ActionInstanceAdmission<'a> {
             return Err(error);
         }
         if let Some(applied) = &applied_object {
-            crate::sekai::feedback_package::complete_object_write(self.db, &applied.object, now);
+            action_object_mutation::complete_object_write(
+                self.db,
+                &applied.object,
+                &instance.principal,
+                now,
+            );
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: granted,
@@ -783,7 +782,12 @@ impl<'a> ActionInstanceAdmission<'a> {
             if current.status == STATUS_ADMITTED
                 && let Some(object) = object_for_admitted_instance(self.db, &current)?
             {
-                crate::sekai::feedback_package::complete_object_write(self.db, &object, now);
+                action_object_mutation::complete_object_write(
+                    self.db,
+                    &object,
+                    &current.principal,
+                    now,
+                );
             }
             Ok(ActionInstanceAdmissionOutcome {
                 instance: current,
@@ -817,7 +821,12 @@ impl<'a> ActionInstanceAdmission<'a> {
             // Clerk admission is already durable. Log catch-up is best-effort so
             // a transient object-log error cannot fail an idempotent replay.
             catch_up_object_log(&existing.operation_id, &object.id, &object.kind, &object);
-            crate::sekai::feedback_package::complete_object_write(self.db, &object, now);
+            action_object_mutation::complete_object_write(
+                self.db,
+                &object,
+                &existing.principal,
+                now,
+            );
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: existing,

@@ -152,8 +152,7 @@ pub(crate) fn plan(
                 updated: 0,
             };
             validate_object_schema(db, &planned)?;
-            crate::sekai::feedback_package::validate_object_write(db, &mut planned, now_ms)
-                .map_err(ActionObjectMutationError::FailedPrecondition)?;
+            validate_object_write(db, &mut planned, now_ms)?;
             Ok(Some(PlannedObjectMutation::Create(planned)))
         }
         OBJECT_MUTATION_UPDATE => {
@@ -190,8 +189,7 @@ pub(crate) fn plan(
                 updated: existing.updated,
             };
             validate_object_schema(db, &planned)?;
-            crate::sekai::feedback_package::validate_object_write(db, &mut planned, now_ms)
-                .map_err(ActionObjectMutationError::FailedPrecondition)?;
+            validate_object_write(db, &mut planned, now_ms)?;
             Ok(Some(PlannedObjectMutation::Update(planned)))
         }
         other => Err(ActionObjectMutationError::FailedPrecondition(format!(
@@ -319,6 +317,23 @@ pub(crate) fn grant_parked(
             }))
         }
     })
+}
+
+fn validate_object_write(
+    db: &RuntimeDb,
+    planned: &mut Object,
+    now_ms: i64,
+) -> Result<(), ActionObjectMutationError> {
+    crate::sekai::feedback_package::validate_object_write(db, planned, now_ms)
+        .and_then(|()| crate::sekai::function_document::validate_lineage_write(db, planned, now_ms))
+        .map_err(ActionObjectMutationError::FailedPrecondition)
+}
+
+/// Best-effort follow-up after an Action's object write is durable. Runs
+/// again on admission replay, so each step must be idempotent.
+pub(crate) fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_ms: i64) {
+    crate::sekai::feedback_package::complete_object_write(db, object, now_ms);
+    let _ = crate::sekai::function_document::complete_lineage_write(db, actor, object, now_ms);
 }
 
 pub(crate) fn compensate(db: &RuntimeDb, applied: &AppliedObjectMutation, actor: &str) {

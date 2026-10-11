@@ -636,7 +636,7 @@ fn digest_token(value: &str) -> bool {
     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn is_expired(document: &GovernedDocument, now_ms: i64) -> bool {
+pub(crate) fn is_expired(document: &GovernedDocument, now_ms: i64) -> bool {
     document.hold_id.is_empty() && document.expires_at_ms > 0 && now_ms >= document.expires_at_ms
 }
 
