@@ -522,6 +522,13 @@ impl SekaiServiceImpl {
             &format!("guarded_update_object_proposed:{}", domain_object.id),
             purpose.as_ref(),
         )?;
+        enforce_marking_declassify(
+            self.db.runtime(),
+            existing.as_ref(),
+            &domain_object,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         let policy_generation =
             object_security_generation(self.db.runtime(), &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();

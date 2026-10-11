@@ -88,6 +88,7 @@ fn principal(name: &str) -> SimulatedPrincipal {
             classification_ceiling: Some(EvidenceClassification::Public),
             classification_token: Some("public".into()),
             allowed_purposes: Default::default(),
+            declassify_markings: Default::default(),
         },
         purpose: None,
         purpose_authorization: None,
@@ -228,6 +229,7 @@ fn audit_query_returns_allow_and_deny_without_hidden_values() {
             classification_ceiling: Some(EvidenceClassification::Public),
             classification_token: Some("public".into()),
             allowed_purposes: Default::default(),
+            declassify_markings: Default::default(),
         };
         let compiled = compile_object_access(PolicyCompileRequest {
             namespace: "acme",

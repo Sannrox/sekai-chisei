@@ -329,16 +329,13 @@ pub(super) fn resolve_principal_authority(
     principals: &[String],
 ) -> Result<markings::PrincipalAuthority, Status> {
     let primary = principals.first().map(String::as_str).unwrap_or_default();
-    if let Some(trusted) = markings::trusted_service_authority(primary) {
-        return Ok(trusted);
-    }
     let external_id = markings::principal_profile_external_id(primary);
     // Prefer an explicit kind-matched sealed profile over any colliding
     // external_id on ordinary objects (external IDs are indexed, not unique).
     let candidates = db
         .find_all_by_external_id(&external_id)
         .map_err(Status::internal)?;
-    let mut trusted = Vec::new();
+    let mut profiles = Vec::new();
     for object in &candidates {
         if object.kind != markings::PRINCIPAL_PROFILE_KIND {
             continue;
@@ -355,16 +352,22 @@ pub(super) fn resolve_principal_authority(
             .iter()
             .any(|grant| matches!(grant.role, security::Role::Admin))
         {
-            trusted.push(object);
+            profiles.push(object);
         }
     }
-    if trusted.len() > 1 {
+    if profiles.len() > 1 {
         return Err(Status::failed_precondition(
             "multiple trusted principal profiles found; resolve duplicates before marking checks",
         ));
     }
-    markings::principal_authority_from_profile(primary, trusted.first().copied())
-        .map_err(Status::internal)
+    let from_profile =
+        markings::principal_authority_from_profile(primary, profiles.first().copied())
+            .map_err(Status::internal)?;
+    if let Some(mut trusted) = markings::trusted_service_authority(primary) {
+        trusted.declassify_markings = from_profile.declassify_markings;
+        return Ok(trusted);
+    }
+    Ok(from_profile)
 }
 pub(super) fn load_classification_lattice(
     db: &RuntimeDb,
@@ -1144,10 +1147,95 @@ pub(super) fn validate_principal_profile_object(obj: &Object) -> Result<(), Stat
         || obj
             .properties
             .contains_key(markings::PRINCIPAL_ALLOWED_PURPOSES_PROPERTY)
+        || obj
+            .properties
+            .contains_key(markings::PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY)
     {
         let domain = from_proto_obj(obj);
         markings::principal_authority_from_profile(&obj.name, Some(&domain))
             .map_err(Status::invalid_argument)?;
+    }
+    Ok(())
+}
+
+pub(super) fn enforce_marking_declassify(
+    db: &RuntimeDb,
+    existing: Option<&domain::Object>,
+    proposed: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Result<(), Status> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    let lattice = load_classification_lattice(db, &existing.namespace)?;
+    let from = markings::object_marking_token(existing);
+    let to = markings::object_marking_token(proposed);
+    let actor = catalog_actor_subject(tenant_context);
+    enforce_subject_declassify(db, existing, from, to, principals, lattice.as_ref(), actor)?;
+    if let Some(actor) = actor {
+        enforce_subject_declassify(
+            db,
+            existing,
+            from,
+            to,
+            std::slice::from_ref(actor),
+            lattice.as_ref(),
+            Some(actor),
+        )?;
+    }
+    Ok(())
+}
+
+fn enforce_subject_declassify(
+    db: &RuntimeDb,
+    existing: &domain::Object,
+    from: Option<&str>,
+    to: Option<&str>,
+    principals: &[String],
+    lattice: Option<&crate::sekai::classification_lattice::ClassificationLattice>,
+    act: Option<&String>,
+) -> Result<(), Status> {
+    let authority = resolve_principal_authority(db, principals)?;
+    let result = crate::sekai::classification_lattice::evaluate_declassify_tokens(
+        &format!("guarded_update_object:{}", existing.id),
+        from,
+        to,
+        &authority,
+        lattice,
+    )
+    .map_err(Status::invalid_argument)?;
+    if result.decision == markings::MarkingDecision::NotApplicable {
+        return Ok(());
+    }
+    let actor = principals.first().cloned().unwrap_or_default();
+    let mut evidence = HashMap::new();
+    if let Some(value) = &result.object_classification {
+        evidence.insert("from_marking".into(), value.clone());
+    }
+    if let Some(value) = &result.principal_ceiling {
+        evidence.insert("to_marking".into(), value.clone());
+    }
+    evidence.insert("detail".into(), result.detail.clone());
+    if let Some(act) = act {
+        evidence.insert("act".into(), act.clone());
+    }
+    let outcome = if result.decision == markings::MarkingDecision::Allow {
+        "allowed"
+    } else {
+        "denied"
+    };
+    record_marking_or_purpose_decision(
+        db,
+        &actor,
+        "declassify",
+        &existing.id,
+        &result.decision_id,
+        outcome,
+        evidence,
+    )?;
+    if result.decision == markings::MarkingDecision::Deny {
+        return Err(Status::permission_denied("access denied"));
     }
     Ok(())
 }

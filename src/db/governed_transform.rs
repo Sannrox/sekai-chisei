@@ -1,9 +1,11 @@
 use crate::db::sekai::SekaiDb;
+use crate::sekai::classification_lattice::ClassificationLattice;
 use crate::sekai::dataset::DatasetRowRecord;
 use crate::sekai::governed_transform::{
     GovernedTransform, TransformRun, bind_checkpoint, checkpoint_after_id, compute_run,
-    fold_output_digest, rows_digest,
+    derive_transform_markings, fold_output_digest, require_bound_output_for_markings, rows_digest,
 };
+use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -37,7 +39,9 @@ impl SekaiDb {
                     rows_in INTEGER NOT NULL,
                     rows_out INTEGER NOT NULL,
                     lineage_parent TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL
+                    created_at_ms INTEGER NOT NULL,
+                    markings_in TEXT NOT NULL DEFAULT '',
+                    markings_out TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS sekai_governed_transform_checkpoint (
                     namespace TEXT NOT NULL,
@@ -54,6 +58,16 @@ impl SekaiDb {
         let _ = self.conn().execute(
             "ALTER TABLE sekai_governed_transform_checkpoint
              ADD COLUMN definition_digest TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_run
+             ADD COLUMN markings_in TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_run
+             ADD COLUMN markings_out TEXT NOT NULL DEFAULT ''",
             [],
         );
         Ok(())
@@ -126,7 +140,7 @@ impl SekaiDb {
             .query_row(
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-                        lineage_parent, created_at_ms
+                        lineage_parent, created_at_ms, markings_in, markings_out
                  FROM sekai_governed_transform_run WHERE run_id = ?1",
                 params![run_id],
                 |row| {
@@ -145,6 +159,8 @@ impl SekaiDb {
                         rows_out: row.get(11)?,
                         lineage_parent: row.get(12)?,
                         created_at_ms: row.get(13)?,
+                        markings_in: row.get(14).unwrap_or_default(),
+                        markings_out: row.get(15).unwrap_or_default(),
                     })
                 },
             )
@@ -183,7 +199,7 @@ impl SekaiDb {
             .prepare(
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-                        lineage_parent, created_at_ms
+                        lineage_parent, created_at_ms, markings_in, markings_out
                  FROM sekai_governed_transform_run
                  WHERE namespace = ?1
                  ORDER BY created_at_ms DESC, run_id DESC
@@ -207,6 +223,8 @@ impl SekaiDb {
                     rows_out: row.get(11)?,
                     lineage_parent: row.get(12)?,
                     created_at_ms: row.get(13)?,
+                    markings_in: row.get(14).unwrap_or_default(),
+                    markings_out: row.get(15).unwrap_or_default(),
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -234,6 +252,17 @@ fn run_governed_transform_tx(
         bind_checkpoint(incremental, stored, &transform.definition_digest);
     let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
     let records = list_row_records_after(tx, &transform.input_dataset_id, after_id)?;
+    let lattice = load_lattice(tx, namespace)?;
+    let input_object_id = load_dataset_object_id(tx, &transform.input_dataset_id)?;
+    let input_token = load_object_marking_token(tx, &input_object_id)?;
+    let output_object_id = load_dataset_object_id(tx, &transform.output_dataset_id)?;
+    let prior_token = load_object_marking_token(tx, &output_object_id)?;
+    let (markings_in, markings_out) = derive_transform_markings(
+        lattice.as_ref(),
+        input_token.as_deref(),
+        prior_token.as_deref(),
+        records.iter().map(|(_, row)| row),
+    )?;
     let (mut run, output_rows) = compute_run(
         &transform,
         checkpoint.as_ref(),
@@ -242,6 +271,8 @@ fn run_governed_transform_tx(
         now_ms,
         Uuid::new_v4().to_string(),
     );
+    run.markings_in = markings_in;
+    run.markings_out = markings_out;
     if run.quarantined {
         if !incremental {
             run.output_digest = live_output_digest(tx, &transform.output_dataset_id)?;
@@ -249,6 +280,7 @@ fn run_governed_transform_tx(
         insert_transform_run(tx, &run)?;
         return Ok(run);
     }
+    require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
     if !incremental {
         tx.execute(
             "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
@@ -265,6 +297,7 @@ fn run_governed_transform_tx(
     } else {
         rows_digest(&output_rows)
     };
+    stamp_object_marking(tx, &output_object_id, &run.markings_out, now_ms)?;
     insert_transform_run(tx, &run)?;
     tx.execute(
         "INSERT OR REPLACE INTO sekai_governed_transform_checkpoint
@@ -395,8 +428,8 @@ fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(), 
         "INSERT INTO sekai_governed_transform_run
          (run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
           last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-          lineage_parent, created_at_ms)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+          lineage_parent, created_at_ms, markings_in, markings_out)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             run.run_id,
             run.namespace,
@@ -411,11 +444,117 @@ fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(), 
             run.rows_in,
             run.rows_out,
             run.lineage_parent,
-            run.created_at_ms
+            run.created_at_ms,
+            run.markings_in,
+            run.markings_out
         ],
     )
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+fn load_lattice(
+    tx: &Transaction<'_>,
+    namespace: &str,
+) -> Result<Option<ClassificationLattice>, String> {
+    match tx.query_row(
+        "SELECT lattice_json FROM sekai_classification_lattices WHERE namespace = ?1",
+        params![namespace],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(json) => {
+            let lattice: ClassificationLattice =
+                serde_json::from_str(&json).map_err(|error| error.to_string())?;
+            lattice.prepare().map(Some)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("no such table") {
+                Ok(None)
+            } else {
+                Err(message)
+            }
+        }
+    }
+}
+
+fn load_dataset_object_id(tx: &Transaction<'_>, dataset_id: &str) -> Result<String, String> {
+    tx.query_row(
+        "SELECT object_id FROM sekai_datasets WHERE id = ?1",
+        params![dataset_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "dataset not found".into())
+}
+
+fn load_object_marking_token(
+    tx: &Transaction<'_>,
+    object_id: &str,
+) -> Result<Option<String>, String> {
+    if object_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let properties = tx
+        .query_row(
+            "SELECT properties FROM sekai_objects WHERE id = ?1",
+            params![object_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("input markings unresolvable: object {object_id} not found"))?;
+    let map: HashMap<String, String> =
+        serde_json::from_str(&properties).map_err(|error| error.to_string())?;
+    Ok(map
+        .get(OBJECT_CLASSIFICATION_PROPERTY)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+fn stamp_object_marking(
+    tx: &Transaction<'_>,
+    object_id: &str,
+    token: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    if object_id.trim().is_empty() {
+        return Ok(());
+    }
+    let properties = tx
+        .query_row(
+            "SELECT properties FROM sekai_objects WHERE id = ?1",
+            params![object_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("output markings unresolvable: object {object_id} not found"))?;
+    let mut map: HashMap<String, String> =
+        serde_json::from_str(&properties).map_err(|error| error.to_string())?;
+    if token.trim().is_empty() {
+        map.remove(OBJECT_CLASSIFICATION_PROPERTY);
+    } else {
+        map.insert(
+            OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+            token.to_string(),
+        );
+    }
+    let json = serde_json::to_string(&map).map_err(|error| error.to_string())?;
+    let changed = tx
+        .execute(
+            "UPDATE sekai_objects SET properties = ?1, updated = ?2 WHERE id = ?3",
+            params![json, now_ms, object_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err(format!(
+            "output markings unresolvable: object {object_id} not found"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -980,5 +1119,206 @@ mod tests {
         assert_eq!(ids, ["1", "2"]);
         let latest = db.list_governed_transform_runs("ops", 1).unwrap();
         assert_eq!(latest[0].output_digest, rows_digest(&live));
+    }
+
+    fn object(id: &str, marking: Option<&str>) -> crate::domain::Object {
+        let mut properties = HashMap::new();
+        if let Some(marking) = marking {
+            properties.insert(OBJECT_CLASSIFICATION_PROPERTY.into(), marking.into());
+        }
+        crate::domain::Object {
+            id: id.into(),
+            kind: "artifact".into(),
+            name: id.into(),
+            namespace: "ops".into(),
+            external_id: format!("artifact:{id}"),
+            properties,
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    #[test]
+    fn transform_unions_input_markings_onto_output_and_receipt() {
+        let db = db();
+        let mut input = dataset("in");
+        input.object_id = "in-obj".into();
+        let mut output = dataset("out");
+        output.object_id = "out-obj".into();
+        db.create_object(&object("in-obj", Some("internal")))
+            .unwrap();
+        db.create_object(&object("out-obj", None)).unwrap();
+        db.create_dataset(&input).unwrap();
+        db.create_dataset(&output).unwrap();
+        db.append_rows(
+            "in",
+            &[
+                HashMap::from([
+                    ("id".into(), "1".into()),
+                    ("keep".into(), "yes".into()),
+                    (OBJECT_CLASSIFICATION_PROPERTY.into(), "internal".into()),
+                ]),
+                HashMap::from([
+                    ("id".into(), "2".into()),
+                    ("keep".into(), "yes".into()),
+                    (OBJECT_CLASSIFICATION_PROPERTY.into(), "confidential".into()),
+                ]),
+            ],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(run.markings_in.contains("internal"));
+        assert!(run.markings_in.contains("confidential"));
+        assert_eq!(run.markings_out, "confidential");
+        let stored = db.get_governed_transform_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(stored.markings_out, "confidential");
+        let output_object = db.get_object("out-obj").unwrap().unwrap();
+        assert_eq!(
+            output_object.properties.get(OBJECT_CLASSIFICATION_PROPERTY),
+            Some(&"confidential".to_string())
+        );
+    }
+
+    #[test]
+    fn full_rebuild_folds_live_output_marking() {
+        let db = db();
+        let mut input = dataset("in");
+        input.object_id = "in-obj".into();
+        let mut output = dataset("out");
+        output.object_id = "out-obj".into();
+        db.create_object(&object("in-obj", Some("public"))).unwrap();
+        db.create_object(&object("out-obj", Some("confidential")))
+            .unwrap();
+        db.create_dataset(&input).unwrap();
+        db.create_dataset(&output).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                (OBJECT_CLASSIFICATION_PROPERTY.into(), "public".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert_eq!(run.markings_in, "public");
+        assert_eq!(run.markings_out, "confidential");
+        let output_object = db.get_object("out-obj").unwrap().unwrap();
+        assert_eq!(
+            output_object.properties.get(OBJECT_CLASSIFICATION_PROPERTY),
+            Some(&"confidential".to_string())
+        );
+    }
+
+    #[test]
+    fn marked_run_without_output_object_fails_closed_without_writing() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                (OBJECT_CLASSIFICATION_PROPERTY.into(), "confidential".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let error = db
+            .run_governed_transform("ops", "t1", false, 20)
+            .unwrap_err();
+        assert!(error.contains("output markings unresolvable"), "{error}");
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unknown_input_marking_fails_closed_without_writing_output() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                (OBJECT_CLASSIFICATION_PROPERTY.into(), "secret-sauce".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let error = db
+            .run_governed_transform("ops", "t1", false, 20)
+            .unwrap_err();
+        assert!(error.contains("unknown classification marking"), "{error}");
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

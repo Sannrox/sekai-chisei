@@ -1459,6 +1459,8 @@ fn to_proto_transform_run(run: &crate::sekai::governed_transform::TransformRun) 
         rows_out: run.rows_out,
         lineage_parent: run.lineage_parent.clone(),
         created_at_ms: run.created_at_ms,
+        markings_in: run.markings_in.clone(),
+        markings_out: run.markings_out.clone(),
     }
 }
 

@@ -101,6 +101,8 @@ const GOVERNED_TRANSFORMS_SCHEMA: &str = include_str!("postgres/0050_governed_tr
 const OBSERVATION_EXTERNAL_ID_SCHEMA: &str =
     include_str!("postgres/0051_observation_external_id.sql");
 const GOVERNED_DOCUMENTS_SCHEMA: &str = include_str!("postgres/0052_governed_documents.sql");
+const TRANSFORM_RUN_MARKINGS_SCHEMA: &str =
+    include_str!("postgres/0053_transform_run_markings.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -445,6 +447,13 @@ const MIGRATIONS: &[Migration] = &[
         51,
         "governed_documents",
         GOVERNED_DOCUMENTS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    // Versions run one behind the file prefixes: `0053_*.sql` is version 52.
+    mig(
+        52,
+        "transform_run_markings",
+        TRANSFORM_RUN_MARKINGS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

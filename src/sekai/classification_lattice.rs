@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::sekai::evidence::EvidenceClassification;
 use crate::sekai::markings::{
-    MarkingCheckResult, MarkingDecision, PrincipalAuthority, is_trusted_service_principal,
+    MarkingCheckResult, MarkingDecision, PrincipalAuthority, is_marking_downgrade,
+    is_trusted_service_principal,
 };
 
 pub const CLASSIFICATION_LATTICE_VERSION: &str = "sekai.classification-lattice/v1";
@@ -285,6 +286,115 @@ pub fn join_marking_tokens(
     }
 }
 
+/// Fold input tokens to their unique list and least-upper-bound.
+/// Unknown or incomparable tokens fail closed.
+pub fn union_input_marking_tokens(
+    lattice: Option<&ClassificationLattice>,
+    tokens: impl IntoIterator<Item = Option<impl AsRef<str>>>,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let mut markings_in = Vec::new();
+    let mut markings_out: Option<String> = None;
+    for token in tokens {
+        let token = token
+            .as_ref()
+            .map(|value| value.as_ref().trim())
+            .filter(|value| !value.is_empty());
+        let Some(token) = token else {
+            continue;
+        };
+        match lattice {
+            None => {
+                crate::sekai::markings::parse_optional_classification(token)?;
+            }
+            Some(lattice) => {
+                if !lattice.contains(token) {
+                    return Err(format!("unknown classification marking: {token}"));
+                }
+            }
+        }
+        if !markings_in.iter().any(|existing| existing == token) {
+            markings_in.push(token.to_string());
+        }
+        let joined = join_marking_tokens(lattice, markings_out.as_deref(), Some(token))?;
+        markings_out = Some(joined.ok_or_else(|| {
+            format!("input markings {token} are incomparable with the current union")
+        })?);
+    }
+    Ok((markings_in, markings_out))
+}
+
+/// True when `to` is strictly below `from`, including removing a marking.
+/// Unknown or incomparable tokens fail closed.
+pub fn is_marking_token_downgrade(
+    lattice: Option<&ClassificationLattice>,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<bool, String> {
+    let from = from.map(str::trim).filter(|value| !value.is_empty());
+    let to = to.map(str::trim).filter(|value| !value.is_empty());
+    match (from, to) {
+        (None, _) => Ok(false),
+        (Some(_), None) => Ok(true),
+        (Some(from), Some(to)) if from == to => Ok(false),
+        (Some(from), Some(to)) => match lattice {
+            Some(lattice) => Ok(!lattice.dominates(to, from)?),
+            None => {
+                let from = crate::sekai::markings::parse_optional_classification(from)?;
+                let to = crate::sekai::markings::parse_optional_classification(to)?;
+                Ok(is_marking_downgrade(from, to))
+            }
+        },
+    }
+}
+
+/// Whether `authority` may lower or remove `from` to `to`.
+/// Owner, admin, and trusted service principals do not bypass this gate.
+pub fn evaluate_declassify_tokens(
+    operation_id: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    authority: &PrincipalAuthority,
+    lattice: Option<&ClassificationLattice>,
+) -> Result<MarkingCheckResult, String> {
+    let from = from.map(str::trim).filter(|value| !value.is_empty());
+    let to = to.map(str::trim).filter(|value| !value.is_empty());
+    let decision_id = format!(
+        "declassify:{operation_id}:{}",
+        uuid::Uuid::new_v4().as_simple()
+    );
+    if !is_marking_token_downgrade(lattice, from, to)? {
+        return Ok(MarkingCheckResult {
+            decision: MarkingDecision::NotApplicable,
+            decision_id,
+            object_classification: from.map(str::to_string),
+            principal_ceiling: to.map(str::to_string),
+            detail: "marking is not a downgrade".into(),
+        });
+    }
+    let from_token = from.ok_or_else(|| "marking is not a downgrade".to_string())?;
+    let from_key = match crate::sekai::markings::parse_classification(from_token) {
+        Ok(marking) => marking.as_str().to_string(),
+        Err(_) => from_token.to_string(),
+    };
+    if authority.declassify_markings.contains(&from_key) {
+        Ok(MarkingCheckResult {
+            decision: MarkingDecision::Allow,
+            decision_id,
+            object_classification: Some(from_key),
+            principal_ceiling: to.map(str::to_string),
+            detail: "principal may declassify this marking".into(),
+        })
+    } else {
+        Ok(MarkingCheckResult {
+            decision: MarkingDecision::Deny,
+            decision_id,
+            object_classification: Some(from_key),
+            principal_ceiling: to.map(str::to_string),
+            detail: "principal is not granted declassify for this marking".into(),
+        })
+    }
+}
+
 /// Path-carried marking identity. Tokens are only meaningful with the lattice
 /// that produced them.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -440,6 +550,7 @@ mod tests {
             }),
             allowed_purposes: BTreeSet::new(),
             classification_token: token.map(str::to_string),
+            declassify_markings: BTreeSet::new(),
         }
     }
 
@@ -449,6 +560,63 @@ mod tests {
         assert!(lattice.dominates("secret", "internal").unwrap());
         assert!(!lattice.dominates("internal", "secret").unwrap());
         assert!(!lattice.dominates("confidential", "health").unwrap());
+        let (inputs, joined) = union_input_marking_tokens(
+            None,
+            [Some("internal"), Some("confidential"), Some("internal")],
+        )
+        .unwrap();
+        assert_eq!(inputs, vec!["internal".to_string(), "confidential".into()]);
+        assert_eq!(joined.as_deref(), Some("confidential"));
+        assert!(
+            union_input_marking_tokens(None, [Some("internal"), Some("not-a-marking")])
+                .unwrap_err()
+                .contains("unknown classification marking")
+        );
+        assert!(
+            union_input_marking_tokens(Some(&lattice), [Some("confidential"), Some("health")])
+                .unwrap_err()
+                .contains("incomparable")
+        );
+        assert!(is_marking_token_downgrade(None, Some("confidential"), Some("internal")).unwrap());
+        assert!(is_marking_token_downgrade(None, Some("internal"), None).unwrap());
+        assert!(!is_marking_token_downgrade(None, Some("internal"), Some("confidential")).unwrap());
+        assert!(
+            is_marking_token_downgrade(Some(&lattice), Some("secret"), Some("internal")).unwrap()
+        );
+        assert!(
+            is_marking_token_downgrade(Some(&lattice), Some("confidential"), Some("health"))
+                .unwrap()
+        );
+        let mut granted = authority(Some("restricted"));
+        granted.declassify_markings.insert("confidential".into());
+        let allow = evaluate_declassify_tokens(
+            "op-declassify",
+            Some("confidential"),
+            Some("public"),
+            &granted,
+            None,
+        )
+        .unwrap();
+        assert_eq!(allow.decision, MarkingDecision::Allow);
+        let deny = evaluate_declassify_tokens(
+            "op-declassify-deny",
+            Some("restricted"),
+            None,
+            &granted,
+            None,
+        )
+        .unwrap();
+        assert_eq!(deny.decision, MarkingDecision::Deny);
+        granted.declassify_markings.insert("health".into());
+        let lattice_allow = evaluate_declassify_tokens(
+            "op-declassify-health",
+            Some("health"),
+            Some("public"),
+            &granted,
+            Some(&lattice),
+        )
+        .unwrap();
+        assert_eq!(lattice_allow.decision, MarkingDecision::Allow);
         assert_eq!(
             lattice.join("public", "internal").unwrap().as_deref(),
             Some("internal")
@@ -515,6 +683,7 @@ mod tests {
             classification_ceiling: None,
             allowed_purposes: BTreeSet::new(),
             classification_token: None,
+            declassify_markings: BTreeSet::new(),
         };
         assert_eq!(
             evaluate_lattice_access("read", Some("health"), &trusted, Some(&lattice)).detail,

@@ -557,6 +557,7 @@ mod tests {
             classification_ceiling: ceiling,
             classification_token: ceiling.map(|value| value.as_str().into()),
             allowed_purposes: BTreeSet::new(),
+            declassify_markings: BTreeSet::new(),
         }
     }
 

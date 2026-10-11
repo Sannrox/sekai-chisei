@@ -2748,6 +2748,326 @@ async fn deny_unmarked_denies_unmarked_reads_and_keeps_marked_rules() {
 }
 
 #[tokio::test]
+async fn owner_admin_cannot_declassify_without_grant_and_granted_principal_is_audited() {
+    let svc = service();
+    let marked = Object {
+        id: "marked-secret".into(),
+        kind: "document".into(),
+        name: "secret".into(),
+        namespace: "ns".into(),
+        external_id: "document:marked-secret".into(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "confidential".into(),
+        )]),
+        created: 1,
+        updated: 1,
+    };
+    svc.db
+        .runtime()
+        .create_object(&from_proto_obj(&marked))
+        .unwrap();
+    grant_object_role(&svc, "marked-secret", "alice", security::Role::Admin);
+    grant_object_role(&svc, "marked-secret", "bob", security::Role::Editor);
+    for (id, actor, declassify) in [
+        ("principal-alice-admin", "alice", None),
+        ("principal-bob-declassify", "bob", Some("confidential")),
+    ] {
+        let mut properties = HashMap::from([
+            (
+                markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                "restricted".into(),
+            ),
+            (
+                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                "true".into(),
+            ),
+        ]);
+        if let Some(marking) = declassify {
+            properties.insert(
+                markings::PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY.into(),
+                marking.into(),
+            );
+        }
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: actor.into(),
+                namespace: "ns".into(),
+                external_id: markings::principal_profile_external_id(actor),
+                properties,
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        grant_object_role(&svc, id, "root", security::Role::Admin);
+    }
+
+    let mut stripped = marked.clone();
+    stripped
+        .properties
+        .remove(markings::OBJECT_CLASSIFICATION_PROPERTY);
+    stripped.updated = 2;
+    let denied = svc
+        .guarded_update_object(with_named_principal(
+            GuardedUpdateObjectRequest {
+                object: Some(stripped.clone()),
+                lease_precondition: None,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let still = svc
+        .db
+        .runtime()
+        .get_object("marked-secret")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        still
+            .properties
+            .get(markings::OBJECT_CLASSIFICATION_PROPERTY),
+        Some(&"confidential".to_string())
+    );
+
+    svc.guarded_update_object(with_named_principal(
+        GuardedUpdateObjectRequest {
+            object: Some(stripped),
+            lease_precondition: None,
+        },
+        "bob",
+    ))
+    .await
+    .unwrap();
+    let updated = svc
+        .db
+        .runtime()
+        .get_object("marked-secret")
+        .unwrap()
+        .unwrap();
+    assert!(markings::object_is_unmarked(&updated));
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("declassify".into()),
+            target_id: Some("marked-secret".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.actor == "alice" && decision.outcome == "denied")
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.actor == "bob" && decision.outcome == "allowed")
+    );
+}
+
+#[tokio::test]
+async fn delegated_actor_without_declassify_grant_cannot_strip_marking() {
+    let svc = service();
+    let marked = Object {
+        id: "delegated-marked".into(),
+        kind: "document".into(),
+        name: "secret".into(),
+        namespace: "ns".into(),
+        external_id: "document:delegated-marked".into(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "confidential".into(),
+        )]),
+        created: 1,
+        updated: 1,
+    };
+    svc.db
+        .runtime()
+        .create_object(&from_proto_obj(&marked))
+        .unwrap();
+    grant_object_role(&svc, "delegated-marked", "service-a", security::Role::Admin);
+    grant_object_role(&svc, "delegated-marked", "human-a", security::Role::Editor);
+    for (id, actor, declassify) in [
+        (
+            "principal-service-declassify",
+            "service-a",
+            Some("confidential"),
+        ),
+        ("principal-human-no-declassify", "human-a", None),
+    ] {
+        let mut properties = HashMap::from([
+            (
+                markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                "restricted".into(),
+            ),
+            (
+                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                "true".into(),
+            ),
+        ]);
+        if let Some(marking) = declassify {
+            properties.insert(
+                markings::PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY.into(),
+                marking.into(),
+            );
+        }
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: actor.into(),
+                namespace: "ns".into(),
+                external_id: markings::principal_profile_external_id(actor),
+                properties,
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        grant_object_role(&svc, id, "root", security::Role::Admin);
+    }
+
+    let mut stripped = marked.clone();
+    stripped
+        .properties
+        .remove(markings::OBJECT_CLASSIFICATION_PROPERTY);
+    stripped.updated = 2;
+    let mut request = Request::new(GuardedUpdateObjectRequest {
+        object: Some(stripped),
+        lease_precondition: None,
+    });
+    let mut delegated = crate::enterprise::AuthenticatedContext::machine(
+        crate::enterprise::AuthenticatedPrincipal {
+            subject: "service-a".into(),
+            credential_id: "service-credential".into(),
+        },
+    );
+    delegated.act = Some("human-a".into());
+    request.extensions_mut().insert(delegated);
+    let denied = svc.guarded_update_object(request).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let still = svc
+        .db
+        .runtime()
+        .get_object("delegated-marked")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        still
+            .properties
+            .get(markings::OBJECT_CLASSIFICATION_PROPERTY),
+        Some(&"confidential".to_string())
+    );
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("declassify".into()),
+            target_id: Some("delegated-marked".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(decisions.iter().any(|decision| {
+        decision.actor == "human-a"
+            && decision.outcome == "denied"
+            && decision.evidence.get("act").map(String::as_str) == Some("human-a")
+    }));
+}
+
+#[tokio::test]
+async fn trusted_principal_declassify_uses_profile_grant() {
+    let svc = service();
+    let marked = Object {
+        id: "trusted-marked".into(),
+        kind: "document".into(),
+        name: "secret".into(),
+        namespace: "ns".into(),
+        external_id: "document:trusted-marked".into(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "confidential".into(),
+        )]),
+        created: 1,
+        updated: 1,
+    };
+    svc.db
+        .runtime()
+        .create_object(&from_proto_obj(&marked))
+        .unwrap();
+    grant_object_role(&svc, "trusted-marked", "root", security::Role::Admin);
+    let mut stripped = marked.clone();
+    stripped
+        .properties
+        .remove(markings::OBJECT_CLASSIFICATION_PROPERTY);
+    stripped.updated = 2;
+    let denied = svc
+        .guarded_update_object(with_named_principal(
+            GuardedUpdateObjectRequest {
+                object: Some(stripped.clone()),
+                lease_precondition: None,
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "principal-root-declassify".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "root".into(),
+            namespace: "ns".into(),
+            external_id: markings::principal_profile_external_id("root"),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "restricted".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+                (
+                    markings::PRINCIPAL_DECLASSIFY_MARKINGS_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    grant_object_role(
+        &svc,
+        "principal-root-declassify",
+        "root",
+        security::Role::Admin,
+    );
+    svc.guarded_update_object(with_named_principal(
+        GuardedUpdateObjectRequest {
+            object: Some(stripped),
+            lease_precondition: None,
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let updated = svc
+        .db
+        .runtime()
+        .get_object("trusted-marked")
+        .unwrap()
+        .unwrap();
+    assert!(markings::object_is_unmarked(&updated));
+}
+
+#[tokio::test]
 async fn activated_get_object_hides_acl_and_marking_denials_as_missing() {
     for (id, namespace, properties, acl_denied) in [
         (
