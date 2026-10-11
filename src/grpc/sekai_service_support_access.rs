@@ -373,6 +373,110 @@ pub(super) fn load_classification_lattice(
     db.get_classification_lattice(namespace)
         .map_err(|_| Status::unavailable("classification lattice unavailable"))
 }
+pub(super) fn catalog_object_passes_marking(
+    db: &RuntimeDb,
+    object_id: &str,
+    principals: &[String],
+) -> Result<bool, Status> {
+    if object_id.is_empty() {
+        return Ok(true);
+    }
+    match db.get_object(object_id).map_err(Status::internal)? {
+        Some(object) => object_passes_marking(db, &object, principals),
+        None => Ok(true),
+    }
+}
+
+pub(super) fn scoped_catalog_context(tenant_context: Option<&RequestEnterpriseContext>) -> bool {
+    tenant_context.is_some_and(|context| context.tenant.is_some() || context.space.is_some())
+}
+
+pub(super) fn catalog_actor_subject(
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Option<&String> {
+    let context = tenant_context?;
+    let actor = context.act.as_ref().filter(|actor| !actor.is_empty())?;
+    (actor != &context.principal.subject).then_some(actor)
+}
+
+pub(super) fn catalog_subjects_pass_marking(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object_id: &str,
+    principals: &[String],
+) -> bool {
+    if !catalog_object_passes_marking(db, object_id, principals).unwrap_or(false) {
+        return false;
+    }
+    match catalog_actor_subject(tenant_context) {
+        Some(actor) => catalog_object_passes_marking(db, object_id, std::slice::from_ref(actor))
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+pub(super) fn catalog_binding_discoverable(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object_id: &str,
+    principals: &[String],
+) -> bool {
+    if object_id.is_empty() {
+        return !scoped_catalog_context(tenant_context);
+    }
+    if !catalog_subjects_pass_marking(db, tenant_context, object_id, principals) {
+        return false;
+    }
+    if !catalog_actor_passes_acl(security, tenant_context, object_id) {
+        return false;
+    }
+    match db.get_object(object_id) {
+        Ok(Some(object)) => {
+            enforce_namespace_tenant_context_for(
+                db,
+                tenant_context,
+                &object.namespace,
+                crate::enterprise::NamespaceAction::Discover,
+            )
+            .is_ok()
+                && catalog_object_policy_visible(db, &object, principals, tenant_context)
+        }
+        Ok(None) => !scoped_catalog_context(tenant_context),
+        Err(_) => false,
+    }
+}
+
+pub(super) fn catalog_actor_passes_acl(
+    security: &SecurityChecker,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object_id: &str,
+) -> bool {
+    catalog_actor_subject(tenant_context)
+        .is_none_or(|actor| check_read(security, object_id, std::slice::from_ref(actor)).is_ok())
+}
+
+/// Catalog listings hide a bound object when its object policy denies
+/// visibility or cannot be evaluated.
+pub(super) fn catalog_object_policy_visible(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> bool {
+    match evaluate_active_object_policy(
+        db,
+        object,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+        None,
+    ) {
+        Ok(Some(false)) | Err(_) => false,
+        Ok(_) => true,
+    }
+}
+
 pub(super) fn object_passes_marking(
     db: &RuntimeDb,
     object: &domain::Object,
@@ -739,11 +843,36 @@ pub(super) fn require_visible_read_root(
     operation_id: &str,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
+    enforce_namespace_tenant_context_for(
+        db,
+        tenant_context,
+        &object.namespace,
+        crate::enterprise::NamespaceAction::Read,
+    )
+    .map_err(hide_read_root_as_missing)?;
+    require_visible_object_contents(
+        db,
+        security,
+        object,
+        principals,
+        tenant_context,
+        operation_id,
+        purpose,
+    )
+}
+
+pub(super) fn require_visible_object_contents(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation_id: &str,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
     if is_reserved_governance_kind(&object.kind) {
         return Err(Status::not_found("not found"));
     }
-    enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false)
-        .map_err(hide_read_root_as_missing)?;
     check_team_namespace(db, principals, &object.namespace, false)?;
     check_object_acl_with_audit(
         db,

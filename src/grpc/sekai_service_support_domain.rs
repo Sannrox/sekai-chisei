@@ -1499,6 +1499,7 @@ pub(super) fn visible_action_object(
     policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
     namespace: &str,
     object_id: &str,
+    action: crate::enterprise::NamespaceAction,
 ) -> Result<crate::domain::Object, Status> {
     let unavailable = || Status::permission_denied("object action unavailable");
     let namespace = namespace.trim();
@@ -1517,7 +1518,14 @@ pub(super) fn visible_action_object(
     if object.namespace != namespace {
         return Err(unavailable());
     }
-    require_visible_read_root(
+    enforce_namespace_tenant_context_for(
+        service.db.runtime(),
+        tenant_context,
+        &object.namespace,
+        action,
+    )
+    .map_err(|_| unavailable())?;
+    require_visible_object_contents(
         service.db.runtime(),
         &service.security,
         object,
