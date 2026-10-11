@@ -9184,6 +9184,66 @@ async fn execute_plan_stream_refuses_when_planning_delegator_is_disabled() {
 }
 
 #[tokio::test]
+async fn execute_plan_stream_refuses_when_planning_receipt_is_missing() {
+    let svc = memory_service();
+    let plan = ExecutionPlan {
+        plan_id: "plan-missing-receipt".into(),
+        input: Some(ExecutionInput {
+            request_id: "task-missing-receipt".into(),
+            namespace: "alpha".into(),
+            spec: "do ordinary streamed work".into(),
+            preferred_model: "native-default".into(),
+            preferred_runtime: "kiro".into(),
+            user_id: "user-1".into(),
+            max_tokens: 512,
+            ..Default::default()
+        }),
+        resolved_runtime: "kiro".into(),
+        resolved_model: "native-default".into(),
+        enriched_spec: "do ordinary streamed work".into(),
+        prepared_messages: vec![ChatMessage {
+            role: "user".into(),
+            content: "do ordinary streamed work".into(),
+            ..Default::default()
+        }],
+        budget: Some(BudgetVerdict {
+            allowed: true,
+            usage: None,
+            reason: String::new(),
+        }),
+        executable: true,
+        created_at: chrono::Utc::now().timestamp_millis(),
+        planning_actor: "local".into(),
+        ..Default::default()
+    };
+    svc.cache_plan(plan.clone());
+    assert!(
+        svc.db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .is_none()
+    );
+
+    let error = match svc
+        .execute_plan_stream(Request::new(ExecutePlanRequest {
+            plan: Some(plan.clone()),
+        }))
+        .await
+    {
+        Ok(_) => panic!("missing planning receipt executed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), crate::enterprise::DELEGATOR_RECORD_MISSING);
+    assert!(
+        svc.db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn execute_plan_rejects_external_plan_without_egress_decisions() {
     let svc = memory_service();
     let plan = ExecutionPlan {
@@ -9254,6 +9314,8 @@ async fn execute_plan_rejects_external_plan_without_egress_decisions() {
         context_truncated: false,
         ..Default::default()
     };
+    svc.record_planned_operation_with_identity(&plan, "local", false, None)
+        .unwrap();
     svc.cache_plan(plan.clone());
 
     let err = svc
@@ -9373,6 +9435,8 @@ async fn execute_plan_stream_rejects_external_plan_without_egress_decisions() {
         context_truncated: false,
         ..Default::default()
     };
+    svc.record_planned_operation_with_identity(&plan, "local", false, None)
+        .unwrap();
     svc.cache_plan(plan.clone());
 
     let result = svc

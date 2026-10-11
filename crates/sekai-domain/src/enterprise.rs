@@ -183,12 +183,14 @@ impl AuthenticatedContext {
 pub const DELEGATOR_DISABLED: &str = "delegator_disabled";
 pub const DELEGATOR_NOT_MEMBER: &str = "delegator_not_member";
 pub const DELEGATOR_GRANT_MISSING: &str = "delegator_grant_missing";
+pub const DELEGATOR_RECORD_MISSING: &str = "delegator_record_missing";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatorApplyRefusal {
     Disabled,
     NotMember,
     GrantMissing,
+    RecordMissing,
 }
 
 impl DelegatorApplyRefusal {
@@ -197,6 +199,7 @@ impl DelegatorApplyRefusal {
             Self::Disabled => DELEGATOR_DISABLED,
             Self::NotMember => DELEGATOR_NOT_MEMBER,
             Self::GrantMissing => DELEGATOR_GRANT_MISSING,
+            Self::RecordMissing => DELEGATOR_RECORD_MISSING,
         }
     }
 }
@@ -743,6 +746,10 @@ mod tests {
         assert_eq!(
             DelegatorApplyRefusal::GrantMissing.as_str(),
             DELEGATOR_GRANT_MISSING
+        );
+        assert_eq!(
+            DelegatorApplyRefusal::RecordMissing.as_str(),
+            DELEGATOR_RECORD_MISSING
         );
     }
 

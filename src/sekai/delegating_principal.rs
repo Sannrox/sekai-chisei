@@ -87,12 +87,19 @@ pub(crate) fn revalidate_delegator_at_apply(
 }
 
 /// Load the delegating actor retained on the planning receipt.
+///
+/// A missing receipt cannot prove the retained `act`, so apply fails closed.
 pub(crate) fn planning_act_from_receipt(
     db: &RuntimeDb,
     operation_id: &str,
-) -> Result<Option<String>, String> {
-    let Some(receipt) = db.get_operation_receipt(operation_id)? else {
-        return Ok(None);
+) -> Result<Option<String>, DelegatorApplyError> {
+    let Some(receipt) = db
+        .get_operation_receipt(operation_id)
+        .map_err(DelegatorApplyError::Internal)?
+    else {
+        return Err(DelegatorApplyError::Refused(
+            DelegatorApplyRefusal::RecordMissing,
+        ));
     };
     Ok(receipt
         .events
@@ -109,6 +116,6 @@ pub(crate) fn revalidate_planning_delegator_at_apply(
     plan_id: &str,
     namespace: &str,
 ) -> Result<(), DelegatorApplyError> {
-    let act = planning_act_from_receipt(db, plan_id).map_err(DelegatorApplyError::Internal)?;
+    let act = planning_act_from_receipt(db, plan_id)?;
     revalidate_delegator_at_apply(db, act.as_deref(), namespace)
 }

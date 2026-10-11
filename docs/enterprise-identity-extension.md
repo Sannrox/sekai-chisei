@@ -59,8 +59,10 @@ the credential subject. Action admission receipts and audit evidence retain
 is retained. Apply of claimed action work and planned execution re-validates the
 `act` retained on the admitted instance or planning receipt against current
 enablement, tenant membership, and the grant the work needs, and records
-`delegator_disabled`, `delegator_not_member`, or `delegator_grant_missing`
-on the receipt. Claim-time re-validation remains the runtime-claim client.
+`delegator_disabled`, `delegator_not_member`, `delegator_grant_missing`, or
+`delegator_record_missing` on the receipt. A missing planning receipt, action
+effect, or action instance fails closed. Claim-time re-validation remains the
+runtime-claim client.
 
 ## Discovery metadata
 
