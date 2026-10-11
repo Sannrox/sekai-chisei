@@ -9,6 +9,7 @@
 - Superseded by: none
 - Related: [ADR 0020](0020-shared-type-revisions-and-object-sync.md),
   [ADR 0021](0021-defer-second-object-sync-source.md),
+  [ADR 0100](0100-relational-source-family.md),
   [research #817](../research/817-source-type-admission.md)
 
 ## Context
