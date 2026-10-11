@@ -18,12 +18,12 @@
 //! - Columns marked `hidden` never leave the connector: they are not in record
 //!   properties, payload digests, or display names.
 
-use sekai_chisei::sekai::object_sync::{
-    ADAPTER_REGISTERED_OBJECT_SYNC, ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
-    SOURCE_BATCH_VERSION, SourceBatch, SourceRecord, object_id_for,
-};
 use sekai_chisei::sekai::source_type_descriptor::{
     ProposedSourceTypeDescriptor, registered_source_id,
+};
+use sekai_source_sdk::{
+    ADAPTER_REGISTERED_OBJECT_SYNC, ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
+    SOURCE_BATCH_VERSION, SourceBatch, SourceRecord, object_id_for,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

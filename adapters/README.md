@@ -108,6 +108,13 @@ properties, raw/unknown fixture fields, and oversized input.
 The content digest excludes `observed_at_ms`, so polling the same immutable
 source revision later does not manufacture a source-content conflict.
 
+The versioned crate `sekai-source-sdk` is the supported dependency for
+adapters outside this repository. In-tree files under `adapters/` re-export
+that crate. Run the out-of-tree example with
+`cargo run -p sekai-source-sdk --example out_of_tree_adapter --locked`.
+Connector certification (`sekaictl admin connectors certify`) records
+`sdk_version` and `conformance_suite_digest`.
+
 `object_sync_sdk.rs` builds and serializes replay-compatible
 `sekai.source-batch/v1` snapshots and the version 2 delivery envelope used by
 generation-fenced snapshots and ordered feeds. Its local outbox writes the

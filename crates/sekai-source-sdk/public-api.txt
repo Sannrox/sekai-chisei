@@ -1,0 +1,519 @@
+# crate-version: 1.0.0
+ADAPTER_GITHUB_OBJECT_SYNC
+ADAPTER_GITHUB_OBJECT_SYNC_VERSION
+ADAPTER_REGISTERED_OBJECT_SYNC
+ADAPTER_REGISTERED_OBJECT_SYNC_VERSION
+ApplySourceBatchReply
+ChangeFeedPage
+ChangeFeedRunError
+ChangeFeedSource
+ChangeFeedSourceFailure
+DEFAULT_MAX_ENTRY_BYTES
+DEFAULT_MAX_PENDING_FILES
+DEFAULT_MAX_SNAPSHOT_PAGES_PER_RUN
+DirectFeedCapability
+FAMILY_OBJECT_SYNC
+FlushDisposition
+FlushEntry
+FlushReport
+GITHUB_OBJECT_SYNC_RECORD_TYPES
+GITHUB_OBJECT_SYNC_TYPE_DIGEST
+GITHUB_OBJECT_SYNC_TYPE_REVISION
+GenerationSnapshotPage
+GenerationSnapshotRead
+GenerationSnapshotSource
+GetSourceSyncStateInput
+GitHubObjectFixture
+LINEAGE_KIND_ACTION
+LINEAGE_KIND_DATASET
+LINEAGE_KIND_OBJECT
+LINEAGE_KIND_SOURCE
+LINEAGE_KIND_WRITEBACK
+LifecycleConformanceReport
+LifecycleFixture
+LifecycleObservation
+LifecycleProjection
+LifecycleStage
+LineageNode
+MAX_GITHUB_FIXTURE_BYTES
+MAX_QUARANTINE_REASON_BYTES
+MAX_SOURCE_BATCH_RECORDS
+MAX_SOURCE_CURSOR_BYTES
+MAX_SOURCE_DISPLAY_NAME_BYTES
+MAX_SOURCE_FEED_EPOCH_BYTES
+MAX_SOURCE_IDENTIFIER_BYTES
+MAX_SOURCE_PROPERTY_KEY_BYTES
+MAX_SOURCE_PROPERTY_VALUE_BYTES
+MAX_SOURCE_RECORD_PROPERTIES
+OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION
+OUTBOX_FORMAT_VERSION
+ObjectLineage
+OperationOutcome
+OutboxLimits
+ReplayDisposition
+SDK_VERSION: &str
+SOURCE_BATCH_V2_VERSION
+SOURCE_BATCH_VERSION
+SOURCE_GITHUB
+SOURCE_TYPE_REVISION_VERSION
+SnapshotPage
+SnapshotPageSource
+SnapshotRead
+SnapshotRunError
+SnapshotRunLimits
+SnapshotRunOutcome
+SnapshotSourceFailure
+SourceAdapterConfig
+SourceBatch
+SourceBatchReplayMaterial
+SourceBatchResult
+SourceBatchStatus
+SourceBatchTransaction
+SourceBatchValidationError
+SourceBinding
+SourceCheckpoint
+SourceDeliveryMode
+SourceDeliveryWindow
+SourceGenerationStatus
+SourceOutbox
+SourceRecord
+SourceRecordResult
+SourceRunDisposition
+SourceRunReport
+SourceSyncGeneration
+SourceSyncGenerationStatus
+SourceSyncState
+SourceSyncStateView
+SourceSyncTransport
+SourceTypeRevisionDescriptor
+SyncDecision
+SyncedObject
+TransportFailure
+assert_cross_page_identity
+assert_deterministic_batch
+assert_files_omit
+assert_lifecycle_report
+assert_snapshot_chain
+bind_sync_lineage
+bind_writeback
+build_source_batch
+build_source_batch_v2
+conformance::LifecycleConformanceReport
+conformance::LifecycleConformanceReport.adapter_id: String
+conformance::LifecycleConformanceReport.contract_version: String
+conformance::LifecycleConformanceReport.projections: Vec<LifecycleProjection>
+conformance::LifecycleConformanceReport.type_digest: String
+conformance::LifecycleFixture
+conformance::LifecycleFixture.contract_version: String
+conformance::LifecycleFixture.observations: Vec<LifecycleObservation>
+conformance::LifecycleObservation
+conformance::LifecycleObservation.deleted: bool
+conformance::LifecycleObservation.display_name: String
+conformance::LifecycleObservation.external_id: String
+conformance::LifecycleObservation.observed_at_ms: i64
+conformance::LifecycleObservation.properties: BTreeMap<String,String>
+conformance::LifecycleObservation.source_instance: String
+conformance::LifecycleObservation.source_version: String
+conformance::LifecycleObservation.stage: LifecycleStage
+conformance::LifecycleObservation.state: String
+conformance::LifecycleObservation.type_name: String
+conformance::LifecycleProjection
+conformance::LifecycleProjection.decision: SyncDecision
+conformance::LifecycleProjection.lineage: ObjectLineage
+conformance::LifecycleProjection.record: SourceRecord
+conformance::LifecycleProjection.stage: LifecycleStage
+conformance::LifecycleStage
+conformance::LifecycleStage::ImmutableRevisionConflict
+conformance::LifecycleStage::Initial
+conformance::LifecycleStage::Refresh
+conformance::LifecycleStage::Reversal
+conformance::LifecycleStage::Tombstone
+conformance::OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION: &str
+conformance::assert_cross_page_identity(&SourceBatch,&SourceBatch,&str) -> Result<(),String>
+conformance::assert_deterministic_batch(&SourceBatch,&SourceBatch) -> Result<(),String>
+conformance::assert_files_omit(&Path,&[&str]) -> Result<(),String>
+conformance::assert_lifecycle_report(&LifecycleConformanceReport) -> Result<(),String>
+conformance::assert_snapshot_chain(&[SourceBatch]) -> Result<(),String>
+conformance::github_issue_lifecycle_fixture() -> LifecycleFixture
+conformance::run_lifecycle_fixture<F>(&str,F) -> Result<LifecycleConformanceReport,String> where F:FnMut(&LifecycleObservation) -> Result<SourceRecord,String>
+conformance::run_restart_and_commit<T:SourceSyncTransport>(&Path,&SourceBatch,&mut T,&mut T) -> Result<(),String>
+conformance_suite_digest() -> String
+contains_secret_like_text
+contract::ADAPTER_GITHUB_OBJECT_SYNC: &str
+contract::ADAPTER_GITHUB_OBJECT_SYNC_VERSION: &str
+contract::ADAPTER_REGISTERED_OBJECT_SYNC: &str
+contract::ADAPTER_REGISTERED_OBJECT_SYNC_VERSION: &str
+contract::FAMILY_OBJECT_SYNC: &str
+contract::GITHUB_OBJECT_SYNC_RECORD_TYPES: &[&str]
+contract::GITHUB_OBJECT_SYNC_TYPE_DIGEST: &str
+contract::GITHUB_OBJECT_SYNC_TYPE_REVISION: SourceTypeRevisionDescriptor
+contract::MAX_SOURCE_BATCH_RECORDS: usize
+contract::MAX_SOURCE_CURSOR_BYTES: usize
+contract::MAX_SOURCE_DISPLAY_NAME_BYTES: usize
+contract::MAX_SOURCE_FEED_EPOCH_BYTES: usize
+contract::MAX_SOURCE_IDENTIFIER_BYTES: usize
+contract::MAX_SOURCE_PROPERTY_KEY_BYTES: usize
+contract::MAX_SOURCE_PROPERTY_VALUE_BYTES: usize
+contract::MAX_SOURCE_RECORD_PROPERTIES: usize
+contract::OperationOutcome
+contract::OperationOutcome::Denial
+contract::OperationOutcome::Partial
+contract::OperationOutcome::Success
+contract::OperationOutcome::Unavailable
+contract::OperationOutcome::Unknown
+contract::ReplayDisposition
+contract::ReplayDisposition::ExactReplay
+contract::ReplayDisposition::NewBatch
+contract::SOURCE_BATCH_V2_VERSION: &str
+contract::SOURCE_BATCH_VERSION: &str
+contract::SOURCE_GITHUB: &str
+contract::SOURCE_TYPE_REVISION_VERSION: &str
+contract::SourceBatch
+contract::SourceBatch.adapter_id: String
+contract::SourceBatch.adapter_version: String
+contract::SourceBatch.batch_digest: String
+contract::SourceBatch.collected_at_ms: i64
+contract::SourceBatch.contract_version: String
+contract::SourceBatch.current_cursor: String
+contract::SourceBatch.delivery: Option<SourceDeliveryWindow>
+contract::SourceBatch.family: String
+contract::SourceBatch.idempotency_key: String
+contract::SourceBatch.namespace: String
+contract::SourceBatch.producer_identity: String
+contract::SourceBatch.proposed_next_cursor: String
+contract::SourceBatch.records: Vec<SourceRecord>
+contract::SourceBatch.source: String
+contract::SourceBatch.source_instance: String
+contract::SourceBatch.type_digest: String
+contract::SourceBatch::canonical_digest(&self) -> Result<String,SourceBatchValidationError>
+contract::SourceBatch::compare_replay(&self,&SourceBatchReplayMaterial) -> Result<ReplayDisposition,SourceBatchValidationError>
+contract::SourceBatch::replay_material(&self) -> Result<SourceBatchReplayMaterial,SourceBatchValidationError>
+contract::SourceBatch::server_validation_outcome(&self,&str) -> OperationOutcome
+contract::SourceBatch::validate(&self) -> Result<(),SourceBatchValidationError>
+contract::SourceBatch::validate_for_producer(&self,&str) -> Result<(),SourceBatchValidationError>
+contract::SourceBatchReplayMaterial
+contract::SourceBatchReplayMaterial.batch_digest: String
+contract::SourceBatchReplayMaterial.idempotency_key: String
+contract::SourceBatchReplayMaterial.namespace: String
+contract::SourceBatchReplayMaterial.producer_identity: String
+contract::SourceBatchResult
+contract::SourceBatchResult.checkpoint_advanced: bool
+contract::SourceBatchResult.records: Vec<SourceRecordResult>
+contract::SourceBatchResult.transaction: SourceBatchTransaction
+contract::SourceBatchStatus
+contract::SourceBatchStatus::Aborted
+contract::SourceBatchStatus::Committed
+contract::SourceBatchStatus::Open
+contract::SourceBatchStatus::Quarantined
+contract::SourceBatchStatus::as_str(self) -> &str
+contract::SourceBatchTransaction
+contract::SourceBatchTransaction.batch_digest: String
+contract::SourceBatchTransaction.binding_id: String
+contract::SourceBatchTransaction.closed_at_ms: Option<i64>
+contract::SourceBatchTransaction.contract_version: String
+contract::SourceBatchTransaction.current_cursor: String
+contract::SourceBatchTransaction.delivery_mode: Option<SourceDeliveryMode>
+contract::SourceBatchTransaction.idempotency_key: String
+contract::SourceBatchTransaction.namespace: String
+contract::SourceBatchTransaction.offset_end: Option<u64>
+contract::SourceBatchTransaction.offset_start: Option<u64>
+contract::SourceBatchTransaction.opened_at_ms: i64
+contract::SourceBatchTransaction.outcome: OperationOutcome
+contract::SourceBatchTransaction.producer_identity: String
+contract::SourceBatchTransaction.proposed_next_cursor: String
+contract::SourceBatchTransaction.reason: String
+contract::SourceBatchTransaction.snapshot_complete: Option<bool>
+contract::SourceBatchTransaction.source_feed_epoch: Option<String>
+contract::SourceBatchTransaction.status: SourceBatchStatus
+contract::SourceBatchTransaction.sync_generation: Option<u64>
+contract::SourceBatchTransaction.transaction_id: String
+contract::SourceBatchValidationError
+contract::SourceBatchValidationError.code: String
+contract::SourceBatchValidationError.message: String
+contract::SourceBinding
+contract::SourceBinding.active: bool
+contract::SourceBinding.adapter_id: String
+contract::SourceBinding.adapter_version: String
+contract::SourceBinding.binding_id: String
+contract::SourceBinding.created_at_ms: i64
+contract::SourceBinding.family: String
+contract::SourceBinding.namespace: String
+contract::SourceBinding.producer_identity: String
+contract::SourceBinding.source: String
+contract::SourceBinding.source_instance: String
+contract::SourceBinding.type_digest: String
+contract::SourceCheckpoint
+contract::SourceCheckpoint.advanced_at_ms: i64
+contract::SourceCheckpoint.binding_id: String
+contract::SourceCheckpoint.committed_batch_digest: String
+contract::SourceCheckpoint.committed_offset: Option<u64>
+contract::SourceCheckpoint.contract_version: String
+contract::SourceCheckpoint.cursor: String
+contract::SourceCheckpoint.delivery_mode: Option<SourceDeliveryMode>
+contract::SourceCheckpoint.namespace: String
+contract::SourceCheckpoint.source_feed_epoch: Option<String>
+contract::SourceCheckpoint.sync_generation: Option<u64>
+contract::SourceDeliveryMode
+contract::SourceDeliveryMode::ChangeFeed
+contract::SourceDeliveryMode::Snapshot
+contract::SourceDeliveryWindow
+contract::SourceDeliveryWindow.mode: SourceDeliveryMode
+contract::SourceDeliveryWindow.offset_end: Option<u64>
+contract::SourceDeliveryWindow.offset_start: Option<u64>
+contract::SourceDeliveryWindow.snapshot_complete: bool
+contract::SourceDeliveryWindow.source_feed_epoch: Option<String>
+contract::SourceDeliveryWindow.sync_generation: u64
+contract::SourceRecord
+contract::SourceRecord.deleted: bool
+contract::SourceRecord.display_name: String
+contract::SourceRecord.external_id: String
+contract::SourceRecord.observed_at_ms: i64
+contract::SourceRecord.payload_digest: String
+contract::SourceRecord.properties: BTreeMap<String,String>
+contract::SourceRecord.source: String
+contract::SourceRecord.source_instance: String
+contract::SourceRecord.source_sequence: Option<u64>
+contract::SourceRecord.source_version: String
+contract::SourceRecord.type_name: String
+contract::SourceRecord::source_id(&self) -> String
+contract::SourceRecordResult
+contract::SourceRecordResult.decision: SyncDecision
+contract::SourceRecordResult.outcome: OperationOutcome
+contract::SourceRecordResult.reason: String
+contract::SourceRecordResult.source_id: String
+contract::SourceRecordResult.source_sequence: Option<u64>
+contract::SourceRecordResult.source_version: String
+contract::SourceRecordResult.transaction_id: String
+contract::SourceSyncGeneration
+contract::SourceSyncGeneration.binding_id: String
+contract::SourceSyncGeneration.committed_offset: Option<u64>
+contract::SourceSyncGeneration.created_at_ms: i64
+contract::SourceSyncGeneration.delivery_mode: SourceDeliveryMode
+contract::SourceSyncGeneration.reason: String
+contract::SourceSyncGeneration.source_feed_epoch: Option<String>
+contract::SourceSyncGeneration.status: SourceSyncGenerationStatus
+contract::SourceSyncGeneration.sync_generation: u64
+contract::SourceSyncGeneration.updated_at_ms: i64
+contract::SourceSyncGenerationStatus
+contract::SourceSyncGenerationStatus::Active
+contract::SourceSyncGenerationStatus::RecoveryRequired
+contract::SourceSyncGenerationStatus::Snapshotting
+contract::SourceSyncGenerationStatus::Superseded
+contract::SourceSyncState
+contract::SourceSyncState.binding: SourceBinding
+contract::SourceSyncState.checkpoint: Option<SourceCheckpoint>
+contract::SourceSyncState.current_generation: Option<SourceSyncGeneration>
+contract::SourceSyncState.last_result: Option<SourceBatchResult>
+contract::SourceSyncState.latest_transaction: Option<SourceBatchTransaction>
+contract::SourceSyncState.open_transaction: Option<SourceBatchTransaction>
+contract::SourceSyncState.updated_at_ms: i64
+contract::SourceTypeRevisionDescriptor
+contract::SourceTypeRevisionDescriptor.contract_version: &str
+contract::SourceTypeRevisionDescriptor.digest: &str
+contract::SourceTypeRevisionDescriptor.family: &str
+contract::SourceTypeRevisionDescriptor.record_types: &[&str]
+contract::SourceTypeRevisionDescriptor.source: &str
+contract::SyncDecision
+contract::SyncDecision::Conflict{source_id:String,reason:String}
+contract::SyncDecision::Reject{reason:String}
+contract::SyncDecision::Tombstone(SyncedObject)
+contract::SyncDecision::Upsert(SyncedObject)
+contract::SyncedObject
+contract::SyncedObject.object_id: String
+contract::SyncedObject.payload_digest: String
+contract::SyncedObject.properties: BTreeMap<String,String>
+contract::SyncedObject.source_id: String
+contract::SyncedObject.source_version: String
+contract::SyncedObject.tombstoned: bool
+contract::SyncedObject.type_digest: String
+contract::SyncedObject.type_name: String
+contract::contains_secret_like_text(&str) -> bool
+contract::detect_identity_conflict(&SyncedObject,&SyncedObject) -> Option<String>
+contract::is_schema_drift_denial(Option<&str>) -> bool
+contract::object_id_for(&str,&str) -> String
+contract::source_id(&str,&str,&str) -> String
+contract::sync_github_record(SourceRecord,&str) -> SyncDecision
+dataset_id_for
+detect_identity_conflict
+direct_feed_capability
+feed::ChangeFeedPage
+feed::ChangeFeedPage.caught_up: bool
+feed::ChangeFeedPage.collected_at_ms: i64
+feed::ChangeFeedPage.offset_start: u64
+feed::ChangeFeedPage.proposed_next_cursor: String
+feed::ChangeFeedPage.records: Vec<SourceRecord>
+feed::ChangeFeedRunError
+feed::ChangeFeedRunError::Outbox
+feed::ChangeFeedRunError::StateAmbiguous
+feed::ChangeFeedRunError::StateUnavailable
+feed::ChangeFeedSource
+feed::ChangeFeedSource::read_change_feed(&mut self,&str,u64,usize) -> Result<ChangeFeedPage,ChangeFeedSourceFailure>
+feed::ChangeFeedSourceFailure
+feed::ChangeFeedSourceFailure::Invalid
+feed::ChangeFeedSourceFailure::Unavailable
+feed::ChangeFeedSourceFailure::UnsupportedOrdering
+feed::run_change_feed<T:SourceSyncTransport,S:ChangeFeedSource>(&SourceAdapterConfig,&SourceOutbox,&mut T,&mut S,usize) -> Result<SourceRunReport,ChangeFeedRunError>
+github::DirectFeedCapability
+github::DirectFeedCapability::UnsupportedOrdering
+github::GitHubObjectFixture
+github::GitHubObjectFixture.deleted: bool
+github::GitHubObjectFixture.kind: String
+github::GitHubObjectFixture.number: u64
+github::GitHubObjectFixture.observed_at_ms: i64
+github::GitHubObjectFixture.properties: BTreeMap<String,String>
+github::GitHubObjectFixture.repository: String
+github::GitHubObjectFixture.revision: String
+github::GitHubObjectFixture.state: String
+github::GitHubObjectFixture.title: String
+github::MAX_GITHUB_FIXTURE_BYTES: usize
+github::direct_feed_capability() -> DirectFeedCapability
+github::parse(&[u8]) -> Result<GitHubObjectFixture,String>
+github::translate(GitHubObjectFixture,&str) -> Result<SourceRecord,String>
+github_issue_lifecycle_fixture
+is_schema_drift_denial
+lineage::LINEAGE_KIND_ACTION: &str
+lineage::LINEAGE_KIND_DATASET: &str
+lineage::LINEAGE_KIND_OBJECT: &str
+lineage::LINEAGE_KIND_SOURCE: &str
+lineage::LINEAGE_KIND_WRITEBACK: &str
+lineage::LineageNode
+lineage::LineageNode.id: String
+lineage::LineageNode.kind: String
+lineage::ObjectLineage
+lineage::ObjectLineage.action_instance_id: String
+lineage::ObjectLineage.dataset_id: String
+lineage::ObjectLineage.nodes: Vec<LineageNode>
+lineage::ObjectLineage.object_id: String
+lineage::ObjectLineage.source_id: String
+lineage::ObjectLineage.type_digest: String
+lineage::ObjectLineage.writeback_effect_id: String
+lineage::bind_sync_lineage(&str,&str,&str,&str) -> Result<ObjectLineage,String>
+lineage::bind_writeback(ObjectLineage,&str,&str) -> Result<ObjectLineage,String>
+lineage::dataset_id_for(&str,&str) -> String
+object_id_for
+parse_github_fixture
+run_change_feed
+run_generation_snapshot_v2
+run_lifecycle_fixture
+run_restart_and_commit
+run_snapshot
+sdk::ApplySourceBatchReply
+sdk::ApplySourceBatchReply::Committed{idempotency_key:String,batch_digest:String,committed_cursor:String}
+sdk::ApplySourceBatchReply::Rejected{reason_code:String}
+sdk::DEFAULT_MAX_ENTRY_BYTES: usize
+sdk::DEFAULT_MAX_PENDING_FILES: usize
+sdk::FlushDisposition
+sdk::FlushDisposition::Committed
+sdk::FlushDisposition::Pending
+sdk::FlushDisposition::Quarantined
+sdk::FlushEntry
+sdk::FlushEntry.disposition: FlushDisposition
+sdk::FlushEntry.idempotency_key: String
+sdk::FlushReport
+sdk::FlushReport.entries: Vec<FlushEntry>
+sdk::GetSourceSyncStateInput
+sdk::GetSourceSyncStateInput.namespace: String
+sdk::GetSourceSyncStateInput.source_instance: String
+sdk::GetSourceSyncStateInput.type_digest: String
+sdk::MAX_QUARANTINE_REASON_BYTES: usize
+sdk::OUTBOX_FORMAT_VERSION: &str
+sdk::OutboxLimits
+sdk::OutboxLimits.max_entry_bytes: usize
+sdk::OutboxLimits.max_pending_files: usize
+sdk::SourceAdapterConfig
+sdk::SourceAdapterConfig.namespace: String
+sdk::SourceAdapterConfig.producer_identity: String
+sdk::SourceAdapterConfig.source_instance: String
+sdk::SourceAdapterConfig.type_digest: String
+sdk::SourceGenerationStatus = SourceSyncGenerationStatus
+sdk::SourceOutbox
+sdk::SourceOutbox::enqueue(&self,&SourceBatch) -> Result<SourceBatch,String>
+sdk::SourceOutbox::flush<T:SourceSyncTransport>(&self,&mut T,bool) -> Result<FlushReport,String>
+sdk::SourceOutbox::flush_idempotency_key<T:SourceSyncTransport>(&self,&str,&mut T,bool) -> Result<FlushEntry,String>
+sdk::SourceOutbox::open(impl Into<PathBuf>,OutboxLimits) -> Result<Self,String>
+sdk::SourceOutbox::pending(&self) -> Result<Vec<SourceBatch>,String>
+sdk::SourceOutbox::quarantine_count(&self) -> Result<usize,String>
+sdk::SourceRunDisposition
+sdk::SourceRunDisposition::CaughtUp
+sdk::SourceRunDisposition::InProgress
+sdk::SourceRunDisposition::InvalidInput
+sdk::SourceRunDisposition::Pending
+sdk::SourceRunDisposition::RecoveryRequired
+sdk::SourceRunDisposition::Rejected
+sdk::SourceRunDisposition::SnapshotRequired
+sdk::SourceRunDisposition::UnsupportedOrdering
+sdk::SourceRunReport
+sdk::SourceRunReport.batches_committed: usize
+sdk::SourceRunReport.committed_cursor: Option<String>
+sdk::SourceRunReport.committed_offset: Option<u64>
+sdk::SourceRunReport.disposition: SourceRunDisposition
+sdk::SourceRunReport.sync_generation: Option<u64>
+sdk::SourceRunReport::from_state(SourceRunDisposition,usize,&SourceSyncStateView) -> Self
+sdk::SourceSyncStateView
+sdk::SourceSyncStateView.committed_offset: Option<u64>
+sdk::SourceSyncStateView.current_cursor: Option<String>
+sdk::SourceSyncStateView.delivery_mode: Option<SourceDeliveryMode>
+sdk::SourceSyncStateView.found: bool
+sdk::SourceSyncStateView.generation_status: Option<SourceGenerationStatus>
+sdk::SourceSyncStateView.last_committed_batch_digest: Option<String>
+sdk::SourceSyncStateView.latest_transaction_idempotency_key: Option<String>
+sdk::SourceSyncStateView.latest_transaction_reason: Option<String>
+sdk::SourceSyncStateView.open_transaction: bool
+sdk::SourceSyncStateView.source_feed_epoch: Option<String>
+sdk::SourceSyncStateView.sync_generation: Option<u64>
+sdk::SourceSyncTransport
+sdk::SourceSyncTransport::apply_source_batch(&mut self,&SourceBatch) -> Result<ApplySourceBatchReply,TransportFailure>
+sdk::SourceSyncTransport::get_source_sync_state(&mut self,&GetSourceSyncStateInput) -> Result<SourceSyncStateView,TransportFailure>
+sdk::TransportFailure
+sdk::TransportFailure::Ambiguous
+sdk::TransportFailure::Unavailable
+sdk::build_source_batch(&SourceAdapterConfig,&str,&str,i64,Vec<SourceRecord>) -> Result<SourceBatch,String>
+sdk::build_source_batch_v2(&SourceAdapterConfig,&str,&str,i64,Vec<SourceRecord>,SourceDeliveryWindow) -> Result<SourceBatch,String>
+sdk::serialize_source_batch(&SourceBatch) -> Result<Vec<u8>,String>
+serialize_source_batch
+snapshot::DEFAULT_MAX_SNAPSHOT_PAGES_PER_RUN: usize
+snapshot::GenerationSnapshotPage
+snapshot::GenerationSnapshotPage.collected_at_ms: i64
+snapshot::GenerationSnapshotPage.complete: bool
+snapshot::GenerationSnapshotPage.handoff_offset: Option<u64>
+snapshot::GenerationSnapshotPage.proposed_next_cursor: String
+snapshot::GenerationSnapshotPage.records: Vec<SourceRecord>
+snapshot::GenerationSnapshotPage.source_feed_epoch: Option<String>
+snapshot::GenerationSnapshotRead
+snapshot::GenerationSnapshotRead::Page(GenerationSnapshotPage)
+snapshot::GenerationSnapshotSource
+snapshot::GenerationSnapshotSource::read_generation_page(&mut self,Option<&str>,usize) -> Result<GenerationSnapshotRead,SnapshotSourceFailure>
+snapshot::SnapshotPage
+snapshot::SnapshotPage.collected_at_ms: i64
+snapshot::SnapshotPage.complete: bool
+snapshot::SnapshotPage.proposed_next_cursor: String
+snapshot::SnapshotPage.records: Vec<SourceRecord>
+snapshot::SnapshotPageSource
+snapshot::SnapshotPageSource::read_page(&mut self,Option<&str>,usize) -> Result<SnapshotRead,SnapshotSourceFailure>
+snapshot::SnapshotRead
+snapshot::SnapshotRead::Complete
+snapshot::SnapshotRead::Page(SnapshotPage)
+snapshot::SnapshotRunError
+snapshot::SnapshotRunError::InvalidLimits
+snapshot::SnapshotRunError::InvalidPage
+snapshot::SnapshotRunError::Outbox
+snapshot::SnapshotRunError::Rejected
+snapshot::SnapshotRunError::SourceUnavailable
+snapshot::SnapshotRunError::StateAmbiguous
+snapshot::SnapshotRunError::StateUnavailable
+snapshot::SnapshotRunLimits
+snapshot::SnapshotRunLimits.max_pages_per_run: usize
+snapshot::SnapshotRunLimits.max_records_per_page: usize
+snapshot::SnapshotRunOutcome
+snapshot::SnapshotRunOutcome::Complete{pages_committed:usize,committed_cursor:String}
+snapshot::SnapshotRunOutcome::InProgress{pages_committed:usize,committed_cursor:Option<String>}
+snapshot::SnapshotRunOutcome::Pending{pages_committed:usize,committed_cursor:Option<String>}
+snapshot::SnapshotRunOutcome::RecoveryRequired{pages_committed:usize,committed_cursor:Option<String>}
+snapshot::SnapshotSourceFailure
+snapshot::SnapshotSourceFailure::Invalid
+snapshot::SnapshotSourceFailure::Unavailable
+snapshot::run_generation_snapshot_v2<T:SourceSyncTransport,S:GenerationSnapshotSource>(&SourceAdapterConfig,&SourceOutbox,&mut T,&mut S,SnapshotRunLimits) -> Result<SourceRunReport,SnapshotRunError>
+snapshot::run_snapshot<T:SourceSyncTransport,S:SnapshotPageSource>(&SourceAdapterConfig,&SourceOutbox,&mut T,&mut S,SnapshotRunLimits) -> Result<SnapshotRunOutcome,SnapshotRunError>
+source_id
+sync_github_record
+translate_github_fixture

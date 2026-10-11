@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Source adapters depend on the versioned `sekai-source-sdk` crate for the
+  batch builder, outbox, snapshot and change-feed runners, and conformance
+  kit. A breaking public-API change without a major bump fails CI. Connector
+  certification records the SDK version and conformance-suite digest (#1407).
+
 - The identity contract distinguishes the acting tenant from a guest's home
   tenant (`AuthenticatedContext.home_tenant`). Guest contexts are denied
   unless an installed extension's `authorize_guest_namespace` admits the
