@@ -7,6 +7,7 @@
 
 pub mod conformance;
 pub mod contract;
+pub mod discover;
 pub mod feed;
 pub mod github;
 pub mod lineage;
@@ -16,8 +17,9 @@ pub mod snapshot;
 pub use conformance::{
     LifecycleConformanceReport, LifecycleFixture, LifecycleObservation, LifecycleProjection,
     LifecycleStage, OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION, assert_cross_page_identity,
-    assert_deterministic_batch, assert_files_omit, assert_lifecycle_report, assert_snapshot_chain,
-    github_issue_lifecycle_fixture, run_lifecycle_fixture, run_restart_and_commit,
+    assert_deterministic_batch, assert_deterministic_discovery, assert_files_omit,
+    assert_lifecycle_report, assert_snapshot_chain, github_issue_lifecycle_fixture,
+    run_check_conformance, run_lifecycle_fixture, run_restart_and_commit,
 };
 pub use contract::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, ADAPTER_REGISTERED_OBJECT_SYNC,
@@ -34,12 +36,17 @@ pub use contract::{
     SyncedObject, contains_secret_like_text, detect_identity_conflict, is_schema_drift_denial,
     object_id_for, source_id, sync_github_record,
 };
+pub use discover::{
+    ColumnProfileHint, ConnectionFailure, DescriptorDraft, DiscoveredColumn, DiscoveredRecordKind,
+    MAX_DISCOVERED_COLUMNS, MAX_DISCOVERED_RECORD_KINDS, PROFILE_RATIO_SCALE,
+    SOURCE_DISCOVERY_VERSION, SourceDiscovery, SourceInspector, column_name_suggests_sensitive,
+};
 pub use feed::{
     ChangeFeedPage, ChangeFeedRunError, ChangeFeedSource, ChangeFeedSourceFailure, run_change_feed,
 };
 pub use github::{
-    DirectFeedCapability, GitHubObjectFixture, MAX_GITHUB_FIXTURE_BYTES, direct_feed_capability,
-    parse as parse_github_fixture, translate as translate_github_fixture,
+    DirectFeedCapability, GitHubObjectFixture, GitHubSource, MAX_GITHUB_FIXTURE_BYTES,
+    direct_feed_capability, parse as parse_github_fixture, translate as translate_github_fixture,
 };
 pub use lineage::{
     LINEAGE_KIND_ACTION, LINEAGE_KIND_DATASET, LINEAGE_KIND_OBJECT, LINEAGE_KIND_SOURCE,
@@ -76,6 +83,8 @@ pub fn conformance_suite_digest() -> String {
     hasher.update(SOURCE_BATCH_VERSION.as_bytes());
     hasher.update(b"\n");
     hasher.update(SOURCE_BATCH_V2_VERSION.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(SOURCE_DISCOVERY_VERSION.as_bytes());
     hasher.update(b"\n");
     hasher.update(include_str!("conformance.rs").as_bytes());
     format!("sha256:{:x}", hasher.finalize())

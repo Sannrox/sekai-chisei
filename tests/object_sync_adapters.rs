@@ -390,6 +390,28 @@ fn sequenced_record(external_id: &str, sequence: u64) -> SourceRecord {
 }
 
 #[test]
+fn github_reference_adapter_check_and_discover_read_zero_records() {
+    let mut source = github_object_sync::GitHubSource::new("sannrox/sekai-chisei");
+    assert_eq!(
+        object_sync_conformance::run_check_conformance(
+            &mut source,
+            github_object_sync::GitHubSource::records_read
+        ),
+        Ok(Ok(()))
+    );
+    let discovery = object_sync_conformance::assert_deterministic_discovery(&mut source).unwrap();
+    assert_eq!(
+        discovery
+            .record_kinds
+            .iter()
+            .map(|kind| kind.record_kind.as_str())
+            .collect::<Vec<_>>(),
+        ["Issue", "PullRequest"]
+    );
+    assert_eq!(source.records_read(), 0);
+}
+
+#[test]
 fn lifecycle_conformance_covers_every_advertised_profile_and_an_independent_canary() {
     let github = object_sync_conformance::run_lifecycle_fixture(
         "adapter.github.object_sync",

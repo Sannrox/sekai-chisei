@@ -7,6 +7,10 @@ use crate::contract::{
     MAX_SOURCE_DISPLAY_NAME_BYTES, MAX_SOURCE_IDENTIFIER_BYTES, MAX_SOURCE_PROPERTY_KEY_BYTES,
     MAX_SOURCE_PROPERTY_VALUE_BYTES, MAX_SOURCE_RECORD_PROPERTIES, SOURCE_GITHUB, SourceRecord,
 };
+use crate::discover::{
+    ConnectionFailure, DiscoveredColumn, DiscoveredRecordKind, SOURCE_DISCOVERY_VERSION,
+    SourceDiscovery, SourceInspector,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -219,6 +223,70 @@ fn is_secret_key(key: &str) -> bool {
         || normalized.contains("authorization")
 }
 
+/// Fixture GitHub source: no network and no credentials. `check` only
+/// validates the canonical `owner/repository` identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubSource {
+    pub repository: String,
+    records_read: u64,
+}
+
+impl GitHubSource {
+    pub fn new(repository: impl Into<String>) -> Self {
+        Self {
+            repository: repository.into(),
+            records_read: 0,
+        }
+    }
+
+    /// Records produced by [`translate`], never by check.
+    pub fn records_read(&self) -> u64 {
+        self.records_read
+    }
+
+    /// Translate one fixture and count it as a record read.
+    pub fn read_fixture(&mut self, fixture: GitHubObjectFixture) -> Result<SourceRecord, String> {
+        let record = translate(fixture, &self.repository)?;
+        self.records_read += 1;
+        Ok(record)
+    }
+}
+
+impl SourceInspector for GitHubSource {
+    fn check(&mut self) -> Result<(), ConnectionFailure> {
+        validate_repository(&self.repository).map_err(|_| ConnectionFailure::Unreachable)
+    }
+
+    /// Lists Issue and PullRequest. Those kinds stay the code-owned GitHub
+    /// profile; the catalog refuses them at registration. Warehouse discovery
+    /// is the catalog round-trip.
+    fn discover(&mut self) -> Result<SourceDiscovery, ConnectionFailure> {
+        self.check()?;
+        let column = |name: &str, data_type: &str, nullable: bool| DiscoveredColumn {
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable,
+            profile: None,
+        };
+        let kind = |record_kind: &str| DiscoveredRecordKind {
+            record_kind: record_kind.into(),
+            schema_revision: "github-object-v1".into(),
+            columns: vec![
+                column("number", "integer", false),
+                column("revision", "string", false),
+                column("title", "string", false),
+                column("state", "string", false),
+            ],
+            key_candidates: vec![vec!["number".into()]],
+        };
+        Ok(SourceDiscovery {
+            contract_version: SOURCE_DISCOVERY_VERSION.into(),
+            source: SOURCE_GITHUB.into(),
+            record_kinds: vec![kind("Issue"), kind("PullRequest")],
+        })
+    }
+}
+
 fn contains_secret_like_text(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("-----begin private key-----")
@@ -235,4 +303,50 @@ fn contains_secret_like_text(value: &str) -> bool {
         || lower.contains("gho_")
         || lower.contains("ghs_")
         || lower.contains("ghu_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conformance::{assert_deterministic_discovery, run_check_conformance};
+
+    #[test]
+    fn check_validates_repository_without_reading_records() {
+        let mut source = GitHubSource::new("sannrox/sekai-chisei");
+        assert_eq!(
+            run_check_conformance(&mut source, GitHubSource::records_read),
+            Ok(Ok(()))
+        );
+        let mut bad = GitHubSource::new("not a repo");
+        assert_eq!(
+            run_check_conformance(&mut bad, GitHubSource::records_read),
+            Ok(Err(ConnectionFailure::Unreachable))
+        );
+    }
+
+    #[test]
+    fn discover_lists_issue_and_pull_request_deterministically() {
+        let mut source = GitHubSource::new("sannrox/sekai-chisei");
+        let discovery = assert_deterministic_discovery(&mut source).unwrap();
+        assert_eq!(discovery.source, SOURCE_GITHUB);
+        assert_eq!(
+            discovery
+                .record_kinds
+                .iter()
+                .map(|kind| kind.record_kind.as_str())
+                .collect::<Vec<_>>(),
+            ["Issue", "PullRequest"]
+        );
+        assert_eq!(
+            discovery
+                .descriptor_drafts()
+                .unwrap()
+                .iter()
+                .map(|draft| draft.record_kind.as_str())
+                .collect::<Vec<_>>(),
+            ["Issue", "PullRequest"],
+            "onboarding drafts exist; catalog admission stays code-owned"
+        );
+        assert_eq!(source.records_read(), 0);
+    }
 }

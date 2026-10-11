@@ -490,3 +490,102 @@ fn the_adapter_refuses_malformed_snapshots() {
     );
     assert_ne!(version(&first, "1001"), version(&second, "1001"));
 }
+
+/// #1408: the reference table connector passes check/discover conformance,
+/// and its discovered schema drafts the descriptor the catalog admits and the
+/// table's batches commit under.
+#[tokio::test]
+async fn discovered_table_schema_round_trips_into_an_admitted_descriptor() {
+    let first = snapshot("orders-snapshot-1.json");
+    let mut store = warehouse_table_ingest::TableStore::new(first.clone()).unwrap();
+    assert_eq!(
+        sekai_source_sdk::run_check_conformance(&mut store, |store| store.rows_read()),
+        Ok(Ok(()))
+    );
+    let discovery = sekai_source_sdk::assert_deterministic_discovery(&mut store).unwrap();
+    assert!(store.rows_read() > 0, "discovery profiles the rows");
+
+    let [kind] = discovery.record_kinds.as_slice() else {
+        panic!("one table is one record kind: {discovery:?}");
+    };
+    let columns = kind
+        .columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.as_str(),
+                column.data_type.as_str(),
+                column.nullable,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        columns,
+        [
+            ("order_id", "bigint", false),
+            ("row_version", "string", false),
+            ("summary", "string", false),
+            ("status", "string", true),
+            ("region", "string", true),
+        ],
+        "hidden columns never leave the connector"
+    );
+    assert_eq!(kind.key_candidates, [["order_id"]]);
+    let region = kind.columns[4].profile.unwrap();
+    assert_eq!((region.distinct_ratio_bp, region.null_ratio_bp), (6_666, 0));
+
+    let [draft] = discovery.descriptor_drafts().unwrap().try_into().unwrap();
+    let descriptor = warehouse_table_ingest::descriptor(&first).unwrap();
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    db.ensure_team_namespace(NAMESPACE, OPERATOR, Role::Admin, OPERATOR)
+        .unwrap();
+    db.ensure_team_namespace(NAMESPACE, CONNECTOR, Role::Editor, OPERATOR)
+        .unwrap();
+    let service =
+        SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(db));
+    let registered = service
+        .register_source_type_descriptor(with_principal(
+            RegisterSourceTypeDescriptorRequest {
+                namespace: NAMESPACE.into(),
+                source: draft.source,
+                record_kind: draft.record_kind,
+                schema_revision: draft.schema_revision,
+            },
+            OPERATOR,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .descriptor
+        .unwrap();
+    assert_eq!(registered.status, "live");
+    assert_eq!(registered.digest, descriptor.digest);
+
+    let admitted = apply(&service, first, NAMESPACE, CONNECTOR, "")
+        .await
+        .unwrap();
+    assert_eq!(status(&admitted), "COMMITTED", "{admitted:?}");
+}
+
+/// Ingest keeps an empty cell as a value, so discovery profiles only a
+/// missing cell as null.
+#[test]
+fn discovery_profiles_missing_cells_as_null_and_empty_cells_as_values() {
+    let mut table = snapshot("orders-snapshot-1.json");
+    table.rows[0].insert("status".into(), String::new());
+    table.rows[1].remove("status");
+    let mut store = warehouse_table_ingest::TableStore::new(table).unwrap();
+    let discovery = sekai_source_sdk::SourceInspector::discover(&mut store).unwrap();
+    let status = discovery.record_kinds[0]
+        .columns
+        .iter()
+        .find(|column| column.name == "status")
+        .and_then(|column| column.profile)
+        .unwrap();
+    assert_eq!(
+        (status.distinct_ratio_bp, status.null_ratio_bp),
+        (6_666, 3_333)
+    );
+}

@@ -8,7 +8,8 @@
   "version_column": "row_version",
   "columns": [
     {
-      "name": "order_id"
+      "name": "order_id",
+      "data_type": "bigint"
     },
     {
       "name": "row_version"

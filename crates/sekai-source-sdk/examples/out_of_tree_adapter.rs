@@ -4,9 +4,10 @@
 //! and runs the offline conformance kit.
 
 use sekai_source_sdk::{
-    GITHUB_OBJECT_SYNC_TYPE_DIGEST, GitHubObjectFixture, SDK_VERSION, SourceAdapterConfig,
-    SourceOutbox, assert_deterministic_batch, assert_files_omit, build_source_batch,
-    conformance_suite_digest, github_issue_lifecycle_fixture, run_lifecycle_fixture,
+    GITHUB_OBJECT_SYNC_TYPE_DIGEST, GitHubObjectFixture, GitHubSource, SDK_VERSION,
+    SourceAdapterConfig, SourceOutbox, assert_deterministic_batch, assert_deterministic_discovery,
+    assert_files_omit, build_source_batch, conformance_suite_digest,
+    github_issue_lifecycle_fixture, run_check_conformance, run_lifecycle_fixture,
     translate_github_fixture,
 };
 use std::collections::BTreeMap;
@@ -14,6 +15,11 @@ use std::env;
 use std::fs;
 
 fn main() -> Result<(), String> {
+    let mut github = GitHubSource::new("sannrox/sekai-chisei");
+    run_check_conformance(&mut github, GitHubSource::records_read)?
+        .map_err(|failure| failure.to_string())?;
+    let _discovery = assert_deterministic_discovery(&mut github)?;
+
     let fixture = GitHubObjectFixture {
         repository: "sannrox/sekai-chisei".into(),
         kind: "Issue".into(),

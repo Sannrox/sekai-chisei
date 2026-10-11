@@ -4,6 +4,7 @@ use crate::contract::{
     GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_GITHUB, SourceBatch, SourceRecord, SyncDecision,
     SyncedObject, sync_github_record,
 };
+use crate::discover::{ConnectionFailure, SourceDiscovery, SourceInspector};
 use crate::lineage::{
     LINEAGE_KIND_DATASET, LINEAGE_KIND_OBJECT, LINEAGE_KIND_SOURCE, ObjectLineage,
     bind_sync_lineage, dataset_id_for,
@@ -386,6 +387,42 @@ pub fn assert_cross_page_identity(
         return Err("cross-page source identity was not a compatible refresh".into());
     }
     Ok(())
+}
+
+/// Run `check` once and require that it read zero records. `records_read`
+/// is the source's own read counter; the kit compares it around the call.
+pub fn run_check_conformance<S, F>(
+    source: &mut S,
+    records_read: F,
+) -> Result<Result<(), ConnectionFailure>, String>
+where
+    S: SourceInspector,
+    F: Fn(&S) -> u64,
+{
+    let before = records_read(source);
+    let outcome = source.check();
+    if records_read(source) != before {
+        return Err("connection check read source records".into());
+    }
+    Ok(outcome)
+}
+
+/// Discover twice from an unchanged source and require a valid, identical
+/// result, including its descriptor drafts.
+pub fn assert_deterministic_discovery<S: SourceInspector>(
+    source: &mut S,
+) -> Result<SourceDiscovery, String> {
+    let first = source
+        .discover()
+        .map_err(|failure| format!("discovery failed: {failure}"))?;
+    first.validate()?;
+    let second = source
+        .discover()
+        .map_err(|failure| format!("discovery failed: {failure}"))?;
+    if first != second || first.descriptor_drafts()? != second.descriptor_drafts()? {
+        return Err("source discovery is not deterministic".into());
+    }
+    Ok(first)
 }
 
 pub fn run_restart_and_commit<T: SourceSyncTransport>(

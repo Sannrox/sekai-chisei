@@ -316,7 +316,8 @@ batch, and the table snapshot id is only the checkpoint cursor (ADR 0036).
 - **Descriptors.** One registered source-type descriptor (`warehouse.table`) covers one record kind and one schema revision.
 - **Object-type definition.** `object_type_definition` derives the definition from the visible columns, so the published definition can filter on them.
 - **Row versions.** Each row's source version is the warehouse row version, so an unchanged row is a no-op refresh.
-- **Restricted columns.** Hidden columns never leave the connector. They appear in no properties, digests, display names, or definitions.
+- **Restricted columns.** Hidden columns never leave the connector. They appear in no properties, digests, display names, definitions, or discovery output.
+- **Check and discover.** `TableStore` implements the SDK inspector: `check` does not read rows; `discover` lists visible columns, types, nullability, and the row key, then drafts the descriptor the batch admits under.
 - **Declared schema drift** (a new revision) is refused before any write until an operator registers that revision.
 - **Undeclared drift** (rows rewritten under the same revision and row version) is quarantined. It appears in `GetSourceSyncState`, and the last consistent objects and checkpoint stay.
 - **Backend support.** Source-type descriptors are SQLite-only, so the profile is SQLite-only. PostgreSQL fails closed at descriptor registration.

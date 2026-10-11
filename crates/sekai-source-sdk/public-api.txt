@@ -1,4 +1,4 @@
-# crate-version: 1.0.0
+# crate-version: 1.1.0
 ADAPTER_GITHUB_OBJECT_SYNC
 ADAPTER_GITHUB_OBJECT_SYNC_VERSION
 ADAPTER_REGISTERED_OBJECT_SYNC
@@ -8,10 +8,15 @@ ChangeFeedPage
 ChangeFeedRunError
 ChangeFeedSource
 ChangeFeedSourceFailure
+ColumnProfileHint
+ConnectionFailure
 DEFAULT_MAX_ENTRY_BYTES
 DEFAULT_MAX_PENDING_FILES
 DEFAULT_MAX_SNAPSHOT_PAGES_PER_RUN
+DescriptorDraft
 DirectFeedCapability
+DiscoveredColumn
+DiscoveredRecordKind
 FAMILY_OBJECT_SYNC
 FlushDisposition
 FlushEntry
@@ -24,6 +29,7 @@ GenerationSnapshotRead
 GenerationSnapshotSource
 GetSourceSyncStateInput
 GitHubObjectFixture
+GitHubSource
 LINEAGE_KIND_ACTION
 LINEAGE_KIND_DATASET
 LINEAGE_KIND_OBJECT
@@ -35,6 +41,8 @@ LifecycleObservation
 LifecycleProjection
 LifecycleStage
 LineageNode
+MAX_DISCOVERED_COLUMNS
+MAX_DISCOVERED_RECORD_KINDS
 MAX_GITHUB_FIXTURE_BYTES
 MAX_QUARANTINE_REASON_BYTES
 MAX_SOURCE_BATCH_RECORDS
@@ -50,10 +58,12 @@ OUTBOX_FORMAT_VERSION
 ObjectLineage
 OperationOutcome
 OutboxLimits
+PROFILE_RATIO_SCALE
 ReplayDisposition
 SDK_VERSION: &str
 SOURCE_BATCH_V2_VERSION
 SOURCE_BATCH_VERSION
+SOURCE_DISCOVERY_VERSION
 SOURCE_GITHUB
 SOURCE_TYPE_REVISION_VERSION
 SnapshotPage
@@ -74,7 +84,9 @@ SourceBinding
 SourceCheckpoint
 SourceDeliveryMode
 SourceDeliveryWindow
+SourceDiscovery
 SourceGenerationStatus
+SourceInspector
 SourceOutbox
 SourceRecord
 SourceRecordResult
@@ -91,6 +103,7 @@ SyncedObject
 TransportFailure
 assert_cross_page_identity
 assert_deterministic_batch
+assert_deterministic_discovery
 assert_files_omit
 assert_lifecycle_report
 assert_snapshot_chain
@@ -98,6 +111,7 @@ bind_sync_lineage
 bind_writeback
 build_source_batch
 build_source_batch_v2
+column_name_suggests_sensitive
 conformance::LifecycleConformanceReport
 conformance::LifecycleConformanceReport.adapter_id: String
 conformance::LifecycleConformanceReport.contract_version: String
@@ -131,10 +145,12 @@ conformance::LifecycleStage::Tombstone
 conformance::OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION: &str
 conformance::assert_cross_page_identity(&SourceBatch,&SourceBatch,&str) -> Result<(),String>
 conformance::assert_deterministic_batch(&SourceBatch,&SourceBatch) -> Result<(),String>
+conformance::assert_deterministic_discovery<S:SourceInspector>(&mut S) -> Result<SourceDiscovery,String>
 conformance::assert_files_omit(&Path,&[&str]) -> Result<(),String>
 conformance::assert_lifecycle_report(&LifecycleConformanceReport) -> Result<(),String>
 conformance::assert_snapshot_chain(&[SourceBatch]) -> Result<(),String>
 conformance::github_issue_lifecycle_fixture() -> LifecycleFixture
+conformance::run_check_conformance<S,F>(&mut S,F) -> Result<Result<(),ConnectionFailure>,String> where S:SourceInspector,F:Fn(&S) -> u64
 conformance::run_lifecycle_fixture<F>(&str,F) -> Result<LifecycleConformanceReport,String> where F:FnMut(&LifecycleObservation) -> Result<SourceRecord,String>
 conformance::run_restart_and_commit<T:SourceSyncTransport>(&Path,&SourceBatch,&mut T,&mut T) -> Result<(),String>
 conformance_suite_digest() -> String
@@ -336,6 +352,42 @@ contract::sync_github_record(SourceRecord,&str) -> SyncDecision
 dataset_id_for
 detect_identity_conflict
 direct_feed_capability
+discover::ColumnProfileHint
+discover::ColumnProfileHint.distinct_ratio_bp: u16
+discover::ColumnProfileHint.null_ratio_bp: u16
+discover::ColumnProfileHint.possibly_sensitive: bool
+discover::ConnectionFailure
+discover::ConnectionFailure::AuthFailed
+discover::ConnectionFailure::PermissionMissing
+discover::ConnectionFailure::Unreachable
+discover::DescriptorDraft
+discover::DescriptorDraft.record_kind: String
+discover::DescriptorDraft.schema_revision: String
+discover::DescriptorDraft.source: String
+discover::DiscoveredColumn
+discover::DiscoveredColumn.data_type: String
+discover::DiscoveredColumn.name: String
+discover::DiscoveredColumn.nullable: bool
+discover::DiscoveredColumn.profile: Option<ColumnProfileHint>
+discover::DiscoveredRecordKind
+discover::DiscoveredRecordKind.columns: Vec<DiscoveredColumn>
+discover::DiscoveredRecordKind.key_candidates: Vec<Vec<String>>
+discover::DiscoveredRecordKind.record_kind: String
+discover::DiscoveredRecordKind.schema_revision: String
+discover::MAX_DISCOVERED_COLUMNS: usize
+discover::MAX_DISCOVERED_RECORD_KINDS: usize
+discover::PROFILE_RATIO_SCALE: u16
+discover::SOURCE_DISCOVERY_VERSION: &str
+discover::SourceDiscovery
+discover::SourceDiscovery.contract_version: String
+discover::SourceDiscovery.record_kinds: Vec<DiscoveredRecordKind>
+discover::SourceDiscovery.source: String
+discover::SourceDiscovery::descriptor_drafts(&self) -> Result<Vec<DescriptorDraft>,String>
+discover::SourceDiscovery::validate(&self) -> Result<(),String>
+discover::SourceInspector
+discover::SourceInspector::check(&mut self) -> Result<(),ConnectionFailure>
+discover::SourceInspector::discover(&mut self) -> Result<SourceDiscovery,ConnectionFailure>
+discover::column_name_suggests_sensitive(&str) -> bool
 feed::ChangeFeedPage
 feed::ChangeFeedPage.caught_up: bool
 feed::ChangeFeedPage.collected_at_ms: i64
@@ -365,6 +417,11 @@ github::GitHubObjectFixture.repository: String
 github::GitHubObjectFixture.revision: String
 github::GitHubObjectFixture.state: String
 github::GitHubObjectFixture.title: String
+github::GitHubSource
+github::GitHubSource.repository: String
+github::GitHubSource::new(impl Into<String>) -> Self
+github::GitHubSource::read_fixture(&mut self,GitHubObjectFixture) -> Result<SourceRecord,String>
+github::GitHubSource::records_read(&self) -> u64
 github::MAX_GITHUB_FIXTURE_BYTES: usize
 github::direct_feed_capability() -> DirectFeedCapability
 github::parse(&[u8]) -> Result<GitHubObjectFixture,String>
@@ -393,6 +450,7 @@ lineage::dataset_id_for(&str,&str) -> String
 object_id_for
 parse_github_fixture
 run_change_feed
+run_check_conformance
 run_generation_snapshot_v2
 run_lifecycle_fixture
 run_restart_and_commit
