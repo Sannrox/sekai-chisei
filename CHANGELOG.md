@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `CreateFunction` refuses a function with an LLM step. The gated publish
+  records an approval for the revision digest and stores it; `InvokeFunction`
+  and document extraction refuse an LLM revision without that approval, so
+  rows stored before this change stay unapproved. Adds PostgreSQL migration
+  `0056_function_gate_approvals` (#1384).
+
 - Governed-document hold, release, expire, and delete check and write the
   record in one transaction on SQLite and PostgreSQL, so a concurrent delete
   or expire can no longer drop a hold reported as placed. Delete drops the
@@ -21,12 +27,6 @@
   confidence, and `allow` writes only at or above the threshold. A direct
   write also runs the caller's CreateObject authorization, which
   `FunctionDocumentExtractRequest.authorize_write` now requires (#1382).
-
-- `CreateFunction` refuses a function with an LLM step. The gated publish
-  records an approval for the revision digest and stores it; `InvokeFunction`
-  and document extraction refuse an LLM revision without that approval, so
-  rows stored before this change stay unapproved. Adds PostgreSQL migration
-  `0056_function_gate_approvals` (#1384).
 
 - Connector certifications persist on PostgreSQL with the SQLite certify, get,
   verify, revoke, and supersession semantics. Adds PostgreSQL migration
