@@ -63,8 +63,30 @@ impl SekaiDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         for certification in certifications {
-            let json = serde_json::to_string(certification)
-                .map_err(|error| format!("encode connector certification: {error}"))?;
+            let json = if certification.superseded_by.is_empty() {
+                serde_json::to_string(certification)
+                    .map_err(|error| format!("encode connector certification: {error}"))?
+            } else {
+                let current_json: Option<String> = tx
+                    .query_row(
+                        "SELECT record_json FROM sekai_connector_certifications
+                         WHERE namespace = ?1 AND certification_id = ?2",
+                        params![certification.namespace, certification.certification_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let current: ConnectorCertification =
+                    serde_json::from_str(&current_json.ok_or(CONNECTOR_UNAVAILABLE)?)
+                        .map_err(|error| format!("decode connector certification: {error}"))?;
+                if current.owner != certification.owner || !current.superseded_by.is_empty() {
+                    return Err(CONNECTOR_UNAVAILABLE.into());
+                }
+                let mut next = current;
+                next.superseded_by = certification.superseded_by.clone();
+                serde_json::to_string(&next)
+                    .map_err(|error| format!("encode connector certification: {error}"))?
+            };
             let changed = if certification.superseded_by.is_empty() {
                 tx.execute(
                     "INSERT INTO sekai_connector_certifications

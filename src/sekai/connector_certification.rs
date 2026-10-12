@@ -18,8 +18,6 @@ pub const REVOCATION_NONE: &str = "";
 pub const REVOCATION_REVOKED: &str = "revoked";
 pub const CONNECTOR_UNAVAILABLE: &str = "connector certification is unavailable";
 pub const PROTOCOL_UNSUPPORTED: &str = "connector certification revision is unsupported";
-pub const POSTGRES_UNAVAILABLE: &str =
-    "connector certifications are unavailable on the PostgreSQL community runtime";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -697,8 +695,19 @@ mod tests {
             CONNECTOR_UNAVAILABLE
         );
         assert_eq!(
-            POSTGRES_UNAVAILABLE,
-            "connector certifications are unavailable on the PostgreSQL community runtime"
+            get_connector(&runtime, "reviewer", "ops", "cert:missing").unwrap_err(),
+            CONNECTOR_UNAVAILABLE
+        );
+        assert_eq!(
+            verify_connector(
+                &runtime,
+                "reviewer",
+                "ops",
+                "cert:missing",
+                &certification()
+            )
+            .unwrap_err(),
+            CONNECTOR_UNAVAILABLE
         );
     }
 }
