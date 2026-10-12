@@ -341,7 +341,40 @@ impl SekaiDb {
                 created INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_links_from ON sekai_links(from_id, relation);
-            CREATE INDEX IF NOT EXISTS idx_links_to ON sekai_links(to_id, relation);",
+            CREATE INDEX IF NOT EXISTS idx_links_to ON sekai_links(to_id, relation);
+            CREATE TABLE IF NOT EXISTS sekai_namespace_object_generation (
+                namespace TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS trg_sekai_objects_namespace_generation_insert
+            AFTER INSERT ON sekai_objects
+            BEGIN
+                INSERT INTO sekai_namespace_object_generation(namespace, generation)
+                VALUES (NEW.namespace, 1)
+                ON CONFLICT(namespace) DO UPDATE SET generation = generation + 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_sekai_objects_namespace_generation_update
+            AFTER UPDATE ON sekai_objects
+            BEGIN
+                INSERT INTO sekai_namespace_object_generation(namespace, generation)
+                VALUES (NEW.namespace, 1)
+                ON CONFLICT(namespace) DO UPDATE SET generation = generation + 1;
+                INSERT INTO sekai_namespace_object_generation(namespace, generation)
+                SELECT OLD.namespace, 1 WHERE OLD.namespace IS NOT NEW.namespace
+                ON CONFLICT(namespace) DO UPDATE SET generation = generation + 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_sekai_objects_namespace_generation_delete
+            AFTER DELETE ON sekai_objects
+            BEGIN
+                INSERT INTO sekai_namespace_object_generation(namespace, generation)
+                VALUES (OLD.namespace, 1)
+                ON CONFLICT(namespace) DO UPDATE SET generation = generation + 1;
+            END;
+            INSERT INTO sekai_namespace_object_generation(namespace, generation)
+            SELECT namespace, COUNT(*)
+            FROM sekai_objects
+            GROUP BY namespace
+            ON CONFLICT(namespace) DO NOTHING;",
         )
         .map_err(|e| e.to_string())?;
         Ok(())

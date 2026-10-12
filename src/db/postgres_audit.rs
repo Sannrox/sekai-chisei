@@ -257,6 +257,19 @@ impl PostgresDb {
         Ok(before)
     }
 
+    pub fn namespace_object_generation(&self, namespace: &str) -> Result<u64, String> {
+        self.connection()?
+            .query_one(
+                "SELECT COALESCE(
+                    (SELECT generation FROM sekai_namespace_object_generation WHERE namespace = $1),
+                    0
+                )",
+                &[&namespace],
+            )
+            .map(|row| row.get::<_, i64>(0).max(0) as u64)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn object_change_watermark(&self, namespace: &str) -> Result<u64, String> {
         self.connection()?
             .query_one(

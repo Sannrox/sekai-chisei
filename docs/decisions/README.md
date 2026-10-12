@@ -125,3 +125,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0101: Analytical governed-transform profile uses in-process SQLite SQL](0101-analytical-transform-profile.md)
 - [ADR 0102: Isolated-process governed-transform profile uses a dedicated claim queue](0102-isolated-process-transform-profile.md)
 - [ADR 0103: The plane admits scheduled and change-triggered transform runs](0103-transform-schedule-and-dependency-graph.md)
+- [ADR 0104: Per-namespace object change generation keys the privacy scan cache](0104-namespace-object-change-generation.md)

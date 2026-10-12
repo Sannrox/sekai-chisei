@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::domain::Object;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -99,7 +98,7 @@ pub struct LeakRule {
 
 struct CachedPrivacyScan {
     leak_fingerprint: String,
-    entity_fingerprint: String,
+    entity_generation: u64,
     rules: Arc<Vec<LeakRule>>,
     entities: Option<Arc<Vec<String>>>,
     truncated: bool,
@@ -125,37 +124,32 @@ impl PrivacyScanCache {
         namespace: &str,
         need_entities: bool,
         leak_objects: impl FnOnce() -> Result<Vec<Object>, E>,
+        entity_generation: u64,
         entity_objects: impl FnOnce() -> Result<Vec<Object>, E>,
     ) -> Result<PrivacyScan, E> {
         let leaks = leak_objects()?;
         let leak_fp = leak_fingerprint(&leaks);
-        let entity_objs = if need_entities {
-            Some(entity_objects()?)
-        } else {
-            None
-        };
-        let entity_fp = entity_objs
-            .as_deref()
-            .map(entity_fingerprint)
-            .unwrap_or_default();
         {
-            let guard = self
+            let mut guard = self
                 .entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(cached) = guard.get(namespace)
-                && cached.leak_fingerprint == leak_fp
-            {
-                if !need_entities {
+            if let Some(cached) = guard.get_mut(namespace) {
+                if !need_entities && cached.leak_fingerprint == leak_fp {
                     return Ok(PrivacyScan {
                         rules: cached.rules.clone(),
                         entities: Arc::new(Vec::new()),
                         truncated: false,
                     });
                 }
-                if cached.entity_fingerprint == entity_fp
+                if need_entities
+                    && cached.entity_generation == entity_generation
                     && let Some(entities) = cached.entities.clone()
                 {
+                    if cached.leak_fingerprint != leak_fp {
+                        cached.leak_fingerprint = leak_fp;
+                        cached.rules = Arc::new(compile_leak_rules(&leaks));
+                    }
                     return Ok(PrivacyScan {
                         rules: cached.rules.clone(),
                         entities,
@@ -165,22 +159,22 @@ impl PrivacyScanCache {
             }
         }
         let rules = Arc::new(compile_leak_rules(&leaks));
-        let (entities, truncated) = match entity_objs {
-            Some(objects) => {
-                // Reference-platform analog: Object Search pageSize is a maximum;
-                // more results exist only when a further page is non-empty.
-                let listed_overflow = objects.len() > ENTITY_SCAN_LIMIT as usize;
-                let scanned = if listed_overflow {
-                    &objects[..ENTITY_SCAN_LIMIT as usize]
-                } else {
-                    objects.as_slice()
-                };
-                (
-                    Some(Arc::new(entity_scan_literals(scanned))),
-                    listed_overflow,
-                )
-            }
-            None => (None, false),
+        let (entities, truncated) = if need_entities {
+            let objects = entity_objects()?;
+            // Reference-platform analog: Object Search pageSize is a maximum;
+            // more results exist only when a further page is non-empty.
+            let listed_overflow = objects.len() > ENTITY_SCAN_LIMIT as usize;
+            let scanned = if listed_overflow {
+                &objects[..ENTITY_SCAN_LIMIT as usize]
+            } else {
+                objects.as_slice()
+            };
+            (
+                Some(Arc::new(entity_scan_literals(scanned))),
+                listed_overflow,
+            )
+        } else {
+            (None, false)
         };
         let returned_entities = entities.clone().unwrap_or_else(|| Arc::new(Vec::new()));
         let mut guard = self
@@ -191,7 +185,7 @@ impl PrivacyScanCache {
             namespace.to_string(),
             CachedPrivacyScan {
                 leak_fingerprint: leak_fp,
-                entity_fingerprint: entity_fp,
+                entity_generation,
                 rules: rules.clone(),
                 entities,
                 truncated,
@@ -232,7 +226,9 @@ fn leak_fingerprint(objects: &[Object]) -> String {
 
 /// Digest of the fields that decide the entity literals, in listing order (id ascending).
 /// A different order only costs a cache miss; it never reuses a stale literal set.
+#[cfg(test)]
 fn entity_fingerprint(objects: &[Object]) -> String {
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for object in objects {
         for field in [
@@ -537,6 +533,7 @@ mod tests {
                     "alpha",
                     true,
                     || Ok::<_, ()>(Vec::new()),
+                    1,
                     || Ok(named_scan_objects(count)),
                 )
                 .unwrap();
@@ -558,6 +555,7 @@ mod tests {
                 "alpha",
                 true,
                 || Ok::<_, ()>(Vec::new()),
+                1,
                 || Ok(named_scan_objects(ENTITY_SCAN_LIMIT as usize + 1)),
             )
             .unwrap();
@@ -655,6 +653,7 @@ mod tests {
                     leak_calls.set(leak_calls.get() + 1);
                     Ok::<_, ()>(vec![leak.clone()])
                 },
+                1,
                 || {
                     entity_calls.set(entity_calls.get() + 1);
                     Ok(vec![asset.clone()])
@@ -664,7 +663,7 @@ mod tests {
         let first = load().unwrap();
         let second = load().unwrap();
         assert_eq!(leak_calls.get(), 2);
-        assert_eq!(entity_calls.get(), 2);
+        assert_eq!(entity_calls.get(), 1);
         assert_eq!(first.rules.len(), 1);
         assert_eq!(first.entities.as_slice(), ["SecretCo", "asset:SECRET"]);
         assert_eq!(second.rules[0].id, first.rules[0].id);
@@ -718,6 +717,7 @@ mod tests {
                 "alpha",
                 true,
                 || Ok::<_, ()>(Vec::new()),
+                1,
                 || Ok(fill_scan_objects(ENTITY_SCAN_LIMIT as usize)),
             )
             .unwrap();
@@ -733,6 +733,7 @@ mod tests {
                 "alpha",
                 true,
                 || Ok::<_, ()>(Vec::new()),
+                1,
                 || Ok(fill_scan_objects(ENTITY_SCAN_LIMIT as usize + 1)),
             )
             .unwrap();
@@ -770,6 +771,7 @@ mod tests {
                 "alpha",
                 true,
                 || Ok::<_, ()>(Vec::new()),
+                1,
                 || Ok(entities.borrow().clone()),
             )
             .unwrap();
@@ -780,6 +782,7 @@ mod tests {
                 "alpha",
                 true,
                 || Ok::<_, ()>(Vec::new()),
+                2,
                 || Ok(entities.borrow().clone()),
             )
             .unwrap();
@@ -834,6 +837,7 @@ mod tests {
                 "alpha",
                 true,
                 || Ok::<_, ()>(vec![leak.clone()]),
+                1,
                 || {
                     entity_calls.set(entity_calls.get() + 1);
                     Ok(vec![asset.clone()])
@@ -846,12 +850,127 @@ mod tests {
                 "alpha",
                 true,
                 || Ok::<_, ()>(vec![leak.clone()]),
+                1,
                 || {
                     entity_calls.set(entity_calls.get() + 1);
                     Ok(vec![asset.clone()])
                 },
             )
             .unwrap();
+        assert_eq!(entity_calls.get(), 1);
+    }
+
+    #[test]
+    fn privacy_scan_cache_hit_skips_entity_listing() {
+        let cache = PrivacyScanCache::default();
+        let asset = Object {
+            id: "asset-1".into(),
+            kind: "asset".into(),
+            name: "SecretCo".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:SECRET".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        };
+        let entity_calls = std::cell::Cell::new(0);
+        let load = || {
+            cache.load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(Vec::new()),
+                7,
+                || {
+                    entity_calls.set(entity_calls.get() + 1);
+                    Ok(vec![asset.clone()])
+                },
+            )
+        };
+        let first = load().unwrap();
+        let second = load().unwrap();
+        assert_eq!(entity_calls.get(), 1);
+        assert!(Arc::ptr_eq(&first.entities, &second.entities));
+    }
+
+    #[test]
+    fn privacy_scan_cache_write_between_checks_forces_relist() {
+        let cache = PrivacyScanCache::default();
+        let first_entities = vec![Object {
+            id: "asset-1".into(),
+            kind: "asset".into(),
+            name: "SecretCo".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:SECRET".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        }];
+        let mut second_entities = first_entities.clone();
+        second_entities.push(Object {
+            id: "asset-2".into(),
+            kind: "asset".into(),
+            name: "UniqueSecretCorp".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:LATE".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        });
+        let entities = std::cell::RefCell::new(first_entities);
+        let entity_calls = std::cell::Cell::new(0);
+        let load = |generation: u64| {
+            cache.load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(Vec::new()),
+                generation,
+                || {
+                    entity_calls.set(entity_calls.get() + 1);
+                    Ok(entities.borrow().clone())
+                },
+            )
+        };
+        load(1).unwrap();
+        *entities.borrow_mut() = second_entities;
+        let second = load(2).unwrap();
         assert_eq!(entity_calls.get(), 2);
+        assert!(
+            second
+                .entities
+                .iter()
+                .any(|literal| literal == "UniqueSecretCorp")
+        );
+    }
+
+    #[test]
+    fn privacy_scan_cache_hit_avoids_listing_cost() {
+        let cache = PrivacyScanCache::default();
+        let objects = named_scan_objects(ENTITY_SCAN_LIMIT as usize);
+        let entity_calls = std::cell::Cell::new(0);
+        let load = || {
+            cache.load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(Vec::new()),
+                4,
+                || {
+                    entity_calls.set(entity_calls.get() + 1);
+                    Ok(objects.clone())
+                },
+            )
+        };
+        let miss_started = std::time::Instant::now();
+        load().unwrap();
+        let miss_listing_calls = entity_calls.get();
+        let _miss_elapsed = miss_started.elapsed();
+        let hit_started = std::time::Instant::now();
+        load().unwrap();
+        let hit_listing_calls = entity_calls.get() - miss_listing_calls;
+        let _hit_elapsed = hit_started.elapsed();
+        assert_eq!(miss_listing_calls, 1, "Sensitive miss must list entities");
+        assert_eq!(
+            hit_listing_calls, 0,
+            "Sensitive cache hit must not list entities (before: 1 listing/check)"
+        );
     }
 }

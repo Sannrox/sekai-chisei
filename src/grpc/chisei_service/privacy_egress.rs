@@ -24,12 +24,25 @@ impl ChiseiServiceImpl {
         if crate::chisei::privacy::provider_safe_to_send(provider, &safe) {
             return Ok(vec![]);
         }
+        let need_entities = data_class == DataClass::Sensitive;
+        let entity_generation = if need_entities {
+            authoritative_graph_runtime(self.sekai_facts.reader(), self.db.fact_runtime())
+                .and_then(|runtime| runtime.namespace_object_generation(namespace))
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "sensitive-entity policy unavailable: {error}"
+                    ))
+                })?
+        } else {
+            0
+        };
         let scan = self
             .privacy_scan
             .load(
                 namespace,
-                data_class == DataClass::Sensitive,
+                need_entities,
                 || self.list_leak_rule_objects(namespace),
+                entity_generation,
                 || self.list_entity_scan_objects(namespace),
             )
             .map_err(Status::failed_precondition)?;

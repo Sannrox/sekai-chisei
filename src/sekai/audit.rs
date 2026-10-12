@@ -1116,6 +1116,20 @@ impl SekaiDb {
             .map_err(|e| e.to_string())
     }
 
+    pub fn namespace_object_generation(&self, namespace: &str) -> Result<u64, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT COALESCE(
+                (SELECT generation FROM sekai_namespace_object_generation WHERE namespace = ?1),
+                0
+            )",
+            params![namespace],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|generation| generation.max(0) as u64)
+        .map_err(|error| error.to_string())
+    }
+
     pub fn object_change_watermark(&self, namespace: &str) -> Result<u64, String> {
         let conn = self.conn();
         conn.query_row(
@@ -1970,5 +1984,78 @@ mod tests {
             "SQLite failure: database is busy"
         ));
         assert!(!sqlite_write_lock_contention("UNIQUE constraint failed"));
+    }
+
+    #[test]
+    fn object_writes_advance_namespace_generation() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        assert_eq!(db.namespace_object_generation("alpha").unwrap(), 0);
+        let mut created = object("o1", "n", "alpha", "ext:1", HashMap::new());
+        db.create_object_with_audit(&created, "alice").unwrap();
+        let after_create = db.namespace_object_generation("alpha").unwrap();
+        assert!(after_create > 0, "create must advance generation");
+
+        created.name = "n2".into();
+        created.updated = 2;
+        db.update_object_with_audit(&created, "alice").unwrap();
+        let after_update = db.namespace_object_generation("alpha").unwrap();
+        assert!(
+            after_update > after_create,
+            "update must advance generation"
+        );
+
+        db.delete_object_with_audit("o1", "alice").unwrap();
+        let after_delete = db.namespace_object_generation("alpha").unwrap();
+        assert!(
+            after_delete > after_update,
+            "delete must advance generation"
+        );
+
+        let raw = object("o2", "n", "alpha", "ext:2", HashMap::new());
+        db.create_object(&raw).unwrap();
+        let after_raw = db.namespace_object_generation("alpha").unwrap();
+        assert!(
+            after_raw > after_delete,
+            "unaudited create must advance generation"
+        );
+
+        db.conn()
+            .execute(
+                "UPDATE sekai_objects SET properties='{\"migrated\":\"1\"}', updated=3 WHERE id='o2'",
+                [],
+            )
+            .unwrap();
+        let after_migration = db.namespace_object_generation("alpha").unwrap();
+        assert!(
+            after_migration > after_raw,
+            "definition-migration property rewrite must advance generation"
+        );
+
+        db.conn()
+            .execute(
+                "UPDATE sekai_objects SET namespace='beta' WHERE id='o2'",
+                [],
+            )
+            .unwrap();
+        let after_move_alpha = db.namespace_object_generation("alpha").unwrap();
+        let after_move_beta = db.namespace_object_generation("beta").unwrap();
+        assert!(
+            after_move_alpha > after_migration,
+            "namespace move must advance the source namespace"
+        );
+        assert!(
+            after_move_beta > 0,
+            "namespace move must advance the destination namespace"
+        );
+
+        let aborted = object("o3", "n", "alpha", "ext:3", HashMap::new());
+        db.create_object(&aborted).unwrap();
+        let before_abort = db.namespace_object_generation("alpha").unwrap();
+        db.abort_unreceipted_object_create("o3").unwrap();
+        let after_abort = db.namespace_object_generation("alpha").unwrap();
+        assert!(
+            after_abort > before_abort,
+            "abort of an unreceipted create must advance generation"
+        );
     }
 }
