@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The egress entity scan no longer truncates at 500 literals. Every name and
+  external id of the up to 500 scanned objects is checked, so namespaces with
+  more than about 250 named objects stop refusing all `Sensitive` egress to
+  non-safe providers. A truncated scan (more than 500 objects) now refuses
+  with `privacy_scan_truncated: ...` and the `EgressDecision` reason
+  `privacy_scan_truncated`, distinct from a leak match. See
+  `docs/egress-privacy-scan.md` (#1372).
+
 - Function document extraction resolves the namespace action policy for every
   extraction: `deny` refuses, `require_approval` parks the Action at any
   confidence, and `allow` writes only at or above the threshold. A direct
