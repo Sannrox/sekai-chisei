@@ -124,3 +124,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0100: Bound a PostgreSQL-first relational source family](0100-relational-source-family.md)
 - [ADR 0101: Analytical governed-transform profile uses in-process SQLite SQL](0101-analytical-transform-profile.md)
 - [ADR 0102: Isolated-process governed-transform profile uses a dedicated claim queue](0102-isolated-process-transform-profile.md)
+- [ADR 0103: The plane admits scheduled and change-triggered transform runs](0103-transform-schedule-and-dependency-graph.md)

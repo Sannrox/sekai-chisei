@@ -523,6 +523,75 @@ impl RuntimeDb {
         }
     }
 
+    pub fn tick_governed_transforms(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.tick_governed_transforms(now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.tick_governed_transforms(now_ms))
+            }
+        }
+    }
+
+    pub fn get_transform_output_state(
+        &self,
+        namespace: &str,
+        dataset_id: &str,
+    ) -> Result<Option<crate::sekai::governed_transform::TransformOutputState>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_transform_output_state(namespace, dataset_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_transform_output_state(namespace, dataset_id)
+            }),
+        }
+    }
+
+    pub fn set_transform_namespace_concurrency(
+        &self,
+        namespace: &str,
+        max_concurrent: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_transform_namespace_concurrency(namespace, max_concurrent),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.set_transform_namespace_concurrency(namespace, max_concurrent)
+            }),
+        }
+    }
+
+    pub fn note_source_change(
+        &self,
+        namespace: &str,
+        object_or_dataset_ids: &[String],
+        cause: &str,
+        cause_ref: &str,
+        now_ms: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformRun>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.note_source_change(namespace, object_or_dataset_ids, cause, cause_ref, now_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.note_source_change(namespace, object_or_dataset_ids, cause, cause_ref, now_ms)
+            }),
+        }
+    }
+
+    pub fn cancel_governed_transform_run(
+        &self,
+        run_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::governed_transform::TransformRun, String> {
+        match self {
+            Self::Sqlite(db) => db.cancel_governed_transform_run(run_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.cancel_governed_transform_run(run_id, now_ms)
+            }),
+        }
+    }
+
     pub fn list_claimable_transform_work(
         &self,
         namespace: &str,

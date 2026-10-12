@@ -267,6 +267,8 @@ mod tests {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: None,
+                schedule: None,
+                trigger: None,
             },
             10,
         )

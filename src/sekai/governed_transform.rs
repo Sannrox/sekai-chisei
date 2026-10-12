@@ -1,10 +1,11 @@
-//! Plane-owned incremental dataset transforms (#880, #1287, #1385, #1386).
+//! Plane-owned incremental dataset transforms (#880, #1287, #1385, #1386, #1387).
 //!
 //! Definitions are content-addressed and receipt-bound. Execution is the
 //! in-process `projection` host of `sekai.governed-transform-execution/v1`,
 //! the analytical SQL profile on the same JobSpec ([ADR 0101]), or the
 //! isolated-process profile that admits work for an external runner
-//! ([ADR 0102]). The plane owns the JobSpec, transaction, lineage, and run
+//! ([ADR 0102]). The plane admits scheduled and change-triggered runs
+//! ([ADR 0103]) and owns the JobSpec, transaction, lineage, and run
 //! receipt. Outputs are datasets, not type-revision object identity. Secrets
 //! are rejected in definitions.
 
@@ -23,10 +24,23 @@ pub const HOSTED_COMPUTE_CAPABILITY: &str = "sekai.transforms.projection";
 pub const ANALYTICAL_COMPUTE_CAPABILITY: &str = "sekai.transforms.analytical";
 /// DiscoverCapabilities name for the isolated-process JobSpec profile.
 pub const ISOLATED_COMPUTE_CAPABILITY: &str = "sekai.transforms.isolated_process";
+/// DiscoverCapabilities name for scheduled and change-triggered admission.
+pub const SCHEDULER_COMPUTE_CAPABILITY: &str = "sekai.transforms.scheduler";
 pub const TRANSFORM_WORK_PENDING: &str = "pending";
 pub const TRANSFORM_WORK_CLAIMED: &str = "claimed";
 pub const TRANSFORM_WORK_COMPLETED: &str = "completed";
 pub const TRANSFORM_WORK_FAILED: &str = "failed";
+pub const TRANSFORM_WORK_CANCELLED: &str = "cancelled";
+pub const TRANSFORM_TRIGGER_MANUAL: &str = "manual";
+pub const TRANSFORM_TRIGGER_SCHEDULE: &str = "schedule";
+pub const TRANSFORM_TRIGGER_UPSTREAM: &str = "upstream";
+pub const TRANSFORM_TRIGGER_SOURCE_BATCH: &str = "source_batch";
+pub const TRANSFORM_TRIGGER_CANCELLED: &str = "cancelled";
+pub const TRANSFORM_OUTPUT_FRESH: &str = "fresh";
+pub const TRANSFORM_OUTPUT_STALE: &str = "stale";
+pub const TRANSFORM_OUTPUT_BLOCKED: &str = "blocked";
+pub const TRANSFORM_DEPENDENCY_CYCLE: &str = "transform dependency cycle";
+pub const DEFAULT_TRANSFORM_TENANT_CONCURRENCY: i64 = 4;
 pub const DEFAULT_TRANSFORM_CLAIM_TTL_MS: i64 = 60_000;
 pub const MAX_TRANSFORM_LEASE_EXPIRIES: i64 = 3;
 pub const STALE_TRANSFORM_CLAIM: &str = "stale transform claim";
@@ -120,6 +134,35 @@ pub struct GovernedTransform {
     /// stable. Present for the isolated-process JobSpec (#1386).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolated_process: Option<IsolatedProcessSpec>,
+    /// Absent unless the definition carries a due interval (#1387).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<TransformSchedule>,
+    /// Absent unless a committed input or source batch should admit a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TransformTrigger>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformSchedule {
+    pub every_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformTrigger {
+    #[serde(default)]
+    pub on_input_commit: bool,
+    #[serde(default)]
+    pub debounce_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformOutputState {
+    pub namespace: String,
+    pub dataset_id: String,
+    pub freshness: String,
+    pub upstream_version: String,
+    pub blocked_run_id: String,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +199,13 @@ pub struct TransformRun {
     /// `failed` for isolated-process dispatch.
     #[serde(default)]
     pub dispatch_status: String,
+    /// Why this run was admitted: `manual`, `schedule`, `upstream`,
+    /// `source_batch`, or `cancelled`. Empty on historical rows.
+    #[serde(default)]
+    pub trigger_cause: String,
+    /// Schedule bucket, upstream run id, source batch digest, or cancelled run.
+    #[serde(default)]
+    pub trigger_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -232,6 +282,25 @@ impl GovernedTransform {
             ));
         }
         reject_secrets(&self)?;
+        if let Some(schedule) = &self.schedule
+            && schedule.every_ms <= 0
+        {
+            return Err(TransformError::InvalidArgument(
+                "schedule.every_ms must be positive".into(),
+            ));
+        }
+        if let Some(trigger) = &self.trigger {
+            if !trigger.on_input_commit {
+                return Err(TransformError::InvalidArgument(
+                    "trigger requires on_input_commit".into(),
+                ));
+            }
+            if trigger.debounce_ms < 0 {
+                return Err(TransformError::InvalidArgument(
+                    "trigger.debounce_ms must be >= 0".into(),
+                ));
+            }
+        }
         for step in &self.steps {
             let kind = step.kind.trim().to_ascii_lowercase();
             if kind != "filter" && kind != "project" {
@@ -301,6 +370,27 @@ impl GovernedTransform {
         };
         vec![(alias, self.input_dataset_id.clone())]
     }
+
+    pub fn consumes_dataset(&self, dataset_id: &str) -> bool {
+        self.input_bindings()
+            .iter()
+            .any(|(_, bound)| bound == dataset_id)
+    }
+
+    pub fn change_trigger(&self) -> Option<&TransformTrigger> {
+        self.trigger
+            .as_ref()
+            .filter(|trigger| trigger.on_input_commit)
+    }
+}
+
+impl TransformRun {
+    pub fn stamp_trigger(&mut self, cause: &str, reference: &str) {
+        if self.trigger_cause.is_empty() {
+            self.trigger_cause = cause.to_string();
+            self.trigger_ref = reference.to_string();
+        }
+    }
 }
 
 pub fn definition_digest(transform: &GovernedTransform) -> String {
@@ -334,7 +424,94 @@ pub fn definition_digest(transform: &GovernedTransform) -> String {
             hasher.update(inputs);
         }
     }
+    if let Some(schedule) = &transform.schedule {
+        hash_field(&mut hasher, "schedule");
+        hasher.update(schedule.every_ms.to_le_bytes());
+    }
+    if let Some(trigger) = &transform.trigger {
+        hash_field(&mut hasher, "trigger");
+        hasher.update([u8::from(trigger.on_input_commit)]);
+        hasher.update(trigger.debounce_ms.to_le_bytes());
+    }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+pub fn refuse_dependency_cycle(
+    published: &[GovernedTransform],
+    incoming: &GovernedTransform,
+) -> Result<(), TransformError> {
+    let mut graph: Vec<GovernedTransform> = published
+        .iter()
+        .filter(|transform| {
+            transform.namespace != incoming.namespace
+                || transform.transform_id != incoming.transform_id
+        })
+        .cloned()
+        .collect();
+    graph.push(incoming.clone());
+    if dependency_graph_has_cycle(&graph) {
+        return Err(TransformError::InvalidArgument(
+            TRANSFORM_DEPENDENCY_CYCLE.into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn schedule_bucket(every_ms: i64, now_ms: i64) -> i64 {
+    if every_ms <= 0 { 0 } else { now_ms / every_ms }
+}
+
+pub fn schedule_due_bucket(last_bucket: Option<i64>, every_ms: i64, now_ms: i64) -> Option<i64> {
+    if every_ms <= 0 {
+        return None;
+    }
+    let bucket = schedule_bucket(every_ms, now_ms);
+    match last_bucket {
+        Some(last) if last >= bucket => None,
+        _ => Some(bucket),
+    }
+}
+
+pub fn trigger_is_due(first_seen_ms: i64, debounce_ms: i64, now_ms: i64) -> bool {
+    now_ms.saturating_sub(first_seen_ms) >= debounce_ms.max(0)
+}
+
+fn dependency_graph_has_cycle(transforms: &[GovernedTransform]) -> bool {
+    let mut producers: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, transform) in transforms.iter().enumerate() {
+        producers
+            .entry(transform.output_dataset_id.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut adj = vec![Vec::new(); transforms.len()];
+    for (consumer, transform) in transforms.iter().enumerate() {
+        for (_, dataset_id) in transform.input_bindings() {
+            if let Some(upstreams) = producers.get(&dataset_id) {
+                for &producer in upstreams {
+                    if producer != consumer {
+                        adj[producer].push(consumer);
+                    }
+                }
+            }
+        }
+    }
+    let mut state = vec![0u8; transforms.len()];
+    (0..transforms.len()).any(|node| state[node] == 0 && graph_cycle_from(node, &adj, &mut state))
+}
+
+fn graph_cycle_from(node: usize, adj: &[Vec<usize>], state: &mut [u8]) -> bool {
+    state[node] = 1;
+    for &next in &adj[node] {
+        if state[next] == 1 {
+            return true;
+        }
+        if state[next] == 0 && graph_cycle_from(next, adj, state) {
+            return true;
+        }
+    }
+    state[node] = 2;
+    false
 }
 
 fn prepare_analytical(
@@ -737,6 +914,8 @@ pub fn compute_run_tables_until(
         engine: String::new(),
         runtime_image: String::new(),
         dispatch_status: String::new(),
+        trigger_cause: String::new(),
+        trigger_ref: String::new(),
     };
     (run, output_rows)
 }
@@ -789,6 +968,8 @@ pub fn admit_isolated_run(
         engine: spec.engine.clone(),
         runtime_image: spec.runtime_image.clone(),
         dispatch_status: TRANSFORM_WORK_PENDING.into(),
+        trigger_cause: String::new(),
+        trigger_ref: String::new(),
     })
 }
 
@@ -806,6 +987,7 @@ pub fn transform_work_is_claimable(work: &TransformWork, now_ms: i64) -> bool {
         TRANSFORM_WORK_CLAIMED => {
             work.claim_expires_at_ms <= now_ms && work.lease_expiries < MAX_TRANSFORM_LEASE_EXPIRIES
         }
+        TRANSFORM_WORK_CANCELLED | TRANSFORM_WORK_COMPLETED | TRANSFORM_WORK_FAILED => false,
         _ => false,
     }
 }
@@ -863,6 +1045,8 @@ fn quarantined_run(
             engine: String::new(),
             runtime_image: String::new(),
             dispatch_status: String::new(),
+            trigger_cause: String::new(),
+            trigger_ref: String::new(),
         },
         Vec::new(),
     )
@@ -923,6 +1107,8 @@ pub(crate) fn budget_quarantined_run(
         engine: String::new(),
         runtime_image: String::new(),
         dispatch_status: String::new(),
+        trigger_cause: String::new(),
+        trigger_ref: String::new(),
     }
 }
 
@@ -1196,6 +1382,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap()
@@ -1220,6 +1408,62 @@ mod tests {
         second.definition_digest.clear();
         let second = second.prepare().unwrap();
         assert_eq!(first.definition_digest, second.definition_digest);
+    }
+
+    #[test]
+    fn projection_digest_ignores_absent_schedule_and_trigger() {
+        let first = transform();
+        let mut second = first.clone();
+        second.schedule = None;
+        second.trigger = None;
+        second.definition_digest.clear();
+        let second = second.prepare().unwrap();
+        assert_eq!(first.definition_digest, second.definition_digest);
+    }
+
+    #[test]
+    fn schedule_participates_in_digest() {
+        let first = transform();
+        let mut second = first.clone();
+        second.schedule = Some(TransformSchedule { every_ms: 60_000 });
+        second.definition_digest.clear();
+        let second = second.prepare().unwrap();
+        assert_ne!(first.definition_digest, second.definition_digest);
+    }
+
+    #[test]
+    fn cycle_is_refused_from_published_definitions() {
+        let upstream = transform();
+        let mut downstream = transform();
+        downstream.transform_id = "t2".into();
+        downstream.input_dataset_id = "out".into();
+        downstream.output_dataset_id = "mid".into();
+        downstream.definition_digest.clear();
+        let downstream = downstream.prepare().unwrap();
+        refuse_dependency_cycle(std::slice::from_ref(&upstream), &downstream).unwrap();
+
+        let mut back = transform();
+        back.transform_id = "t3".into();
+        back.input_dataset_id = "mid".into();
+        back.output_dataset_id = "in".into();
+        back.definition_digest.clear();
+        let back = back.prepare().unwrap();
+        let error = refuse_dependency_cycle(&[upstream, downstream], &back).unwrap_err();
+        assert_eq!(error.message(), TRANSFORM_DEPENDENCY_CYCLE);
+    }
+
+    #[test]
+    fn schedule_admits_each_bucket_once() {
+        assert_eq!(schedule_due_bucket(None, 1_000, 1_500), Some(1));
+        assert_eq!(schedule_due_bucket(Some(1), 1_000, 1_500), None);
+        assert_eq!(schedule_due_bucket(Some(1), 1_000, 2_000), Some(2));
+    }
+
+    #[test]
+    fn trigger_debounce_coalesces_until_the_window() {
+        assert!(!trigger_is_due(10, 1_000, 500));
+        assert!(trigger_is_due(10, 1_000, 1_010));
+        assert!(trigger_is_due(10, 0, 10));
     }
 
     #[test]
@@ -1308,6 +1552,8 @@ mod tests {
                 runtime_image: runtime_image.into(),
                 inputs: Vec::new(),
             }),
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap()
@@ -1542,6 +1788,8 @@ mod tests {
             engine: String::new(),
             runtime_image: String::new(),
             dispatch_status: String::new(),
+            trigger_cause: String::new(),
+            trigger_ref: String::new(),
         }
     }
 
@@ -1562,6 +1810,8 @@ mod tests {
                 time_limit_ms: 0,
             }),
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
     }
 

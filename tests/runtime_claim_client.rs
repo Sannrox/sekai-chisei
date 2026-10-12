@@ -183,6 +183,8 @@ fn seed_transform(db: &RuntimeDb, prefix: &str) {
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
         }),
+        schedule: None,
+        trigger: None,
     }
     .prepare()
     .unwrap();

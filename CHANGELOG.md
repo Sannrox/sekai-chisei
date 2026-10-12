@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Governed transforms accept an optional schedule and change trigger. The
+  plane admits one run per schedule tick across restarts, runs downstream
+  once after an upstream commit or `ApplySourceBatch`, refuses dependency
+  cycles at Put, and records the trigger cause on the receipt. Output
+  freshness is `fresh`, `stale`, or `blocked`. Cancelling a run skips
+  not-yet-started downstream work. Per-namespace concurrency bounds
+  isolated admission. Adds `sekai.transforms.scheduler`, experimental tick,
+  output-state, and cancel RPCs, ADR 0103, and PostgreSQL migration
+  `0058_transform_schedule` (#1387).
+
 - The privacy entity scan lists at most 501 objects in one query that
   excludes `leak_rule` in SQL, instead of paging up to 1000 objects and
   filtering in Rust, and fingerprints the set with a streaming digest

@@ -4,7 +4,8 @@ Sekai hosts an in-process dataset transform class
 ([ADR 0074](decisions/0074-plane-owned-transforms.md),
 [ADR 0097](decisions/0097-in-process-transform-host.md),
 [ADR 0101](decisions/0101-analytical-transform-profile.md),
-[ADR 0102](decisions/0102-isolated-process-transform-profile.md)). A JobSpec
+[ADR 0102](decisions/0102-isolated-process-transform-profile.md),
+[ADR 0103](decisions/0103-transform-schedule-and-dependency-graph.md)). A JobSpec
 names input and output datasets and a list of `filter` / `project` steps, the
 analytical SQL profile with one or more named inputs, or an
 `isolated_process` profile that admits work for an external runner. In-process
@@ -20,12 +21,21 @@ The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `GetGovernedTransformRun`, `ListGovernedTransforms`,
 `ListGovernedTransformRuns`, `ListClaimableTransformWork`,
 `ClaimTransformWork`, `HeartbeatTransformClaim`, `ReadTransformRunInputs`,
-`WriteTransformRunResult`) are `experimental`: start the plane with
-`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature. See
-[rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities` reports
-`sekai.transforms.projection`, `sekai.transforms.analytical`, and
-`sekai.transforms.isolated_process` on the core pack; `lifecycle_state` is
-`disabled` unless experimental RPCs are enabled.
+`WriteTransformRunResult`, `TickGovernedTransforms`,
+`GetTransformOutputState`, `CancelGovernedTransformRun`) are `experimental`:
+start the plane with `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
+feature. See [rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities`
+reports `sekai.transforms.projection`, `sekai.transforms.analytical`,
+`sekai.transforms.isolated_process`, and `sekai.transforms.scheduler` on the
+core pack; `lifecycle_state` is `disabled` unless experimental RPCs are
+enabled.
+
+A definition may carry a `schedule` interval and an `on_input_commit` trigger.
+The plane admits due work on an idempotent replica tick. An upstream commit
+or `ApplySourceBatch` coalesces into one downstream run inside the debounce
+window. Cycles are refused at Put. Failed upstream runs mark downstream
+outputs `blocked`; a later success unblocks them. Cancelling a run skips
+not-yet-started downstream work and records that on the receipts.
 
 The analytical profile runs SQL in a private in-memory SQLite connection
 (bundled rusqlite). Default bounds: 64 MiB and 5 seconds. Over-budget runs

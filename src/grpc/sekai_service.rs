@@ -1160,6 +1160,24 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<WriteTransformRunResultResponse>, Status> {
         rpc_data::write_transform_run_result(self, req).await
     }
+    async fn tick_governed_transforms(
+        &self,
+        req: Request<TickGovernedTransformsRequest>,
+    ) -> Result<Response<TickGovernedTransformsResponse>, Status> {
+        rpc_data::tick_governed_transforms(self, req).await
+    }
+    async fn get_transform_output_state(
+        &self,
+        req: Request<GetTransformOutputStateRequest>,
+    ) -> Result<Response<GetTransformOutputStateResponse>, Status> {
+        rpc_data::get_transform_output_state(self, req).await
+    }
+    async fn cancel_governed_transform_run(
+        &self,
+        req: Request<CancelGovernedTransformRunRequest>,
+    ) -> Result<Response<CancelGovernedTransformRunResponse>, Status> {
+        rpc_data::cancel_governed_transform_run(self, req).await
+    }
     async fn admit_governed_document(
         &self,
         req: Request<AdmitGovernedDocumentRequest>,

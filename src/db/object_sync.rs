@@ -31,6 +31,19 @@ thread_local! {
 
 pub const POSTGRES_OBJECT_SYNC_SURFACE: &str = "sekai.object-sync";
 
+pub(crate) fn source_batch_trigger_ids(result: &SourceBatchResult) -> Vec<String> {
+    result
+        .records
+        .iter()
+        .filter_map(|record| match &record.decision {
+            SyncDecision::Upsert(object) | SyncDecision::Tombstone(object) => {
+                Some(object.object_id.clone())
+            }
+            SyncDecision::Conflict { .. } | SyncDecision::Reject { .. } => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 const SOURCE_BINDINGS_TABLE: &str = "sekai_source_bindings";
 #[cfg(test)]
@@ -812,25 +825,41 @@ impl SekaiDb {
         #[cfg(test)]
         take_after_source_batch_mapper_hook();
         let prepared = PreparedBatch::new(batch, &mapper).map_err(|error| error.to_string())?;
-        match self
+        let (result, newly_committed) = match self
             .persist_source_batch_open(batch, &prepared, now_ms)
             .map_err(|error| error.to_string())?
         {
-            OpenDisposition::Committed(result) => Ok(*result),
+            OpenDisposition::Committed(result) => (*result, false),
             OpenDisposition::Open => {
                 #[cfg(test)]
                 take_after_source_batch_open_hook();
-                self.commit_source_batch(
-                    batch,
-                    &prepared,
-                    authenticated_producer,
-                    now_ms,
-                    expected_policy_generation,
-                    authorized_objects,
+                (
+                    self.commit_source_batch(
+                        batch,
+                        &prepared,
+                        authenticated_producer,
+                        now_ms,
+                        expected_policy_generation,
+                        authorized_objects,
+                    )
+                    .map_err(|error| error.to_string())?,
+                    true,
                 )
-                .map_err(|error| error.to_string())
             }
+        };
+        if newly_committed && result.transaction.status == SourceBatchStatus::Committed {
+            let ids = source_batch_trigger_ids(&result);
+            // Best-effort: ingest must not fail closed on trigger bugs, and a
+            // committed replay must not emit a second run.
+            let _ = self.note_source_change(
+                &batch.namespace,
+                &ids,
+                crate::sekai::governed_transform::TRANSFORM_TRIGGER_SOURCE_BATCH,
+                &batch.batch_digest,
+                now_ms,
+            );
         }
+        Ok(result)
     }
 
     fn source_batch_mapper(&self, batch: &SourceBatch) -> Result<SourceBatchMapper, ApplyError> {

@@ -542,6 +542,9 @@ message GovernedTransform {
   uint64 time_limit_ms = 13;
   string engine = 14;
   string runtime_image = 15;
+  int64 schedule_every_ms = 16;
+  bool trigger_on_input_commit = 17;
+  int64 trigger_debounce_ms = 18;
 }
 message PutGovernedTransformRequest {
   GovernedTransform transform = 1;
@@ -575,6 +578,35 @@ message TransformRun {
   string engine = 18;
   string runtime_image = 19;
   string dispatch_status = 20;
+  string trigger_cause = 21;
+  string trigger_ref = 22;
+}
+message TickGovernedTransformsRequest {
+  int64 now_ms = 1;
+}
+message TickGovernedTransformsResponse {
+  repeated TransformRun runs = 1;
+}
+message TransformOutputState {
+  string namespace = 1;
+  string dataset_id = 2;
+  string freshness = 3;
+  string upstream_version = 4;
+  string blocked_run_id = 5;
+  int64 updated_at_ms = 6;
+}
+message GetTransformOutputStateRequest {
+  string namespace = 1;
+  string dataset_id = 2;
+}
+message GetTransformOutputStateResponse {
+  TransformOutputState state = 1;
+}
+message CancelGovernedTransformRunRequest {
+  string run_id = 1;
+}
+message CancelGovernedTransformRunResponse {
+  TransformRun run = 1;
 }
 message RunGovernedTransformResponse {
   TransformRun run = 1;
@@ -2627,6 +2659,9 @@ service SekaiService {
   rpc HeartbeatTransformClaim(HeartbeatTransformClaimRequest) returns (HeartbeatTransformClaimResponse);
   rpc ReadTransformRunInputs(ReadTransformRunInputsRequest) returns (stream ReadTransformRunInputsResponse);
   rpc WriteTransformRunResult(WriteTransformRunResultRequest) returns (WriteTransformRunResultResponse);
+  rpc TickGovernedTransforms(TickGovernedTransformsRequest) returns (TickGovernedTransformsResponse);
+  rpc GetTransformOutputState(GetTransformOutputStateRequest) returns (GetTransformOutputStateResponse);
+  rpc CancelGovernedTransformRun(CancelGovernedTransformRunRequest) returns (CancelGovernedTransformRunResponse);
   rpc AdmitGovernedDocument(AdmitGovernedDocumentRequest) returns (AdmitGovernedDocumentResponse);
   rpc AttachGovernedDocumentRendition(AttachGovernedDocumentRenditionRequest) returns (AttachGovernedDocumentRenditionResponse);
   rpc GetGovernedDocument(GetGovernedDocumentRequest) returns (GetGovernedDocumentResponse);

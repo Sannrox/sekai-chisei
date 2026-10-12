@@ -2,19 +2,23 @@ use crate::db::sekai::SekaiDb;
 use crate::sekai::classification_lattice::ClassificationLattice;
 use crate::sekai::dataset::DatasetRowRecord;
 use crate::sekai::governed_transform::{
-    GovernedTransform, InputLoadBudget, MAX_TRANSFORM_LEASE_EXPIRIES, STALE_TRANSFORM_CLAIM,
-    TRANSFORM_DEFINITION_CHANGED, TRANSFORM_DIGEST_MISMATCH, TRANSFORM_WORK_CLAIMED,
-    TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows,
-    TransformRun, TransformRunInputRow, TransformWork, WriteTransformRunCommand,
-    admit_isolated_run, bind_checkpoint, bind_isolated_write_lineage, budget_quarantined_run,
-    checkpoint_after_id, compute_run_tables_until, derive_transform_markings, evaluate_quality,
+    DEFAULT_TRANSFORM_TENANT_CONCURRENCY, GovernedTransform, InputLoadBudget,
+    MAX_TRANSFORM_LEASE_EXPIRIES, STALE_TRANSFORM_CLAIM, TRANSFORM_DEFINITION_CHANGED,
+    TRANSFORM_DIGEST_MISMATCH, TRANSFORM_OUTPUT_BLOCKED, TRANSFORM_OUTPUT_FRESH,
+    TRANSFORM_OUTPUT_STALE, TRANSFORM_TRIGGER_CANCELLED, TRANSFORM_TRIGGER_MANUAL,
+    TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED,
+    TRANSFORM_WORK_CLAIMED, TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED,
+    TRANSFORM_WORK_PENDING, TransformInputRows, TransformOutputState, TransformRun,
+    TransformRunInputRow, TransformWork, WriteTransformRunCommand, admit_isolated_run,
+    bind_checkpoint, bind_isolated_write_lineage, budget_quarantined_run, checkpoint_after_id,
+    compute_run_tables_until, derive_transform_markings, evaluate_quality,
     fold_live_output_marking, fold_output_digest, normalize_transform_claim_ttl_ms,
-    require_bound_output_for_markings, rows_digest, transform_claim_fence_matches,
-    transform_work_is_claimable,
+    refuse_dependency_cycle, require_bound_output_for_markings, rows_digest, schedule_due_bucket,
+    transform_claim_fence_matches, transform_work_is_claimable, trigger_is_due,
 };
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 impl SekaiDb {
@@ -130,6 +134,49 @@ impl SekaiDb {
              ADD COLUMN definition_json TEXT NOT NULL DEFAULT ''",
             [],
         );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_run
+             ADD COLUMN trigger_cause TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_run
+             ADD COLUMN trigger_ref TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        self.conn()
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS sekai_transform_schedule_cursor (
+                    namespace TEXT NOT NULL,
+                    transform_id TEXT NOT NULL,
+                    last_bucket INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, transform_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_transform_trigger_pending (
+                    namespace TEXT NOT NULL,
+                    transform_id TEXT NOT NULL,
+                    cause TEXT NOT NULL,
+                    cause_ref TEXT NOT NULL,
+                    first_seen_ms INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, transform_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_transform_output_state (
+                    namespace TEXT NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    freshness TEXT NOT NULL,
+                    upstream_version TEXT NOT NULL DEFAULT '',
+                    blocked_run_id TEXT NOT NULL DEFAULT '',
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, dataset_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_transform_namespace_limit (
+                    namespace TEXT PRIMARY KEY,
+                    max_concurrent INTEGER NOT NULL
+                );
+                ",
+            )
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -138,24 +185,30 @@ impl SekaiDb {
         transform: &GovernedTransform,
         created_at_ms: i64,
     ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let published = list_all_transforms_tx(&tx)?;
+        refuse_dependency_cycle(&published, transform).map_err(|error| error.message())?;
         let json = serde_json::to_string(transform).map_err(|error| error.to_string())?;
-        self.conn()
-            .execute(
-                "INSERT OR REPLACE INTO sekai_governed_transform
-                 (namespace, transform_id, definition_json, definition_digest, input_dataset_id, output_dataset_id, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    transform.namespace,
-                    transform.transform_id,
-                    json,
-                    transform.definition_digest,
-                    transform.input_dataset_id,
-                    transform.output_dataset_id,
-                    created_at_ms
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        tx.execute(
+            "INSERT OR REPLACE INTO sekai_governed_transform
+             (namespace, transform_id, definition_json, definition_digest, input_dataset_id, output_dataset_id, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                transform.namespace,
+                transform.transform_id,
+                json,
+                transform.definition_digest,
+                transform.input_dataset_id,
+                transform.output_dataset_id,
+                created_at_ms
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn get_governed_transform(
@@ -210,7 +263,103 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let run = run_governed_transform_tx(&tx, namespace, transform_id, incremental, now_ms)?;
+        let run = run_governed_transform_tx(
+            &tx,
+            namespace,
+            transform_id,
+            incremental,
+            TRANSFORM_TRIGGER_MANUAL,
+            "",
+            now_ms,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(run)
+    }
+
+    pub fn tick_governed_transforms(&self, now_ms: i64) -> Result<Vec<TransformRun>, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let runs = tick_governed_transforms_tx(&tx, now_ms)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(runs)
+    }
+
+    pub fn get_transform_output_state(
+        &self,
+        namespace: &str,
+        dataset_id: &str,
+    ) -> Result<Option<TransformOutputState>, String> {
+        self.conn()
+            .query_row(
+                "SELECT namespace, dataset_id, freshness, upstream_version, blocked_run_id, updated_at_ms
+                 FROM sekai_transform_output_state
+                 WHERE namespace = ?1 AND dataset_id = ?2",
+                params![namespace, dataset_id],
+                map_output_state,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn set_transform_namespace_concurrency(
+        &self,
+        namespace: &str,
+        max_concurrent: i64,
+    ) -> Result<(), String> {
+        if max_concurrent <= 0 {
+            return Err("max_concurrent must be positive".into());
+        }
+        self.conn()
+            .execute(
+                "INSERT OR REPLACE INTO sekai_transform_namespace_limit (namespace, max_concurrent)
+                 VALUES (?1,?2)",
+                params![namespace, max_concurrent],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn note_source_change(
+        &self,
+        namespace: &str,
+        object_or_dataset_ids: &[String],
+        cause: &str,
+        cause_ref: &str,
+        now_ms: i64,
+    ) -> Result<Vec<TransformRun>, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let datasets = resolve_changed_datasets(&tx, object_or_dataset_ids)?;
+        let mut runs = Vec::new();
+        for dataset_id in datasets {
+            runs.extend(enqueue_change_triggers_tx(
+                &tx,
+                namespace,
+                &dataset_id,
+                cause,
+                cause_ref,
+                now_ms,
+                false,
+            )?);
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(runs)
+    }
+
+    pub fn cancel_governed_transform_run(
+        &self,
+        run_id: &str,
+        now_ms: i64,
+    ) -> Result<TransformRun, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let run = cancel_governed_transform_run_tx(&tx, run_id, now_ms)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
@@ -221,7 +370,7 @@ impl SekaiDb {
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
-                        profile, engine, runtime_image, dispatch_status
+                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
                  FROM sekai_governed_transform_run WHERE run_id = ?1",
                 params![run_id],
                 map_transform_run,
@@ -262,7 +411,7 @@ impl SekaiDb {
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
-                        profile, engine, runtime_image, dispatch_status
+                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
                  FROM sekai_governed_transform_run
                  WHERE namespace = ?1
                  ORDER BY created_at_ms DESC, run_id DESC
@@ -411,12 +560,20 @@ fn run_governed_transform_tx(
     namespace: &str,
     transform_id: &str,
     incremental: bool,
+    trigger_cause: &str,
+    trigger_ref: &str,
     now_ms: i64,
 ) -> Result<TransformRun, String> {
     let transform =
         load_transform(tx, namespace, transform_id)?.ok_or("governed transform not found")?;
     if transform.is_isolated_process() {
-        return admit_isolated_process_tx(tx, &transform, now_ms);
+        // Operator RunGovernedTransform is not the scheduler cap; ticks and
+        // change triggers consult can_admit_namespace.
+        let mut run = admit_isolated_process_tx(tx, &transform, now_ms)?;
+        run.stamp_trigger(trigger_cause, trigger_ref);
+        persist_transform_run(tx, &run)?;
+        clear_pending_for_transform(tx, &transform.namespace, &transform.transform_id)?;
+        return Ok(run);
     }
     let bindings = transform.input_bindings();
     for (_, dataset_id) in &bindings {
@@ -510,11 +667,13 @@ fn run_governed_transform_tx(
         };
     run.markings_in = markings_in;
     run.markings_out = markings_out;
+    run.stamp_trigger(trigger_cause, trigger_ref);
     if run.quarantined {
         if !incremental {
             run.output_digest = live_output_digest(tx, &transform.output_dataset_id)?;
         }
         insert_transform_run(tx, &run)?;
+        after_run_committed_tx(tx, &transform, &run, now_ms)?;
         return Ok(run);
     }
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
@@ -550,6 +709,7 @@ fn run_governed_transform_tx(
         ],
     )
     .map_err(|error| error.to_string())?;
+    after_run_committed_tx(tx, &transform, &run, now_ms)?;
     Ok(run)
 }
 
@@ -754,6 +914,7 @@ fn write_transform_run_tx(
         done.status = TRANSFORM_WORK_COMPLETED.into();
         persist_transform_work(tx, &done)?;
         delete_run_input_snapshot(tx, &run.run_id)?;
+        after_run_committed_tx(tx, &transform, &run, now_ms)?;
         return Ok(run);
     }
     let live = match load_checkpoint(tx, &transform.namespace, &transform.transform_id)? {
@@ -800,6 +961,7 @@ fn write_transform_run_tx(
     done.status = TRANSFORM_WORK_COMPLETED.into();
     persist_transform_work(tx, &done)?;
     delete_run_input_snapshot(tx, &run.run_id)?;
+    after_run_committed_tx(tx, &transform, &run, now_ms)?;
     Ok(run)
 }
 
@@ -842,7 +1004,7 @@ fn load_transform_run(tx: &Transaction<'_>, run_id: &str) -> Result<Option<Trans
         "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                 last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                 lineage_parent, created_at_ms, markings_in, markings_out,
-                profile, engine, runtime_image, dispatch_status
+                profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
          FROM sekai_governed_transform_run WHERE run_id = ?1",
         params![run_id],
         map_transform_run,
@@ -1031,7 +1193,7 @@ fn persist_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(),
             output_digest = ?2, last_input_row_id = ?3, incremental = ?4, quarantined = ?5,
             quality_rule = ?6, rows_in = ?7, rows_out = ?8, lineage_parent = ?9,
             markings_in = ?10, markings_out = ?11, profile = ?12, engine = ?13,
-            runtime_image = ?14, dispatch_status = ?15
+            runtime_image = ?14, dispatch_status = ?15, trigger_cause = ?16, trigger_ref = ?17
          WHERE run_id = ?1",
         params![
             run.run_id,
@@ -1048,7 +1210,9 @@ fn persist_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(),
             run.profile,
             run.engine,
             run.runtime_image,
-            run.dispatch_status
+            run.dispatch_status,
+            run.trigger_cause,
+            run.trigger_ref
         ],
     )
     .map(|_| ())
@@ -1212,6 +1376,8 @@ fn map_transform_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformRun> 
         engine: row.get(17).unwrap_or_default(),
         runtime_image: row.get(18).unwrap_or_default(),
         dispatch_status: row.get(19).unwrap_or_default(),
+        trigger_cause: row.get(20).unwrap_or_default(),
+        trigger_ref: row.get(21).unwrap_or_default(),
     })
 }
 
@@ -1221,8 +1387,8 @@ pub(crate) fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> 
          (run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
           last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
           lineage_parent, created_at_ms, markings_in, markings_out,
-          profile, engine, runtime_image, dispatch_status)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
         params![
             run.run_id,
             run.namespace,
@@ -1243,7 +1409,9 @@ pub(crate) fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> 
             run.profile,
             run.engine,
             run.runtime_image,
-            run.dispatch_status
+            run.dispatch_status,
+            run.trigger_cause,
+            run.trigger_ref
         ],
     )
     .map(|_| ())
@@ -1394,13 +1562,681 @@ pub(crate) fn stamp_object_marking(
     Ok(())
 }
 
+fn list_all_transforms_tx(tx: &Transaction<'_>) -> Result<Vec<GovernedTransform>, String> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT definition_json FROM sekai_governed_transform
+             ORDER BY namespace, transform_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        let json = row.map_err(|error| error.to_string())?;
+        serde_json::from_str(&json).map_err(|error| error.to_string())
+    })
+    .collect()
+}
+
+fn map_output_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformOutputState> {
+    Ok(TransformOutputState {
+        namespace: row.get(0)?,
+        dataset_id: row.get(1)?,
+        freshness: row.get(2)?,
+        upstream_version: row.get(3)?,
+        blocked_run_id: row.get(4)?,
+        updated_at_ms: row.get(5)?,
+    })
+}
+
+fn after_run_committed_tx(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    run: &TransformRun,
+    now_ms: i64,
+) -> Result<Vec<TransformRun>, String> {
+    consume_pending_covered_by_run(
+        tx,
+        &transform.namespace,
+        &transform.transform_id,
+        run.created_at_ms,
+    )?;
+    if run.quarantined {
+        upsert_output_state(
+            tx,
+            &transform.namespace,
+            &transform.output_dataset_id,
+            TRANSFORM_OUTPUT_BLOCKED,
+            &run.run_id,
+            &run.run_id,
+            now_ms,
+        )?;
+        block_downstream_tx(
+            tx,
+            &transform.namespace,
+            &transform.output_dataset_id,
+            run,
+            now_ms,
+        )?;
+        return Ok(Vec::new());
+    }
+    mark_output_after_success_tx(tx, transform, run, now_ms)?;
+    enqueue_change_triggers_tx(
+        tx,
+        &transform.namespace,
+        &transform.output_dataset_id,
+        TRANSFORM_TRIGGER_UPSTREAM,
+        &run.run_id,
+        now_ms,
+        true,
+    )
+}
+
+fn consume_pending_covered_by_run(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+    created_at_ms: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM sekai_transform_trigger_pending
+         WHERE namespace = ?1 AND transform_id = ?2 AND first_seen_ms <= ?3",
+        params![namespace, transform_id, created_at_ms],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn clear_pending_for_transform(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM sekai_transform_trigger_pending
+         WHERE namespace = ?1 AND transform_id = ?2",
+        params![namespace, transform_id],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn mark_output_after_success_tx(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    run: &TransformRun,
+    now_ms: i64,
+) -> Result<(), String> {
+    if let Some((_, _, cause_ref)) =
+        load_pending(tx, &transform.namespace, &transform.transform_id)?
+    {
+        upsert_output_state(
+            tx,
+            &transform.namespace,
+            &transform.output_dataset_id,
+            TRANSFORM_OUTPUT_STALE,
+            &cause_ref,
+            "",
+            now_ms,
+        )
+    } else {
+        upsert_output_state(
+            tx,
+            &transform.namespace,
+            &transform.output_dataset_id,
+            TRANSFORM_OUTPUT_FRESH,
+            &run.output_digest,
+            "",
+            now_ms,
+        )
+    }
+}
+
+fn upsert_output_state(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    dataset_id: &str,
+    freshness: &str,
+    upstream_version: &str,
+    blocked_run_id: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT OR REPLACE INTO sekai_transform_output_state
+         (namespace, dataset_id, freshness, upstream_version, blocked_run_id, updated_at_ms)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            namespace,
+            dataset_id,
+            freshness,
+            upstream_version,
+            blocked_run_id,
+            now_ms
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn block_downstream_tx(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    dataset_id: &str,
+    run: &TransformRun,
+    now_ms: i64,
+) -> Result<(), String> {
+    for transform in list_all_transforms_tx(tx)? {
+        if transform.namespace != namespace || !transform.consumes_dataset(dataset_id) {
+            continue;
+        }
+        if transform.change_trigger().is_none() {
+            continue;
+        }
+        upsert_output_state(
+            tx,
+            &transform.namespace,
+            &transform.output_dataset_id,
+            TRANSFORM_OUTPUT_BLOCKED,
+            &run.run_id,
+            &run.run_id,
+            now_ms,
+        )?;
+        tx.execute(
+            "DELETE FROM sekai_transform_trigger_pending
+             WHERE namespace = ?1 AND transform_id = ?2",
+            params![transform.namespace, transform.transform_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn enqueue_change_triggers_tx(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    dataset_id: &str,
+    cause: &str,
+    cause_ref: &str,
+    now_ms: i64,
+    admit_now: bool,
+) -> Result<Vec<TransformRun>, String> {
+    let mut admitted = Vec::new();
+    for transform in list_all_transforms_tx(tx)? {
+        if transform.namespace != namespace || !transform.consumes_dataset(dataset_id) {
+            continue;
+        }
+        let Some(trigger) = transform.change_trigger() else {
+            continue;
+        };
+        if cause == TRANSFORM_TRIGGER_UPSTREAM
+            && remaining_blocked_inputs(tx, &transform, dataset_id)?
+        {
+            continue;
+        }
+        if output_blocked_by_upstream(tx, &transform)? && cause != TRANSFORM_TRIGGER_UPSTREAM {
+            continue;
+        }
+        upsert_output_state(
+            tx,
+            &transform.namespace,
+            &transform.output_dataset_id,
+            TRANSFORM_OUTPUT_STALE,
+            cause_ref,
+            "",
+            now_ms,
+        )?;
+        let first_seen =
+            load_pending_first_seen(tx, &transform.namespace, &transform.transform_id)?
+                .unwrap_or(now_ms);
+        tx.execute(
+            "INSERT INTO sekai_transform_trigger_pending
+             (namespace, transform_id, cause, cause_ref, first_seen_ms)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT (namespace, transform_id) DO UPDATE SET
+                cause = excluded.cause,
+                cause_ref = excluded.cause_ref",
+            params![
+                transform.namespace,
+                transform.transform_id,
+                cause,
+                cause_ref,
+                first_seen
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        // Source-batch bursts pass admit_now=false and wait for debounce.
+        // A committed upstream DAG hop admits in this transaction so the
+        // pipeline advances without a later tick.
+        if (admit_now || trigger_is_due(first_seen, trigger.debounce_ms, now_ms))
+            && can_admit_namespace(tx, &transform.namespace)?
+            && let Some(run) = admit_pending_transform_tx(tx, &transform, cause, cause_ref, now_ms)?
+        {
+            admitted.push(run);
+        }
+    }
+    Ok(admitted)
+}
+
+fn load_output_state(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    dataset_id: &str,
+) -> Result<Option<TransformOutputState>, String> {
+    tx.query_row(
+        "SELECT namespace, dataset_id, freshness, upstream_version, blocked_run_id, updated_at_ms
+         FROM sekai_transform_output_state
+         WHERE namespace = ?1 AND dataset_id = ?2",
+        params![namespace, dataset_id],
+        map_output_state,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn load_pending_first_seen(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+) -> Result<Option<i64>, String> {
+    tx.query_row(
+        "SELECT first_seen_ms FROM sekai_transform_trigger_pending
+         WHERE namespace = ?1 AND transform_id = ?2",
+        params![namespace, transform_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn namespace_limit(tx: &Transaction<'_>, namespace: &str) -> Result<i64, String> {
+    Ok(tx
+        .query_row(
+            "SELECT max_concurrent FROM sekai_transform_namespace_limit WHERE namespace = ?1",
+            params![namespace],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(DEFAULT_TRANSFORM_TENANT_CONCURRENCY)
+        .max(1))
+}
+
+fn in_flight_count(tx: &Transaction<'_>, namespace: &str) -> Result<i64, String> {
+    tx.query_row(
+        "SELECT COUNT(*) FROM sekai_transform_work
+         WHERE namespace = ?1 AND status IN (?2, ?3)",
+        params![namespace, TRANSFORM_WORK_PENDING, TRANSFORM_WORK_CLAIMED],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn can_admit_namespace(tx: &Transaction<'_>, namespace: &str) -> Result<bool, String> {
+    Ok(in_flight_count(tx, namespace)? < namespace_limit(tx, namespace)?)
+}
+
+fn remaining_blocked_inputs(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    recovered_dataset_id: &str,
+) -> Result<bool, String> {
+    for (_, dataset_id) in transform.input_bindings() {
+        if dataset_id == recovered_dataset_id {
+            continue;
+        }
+        if load_output_state(tx, &transform.namespace, &dataset_id)?
+            .is_some_and(|state| state.freshness == TRANSFORM_OUTPUT_BLOCKED)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn output_blocked_by_upstream(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+) -> Result<bool, String> {
+    let Some(state) = load_output_state(tx, &transform.namespace, &transform.output_dataset_id)?
+    else {
+        return Ok(false);
+    };
+    if state.freshness != TRANSFORM_OUTPUT_BLOCKED || state.blocked_run_id.is_empty() {
+        return Ok(false);
+    }
+    Ok(
+        load_transform_run(tx, &state.blocked_run_id)?.is_some_and(|run| {
+            run.namespace != transform.namespace || run.transform_id != transform.transform_id
+        }),
+    )
+}
+
+fn tick_governed_transforms_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+) -> Result<Vec<TransformRun>, String> {
+    let transforms = list_all_transforms_tx(tx)?;
+    let mut by_namespace: BTreeMap<String, Vec<(GovernedTransform, String, String)>> =
+        BTreeMap::new();
+    for transform in transforms {
+        if let Some(schedule) = &transform.schedule
+            && !output_blocked_by_upstream(tx, &transform)?
+        {
+            let last = load_schedule_bucket(tx, &transform.namespace, &transform.transform_id)?;
+            if let Some(bucket) = schedule_due_bucket(last, schedule.every_ms, now_ms) {
+                by_namespace
+                    .entry(transform.namespace.clone())
+                    .or_default()
+                    .push((
+                        transform.clone(),
+                        TRANSFORM_TRIGGER_SCHEDULE.into(),
+                        bucket.to_string(),
+                    ));
+            }
+        }
+        if let Some(pending) = load_pending(tx, &transform.namespace, &transform.transform_id)? {
+            let debounce = transform
+                .change_trigger()
+                .map(|trigger| trigger.debounce_ms)
+                .unwrap_or(0);
+            if trigger_is_due(pending.0, debounce, now_ms) {
+                let items = by_namespace.entry(transform.namespace.clone()).or_default();
+                if !items
+                    .iter()
+                    .any(|(queued, _, _)| queued.transform_id == transform.transform_id)
+                {
+                    items.push((transform, pending.1, pending.2));
+                }
+            }
+        }
+    }
+    let mut due: Vec<Vec<(GovernedTransform, String, String)>> =
+        by_namespace.into_values().collect();
+    let mut admitted = Vec::new();
+    loop {
+        let mut progress = false;
+        for items in &mut due {
+            while !items.is_empty() {
+                let namespace = items[0].0.namespace.clone();
+                if !can_admit_namespace(tx, &namespace)? {
+                    items.clear();
+                    break;
+                }
+                let (transform, cause, cause_ref) = items.remove(0);
+                if let Some(run) =
+                    admit_pending_transform_tx(tx, &transform, &cause, &cause_ref, now_ms)?
+                {
+                    if cause == TRANSFORM_TRIGGER_SCHEDULE
+                        && let Ok(bucket) = cause_ref.parse::<i64>()
+                    {
+                        store_schedule_bucket(
+                            tx,
+                            &transform.namespace,
+                            &transform.transform_id,
+                            bucket,
+                        )?;
+                    }
+                    admitted.push(run);
+                    progress = true;
+                    break;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    Ok(admitted)
+}
+
+fn load_schedule_bucket(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+) -> Result<Option<i64>, String> {
+    tx.query_row(
+        "SELECT last_bucket FROM sekai_transform_schedule_cursor
+         WHERE namespace = ?1 AND transform_id = ?2",
+        params![namespace, transform_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn store_schedule_bucket(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+    bucket: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT OR REPLACE INTO sekai_transform_schedule_cursor
+         (namespace, transform_id, last_bucket) VALUES (?1,?2,?3)",
+        params![namespace, transform_id, bucket],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn load_pending(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+) -> Result<Option<(i64, String, String)>, String> {
+    tx.query_row(
+        "SELECT first_seen_ms, cause, cause_ref FROM sekai_transform_trigger_pending
+         WHERE namespace = ?1 AND transform_id = ?2",
+        params![namespace, transform_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn admit_pending_transform_tx(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    cause: &str,
+    cause_ref: &str,
+    now_ms: i64,
+) -> Result<Option<TransformRun>, String> {
+    if transform.is_isolated_process()
+        && has_open_work(tx, &transform.namespace, &transform.transform_id)?
+    {
+        return Ok(None);
+    }
+    let run = run_governed_transform_tx(
+        tx,
+        &transform.namespace,
+        &transform.transform_id,
+        false,
+        cause,
+        cause_ref,
+        now_ms,
+    )?;
+    Ok(Some(run))
+}
+
+fn has_open_work(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+) -> Result<bool, String> {
+    let count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sekai_transform_work
+             WHERE namespace = ?1 AND transform_id = ?2 AND status IN (?3, ?4)",
+            params![
+                namespace,
+                transform_id,
+                TRANSFORM_WORK_PENDING,
+                TRANSFORM_WORK_CLAIMED
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(count > 0)
+}
+
+fn resolve_changed_datasets(
+    tx: &Transaction<'_>,
+    object_or_dataset_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let mut datasets = Vec::new();
+    for id in object_or_dataset_ids {
+        if id.trim().is_empty() {
+            continue;
+        }
+        let found: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM sekai_datasets WHERE id = ?1 OR object_id = ?1")
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![id], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            rows.map(|row| row.map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for dataset_id in found {
+            if !datasets.contains(&dataset_id) {
+                datasets.push(dataset_id);
+            }
+        }
+        if datasets.iter().all(|dataset_id| dataset_id != id) && dataset_exists(tx, id)? {
+            datasets.push(id.clone());
+        }
+    }
+    Ok(datasets)
+}
+
+fn cancel_governed_transform_run_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now_ms: i64,
+) -> Result<TransformRun, String> {
+    let mut run = load_transform_run(tx, run_id)?.ok_or("governed transform run not found")?;
+    if let Some(mut work) = load_transform_work(tx, run_id)?
+        && (work.status == TRANSFORM_WORK_PENDING || work.status == TRANSFORM_WORK_CLAIMED)
+    {
+        work.status = TRANSFORM_WORK_CANCELLED.into();
+        persist_transform_work(tx, &work)?;
+        run.dispatch_status = TRANSFORM_WORK_CANCELLED.into();
+        run.quarantined = true;
+        run.quality_rule = TRANSFORM_TRIGGER_CANCELLED.into();
+        run.stamp_trigger(TRANSFORM_TRIGGER_CANCELLED, run_id);
+        persist_transform_run(tx, &run)?;
+        delete_run_input_snapshot(tx, run_id)?;
+    }
+    let transform = load_transform(tx, &run.namespace, &run.transform_id)?;
+    if let Some(transform) = transform {
+        skip_downstream_pending_tx(tx, &transform, &run, now_ms)?;
+    }
+    Ok(run)
+}
+
+fn pending_work_run_id(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+) -> Result<Option<String>, String> {
+    tx.query_row(
+        "SELECT run_id FROM sekai_transform_work
+         WHERE namespace = ?1 AND transform_id = ?2 AND status = ?3",
+        params![namespace, transform_id, TRANSFORM_WORK_PENDING],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn cancel_pending_downstream_work_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    cancelled_run_id: &str,
+) -> Result<(), String> {
+    let Some(mut work) = load_transform_work(tx, run_id)? else {
+        return Ok(());
+    };
+    if work.status != TRANSFORM_WORK_PENDING {
+        return Ok(());
+    }
+    work.status = TRANSFORM_WORK_CANCELLED.into();
+    persist_transform_work(tx, &work)?;
+    let mut run = load_transform_run(tx, run_id)?.ok_or("governed transform run not found")?;
+    run.dispatch_status = TRANSFORM_WORK_CANCELLED.into();
+    run.quarantined = true;
+    run.quality_rule = TRANSFORM_TRIGGER_CANCELLED.into();
+    run.stamp_trigger(TRANSFORM_TRIGGER_CANCELLED, cancelled_run_id);
+    persist_transform_run(tx, &run)?;
+    delete_run_input_snapshot(tx, run_id)
+}
+
+fn skip_downstream_pending_tx(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    cancelled: &TransformRun,
+    now_ms: i64,
+) -> Result<(), String> {
+    for downstream in list_all_transforms_tx(tx)? {
+        if downstream.namespace != transform.namespace
+            || !downstream.consumes_dataset(&transform.output_dataset_id)
+        {
+            continue;
+        }
+        let pending_work =
+            pending_work_run_id(tx, &downstream.namespace, &downstream.transform_id)?;
+        let had_trigger =
+            load_pending(tx, &downstream.namespace, &downstream.transform_id)?.is_some();
+        if pending_work.is_none() && !had_trigger {
+            continue;
+        }
+        clear_pending_for_transform(tx, &downstream.namespace, &downstream.transform_id)?;
+        if let Some(work_run_id) = pending_work {
+            cancel_pending_downstream_work_tx(tx, &work_run_id, &cancelled.run_id)?;
+            continue;
+        }
+        let skip = TransformRun {
+            run_id: Uuid::new_v4().to_string(),
+            namespace: downstream.namespace.clone(),
+            transform_id: downstream.transform_id.clone(),
+            definition_digest: downstream.definition_digest.clone(),
+            input_digest: String::new(),
+            output_digest: String::new(),
+            last_input_row_id: 0,
+            incremental: false,
+            quarantined: true,
+            quality_rule: TRANSFORM_TRIGGER_CANCELLED.into(),
+            rows_in: 0,
+            rows_out: 0,
+            lineage_parent: cancelled.run_id.clone(),
+            created_at_ms: now_ms,
+            markings_in: String::new(),
+            markings_out: String::new(),
+            profile: String::new(),
+            engine: String::new(),
+            runtime_image: String::new(),
+            dispatch_status: TRANSFORM_WORK_CANCELLED.into(),
+            trigger_cause: TRANSFORM_TRIGGER_CANCELLED.into(),
+            trigger_ref: cancelled.run_id.clone(),
+        };
+        insert_transform_run(tx, &skip)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use crate::sekai::governed_transform::{
         AnalyticalSpec, CONTRACT_VERSION, GovernedTransform, ISOLATED_CLASS, IsolatedProcessSpec,
-        STALE_TRANSFORM_ADMISSION, TransformInput, TransformStep,
+        STALE_TRANSFORM_ADMISSION, TRANSFORM_DEPENDENCY_CYCLE, TRANSFORM_OUTPUT_BLOCKED,
+        TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE, TRANSFORM_TRIGGER_CANCELLED,
+        TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_SOURCE_BATCH,
+        TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED, TransformInput, TransformSchedule,
+        TransformStep, TransformTrigger,
     };
 
     fn db() -> SekaiDb {
@@ -1462,6 +2298,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -1523,6 +2361,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -1569,6 +2409,8 @@ mod tests {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: None,
+                schedule: None,
+                trigger: None,
             }
             .prepare()
             .unwrap();
@@ -1617,6 +2459,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -1647,6 +2491,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -1692,6 +2538,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -1703,6 +2551,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
             ..first
         }
         .prepare()
@@ -1739,6 +2589,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -1799,6 +2651,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -1810,6 +2664,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
             steps: vec![TransformStep {
                 kind: "filter".into(),
                 column: "keep".into(),
@@ -1859,6 +2715,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -1912,6 +2770,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2041,6 +2901,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2090,6 +2952,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2129,6 +2993,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2174,6 +3040,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2206,6 +3074,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: Some(AnalyticalSpec::default()),
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap()
@@ -2274,6 +3144,8 @@ mod tests {
             definition_digest: String::new(),
             analytical: Some(AnalyticalSpec::default()),
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2320,6 +3192,8 @@ mod tests {
                 definition_digest: String::new(),
                 analytical: Some(AnalyticalSpec::default()),
                 isolated_process: None,
+                schedule: None,
+                trigger: None,
             }
             .prepare()
             .unwrap();
@@ -2441,6 +3315,8 @@ mod tests {
                 time_limit_ms: 0,
             }),
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2492,6 +3368,8 @@ mod tests {
                 time_limit_ms: 1,
             }),
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2547,6 +3425,8 @@ mod tests {
                 time_limit_ms: 5_000,
             }),
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2649,6 +3529,8 @@ mod tests {
                 time_limit_ms: 0,
             }),
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2759,6 +3641,8 @@ mod tests {
                 time_limit_ms: 0,
             }),
             isolated_process: None,
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -2786,6 +3670,8 @@ mod tests {
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
             }),
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap()
@@ -3362,6 +4248,8 @@ mod tests {
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
             }),
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -3529,6 +4417,8 @@ mod tests {
                     },
                 ],
             }),
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -3602,6 +4492,8 @@ mod tests {
                     },
                 ],
             }),
+            schedule: None,
+            trigger: None,
         }
         .prepare()
         .unwrap();
@@ -3640,5 +4532,482 @@ mod tests {
                 ("right".into(), Some("1".into())),
             ]
         );
+    }
+
+    fn projection(id: &str, input: &str, output: &str) -> GovernedTransform {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: id.into(),
+            input_dataset_id: input.into(),
+            output_dataset_id: output.into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    }
+
+    #[test]
+    fn put_refuses_a_dependency_cycle() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.put_governed_transform(&projection("a", "in", "out"), 10)
+            .unwrap();
+        let error = db
+            .put_governed_transform(&projection("b", "out", "in"), 11)
+            .unwrap_err();
+        assert_eq!(error, TRANSFORM_DEPENDENCY_CYCLE);
+    }
+
+    #[test]
+    fn schedule_admits_one_run_per_tick_across_restarts() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = projection("t1", "in", "out");
+        transform.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.tick_governed_transforms(1_500).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].trigger_cause, TRANSFORM_TRIGGER_SCHEDULE);
+        assert_eq!(first[0].trigger_ref, "1");
+        assert_eq!(db.tick_governed_transforms(1_800).unwrap().len(), 0);
+        let second = db.tick_governed_transforms(2_000).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].trigger_ref, "2");
+        assert_ne!(second[0].run_id, first[0].run_id);
+    }
+
+    #[test]
+    fn upstream_commit_triggers_downstream_once() {
+        let db = db();
+        for id in ["in", "mid", "out"] {
+            db.create_dataset(&dataset(id)).unwrap();
+        }
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&projection("up", "in", "mid"), 10)
+            .unwrap();
+        let mut down = projection("down", "mid", "out");
+        down.trigger = Some(TransformTrigger {
+            on_input_commit: true,
+            debounce_ms: 0,
+        });
+        down.definition_digest.clear();
+        let down = down.prepare().unwrap();
+        db.put_governed_transform(&down, 11).unwrap();
+        let up = db.run_governed_transform("ops", "up", false, 20).unwrap();
+        assert_eq!(up.trigger_cause, TRANSFORM_TRIGGER_MANUAL);
+        let runs = db.list_governed_transform_runs("ops", 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        let down_run = runs.iter().find(|run| run.transform_id == "down").unwrap();
+        assert_eq!(down_run.trigger_cause, TRANSFORM_TRIGGER_UPSTREAM);
+        assert_eq!(down_run.trigger_ref, up.run_id);
+        assert_eq!(db.tick_governed_transforms(30).unwrap().len(), 0);
+        let state = db
+            .get_transform_output_state("ops", "out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.freshness, TRANSFORM_OUTPUT_FRESH);
+    }
+
+    #[test]
+    fn upstream_failure_blocks_downstream() {
+        let db = db();
+        for id in ["in", "mid", "out"] {
+            db.create_dataset(&dataset(id)).unwrap();
+        }
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), String::new()),
+            ])],
+        )
+        .unwrap();
+        let mut up = projection("up", "in", "mid");
+        up.steps = vec![TransformStep {
+            kind: "project".into(),
+            column: String::new(),
+            op: String::new(),
+            value: String::new(),
+            columns: vec!["id".into(), "keep".into()],
+        }];
+        up.quality_rule = "required:keep".into();
+        up.definition_digest.clear();
+        let up = up.prepare().unwrap();
+        db.put_governed_transform(&up, 10).unwrap();
+        let mut down = projection("down", "mid", "out");
+        down.trigger = Some(TransformTrigger {
+            on_input_commit: true,
+            debounce_ms: 0,
+        });
+        down.definition_digest.clear();
+        let down = down.prepare().unwrap();
+        db.put_governed_transform(&down, 11).unwrap();
+        let failed = db.run_governed_transform("ops", "up", false, 20).unwrap();
+        assert!(failed.quarantined);
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .iter()
+                .all(|run| run.transform_id != "down")
+        );
+        let state = db
+            .get_transform_output_state("ops", "out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.freshness, TRANSFORM_OUTPUT_BLOCKED);
+        assert_eq!(state.blocked_run_id, failed.run_id);
+    }
+
+    #[test]
+    fn source_batch_trigger_coalesces_under_debounce() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = projection("t1", "in", "out");
+        transform.trigger = Some(TransformTrigger {
+            on_input_commit: true,
+            debounce_ms: 1_000,
+        });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        db.note_source_change(
+            "ops",
+            &["in".into()],
+            TRANSFORM_TRIGGER_SOURCE_BATCH,
+            "batch-a",
+            20,
+        )
+        .unwrap();
+        db.note_source_change(
+            "ops",
+            &["in".into()],
+            TRANSFORM_TRIGGER_SOURCE_BATCH,
+            "batch-b",
+            30,
+        )
+        .unwrap();
+        let stale = db
+            .get_transform_output_state("ops", "out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.freshness, TRANSFORM_OUTPUT_STALE);
+        assert_eq!(db.tick_governed_transforms(500).unwrap().len(), 0);
+        let runs = db.tick_governed_transforms(1_020).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger_cause, TRANSFORM_TRIGGER_SOURCE_BATCH);
+        assert_eq!(runs[0].trigger_ref, "batch-b");
+        assert_eq!(db.tick_governed_transforms(2_000).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn cancel_skips_not_yet_started_downstream() {
+        let db = db();
+        for id in ["in", "mid", "out"] {
+            db.create_dataset(&dataset(id)).unwrap();
+        }
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let mut down = projection("down", "out", "mid");
+        down.input_dataset_id = "out".into();
+        down.output_dataset_id = "mid".into();
+        down.trigger = Some(TransformTrigger {
+            on_input_commit: true,
+            debounce_ms: 5_000,
+        });
+        down.definition_digest.clear();
+        let down = down.prepare().unwrap();
+        db.put_governed_transform(&down, 11).unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        db.note_source_change(
+            "ops",
+            &["out".into()],
+            TRANSFORM_TRIGGER_UPSTREAM,
+            &admitted.run_id,
+            25,
+        )
+        .unwrap();
+        db.cancel_governed_transform_run(&admitted.run_id, 30)
+            .unwrap();
+        let runs = db.list_governed_transform_runs("ops", 10).unwrap();
+        assert!(
+            runs.iter().any(|run| run.run_id == admitted.run_id
+                && run.dispatch_status == TRANSFORM_WORK_CANCELLED)
+        );
+        let skipped = runs.iter().find(|run| run.transform_id == "down").unwrap();
+        assert_eq!(skipped.trigger_cause, TRANSFORM_TRIGGER_CANCELLED);
+        assert_eq!(skipped.trigger_ref, admitted.run_id);
+        assert_eq!(db.tick_governed_transforms(10_000).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn per_tenant_concurrency_holds_the_second_isolated_admission() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.create_dataset(&dataset("out2")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.set_transform_namespace_concurrency("ops", 1).unwrap();
+        let mut first = isolated_transform();
+        first.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        first.definition_digest.clear();
+        let first = first.prepare().unwrap();
+        db.put_governed_transform(&first, 10).unwrap();
+        let mut second = isolated_transform();
+        second.transform_id = "iso2".into();
+        second.output_dataset_id = "out2".into();
+        second.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        second.definition_digest.clear();
+        let second = second.prepare().unwrap();
+        db.put_governed_transform(&second, 11).unwrap();
+        let admitted = db.tick_governed_transforms(1_500).unwrap();
+        assert_eq!(admitted.len(), 1);
+        let leftover = db.list_claimable_transform_work("ops", 1_500, 10).unwrap();
+        assert_eq!(leftover.len(), 1);
+    }
+
+    #[test]
+    fn due_schedule_and_trigger_admit_one_run() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = projection("t1", "in", "out");
+        transform.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        transform.trigger = Some(TransformTrigger {
+            on_input_commit: true,
+            debounce_ms: 2_000,
+        });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        db.note_source_change(
+            "ops",
+            &["in".into()],
+            TRANSFORM_TRIGGER_SOURCE_BATCH,
+            "batch-a",
+            20,
+        )
+        .unwrap();
+        let runs = db.tick_governed_transforms(2_500).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(db.tick_governed_transforms(2_500).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn later_input_survives_isolated_write_back() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = isolated_transform();
+        transform.trigger = Some(TransformTrigger {
+            on_input_commit: true,
+            debounce_ms: 0,
+        });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let admitted = db
+            .note_source_change(
+                "ops",
+                &["in".into()],
+                TRANSFORM_TRIGGER_SOURCE_BATCH,
+                "batch-first",
+                20,
+            )
+            .unwrap()
+            .pop()
+            .expect("triggered isolated admission");
+        db.note_source_change(
+            "ops",
+            &["in".into()],
+            TRANSFORM_TRIGGER_SOURCE_BATCH,
+            "batch-later",
+            30,
+        )
+        .unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 40)
+            .unwrap()
+            .expect("claimable work");
+        let output = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("keep".into(), "yes".into()),
+        ])];
+        db.write_transform_run(
+            WriteTransformRunCommand {
+                run_id: work.run_id,
+                runtime_id: work.claim_owner,
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token,
+                rows: output.clone(),
+                output_digest: rows_digest(&output),
+                quarantined: false,
+                quality_rule: String::new(),
+            },
+            50,
+        )
+        .unwrap();
+        let state = db
+            .get_transform_output_state("ops", "out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.freshness, TRANSFORM_OUTPUT_STALE);
+        assert_eq!(state.upstream_version, "batch-later");
+        let retry = db.tick_governed_transforms(60).unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_ne!(retry[0].run_id, admitted.run_id);
+        assert_eq!(retry[0].trigger_cause, TRANSFORM_TRIGGER_SOURCE_BATCH);
+        assert_eq!(retry[0].trigger_ref, "batch-later");
+    }
+
+    #[test]
+    fn own_quality_failure_retries_on_source_batch() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), String::new()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = projection("t1", "in", "out");
+        transform.steps = vec![TransformStep {
+            kind: "project".into(),
+            column: String::new(),
+            op: String::new(),
+            value: String::new(),
+            columns: vec!["id".into(), "keep".into()],
+        }];
+        transform.quality_rule = "required:keep".into();
+        transform.trigger = Some(TransformTrigger {
+            on_input_commit: true,
+            debounce_ms: 0,
+        });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let failed = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(failed.quarantined);
+        assert_eq!(
+            db.get_transform_output_state("ops", "out")
+                .unwrap()
+                .unwrap()
+                .freshness,
+            TRANSFORM_OUTPUT_BLOCKED
+        );
+        let retry = db
+            .note_source_change(
+                "ops",
+                &["in".into()],
+                TRANSFORM_TRIGGER_SOURCE_BATCH,
+                "batch-fix",
+                30,
+            )
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].trigger_cause, TRANSFORM_TRIGGER_SOURCE_BATCH);
+        assert_eq!(retry[0].trigger_ref, "batch-fix");
+    }
+
+    #[test]
+    fn tick_skips_busy_isolated_and_admits_the_next() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.create_dataset(&dataset("out2")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let mut first = isolated_transform();
+        first.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        first.definition_digest.clear();
+        let first = first.prepare().unwrap();
+        db.put_governed_transform(&first, 10).unwrap();
+        let mut second = isolated_transform();
+        second.transform_id = "iso2".into();
+        second.output_dataset_id = "out2".into();
+        second.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        second.definition_digest.clear();
+        let second = second.prepare().unwrap();
+        db.put_governed_transform(&second, 11).unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let admitted = db.tick_governed_transforms(1_500).unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].transform_id, "iso2");
+        let claimable = db.list_claimable_transform_work("ops", 1_500, 10).unwrap();
+        assert_eq!(claimable.len(), 2);
     }
 }
