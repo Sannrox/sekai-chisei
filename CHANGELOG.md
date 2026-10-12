@@ -2,12 +2,6 @@
 
 ## Unreleased
 
-- `CreateFunction` refuses a function with an LLM step. The gated publish
-  records an approval for the revision digest and stores it; `InvokeFunction`
-  and document extraction refuse an LLM revision without that approval, so
-  rows stored before this change stay unapproved. Adds PostgreSQL migration
-  `0056_function_gate_approvals` (#1384).
-
 - Function document extraction resolves the namespace action policy for every
   extraction: `deny` refuses, `require_approval` parks the Action at any
   confidence, and `allow` writes only at or above the threshold. A direct
@@ -17,6 +11,12 @@
 - Connector certifications persist on PostgreSQL with the SQLite certify, get,
   verify, revoke, and supersession semantics. Adds PostgreSQL migration
   `0055_connector_certifications` (#1481).
+
+- `CreateFunction` refuses a function with an LLM step. The gated publish
+  records an approval for the revision digest and stores it; `InvokeFunction`
+  and document extraction refuse an LLM revision without that approval, so
+  rows stored before this change stay unapproved. Adds PostgreSQL migration
+  `0056_function_gate_approvals` (#1384).
 
 - Source-webhook key pins and registered source-type descriptors persist on
   PostgreSQL, and PostgreSQL `ApplySourceBatch` admits batches for live
