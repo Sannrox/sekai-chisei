@@ -56,13 +56,15 @@ access on its own. Unknown roles and incomplete space authority fail closed.
 It is attribution, never an additional policy principal or a replacement for
 the credential subject. Action admission receipts and audit evidence retain
 `act`; model planning receipts retain `act`, space, and role. No bearer secret
-is retained. Apply of claimed action work and planned execution re-validates the
-`act` retained on the admitted instance or planning receipt against current
-enablement, tenant membership, and the grant the work needs, and records
-`delegator_disabled`, `delegator_not_member`, `delegator_grant_missing`, or
-`delegator_record_missing` on the receipt. A missing planning receipt, action
-effect, or action instance fails closed. Claim-time re-validation remains the
-runtime-claim client.
+is retained. Claim of `runtime_dispatch` work, apply of claimed action work, and
+planned execution re-validate the `act` retained on the admitted instance or
+planning receipt against current enablement, tenant membership, and the grant
+the work needs. Claim fails closed with `delegator_disabled`,
+`delegator_not_member`, or `delegator_grant_missing` before the worker receives
+a fence. Apply records those reasons, or `delegator_record_missing`, on the
+receipt. A missing planning receipt, action effect, or action instance fails
+closed at apply. The runtime-claim client surfaces the `delegator_*` tokens
+instead of collapsing them to contention or fence loss.
 
 ## Discovery metadata
 

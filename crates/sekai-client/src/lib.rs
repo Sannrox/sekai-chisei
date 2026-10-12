@@ -173,9 +173,10 @@ impl SdkErrorCode {
     }
 }
 
-/// A safe, bounded error. Server status text is deliberately not retained:
-/// it may contain provider or credential material and the status code already
-/// preserves the authorization/policy distinction callers need.
+/// A safe, bounded error. Arbitrary server status text is deliberately not
+/// retained: it may contain provider or credential material. An allowlisted
+/// machine-readable `reason_code` (delegator refusals) is kept so the
+/// runtime-claim client can surface policy reasons without leaking status text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SdkError {
     pub code: SdkErrorCode,
@@ -184,6 +185,8 @@ pub struct SdkError {
     pub operation_id: Option<String>,
     pub request_id: Option<String>,
     pub retryable: bool,
+    /// Allowlisted plane reason, when the status message is a known token.
+    pub reason_code: Option<&'static str>,
 }
 
 impl SdkError {
@@ -199,6 +202,7 @@ impl SdkError {
             operation_id: None,
             request_id: None,
             retryable: code.retryable_by_default(),
+            reason_code: None,
         }
     }
 
@@ -216,6 +220,7 @@ impl SdkError {
             operation_id: options.context.operation_id.clone(),
             request_id: (!request_id.is_empty()).then(|| request_id.to_string()),
             retryable: code.retryable_by_default(),
+            reason_code: None,
         }
     }
 
@@ -226,13 +231,15 @@ impl SdkError {
         options: &CallOptions,
         request_id: &str,
     ) -> Self {
-        Self::for_call(
+        let mut error = Self::for_call(
             SdkErrorCode::from_status(status.code()),
             service,
             method,
             options,
             request_id,
-        )
+        );
+        error.reason_code = claim::allowlisted_reason_code(status.message());
+        error
     }
 
     pub fn is_authorization(&self) -> bool {
@@ -253,6 +260,9 @@ impl SdkError {
 impl fmt::Display for SdkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.code.default_message())?;
+        if let Some(reason) = self.reason_code {
+            write!(formatter, ": {reason}")?;
+        }
         if let (Some(service), Some(method)) = (self.service, self.method.as_deref()) {
             write!(formatter, " ({service}/{method})")?;
         }

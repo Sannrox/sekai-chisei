@@ -7,6 +7,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::store::SekaiStore;
+use sekai_chisei::gateway_keys::hash_gateway_key;
 use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
 use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
 use sekai_chisei::rpc_maturity::RpcMaturityLayer;
@@ -18,7 +19,8 @@ use sekai_chisei::sekai::governed_transform::{
 };
 use sekai_chisei::sekai::security::Role;
 use sekai_client::claim::{
-    ActionAck, ActionFence, ClaimAttempt, RuntimeClaimError, TransformFence, TransformWrite,
+    ActionAck, ActionFence, ClaimAttempt, DELEGATOR_DISABLED, RuntimeClaimError, TransformFence,
+    TransformWrite,
 };
 use sekai_client::protocol::sekai::TransformRunInputRow;
 use sekai_client::{ClientConfig, CoreLoopClient};
@@ -30,6 +32,7 @@ use crate::postgres_scratch::ScratchDatabase;
 
 const NAMESPACE: &str = "ops";
 const PRINCIPAL: &str = "local";
+const DELEGATOR: &str = "origin-user";
 
 struct ServingPlane {
     endpoint: String,
@@ -90,6 +93,10 @@ impl Drop for ServingPlane {
 }
 
 fn seed_action(db: &RuntimeDb, prefix: &str) {
+    seed_action_with_act(db, prefix, None);
+}
+
+fn seed_action_with_act(db: &RuntimeDb, prefix: &str, delegating_actor: Option<&str>) {
     db.ensure_team_namespace(NAMESPACE, PRINCIPAL, Role::Admin, PRINCIPAL)
         .unwrap();
     let mut effect = plan_effects_for_admit(
@@ -110,7 +117,7 @@ fn seed_action(db: &RuntimeDb, prefix: &str) {
         type_id: "dispatch".into(),
         version: "1".into(),
         principal: PRINCIPAL.into(),
-        delegating_actor: None,
+        delegating_actor: delegating_actor.map(str::to_string),
         parameters_json: r#"{"runtime":"runner-a"}"#.into(),
         request_digest: "digest-1".into(),
         idempotency_key: format!("idem-{}", effect.effect_id),
@@ -130,6 +137,14 @@ fn seed_action(db: &RuntimeDb, prefix: &str) {
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();
+}
+
+fn seed_delegated_action(db: &RuntimeDb, prefix: &str) {
+    db.create_principal_credential(DELEGATOR, &hash_gateway_key("delegator-secret"), 1)
+        .unwrap();
+    db.ensure_team_namespace(NAMESPACE, DELEGATOR, Role::Editor, PRINCIPAL)
+        .unwrap();
+    seed_action_with_act(db, prefix, Some(DELEGATOR));
 }
 
 /// Community `RuntimeDb::append_rows` stays SQLite-only; PostgreSQL snapshots
@@ -267,6 +282,37 @@ async fn exercise_action(db: RuntimeDb, prefix: &str) {
     plane.shutdown().await;
 }
 
+async fn exercise_delegator_claim_refusal(db: RuntimeDb, prefix: &str) {
+    seed_delegated_action(&db, prefix);
+    db.revoke_principal_credential(DELEGATOR).unwrap();
+    let plane = ServingPlane::start(db).await;
+    let client = plane.client().await;
+    let claim = client.runtime_claim();
+    let effect_id = format!("{prefix}-effect");
+
+    let targeted = claim
+        .claim_action_work(&effect_id, "runner-a", Duration::from_secs(30), None)
+        .await
+        .expect_err("disabled delegator must not claim");
+    assert!(
+        matches!(
+            targeted,
+            RuntimeClaimError::DelegatorRefused(DELEGATOR_DISABLED)
+        ),
+        "claim client must surface delegator_disabled, got {targeted}"
+    );
+
+    let scheduled = claim
+        .claim_next_action("runner-a", Duration::from_secs(30))
+        .await
+        .expect("drained refusal must not keep blocking the queue");
+    assert!(
+        matches!(scheduled, ClaimAttempt::Idle),
+        "scheduled claim must not run after the refused item is drained, got {scheduled:?}"
+    );
+    plane.shutdown().await;
+}
+
 async fn exercise_transform(db: RuntimeDb, prefix: &str) {
     seed_transform(&db, prefix);
     let plane = ServingPlane::start(db.clone()).await;
@@ -334,6 +380,11 @@ async fn exercise_transform(db: RuntimeDb, prefix: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_runtime_claim_action_conformance() {
     exercise_action(RuntimeDb::memory(), "sqlite-action").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_runtime_claim_refuses_disabled_delegator() {
+    exercise_delegator_claim_refusal(RuntimeDb::memory(), "sqlite-delegator").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

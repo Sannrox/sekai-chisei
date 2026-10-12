@@ -268,7 +268,7 @@ impl AuthenticatedContext {
     }
 }
 
-/// Machine-readable apply-time refusal when `act` can no longer authorize work.
+/// Machine-readable refusal when `act` can no longer authorize claim or apply.
 pub const DELEGATOR_DISABLED: &str = "delegator_disabled";
 pub const DELEGATOR_NOT_MEMBER: &str = "delegator_not_member";
 pub const DELEGATOR_GRANT_MISSING: &str = "delegator_grant_missing";
@@ -293,7 +293,7 @@ impl DelegatorApplyRefusal {
     }
 }
 
-/// Live facts about the delegating principal, loaded at apply.
+/// Live facts about the delegating principal, loaded at claim and apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegatingPrincipalState {
     pub enabled: bool,
@@ -301,7 +301,7 @@ pub struct DelegatingPrincipalState {
     pub holds_needed_grant: bool,
 }
 
-/// Re-validate `act` at apply. Absent or empty `act` is a no-op.
+/// Re-validate `act` at claim and apply. Absent or empty `act` is a no-op.
 pub fn revalidate_delegating_principal(
     act: Option<&str>,
     state: DelegatingPrincipalState,

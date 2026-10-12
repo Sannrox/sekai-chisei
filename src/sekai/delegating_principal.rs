@@ -1,8 +1,9 @@
-//! Apply-time re-validation of the delegating principal (`act`).
+//! Re-validation of the delegating principal (`act`) at claim and apply.
 //!
-//! Claim-time re-validation waits on the runtime-claim client. This module
-//! loads live credential, membership, and grant facts and applies the identity
-//! contract rule.
+//! Claim of `runtime_dispatch` work and apply of claimed or planned execution
+//! load live credential, membership, and grant facts and apply the identity
+//! contract rule. The runtime-claim client surfaces the same machine-readable
+//! reasons the plane returns.
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::enterprise::{
@@ -53,13 +54,14 @@ pub(crate) fn current_delegating_principal_state(
             Err(error) => Err(format!("{error:?}")),
         };
     }
-    // Community apply uses the same live facts as namespace access: principal
-    // credential status, namespace membership, and write grants.
+    // Community claim/apply uses the same live facts as namespace access:
+    // an active credential, namespace membership, and write grants. No
+    // credential rows means the principal is not enabled: a removed member
+    // whose rows were deleted must not keep running delegated work.
     let credentials = db.list_credentials(Some(principal), None)?;
-    let enabled = credentials.is_empty()
-        || credentials
-            .iter()
-            .any(|credential| credential.status == "active");
+    let enabled = credentials
+        .iter()
+        .any(|credential| credential.status == "active");
     let tenant_member = principal_can_access_namespace(db, principal, namespace)?;
     let holds_needed_grant = match needed {
         NamespaceAction::Discover | NamespaceAction::Read => tenant_member,
