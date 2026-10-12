@@ -457,6 +457,18 @@ impl RuntimeDb {
         }
     }
 
+    pub fn admitted_isolated_transform(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::sekai::governed_transform::GovernedTransform>, String> {
+        match self {
+            Self::Sqlite(db) => db.admitted_isolated_transform(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.admitted_isolated_transform(run_id))
+            }
+        }
+    }
+
     pub fn run_governed_transform(
         &self,
         namespace: &str,
@@ -508,6 +520,119 @@ impl RuntimeDb {
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.list_governed_transform_runs(namespace, limit)
             }),
+        }
+    }
+
+    pub fn list_claimable_transform_work(
+        &self,
+        namespace: &str,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformWork>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_claimable_transform_work(namespace, now_ms, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_claimable_transform_work(namespace, now_ms, limit)
+            }),
+        }
+    }
+
+    pub fn claim_transform_work(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        run_id: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<
+        Option<(
+            crate::sekai::governed_transform::TransformWork,
+            crate::sekai::governed_transform::GovernedTransform,
+        )>,
+        String,
+    > {
+        match self {
+            Self::Sqlite(db) => {
+                db.claim_transform_work(namespace, runtime_id, run_id, ttl_ms, now_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.claim_transform_work(namespace, runtime_id, run_id, ttl_ms, now_ms)
+            }),
+        }
+    }
+
+    pub fn heartbeat_transform_work(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<crate::sekai::governed_transform::TransformWork, String> {
+        match self {
+            Self::Sqlite(db) => db.heartbeat_transform_work(
+                run_id,
+                runtime_id,
+                claim_generation,
+                fencing_token,
+                ttl_ms,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.heartbeat_transform_work(
+                    run_id,
+                    runtime_id,
+                    claim_generation,
+                    fencing_token,
+                    ttl_ms,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
+    pub fn read_transform_run_input(
+        &self,
+        command: &crate::sekai::governed_transform::WriteTransformRunCommand,
+        alias: &str,
+        after_alias: &str,
+        after_row_id: i64,
+        limit: i64,
+        now_ms: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformRunInputRow>, String> {
+        match self {
+            Self::Sqlite(db) => db.read_transform_run_input(
+                command,
+                alias,
+                after_alias,
+                after_row_id,
+                limit,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.read_transform_run_input(
+                    command,
+                    alias,
+                    after_alias,
+                    after_row_id,
+                    limit,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
+    pub fn write_transform_run(
+        &self,
+        command: crate::sekai::governed_transform::WriteTransformRunCommand,
+        now_ms: i64,
+    ) -> Result<crate::sekai::governed_transform::TransformRun, String> {
+        match self {
+            Self::Sqlite(db) => db.write_transform_run(command, now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.write_transform_run(command, now_ms))
+            }
         }
     }
 

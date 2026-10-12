@@ -45,10 +45,11 @@ They stay out of the default RPC surface.
 `DiscoverCapabilities` always reports `sekai.rpc.experimental` on the core
 pack. `lifecycle_state` is `disabled` unless the runtime flag or build
 feature is on. Visibility of that entry is not permission to invoke an
-experimental RPC. The core pack also reports `sekai.transforms.projection`
-and `sekai.transforms.analytical` as the in-process transform host; their
-`lifecycle_state` is `disabled` unless the experimental RPC gate is on,
-matching `sekai.rpc.experimental`. Put/run/get/list RPCs stay experimental.
+experimental RPC. The core pack also reports `sekai.transforms.projection`,
+`sekai.transforms.analytical`, and `sekai.transforms.isolated_process` as
+governed transform profiles; their `lifecycle_state` is `disabled` unless
+the experimental RPC gate is on, matching `sekai.rpc.experimental`.
+Put/run/get/list and isolated-process claim RPCs stay experimental.
 
 SDK generation for the stable set succeeds without a denylist. Experimental
 and `remove` RPCs are omitted automatically.
@@ -112,6 +113,11 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.ListGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListGovernedTransformRuns` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.ListClaimableTransformWork` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.ClaimTransformWork` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.HeartbeatTransformClaim` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.WriteTransformRunResult` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
 | `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `experimental` |
 | `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |

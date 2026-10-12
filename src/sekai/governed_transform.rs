@@ -1,11 +1,12 @@
-//! Plane-owned incremental dataset transforms (#880, #1287, #1385).
+//! Plane-owned incremental dataset transforms (#880, #1287, #1385, #1386).
 //!
 //! Definitions are content-addressed and receipt-bound. Execution is the
 //! in-process `projection` host of `sekai.governed-transform-execution/v1`,
-//! or the analytical SQL profile on the same JobSpec ([ADR 0101]). The plane
-//! owns the JobSpec, transaction, lineage, and run receipt. Outputs are
-//! datasets, not type-revision object identity. Secrets are rejected in
-//! definitions.
+//! the analytical SQL profile on the same JobSpec ([ADR 0101]), or the
+//! isolated-process profile that admits work for an external runner
+//! ([ADR 0102]). The plane owns the JobSpec, transaction, lineage, and run
+//! receipt. Outputs are datasets, not type-revision object identity. Secrets
+//! are rejected in definitions.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,10 +16,23 @@ use std::time::{Duration, Instant};
 pub const CONTRACT_VERSION: &str = "sekai.governed-transform/v1";
 pub const TRANSFORM_CLASS: &str = "projection";
 pub const ANALYTICAL_CLASS: &str = "analytical";
+pub const ISOLATED_CLASS: &str = "isolated_process";
 /// DiscoverCapabilities name for the in-process transform host.
 pub const HOSTED_COMPUTE_CAPABILITY: &str = "sekai.transforms.projection";
 /// DiscoverCapabilities name for the analytical SQL profile.
 pub const ANALYTICAL_COMPUTE_CAPABILITY: &str = "sekai.transforms.analytical";
+/// DiscoverCapabilities name for the isolated-process JobSpec profile.
+pub const ISOLATED_COMPUTE_CAPABILITY: &str = "sekai.transforms.isolated_process";
+pub const TRANSFORM_WORK_PENDING: &str = "pending";
+pub const TRANSFORM_WORK_CLAIMED: &str = "claimed";
+pub const TRANSFORM_WORK_COMPLETED: &str = "completed";
+pub const TRANSFORM_WORK_FAILED: &str = "failed";
+pub const DEFAULT_TRANSFORM_CLAIM_TTL_MS: i64 = 60_000;
+pub const MAX_TRANSFORM_LEASE_EXPIRIES: i64 = 3;
+pub const STALE_TRANSFORM_CLAIM: &str = "stale transform claim";
+pub const STALE_TRANSFORM_ADMISSION: &str = "stale isolated transform admission";
+pub const TRANSFORM_DIGEST_MISMATCH: &str = "transform output digest mismatch";
+pub const TRANSFORM_DEFINITION_CHANGED: &str = "transform definition changed";
 /// Order-independent 256-bit sum of per-row SHA-256 hashes.
 /// Reference-platform analog: governed incremental `semantic_version` / `v2_semantics`
 /// force a SNAPSHOT rebuild; old encodings are not folded as the new sum.
@@ -78,6 +92,16 @@ pub struct AnalyticalSpec {
     pub time_limit_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IsolatedProcessSpec {
+    #[serde(default)]
+    pub engine: String,
+    #[serde(default)]
+    pub runtime_image: String,
+    #[serde(default)]
+    pub inputs: Vec<TransformInput>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernedTransform {
     pub contract_version: String,
@@ -92,6 +116,10 @@ pub struct GovernedTransform {
     /// stable. Present for the analytical SQL profile (#1385).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analytical: Option<AnalyticalSpec>,
+    /// Absent on in-process profiles so existing definition digests stay
+    /// stable. Present for the isolated-process JobSpec (#1386).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolated_process: Option<IsolatedProcessSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +144,55 @@ pub struct TransformRun {
     /// Union of input markings written on the output, empty when unmarked.
     #[serde(default)]
     pub markings_out: String,
+    /// JobSpec profile recorded on the receipt. Empty on historical in-process
+    /// rows; `isolated_process` when the run is admitted for an external worker.
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub engine: String,
+    #[serde(default)]
+    pub runtime_image: String,
+    /// Empty for in-process compute. `pending` / `claimed` / `completed` /
+    /// `failed` for isolated-process dispatch.
+    #[serde(default)]
+    pub dispatch_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformWork {
+    pub run_id: String,
+    pub namespace: String,
+    pub transform_id: String,
+    pub definition_digest: String,
+    pub engine: String,
+    pub runtime_image: String,
+    pub status: String,
+    pub claim_owner: String,
+    pub claim_generation: i64,
+    pub fencing_token: String,
+    pub claim_expires_at_ms: i64,
+    pub lease_expiries: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransformRunInputRow {
+    pub alias: String,
+    pub dataset_id: String,
+    pub row_id: i64,
+    pub values: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WriteTransformRunCommand {
+    pub run_id: String,
+    pub runtime_id: String,
+    pub claim_generation: i64,
+    pub fencing_token: String,
+    pub rows: Vec<HashMap<String, String>>,
+    pub output_digest: String,
+    pub quarantined: bool,
+    pub quality_rule: String,
 }
 
 impl GovernedTransform {
@@ -128,7 +205,14 @@ impl GovernedTransform {
         require_token("namespace", &self.namespace)?;
         require_token("transform_id", &self.transform_id)?;
         require_token("output_dataset_id", &self.output_dataset_id)?;
-        if let Some(spec) = self.analytical.as_mut() {
+        if self.analytical.is_some() && self.isolated_process.is_some() {
+            return Err(TransformError::InvalidArgument(
+                "cannot combine analytical and isolated_process profiles".into(),
+            ));
+        }
+        if let Some(spec) = self.isolated_process.as_mut() {
+            prepare_isolated(&mut self.input_dataset_id, spec, &self.steps)?;
+        } else if let Some(spec) = self.analytical.as_mut() {
             prepare_analytical(&mut self.input_dataset_id, spec, &self.steps)?;
         } else {
             require_token("input_dataset_id", &self.input_dataset_id)?;
@@ -164,9 +248,17 @@ impl GovernedTransform {
         self.analytical.is_some()
     }
 
+    pub fn is_isolated_process(&self) -> bool {
+        self.isolated_process.is_some()
+    }
+
     /// Compiled filter/project steps keep the projection watermark.
-    /// Explicit SQL always rebuilds from all input rows.
+    /// Explicit SQL always rebuilds from all input rows. Isolated-process
+    /// runs always rebuild; the worker owns incrementality.
     pub fn allows_incremental(&self) -> bool {
+        if self.isolated_process.is_some() {
+            return false;
+        }
         match &self.analytical {
             None => true,
             Some(spec) if spec.inputs.len() > 1 || self.steps.is_empty() => false,
@@ -184,6 +276,15 @@ impl GovernedTransform {
 
     /// Alias + dataset_id pairs the run path must load.
     pub fn input_bindings(&self) -> Vec<(String, String)> {
+        if let Some(spec) = &self.isolated_process
+            && !spec.inputs.is_empty()
+        {
+            return spec
+                .inputs
+                .iter()
+                .map(|input| (input.alias.clone(), input.dataset_id.clone()))
+                .collect();
+        }
         if let Some(spec) = &self.analytical
             && !spec.inputs.is_empty()
         {
@@ -193,7 +294,7 @@ impl GovernedTransform {
                 .map(|input| (input.alias.clone(), input.dataset_id.clone()))
                 .collect();
         }
-        let alias = if self.is_analytical() {
+        let alias = if self.is_analytical() || self.is_isolated_process() {
             "input".to_string()
         } else {
             self.input_dataset_id.clone()
@@ -224,6 +325,15 @@ pub fn definition_digest(transform: &GovernedTransform) -> String {
             hasher.update(inputs);
         }
     }
+    if let Some(spec) = &transform.isolated_process {
+        hash_field(&mut hasher, ISOLATED_CLASS);
+        hash_field(&mut hasher, &spec.engine);
+        hash_field(&mut hasher, &spec.runtime_image);
+        if let Ok(inputs) = serde_json::to_vec(&spec.inputs) {
+            hasher.update((inputs.len() as u64).to_le_bytes());
+            hasher.update(inputs);
+        }
+    }
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -234,28 +344,34 @@ fn prepare_analytical(
 ) -> Result<(), TransformError> {
     if spec.inputs.is_empty() {
         require_token("input_dataset_id", input_dataset_id)?;
+        *input_dataset_id = input_dataset_id.trim().to_string();
         spec.inputs.push(TransformInput {
             alias: "input".into(),
             dataset_id: input_dataset_id.clone(),
         });
     } else {
         let mut seen = std::collections::BTreeSet::new();
-        for input in &spec.inputs {
+        for input in spec.inputs.iter_mut() {
+            input.alias = input.alias.trim().to_string();
+            input.dataset_id = input.dataset_id.trim().to_string();
             require_token("input alias", &input.alias)?;
             require_token("input dataset_id", &input.dataset_id)?;
-            if !seen.insert(input.alias.trim().to_ascii_lowercase()) {
+            if !seen.insert(input.alias.to_ascii_lowercase()) {
                 return Err(TransformError::InvalidArgument(
                     "transform input aliases must be unique".into(),
                 ));
             }
         }
         let first = spec.inputs[0].dataset_id.clone();
-        if input_dataset_id.trim().is_empty() {
+        let trimmed_input = input_dataset_id.trim().to_string();
+        if trimmed_input.is_empty() {
             *input_dataset_id = first;
-        } else if input_dataset_id != &first {
+        } else if trimmed_input != first {
             return Err(TransformError::InvalidArgument(
                 "input_dataset_id must match the first analytical input".into(),
             ));
+        } else {
+            *input_dataset_id = trimmed_input;
         }
     }
     if spec.sql.trim().is_empty() {
@@ -286,6 +402,53 @@ fn prepare_analytical(
         spec.time_limit_ms,
         crate::sekai::transform_engine::DEFAULT_TIME_LIMIT_MS,
     );
+    Ok(())
+}
+
+fn prepare_isolated(
+    input_dataset_id: &mut String,
+    spec: &mut IsolatedProcessSpec,
+    steps: &[TransformStep],
+) -> Result<(), TransformError> {
+    if !steps.is_empty() {
+        return Err(TransformError::InvalidArgument(
+            "isolated_process profile rejects in-process steps".into(),
+        ));
+    }
+    require_token("engine", &spec.engine)?;
+    require_token("runtime_image", &spec.runtime_image)?;
+    if spec.inputs.is_empty() {
+        require_token("input_dataset_id", input_dataset_id)?;
+        *input_dataset_id = input_dataset_id.trim().to_string();
+        spec.inputs.push(TransformInput {
+            alias: "input".into(),
+            dataset_id: input_dataset_id.clone(),
+        });
+    } else {
+        let mut seen = std::collections::BTreeSet::new();
+        for input in spec.inputs.iter_mut() {
+            input.alias = input.alias.trim().to_string();
+            input.dataset_id = input.dataset_id.trim().to_string();
+            require_token("input alias", &input.alias)?;
+            require_token("input dataset_id", &input.dataset_id)?;
+            if !seen.insert(input.alias.to_ascii_lowercase()) {
+                return Err(TransformError::InvalidArgument(
+                    "isolated_process input aliases must be unique".into(),
+                ));
+            }
+        }
+        let first = spec.inputs[0].dataset_id.clone();
+        let trimmed_input = input_dataset_id.trim().to_string();
+        if trimmed_input.is_empty() {
+            *input_dataset_id = first;
+        } else if trimmed_input != first {
+            return Err(TransformError::InvalidArgument(
+                "input_dataset_id must match the first isolated_process input".into(),
+            ));
+        } else {
+            *input_dataset_id = trimmed_input;
+        }
+    }
     Ok(())
 }
 
@@ -328,6 +491,11 @@ fn apply_profile(
     tables: &[crate::sekai::transform_engine::EngineTable],
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<HashMap<String, String>>, TransformError> {
+    if transform.isolated_process.is_some() {
+        return Err(TransformError::InvalidArgument(
+            "isolated_process runs cannot execute in-process".into(),
+        ));
+    }
     if let Some(spec) = &transform.analytical {
         crate::sekai::transform_engine::execute_sql_until(
             &spec.sql,
@@ -565,8 +733,96 @@ pub fn compute_run_tables_until(
         created_at_ms: now_ms,
         markings_in: String::new(),
         markings_out: String::new(),
+        profile: String::new(),
+        engine: String::new(),
+        runtime_image: String::new(),
+        dispatch_status: String::new(),
     };
     (run, output_rows)
+}
+
+/// Admit an isolated-process run as pending work. The plane does not compute
+/// output rows; a claimed worker writes them back under a fence.
+pub fn admit_isolated_run(
+    transform: &GovernedTransform,
+    inputs: &[TransformInputRows<'_>],
+    now_ms: i64,
+    run_id: String,
+) -> Result<TransformRun, TransformError> {
+    let spec = transform.isolated_process.as_ref().ok_or_else(|| {
+        TransformError::InvalidArgument("isolated_process profile required".into())
+    })?;
+    let mut last_input_row_id = 0i64;
+    let mut tables: Vec<crate::sekai::transform_engine::EngineTable> = Vec::new();
+    let mut rows_in = 0i32;
+    for input in inputs {
+        let mut rows = Vec::new();
+        for (id, row) in input.records {
+            last_input_row_id = last_input_row_id.max(*id);
+            rows.push(row.clone());
+            rows_in += 1;
+        }
+        tables.push(crate::sekai::transform_engine::EngineTable {
+            alias: input.alias.to_string(),
+            rows,
+            columns: input.columns.to_vec(),
+        });
+    }
+    Ok(TransformRun {
+        run_id,
+        namespace: transform.namespace.clone(),
+        transform_id: transform.transform_id.clone(),
+        definition_digest: transform.definition_digest.clone(),
+        input_digest: run_input_digest(transform, &tables),
+        output_digest: String::new(),
+        last_input_row_id,
+        incremental: false,
+        quarantined: false,
+        quality_rule: transform.quality_rule.clone(),
+        rows_in,
+        rows_out: 0,
+        lineage_parent: String::new(),
+        created_at_ms: now_ms,
+        markings_in: String::new(),
+        markings_out: String::new(),
+        profile: ISOLATED_CLASS.into(),
+        engine: spec.engine.clone(),
+        runtime_image: spec.runtime_image.clone(),
+        dispatch_status: TRANSFORM_WORK_PENDING.into(),
+    })
+}
+
+pub fn normalize_transform_claim_ttl_ms(ttl_ms: i64) -> i64 {
+    if ttl_ms <= 0 {
+        DEFAULT_TRANSFORM_CLAIM_TTL_MS
+    } else {
+        ttl_ms.min(300_000)
+    }
+}
+
+pub fn transform_work_is_claimable(work: &TransformWork, now_ms: i64) -> bool {
+    match work.status.as_str() {
+        TRANSFORM_WORK_PENDING => true,
+        TRANSFORM_WORK_CLAIMED => {
+            work.claim_expires_at_ms <= now_ms && work.lease_expiries < MAX_TRANSFORM_LEASE_EXPIRIES
+        }
+        _ => false,
+    }
+}
+
+pub fn transform_claim_fence_matches(
+    work: &TransformWork,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+    now_ms: i64,
+) -> bool {
+    work.status == TRANSFORM_WORK_CLAIMED
+        && work.claim_owner == runtime_id
+        && work.claim_generation == claim_generation
+        && work.fencing_token == fencing_token
+        && !fencing_token.trim().is_empty()
+        && work.claim_expires_at_ms > now_ms
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -603,6 +859,10 @@ fn quarantined_run(
             created_at_ms: now_ms,
             markings_in: String::new(),
             markings_out: String::new(),
+            profile: String::new(),
+            engine: String::new(),
+            runtime_image: String::new(),
+            dispatch_status: String::new(),
         },
         Vec::new(),
     )
@@ -612,7 +872,7 @@ fn run_input_digest(
     transform: &GovernedTransform,
     tables: &[crate::sekai::transform_engine::EngineTable],
 ) -> String {
-    if transform.is_analytical() {
+    if transform.is_analytical() || transform.is_isolated_process() {
         let mut hasher = Sha256::new();
         for table in tables {
             hash_field(&mut hasher, &table.alias);
@@ -659,6 +919,10 @@ pub(crate) fn budget_quarantined_run(
         created_at_ms: now_ms,
         markings_in: String::new(),
         markings_out: String::new(),
+        profile: String::new(),
+        engine: String::new(),
+        runtime_image: String::new(),
+        dispatch_status: String::new(),
     }
 }
 
@@ -772,6 +1036,42 @@ pub fn derive_transform_markings<'a>(
         input_union
     };
     Ok((markings_in.join(","), markings_out.unwrap_or_default()))
+}
+
+/// Fold a live output stamp into the admitted token so write-back cannot
+/// strip a stricter classification applied after admission.
+/// Isolated write-back may not replace a newer committed result. A strictly
+/// older live receipt becomes this run's lineage parent. Same-millisecond
+/// admissions use run_id as a deterministic tie-break, not a sequence number.
+pub fn bind_isolated_write_lineage(
+    run: &mut TransformRun,
+    live: Option<&TransformRun>,
+) -> Result<(), String> {
+    let Some(live) = live else {
+        return Ok(());
+    };
+    if live.run_id == run.run_id {
+        return Ok(());
+    }
+    if (live.created_at_ms, live.run_id.as_str()) > (run.created_at_ms, run.run_id.as_str()) {
+        return Err(STALE_TRANSFORM_ADMISSION.into());
+    }
+    run.lineage_parent = live.run_id.clone();
+    Ok(())
+}
+
+pub fn fold_live_output_marking(
+    lattice: Option<&crate::sekai::classification_lattice::ClassificationLattice>,
+    admitted_out: &str,
+    live_output: Option<&str>,
+) -> Result<String, String> {
+    Ok(derive_transform_markings(
+        lattice,
+        [Some(admitted_out)],
+        live_output,
+        &[] as &[HashMap<String, String>],
+    )?
+    .1)
 }
 
 /// Marked derived output must stamp a bound dataset object. Unbound datasets
@@ -895,6 +1195,7 @@ mod tests {
             quality_rule: String::new(),
             definition_digest: String::new(),
             analytical: None,
+            isolated_process: None,
         }
         .prepare()
         .unwrap()
@@ -905,9 +1206,111 @@ mod tests {
         let first = transform();
         let mut second = first.clone();
         second.analytical = None;
+        second.isolated_process = None;
         second.definition_digest.clear();
         let second = second.prepare().unwrap();
         assert_eq!(first.definition_digest, second.definition_digest);
+    }
+
+    #[test]
+    fn projection_digest_ignores_absent_isolated_process_profile() {
+        let first = transform();
+        let mut second = first.clone();
+        second.isolated_process = None;
+        second.definition_digest.clear();
+        let second = second.prepare().unwrap();
+        assert_eq!(first.definition_digest, second.definition_digest);
+    }
+
+    #[test]
+    fn isolated_process_engine_participates_in_digest() {
+        let first = isolated_transform("duckdb", "ghcr.io/sekai/runner:1");
+        let second = isolated_transform("duckdb", "ghcr.io/sekai/runner:2");
+        assert_ne!(first.definition_digest, second.definition_digest);
+    }
+
+    #[test]
+    fn isolated_process_prepare_trims_input_aliases() {
+        let mut transform = isolated_transform("python", "runner:1");
+        transform.isolated_process.as_mut().unwrap().inputs = vec![TransformInput {
+            alias: " left ".into(),
+            dataset_id: " in ".into(),
+        }];
+        transform.input_dataset_id = " in ".into();
+        transform.definition_digest.clear();
+        let prepared = transform.prepare().unwrap();
+        let spec = prepared.isolated_process.as_ref().unwrap();
+        assert_eq!(spec.inputs[0].alias, "left");
+        assert_eq!(spec.inputs[0].dataset_id, "in");
+        assert_eq!(prepared.input_dataset_id, "in");
+    }
+
+    #[test]
+    fn expired_claimed_work_returns_to_the_queue_until_the_lease_cap() {
+        let work = TransformWork {
+            status: TRANSFORM_WORK_CLAIMED.into(),
+            claim_expires_at_ms: 10,
+            lease_expiries: 0,
+            ..TransformWork::default()
+        };
+        assert!(transform_work_is_claimable(&work, 11));
+        let dead = TransformWork {
+            lease_expiries: MAX_TRANSFORM_LEASE_EXPIRIES,
+            ..work.clone()
+        };
+        assert!(!transform_work_is_claimable(&dead, 11));
+        assert!(!transform_work_is_claimable(
+            &TransformWork {
+                status: TRANSFORM_WORK_COMPLETED.into(),
+                ..work
+            },
+            11
+        ));
+    }
+
+    #[test]
+    fn write_back_fence_rejects_stale_generation_and_expired_lease() {
+        let work = TransformWork {
+            status: TRANSFORM_WORK_CLAIMED.into(),
+            claim_owner: "runner-a".into(),
+            claim_generation: 2,
+            fencing_token: "fence".into(),
+            claim_expires_at_ms: 50,
+            ..TransformWork::default()
+        };
+        assert!(transform_claim_fence_matches(
+            &work, "runner-a", 2, "fence", 40
+        ));
+        assert!(!transform_claim_fence_matches(
+            &work, "runner-a", 1, "fence", 40
+        ));
+        assert!(!transform_claim_fence_matches(
+            &work, "runner-a", 2, "other", 40
+        ));
+        assert!(!transform_claim_fence_matches(
+            &work, "runner-a", 2, "fence", 50
+        ));
+    }
+
+    fn isolated_transform(engine: &str, runtime_image: &str) -> GovernedTransform {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "iso".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: engine.into(),
+                runtime_image: runtime_image.into(),
+                inputs: Vec::new(),
+            }),
+        }
+        .prepare()
+        .unwrap()
     }
 
     #[test]
@@ -1083,9 +1486,63 @@ mod tests {
             .unwrap_err()
             .contains("unknown classification marking")
         );
+        assert_eq!(
+            fold_live_output_marking(None, "", Some("confidential")).unwrap(),
+            "confidential"
+        );
+        assert_eq!(
+            fold_live_output_marking(None, "public", Some("confidential")).unwrap(),
+            "confidential"
+        );
+        assert_eq!(
+            fold_live_output_marking(None, "confidential", Some("public")).unwrap(),
+            "confidential"
+        );
         assert!(require_bound_output_for_markings("", "confidential").is_err());
         assert!(require_bound_output_for_markings("out-obj", "confidential").is_ok());
         assert!(require_bound_output_for_markings("", "").is_ok());
+    }
+
+    #[test]
+    fn isolated_write_lineage_rejects_a_newer_live_receipt() {
+        let older = sample_run("a", 10);
+        let newer = sample_run("b", 20);
+        let mut rejected = older.clone();
+        assert_eq!(
+            bind_isolated_write_lineage(&mut rejected, Some(&newer)).unwrap_err(),
+            STALE_TRANSFORM_ADMISSION
+        );
+        let mut child = newer.clone();
+        bind_isolated_write_lineage(&mut child, Some(&older)).unwrap();
+        assert_eq!(child.lineage_parent, "a");
+        let mut first = older.clone();
+        bind_isolated_write_lineage(&mut first, None).unwrap();
+        assert!(first.lineage_parent.is_empty());
+    }
+
+    fn sample_run(id: &str, created_at_ms: i64) -> TransformRun {
+        TransformRun {
+            run_id: id.into(),
+            namespace: "ops".into(),
+            transform_id: "t".into(),
+            definition_digest: String::new(),
+            input_digest: String::new(),
+            output_digest: String::new(),
+            last_input_row_id: 0,
+            incremental: false,
+            quarantined: false,
+            quality_rule: String::new(),
+            rows_in: 0,
+            rows_out: 0,
+            lineage_parent: String::new(),
+            created_at_ms,
+            markings_in: String::new(),
+            markings_out: String::new(),
+            profile: String::new(),
+            engine: String::new(),
+            runtime_image: String::new(),
+            dispatch_status: String::new(),
+        }
     }
 
     fn analytical_from_bindings(inputs: Vec<TransformInput>) -> GovernedTransform {
@@ -1104,6 +1561,7 @@ mod tests {
                 memory_limit_bytes: 0,
                 time_limit_ms: 0,
             }),
+            isolated_process: None,
         }
     }
 

@@ -11,9 +11,15 @@ use crate::db::postgres_audit::lock_object_lifecycle;
 use crate::domain::storage_properties_json;
 use crate::sekai::dataset::DatasetRowRecord;
 use crate::sekai::governed_transform::{
-    GovernedTransform, InputLoadBudget, TransformInputRows, TransformRun, bind_checkpoint,
-    budget_quarantined_run, checkpoint_after_id, compute_run_tables_until,
-    derive_transform_markings, fold_output_digest, require_bound_output_for_markings, rows_digest,
+    GovernedTransform, InputLoadBudget, MAX_TRANSFORM_LEASE_EXPIRIES, STALE_TRANSFORM_CLAIM,
+    TRANSFORM_DEFINITION_CHANGED, TRANSFORM_DIGEST_MISMATCH, TRANSFORM_WORK_CLAIMED,
+    TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows,
+    TransformRun, TransformRunInputRow, TransformWork, WriteTransformRunCommand,
+    admit_isolated_run, bind_checkpoint, bind_isolated_write_lineage, budget_quarantined_run,
+    checkpoint_after_id, compute_run_tables_until, derive_transform_markings, evaluate_quality,
+    fold_live_output_marking, fold_output_digest, normalize_transform_claim_ttl_ms,
+    require_bound_output_for_markings, rows_digest, transform_claim_fence_matches,
+    transform_work_is_claimable,
 };
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 
@@ -69,6 +75,25 @@ impl PostgresDb {
             .transpose()
     }
 
+    pub fn admitted_isolated_transform(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<GovernedTransform>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT definition_json, definition_digest FROM sekai_transform_work
+                 WHERE run_id = $1",
+                &[&run_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let json: String = row.get(0);
+                let digest: String = row.get(1);
+                parse_admitted_definition(&json, &digest)
+            })
+            .transpose()
+    }
+
     pub fn run_governed_transform(
         &self,
         namespace: &str,
@@ -88,6 +113,11 @@ impl PostgresDb {
         .map_err(|error| error.to_string())?;
         let transform = load_transform(&mut tx, namespace, transform_id)?
             .ok_or_else(|| "governed transform not found".to_string())?;
+        if transform.is_isolated_process() {
+            let run = admit_isolated_postgres(&mut tx, &transform, now_ms)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(run);
+        }
         let bindings = transform.input_bindings();
         let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
         lock_ids.push(transform.output_dataset_id.as_str());
@@ -237,7 +267,8 @@ impl PostgresDb {
             .query_opt(
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-                        lineage_parent, created_at_ms, markings_in, markings_out
+                        lineage_parent, created_at_ms, markings_in, markings_out,
+                        profile, engine, runtime_image, dispatch_status
                  FROM sekai_governed_transform_run WHERE run_id = $1",
                 &[&run_id],
             )
@@ -274,7 +305,8 @@ impl PostgresDb {
             .query(
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-                        lineage_parent, created_at_ms, markings_in, markings_out
+                        lineage_parent, created_at_ms, markings_in, markings_out,
+                        profile, engine, runtime_image, dispatch_status
                  FROM sekai_governed_transform_run
                  WHERE namespace = $1
                  ORDER BY created_at_ms DESC, run_id DESC
@@ -285,6 +317,148 @@ impl PostgresDb {
             .into_iter()
             .map(row_to_run)
             .collect()
+    }
+
+    pub fn list_claimable_transform_work(
+        &self,
+        namespace: &str,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<TransformWork>, String> {
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT run_id, namespace, transform_id, definition_digest, engine, runtime_image,
+                        status, claim_owner, claim_generation, fencing_token, claim_expires_at_ms,
+                        lease_expiries, created_at_ms
+                 FROM sekai_transform_work
+                 WHERE namespace = $1
+                 ORDER BY created_at_ms, run_id",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?;
+        let cap = if limit <= 0 { 50 } else { limit.min(500) };
+        let mut out = Vec::new();
+        for row in rows {
+            let work = row_to_work(row)?;
+            if transform_work_is_claimable(&work, now_ms) {
+                out.push(work);
+                if out.len() as i64 >= cap {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn claim_transform_work(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        run_id: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<Option<(TransformWork, GovernedTransform)>, String> {
+        if runtime_id.trim().is_empty() {
+            return Err("runtime_id required".into());
+        }
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_transform_work_namespace(&mut tx, namespace)?;
+        let claimed =
+            claim_transform_work_pg(&mut tx, namespace, runtime_id, run_id, ttl_ms, now_ms)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(claimed)
+    }
+
+    pub fn heartbeat_transform_work(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<TransformWork, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let namespace = peek_transform_work_namespace(&mut tx, run_id)?;
+        lock_transform_work_namespace(&mut tx, &namespace)?;
+        // `now_ms` is the caller's transaction time, matching SQLite's
+        // injected clock. Expiry is judged at that logical time after the
+        // namespace lock serializes claim/heartbeat/write.
+        let mut work =
+            load_transform_work_pg(&mut tx, run_id)?.ok_or("transform work not found")?;
+        if !transform_claim_fence_matches(
+            &work,
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            now_ms,
+        ) {
+            return Err(STALE_TRANSFORM_CLAIM.into());
+        }
+        work.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
+        persist_fenced_transform_work_pg(&mut tx, &work, claim_generation, fencing_token)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(work)
+    }
+
+    pub fn read_transform_run_input(
+        &self,
+        command: &WriteTransformRunCommand,
+        alias: &str,
+        after_alias: &str,
+        after_row_id: i64,
+        limit: i64,
+        now_ms: i64,
+    ) -> Result<Vec<TransformRunInputRow>, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let namespace = peek_transform_work_namespace(&mut tx, &command.run_id)?;
+        lock_transform_work_namespace(&mut tx, &namespace)?;
+        let work =
+            load_transform_work_pg(&mut tx, &command.run_id)?.ok_or("transform work not found")?;
+        if !transform_claim_fence_matches(
+            &work,
+            &command.runtime_id,
+            command.claim_generation,
+            &command.fencing_token,
+            now_ms,
+        ) {
+            return Err(STALE_TRANSFORM_CLAIM.into());
+        }
+        let _transform = load_admitted_transform_pg(&mut tx, &work)?;
+        load_run_input_snapshot_pg(
+            &mut tx,
+            &command.run_id,
+            alias,
+            after_alias,
+            after_row_id,
+            limit,
+        )
+    }
+
+    pub fn write_transform_run(
+        &self,
+        command: WriteTransformRunCommand,
+        now_ms: i64,
+    ) -> Result<TransformRun, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let namespace = peek_transform_work_namespace(&mut tx, &command.run_id)?;
+        lock_transform_work_namespace(&mut tx, &namespace)?;
+        let run = write_transform_run_pg(&mut tx, &command, now_ms)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(run)
     }
 }
 
@@ -310,6 +484,32 @@ fn lock_transform_datasets(
         }
     }
     Ok(())
+}
+
+fn peek_transform_work_namespace(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+) -> Result<String, String> {
+    tx.query_opt(
+        "SELECT namespace FROM sekai_transform_work WHERE run_id = $1",
+        &[&run_id],
+    )
+    .map_err(|error| error.to_string())?
+    .map(|row| row.get(0))
+    .ok_or_else(|| "transform work not found".into())
+}
+
+fn lock_transform_work_namespace(
+    tx: &mut postgres::Transaction<'_>,
+    namespace: &str,
+) -> Result<(), String> {
+    let lock_key = advisory_lock_key(&["transform_work", namespace]);
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 467))",
+        &[&lock_key],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn load_transform(
@@ -420,8 +620,9 @@ fn insert_transform_run(
         "INSERT INTO sekai_governed_transform_run
          (run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
           last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
-          lineage_parent, created_at_ms, markings_in, markings_out)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+          lineage_parent, created_at_ms, markings_in, markings_out,
+          profile, engine, runtime_image, dispatch_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
         &[
             &run.run_id,
             &run.namespace,
@@ -439,6 +640,10 @@ fn insert_transform_run(
             &run.created_at_ms,
             &run.markings_in,
             &run.markings_out,
+            &run.profile,
+            &run.engine,
+            &run.runtime_image,
+            &run.dispatch_status,
         ],
     )
     .map(|_| ())
@@ -465,6 +670,10 @@ fn row_to_run(row: Row) -> Result<TransformRun, String> {
         created_at_ms: row.get(13),
         markings_in: row.get(14),
         markings_out: row.get(15),
+        profile: row.try_get(16).unwrap_or_default(),
+        engine: row.try_get(17).unwrap_or_default(),
+        runtime_image: row.try_get(18).unwrap_or_default(),
+        dispatch_status: row.try_get(19).unwrap_or_default(),
     })
 }
 
@@ -561,13 +770,593 @@ fn stamp_object_marking(
     Ok(())
 }
 
+fn admit_isolated_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    transform: &GovernedTransform,
+    now_ms: i64,
+) -> Result<TransformRun, String> {
+    let bindings = transform.input_bindings();
+    let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
+    lock_ids.push(transform.output_dataset_id.as_str());
+    lock_transform_datasets(tx, &lock_ids)?;
+    let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
+    let mut input_object_tokens: Vec<Option<String>> = Vec::new();
+    for (alias, dataset_id) in &bindings {
+        loaded.push((
+            alias.clone(),
+            load_dataset_column_names(tx, dataset_id)?,
+            load_row_records(tx, dataset_id, 0, None)?,
+        ));
+        let object_id = load_dataset_object_id(tx, dataset_id)?;
+        input_object_tokens.push(load_object_marking_token(tx, &object_id)?);
+    }
+    let output_object_id = load_dataset_object_id(tx, &transform.output_dataset_id)?;
+    let prior_token = load_object_marking_token(tx, &output_object_id)?;
+    let marking_rows: Vec<&HashMap<String, String>> = loaded
+        .iter()
+        .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row))
+        .collect();
+    let (markings_in, markings_out) = derive_transform_markings(
+        None,
+        input_object_tokens.iter().map(|token| token.as_deref()),
+        prior_token.as_deref(),
+        marking_rows,
+    )?;
+    let tables: Vec<TransformInputRows<'_>> = loaded
+        .iter()
+        .map(|(alias, columns, records)| TransformInputRows {
+            alias,
+            records,
+            columns,
+        })
+        .collect();
+    let mut run = admit_isolated_run(transform, &tables, now_ms, Uuid::new_v4().to_string())
+        .map_err(|error| error.message())?;
+    run.markings_in = markings_in;
+    run.markings_out = markings_out;
+    insert_transform_run(tx, &run)?;
+    persist_run_input_snapshot_pg(tx, &run.run_id, &bindings, &loaded)?;
+    let spec = transform
+        .isolated_process
+        .as_ref()
+        .ok_or("isolated_process profile required")?;
+    persist_admitted_transform_work_pg(
+        tx,
+        &TransformWork {
+            run_id: run.run_id.clone(),
+            namespace: transform.namespace.clone(),
+            transform_id: transform.transform_id.clone(),
+            definition_digest: transform.definition_digest.clone(),
+            engine: spec.engine.clone(),
+            runtime_image: spec.runtime_image.clone(),
+            status: TRANSFORM_WORK_PENDING.into(),
+            claim_owner: String::new(),
+            claim_generation: 0,
+            fencing_token: String::new(),
+            claim_expires_at_ms: 0,
+            lease_expiries: 0,
+            created_at_ms: now_ms,
+        },
+        transform,
+    )?;
+    Ok(run)
+}
+
+fn claim_transform_work_pg(
+    tx: &mut postgres::Transaction<'_>,
+    namespace: &str,
+    runtime_id: &str,
+    run_id: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+) -> Result<Option<(TransformWork, GovernedTransform)>, String> {
+    let rows = tx
+        .query(
+            "SELECT run_id, namespace, transform_id, definition_digest, engine, runtime_image,
+                    status, claim_owner, claim_generation, fencing_token, claim_expires_at_ms,
+                    lease_expiries, created_at_ms
+             FROM sekai_transform_work
+             WHERE namespace = $1
+             ORDER BY created_at_ms, run_id",
+            &[&namespace],
+        )
+        .map_err(|error| error.to_string())?;
+    let wanted = run_id.trim();
+    let mut chosen: Option<(TransformWork, GovernedTransform)> = None;
+    for row in rows {
+        let preview = row_to_work(row)?;
+        if !wanted.is_empty() && preview.run_id != wanted {
+            continue;
+        }
+        let Some(mut work) = load_transform_work_pg(tx, &preview.run_id)? else {
+            continue;
+        };
+        if work.status == TRANSFORM_WORK_CLAIMED && work.claim_expires_at_ms <= now_ms {
+            work.lease_expiries = work.lease_expiries.saturating_add(1);
+            if work.lease_expiries >= MAX_TRANSFORM_LEASE_EXPIRIES {
+                work.status = TRANSFORM_WORK_FAILED.into();
+                persist_transform_work_pg(tx, &work)?;
+                stamp_run_dispatch_pg(tx, &work.run_id, TRANSFORM_WORK_FAILED)?;
+                delete_run_input_snapshot_pg(tx, &work.run_id)?;
+                continue;
+            }
+            persist_transform_work_pg(tx, &work)?;
+        }
+        if !transform_work_is_claimable(&work, now_ms) {
+            continue;
+        }
+        let transform = match load_admitted_transform_pg(tx, &work) {
+            Ok(transform) => transform,
+            Err(error) if error == TRANSFORM_DEFINITION_CHANGED => {
+                work.status = TRANSFORM_WORK_FAILED.into();
+                persist_transform_work_pg(tx, &work)?;
+                stamp_run_dispatch_pg(tx, &work.run_id, TRANSFORM_WORK_FAILED)?;
+                delete_run_input_snapshot_pg(tx, &work.run_id)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        chosen = Some((work, transform));
+        break;
+    }
+    let (mut work, transform) = match chosen {
+        Some(chosen) => chosen,
+        None => return Ok(None),
+    };
+    work.status = TRANSFORM_WORK_CLAIMED.into();
+    work.claim_owner = runtime_id.to_string();
+    work.claim_generation = work.claim_generation.saturating_add(1);
+    work.fencing_token = Uuid::new_v4().to_string();
+    work.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
+    persist_transform_work_pg(tx, &work)?;
+    stamp_run_dispatch_pg(tx, &work.run_id, TRANSFORM_WORK_CLAIMED)?;
+    Ok(Some((work, transform)))
+}
+
+fn write_transform_run_pg(
+    tx: &mut postgres::Transaction<'_>,
+    command: &WriteTransformRunCommand,
+    now_ms: i64,
+) -> Result<TransformRun, String> {
+    let work = load_transform_work_pg(tx, &command.run_id)?.ok_or("transform work not found")?;
+    if !transform_claim_fence_matches(
+        &work,
+        &command.runtime_id,
+        command.claim_generation,
+        &command.fencing_token,
+        now_ms,
+    ) {
+        return Err(STALE_TRANSFORM_CLAIM.into());
+    }
+    let transform = load_admitted_transform_pg(tx, &work)?;
+    lock_transform_datasets(tx, &[transform.output_dataset_id.as_str()])?;
+    let mut run = tx
+        .query_opt(
+            "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
+                    last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
+                    lineage_parent, created_at_ms, markings_in, markings_out,
+                    profile, engine, runtime_image, dispatch_status
+             FROM sekai_governed_transform_run WHERE run_id = $1",
+            &[&command.run_id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(row_to_run)
+        .transpose()?
+        .ok_or("transform run not found")?;
+    let computed = rows_digest(&command.rows);
+    if !command.quarantined && computed != command.output_digest {
+        return Err(TRANSFORM_DIGEST_MISMATCH.into());
+    }
+    let quality_error = evaluate_quality(&command.rows, &transform.quality_rule)
+        .err()
+        .map(|error| error.message());
+    let quarantined = command.quarantined || quality_error.is_some();
+    let output_object_id = load_dataset_object_id(tx, &transform.output_dataset_id)?;
+    if quarantined {
+        run.quarantined = true;
+        run.quality_rule = quality_error.unwrap_or_else(|| {
+            if command.quality_rule.trim().is_empty() {
+                transform.quality_rule.clone()
+            } else {
+                command.quality_rule.clone()
+            }
+        });
+        run.rows_out = 0;
+        let live: Vec<HashMap<String, String>> =
+            load_row_records(tx, &transform.output_dataset_id, 0, None)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect();
+        run.output_digest = rows_digest(&live);
+        if !output_object_id.trim().is_empty() {
+            lock_object_lifecycle(tx, &output_object_id)?;
+        }
+        let live_output = load_object_marking_token(tx, &output_object_id)?;
+        run.markings_out =
+            fold_live_output_marking(None, &run.markings_out, live_output.as_deref())?;
+        require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
+        run.dispatch_status = TRANSFORM_WORK_COMPLETED.into();
+        run.engine = work.engine.clone();
+        run.runtime_image = work.runtime_image.clone();
+        persist_transform_run_pg(tx, &run)?;
+        let mut done = work;
+        done.status = TRANSFORM_WORK_COMPLETED.into();
+        persist_fenced_transform_work_pg(
+            tx,
+            &done,
+            command.claim_generation,
+            &command.fencing_token,
+        )?;
+        delete_run_input_snapshot_pg(tx, &run.run_id)?;
+        return Ok(run);
+    }
+    let live = match load_checkpoint(tx, &transform.namespace, &transform.transform_id)? {
+        Some(((_, live_run_id, _), _)) if !live_run_id.is_empty() => {
+            load_transform_run_pg(tx, &live_run_id)?
+        }
+        _ => None,
+    };
+    bind_isolated_write_lineage(&mut run, live.as_ref())?;
+    if !output_object_id.trim().is_empty() {
+        lock_object_lifecycle(tx, &output_object_id)?;
+    }
+    let live_output = load_object_marking_token(tx, &output_object_id)?;
+    run.markings_out = fold_live_output_marking(None, &run.markings_out, live_output.as_deref())?;
+    require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
+    tx.execute(
+        "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
+        &[&transform.output_dataset_id],
+    )
+    .map_err(|error| error.to_string())?;
+    insert_output_rows(tx, &transform.output_dataset_id, &command.rows)?;
+    run.output_digest = computed;
+    run.rows_out = command.rows.len() as i32;
+    run.quarantined = false;
+    run.dispatch_status = TRANSFORM_WORK_COMPLETED.into();
+    run.engine = work.engine.clone();
+    run.runtime_image = work.runtime_image.clone();
+    stamp_object_marking(tx, &output_object_id, &run.markings_out, now_ms)?;
+    persist_transform_run_pg(tx, &run)?;
+    tx.execute(
+        "INSERT INTO sekai_governed_transform_checkpoint
+         (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (namespace, transform_id) DO UPDATE SET
+            definition_digest = EXCLUDED.definition_digest,
+            last_input_row_id = EXCLUDED.last_input_row_id,
+            live_run_id = EXCLUDED.live_run_id,
+            live_output_digest = EXCLUDED.live_output_digest",
+        &[
+            &transform.namespace,
+            &transform.transform_id,
+            &transform.definition_digest,
+            &run.last_input_row_id,
+            &run.run_id,
+            &run.output_digest,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut done = work;
+    done.status = TRANSFORM_WORK_COMPLETED.into();
+    persist_fenced_transform_work_pg(tx, &done, command.claim_generation, &command.fencing_token)?;
+    delete_run_input_snapshot_pg(tx, &run.run_id)?;
+    Ok(run)
+}
+
+fn row_to_work(row: Row) -> Result<TransformWork, String> {
+    Ok(TransformWork {
+        run_id: row.get(0),
+        namespace: row.get(1),
+        transform_id: row.get(2),
+        definition_digest: row.get(3),
+        engine: row.get(4),
+        runtime_image: row.get(5),
+        status: row.get(6),
+        claim_owner: row.get(7),
+        claim_generation: row.get(8),
+        fencing_token: row.get(9),
+        claim_expires_at_ms: row.get(10),
+        lease_expiries: row.get(11),
+        created_at_ms: row.get(12),
+    })
+}
+
+fn load_transform_run_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+) -> Result<Option<TransformRun>, String> {
+    tx.query_opt(
+        "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
+                last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
+                lineage_parent, created_at_ms, markings_in, markings_out,
+                profile, engine, runtime_image, dispatch_status
+         FROM sekai_governed_transform_run WHERE run_id = $1",
+        &[&run_id],
+    )
+    .map_err(|error| error.to_string())?
+    .map(row_to_run)
+    .transpose()
+}
+
+fn load_transform_work_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+) -> Result<Option<TransformWork>, String> {
+    tx.query_opt(
+        "SELECT run_id, namespace, transform_id, definition_digest, engine, runtime_image,
+                status, claim_owner, claim_generation, fencing_token, claim_expires_at_ms,
+                lease_expiries, created_at_ms
+         FROM sekai_transform_work WHERE run_id = $1 FOR UPDATE",
+        &[&run_id],
+    )
+    .map_err(|error| error.to_string())?
+    .map(row_to_work)
+    .transpose()
+}
+
+fn persist_admitted_transform_work_pg(
+    tx: &mut postgres::Transaction<'_>,
+    work: &TransformWork,
+    transform: &GovernedTransform,
+) -> Result<(), String> {
+    let json = serde_json::to_string(transform).map_err(|error| error.to_string())?;
+    upsert_transform_work_pg(tx, work, &json)
+}
+
+fn persist_transform_work_pg(
+    tx: &mut postgres::Transaction<'_>,
+    work: &TransformWork,
+) -> Result<(), String> {
+    upsert_transform_work_pg(tx, work, "")
+}
+
+fn upsert_transform_work_pg(
+    tx: &mut postgres::Transaction<'_>,
+    work: &TransformWork,
+    definition_json: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO sekai_transform_work
+         (run_id, namespace, transform_id, definition_digest, definition_json, engine, runtime_image, status,
+          claim_owner, claim_generation, fencing_token, claim_expires_at_ms, lease_expiries, created_at_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         ON CONFLICT (run_id) DO UPDATE SET
+            status = EXCLUDED.status,
+            claim_owner = EXCLUDED.claim_owner,
+            claim_generation = EXCLUDED.claim_generation,
+            fencing_token = EXCLUDED.fencing_token,
+            claim_expires_at_ms = EXCLUDED.claim_expires_at_ms,
+            lease_expiries = EXCLUDED.lease_expiries",
+        &[
+            &work.run_id,
+            &work.namespace,
+            &work.transform_id,
+            &work.definition_digest,
+            &definition_json,
+            &work.engine,
+            &work.runtime_image,
+            &work.status,
+            &work.claim_owner,
+            &work.claim_generation,
+            &work.fencing_token,
+            &work.claim_expires_at_ms,
+            &work.lease_expiries,
+            &work.created_at_ms,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn persist_fenced_transform_work_pg(
+    tx: &mut postgres::Transaction<'_>,
+    work: &TransformWork,
+    expected_generation: i64,
+    expected_token: &str,
+) -> Result<(), String> {
+    let changed = tx
+        .execute(
+            "UPDATE sekai_transform_work SET
+                status = $2,
+                claim_owner = $3,
+                claim_generation = $4,
+                fencing_token = $5,
+                claim_expires_at_ms = $6,
+                lease_expiries = $7
+             WHERE run_id = $1
+               AND claim_generation = $8
+               AND fencing_token = $9
+               AND status = $10",
+            &[
+                &work.run_id,
+                &work.status,
+                &work.claim_owner,
+                &work.claim_generation,
+                &work.fencing_token,
+                &work.claim_expires_at_ms,
+                &work.lease_expiries,
+                &expected_generation,
+                &expected_token,
+                &TRANSFORM_WORK_CLAIMED,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err(STALE_TRANSFORM_CLAIM.into());
+    }
+    Ok(())
+}
+
+fn persist_run_input_snapshot_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    bindings: &[(String, String)],
+    loaded: &[(String, Vec<String>, Vec<DatasetRowRecord>)],
+) -> Result<(), String> {
+    // Snapshot is the admitted pin: persist the full loaded set, not a stream.
+    for ((alias, dataset_id), (_, _, records)) in bindings.iter().zip(loaded.iter()) {
+        for (row_id, values) in records {
+            let values_json = serde_json::to_string(values).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO sekai_transform_run_input
+                 (run_id, alias, dataset_id, row_id, values_json)
+                 VALUES ($1,$2,$3,$4,$5)",
+                &[&run_id, alias, dataset_id, row_id, &values_json],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn load_admitted_transform_pg(
+    tx: &mut postgres::Transaction<'_>,
+    work: &TransformWork,
+) -> Result<GovernedTransform, String> {
+    let json: String = tx
+        .query_opt(
+            "SELECT definition_json FROM sekai_transform_work WHERE run_id = $1",
+            &[&work.run_id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get(0))
+        .ok_or_else(|| "transform work not found".to_string())?;
+    parse_admitted_definition(&json, &work.definition_digest)
+}
+
+fn parse_admitted_definition(
+    json: &str,
+    definition_digest: &str,
+) -> Result<GovernedTransform, String> {
+    if json.trim().is_empty() {
+        return Err(TRANSFORM_DEFINITION_CHANGED.into());
+    }
+    let transform: GovernedTransform =
+        serde_json::from_str(json).map_err(|_| TRANSFORM_DEFINITION_CHANGED.to_string())?;
+    if transform.definition_digest != definition_digest {
+        return Err(TRANSFORM_DEFINITION_CHANGED.into());
+    }
+    Ok(transform)
+}
+
+fn load_run_input_snapshot_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    alias: &str,
+    after_alias: &str,
+    after_row_id: i64,
+    limit: i64,
+) -> Result<Vec<TransformRunInputRow>, String> {
+    let cap = if limit <= 0 { 1_000 } else { limit.min(5_000) };
+    let wanted = alias.trim();
+    let after = after_alias.trim();
+    // Empty alias walks every input in (alias, row_id) order. Continue with
+    // after_alias + after_row_id from the last row. Named alias stays per input.
+    let rows = if wanted.is_empty() {
+        tx.query(
+            "SELECT alias, dataset_id, row_id, values_json
+             FROM sekai_transform_run_input
+             WHERE run_id = $1
+               AND (alias > $2 OR (alias = $2 AND row_id > $3))
+             ORDER BY alias, row_id
+             LIMIT $4",
+            &[&run_id, &after, &after_row_id, &cap],
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        tx.query(
+            "SELECT alias, dataset_id, row_id, values_json
+             FROM sekai_transform_run_input
+             WHERE run_id = $1 AND alias = $2 AND row_id > $3
+             ORDER BY row_id
+             LIMIT $4",
+            &[&run_id, &wanted, &after_row_id, &cap],
+        )
+        .map_err(|error| error.to_string())?
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let values_json: String = row.get(3);
+        let values: HashMap<String, String> =
+            serde_json::from_str(&values_json).map_err(|error| error.to_string())?;
+        out.push(TransformRunInputRow {
+            alias: row.get(0),
+            dataset_id: row.get(1),
+            row_id: row.get(2),
+            values,
+        });
+    }
+    Ok(out)
+}
+
+fn delete_run_input_snapshot_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM sekai_transform_run_input WHERE run_id = $1",
+        &[&run_id],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn persist_transform_run_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run: &TransformRun,
+) -> Result<(), String> {
+    let incremental: i16 = i16::from(run.incremental);
+    let quarantined: i16 = i16::from(run.quarantined);
+    tx.execute(
+        "UPDATE sekai_governed_transform_run SET
+            output_digest = $2, last_input_row_id = $3, incremental = $4, quarantined = $5,
+            quality_rule = $6, rows_in = $7, rows_out = $8, lineage_parent = $9,
+            markings_in = $10, markings_out = $11, profile = $12, engine = $13,
+            runtime_image = $14, dispatch_status = $15
+         WHERE run_id = $1",
+        &[
+            &run.run_id,
+            &run.output_digest,
+            &run.last_input_row_id,
+            &incremental,
+            &quarantined,
+            &run.quality_rule,
+            &run.rows_in,
+            &run.rows_out,
+            &run.lineage_parent,
+            &run.markings_in,
+            &run.markings_out,
+            &run.profile,
+            &run.engine,
+            &run.runtime_image,
+            &run.dispatch_status,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn stamp_run_dispatch_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE sekai_governed_transform_run SET dispatch_status = $2 WHERE run_id = $1",
+        &[&run_id, &status],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::postgres::ScratchDatabase;
     use crate::sekai::dataset::{ColumnDef, Dataset, RowQuery};
     use crate::sekai::governed_transform::{
-        AnalyticalSpec, CONTRACT_VERSION, TransformInput, TransformStep,
+        AnalyticalSpec, CONTRACT_VERSION, ISOLATED_CLASS, IsolatedProcessSpec, TransformInput,
+        TransformStep,
     };
 
     fn dataset(id: &str) -> Dataset {
@@ -626,6 +1415,7 @@ mod tests {
             quality_rule: String::new(),
             definition_digest: String::new(),
             analytical: None,
+            isolated_process: None,
         }
         .prepare()
         .unwrap();
@@ -710,6 +1500,7 @@ mod tests {
             quality_rule: String::new(),
             definition_digest: String::new(),
             analytical: None,
+            isolated_process: None,
         }
         .prepare()
         .unwrap();
@@ -760,6 +1551,7 @@ mod tests {
             quality_rule: String::new(),
             definition_digest: String::new(),
             analytical: None,
+            isolated_process: None,
         }
         .prepare()
         .unwrap();
@@ -800,6 +1592,7 @@ mod tests {
             quality_rule: String::new(),
             definition_digest: String::new(),
             analytical: None,
+            isolated_process: None,
         }
         .prepare()
         .unwrap();
@@ -846,6 +1639,7 @@ mod tests {
             quality_rule: String::new(),
             definition_digest: String::new(),
             analytical: None,
+            isolated_process: None,
         }
         .prepare()
         .unwrap();
@@ -877,6 +1671,7 @@ mod tests {
             quality_rule: String::new(),
             definition_digest: String::new(),
             analytical: Some(AnalyticalSpec::default()),
+            isolated_process: None,
         }
         .prepare()
         .unwrap()
@@ -1014,6 +1809,7 @@ mod tests {
                 memory_limit_bytes: 0,
                 time_limit_ms: 0,
             }),
+            isolated_process: None,
         }
         .prepare()
         .unwrap();
@@ -1065,6 +1861,7 @@ mod tests {
                 memory_limit_bytes: 0,
                 time_limit_ms: 1,
             }),
+            isolated_process: None,
         }
         .prepare()
         .unwrap();
@@ -1080,6 +1877,606 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    fn isolated_transform() -> GovernedTransform {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "iso1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                inputs: Vec::new(),
+            }),
+        }
+        .prepare()
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_run_claims_reads_and_commits_write_back() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        assert_eq!(admitted.profile, ISOLATED_CLASS);
+        assert_eq!(admitted.dispatch_status, TRANSFORM_WORK_PENDING);
+        assert!(
+            db.query_dataset_rows("out", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        assert_eq!(work.run_id, admitted.run_id);
+        assert_eq!(work.status, TRANSFORM_WORK_CLAIMED);
+        let fence = WriteTransformRunCommand {
+            run_id: work.run_id.clone(),
+            runtime_id: work.claim_owner.clone(),
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token.clone(),
+            ..WriteTransformRunCommand::default()
+        };
+        let inputs = db
+            .read_transform_run_input(&fence, "", "", 0, 100, 40)
+            .unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].values.get("id").map(String::as_str), Some("1"));
+        let output = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("keep".into(), "yes".into()),
+            ("derived".into(), "ok".into()),
+        ])];
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id.clone(),
+                    runtime_id: work.claim_owner.clone(),
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token.clone(),
+                    rows: output.clone(),
+                    output_digest: rows_digest(&output),
+                    quarantined: false,
+                    quality_rule: String::new(),
+                },
+                50,
+            )
+            .unwrap();
+        assert_eq!(committed.dispatch_status, TRANSFORM_WORK_COMPLETED);
+        assert_eq!(committed.rows_out, 1);
+        let live = db.query_dataset_rows("out", &RowQuery::default()).unwrap();
+        assert_eq!(live, output);
+        assert_eq!(committed.output_digest, rows_digest(&live));
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_write_back_folds_live_output_marking() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        let mut input = dataset("in");
+        input.object_id = "in-obj".into();
+        let mut output = dataset("out");
+        output.object_id = "out-obj".into();
+        db.create_object(&object("in-obj", None)).unwrap();
+        db.create_object(&object("out-obj", None)).unwrap();
+        db.create_dataset(&input).unwrap();
+        db.create_dataset(&output).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        assert!(admitted.markings_out.is_empty());
+        let mut live_object = db.get_object("out-obj").unwrap().unwrap();
+        live_object
+            .properties
+            .insert(OBJECT_CLASSIFICATION_PROPERTY.into(), "confidential".into());
+        db.update_object(&live_object).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let output_rows = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("keep".into(), "yes".into()),
+        ])];
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    rows: output_rows.clone(),
+                    output_digest: rows_digest(&output_rows),
+                    quarantined: false,
+                    quality_rule: String::new(),
+                },
+                50,
+            )
+            .unwrap();
+        assert_eq!(committed.markings_out, "confidential");
+        let stamped = db.get_object("out-obj").unwrap().unwrap();
+        assert_eq!(
+            stamped.properties.get(OBJECT_CLASSIFICATION_PROPERTY),
+            Some(&"confidential".to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_quarantined_write_back_folds_live_output_marking() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        let mut input = dataset("in");
+        input.object_id = "in-obj".into();
+        let mut output = dataset("out");
+        output.object_id = "out-obj".into();
+        db.create_object(&object("in-obj", None)).unwrap();
+        db.create_object(&object("out-obj", None)).unwrap();
+        db.create_dataset(&input).unwrap();
+        db.create_dataset(&output).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let mut live_object = db.get_object("out-obj").unwrap().unwrap();
+        live_object
+            .properties
+            .insert(OBJECT_CLASSIFICATION_PROPERTY.into(), "confidential".into());
+        db.update_object(&live_object).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    rows: vec![HashMap::from([("id".into(), "1".into())])],
+                    output_digest: "ignored".into(),
+                    quarantined: true,
+                    quality_rule: "worker-failed".into(),
+                },
+                50,
+            )
+            .unwrap();
+        assert!(committed.quarantined);
+        assert_eq!(committed.markings_out, "confidential");
+        assert!(
+            db.query_dataset_rows("out", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_stale_fence_write_back_commits_nothing() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let output = vec![HashMap::from([("id".into(), "x".into())])];
+        let error = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: "not-the-token".into(),
+                    rows: output,
+                    output_digest: "ignored".into(),
+                    quarantined: false,
+                    quality_rule: String::new(),
+                },
+                40,
+            )
+            .unwrap_err();
+        assert_eq!(error, STALE_TRANSFORM_CLAIM);
+        assert!(
+            db.query_dataset_rows("out", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+        let stored = db
+            .get_governed_transform_run(&admitted.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.dispatch_status, TRANSFORM_WORK_CLAIMED);
+        assert!(stored.output_digest.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_expired_lease_returns_to_the_queue() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (first, _) = db
+            .claim_transform_work("ops", "runner-a", "", 5, 30)
+            .unwrap()
+            .expect("first claim");
+        let (second, _) = db
+            .claim_transform_work("ops", "runner-b", "", 5, first.claim_expires_at_ms + 1)
+            .unwrap()
+            .expect("expired lease returns to queue");
+        assert_eq!(second.claim_owner, "runner-b");
+        assert_eq!(second.claim_generation, first.claim_generation + 1);
+        assert_eq!(second.lease_expiries, 1);
+        assert_ne!(second.fencing_token, first.fencing_token);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_third_lease_expiry_fails_the_run() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let mut now_ms = 30;
+        for attempt in 0..MAX_TRANSFORM_LEASE_EXPIRIES {
+            let (work, _) = db
+                .claim_transform_work("ops", &format!("runner-{attempt}"), "", 5, now_ms)
+                .unwrap()
+                .expect("claim before the expiry cap");
+            now_ms = work.claim_expires_at_ms + 1;
+        }
+        assert!(
+            db.claim_transform_work("ops", "runner-final", "", 5, now_ms)
+                .unwrap()
+                .is_none()
+        );
+        let stored = db
+            .get_governed_transform_run(&admitted.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.dispatch_status, TRANSFORM_WORK_FAILED);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_reads_the_admitted_input_snapshot() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "2".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let inputs = db
+            .read_transform_run_input(
+                &WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    ..WriteTransformRunCommand::default()
+                },
+                "",
+                "",
+                0,
+                100,
+                40,
+            )
+            .unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].values.get("id").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_write_back_enforces_the_jobspec_quality_rule() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "iso1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: "required:keep".into(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                inputs: Vec::new(),
+            }),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let output = vec![HashMap::from([("id".into(), "1".into())])];
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    rows: output.clone(),
+                    output_digest: rows_digest(&output),
+                    quarantined: false,
+                    quality_rule: String::new(),
+                },
+                40,
+            )
+            .unwrap();
+        assert!(committed.quarantined);
+        assert!(committed.quality_rule.contains("required:keep"));
+        assert!(
+            db.query_dataset_rows("out", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+        let stored = db
+            .get_governed_transform_run(&admitted.run_id)
+            .unwrap()
+            .unwrap();
+        assert!(stored.quarantined);
+        assert_eq!(stored.output_digest, rows_digest(&[]));
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_write_back_uses_the_admitted_jobspec() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.create_dataset(&dataset("other")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let mut updated = isolated_transform();
+        updated.isolated_process.as_mut().unwrap().engine = "duckdb".into();
+        updated.output_dataset_id = "other".into();
+        updated.definition_digest.clear();
+        let updated = updated.prepare().unwrap();
+        db.put_governed_transform(&updated, 25).unwrap();
+        let (work, transform) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("pinned admitted JobSpec");
+        assert_eq!(work.run_id, admitted.run_id);
+        assert_eq!(
+            transform.isolated_process.as_ref().unwrap().engine,
+            "python"
+        );
+        assert_eq!(transform.output_dataset_id, "out");
+        let output = vec![HashMap::from([("id".into(), "1".into())])];
+        db.write_transform_run(
+            WriteTransformRunCommand {
+                run_id: work.run_id,
+                runtime_id: work.claim_owner,
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token,
+                rows: output.clone(),
+                output_digest: rows_digest(&output),
+                quarantined: false,
+                quality_rule: String::new(),
+            },
+            40,
+        )
+        .unwrap();
+        assert_eq!(
+            db.query_dataset_rows("out", &RowQuery::default()).unwrap(),
+            output
+        );
+        assert!(
+            db.query_dataset_rows("other", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_empty_alias_paginates_across_inputs() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("left")).unwrap();
+        db.create_dataset(&dataset("right")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "left",
+            &[
+                HashMap::from([("id".into(), "1".into()), ("keep".into(), "yes".into())]),
+                HashMap::from([("id".into(), "2".into()), ("keep".into(), "yes".into())]),
+            ],
+        )
+        .unwrap();
+        db.append_dataset_rows(
+            "right",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "iso1".into(),
+            input_dataset_id: "left".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                inputs: vec![
+                    TransformInput {
+                        alias: "left".into(),
+                        dataset_id: "left".into(),
+                    },
+                    TransformInput {
+                        alias: "right".into(),
+                        dataset_id: "right".into(),
+                    },
+                ],
+            }),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let fence = WriteTransformRunCommand {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            ..WriteTransformRunCommand::default()
+        };
+        let mut seen = Vec::new();
+        let mut after_alias = String::new();
+        let mut after_row_id = 0;
+        loop {
+            let page = db
+                .read_transform_run_input(&fence, "", &after_alias, after_row_id, 1, 40)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            after_alias = page[0].alias.clone();
+            after_row_id = page[0].row_id;
+            seen.push((page[0].alias.clone(), page[0].values.get("id").cloned()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("left".into(), Some("1".into())),
+                ("left".into(), Some("2".into())),
+                ("right".into(), Some("1".into())),
+            ]
         );
     }
 }

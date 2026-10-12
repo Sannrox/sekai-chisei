@@ -150,15 +150,17 @@ provenance on the receipt (`reported_catalog_version`), not a grant.
 
 The graph retrieval capabilities advertise
 `epistemic_descriptor_projection` and bounded descriptor source-list limits.
-`DiscoverCapabilities` reports `sekai.transforms.projection` and
-`sekai.transforms.analytical` on the core pack as the in-process dataset
-transform host. `lifecycle_state` is `disabled` unless the experimental RPC
-gate is on. Invocation of `PutGovernedTransform` / `RunGovernedTransform` /
+`DiscoverCapabilities` reports `sekai.transforms.projection`,
+`sekai.transforms.analytical`, and `sekai.transforms.isolated_process` on
+the core pack as governed dataset transform profiles. `lifecycle_state` is
+`disabled` unless the experimental RPC gate is on. Invocation of
+`PutGovernedTransform` / `RunGovernedTransform` /
 `GetGovernedTransformRun` / `ListGovernedTransforms` /
-`ListGovernedTransformRuns` still requires that gate. See
-[governed-transforms.md](governed-transforms.md),
-[ADR 0097](decisions/0097-in-process-transform-host.md), and
-[ADR 0101](decisions/0101-analytical-transform-profile.md).
+`ListGovernedTransformRuns` / isolated-process claim RPCs still requires
+that gate. See [governed-transforms.md](governed-transforms.md),
+[ADR 0097](decisions/0097-in-process-transform-host.md),
+[ADR 0101](decisions/0101-analytical-transform-profile.md), and
+[ADR 0102](decisions/0102-isolated-process-transform-profile.md).
 
 Asserted graph retrieval is available on both reusable community backends.
 Query-time ontology entailment is currently SQLite-only; PostgreSQL advertises
