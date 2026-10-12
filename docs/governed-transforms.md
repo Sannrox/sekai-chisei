@@ -12,7 +12,9 @@ runs write output rows, record lineage, and store a receipt. Isolated-process
 runs return a pending receipt; a claimed worker streams the admitted input
 snapshot and writes the output, receipt, and lineage in one fenced
 transaction against the admitted JobSpec. Claim, heartbeat, input, and
-write-back RPCs require credential admin. Objects stay Action-written.
+write-back RPCs require credential admin. Workers pin
+`sekai-client::claim` rather than copying those RPCs. Objects stay
+Action-written.
 
 The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `GetGovernedTransformRun`, `ListGovernedTransforms`,

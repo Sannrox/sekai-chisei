@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `sekai-client` publishes a versioned runtime-claim module
+  (`sekai.sdk-runtime-claim/v1`) so Action and isolated-process transform
+  workers share list, claim, heartbeat, ack, claim-event, streamed input
+  read, and fenced write-back helpers. Typed errors keep fence loss distinct
+  from idle, contention, denial, and unavailability (#1389).
+
 - Isolated-process governed transforms admit claimable work instead of
   computing in-process. A worker claims with a fencing token, streams the
   admitted JobSpec snapshot, and writes the output, receipt, and lineage in
