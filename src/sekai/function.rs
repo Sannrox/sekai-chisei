@@ -307,9 +307,33 @@ where
     execute_with_source_and_result_filter(db, f, params, Some(source), allow, None, &RejectLlmHost)
 }
 
+/// Refusal for storing, invoking, or extracting with an LLM function revision whose
+/// digest has no allowing evaluation gate (`publish_function_revision`).
+pub const LLM_FUNCTION_REQUIRES_GATE: &str =
+    "LLM function revisions require an allowing evaluation gate";
+
+pub fn has_llm_step(function: &Function) -> bool {
+    function
+        .pipeline
+        .iter()
+        .any(|step| matches!(step, PipelineStep::Llm(_)))
+}
+
+/// Digest over every execution-affecting field: name, params, and each pipeline step.
+/// Gate approvals and invocation receipts bind to it.
 pub fn function_digest(function: &Function) -> String {
     let mut hasher = Sha256::new();
     hasher.update(function.name.as_bytes());
+    hasher.update(
+        serde_json::to_vec(
+            &function
+                .params
+                .iter()
+                .map(|param| (&param.name, &param.param_type, param.required))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default(),
+    );
     hasher.update(
         serde_json::to_vec(
             &function
@@ -323,6 +347,7 @@ pub fn function_digest(function: &Function) -> String {
                         step.property,
                         step.value,
                         step.relation,
+                        step.dir,
                         step.func,
                         step.field,
                         step.alias
@@ -1076,6 +1101,10 @@ impl SekaiDb {
                 params TEXT NOT NULL DEFAULT '[]',
                 pipeline TEXT NOT NULL DEFAULT '[]',
                 created INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sekai_function_gate_approvals (
+                function_digest TEXT PRIMARY KEY,
+                name TEXT NOT NULL
             );",
         )
         .map_err(|e| e.to_string())
@@ -1098,6 +1127,29 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn approve_function_gate(&self, function_digest: &str, name: &str) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "INSERT OR IGNORE INTO sekai_function_gate_approvals (function_digest, name)
+                 VALUES (?1, ?2)",
+                params![function_digest, name],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn function_gate_approved(&self, function_digest: &str) -> Result<bool, String> {
+        self.conn()
+            .query_row(
+                "SELECT 1 FROM sekai_function_gate_approvals WHERE function_digest = ?1",
+                params![function_digest],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|e| e.to_string())
     }
 
     pub fn get_function(&self, name: &str) -> Result<Option<Function>, String> {
@@ -1753,6 +1805,42 @@ mod tests {
                 }),
             ],
         }
+    }
+
+    #[test]
+    fn digest_binds_traversal_direction_and_params() {
+        let base = classify_function();
+        let mut incoming = base.clone();
+        if let PipelineStep::Operator(step) = &mut incoming.pipeline[0] {
+            step.dir = "in".into();
+        }
+        let mut with_param = base.clone();
+        with_param.params.push(FuncParam {
+            name: "lang".into(),
+            param_type: "string".into(),
+            required: true,
+        });
+        assert_ne!(function_digest(&base), function_digest(&incoming));
+        assert_ne!(function_digest(&base), function_digest(&with_param));
+    }
+
+    #[test]
+    fn gated_publish_approves_only_the_stored_revision() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let published = classify_function();
+        assert_eq!(
+            db.create_function(&published).unwrap_err(),
+            LLM_FUNCTION_REQUIRES_GATE
+        );
+        db.publish_gated_function(&published).unwrap();
+        db.publish_gated_function(&published).unwrap();
+        assert!(db.function_gate_approved(&published).unwrap());
+        let mut other = published.clone();
+        if let PipelineStep::Llm(step) = &mut other.pipeline[1] {
+            step.prompt_revision = "classify/v2".into();
+        }
+        assert!(db.publish_gated_function(&other).is_err());
+        assert!(!db.function_gate_approved(&other).unwrap());
     }
 
     fn invoke_host() -> FunctionHost {

@@ -106,6 +106,8 @@ const TRANSFORM_RUN_MARKINGS_SCHEMA: &str =
 const SOURCE_REGISTRY_SCHEMA: &str = include_str!("postgres/0054_source_registry.sql");
 const CONNECTOR_CERTIFICATIONS_SCHEMA: &str =
     include_str!("postgres/0055_connector_certifications.sql");
+const FUNCTION_GATE_APPROVALS_SCHEMA: &str =
+    include_str!("postgres/0056_function_gate_approvals.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -469,6 +471,12 @@ const MIGRATIONS: &[Migration] = &[
         54,
         "connector_certifications",
         CONNECTOR_CERTIFICATIONS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        55,
+        "function_gate_approvals",
+        FUNCTION_GATE_APPROVALS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
