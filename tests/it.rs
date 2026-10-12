@@ -100,6 +100,7 @@ mod retention_dedup_backend_conformance;
 mod reusable_sekai_backend_conformance;
 mod rpc_maturity;
 mod rpc_maturity_adr;
+mod runtime_claim_client;
 mod sample_observation_readback_docs;
 mod sdk_external_consumer;
 mod sekai_postgres_inventory_conformance;
@@ -247,6 +248,7 @@ const GROUPED_MODULES: &[&str] = &[
     "reusable_sekai_backend_conformance",
     "rpc_maturity",
     "rpc_maturity_adr",
+    "runtime_claim_client",
     "sample_observation_readback_docs",
     "sdk_external_consumer",
     "sekai_postgres_inventory_conformance",
@@ -372,6 +374,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 118);
+    assert_eq!(GROUPED_MODULES.len(), 119);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

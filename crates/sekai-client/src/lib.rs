@@ -42,6 +42,9 @@ use uuid::Uuid;
 /// Version of the typed client contract, independent of the wire protocol.
 pub const SDK_CONTRACT_VERSION: &str = "sekai.sdk-core-loop/v1";
 pub const CONTENT_SDK_CONTRACT_VERSION: &str = "sekai.sdk-content-execution/v1";
+/// Versioned runtime-claim client contract (#1389). Additive on `0.1.x`.
+pub const RUNTIME_CLAIM_CONTRACT_VERSION: &str = "sekai.sdk-runtime-claim/v1";
+pub mod claim;
 pub const CONTENT_CONTRACT_VERSION: &str = "chisei.content-execution/v1";
 pub const CONTENT_DISCLOSURE_AUTHORITY: &str = "chisei.policy/v1";
 
