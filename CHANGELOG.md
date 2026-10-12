@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Governed-document hold, release, expire, and delete check and write the
+  record in one transaction on SQLite and PostgreSQL, so a concurrent delete
+  or expire can no longer drop a hold reported as placed. Delete drops the
+  renditions in the same transaction, and a rendition no longer attaches to
+  a deleted document (#1381).
+
 - Connector certifications persist on PostgreSQL with the SQLite certify, get,
   verify, revoke, and supersession semantics. Adds PostgreSQL migration
   `0055_connector_certifications` (#1481).

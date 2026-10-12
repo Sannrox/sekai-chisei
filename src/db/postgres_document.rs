@@ -46,6 +46,61 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Read-modify-write of one document under its advisory lock, so a check made by
+    /// `update` (hold, deletion, expiry) still holds when its result is stored.
+    /// Writing a deleted document also drops its renditions in the same transaction.
+    pub fn update_governed_document(
+        &self,
+        namespace: &str,
+        document_id: &str,
+        update: impl FnOnce(GovernedDocument) -> Result<GovernedDocument, String>,
+    ) -> Result<GovernedDocument, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let lock_key = advisory_lock_key(&["governed_document", namespace, document_id]);
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 467))",
+            &[&lock_key],
+        )
+        .map_err(|error| error.to_string())?;
+        let current: String = tx
+            .query_opt(
+                "SELECT record_json FROM sekai_governed_documents
+                 WHERE namespace = $1 AND document_id = $2",
+                &[&namespace, &document_id],
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or(DOCUMENT_UNAVAILABLE)?
+            .get(0);
+        let current: GovernedDocument = serde_json::from_str(&current)
+            .map_err(|error| format!("decode governed document: {error}"))?;
+        let owner = current.owner.clone();
+        let next = update(current)?;
+        if next.namespace != namespace || next.document_id != document_id || next.owner != owner {
+            return Err(DOCUMENT_UNAVAILABLE.into());
+        }
+        let json = serde_json::to_string(&next)
+            .map_err(|error| format!("encode governed document: {error}"))?;
+        tx.execute(
+            "UPDATE sekai_governed_documents SET record_json = $3
+             WHERE namespace = $1 AND document_id = $2",
+            &[&namespace, &document_id, &json],
+        )
+        .map_err(|error| error.to_string())?;
+        if next.deleted_at_ms != 0 {
+            tx.execute(
+                "DELETE FROM sekai_governed_renditions
+                 WHERE namespace = $1 AND document_id = $2",
+                &[&namespace, &document_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(next)
+    }
+
     pub fn get_governed_document(
         &self,
         namespace: &str,
@@ -90,7 +145,9 @@ impl PostgresDb {
                 &[&rendition.namespace, &rendition.document_id],
             )
             .map_err(|error| error.to_string())?;
-        if parent.is_none() {
+        if !parent
+            .is_some_and(|row| crate::db::document_store::live_parent(&row.get::<_, String>(0)))
+        {
             return Err(DOCUMENT_UNAVAILABLE.into());
         }
         let changed = tx
@@ -140,20 +197,5 @@ impl PostgresDb {
             );
         }
         Ok(renditions)
-    }
-
-    pub fn delete_governed_renditions(
-        &self,
-        namespace: &str,
-        document_id: &str,
-    ) -> Result<(), String> {
-        self.connection()?
-            .execute(
-                "DELETE FROM sekai_governed_renditions
-                 WHERE namespace = $1 AND document_id = $2",
-                &[&namespace, &document_id],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(())
     }
 }

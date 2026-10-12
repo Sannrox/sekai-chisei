@@ -300,14 +300,15 @@ pub fn place_hold(
     if now_ms < 0 {
         return Err("hold timestamp must be non-negative".into());
     }
-    let mut document = live_document(db, namespace, document_id, actor, now_ms)?;
-    if !document.hold_id.is_empty() && document.hold_id != hold_id {
-        return Err(DOCUMENT_HELD.into());
-    }
-    document.hold_id = hold_id.into();
-    document.hold_reason = reason.into();
-    db.put_governed_document(&document)?;
-    Ok(document)
+    update_owned(db, namespace, document_id, actor, |mut document| {
+        check_live(&document, now_ms)?;
+        if !document.hold_id.is_empty() && document.hold_id != hold_id {
+            return Err(DOCUMENT_HELD.into());
+        }
+        document.hold_id = hold_id.into();
+        document.hold_reason = reason.into();
+        Ok(document)
+    })
 }
 
 pub fn release_hold(
@@ -323,14 +324,15 @@ pub fn release_hold(
     if now_ms < 0 {
         return Err("release timestamp must be non-negative".into());
     }
-    let mut document = live_document(db, namespace, document_id, actor, now_ms)?;
-    if document.hold_id != hold_id {
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
-    document.hold_id.clear();
-    document.hold_reason.clear();
-    db.put_governed_document(&document)?;
-    Ok(document)
+    update_owned(db, namespace, document_id, actor, |mut document| {
+        check_live(&document, now_ms)?;
+        if document.hold_id != hold_id {
+            return Err(DOCUMENT_UNAVAILABLE.into());
+        }
+        document.hold_id.clear();
+        document.hold_reason.clear();
+        Ok(document)
+    })
 }
 
 pub fn expire_document(
@@ -344,18 +346,18 @@ pub fn expire_document(
     if now_ms < 0 {
         return Err("expire timestamp must be non-negative".into());
     }
-    let mut document = owned_document(db, namespace, document_id, actor)?;
-    if document.deleted_at_ms != 0 {
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
-    if !document.hold_id.is_empty() {
-        return Err(DOCUMENT_HELD.into());
-    }
-    if document.expires_at_ms == 0 || document.expires_at_ms > now_ms {
-        document.expires_at_ms = now_ms;
-    }
-    db.put_governed_document(&document)?;
-    Ok(document)
+    update_owned(db, namespace, document_id, actor, |mut document| {
+        if document.deleted_at_ms != 0 {
+            return Err(DOCUMENT_UNAVAILABLE.into());
+        }
+        if !document.hold_id.is_empty() {
+            return Err(DOCUMENT_HELD.into());
+        }
+        if document.expires_at_ms == 0 || document.expires_at_ms > now_ms {
+            document.expires_at_ms = now_ms;
+        }
+        Ok(document)
+    })
 }
 
 pub fn delete_document(
@@ -366,23 +368,40 @@ pub fn delete_document(
     now_ms: i64,
 ) -> Result<GovernedDocument, String> {
     required("actor", actor)?;
-    if now_ms < 0 {
-        return Err("delete timestamp must be non-negative".into());
+    // deleted_at_ms == 0 means live, so a delete needs a positive timestamp.
+    if now_ms <= 0 {
+        return Err("delete timestamp must be positive".into());
     }
-    let mut document = owned_document(db, namespace, document_id, actor)?;
-    if document.deleted_at_ms != 0 {
-        return Ok(document);
-    }
-    if !document.hold_id.is_empty() {
-        return Err(DOCUMENT_HELD.into());
-    }
-    if is_expired(&document, now_ms) {
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
-    document.deleted_at_ms = now_ms;
-    db.delete_governed_renditions(&document.namespace, &document.document_id)?;
-    db.put_governed_document(&document)?;
-    Ok(document)
+    update_owned(db, namespace, document_id, actor, |mut document| {
+        if document.deleted_at_ms != 0 {
+            return Ok(document);
+        }
+        if !document.hold_id.is_empty() {
+            return Err(DOCUMENT_HELD.into());
+        }
+        if is_expired(&document, now_ms) {
+            return Err(DOCUMENT_UNAVAILABLE.into());
+        }
+        document.deleted_at_ms = now_ms;
+        Ok(document)
+    })
+}
+
+/// Applies a lifecycle change to the actor's document atomically: the checks in `change`
+/// run against the stored record inside the same transaction that writes the result.
+fn update_owned(
+    db: &RuntimeDb,
+    namespace: &str,
+    document_id: &str,
+    actor: &str,
+    change: impl FnOnce(GovernedDocument) -> Result<GovernedDocument, String>,
+) -> Result<GovernedDocument, String> {
+    required("namespace", namespace)?;
+    required("document id", document_id)?;
+    db.update_governed_document(namespace, document_id, |document| {
+        check_owner(&document, actor)?;
+        change(document)
+    })
 }
 
 fn live_document(
@@ -393,7 +412,12 @@ fn live_document(
     now_ms: i64,
 ) -> Result<GovernedDocument, String> {
     let document = owned_document(db, namespace, document_id, actor)?;
-    if document.deleted_at_ms != 0 || is_expired(&document, now_ms) {
+    check_live(&document, now_ms)?;
+    Ok(document)
+}
+
+fn check_live(document: &GovernedDocument, now_ms: i64) -> Result<(), String> {
+    if document.deleted_at_ms != 0 || is_expired(document, now_ms) {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
     if document.contract_version != DOCUMENT_CONTRACT || document.type_revision != TYPE_REVISION_V1
@@ -403,7 +427,7 @@ fn live_document(
     if content_digest_for(&document.content_ref)? != document.content_digest {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
-    Ok(document)
+    Ok(())
 }
 
 fn owned_document(
@@ -417,10 +441,15 @@ fn owned_document(
     let document = db
         .get_governed_document(namespace, document_id)?
         .ok_or(DOCUMENT_UNAVAILABLE)?;
+    check_owner(&document, actor)?;
+    Ok(document)
+}
+
+fn check_owner(document: &GovernedDocument, actor: &str) -> Result<(), String> {
     if document.owner != actor {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
-    Ok(document)
+    Ok(())
 }
 
 fn validate_document(
@@ -893,6 +922,62 @@ mod tests {
                 .list_governed_renditions("records", "doc:brief")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn hold_racing_an_in_flight_delete_cannot_be_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new(dir.path().join("docs.db").to_str().unwrap()).unwrap(),
+        ));
+        admit(&runtime);
+        attach_rendition(&runtime, "analyst", &rendition(), 1_500).unwrap();
+        let (read, read_seen) = std::sync::mpsc::channel();
+        let (deleted, hold) = std::thread::scope(|scope| {
+            // Request A has read the record and passed its hold check when B arrives.
+            let deleter = scope.spawn(|| {
+                update_owned(
+                    &runtime,
+                    "records",
+                    "doc:brief",
+                    "analyst",
+                    |mut document| {
+                        read.send(()).unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        document.deleted_at_ms = 3_000;
+                        Ok(document)
+                    },
+                )
+            });
+            read_seen.recv().unwrap();
+            let hold = place_hold(
+                &runtime,
+                "analyst",
+                "records",
+                "doc:brief",
+                "hold:1",
+                "litigation",
+                3_000,
+            );
+            (deleter.join().unwrap(), hold)
+        });
+        assert_eq!(deleted.unwrap().deleted_at_ms, 3_000);
+        assert_eq!(hold.unwrap_err(), DOCUMENT_UNAVAILABLE);
+        let stored = runtime
+            .get_governed_document("records", "doc:brief")
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.deleted_at_ms, stored.hold_id.as_str()), (3_000, ""));
+        assert!(
+            runtime
+                .list_governed_renditions("records", "doc:brief")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            attach_rendition(&runtime, "analyst", &rendition(), 3_500).unwrap_err(),
+            DOCUMENT_UNAVAILABLE
         );
     }
 
