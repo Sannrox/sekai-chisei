@@ -2,16 +2,6 @@
 
 ## Unreleased
 
-- Enterprise extensions can admit or refuse the resolved model of a provider
-  execution before its credential lookup and provider call:
-  `EnterpriseExtension::admit_model` receives a `ModelIdentity` (provider,
-  model, profile version, pinned `artifact_digest`, and the endpoint the
-  provider client uses) and defaults to admit. Provider profiles and hosted
-  endpoints gain an optional `artifact_digest`. With an extension installed,
-  any `resolve_provider_credential` error, `CredentialNotFound` included,
-  now refuses execution instead of falling back to the process key; an
-  extension that wants the instance key returns it explicitly (#1352).
-
 - Governed-document hold, release, expire, and delete check and write the
   record in one transaction on SQLite and PostgreSQL, so a concurrent delete
   or expire can no longer drop a hold reported as placed. Delete drops the
@@ -25,6 +15,16 @@
   with `privacy_scan_truncated: ...` and the `EgressDecision` reason
   `privacy_scan_truncated`, distinct from a leak match. See
   `docs/egress-privacy-scan.md` (#1372).
+
+- Enterprise extensions can admit or refuse the resolved model of a provider
+  execution before its credential lookup and provider call:
+  `EnterpriseExtension::admit_model` receives a `ModelIdentity` (provider,
+  model, profile version, pinned `artifact_digest`, and the endpoint the
+  provider client uses) and defaults to admit. Provider profiles and hosted
+  endpoints gain an optional `artifact_digest`. With an extension installed,
+  any `resolve_provider_credential` error, `CredentialNotFound` included,
+  now refuses execution instead of falling back to the process key; an
+  extension that wants the instance key returns it explicitly (#1352).
 
 - Function document extraction resolves the namespace action policy for every
   extraction: `deny` refuses, `require_approval` parks the Action at any
