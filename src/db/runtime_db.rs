@@ -6846,15 +6846,18 @@ impl RuntimeDb {
         }
     }
 
-    pub fn delete_governed_renditions(
+    pub fn update_governed_document(
         &self,
         namespace: &str,
         document_id: &str,
-    ) -> Result<(), String> {
+        update: impl FnOnce(
+            crate::sekai::document::GovernedDocument,
+        ) -> Result<crate::sekai::document::GovernedDocument, String>,
+    ) -> Result<crate::sekai::document::GovernedDocument, String> {
         match self {
-            Self::Sqlite(db) => db.delete_governed_renditions(namespace, document_id),
+            Self::Sqlite(db) => db.update_governed_document(namespace, document_id, update),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.delete_governed_renditions(namespace, document_id)
+                db.update_governed_document(namespace, document_id, update)
             }),
         }
     }
