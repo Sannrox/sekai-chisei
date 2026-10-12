@@ -1342,6 +1342,7 @@ pub(super) async fn put_governed_transform(
         .into_inner()
         .transform
         .ok_or_else(|| Status::invalid_argument("transform required"))?;
+    let analytical = from_proto_analytical(&proto);
     let transform = crate::sekai::governed_transform::GovernedTransform {
         contract_version: proto.contract_version,
         namespace: proto.namespace,
@@ -1361,6 +1362,7 @@ pub(super) async fn put_governed_transform(
             .collect(),
         quality_rule: proto.quality_rule,
         definition_digest: proto.definition_digest,
+        analytical,
     }
     .prepare()
     .map_err(|error| Status::invalid_argument(error.message()))?;
@@ -1417,6 +1419,47 @@ pub(super) async fn get_governed_transform_run(
         run: Some(to_proto_transform_run(&run)),
     }))
 }
+pub(super) async fn list_governed_transforms(
+    service: &SekaiServiceImpl,
+    req: Request<ListGovernedTransformsRequest>,
+) -> Result<Response<ListGovernedTransformsResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let namespace = req.into_inner().namespace;
+    check_team_namespace(service.db.runtime(), &principals, &namespace, false)?;
+    let transforms = service
+        .db
+        .runtime()
+        .list_governed_transforms(&namespace)
+        .map_err(Status::internal)?
+        .iter()
+        .map(to_proto_transform)
+        .collect();
+    Ok(Response::new(ListGovernedTransformsResponse { transforms }))
+}
+pub(super) async fn list_governed_transform_runs(
+    service: &SekaiServiceImpl,
+    req: Request<ListGovernedTransformRunsRequest>,
+) -> Result<Response<ListGovernedTransformRunsResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let input = req.into_inner();
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
+    let limit = if input.limit <= 0 {
+        50
+    } else {
+        i64::from(input.limit.min(MAX_LIST_LIMIT))
+    };
+    let runs = service
+        .db
+        .runtime()
+        .list_governed_transform_runs(&input.namespace, limit)
+        .map_err(Status::internal)?
+        .iter()
+        .map(to_proto_transform_run)
+        .collect();
+    Ok(Response::new(ListGovernedTransformRunsResponse { runs }))
+}
 
 fn to_proto_transform(
     transform: &crate::sekai::governed_transform::GovernedTransform,
@@ -1440,7 +1483,67 @@ fn to_proto_transform(
             .collect(),
         quality_rule: transform.quality_rule.clone(),
         definition_digest: transform.definition_digest.clone(),
+        profile: if transform.is_analytical() {
+            crate::sekai::governed_transform::ANALYTICAL_CLASS.into()
+        } else {
+            String::new()
+        },
+        inputs: transform
+            .analytical
+            .as_ref()
+            .map(|spec| {
+                spec.inputs
+                    .iter()
+                    .map(|input| TransformInput {
+                        alias: input.alias.clone(),
+                        dataset_id: input.dataset_id.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        sql: transform
+            .analytical
+            .as_ref()
+            .map(|spec| spec.sql.clone())
+            .unwrap_or_default(),
+        memory_limit_bytes: transform
+            .analytical
+            .as_ref()
+            .map(|spec| spec.memory_limit_bytes)
+            .unwrap_or(0),
+        time_limit_ms: transform
+            .analytical
+            .as_ref()
+            .map(|spec| spec.time_limit_ms)
+            .unwrap_or(0),
     }
+}
+
+fn from_proto_analytical(
+    proto: &GovernedTransform,
+) -> Option<crate::sekai::governed_transform::AnalyticalSpec> {
+    let profile = proto.profile.trim().to_ascii_lowercase();
+    let has_spec = profile == crate::sekai::governed_transform::ANALYTICAL_CLASS
+        || !proto.inputs.is_empty()
+        || !proto.sql.trim().is_empty()
+        || proto.memory_limit_bytes != 0
+        || proto.time_limit_ms != 0;
+    if !has_spec {
+        return None;
+    }
+    Some(crate::sekai::governed_transform::AnalyticalSpec {
+        inputs: proto
+            .inputs
+            .iter()
+            .map(|input| crate::sekai::governed_transform::TransformInput {
+                alias: input.alias.clone(),
+                dataset_id: input.dataset_id.clone(),
+            })
+            .collect(),
+        sql: proto.sql.clone(),
+        memory_limit_bytes: proto.memory_limit_bytes,
+        time_limit_ms: proto.time_limit_ms,
+    })
 }
 
 fn to_proto_transform_run(run: &crate::sekai::governed_transform::TransformRun) -> TransformRun {

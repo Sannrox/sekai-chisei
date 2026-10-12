@@ -2,17 +2,24 @@
 
 Sekai hosts an in-process dataset transform class
 ([ADR 0074](decisions/0074-plane-owned-transforms.md),
-[ADR 0097](decisions/0097-in-process-transform-host.md)). A JobSpec names
-input and output datasets and a list of `filter` / `project` steps. A run
-writes output rows, records lineage, and stores a receipt. Objects stay
-Action-written.
+[ADR 0097](decisions/0097-in-process-transform-host.md),
+[ADR 0101](decisions/0101-analytical-transform-profile.md)). A JobSpec names
+input and output datasets and a list of `filter` / `project` steps, or the
+analytical SQL profile with one or more named inputs. A run writes output
+rows, records lineage, and stores a receipt. Objects stay Action-written.
 
 The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
-`GetGovernedTransformRun`) are `experimental`: start the plane with
+`GetGovernedTransformRun`, `ListGovernedTransforms`,
+`ListGovernedTransformRuns`) are `experimental`: start the plane with
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature. See
 [rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities` reports
-`sekai.transforms.projection` on the core pack; `lifecycle_state` is
-`disabled` unless experimental RPCs are enabled.
+`sekai.transforms.projection` and `sekai.transforms.analytical` on the core
+pack; `lifecycle_state` is `disabled` unless experimental RPCs are enabled.
+
+The analytical profile runs SQL in a private in-memory SQLite connection
+(bundled rusqlite). Default bounds: 64 MiB and 5 seconds. Over-budget runs
+fail with `transform_budget_time` or `transform_budget_memory` and leave the
+previous output readable. Example: `cargo run --example analytical_transform`.
 
 ## Operator path
 

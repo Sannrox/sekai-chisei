@@ -1,19 +1,24 @@
-//! Plane-owned incremental dataset transforms (#880, #1287).
+//! Plane-owned incremental dataset transforms (#880, #1287, #1385).
 //!
 //! Definitions are content-addressed and receipt-bound. Execution is the
-//! in-process `projection` host of `sekai.governed-transform-execution/v1`.
-//! The plane owns the JobSpec, transaction, lineage, and run receipt. Engine
-//! choice is a later profile on that contract. Outputs are datasets, not
-//! type-revision object identity. Secrets are rejected in definitions.
+//! in-process `projection` host of `sekai.governed-transform-execution/v1`,
+//! or the analytical SQL profile on the same JobSpec ([ADR 0101]). The plane
+//! owns the JobSpec, transaction, lineage, and run receipt. Outputs are
+//! datasets, not type-revision object identity. Secrets are rejected in
+//! definitions.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 pub const CONTRACT_VERSION: &str = "sekai.governed-transform/v1";
 pub const TRANSFORM_CLASS: &str = "projection";
+pub const ANALYTICAL_CLASS: &str = "analytical";
 /// DiscoverCapabilities name for the in-process transform host.
 pub const HOSTED_COMPUTE_CAPABILITY: &str = "sekai.transforms.projection";
+/// DiscoverCapabilities name for the analytical SQL profile.
+pub const ANALYTICAL_COMPUTE_CAPABILITY: &str = "sekai.transforms.analytical";
 /// Order-independent 256-bit sum of per-row SHA-256 hashes.
 /// Reference-platform analog: governed incremental `semantic_version` / `v2_semantics`
 /// force a SNAPSHOT rebuild; old encodings are not folded as the new sum.
@@ -46,13 +51,31 @@ impl TransformError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TransformStep {
     pub kind: String,
     pub column: String,
     pub op: String,
     pub value: String,
     pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformInput {
+    pub alias: String,
+    pub dataset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AnalyticalSpec {
+    #[serde(default)]
+    pub inputs: Vec<TransformInput>,
+    #[serde(default)]
+    pub sql: String,
+    #[serde(default)]
+    pub memory_limit_bytes: u64,
+    #[serde(default)]
+    pub time_limit_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +88,10 @@ pub struct GovernedTransform {
     pub steps: Vec<TransformStep>,
     pub quality_rule: String,
     pub definition_digest: String,
+    /// Absent on the `projection` profile so existing definition digests stay
+    /// stable. Present for the analytical SQL profile (#1385).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analytical: Option<AnalyticalSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,16 +127,24 @@ impl GovernedTransform {
         }
         require_token("namespace", &self.namespace)?;
         require_token("transform_id", &self.transform_id)?;
-        require_token("input_dataset_id", &self.input_dataset_id)?;
         require_token("output_dataset_id", &self.output_dataset_id)?;
-        if self.input_dataset_id == self.output_dataset_id {
+        if let Some(spec) = self.analytical.as_mut() {
+            prepare_analytical(&mut self.input_dataset_id, spec, &self.steps)?;
+        } else {
+            require_token("input_dataset_id", &self.input_dataset_id)?;
+            if self.steps.is_empty() {
+                return Err(TransformError::InvalidArgument(
+                    "transform steps required".into(),
+                ));
+            }
+        }
+        if self
+            .input_bindings()
+            .iter()
+            .any(|(_, dataset_id)| dataset_id == &self.output_dataset_id)
+        {
             return Err(TransformError::InvalidArgument(
                 "transform output must be a distinct dataset".into(),
-            ));
-        }
-        if self.steps.is_empty() {
-            return Err(TransformError::InvalidArgument(
-                "transform steps required".into(),
             ));
         }
         reject_secrets(&self)?;
@@ -123,6 +158,47 @@ impl GovernedTransform {
         }
         self.definition_digest = definition_digest(&self);
         Ok(self)
+    }
+
+    pub fn is_analytical(&self) -> bool {
+        self.analytical.is_some()
+    }
+
+    /// Compiled filter/project steps keep the projection watermark.
+    /// Explicit SQL always rebuilds from all input rows.
+    pub fn allows_incremental(&self) -> bool {
+        match &self.analytical {
+            None => true,
+            Some(spec) if spec.inputs.len() > 1 || self.steps.is_empty() => false,
+            Some(spec) => {
+                let alias = spec
+                    .inputs
+                    .first()
+                    .map(|input| input.alias.as_str())
+                    .unwrap_or("input");
+                crate::sekai::transform_engine::compile_steps_sql(&self.steps, alias)
+                    .is_ok_and(|sql| sql == spec.sql)
+            }
+        }
+    }
+
+    /// Alias + dataset_id pairs the run path must load.
+    pub fn input_bindings(&self) -> Vec<(String, String)> {
+        if let Some(spec) = &self.analytical
+            && !spec.inputs.is_empty()
+        {
+            return spec
+                .inputs
+                .iter()
+                .map(|input| (input.alias.clone(), input.dataset_id.clone()))
+                .collect();
+        }
+        let alias = if self.is_analytical() {
+            "input".to_string()
+        } else {
+            self.input_dataset_id.clone()
+        };
+        vec![(alias, self.input_dataset_id.clone())]
     }
 }
 
@@ -138,7 +214,79 @@ pub fn definition_digest(transform: &GovernedTransform) -> String {
         hasher.update((steps.len() as u64).to_le_bytes());
         hasher.update(steps);
     }
+    if let Some(spec) = &transform.analytical {
+        hash_field(&mut hasher, ANALYTICAL_CLASS);
+        hash_field(&mut hasher, &spec.sql);
+        hasher.update(spec.memory_limit_bytes.to_le_bytes());
+        hasher.update(spec.time_limit_ms.to_le_bytes());
+        if let Ok(inputs) = serde_json::to_vec(&spec.inputs) {
+            hasher.update((inputs.len() as u64).to_le_bytes());
+            hasher.update(inputs);
+        }
+    }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn prepare_analytical(
+    input_dataset_id: &mut String,
+    spec: &mut AnalyticalSpec,
+    steps: &[TransformStep],
+) -> Result<(), TransformError> {
+    if spec.inputs.is_empty() {
+        require_token("input_dataset_id", input_dataset_id)?;
+        spec.inputs.push(TransformInput {
+            alias: "input".into(),
+            dataset_id: input_dataset_id.clone(),
+        });
+    } else {
+        let mut seen = std::collections::BTreeSet::new();
+        for input in &spec.inputs {
+            require_token("input alias", &input.alias)?;
+            require_token("input dataset_id", &input.dataset_id)?;
+            if !seen.insert(input.alias.trim().to_ascii_lowercase()) {
+                return Err(TransformError::InvalidArgument(
+                    "transform input aliases must be unique".into(),
+                ));
+            }
+        }
+        let first = spec.inputs[0].dataset_id.clone();
+        if input_dataset_id.trim().is_empty() {
+            *input_dataset_id = first;
+        } else if input_dataset_id != &first {
+            return Err(TransformError::InvalidArgument(
+                "input_dataset_id must match the first analytical input".into(),
+            ));
+        }
+    }
+    if spec.sql.trim().is_empty() {
+        if steps.is_empty() {
+            return Err(TransformError::InvalidArgument(
+                "analytical transform requires sql or steps".into(),
+            ));
+        }
+        if spec.inputs.len() > 1 {
+            return Err(TransformError::InvalidArgument(
+                "analytical steps require a single input or explicit sql".into(),
+            ));
+        }
+        let alias = spec
+            .inputs
+            .first()
+            .map(|input| input.alias.as_str())
+            .unwrap_or("input");
+        spec.sql = crate::sekai::transform_engine::compile_steps_sql(steps, alias)?;
+    } else {
+        crate::sekai::transform_engine::validate_analytical_sql(&spec.sql)?;
+    }
+    spec.memory_limit_bytes = crate::sekai::transform_engine::host_limit(
+        spec.memory_limit_bytes,
+        crate::sekai::transform_engine::DEFAULT_MEMORY_LIMIT_BYTES,
+    );
+    spec.time_limit_ms = crate::sekai::transform_engine::host_limit(
+        spec.time_limit_ms,
+        crate::sekai::transform_engine::DEFAULT_TIME_LIMIT_MS,
+    );
+    Ok(())
 }
 
 fn hash_field(hasher: &mut Sha256, value: &str) {
@@ -173,6 +321,30 @@ pub fn apply_steps(
         }
     }
     out
+}
+
+fn apply_profile(
+    transform: &GovernedTransform,
+    tables: &[crate::sekai::transform_engine::EngineTable],
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<HashMap<String, String>>, TransformError> {
+    if let Some(spec) = &transform.analytical {
+        crate::sekai::transform_engine::execute_sql_until(
+            &spec.sql,
+            tables,
+            spec.memory_limit_bytes,
+            spec.time_limit_ms,
+            deadline,
+        )
+    } else {
+        Ok(apply_steps(
+            tables
+                .first()
+                .map(|table| table.rows.as_slice())
+                .unwrap_or(&[]),
+            &transform.steps,
+        ))
+    }
 }
 
 pub fn evaluate_quality(
@@ -229,6 +401,13 @@ pub fn checkpoint_after_id(incremental: bool, checkpoint: Option<&TransformCheck
     }
 }
 
+/// Named input table for a multi-dataset analytical run.
+pub struct TransformInputRows<'a> {
+    pub alias: &'a str,
+    pub records: &'a [(i64, HashMap<String, String>)],
+    pub columns: &'a [String],
+}
+
 /// Compute one run. The caller persists `output_rows` (unless quarantined),
 /// then fills `run.output_digest` with `fold_output_digest` (incremental) or
 /// `rows_digest(&output_rows)` (full rebuild) and writes the receipt.
@@ -240,52 +419,145 @@ pub fn compute_run(
     now_ms: i64,
     run_id: String,
 ) -> (TransformRun, Vec<HashMap<String, String>>) {
+    compute_run_tables(
+        transform,
+        checkpoint,
+        &[TransformInputRows {
+            alias: "input",
+            records: input_records,
+            columns: &[],
+        }],
+        incremental,
+        now_ms,
+        run_id,
+    )
+}
+
+pub fn compute_run_tables(
+    transform: &GovernedTransform,
+    checkpoint: Option<&TransformCheckpoint>,
+    inputs: &[TransformInputRows<'_>],
+    incremental: bool,
+    now_ms: i64,
+    run_id: String,
+) -> (TransformRun, Vec<HashMap<String, String>>) {
+    compute_run_tables_until(
+        transform,
+        checkpoint,
+        inputs,
+        incremental,
+        now_ms,
+        run_id,
+        None,
+    )
+}
+
+pub fn compute_run_tables_until(
+    transform: &GovernedTransform,
+    checkpoint: Option<&TransformCheckpoint>,
+    inputs: &[TransformInputRows<'_>],
+    incremental: bool,
+    now_ms: i64,
+    run_id: String,
+    deadline: Option<std::time::Instant>,
+) -> (TransformRun, Vec<HashMap<String, String>>) {
     let after_id = checkpoint_after_id(incremental, checkpoint);
-    let selected: Vec<&(i64, HashMap<String, String>)> = input_records
-        .iter()
-        .filter(|(id, _)| *id > after_id)
-        .collect();
-    let last_input_row_id = selected.iter().map(|(id, _)| *id).max().unwrap_or(after_id);
-    let input_rows: Vec<HashMap<String, String>> =
-        selected.iter().map(|(_, row)| (*row).clone()).collect();
-    let output_rows = apply_steps(&input_rows, &transform.steps);
+    let mut last_input_row_id = after_id;
+    let mut tables: Vec<crate::sekai::transform_engine::EngineTable> = Vec::new();
+    let mut rows_in = 0i32;
+    let mut used = 0u64;
+    let memory_limit = transform.analytical.as_ref().map(|spec| {
+        crate::sekai::transform_engine::host_limit(
+            spec.memory_limit_bytes,
+            crate::sekai::transform_engine::DEFAULT_MEMORY_LIMIT_BYTES,
+        )
+    });
+    for input in inputs {
+        let mut rows = Vec::new();
+        for (id, row) in input.records {
+            if *id <= after_id {
+                continue;
+            }
+            last_input_row_id = last_input_row_id.max(*id);
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return quarantined_run(
+                    transform,
+                    checkpoint,
+                    &tables,
+                    after_id,
+                    incremental,
+                    now_ms,
+                    run_id,
+                    rows_in,
+                    crate::sekai::transform_engine::BUDGET_TIME,
+                );
+            }
+            if let Some(limit) = memory_limit {
+                used = used.saturating_add(row_payload_bytes(row));
+                if used > limit {
+                    return quarantined_run(
+                        transform,
+                        checkpoint,
+                        &tables,
+                        after_id,
+                        incremental,
+                        now_ms,
+                        run_id,
+                        rows_in,
+                        crate::sekai::transform_engine::BUDGET_MEMORY,
+                    );
+                }
+            }
+            rows.push(row.clone());
+            rows_in += 1;
+        }
+        tables.push(crate::sekai::transform_engine::EngineTable {
+            alias: input.alias.to_string(),
+            rows,
+            columns: input.columns.to_vec(),
+        });
+    }
+    let output_rows = match apply_profile(transform, &tables, deadline) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return quarantined_run(
+                transform,
+                checkpoint,
+                &tables,
+                after_id,
+                incremental,
+                now_ms,
+                run_id,
+                rows_in,
+                &error.message(),
+            );
+        }
+    };
     if let Err(error) = evaluate_quality(&output_rows, &transform.quality_rule) {
-        let run = TransformRun {
-            run_id,
-            namespace: transform.namespace.clone(),
-            transform_id: transform.transform_id.clone(),
-            definition_digest: transform.definition_digest.clone(),
-            input_digest: rows_digest(&input_rows),
-            output_digest: checkpoint
-                .map(|checkpoint| checkpoint.2.clone())
-                .unwrap_or_default(),
-            last_input_row_id: after_id,
+        return quarantined_run(
+            transform,
+            checkpoint,
+            &tables,
+            after_id,
             incremental,
-            quarantined: true,
-            quality_rule: error.message(),
-            rows_in: input_rows.len() as i32,
-            rows_out: 0,
-            lineage_parent: checkpoint
-                .map(|checkpoint| checkpoint.1.clone())
-                .unwrap_or_default(),
-            created_at_ms: now_ms,
-            markings_in: String::new(),
-            markings_out: String::new(),
-        };
-        return (run, Vec::new());
+            now_ms,
+            run_id,
+            rows_in,
+            &error.message(),
+        );
     }
     let run = TransformRun {
         run_id,
         namespace: transform.namespace.clone(),
         transform_id: transform.transform_id.clone(),
         definition_digest: transform.definition_digest.clone(),
-        input_digest: rows_digest(&input_rows),
+        input_digest: run_input_digest(transform, &tables),
         output_digest: String::new(),
         last_input_row_id,
         incremental,
         quarantined: false,
         quality_rule: transform.quality_rule.clone(),
-        rows_in: input_rows.len() as i32,
+        rows_in,
         rows_out: output_rows.len() as i32,
         lineage_parent: checkpoint
             .map(|checkpoint| checkpoint.1.clone())
@@ -297,23 +569,190 @@ pub fn compute_run(
     (run, output_rows)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn quarantined_run(
+    transform: &GovernedTransform,
+    checkpoint: Option<&TransformCheckpoint>,
+    tables: &[crate::sekai::transform_engine::EngineTable],
+    after_id: i64,
+    incremental: bool,
+    now_ms: i64,
+    run_id: String,
+    rows_in: i32,
+    reason: &str,
+) -> (TransformRun, Vec<HashMap<String, String>>) {
+    (
+        TransformRun {
+            run_id,
+            namespace: transform.namespace.clone(),
+            transform_id: transform.transform_id.clone(),
+            definition_digest: transform.definition_digest.clone(),
+            input_digest: run_input_digest(transform, tables),
+            output_digest: checkpoint
+                .map(|checkpoint| checkpoint.2.clone())
+                .unwrap_or_default(),
+            last_input_row_id: after_id,
+            incremental,
+            quarantined: true,
+            quality_rule: reason.into(),
+            rows_in,
+            rows_out: 0,
+            lineage_parent: checkpoint
+                .map(|checkpoint| checkpoint.1.clone())
+                .unwrap_or_default(),
+            created_at_ms: now_ms,
+            markings_in: String::new(),
+            markings_out: String::new(),
+        },
+        Vec::new(),
+    )
+}
+
+fn run_input_digest(
+    transform: &GovernedTransform,
+    tables: &[crate::sekai::transform_engine::EngineTable],
+) -> String {
+    if transform.is_analytical() {
+        let mut hasher = Sha256::new();
+        for table in tables {
+            hash_field(&mut hasher, &table.alias);
+            hash_field(&mut hasher, &rows_digest(&table.rows));
+        }
+        format!("sha256:{:x}", hasher.finalize())
+    } else {
+        rows_digest(
+            tables
+                .first()
+                .map(|table| table.rows.as_slice())
+                .unwrap_or(&[]),
+        )
+    }
+}
+
+pub(crate) fn budget_quarantined_run(
+    transform: &GovernedTransform,
+    checkpoint: Option<&TransformCheckpoint>,
+    incremental: bool,
+    now_ms: i64,
+    run_id: String,
+    rows_in: i32,
+    reason: &str,
+) -> TransformRun {
+    TransformRun {
+        run_id,
+        namespace: transform.namespace.clone(),
+        transform_id: transform.transform_id.clone(),
+        definition_digest: transform.definition_digest.clone(),
+        input_digest: String::new(),
+        output_digest: checkpoint
+            .map(|checkpoint| checkpoint.2.clone())
+            .unwrap_or_default(),
+        last_input_row_id: checkpoint_after_id(incremental, checkpoint),
+        incremental,
+        quarantined: true,
+        quality_rule: reason.into(),
+        rows_in,
+        rows_out: 0,
+        lineage_parent: checkpoint
+            .map(|checkpoint| checkpoint.1.clone())
+            .unwrap_or_default(),
+        created_at_ms: now_ms,
+        markings_in: String::new(),
+        markings_out: String::new(),
+    }
+}
+
+pub(crate) fn row_payload_bytes(row: &HashMap<String, String>) -> u64 {
+    row.iter().fold(64u64, |used, (key, value)| {
+        used.saturating_add(key.len() as u64)
+            .saturating_add(value.len() as u64)
+            .saturating_add(32)
+    })
+}
+
+pub(crate) struct InputLoadBudget {
+    used: u64,
+    limit: u64,
+    deadline: Instant,
+    pub exceeded: Option<&'static str>,
+}
+
+impl InputLoadBudget {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub(crate) fn expire_if_past(&mut self) {
+        if self.exceeded.is_none() && Instant::now() >= self.deadline {
+            self.exceeded = Some(crate::sekai::transform_engine::BUDGET_TIME);
+        }
+    }
+
+    pub(crate) fn for_transform(transform: &GovernedTransform) -> Option<Self> {
+        let spec = transform.analytical.as_ref()?;
+        Some(Self {
+            used: 0,
+            limit: crate::sekai::transform_engine::host_limit(
+                spec.memory_limit_bytes,
+                crate::sekai::transform_engine::DEFAULT_MEMORY_LIMIT_BYTES,
+            ),
+            deadline: Instant::now()
+                + Duration::from_millis(crate::sekai::transform_engine::host_limit(
+                    spec.time_limit_ms,
+                    crate::sekai::transform_engine::DEFAULT_TIME_LIMIT_MS,
+                )),
+            exceeded: None,
+        })
+    }
+
+    pub(crate) fn allow_encoded(&mut self, encoded_len: u64) -> bool {
+        if self.exceeded.is_some() {
+            return false;
+        }
+        if Instant::now() >= self.deadline {
+            self.exceeded = Some(crate::sekai::transform_engine::BUDGET_TIME);
+            return false;
+        }
+        if encoded_len > self.limit.saturating_sub(self.used) {
+            self.exceeded = Some(crate::sekai::transform_engine::BUDGET_MEMORY);
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn charge(&mut self, row: &HashMap<String, String>) -> bool {
+        if self.exceeded.is_some() {
+            return false;
+        }
+        if Instant::now() >= self.deadline {
+            self.exceeded = Some(crate::sekai::transform_engine::BUDGET_TIME);
+            return false;
+        }
+        self.used = self.used.saturating_add(row_payload_bytes(row));
+        if self.used > self.limit {
+            self.exceeded = Some(crate::sekai::transform_engine::BUDGET_MEMORY);
+            return false;
+        }
+        true
+    }
+}
+
 /// Union input dataset/object/row markings for a transform receipt.
 /// Unknown or incomparable tokens fail closed. The live output marking is
 /// always folded into markings_out so a rebuild cannot strip a stricter stamp.
 pub fn derive_transform_markings<'a>(
     lattice: Option<&crate::sekai::classification_lattice::ClassificationLattice>,
-    input_object_token: Option<&str>,
+    input_object_tokens: impl IntoIterator<Item = Option<&'a str>>,
     prior_output_token: Option<&str>,
     rows: impl IntoIterator<Item = &'a HashMap<String, String>>,
 ) -> Result<(String, String), String> {
     use crate::sekai::classification_lattice::union_input_marking_tokens;
     use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
     let mut input_tokens: Vec<Option<String>> = Vec::new();
-    if let Some(token) = input_object_token
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        input_tokens.push(Some(token.to_string()));
+    for token in input_object_tokens {
+        if let Some(token) = token.map(str::trim).filter(|value| !value.is_empty()) {
+            input_tokens.push(Some(token.to_string()));
+        }
     }
     for row in rows {
         match row.get(OBJECT_CLASSIFICATION_PROPERTY) {
@@ -455,9 +894,20 @@ mod tests {
             }],
             quality_rule: String::new(),
             definition_digest: String::new(),
+            analytical: None,
         }
         .prepare()
         .unwrap()
+    }
+
+    #[test]
+    fn projection_digest_ignores_absent_analytical_profile() {
+        let first = transform();
+        let mut second = first.clone();
+        second.analytical = None;
+        second.definition_digest.clear();
+        let second = second.prepare().unwrap();
+        assert_eq!(first.definition_digest, second.definition_digest);
     }
 
     #[test]
@@ -604,17 +1054,26 @@ mod tests {
                 ),
             ]),
         ];
-        let (inputs, output) = derive_transform_markings(None, None, None, &rows).unwrap();
+        let (inputs, output) = derive_transform_markings(None, [None], None, &rows).unwrap();
         assert_eq!(inputs, "internal,confidential");
         assert_eq!(output, "confidential");
         let (inputs, output) =
-            derive_transform_markings(None, Some("public"), Some("internal"), &[]).unwrap();
+            derive_transform_markings(None, [Some("public")], Some("internal"), &[]).unwrap();
         assert_eq!(inputs, "public");
         assert_eq!(output, "internal");
+        let (inputs, output) = derive_transform_markings(
+            None,
+            [Some("public"), Some("confidential")],
+            None,
+            &[] as &[HashMap<String, String>],
+        )
+        .unwrap();
+        assert!(inputs.contains("confidential"));
+        assert_eq!(output, "confidential");
         assert!(
             derive_transform_markings(
                 None,
-                None,
+                [None],
                 None,
                 &[HashMap::from([(
                     crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
@@ -627,5 +1086,262 @@ mod tests {
         assert!(require_bound_output_for_markings("", "confidential").is_err());
         assert!(require_bound_output_for_markings("out-obj", "confidential").is_ok());
         assert!(require_bound_output_for_markings("", "").is_ok());
+    }
+
+    fn analytical_from_bindings(inputs: Vec<TransformInput>) -> GovernedTransform {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: String::new(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: Some(AnalyticalSpec {
+                inputs,
+                sql: String::new(),
+                memory_limit_bytes: 0,
+                time_limit_ms: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn analytical_aliases_are_unique_case_insensitively() {
+        let mut transform = analytical_from_bindings(vec![
+            TransformInput {
+                alias: "Orders".into(),
+                dataset_id: "a".into(),
+            },
+            TransformInput {
+                alias: "orders".into(),
+                dataset_id: "b".into(),
+            },
+        ]);
+        transform.analytical.as_mut().unwrap().sql = "SELECT * FROM \"Orders\"".into();
+        let error = transform.prepare().unwrap_err();
+        assert!(error.message().contains("unique"), "{}", error.message());
+    }
+
+    #[test]
+    fn analytical_prepare_fills_input_dataset_id_from_first_binding() {
+        let mut transform = analytical_from_bindings(vec![TransformInput {
+            alias: "customers".into(),
+            dataset_id: "cust".into(),
+        }]);
+        transform.analytical.as_mut().unwrap().sql = "SELECT * FROM customers".into();
+        let prepared = transform.prepare().unwrap();
+        assert_eq!(prepared.input_dataset_id, "cust");
+        assert_eq!(
+            prepared.input_bindings(),
+            vec![("customers".into(), "cust".into())]
+        );
+    }
+
+    #[test]
+    fn analytical_steps_compile_against_first_input_alias() {
+        let mut transform = analytical_from_bindings(vec![TransformInput {
+            alias: "customers".into(),
+            dataset_id: "cust".into(),
+        }]);
+        transform.steps = vec![TransformStep {
+            kind: "filter".into(),
+            column: "keep".into(),
+            op: "eq".into(),
+            value: "yes".into(),
+            columns: Vec::new(),
+        }];
+        let prepared = transform.prepare().unwrap();
+        assert_eq!(
+            prepared.analytical.as_ref().unwrap().sql,
+            "SELECT * FROM (SELECT * FROM \"customers\") WHERE \"keep\" = 'yes'"
+        );
+    }
+
+    #[test]
+    fn analytical_steps_rejected_with_multiple_inputs() {
+        let mut transform = analytical_from_bindings(vec![
+            TransformInput {
+                alias: "customers".into(),
+                dataset_id: "cust".into(),
+            },
+            TransformInput {
+                alias: "orders".into(),
+                dataset_id: "ord".into(),
+            },
+        ]);
+        transform.steps = vec![TransformStep {
+            kind: "filter".into(),
+            column: "keep".into(),
+            op: "eq".into(),
+            value: "yes".into(),
+            columns: Vec::new(),
+        }];
+        let error = transform.prepare().unwrap_err();
+        assert!(
+            error.message().contains("explicit sql"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn compiled_analytical_steps_keep_incremental() {
+        let mut transform = analytical_from_bindings(vec![TransformInput {
+            alias: "customers".into(),
+            dataset_id: "cust".into(),
+        }]);
+        transform.steps = vec![TransformStep {
+            kind: "filter".into(),
+            column: "keep".into(),
+            op: "eq".into(),
+            value: "yes".into(),
+            columns: Vec::new(),
+        }];
+        let prepared = transform.prepare().unwrap();
+        assert!(prepared.allows_incremental());
+    }
+
+    #[test]
+    fn explicit_order_by_sql_rebuilds() {
+        let mut transform = analytical_from_bindings(vec![TransformInput {
+            alias: "input".into(),
+            dataset_id: "in".into(),
+        }]);
+        transform.analytical.as_mut().unwrap().sql =
+            "SELECT * FROM input ORDER BY id LIMIT 1".into();
+        let prepared = transform.prepare().unwrap();
+        assert!(!prepared.allows_incremental());
+    }
+
+    #[test]
+    fn secondary_analytical_input_cannot_be_the_output() {
+        let mut transform = analytical_from_bindings(vec![
+            TransformInput {
+                alias: "source".into(),
+                dataset_id: "in".into(),
+            },
+            TransformInput {
+                alias: "prior".into(),
+                dataset_id: "out".into(),
+            },
+        ]);
+        transform.analytical.as_mut().unwrap().sql =
+            "SELECT * FROM source UNION ALL SELECT * FROM prior".into();
+        let error = transform.prepare().unwrap_err();
+        assert!(
+            error.message().contains("distinct dataset"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn analytical_limits_clamp_to_host_maxima() {
+        let mut transform = analytical_from_bindings(vec![TransformInput {
+            alias: "input".into(),
+            dataset_id: "in".into(),
+        }]);
+        transform.analytical.as_mut().unwrap().sql = "SELECT * FROM input".into();
+        transform.analytical.as_mut().unwrap().memory_limit_bytes = u64::MAX;
+        transform.analytical.as_mut().unwrap().time_limit_ms = u64::MAX;
+        let prepared = transform.prepare().unwrap();
+        let spec = prepared.analytical.as_ref().unwrap();
+        assert_eq!(
+            spec.memory_limit_bytes,
+            crate::sekai::transform_engine::DEFAULT_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(
+            spec.time_limit_ms,
+            crate::sekai::transform_engine::DEFAULT_TIME_LIMIT_MS
+        );
+    }
+
+    #[test]
+    fn analytical_input_digest_includes_alias_identity() {
+        let mut transform = analytical_from_bindings(vec![
+            TransformInput {
+                alias: "left".into(),
+                dataset_id: "a".into(),
+            },
+            TransformInput {
+                alias: "right".into(),
+                dataset_id: "b".into(),
+            },
+        ]);
+        transform.analytical.as_mut().unwrap().sql = "SELECT * FROM left".into();
+        let transform = transform.prepare().unwrap();
+        let left = vec![(1, HashMap::from([("id".into(), "1".into())]))];
+        let right = vec![(1, HashMap::from([("id".into(), "2".into())]))];
+        let (first, _) = compute_run_tables(
+            &transform,
+            None,
+            &[
+                TransformInputRows {
+                    alias: "left",
+                    records: &left,
+                    columns: &[],
+                },
+                TransformInputRows {
+                    alias: "right",
+                    records: &right,
+                    columns: &[],
+                },
+            ],
+            false,
+            10,
+            "r1".into(),
+        );
+        let (swapped, _) = compute_run_tables(
+            &transform,
+            None,
+            &[
+                TransformInputRows {
+                    alias: "left",
+                    records: &right,
+                    columns: &[],
+                },
+                TransformInputRows {
+                    alias: "right",
+                    records: &left,
+                    columns: &[],
+                },
+            ],
+            false,
+            10,
+            "r2".into(),
+        );
+        assert_ne!(first.input_digest, swapped.input_digest);
+    }
+
+    #[test]
+    fn analytical_input_copy_respects_memory_budget() {
+        let mut transform = analytical_from_bindings(vec![TransformInput {
+            alias: "input".into(),
+            dataset_id: "in".into(),
+        }]);
+        transform.analytical.as_mut().unwrap().sql = "SELECT * FROM input".into();
+        transform.analytical.as_mut().unwrap().memory_limit_bytes = 80;
+        let transform = transform.prepare().unwrap();
+        let records = vec![(1, HashMap::from([("blob".into(), "x".repeat(200))]))];
+        let (run, rows) = compute_run_tables(
+            &transform,
+            None,
+            &[TransformInputRows {
+                alias: "input",
+                records: &records,
+                columns: &[],
+            }],
+            false,
+            10,
+            "r1".into(),
+        );
+        assert!(run.quarantined);
+        assert_eq!(
+            run.quality_rule,
+            crate::sekai::transform_engine::BUDGET_MEMORY
+        );
+        assert!(rows.is_empty());
     }
 }

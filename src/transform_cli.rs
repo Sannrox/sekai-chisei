@@ -265,6 +265,7 @@ mod tests {
                 }],
                 quality_rule: String::new(),
                 definition_digest: String::new(),
+                analytical: None,
             },
             10,
         )

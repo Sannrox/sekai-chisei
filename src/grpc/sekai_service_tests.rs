@@ -11897,6 +11897,16 @@ async fn capability_discovery_defaults_to_core_and_requires_explicit_expansion()
         if enabled { "active" } else { "disabled" }
     );
     assert!(transform.description.contains("dataset transform host"));
+    let analytical = core
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == crate::sekai::governed_transform::ANALYTICAL_COMPUTE_CAPABILITY)
+        .expect("core catalog reports the analytical transform profile");
+    assert_eq!(analytical.product_tier, "core");
+    assert_eq!(
+        analytical.lifecycle_state,
+        if enabled { "active" } else { "disabled" }
+    );
 }
 
 #[tokio::test]
@@ -13882,4 +13892,122 @@ async fn guest_ceiling_follows_activated_lattice() {
         3,
         "{decisions:?}"
     );
+}
+
+#[tokio::test]
+async fn list_governed_transforms_returns_definitions_and_runs_for_authorized_principal() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform, TransformStep};
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ops".into(),
+        transform_id: "t1".into(),
+        input_dataset_id: "in".into(),
+        output_dataset_id: "out".into(),
+        steps: vec![TransformStep {
+            kind: "project".into(),
+            column: String::new(),
+            op: String::new(),
+            value: String::new(),
+            columns: vec!["id".into()],
+        }],
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+    }
+    .prepare()
+    .unwrap();
+    runtime.put_governed_transform(&transform, 10).unwrap();
+    runtime
+        .run_governed_transform("ops", "t1", false, 20)
+        .unwrap();
+
+    let listed = svc
+        .list_governed_transforms(with_principal(ListGovernedTransformsRequest {
+            namespace: "ops".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .transforms;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].transform_id, "t1");
+
+    let runs = svc
+        .list_governed_transform_runs(with_principal(ListGovernedTransformRunsRequest {
+            namespace: "ops".into(),
+            limit: 10,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(runs.len(), 1);
+    let over_max = svc
+        .list_governed_transform_runs(with_principal(ListGovernedTransformRunsRequest {
+            namespace: "ops".into(),
+            limit: crate::domain::MAX_LIST_LIMIT + 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(over_max.len(), 1);
+
+    let denied = svc
+        .list_governed_transforms(Request::new(ListGovernedTransformsRequest {
+            namespace: "ops".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::Unauthenticated);
+
+    svc.ensure_team_namespace(with_named_principal(
+        EnsureTeamNamespaceRequest {
+            namespace: "ops".into(),
+            principal: "bob".into(),
+            role: "viewer".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let member = svc
+        .list_governed_transforms(with_named_principal(
+            ListGovernedTransformsRequest {
+                namespace: "ops".into(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .transforms;
+    assert_eq!(member.len(), 1);
+    let outsider = svc
+        .list_governed_transforms(with_principal(ListGovernedTransformsRequest {
+            namespace: "ops".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(outsider.code(), tonic::Code::PermissionDenied);
 }

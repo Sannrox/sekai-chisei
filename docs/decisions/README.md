@@ -122,3 +122,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0098: Keep a separate `chisei-plane` process](0098-keep-chisei-plane-process.md)
 - [ADR 0099: Shared identity and tenancy contract](0099-shared-identity-and-tenancy.md)
 - [ADR 0100: Bound a PostgreSQL-first relational source family](0100-relational-source-family.md)
+- [ADR 0101: Analytical governed-transform profile uses in-process SQLite SQL](0101-analytical-transform-profile.md)

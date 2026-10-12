@@ -349,6 +349,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ListGovernedTransforms",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListGovernedTransformRuns",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "AdmitGovernedDocument",
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",

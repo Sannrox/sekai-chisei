@@ -522,6 +522,10 @@ message TransformStep {
   string value = 4;
   repeated string columns = 5;
 }
+message TransformInput {
+  string alias = 1;
+  string dataset_id = 2;
+}
 message GovernedTransform {
   string contract_version = 1;
   string namespace = 2;
@@ -531,6 +535,11 @@ message GovernedTransform {
   repeated TransformStep steps = 6;
   string quality_rule = 7;
   string definition_digest = 8;
+  string profile = 9;
+  repeated TransformInput inputs = 10;
+  string sql = 11;
+  uint64 memory_limit_bytes = 12;
+  uint64 time_limit_ms = 13;
 }
 message PutGovernedTransformRequest {
   GovernedTransform transform = 1;
@@ -569,6 +578,19 @@ message GetGovernedTransformRunRequest {
 }
 message GetGovernedTransformRunResponse {
   TransformRun run = 1;
+}
+message ListGovernedTransformsRequest {
+  string namespace = 1;
+}
+message ListGovernedTransformsResponse {
+  repeated GovernedTransform transforms = 1;
+}
+message ListGovernedTransformRunsRequest {
+  string namespace = 1;
+  int32 limit = 2;
+}
+message ListGovernedTransformRunsResponse {
+  repeated TransformRun runs = 1;
 }
 message ContentReference {
   string scheme = 1;
@@ -2515,6 +2537,8 @@ service SekaiService {
   rpc PutGovernedTransform(PutGovernedTransformRequest) returns (PutGovernedTransformResponse);
   rpc RunGovernedTransform(RunGovernedTransformRequest) returns (RunGovernedTransformResponse);
   rpc GetGovernedTransformRun(GetGovernedTransformRunRequest) returns (GetGovernedTransformRunResponse);
+  rpc ListGovernedTransforms(ListGovernedTransformsRequest) returns (ListGovernedTransformsResponse);
+  rpc ListGovernedTransformRuns(ListGovernedTransformRunsRequest) returns (ListGovernedTransformRunsResponse);
   rpc AdmitGovernedDocument(AdmitGovernedDocumentRequest) returns (AdmitGovernedDocumentResponse);
   rpc AttachGovernedDocumentRendition(AttachGovernedDocumentRenditionRequest) returns (AttachGovernedDocumentRenditionResponse);
   rpc GetGovernedDocument(GetGovernedDocumentRequest) returns (GetGovernedDocumentResponse);
