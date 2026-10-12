@@ -429,6 +429,20 @@ pub enum NamespaceAction {
     Write,
 }
 
+/// The model a provider call will reach, resolved before any credential lookup (#1352).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    pub provider: String,
+    /// Canonical model id after alias resolution.
+    pub model: String,
+    pub upstream_model: String,
+    pub profile_version: String,
+    /// Pinned weights digest, when the provider profile carries one.
+    pub artifact_digest: Option<String>,
+    /// Base URL of the endpoint that will receive the prompt.
+    pub endpoint: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionError {
     CredentialNotFound,
@@ -597,12 +611,31 @@ pub trait EnterpriseExtension: Send + Sync {
         ))
     }
 
+    /// Admit or refuse the resolved model of a provider execution before its
+    /// credential lookup and provider call (#1352), for keyed and keyless
+    /// providers alike. Operator-configured internal models (leak reviewer,
+    /// scoring, evaluation) are not tenant routes and do not pass through it.
+    ///
+    /// Default: admit. Return `PermissionDenied` to deny or `Unavailable` when
+    /// the admission policy cannot decide; either refuses execution.
+    fn admit_model(
+        &self,
+        context: &AuthenticatedContext,
+        model: &ModelIdentity,
+    ) -> Result<(), ExtensionError> {
+        let _ = (context, model);
+        Ok(())
+    }
+
     /// Resolve a tenant-scoped model-provider credential (#118).
     ///
     /// Default: unavailable. Enterprise distributions must implement this so
     /// each authenticated tenant supplies isolated provider secrets. Callers
     /// pass only `AuthenticatedContext`; request-selected tenant ids are never
     /// accepted. Implementations must not log or persist secret material.
+    ///
+    /// Any error, `CredentialNotFound` included, refuses execution. The process
+    /// environment key is used only when no extension is installed (#1352).
     fn resolve_provider_credential(
         &self,
         context: &AuthenticatedContext,

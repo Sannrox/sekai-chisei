@@ -164,6 +164,10 @@ pub struct ProviderProfile {
     pub pricing: PricingProfile,
     pub governance: ProviderGovernanceProfile,
     pub prompt_cache: PromptCacheProfile,
+    /// Digest of the model weights this profile pins. Set for hosted routes that pin
+    /// one; passed to the enterprise model-admission hook (#1352).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1261,6 +1265,7 @@ impl ProviderRegistry {
                 .map(|pattern| format!("{provider}/{pattern}"))
                 .collect();
             hosted.endpoint.default_base_url = Some(endpoint.origin.clone());
+            hosted.artifact_digest = endpoint.artifact_digest.clone();
             registry.profiles.push(hosted);
         }
         registry
@@ -1452,6 +1457,8 @@ pub struct HostedEndpoint {
     pub origin: String,
     /// Upstream model patterns (`*` suffix for a prefix match).
     pub model_patterns: Vec<String>,
+    /// Digest of the weights the endpoint serves, when the route pins one.
+    pub artifact_digest: Option<String>,
 }
 
 fn resolve_provider_model(model: &str) -> Result<(&str, &str), String> {
@@ -1860,6 +1867,7 @@ fn profile(
             protocol_portability: "not_supported".into(),
             privacy_assurance: "no_upstream_prompt_cache_assurance".into(),
         },
+        artifact_digest: None,
     }
 }
 
@@ -2420,6 +2428,7 @@ mod tests {
             name: name.into(),
             origin: "https://models.example.com".into(),
             model_patterns: vec!["acme-*".into()],
+            artifact_digest: None,
         }
     }
 

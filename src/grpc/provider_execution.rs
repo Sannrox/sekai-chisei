@@ -127,6 +127,7 @@ pub async fn execute_native_content_request_stream(
         }),
         &registry,
         &request.model,
+        LocalEndpoints::from_config(config),
     )?;
     budget
         .check_and_reserve(&user_id, estimated)
@@ -258,8 +259,12 @@ async fn execute_chat_request_stream_with_cache(
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.clone().unwrap_or_else(|| "default".to_string());
     let estimated = estimate_chat_request(&r);
-    let provider_credential =
-        execution_provider_credential(execution_authentication, &registry, &r.model)?;
+    let provider_credential = execution_provider_credential(
+        execution_authentication,
+        &registry,
+        &r.model,
+        LocalEndpoints::from_config(config),
+    )?;
     budget
         .check_and_reserve(&user_id, estimated)
         .map_err(Status::resource_exhausted)?;
@@ -356,10 +361,14 @@ async fn execute_chat_request_stream_with_cache(
     Ok(Box::pin(ReceiverStream::new(rx)))
 }
 
+/// Admits the resolved model with the enterprise extension, then resolves the provider
+/// credential. With an extension installed, a refused model or any credential error
+/// refuses execution; the process environment key serves only the community runtime.
 fn execution_provider_credential(
     authentication: Option<ExecutionAuthentication<'_>>,
     registry: &crate::provider_profile::ProviderRegistry,
     model: &str,
+    local_endpoints: LocalEndpoints<'_>,
 ) -> Result<Option<crate::provider_credentials::ResolvedProviderCredential>, Status> {
     let Some(authentication) = authentication else {
         return Ok(None);
@@ -377,24 +386,32 @@ fn execution_provider_credential(
     let profile = registry
         .effective_profile(&resolved.provider)
         .ok_or_else(|| Status::failed_precondition("provider profile unavailable"))?;
+    let extension = authentication.db.enterprise_extension();
+    if let Some(extension) = extension {
+        let endpoint = llm::execution_endpoint(
+            &resolved,
+            registry,
+            local_endpoints.ollama,
+            local_endpoints.native,
+        )
+        .map_err(Status::failed_precondition)?;
+        extension
+            .admit_model(context, &model_identity(&resolved, &profile, endpoint))
+            .map_err(|error| match error {
+                crate::enterprise::ExtensionError::Unavailable(_) => {
+                    Status::unavailable("model admission unavailable")
+                }
+                _ => Status::permission_denied("model not admitted"),
+            })?;
+    }
     if profile.endpoint.api_key_env.is_none() {
         return Ok(None);
     }
-    let credential = match authentication.db.enterprise_extension() {
-        Some(extension) => match extension.resolve_provider_credential(context, &resolved.provider)
-        {
-            Ok(credential) => credential,
-            Err(crate::enterprise::ExtensionError::CredentialNotFound) => {
-                ProcessEnvProviderCredentialResolver
-                    .resolve(context, &resolved.provider)
-                    .map_err(|_| Status::unavailable("provider credential unavailable"))?
-            }
-            Err(_) => return Err(Status::unavailable("provider credential unavailable")),
-        },
-        None => ProcessEnvProviderCredentialResolver
-            .resolve(context, &resolved.provider)
-            .map_err(|_| Status::unavailable("provider credential unavailable"))?,
-    };
+    let credential = match extension {
+        Some(extension) => extension.resolve_provider_credential(context, &resolved.provider),
+        None => ProcessEnvProviderCredentialResolver.resolve(context, &resolved.provider),
+    }
+    .map_err(|_| Status::unavailable("provider credential unavailable"))?;
     if credential.provider != resolved.provider
         || !instance_or_matching_tenant(credential.tenant_id.as_deref(), expected_tenant_id)
         || credential.secret.expose().trim().is_empty()
@@ -402,6 +419,37 @@ fn execution_provider_credential(
         return Err(Status::unavailable("provider credential unavailable"));
     }
     Ok(Some(credential))
+}
+
+/// Configured endpoints for the local providers, which have no profile URL.
+#[derive(Clone, Copy)]
+struct LocalEndpoints<'a> {
+    ollama: &'a str,
+    native: Option<&'a str>,
+}
+
+impl<'a> LocalEndpoints<'a> {
+    fn from_config(config: &'a Config) -> Self {
+        Self {
+            ollama: &config.ollama_url,
+            native: config.native_llm_url.as_deref(),
+        }
+    }
+}
+
+fn model_identity(
+    resolved: &crate::provider_profile::ResolvedProviderModel,
+    profile: &crate::provider_profile::ProviderProfile,
+    endpoint: String,
+) -> crate::enterprise::ModelIdentity {
+    crate::enterprise::ModelIdentity {
+        provider: resolved.provider.clone(),
+        model: resolved.canonical_model.clone(),
+        upstream_model: resolved.upstream_model.clone(),
+        profile_version: resolved.profile_version.clone(),
+        artifact_digest: profile.artifact_digest.clone(),
+        endpoint,
+    }
 }
 
 fn instance_or_matching_tenant(
@@ -789,6 +837,7 @@ mod tests {
             }),
             &registry,
             "openai/gpt-5.5",
+            TEST_ENDPOINTS,
         )
         .unwrap()
         .unwrap();
@@ -799,6 +848,7 @@ mod tests {
             }),
             &registry,
             "openai/gpt-5.5",
+            TEST_ENDPOINTS,
         )
         .unwrap()
         .unwrap();
@@ -831,6 +881,7 @@ mod tests {
             }),
             &registry,
             "openai/gpt-5.5",
+            TEST_ENDPOINTS,
         )
         .unwrap()
         .unwrap();
@@ -856,6 +907,7 @@ mod tests {
                     }),
                     &registry,
                     "openai/gpt-5.5",
+                    TEST_ENDPOINTS,
                 )
                 .unwrap()
                 .unwrap();
@@ -867,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_missing_row_falls_back_to_instance_key() {
+    fn enterprise_missing_row_does_not_fall_back_to_instance_key() {
         let db = RuntimeDb::Sqlite(Arc::new(
             crate::db::sekai::SekaiDb::new_with_enterprise_extension(
                 ":memory:",
@@ -880,20 +932,145 @@ mod tests {
             "OPENAI_API_KEY",
             "sk-enterprise-fallback",
             || {
-                let credential = execution_provider_credential(
+                let status = execution_provider_credential(
                     Some(ExecutionAuthentication {
                         db: &db,
                         context: Some(&tenant_context("tenant-c")),
                     }),
                     &registry,
                     "openai/gpt-5.5",
+                    TEST_ENDPOINTS,
                 )
-                .unwrap()
-                .unwrap();
-                assert!(credential.tenant_id.is_none());
-                assert_eq!(credential.secret.expose(), "sk-enterprise-fallback");
+                .unwrap_err();
+                assert_eq!(status.code(), tonic::Code::Unavailable);
             },
         );
+    }
+
+    const TEST_ENDPOINTS: LocalEndpoints<'static> = LocalEndpoints {
+        ollama: "http://127.0.0.1:11434",
+        native: None,
+    };
+
+    const PINNED_DIGEST: &str =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    const LAB_ORIGIN: &str = "http://127.0.0.1:8000";
+
+    /// Admits only `hosted.lab/llama3` pinned to `PINNED_DIGEST` at `LAB_ORIGIN`.
+    struct PinnedModelExtension;
+
+    impl crate::enterprise::EnterpriseExtension for PinnedModelExtension {
+        fn authenticate_bearer(
+            &self,
+            _bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::Unauthenticated)
+        }
+
+        fn authenticate_context(
+            &self,
+            _bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::Unauthenticated)
+        }
+
+        fn tenant_context(
+            &self,
+            _principal: &crate::enterprise::AuthenticatedPrincipal,
+        ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::Unauthenticated)
+        }
+
+        fn authorize_namespace(
+            &self,
+            _context: &crate::enterprise::TenantContext,
+            _namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Ok(())
+        }
+
+        fn authorize_unscoped_namespace(
+            &self,
+            _principal: &crate::enterprise::AuthenticatedPrincipal,
+            _namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+
+        fn admit_model(
+            &self,
+            _context: &crate::enterprise::AuthenticatedContext,
+            model: &crate::enterprise::ModelIdentity,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            (model.model == "hosted.lab/llama3"
+                && model.artifact_digest.as_deref() == Some(PINNED_DIGEST)
+                && model.endpoint == LAB_ORIGIN)
+                .then_some(())
+                .ok_or(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+    }
+
+    /// The registry a request sees after its hosted routes are applied.
+    fn lab_registry(
+        origin: &str,
+        digest: Option<&str>,
+    ) -> crate::provider_profile::ProviderRegistry {
+        crate::provider_profile::ProviderRegistry::built_in().with_hosted_endpoints(&[
+            crate::provider_profile::HostedEndpoint {
+                name: "lab".into(),
+                origin: origin.into(),
+                model_patterns: vec!["llama*".into(), "qwen*".into()],
+                artifact_digest: digest.map(Into::into),
+            },
+        ])
+    }
+
+    #[test]
+    fn extension_admits_only_the_pinned_model_digest_and_endpoint() {
+        let db = RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(PinnedModelExtension)),
+            )
+            .unwrap(),
+        ));
+        let context = tenant_context("tenant-a");
+        let execute = |registry: &crate::provider_profile::ProviderRegistry, model: &str| {
+            execution_provider_credential(
+                Some(ExecutionAuthentication {
+                    db: &db,
+                    context: Some(&context),
+                }),
+                registry,
+                model,
+                TEST_ENDPOINTS,
+            )
+        };
+
+        let pinned = lab_registry(LAB_ORIGIN, Some(PINNED_DIGEST));
+        assert!(execute(&pinned, "hosted.lab/llama3").is_ok());
+        for (registry, model) in [
+            (
+                &lab_registry(LAB_ORIGIN, Some("sha256:0000")),
+                "hosted.lab/llama3",
+            ),
+            (&lab_registry(LAB_ORIGIN, None), "hosted.lab/llama3"),
+            (
+                &lab_registry("http://127.0.0.2:8000", Some(PINNED_DIGEST)),
+                "hosted.lab/llama3",
+            ),
+            (&pinned, "hosted.lab/qwen3"),
+            (&pinned, "openai/gpt-5.5"),
+            (&pinned, "ollama/llama3.2"),
+        ] {
+            let status = execute(registry, model).unwrap_err();
+            assert_eq!(status.code(), tonic::Code::PermissionDenied, "{model}");
+        }
     }
 
     #[test]

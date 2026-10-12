@@ -17,6 +17,9 @@ pub struct OpenAI {
     timeouts: HttpTimeouts,
 }
 
+/// Base URL of the OpenAI client when no override is given.
+pub const OPENAI_BASE_URL: &str = "https://api.openai.com";
+
 impl OpenAI {
     pub fn new(api_key: &str, base_url: Option<&str>) -> Self {
         Self::with_timeouts(api_key, base_url, HttpTimeouts::from_env())
@@ -29,7 +32,7 @@ impl OpenAI {
     ) -> Self {
         Self {
             api_key: api_key.to_string(),
-            base_url: base_url.unwrap_or("https://api.openai.com").to_string(),
+            base_url: base_url.unwrap_or(OPENAI_BASE_URL).to_string(),
             client: timeouts.client(),
             timeouts,
         }

@@ -182,10 +182,10 @@ impl TenantProviderCredentialResolver for MemoryTenantProviderCredentialResolver
     }
 }
 
-/// Resolve through an optional enterprise resolver, then the instance env key.
+/// Resolve through the enterprise resolver when one is installed, else the instance env key.
 ///
-/// A tenant-specific secret wins when the enterprise resolver returns one.
-/// `CredentialNotFound` and a missing resolver fall back to the process key.
+/// An installed resolver's answer is final: `CredentialNotFound` refuses rather than
+/// falling back to the process key (#1352).
 pub fn resolve_provider_credential(
     resolver: Option<&dyn TenantProviderCredentialResolver>,
     context: &AuthenticatedContext,
@@ -194,13 +194,10 @@ pub fn resolve_provider_credential(
     if provider.trim().is_empty() {
         return Err(ExtensionError::CredentialNotFound);
     }
-    if let Some(resolver) = resolver {
-        match resolver.resolve(context, provider) {
-            Err(ExtensionError::CredentialNotFound) => {}
-            result => return result,
-        }
+    match resolver {
+        Some(resolver) => resolver.resolve(context, provider),
+        None => ProcessEnvProviderCredentialResolver.resolve(context, provider),
     }
-    ProcessEnvProviderCredentialResolver.resolve(context, provider)
 }
 
 /// Build a machine context for community/process-wide resolution tests.
@@ -342,20 +339,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_helper_falls_back_to_instance_key_when_enterprise_has_no_row() {
+    fn resolve_helper_does_not_fall_back_to_instance_key_when_enterprise_has_no_row() {
         let store = MemoryTenantProviderCredentialResolver::new();
         crate::provider_credentials::with_test_env(
             "OPENAI_API_KEY",
             "sk-instance-fallback",
             || {
-                let resolved = resolve_provider_credential(
+                let error = resolve_provider_credential(
                     Some(&store),
                     &tenant_context("tenant-a", "alice"),
                     "openai",
                 )
-                .unwrap();
-                assert_eq!(resolved.secret.expose(), "sk-instance-fallback");
-                assert!(resolved.tenant_id.is_none());
+                .unwrap_err();
+                assert_eq!(error, ExtensionError::CredentialNotFound);
             },
         );
     }

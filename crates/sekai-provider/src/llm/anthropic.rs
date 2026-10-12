@@ -17,13 +17,12 @@ pub struct Anthropic {
     timeouts: HttpTimeouts,
 }
 
+/// Base URL of the Anthropic client.
+pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+
 impl Anthropic {
     pub fn new(api_key: &str) -> Self {
-        Self::with_base_url_and_timeouts(
-            api_key,
-            "https://api.anthropic.com",
-            HttpTimeouts::from_env(),
-        )
+        Self::with_base_url_and_timeouts(api_key, ANTHROPIC_BASE_URL, HttpTimeouts::from_env())
     }
 
     pub(crate) fn with_base_url_and_timeouts(
