@@ -63,6 +63,7 @@ mod rpc_retrieval;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
@@ -341,6 +342,10 @@ const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
 
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
+    type ReadTransformRunInputsStream = Pin<
+        Box<dyn futures_util::Stream<Item = Result<ReadTransformRunInputsResponse, Status>> + Send>,
+    >;
+
     async fn acquire_lease(
         &self,
         req: Request<AcquireLeaseRequest>,
@@ -1124,6 +1129,36 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListGovernedTransformRunsRequest>,
     ) -> Result<Response<ListGovernedTransformRunsResponse>, Status> {
         rpc_data::list_governed_transform_runs(self, req).await
+    }
+    async fn list_claimable_transform_work(
+        &self,
+        req: Request<ListClaimableTransformWorkRequest>,
+    ) -> Result<Response<ListClaimableTransformWorkResponse>, Status> {
+        rpc_data::list_claimable_transform_work(self, req).await
+    }
+    async fn claim_transform_work(
+        &self,
+        req: Request<ClaimTransformWorkRequest>,
+    ) -> Result<Response<ClaimTransformWorkResponse>, Status> {
+        rpc_data::claim_transform_work(self, req).await
+    }
+    async fn heartbeat_transform_claim(
+        &self,
+        req: Request<HeartbeatTransformClaimRequest>,
+    ) -> Result<Response<HeartbeatTransformClaimResponse>, Status> {
+        rpc_data::heartbeat_transform_claim(self, req).await
+    }
+    async fn read_transform_run_inputs(
+        &self,
+        req: Request<ReadTransformRunInputsRequest>,
+    ) -> Result<Response<Self::ReadTransformRunInputsStream>, Status> {
+        rpc_data::read_transform_run_inputs(self, req).await
+    }
+    async fn write_transform_run_result(
+        &self,
+        req: Request<WriteTransformRunResultRequest>,
+    ) -> Result<Response<WriteTransformRunResultResponse>, Status> {
+        rpc_data::write_transform_run_result(self, req).await
     }
     async fn admit_governed_document(
         &self,

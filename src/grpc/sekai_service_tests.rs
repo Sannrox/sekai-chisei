@@ -11935,6 +11935,16 @@ async fn capability_discovery_defaults_to_core_and_requires_explicit_expansion()
         analytical.lifecycle_state,
         if enabled { "active" } else { "disabled" }
     );
+    let isolated = core
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == crate::sekai::governed_transform::ISOLATED_COMPUTE_CAPABILITY)
+        .expect("core catalog reports the isolated-process transform profile");
+    assert_eq!(isolated.product_tier, "core");
+    assert_eq!(
+        isolated.lifecycle_state,
+        if enabled { "active" } else { "disabled" }
+    );
 }
 
 #[tokio::test]
@@ -13961,6 +13971,7 @@ async fn list_governed_transforms_returns_definitions_and_runs_for_authorized_pr
         quality_rule: String::new(),
         definition_digest: String::new(),
         analytical: None,
+        isolated_process: None,
     }
     .prepare()
     .unwrap();
@@ -14038,4 +14049,331 @@ async fn list_governed_transforms_returns_definitions_and_runs_for_authorized_pr
         .await
         .unwrap_err();
     assert_eq!(outsider.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn isolated_process_claim_and_write_back_are_namespace_authorized() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, rows_digest,
+    };
+    use futures_util::StreamExt;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ops".into(),
+        transform_id: "iso1".into(),
+        input_dataset_id: "in".into(),
+        output_dataset_id: "out".into(),
+        steps: Vec::new(),
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: Some(IsolatedProcessSpec {
+            engine: "python".into(),
+            runtime_image: "runner:1".into(),
+            inputs: Vec::new(),
+        }),
+    }
+    .prepare()
+    .unwrap();
+    runtime.put_governed_transform(&transform, 10).unwrap();
+    runtime
+        .run_governed_transform("ops", "iso1", false, 20)
+        .unwrap();
+
+    let editor_denied = svc
+        .list_claimable_transform_work(with_principal(ListClaimableTransformWorkRequest {
+            namespace: "ops".into(),
+            runtime_id: "runner-a".into(),
+            limit: 10,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(editor_denied.code(), tonic::Code::PermissionDenied);
+    let listed = svc
+        .list_claimable_transform_work(with_named_principal(
+            ListClaimableTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                limit: 10,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert_eq!(listed.len(), 1);
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let mut stream = svc
+        .read_transform_run_inputs(with_named_principal(
+            ReadTransformRunInputsRequest {
+                run_id: work.run_id.clone(),
+                runtime_id: work.claim_owner.clone(),
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token.clone(),
+                alias: String::new(),
+                after_row_id: 0,
+                limit: 100,
+                after_alias: String::new(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.unwrap().row.unwrap());
+    }
+    assert_eq!(rows.len(), 1);
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    let written = svc
+        .write_transform_run_result(with_named_principal(
+            WriteTransformRunResultRequest {
+                run_id: work.run_id,
+                runtime_id: work.claim_owner,
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token,
+                rows: output
+                    .iter()
+                    .map(|values| TransformRunInputRow {
+                        alias: String::new(),
+                        dataset_id: "out".into(),
+                        row_id: 0,
+                        values: values.clone(),
+                    })
+                    .collect(),
+                output_digest: rows_digest(&output),
+                quarantined: false,
+                quality_rule: String::new(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(written.dispatch_status, "completed");
+    let denied = svc
+        .list_claimable_transform_work(Request::new(ListClaimableTransformWorkRequest {
+            namespace: "ops".into(),
+            runtime_id: "runner-a".into(),
+            limit: 10,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn isolated_process_input_stream_requires_dataset_read() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, rows_digest,
+    };
+    use futures_util::StreamExt;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str, object_id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: object_id.into(),
+        created: 1,
+    };
+    for (id, name) in [("secret-in", "in"), ("secret-out", "out")] {
+        runtime
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: "artifact".into(),
+                name: name.into(),
+                namespace: "ops".into(),
+                external_id: format!("artifact:{id}"),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    runtime.create_dataset(&dataset("in", "secret-in")).unwrap();
+    runtime
+        .create_dataset(&dataset("out", "secret-out"))
+        .unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let owner_in = security::Grant {
+        id: "owner-in".into(),
+        object_id: "secret-in".into(),
+        principal: "alice".into(),
+        role: security::Role::Admin,
+        created: 0,
+    };
+    let owner_out = security::Grant {
+        id: "owner-out".into(),
+        object_id: "secret-out".into(),
+        principal: "alice".into(),
+        role: security::Role::Admin,
+        created: 0,
+    };
+    runtime.create_grant(&owner_in).unwrap();
+    runtime.create_grant(&owner_out).unwrap();
+    svc.security.add_grant(&owner_in);
+    svc.security.add_grant(&owner_out);
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ops".into(),
+        transform_id: "iso-acl".into(),
+        input_dataset_id: "in".into(),
+        output_dataset_id: "out".into(),
+        steps: Vec::new(),
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: Some(IsolatedProcessSpec {
+            engine: "python".into(),
+            runtime_image: "runner:1".into(),
+            inputs: Vec::new(),
+        }),
+    }
+    .prepare()
+    .unwrap();
+    runtime.put_governed_transform(&transform, 10).unwrap();
+    runtime
+        .run_governed_transform("ops", "iso-acl", false, 20)
+        .unwrap();
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let read_req = || ReadTransformRunInputsRequest {
+        run_id: work.run_id.clone(),
+        runtime_id: work.claim_owner.clone(),
+        claim_generation: work.claim_generation,
+        fencing_token: work.fencing_token.clone(),
+        alias: String::new(),
+        after_row_id: 0,
+        limit: 100,
+        after_alias: String::new(),
+    };
+    let denied_read = match svc
+        .read_transform_run_inputs(with_named_principal(read_req(), "local"))
+        .await
+    {
+        Err(status) => status,
+        Ok(_) => panic!("expected dataset read to be denied"),
+    };
+    assert_eq!(denied_read.code(), tonic::Code::PermissionDenied);
+
+    let reader = security::Grant {
+        id: "reader".into(),
+        object_id: "secret-in".into(),
+        principal: "local".into(),
+        role: security::Role::Viewer,
+        created: 0,
+    };
+    runtime.create_grant(&reader).unwrap();
+    svc.security.add_grant(&reader);
+    let mut stream = svc
+        .read_transform_run_inputs(with_named_principal(read_req(), "local"))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.unwrap().row.unwrap());
+    }
+    assert_eq!(rows.len(), 1);
+
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    let write_req = || WriteTransformRunResultRequest {
+        run_id: work.run_id.clone(),
+        runtime_id: work.claim_owner.clone(),
+        claim_generation: work.claim_generation,
+        fencing_token: work.fencing_token.clone(),
+        rows: output
+            .iter()
+            .map(|values| TransformRunInputRow {
+                alias: String::new(),
+                dataset_id: "out".into(),
+                row_id: 0,
+                values: values.clone(),
+            })
+            .collect(),
+        output_digest: rows_digest(&output),
+        quarantined: false,
+        quality_rule: String::new(),
+    };
+    let denied_write = svc
+        .write_transform_run_result(with_named_principal(write_req(), "local"))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_write.code(), tonic::Code::PermissionDenied);
+
+    let writer = security::Grant {
+        id: "writer".into(),
+        object_id: "secret-out".into(),
+        principal: "local".into(),
+        role: security::Role::Editor,
+        created: 0,
+    };
+    runtime.create_grant(&writer).unwrap();
+    svc.security.add_grant(&writer);
+    let written = svc
+        .write_transform_run_result(with_named_principal(write_req(), "local"))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(written.dispatch_status, "completed");
 }

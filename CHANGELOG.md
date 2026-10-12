@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Isolated-process governed transforms admit claimable work instead of
+  computing in-process. A worker claims with a fencing token, streams the
+  admitted JobSpec snapshot, and writes the output, receipt, and lineage in
+  one transaction. Write-back keeps the admitted destination after a later
+  Put. A stale fence or digest mismatch commits nothing. Claim RPCs require
+  credential admin. Adds `sekai.transforms.isolated_process`, experimental
+  claim RPCs, ADR 0102, and PostgreSQL migration `0057_isolated_transform_work`
+  (#1386).
+
 - Enterprise extensions can admit or refuse the resolved model of a provider
   execution before its credential lookup and provider call:
   `EnterpriseExtension::admit_model` receives a `ModelIdentity` (provider,

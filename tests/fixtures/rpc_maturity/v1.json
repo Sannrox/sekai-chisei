@@ -367,6 +367,51 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ListClaimableTransformWork",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "HeartbeatTransformClaim",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ReadTransformRunInputs",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "WriteTransformRunResult",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ClaimTransformWork",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "AdmitGovernedDocument",
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",

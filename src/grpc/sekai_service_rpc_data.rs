@@ -1354,6 +1354,7 @@ pub(super) async fn put_governed_transform(
         .transform
         .ok_or_else(|| Status::invalid_argument("transform required"))?;
     let analytical = from_proto_analytical(&proto);
+    let isolated_process = from_proto_isolated(&proto);
     let transform = crate::sekai::governed_transform::GovernedTransform {
         contract_version: proto.contract_version,
         namespace: proto.namespace,
@@ -1374,6 +1375,7 @@ pub(super) async fn put_governed_transform(
         quality_rule: proto.quality_rule,
         definition_digest: proto.definition_digest,
         analytical,
+        isolated_process,
     }
     .prepare()
     .map_err(|error| Status::invalid_argument(error.message()))?;
@@ -1471,6 +1473,259 @@ pub(super) async fn list_governed_transform_runs(
         .collect();
     Ok(Response::new(ListGovernedTransformRunsResponse { runs }))
 }
+pub(super) async fn list_claimable_transform_work(
+    service: &SekaiServiceImpl,
+    req: Request<ListClaimableTransformWorkRequest>,
+) -> Result<Response<ListClaimableTransformWorkResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let input = req.into_inner();
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
+    let limit = if input.limit <= 0 {
+        50
+    } else {
+        i64::from(input.limit.min(MAX_LIST_LIMIT))
+    };
+    let work = service
+        .db
+        .runtime()
+        .list_claimable_transform_work(&input.namespace, now_millis(), limit)
+        .map_err(Status::internal)?
+        .iter()
+        .map(to_proto_transform_work)
+        .collect();
+    Ok(Response::new(ListClaimableTransformWorkResponse { work }))
+}
+pub(super) async fn claim_transform_work(
+    service: &SekaiServiceImpl,
+    req: Request<ClaimTransformWorkRequest>,
+) -> Result<Response<ClaimTransformWorkResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let input = req.into_inner();
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
+    let claimed = service
+        .db
+        .runtime()
+        .claim_transform_work(
+            &input.namespace,
+            &input.runtime_id,
+            &input.run_id,
+            input.ttl_ms,
+            now_millis(),
+        )
+        .map_err(transform_work_status)?;
+    match claimed {
+        Some((work, transform)) => Ok(Response::new(ClaimTransformWorkResponse {
+            work: Some(to_proto_transform_work(&work)),
+            transform: Some(to_proto_transform(&transform)),
+        })),
+        None => Err(Status::not_found("no claimable transform work")),
+    }
+}
+pub(super) async fn heartbeat_transform_claim(
+    service: &SekaiServiceImpl,
+    req: Request<HeartbeatTransformClaimRequest>,
+) -> Result<Response<HeartbeatTransformClaimResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let input = req.into_inner();
+    let run = service
+        .db
+        .runtime()
+        .get_governed_transform_run(&input.run_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("transform run not found"))?;
+    check_team_namespace(service.db.runtime(), &principals, &run.namespace, true)?;
+    let work = service
+        .db
+        .runtime()
+        .heartbeat_transform_work(
+            &input.run_id,
+            &input.runtime_id,
+            input.claim_generation,
+            &input.fencing_token,
+            input.ttl_ms,
+            now_millis(),
+        )
+        .map_err(transform_work_status)?;
+    Ok(Response::new(HeartbeatTransformClaimResponse {
+        work: Some(to_proto_transform_work(&work)),
+    }))
+}
+pub(super) async fn read_transform_run_inputs(
+    service: &SekaiServiceImpl,
+    req: Request<ReadTransformRunInputsRequest>,
+) -> Result<
+    Response<
+        std::pin::Pin<
+            Box<
+                dyn futures_util::Stream<Item = Result<ReadTransformRunInputsResponse, Status>>
+                    + Send,
+            >,
+        >,
+    >,
+    Status,
+> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let input = req.into_inner();
+    let run = service
+        .db
+        .runtime()
+        .get_governed_transform_run(&input.run_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("transform run not found"))?;
+    check_team_namespace(service.db.runtime(), &principals, &run.namespace, true)?;
+    check_isolated_transform_datasets(service, &principals, &run, false)?;
+    let command = crate::sekai::governed_transform::WriteTransformRunCommand {
+        run_id: input.run_id,
+        runtime_id: input.runtime_id,
+        claim_generation: input.claim_generation,
+        fencing_token: input.fencing_token,
+        ..crate::sekai::governed_transform::WriteTransformRunCommand::default()
+    };
+    let rows = service
+        .db
+        .runtime()
+        .read_transform_run_input(
+            &command,
+            &input.alias,
+            &input.after_alias,
+            input.after_row_id,
+            i64::from(input.limit),
+            now_millis(),
+        )
+        .map_err(transform_work_status)?;
+    let stream = futures_util::stream::iter(rows.into_iter().map(|row| {
+        Ok(ReadTransformRunInputsResponse {
+            row: Some(TransformRunInputRow {
+                alias: row.alias,
+                dataset_id: row.dataset_id,
+                row_id: row.row_id,
+                values: row.values,
+            }),
+        })
+    }));
+    Ok(Response::new(Box::pin(stream)))
+}
+pub(super) async fn write_transform_run_result(
+    service: &SekaiServiceImpl,
+    req: Request<WriteTransformRunResultRequest>,
+) -> Result<Response<WriteTransformRunResultResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let input = req.into_inner();
+    let run = service
+        .db
+        .runtime()
+        .get_governed_transform_run(&input.run_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("transform run not found"))?;
+    check_team_namespace(service.db.runtime(), &principals, &run.namespace, true)?;
+    check_isolated_transform_datasets(service, &principals, &run, true)?;
+    let command = crate::sekai::governed_transform::WriteTransformRunCommand {
+        run_id: input.run_id,
+        runtime_id: input.runtime_id,
+        claim_generation: input.claim_generation,
+        fencing_token: input.fencing_token,
+        rows: input.rows.into_iter().map(|row| row.values).collect(),
+        output_digest: input.output_digest,
+        quarantined: input.quarantined,
+        quality_rule: input.quality_rule,
+    };
+    let run = service
+        .db
+        .runtime()
+        .write_transform_run(command, now_millis())
+        .map_err(transform_work_status)?;
+    Ok(Response::new(WriteTransformRunResultResponse {
+        run: Some(to_proto_transform_run(&run)),
+    }))
+}
+
+// Authorize the admitted JobSpec dataset bindings. Snapshot rows stay claim-fenced
+// to this run; dataset-id reuse under a live claim is outside this check.
+fn check_isolated_transform_datasets(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    run: &crate::sekai::governed_transform::TransformRun,
+    write_output: bool,
+) -> Result<(), Status> {
+    let transform = service
+        .db
+        .runtime()
+        .admitted_isolated_transform(&run.run_id)
+        .map_err(transform_work_status)?
+        .ok_or_else(|| Status::not_found("admitted transform not found"))?;
+    let dataset_ids: Vec<String> = if write_output {
+        vec![transform.output_dataset_id]
+    } else {
+        transform
+            .input_bindings()
+            .into_iter()
+            .map(|(_, dataset_id)| dataset_id)
+            .collect()
+    };
+    for dataset_id in dataset_ids {
+        let dataset = service
+            .db
+            .runtime()
+            .get_dataset(&dataset_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("dataset not found"))?;
+        check_dataset_access(
+            service.db.runtime(),
+            &service.security,
+            principals,
+            &dataset,
+            write_output,
+        )?;
+    }
+    Ok(())
+}
+
+fn transform_work_status(error: String) -> Status {
+    if error == crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM
+        || error == crate::sekai::governed_transform::STALE_TRANSFORM_ADMISSION
+        || error == crate::sekai::governed_transform::TRANSFORM_DEFINITION_CHANGED
+    {
+        Status::failed_precondition(error)
+    } else if error == crate::sekai::governed_transform::TRANSFORM_DIGEST_MISMATCH
+        || error.contains("required")
+    {
+        Status::invalid_argument(error)
+    } else if error.contains("not found") {
+        Status::not_found(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
+fn to_proto_transform_work(
+    work: &crate::sekai::governed_transform::TransformWork,
+) -> TransformWork {
+    TransformWork {
+        run_id: work.run_id.clone(),
+        namespace: work.namespace.clone(),
+        transform_id: work.transform_id.clone(),
+        definition_digest: work.definition_digest.clone(),
+        engine: work.engine.clone(),
+        runtime_image: work.runtime_image.clone(),
+        status: work.status.clone(),
+        claim_owner: work.claim_owner.clone(),
+        claim_generation: work.claim_generation,
+        fencing_token: work.fencing_token.clone(),
+        claim_expires_at_ms: work.claim_expires_at_ms,
+        lease_expiries: work.lease_expiries,
+        created_at_ms: work.created_at_ms,
+    }
+}
 
 fn to_proto_transform(
     transform: &crate::sekai::governed_transform::GovernedTransform,
@@ -1494,24 +1749,30 @@ fn to_proto_transform(
             .collect(),
         quality_rule: transform.quality_rule.clone(),
         definition_digest: transform.definition_digest.clone(),
-        profile: if transform.is_analytical() {
+        profile: if transform.is_isolated_process() {
+            crate::sekai::governed_transform::ISOLATED_CLASS.into()
+        } else if transform.is_analytical() {
             crate::sekai::governed_transform::ANALYTICAL_CLASS.into()
         } else {
             String::new()
         },
         inputs: transform
-            .analytical
+            .isolated_process
             .as_ref()
-            .map(|spec| {
-                spec.inputs
-                    .iter()
-                    .map(|input| TransformInput {
-                        alias: input.alias.clone(),
-                        dataset_id: input.dataset_id.clone(),
-                    })
-                    .collect()
+            .map(|spec| spec.inputs.as_slice())
+            .or_else(|| {
+                transform
+                    .analytical
+                    .as_ref()
+                    .map(|spec| spec.inputs.as_slice())
             })
-            .unwrap_or_default(),
+            .unwrap_or(&[])
+            .iter()
+            .map(|input| TransformInput {
+                alias: input.alias.clone(),
+                dataset_id: input.dataset_id.clone(),
+            })
+            .collect(),
         sql: transform
             .analytical
             .as_ref()
@@ -1527,6 +1788,16 @@ fn to_proto_transform(
             .as_ref()
             .map(|spec| spec.time_limit_ms)
             .unwrap_or(0),
+        engine: transform
+            .isolated_process
+            .as_ref()
+            .map(|spec| spec.engine.clone())
+            .unwrap_or_default(),
+        runtime_image: transform
+            .isolated_process
+            .as_ref()
+            .map(|spec| spec.runtime_image.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1534,11 +1805,17 @@ fn from_proto_analytical(
     proto: &GovernedTransform,
 ) -> Option<crate::sekai::governed_transform::AnalyticalSpec> {
     let profile = proto.profile.trim().to_ascii_lowercase();
+    if profile == crate::sekai::governed_transform::ISOLATED_CLASS {
+        return None;
+    }
     let has_spec = profile == crate::sekai::governed_transform::ANALYTICAL_CLASS
-        || !proto.inputs.is_empty()
         || !proto.sql.trim().is_empty()
         || proto.memory_limit_bytes != 0
-        || proto.time_limit_ms != 0;
+        || proto.time_limit_ms != 0
+        || (profile != crate::sekai::governed_transform::ISOLATED_CLASS
+            && !proto.inputs.is_empty()
+            && proto.engine.trim().is_empty()
+            && proto.runtime_image.trim().is_empty());
     if !has_spec {
         return None;
     }
@@ -1554,6 +1831,33 @@ fn from_proto_analytical(
         sql: proto.sql.clone(),
         memory_limit_bytes: proto.memory_limit_bytes,
         time_limit_ms: proto.time_limit_ms,
+    })
+}
+
+fn from_proto_isolated(
+    proto: &GovernedTransform,
+) -> Option<crate::sekai::governed_transform::IsolatedProcessSpec> {
+    let profile = proto.profile.trim().to_ascii_lowercase();
+    if profile == crate::sekai::governed_transform::ANALYTICAL_CLASS {
+        return None;
+    }
+    let has_spec = profile == crate::sekai::governed_transform::ISOLATED_CLASS
+        || !proto.engine.trim().is_empty()
+        || !proto.runtime_image.trim().is_empty();
+    if !has_spec {
+        return None;
+    }
+    Some(crate::sekai::governed_transform::IsolatedProcessSpec {
+        engine: proto.engine.clone(),
+        runtime_image: proto.runtime_image.clone(),
+        inputs: proto
+            .inputs
+            .iter()
+            .map(|input| crate::sekai::governed_transform::TransformInput {
+                alias: input.alias.clone(),
+                dataset_id: input.dataset_id.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -1575,6 +1879,10 @@ fn to_proto_transform_run(run: &crate::sekai::governed_transform::TransformRun) 
         created_at_ms: run.created_at_ms,
         markings_in: run.markings_in.clone(),
         markings_out: run.markings_out.clone(),
+        profile: run.profile.clone(),
+        engine: run.engine.clone(),
+        runtime_image: run.runtime_image.clone(),
+        dispatch_status: run.dispatch_status.clone(),
     }
 }
 

@@ -108,6 +108,8 @@ const CONNECTOR_CERTIFICATIONS_SCHEMA: &str =
     include_str!("postgres/0055_connector_certifications.sql");
 const FUNCTION_GATE_APPROVALS_SCHEMA: &str =
     include_str!("postgres/0056_function_gate_approvals.sql");
+const ISOLATED_TRANSFORM_WORK_SCHEMA: &str =
+    include_str!("postgres/0057_isolated_transform_work.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -477,6 +479,12 @@ const MIGRATIONS: &[Migration] = &[
         55,
         "function_gate_approvals",
         FUNCTION_GATE_APPROVALS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        56,
+        "isolated_transform_work",
+        ISOLATED_TRANSFORM_WORK_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -1325,6 +1333,25 @@ mod tests {
             CONNECTOR_CERTIFICATIONS_SCHEMA
                 .contains("sekai_connector_certifications_live_identity"),
             "missing PostgreSQL live-certification unique index"
+        );
+        assert!(
+            FUNCTION_GATE_APPROVALS_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_function_gate_approvals"),
+            "missing PostgreSQL function-gate approvals table"
+        );
+        assert!(
+            ISOLATED_TRANSFORM_WORK_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_transform_work"),
+            "missing PostgreSQL isolated transform work table"
+        );
+        assert!(
+            ISOLATED_TRANSFORM_WORK_SCHEMA.contains("definition_json TEXT NOT NULL DEFAULT ''"),
+            "missing PostgreSQL isolated transform admitted JobSpec pin"
+        );
+        assert!(
+            ISOLATED_TRANSFORM_WORK_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_transform_run_input"),
+            "missing PostgreSQL isolated transform input snapshot table"
         );
         for table in ["sekai_governed_documents", "sekai_governed_renditions"] {
             assert!(

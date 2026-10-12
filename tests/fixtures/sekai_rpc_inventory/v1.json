@@ -531,6 +531,81 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ListClaimableTransformWork",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "HeartbeatTransformClaim",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReadTransformRunInputs",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "WriteTransformRunResult",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ClaimTransformWork",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "AdmitGovernedDocument",
       "kind": "persistent",
       "surfaces": [
