@@ -6,8 +6,11 @@
 //! Ontology edits apply automatically or are staged for human review via an
 //! Action. Sekai binds an existing `extracted_text` rendition, checks the
 //! caller-held text against the pinned digest (the plane stores no bytes),
-//! stamps `derived_from` lineage, and parks a `require_approval` Action when
-//! confidence is below the function threshold.
+//! stamps `derived_from` lineage, and resolves the namespace action policy for
+//! every extraction: `deny` refuses, `require_approval` parks the Action at any
+//! confidence, and `allow` writes only at or above the function threshold (a
+//! threshold of 0 writes every `allow` extraction). A write also passes the
+//! caller's object-write authorization.
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{Link, Object, REL_DERIVED_FROM, is_valid_property_key};
@@ -67,6 +70,9 @@ pub struct FunctionDocumentExtractRequest<'a> {
     pub now_ms: i64,
     pub object_kind: &'a str,
     pub action: FunctionDocumentAction,
+    /// The caller's CreateObject authorization for the extracted object. Runs before a
+    /// direct write; a parked extraction is authorized when its Action is granted.
+    pub authorize_write: &'a dyn Fn(&Object) -> Result<(), String>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +105,7 @@ pub fn extract_from_rendition(
         now_ms,
         object_kind,
         action,
+        authorize_write,
     } = request;
     validate_function(function)?;
     let llm = llm_step(function)?;
@@ -199,12 +206,26 @@ pub fn extract_from_rendition(
         created: now_ms,
         updated: now_ms,
     };
-    if (confidence as u32) < llm.minimum_confidence_micros {
-        let instance = park_extraction(db, actor, namespace, now_ms, &action, &object)?;
-        return Ok(FunctionDocumentExtract::Parked {
-            instance: Box::new(instance),
-            invocation,
-        });
+    let (type_def, decision) = extraction_policy(db, actor, namespace, &action)?;
+    match decision {
+        ActionDecision::Deny => {
+            return Err("function document extract denied by action policy".into());
+        }
+        ActionDecision::RequireApproval => {
+            let instance =
+                park_extraction(db, actor, namespace, now_ms, &type_def, &action, &object)?;
+            return Ok(FunctionDocumentExtract::Parked {
+                instance: Box::new(instance),
+                invocation,
+            });
+        }
+        ActionDecision::Allow if (confidence as u32) < llm.minimum_confidence_micros => {
+            return Err(
+                "function document extract below the confidence threshold requires require_approval"
+                    .into(),
+            );
+        }
+        ActionDecision::Allow => authorize_write(&object)?,
     }
     persist_extracted_object(
         db,
@@ -496,12 +517,13 @@ fn check_lineage_stub(
     Ok(())
 }
 
-fn require_approval_policy(
+/// The namespace action-policy decision for submitting the extraction Action.
+fn extraction_policy(
     db: &RuntimeDb,
     actor: &str,
     namespace: &str,
     action: &FunctionDocumentAction,
-) -> Result<GovernedActionType, String> {
+) -> Result<(GovernedActionType, ActionDecision), String> {
     let type_def =
         db.require_enabled_governed_action_type(namespace, &action.type_id, &action.version)?;
     let policy_project = if type_def.policy_scope.trim().is_empty() {
@@ -509,15 +531,11 @@ fn require_approval_policy(
     } else {
         type_def.policy_scope.as_str()
     };
-    let policy = db.resolve_action_policy(actor, namespace, policy_project)?;
-    let decision = match policy {
+    let decision = match db.resolve_action_policy(actor, namespace, policy_project)? {
         Some(policy) => policy.decide(SUBMIT_POLICY_ACTION, RiskClass::Write),
         None => ActionDecision::Allow,
     };
-    if decision != ActionDecision::RequireApproval {
-        return Err("function document extract requires require_approval".into());
-    }
-    Ok(type_def)
+    Ok((type_def, decision))
 }
 
 fn park_extraction(
@@ -525,10 +543,10 @@ fn park_extraction(
     actor: &str,
     namespace: &str,
     now_ms: i64,
+    type_def: &GovernedActionType,
     action: &FunctionDocumentAction,
     object: &Object,
 ) -> Result<ActionInstance, String> {
-    let type_def = require_approval_policy(db, actor, namespace, action)?;
     // A grant writes the object through the type's own create mutation, so
     // refuse a type whose grant would write nothing or another kind.
     if type_def.object_kind.trim() != object.kind
@@ -805,11 +823,27 @@ mod tests {
         }
     }
 
+    fn set_policy(runtime: &RuntimeDb, decision: ActionDecision) {
+        let mut policy = ActionPolicy::allow_all("records");
+        policy.default_decision = decision;
+        runtime.upsert_action_policy(&policy).unwrap();
+    }
+
     fn extract(
         runtime: &RuntimeDb,
         function: &Function,
         text: &str,
         output: serde_json::Value,
+    ) -> Result<(FunctionDocumentExtract, Option<serde_json::Value>), String> {
+        extract_authorized(runtime, function, text, output, &|_| Ok(()))
+    }
+
+    fn extract_authorized(
+        runtime: &RuntimeDb,
+        function: &Function,
+        text: &str,
+        output: serde_json::Value,
+        authorize_write: &dyn Fn(&Object) -> Result<(), String>,
     ) -> Result<(FunctionDocumentExtract, Option<serde_json::Value>), String> {
         let llm = RecordingHost {
             output,
@@ -832,6 +866,7 @@ mod tests {
             now_ms: 2_000,
             object_kind: "invoice",
             action: action(),
+            authorize_write,
         })?;
         Ok((result, llm.bound.lock().unwrap().clone()))
     }
@@ -841,6 +876,7 @@ mod tests {
         let runtime = db();
         let text_digest = admit_invoice_document(&runtime);
         seed_action(&runtime);
+        set_policy(&runtime, ActionDecision::Allow);
         let function = extract_function(800_000);
         let (result, bound) = extract(
             &runtime,
@@ -1055,6 +1091,66 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn invoice_output(confidence: u64) -> serde_json::Value {
+        serde_json::json!({"id": "inv-1", "vendor": "ACME", "confidence_micros": confidence})
+    }
+
+    #[test]
+    fn deny_policy_refuses_an_above_threshold_extract() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        set_policy(&runtime, ActionDecision::Deny);
+        let error = extract(
+            &runtime,
+            &extract_function(800_000),
+            EXTRACTED,
+            invoice_output(900_000),
+        )
+        .unwrap_err();
+        assert!(error.contains("denied by action policy"), "{error}");
+        assert!(runtime.get_object("inv-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn require_approval_parks_at_any_confidence_including_a_zero_threshold() {
+        for threshold in [800_000, 0] {
+            let runtime = db();
+            admit_invoice_document(&runtime);
+            seed_action(&runtime);
+            let (result, _) = extract(
+                &runtime,
+                &extract_function(threshold),
+                EXTRACTED,
+                invoice_output(900_000),
+            )
+            .unwrap();
+            assert!(
+                matches!(result, FunctionDocumentExtract::Parked { .. }),
+                "threshold {threshold} must park"
+            );
+            assert!(runtime.get_object("inv-1").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn allowed_extract_is_refused_by_the_write_authorization() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        set_policy(&runtime, ActionDecision::Allow);
+        let error = extract_authorized(
+            &runtime,
+            &extract_function(800_000),
+            EXTRACTED,
+            invoice_output(900_000),
+            &|object| Err(format!("write denied for {}", object.id)),
+        )
+        .unwrap_err();
+        assert_eq!(error, "write denied for inv-1");
+        assert!(runtime.get_object("inv-1").unwrap().is_none());
     }
 
     fn grant(runtime: &RuntimeDb, instance_id: &str) -> ActionInstance {
