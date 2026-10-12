@@ -2,16 +2,6 @@
 
 ## Unreleased
 
-- Enterprise extensions can admit or refuse the resolved model of a provider
-  execution before its credential lookup and provider call:
-  `EnterpriseExtension::admit_model` receives a `ModelIdentity` (provider,
-  model, profile version, pinned `artifact_digest`, and the endpoint the
-  provider client uses) and defaults to admit. Provider profiles and hosted
-  endpoints gain an optional `artifact_digest`. With an extension installed,
-  any `resolve_provider_credential` error, `CredentialNotFound` included,
-  now refuses execution instead of falling back to the process key; an
-  extension that wants the instance key returns it explicitly (#1352).
-
 - The egress entity scan no longer truncates at 500 literals. Every name and
   external id of the up to 500 scanned objects is checked, so namespaces with
   more than about 250 named objects stop refusing all `Sensitive` egress to
@@ -25,6 +15,16 @@
   confidence, and `allow` writes only at or above the threshold. A direct
   write also runs the caller's CreateObject authorization, which
   `FunctionDocumentExtractRequest.authorize_write` now requires (#1382).
+
+- Enterprise extensions can admit or refuse the resolved model of a provider
+  execution before its credential lookup and provider call:
+  `EnterpriseExtension::admit_model` receives a `ModelIdentity` (provider,
+  model, profile version, pinned `artifact_digest`, and the endpoint the
+  provider client uses) and defaults to admit. Provider profiles and hosted
+  endpoints gain an optional `artifact_digest`. With an extension installed,
+  any `resolve_provider_credential` error, `CredentialNotFound` included,
+  now refuses execution instead of falling back to the process key; an
+  extension that wants the instance key returns it explicitly (#1352).
 
 - Connector certifications persist on PostgreSQL with the SQLite certify, get,
   verify, revoke, and supersession semantics. Adds PostgreSQL migration
