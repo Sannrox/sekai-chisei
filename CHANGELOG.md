@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Governed-document hold, release, expire, and delete check and write the
+  record in one transaction on SQLite and PostgreSQL, so a concurrent delete
+  or expire can no longer drop a hold reported as placed. Delete drops the
+  renditions in the same transaction, and a rendition no longer attaches to
+  a deleted document (#1381).
+
 - The egress entity scan no longer truncates at 500 literals. Every name and
   external id of the up to 500 scanned objects is checked, so namespaces with
   more than about 250 named objects stop refusing all `Sensitive` egress to
