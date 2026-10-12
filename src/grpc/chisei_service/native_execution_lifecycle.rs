@@ -714,10 +714,7 @@ impl ChiseiServiceImpl {
             payload_for_leak_check(&plan.prepared_system, &plan.prepared_messages, &plan.tools);
         let leak_findings =
             self.leak_findings_for_payload(&input.namespace, provider, data_class, &payload)?;
-        if leak_findings
-            .iter()
-            .any(|finding| finding.action == LeakAction::Block)
-        {
+        if let Some(refusal) = crate::chisei::privacy::blocking_refusal(&leak_findings) {
             self.record_leak_audit(
                 "execute_leak_check",
                 &input.request_id,
@@ -731,9 +728,7 @@ impl ChiseiServiceImpl {
                 "privacy_leak_detected_after_planning",
             )
             .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "privacy leak checker blocked outbound payload",
-            ));
+            return Err(Status::failed_precondition(refusal));
         }
         Ok(())
     }
