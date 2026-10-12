@@ -270,6 +270,8 @@ pub fn hosted_endpoints(
                     .to_string(),
                 origin: profile.endpoint_origin.clone(),
                 model_patterns: profile.model_patterns.clone(),
+                // Registered routes do not pin weights yet (#1396).
+                artifact_digest: None,
             })
         })
         .collect()

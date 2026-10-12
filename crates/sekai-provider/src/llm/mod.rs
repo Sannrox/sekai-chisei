@@ -613,6 +613,7 @@ pub fn resolve_with_registry_and_provider_credential(
     provider_credential: Option<&str>,
 ) -> Result<Box<dyn Provider>, String> {
     let resolved = registry.resolve_model(model)?;
+    let endpoint = execution_endpoint(&resolved, registry, ollama_url, native_url)?;
     let inner: Box<dyn Provider> = match resolved.provider.as_str() {
         "anthropic" => {
             let key = provider_credential
@@ -624,14 +625,61 @@ pub fn resolve_with_registry_and_provider_credential(
             let key = provider_credential
                 .or(openai_key)
                 .ok_or("OPENAI_API_KEY not set")?;
-            Box::new(openai::OpenAI::new(key, None))
+            Box::new(openai::OpenAI::new(key, Some(&endpoint)))
         }
-        "ollama" => Box::new(openai::OpenAI::new("", Some(ollama_url))),
-        "native" => {
-            let url = native_url
-                .ok_or_else(|| format!("NATIVE_LLM_URL not set for model {:?}", model))?;
-            Box::new(openai::OpenAI::new("", Some(url)))
+        "ollama" | "native" => Box::new(openai::OpenAI::new("", Some(&endpoint))),
+        "xai" | "meta" => {
+            let key_env = registry
+                .effective_profile(&resolved.provider)
+                .and_then(|profile| profile.endpoint.api_key_env)
+                .ok_or_else(|| format!("provider {:?} has no API key source", resolved.provider))?;
+            let process_key = std::env::var(&key_env)
+                .ok()
+                .filter(|value| !value.trim().is_empty());
+            let key = provider_credential
+                .or(process_key.as_deref())
+                .ok_or_else(|| format!("{key_env} not set"))?;
+            Box::new(openai::OpenAI::new(key, Some(&endpoint)))
         }
+        provider if crate::provider_profile::is_hosted_provider(provider) => {
+            // A hosted route authenticates only with the credential its
+            // profile references; process-wide provider keys never apply.
+            let key = provider_credential
+                .ok_or_else(|| format!("hosted route {provider:?} credential unavailable"))?;
+            Box::new(openai::OpenAI::new(key, Some(&endpoint)))
+        }
+        provider => return Err(format!("unsupported provider {provider:?}")),
+    };
+    let hosted_profile = crate::provider_profile::is_hosted_provider(&resolved.provider)
+        .then(|| registry.effective_profile(&resolved.provider))
+        .flatten();
+    Ok(Box::new(ResolvedModelProvider {
+        inner,
+        upstream_model: resolved.upstream_model,
+        canonical_model: resolved.canonical_model,
+        registry_state_path: registry_state_path.map(std::path::Path::to_path_buf),
+        hosted_profile,
+    }))
+}
+
+/// Base URL a call for `resolved` reaches. Provider construction and enterprise model
+/// admission both use it, so admission sees the endpoint that receives the prompt.
+pub fn execution_endpoint(
+    resolved: &crate::provider_profile::ResolvedProviderModel,
+    registry: &crate::provider_profile::ProviderRegistry,
+    ollama_url: &str,
+    native_url: Option<&str>,
+) -> Result<String, String> {
+    match resolved.provider.as_str() {
+        "anthropic" => Ok(anthropic::ANTHROPIC_BASE_URL.into()),
+        "openai" => Ok(openai::OPENAI_BASE_URL.into()),
+        "ollama" => Ok(ollama_url.into()),
+        "native" => native_url.map(Into::into).ok_or_else(|| {
+            format!(
+                "NATIVE_LLM_URL not set for model {:?}",
+                resolved.requested_model
+            )
+        }),
         "xai" | "meta" => {
             let profile = registry
                 .effective_profile(&resolved.provider)
@@ -648,42 +696,14 @@ pub fn resolve_with_registry_and_provider_credential(
                         profile.endpoint.base_url_env, resolved.provider
                     )
                 })?;
-            let key_env = profile
-                .endpoint
-                .api_key_env
-                .ok_or_else(|| format!("provider {:?} has no API key source", resolved.provider))?;
-            let process_key = std::env::var(&key_env)
-                .ok()
-                .filter(|value| !value.trim().is_empty());
-            let key = provider_credential
-                .or(process_key.as_deref())
-                .ok_or_else(|| format!("{key_env} not set"))?;
-            let api_root = openai_compatible_api_root(&base_url);
-            Box::new(openai::OpenAI::new(key, Some(api_root)))
+            Ok(openai_compatible_api_root(&base_url).into())
         }
-        provider if crate::provider_profile::is_hosted_provider(provider) => {
-            let base_url = registry
-                .effective_profile(provider)
-                .and_then(|profile| profile.endpoint.default_base_url)
-                .ok_or_else(|| format!("hosted route {provider:?} is unavailable"))?;
-            // A hosted route authenticates only with the credential its
-            // profile references; process-wide provider keys never apply.
-            let key = provider_credential
-                .ok_or_else(|| format!("hosted route {provider:?} credential unavailable"))?;
-            Box::new(openai::OpenAI::new(key, Some(&base_url)))
-        }
-        provider => return Err(format!("unsupported provider {provider:?}")),
-    };
-    let hosted_profile = crate::provider_profile::is_hosted_provider(&resolved.provider)
-        .then(|| registry.effective_profile(&resolved.provider))
-        .flatten();
-    Ok(Box::new(ResolvedModelProvider {
-        inner,
-        upstream_model: resolved.upstream_model,
-        canonical_model: resolved.canonical_model,
-        registry_state_path: registry_state_path.map(std::path::Path::to_path_buf),
-        hosted_profile,
-    }))
+        provider if crate::provider_profile::is_hosted_provider(provider) => registry
+            .effective_profile(provider)
+            .and_then(|profile| profile.endpoint.default_base_url)
+            .ok_or_else(|| format!("hosted route {provider:?} is unavailable")),
+        provider => Err(format!("unsupported provider {provider:?}")),
+    }
 }
 
 fn openai_compatible_api_root(base_url: &str) -> &str {
@@ -724,6 +744,7 @@ mod tests {
                     name: "acme".into(),
                     origin: "https://models.example.com".into(),
                     model_patterns: vec!["acme-*".into()],
+                    artifact_digest: None,
                 },
             ]);
         let resolve = |credential| {
