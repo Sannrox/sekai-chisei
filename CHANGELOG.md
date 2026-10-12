@@ -2,11 +2,6 @@
 
 ## Unreleased
 
-- The privacy entity scan lists at most 501 objects in one query that
-  excludes `leak_rule` in SQL, instead of paging up to 1000 objects and
-  filtering in Rust, and fingerprints the set with a streaming digest
-  instead of formatting, sorting, and joining strings (#1491).
-
 - Isolated-process governed transforms admit claimable work instead of
   computing in-process. A worker claims with a fencing token, streams the
   admitted JobSpec snapshot, and writes the output, receipt, and lineage in
@@ -25,6 +20,11 @@
   any `resolve_provider_credential` error, `CredentialNotFound` included,
   now refuses execution instead of falling back to the process key; an
   extension that wants the instance key returns it explicitly (#1352).
+
+- The privacy entity scan lists at most 501 objects in one query that
+  excludes `leak_rule` in SQL, instead of paging up to 1000 objects and
+  filtering in Rust, and fingerprints the set with a streaming digest
+  instead of formatting, sorting, and joining strings (#1491).
 
 - `CreateFunction` refuses a function with an LLM step. The gated publish
   records an approval for the revision digest and stores it; `InvokeFunction`
