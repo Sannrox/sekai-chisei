@@ -132,6 +132,21 @@ fn seed_action(db: &RuntimeDb, prefix: &str) {
     db.put_action_effects(&[effect]).unwrap();
 }
 
+/// Community `RuntimeDb::append_rows` stays SQLite-only; PostgreSQL snapshots
+/// come from each backend's native dataset-row API.
+fn seed_dataset_rows(db: &RuntimeDb, dataset_id: &str, rows: &[HashMap<String, String>]) {
+    match db {
+        RuntimeDb::Sqlite(_) => {
+            db.append_rows(dataset_id, rows).unwrap();
+        }
+        RuntimeDb::Postgres(pg) => {
+            tokio::task::block_in_place(|| {
+                pg.append_dataset_rows(dataset_id, rows).unwrap();
+            });
+        }
+    }
+}
+
 fn seed_transform(db: &RuntimeDb, prefix: &str) {
     db.ensure_team_namespace(NAMESPACE, PRINCIPAL, Role::Admin, PRINCIPAL)
         .unwrap();
@@ -148,11 +163,11 @@ fn seed_transform(db: &RuntimeDb, prefix: &str) {
     };
     db.create_dataset(&dataset("in")).unwrap();
     db.create_dataset(&dataset("out")).unwrap();
-    db.append_rows(
+    seed_dataset_rows(
+        db,
         &format!("{prefix}-in"),
         &[HashMap::from([("id".into(), "1".into())])],
-    )
-    .unwrap();
+    );
     let transform = GovernedTransform {
         contract_version: CONTRACT_VERSION.into(),
         namespace: NAMESPACE.into(),
