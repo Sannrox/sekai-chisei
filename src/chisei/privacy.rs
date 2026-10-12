@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::domain::Object;
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -229,27 +230,28 @@ fn leak_fingerprint(objects: &[Object]) -> String {
     parts.join("\n")
 }
 
+/// Digest of the fields that decide the entity literals, in listing order (id ascending).
+/// A different order only costs a cache miss; it never reuses a stale literal set.
 fn entity_fingerprint(objects: &[Object]) -> String {
-    let mut parts: Vec<String> = objects
-        .iter()
-        .map(|object| {
-            format!(
-                "{}|{}|{}|{}|{}|{}",
-                object.namespace,
-                object.id,
-                object.name,
-                object.external_id,
-                object
-                    .properties
-                    .get(ENTITY_SCAN_OPT_OUT_KEY)
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                object.updated,
-            )
-        })
-        .collect();
-    parts.sort();
-    parts.join("\n")
+    let mut hasher = Sha256::new();
+    for object in objects {
+        for field in [
+            object.namespace.as_str(),
+            object.id.as_str(),
+            object.name.as_str(),
+            object.external_id.as_str(),
+            object
+                .properties
+                .get(ENTITY_SCAN_OPT_OUT_KEY)
+                .map(String::as_str)
+                .unwrap_or(""),
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.update(object.updated.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 pub fn compile_leak_rules(objects: &[Object]) -> Vec<LeakRule> {
@@ -669,6 +671,28 @@ mod tests {
         assert_eq!(second.entities.as_slice(), first.entities.as_slice());
         assert!(Arc::ptr_eq(&first.entities, &second.entities));
         assert!(!first.truncated);
+    }
+
+    #[test]
+    fn entity_fingerprint_tracks_literal_fields_without_ambiguity() {
+        let base = named_scan_objects(2);
+        assert_eq!(entity_fingerprint(&base), entity_fingerprint(&base.clone()));
+        let mut renamed = base.clone();
+        renamed[1].name = "Customer 9999".into();
+        assert_ne!(entity_fingerprint(&base), entity_fingerprint(&renamed));
+        let mut opted_out = base.clone();
+        opted_out[0]
+            .properties
+            .insert(ENTITY_SCAN_OPT_OUT_KEY.into(), "false".into());
+        assert_ne!(entity_fingerprint(&base), entity_fingerprint(&opted_out));
+        // Length prefixes keep field boundaries: "ab"+"c" differs from "a"+"bc".
+        let mut shifted = base.clone();
+        shifted[0].name = "ab".into();
+        shifted[0].external_id = "c".into();
+        let mut other = base.clone();
+        other[0].name = "a".into();
+        other[0].external_id = "bc".into();
+        assert_ne!(entity_fingerprint(&shifted), entity_fingerprint(&other));
     }
 
     fn fill_scan_objects(count: usize) -> Vec<Object> {

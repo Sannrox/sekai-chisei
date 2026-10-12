@@ -7793,6 +7793,20 @@ impl RuntimeDb {
         }
     }
 
+    /// One unfiltered page without `excluded_kinds`; the kinds are internal constants.
+    pub fn list_objects_excluding_kinds(
+        &self,
+        filter: &ListFilter,
+        excluded_kinds: &[&str],
+    ) -> Result<Vec<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_objects_excluding_kinds(filter, excluded_kinds),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_objects_excluding_kinds(filter, excluded_kinds)
+            }),
+        }
+    }
+
     pub fn delete_object(&self, id: &str) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.delete_object(id),
