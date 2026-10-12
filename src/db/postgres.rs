@@ -111,6 +111,8 @@ const FUNCTION_GATE_APPROVALS_SCHEMA: &str =
 const ISOLATED_TRANSFORM_WORK_SCHEMA: &str =
     include_str!("postgres/0057_isolated_transform_work.sql");
 const TRANSFORM_SCHEDULE_SCHEMA: &str = include_str!("postgres/0058_transform_schedule.sql");
+const NAMESPACE_OBJECT_GENERATION_SCHEMA: &str =
+    include_str!("postgres/0059_namespace_object_generation.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -492,6 +494,12 @@ const MIGRATIONS: &[Migration] = &[
         57,
         "transform_schedule",
         TRANSFORM_SCHEDULE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        58,
+        "namespace_object_generation",
+        NAMESPACE_OBJECT_GENERATION_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

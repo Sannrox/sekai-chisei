@@ -8618,7 +8618,9 @@ fn privacy_egress_fails_closed_when_sekai_is_hop_only() {
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(
-        error.message().contains("leak-rule policy unavailable"),
+        error
+            .message()
+            .contains("sensitive-entity policy unavailable"),
         "{}",
         error.message()
     );

@@ -2808,6 +2808,10 @@ mod tests {
         assert_eq!(result.transaction.status, SourceBatchStatus::Committed);
         assert_eq!(result.transaction.outcome, OperationOutcome::Success);
         assert!(result.checkpoint_advanced);
+        assert!(
+            db.namespace_object_generation("acme").unwrap() > 0,
+            "sync apply must advance the namespace object generation"
+        );
         assert_eq!(result.records.len(), 1);
         assert_eq!(checkpoint(&db).as_deref(), Some("cursor:1"));
 

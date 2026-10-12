@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Sensitive egress reuses compiled entity literals from a per-namespace
+  object-change generation instead of listing the graph on every cache hit.
+  SQLite and PostgreSQL advance that generation in the same transaction as
+  every object write (create, update, delete, namespace move, sync apply,
+  definition-migration rewrites). Adds ADR 0104 and PostgreSQL migration
+  `0059_namespace_object_generation` (#1492).
+
 - Governed transforms accept an optional schedule and change trigger. The
   plane admits one run per schedule tick across restarts, runs downstream
   once after an upstream commit or `ApplySourceBatch`, refuses dependency

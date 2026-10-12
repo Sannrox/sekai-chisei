@@ -5010,6 +5010,15 @@ impl RuntimeDb {
         }
     }
 
+    pub fn namespace_object_generation(&self, namespace: &str) -> Result<u64, String> {
+        match self {
+            Self::Sqlite(db) => db.namespace_object_generation(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.namespace_object_generation(namespace))
+            }
+        }
+    }
+
     pub fn object_change_watermark(&self, namespace: &str) -> Result<u64, String> {
         match self {
             Self::Sqlite(db) => db.object_change_watermark(namespace),
