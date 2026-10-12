@@ -4790,28 +4790,62 @@ async fn create_function_rejects_an_empty_pipeline_step() {
 }
 
 #[tokio::test]
-async fn create_and_list_function_with_llm_step_fail_closes_invoke_without_a_host() {
+async fn create_function_refuses_an_ungated_llm_step_and_invoke_fail_closes_without_a_host() {
     let svc = service();
     let schema =
         r#"{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}"#;
-    svc.create_function(with_principal(CreateFunctionRequest {
-        function: Some(Function {
-            name: "classify".into(),
-            pipeline: vec![PipelineStep {
-                step: Some(pipeline_step::Step::Llm(LlmStep {
-                    prompt_revision: "classify/v1".into(),
-                    input_bindings: HashMap::from([("language".into(), "language".into())]),
-                    output_schema: schema.into(),
-                    model_route: "native/scripted".into(),
-                    minimum_confidence_micros: 800_000,
-                })),
-                ..Default::default()
-            }],
+    let function = Function {
+        name: "classify".into(),
+        pipeline: vec![PipelineStep {
+            step: Some(pipeline_step::Step::Llm(LlmStep {
+                prompt_revision: "classify/v1".into(),
+                input_bindings: HashMap::from([("language".into(), "language".into())]),
+                output_schema: schema.into(),
+                model_route: "native/scripted".into(),
+                minimum_confidence_micros: 800_000,
+            })),
             ..Default::default()
-        }),
-    }))
-    .await
-    .unwrap();
+        }],
+        ..Default::default()
+    };
+    let refused = svc
+        .create_function(with_principal(CreateFunctionRequest {
+            function: Some(function.clone()),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        refused.message(),
+        crate::sekai::function::LLM_FUNCTION_REQUIRES_GATE
+    );
+    let invoke = || {
+        svc.invoke_function(with_principal(InvokeFunctionRequest {
+            name: "classify".into(),
+            ..Default::default()
+        }))
+    };
+    // A row stored before gate approvals were recorded is not invokable.
+    let crate::db::runtime_db::RuntimeDb::Sqlite(sqlite) = svc.db.runtime() else {
+        panic!("sqlite test service");
+    };
+    sqlite
+        .create_function(&from_proto_function(&function).unwrap())
+        .unwrap();
+    let legacy = invoke().await.unwrap_err();
+    assert_eq!(legacy.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        legacy.message(),
+        crate::sekai::function::LLM_FUNCTION_REQUIRES_GATE
+    );
+    // Once the revision's gate approval exists, invoke reaches the (absent) LLM host.
+    let parsed = from_proto_function(&function).unwrap();
+    sqlite
+        .approve_function_gate(
+            &crate::sekai::function::function_digest(&parsed),
+            "classify",
+        )
+        .unwrap();
     let listed = svc
         .list_functions(with_principal(ListFunctionsRequest {}))
         .await
@@ -4831,13 +4865,7 @@ async fn create_and_list_function_with_llm_step_fail_closes_invoke_without_a_hos
         }
         other => panic!("expected llm step, got {other:?}"),
     }
-    let error = svc
-        .invoke_function(with_principal(InvokeFunctionRequest {
-            name: "classify".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
+    let error = invoke().await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::Internal);
     assert!(error.message().contains("llm step requires a host"));
 }
