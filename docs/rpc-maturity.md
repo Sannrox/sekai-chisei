@@ -79,9 +79,9 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.TakeoverExpiredLease` | `sekai.leases` | yes | none | `experimental` |
 | `SekaiService.ApplySourceBatch` | `sekai.object-sync` | yes | example | `stable` |
 | `SekaiService.GetSourceSyncState` | `sekai.object-sync` | yes | example | `stable` |
-| `SekaiService.RegisterSourceTypeDescriptor` | `sekai.object-sync` | sqlite only | none | `experimental` |
-| `SekaiService.InspectSourceTypeDescriptor` | `sekai.object-sync` | sqlite only | none | `experimental` |
-| `SekaiService.RetireSourceTypeDescriptor` | `sekai.object-sync` | sqlite only | none | `experimental` |
+| `SekaiService.RegisterSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.InspectSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.RetireSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.CreateDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ApplyDefinitionBranchEdit` | `sekai.definition-branch` | yes | none | `experimental` |

@@ -3,17 +3,19 @@ use std::collections::{BTreeMap, HashMap};
 use postgres::{GenericClient, IsolationLevel, Row};
 
 use crate::db::object_sync::{
-    ApplyError, PreparedBatch, PreparedRecord, mapper_for_github_or_unbound,
-    require_authorized_object_snapshot, validate_binding,
+    ApplyError, PreparedBatch, PreparedRecord, registered_descriptor_authorizes_batch,
+    require_authorized_object_snapshot, source_batch_mapper, unbound_type_revision,
+    validate_binding,
 };
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_audit::{insert_changes, lock_object_lifecycle};
+use crate::db::postgres_source_registry::{RowLock, get_descriptor};
 use crate::domain::Object;
 use crate::sekai::audit::object_diff_changes;
 use crate::sekai::object_lineage::ObjectLineage;
 use crate::sekai::object_sync::{
-    OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_GITHUB, SourceBatch, SourceBatchResult,
-    SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
+    OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch, SourceBatchResult, SourceBatchStatus,
+    SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
     SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
     SyncDecision, SyncedObject, is_schema_drift_denial, schema_quarantine_record_reason,
 };
@@ -79,7 +81,10 @@ impl PostgresDb {
         if now_ms <= 0 {
             return Err("invalid_timestamp: now_ms must be positive".into());
         }
-        let mapper = mapper_for_github_or_unbound(batch).map_err(|error| error.to_string())?;
+        let mapper = source_batch_mapper(batch, || {
+            self.get_source_type_descriptor(&batch.namespace, &batch.type_digest)
+        })
+        .map_err(|error| error.to_string())?;
         let prepared = PreparedBatch::new(batch, &mapper).map_err(|error| error.to_string())?;
         match self
             .persist_source_batch_open(batch, &prepared, now_ms)
@@ -145,6 +150,12 @@ impl PostgresDb {
                             )
                         })?;
                     validate_binding(&binding.binding, batch)?;
+                    if let Err(error) = require_live_registered_descriptor(&mut transaction, batch)
+                    {
+                        abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
+                        transaction.commit()?;
+                        return Err(error);
+                    }
                     transaction.commit()?;
                     Ok(OpenDisposition::Open)
                 }
@@ -154,6 +165,8 @@ impl PostgresDb {
                 )),
             };
         }
+
+        require_live_registered_descriptor(&mut transaction, batch)?;
 
         let binding = match load_binding_by_source(
             &mut transaction,
@@ -342,6 +355,11 @@ impl PostgresDb {
                     "open transaction has no stable source binding",
                 )
             })?;
+        if let Err(error) = require_live_registered_descriptor(&mut transaction, batch) {
+            abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
+            transaction.commit()?;
+            return Err(error);
+        }
         let preflight = validate_binding(&binding.binding, batch).and_then(|()| {
             preflight_commit_state(&mut transaction, &binding.binding, batch, &prepared.records)
         });
@@ -370,16 +388,7 @@ impl PostgresDb {
                     now_ms,
                 )?;
             }
-            transaction.execute(
-                "UPDATE sekai_source_batch_transactions
-                 SET status = 'ABORTED', outcome = 'denial', closed_at_ms = $1, reason = $2
-                 WHERE transaction_id = $3 AND status = 'OPEN'",
-                &[&now_ms, &error.to_string(), &prepared.transaction_id],
-            )?;
-            transaction.execute(
-                "UPDATE sekai_source_bindings SET updated_at_ms = $1 WHERE binding_id = $2",
-                &[&now_ms, &prepared.binding_id],
-            )?;
+            abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
             transaction.commit()?;
             return Err(error);
         }
@@ -1294,6 +1303,42 @@ fn load_binding_by_id(
         .transpose()
 }
 
+/// The registered descriptor must still be live when a batch opens and when
+/// it commits. The share lock holds off a concurrent retire until commit.
+fn require_live_registered_descriptor(
+    client: &mut impl GenericClient,
+    batch: &SourceBatch,
+) -> Result<(), ApplyError> {
+    if batch.type_digest == crate::sekai::object_sync::GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        return Ok(());
+    }
+    let stored = get_descriptor(client, &batch.namespace, &batch.type_digest, RowLock::Share)
+        .map_err(ApplyError::storage)?;
+    match stored {
+        Some(stored) if registered_descriptor_authorizes_batch(&stored, batch) => Ok(()),
+        _ => Err(unbound_type_revision()),
+    }
+}
+
+fn abort_open_source_batch(
+    client: &mut impl GenericClient,
+    prepared: &PreparedBatch,
+    now_ms: i64,
+    error: &ApplyError,
+) -> Result<(), ApplyError> {
+    client.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET status = 'ABORTED', outcome = 'denial', closed_at_ms = $1, reason = $2
+         WHERE transaction_id = $3 AND status = 'OPEN'",
+        &[&now_ms, &error.to_string(), &prepared.transaction_id],
+    )?;
+    client.execute(
+        "UPDATE sekai_source_bindings SET updated_at_ms = $1 WHERE binding_id = $2",
+        &[&now_ms, &prepared.binding_id],
+    )?;
+    Ok(())
+}
+
 fn load_binding_for_state(
     client: &mut impl GenericClient,
     namespace: &str,
@@ -1306,10 +1351,10 @@ fn load_binding_for_state(
                     family, adapter_id, adapter_version, type_digest, created_at_ms,
                     active, updated_at_ms
              FROM sekai_source_bindings
-             WHERE namespace = $1 AND source = $2
-               AND source_instance = $3 AND type_digest = $4
+             WHERE namespace = $1
+               AND source_instance = $2 AND type_digest = $3
              ORDER BY binding_id LIMIT 1",
-            &[&namespace, &SOURCE_GITHUB, &source_instance, &type_digest],
+            &[&namespace, &source_instance, &type_digest],
         )?
         .map(stored_binding_from_row)
         .transpose()

@@ -1,4 +1,5 @@
-//! Additive source-type descriptor identity and SQLite catalog (ADR 0060, #818).
+//! Additive source-type descriptor identity and catalog (ADR 0060, #818);
+//! persisted on SQLite and PostgreSQL (#1322).
 //!
 //! Register, inspect, and retire persist beside the code-owned GitHub profile.
 //! Live registered descriptors may authorize `ApplySourceBatch` (#819).
@@ -15,8 +16,6 @@ pub const SOURCE_TYPE_DESCRIPTOR_CONTRACT: &str = "sekai.source-type-descriptor/
 pub const STATUS_LIVE: &str = "live";
 pub const STATUS_RETIRED: &str = "retired";
 pub const DESCRIPTOR_UNAVAILABLE: &str = "source-type descriptor is unavailable";
-pub const POSTGRES_UNAVAILABLE: &str =
-    "source-type descriptors are unavailable on the PostgreSQL community runtime";
 
 /// One proposed registered source kind. One descriptor admits exactly one
 /// record kind and one schema revision.
@@ -234,7 +233,6 @@ pub fn register_source_type_descriptor(
     }
     match db.put_source_type_descriptor(&stored) {
         Ok(()) => Ok(inspect_identity(&stored)),
-        Err(error) if error == POSTGRES_UNAVAILABLE => Err(error),
         Err(error) if error == DESCRIPTOR_UNAVAILABLE => {
             let existing = db
                 .get_source_type_descriptor(&stored.namespace, &stored.digest)?

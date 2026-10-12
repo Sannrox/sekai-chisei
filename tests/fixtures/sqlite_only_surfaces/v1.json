@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 33,
+  "limit": 29,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -22,21 +22,6 @@
       "id": "SekaiService.GetClassificationLattice",
       "kind": "rpc",
       "methods": ["get_classification_lattice"]
-    },
-    {
-      "id": "SekaiService.RegisterSourceTypeDescriptor",
-      "kind": "rpc",
-      "methods": ["put_source_type_descriptor"]
-    },
-    {
-      "id": "SekaiService.InspectSourceTypeDescriptor",
-      "kind": "rpc",
-      "methods": ["get_source_type_descriptor"]
-    },
-    {
-      "id": "SekaiService.RetireSourceTypeDescriptor",
-      "kind": "rpc",
-      "methods": ["cas_source_type_descriptor"]
     },
     {
       "id": "SekaiService.PutActionBinding",
@@ -147,11 +132,6 @@
       "id": "admin.federation-snapshot",
       "kind": "admin",
       "methods": ["put_federation_snapshot_export", "get_federation_snapshot_import"]
-    },
-    {
-      "id": "admin.source-webhook",
-      "kind": "admin",
-      "methods": ["put_source_webhook_key", "get_source_webhook_key"]
     },
     {
       "id": "admin.data-quality",

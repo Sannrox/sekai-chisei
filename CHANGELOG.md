@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Source-webhook key pins and registered source-type descriptors persist on
+  PostgreSQL, and PostgreSQL `ApplySourceBatch` admits batches for live
+  registered descriptors. Register, inspect, and retire descriptor RPCs and
+  `sekaictl admin sync pin-webhook-key` now work on both backends. Adds
+  PostgreSQL migration `0054_source_registry` (#1322).
+
 - `sekaictl admin connectors new <name> --out <dir>` generates a source
   connector from `crates/sekai-connector-template`: check, discover, and read
   stubs, a fake source, gRPC transport, outbox commit per batch, and a config

@@ -213,8 +213,9 @@ transactions that open and commit a batch. A concurrent retire fails closed as
 `unbound_type_revision` before durable advance. Exact replay of an already
 committed or quarantined batch is unchanged after retirement. Unknown, retired,
 or unadmitted descriptors fail as `unbound_type_revision` without disclosure.
-PostgreSQL registered-type apply stays unavailable; GitHub apply remains
-dual-backend. GitHub is not rewritten as a registered descriptor. See
+On PostgreSQL the same checks hold under a row lock: apply reads the
+descriptor `FOR SHARE` and retire `FOR UPDATE`, so the two serialize. GitHub
+is not rewritten as a registered descriptor. See
 [research/817-source-type-admission.md](research/817-source-type-admission.md).
 
 The canonical batch digest includes all replay-relevant input, including the

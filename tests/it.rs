@@ -109,6 +109,7 @@ mod sekaictl_learning_pin;
 mod sekaictl_semantic_reads;
 mod service_file_ceilings;
 mod source_ingestion_benchmark;
+mod source_registry_backend_conformance;
 mod source_type_descriptor_adr;
 mod source_type_descriptor_catalog;
 mod source_type_descriptor_research;
@@ -254,6 +255,7 @@ const GROUPED_MODULES: &[&str] = &[
     "sekaictl_semantic_reads",
     "service_file_ceilings",
     "source_ingestion_benchmark",
+    "source_registry_backend_conformance",
     "source_type_descriptor_adr",
     "source_type_descriptor_catalog",
     "source_type_descriptor_research",
@@ -368,6 +370,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 116);
+    assert_eq!(GROUPED_MODULES.len(), 117);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }
