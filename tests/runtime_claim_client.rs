@@ -34,6 +34,7 @@ const PRINCIPAL: &str = "local";
 struct ServingPlane {
     endpoint: String,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServingPlane {
@@ -44,7 +45,7 @@ impl ServingPlane {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
@@ -56,6 +57,7 @@ impl ServingPlane {
         Self {
             endpoint,
             stop: Some(stop),
+            join: Some(join),
         }
     }
 
@@ -67,6 +69,15 @@ impl ServingPlane {
         )
         .await
         .expect("connect runtime-claim client")
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.await;
+        }
     }
 }
 
@@ -236,11 +247,12 @@ async fn exercise_action(db: RuntimeDb, prefix: &str) {
         matches!(lost, RuntimeClaimError::FenceLost),
         "lease expiry is fence loss, not idle: {lost}"
     );
+    plane.shutdown().await;
 }
 
 async fn exercise_transform(db: RuntimeDb, prefix: &str) {
     seed_transform(&db, prefix);
-    let plane = ServingPlane::start(db).await;
+    let plane = ServingPlane::start(db.clone()).await;
     let client = plane.client().await;
     let claim = client.runtime_claim();
 
@@ -299,6 +311,7 @@ async fn exercise_transform(db: RuntimeDb, prefix: &str) {
         .run
         .expect("completed run");
     assert_eq!(written.dispatch_status, "completed");
+    plane.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -311,24 +324,30 @@ async fn sqlite_runtime_claim_transform_conformance() {
     exercise_transform(RuntimeDb::memory(), "sqlite-transform").await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
-async fn postgres_runtime_claim_action_conformance() {
+fn postgres_runtime_claim_action_conformance() {
     let scratch = ScratchDatabase::create();
-    exercise_action(
-        RuntimeDb::Postgres(Arc::new(scratch.connect(4))),
-        &format!("pg-a-{}", uuid::Uuid::new_v4().simple()),
-    )
-    .await;
+    let db = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
+    let prefix = format!("pg-a-{}", uuid::Uuid::new_v4().simple());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(exercise_action(db.clone(), &prefix));
+    drop(db);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
-async fn postgres_runtime_claim_transform_conformance() {
+fn postgres_runtime_claim_transform_conformance() {
     let scratch = ScratchDatabase::create();
-    exercise_transform(
-        RuntimeDb::Postgres(Arc::new(scratch.connect(4))),
-        &format!("pg-t-{}", uuid::Uuid::new_v4().simple()),
-    )
-    .await;
+    let db = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
+    let prefix = format!("pg-t-{}", uuid::Uuid::new_v4().simple());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(exercise_transform(db.clone(), &prefix));
+    drop(db);
 }
