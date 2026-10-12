@@ -103,6 +103,7 @@ const OBSERVATION_EXTERNAL_ID_SCHEMA: &str =
 const GOVERNED_DOCUMENTS_SCHEMA: &str = include_str!("postgres/0052_governed_documents.sql");
 const TRANSFORM_RUN_MARKINGS_SCHEMA: &str =
     include_str!("postgres/0053_transform_run_markings.sql");
+const SOURCE_REGISTRY_SCHEMA: &str = include_str!("postgres/0054_source_registry.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -454,6 +455,12 @@ const MIGRATIONS: &[Migration] = &[
         52,
         "transform_run_markings",
         TRANSFORM_RUN_MARKINGS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        53,
+        "source_registry",
+        SOURCE_REGISTRY_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -1285,6 +1292,12 @@ mod tests {
             assert!(
                 GOVERNED_TRANSFORMS_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
                 "missing PostgreSQL governed-transform table {table}"
+            );
+        }
+        for table in ["sekai_source_webhook_keys", "sekai_source_type_descriptors"] {
+            assert!(
+                SOURCE_REGISTRY_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL source-registry table {table}"
             );
         }
         for table in ["sekai_governed_documents", "sekai_governed_renditions"] {

@@ -6552,9 +6552,9 @@ impl RuntimeDb {
     {
         match self {
             Self::Sqlite(db) => db.get_source_type_descriptor(namespace, digest),
-            Self::Postgres(_) => {
-                Err(crate::sekai::source_type_descriptor::POSTGRES_UNAVAILABLE.into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_source_type_descriptor(namespace, digest)
+            }),
         }
     }
 
@@ -6564,8 +6564,8 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_source_type_descriptor(descriptor),
-            Self::Postgres(_) => {
-                Err(crate::sekai::source_type_descriptor::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_source_type_descriptor(descriptor))
             }
         }
     }
@@ -6577,8 +6577,8 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.cas_source_type_descriptor(expected, next),
-            Self::Postgres(_) => {
-                Err(crate::sekai::source_type_descriptor::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.cas_source_type_descriptor(expected, next))
             }
         }
     }
@@ -6589,9 +6589,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_source_webhook_key(pin),
-            Self::Postgres(_) => Err(
-                "put_source_webhook_key is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_source_webhook_key(pin))
+            }
         }
     }
 
@@ -6603,9 +6603,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::source_webhook::SourceWebhookKeyPin>, String> {
         match self {
             Self::Sqlite(db) => db.get_source_webhook_key(namespace, source_instance, key_id),
-            Self::Postgres(_) => Err(
-                "get_source_webhook_key is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_source_webhook_key(namespace, source_instance, key_id)
+            }),
         }
     }
 
@@ -6616,10 +6616,9 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::source_webhook::SourceWebhookKeyPin>, String> {
         match self {
             Self::Sqlite(db) => db.list_source_webhook_keys(namespace, source_instance),
-            Self::Postgres(_) => Err(
-                "list_source_webhook_keys is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_source_webhook_keys(namespace, source_instance)
+            }),
         }
     }
 

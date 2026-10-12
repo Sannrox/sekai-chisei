@@ -329,7 +329,7 @@ batch, and the table snapshot id is only the checkpoint cursor (ADR 0036).
 - **Check and discover.** `TableStore` implements the SDK inspector: `check` does not read rows; `discover` lists visible columns, types, nullability, and the row key, then drafts the descriptor the batch admits under.
 - **Declared schema drift** (a new revision) is refused before any write until an operator registers that revision.
 - **Undeclared drift** (rows rewritten under the same revision and row version) is quarantined. It appears in `GetSourceSyncState`, and the last consistent objects and checkpoint stay.
-- **Backend support.** Source-type descriptors are SQLite-only, so the profile is SQLite-only. PostgreSQL fails closed at descriptor registration.
+- **Backend support.** Descriptors, batches, and checkpoints work on SQLite and PostgreSQL.
 
 Offline end to end (register, ingest, evaluate, drift, and foreign producer):
 

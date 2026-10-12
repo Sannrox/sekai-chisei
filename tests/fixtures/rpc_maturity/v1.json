@@ -72,7 +72,7 @@
       "service": "SekaiService",
       "rpc": "RegisterSourceTypeDescriptor",
       "storage_path": "sekai.object-sync",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
@@ -81,7 +81,7 @@
       "service": "SekaiService",
       "rpc": "InspectSourceTypeDescriptor",
       "storage_path": "sekai.object-sync",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
@@ -90,7 +90,7 @@
       "service": "SekaiService",
       "rpc": "RetireSourceTypeDescriptor",
       "storage_path": "sekai.object-sync",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"

@@ -231,17 +231,30 @@ impl SourceBatchMapper {
     }
 }
 
-pub(crate) fn mapper_for_github_or_unbound(
+/// The projection for `batch`: the code-owned GitHub profile, or the
+/// registered descriptor stored under its type digest. Both backends resolve
+/// through here; liveness is rechecked inside the apply transaction.
+pub(crate) fn source_batch_mapper(
     batch: &SourceBatch,
+    lookup: impl FnOnce() -> Result<Option<StoredSourceTypeDescriptor>, String>,
 ) -> Result<SourceBatchMapper, ApplyError> {
     if batch.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
-        Ok(SourceBatchMapper::Github)
-    } else {
-        Err(ApplyError::denied(
-            "unbound_type_revision",
-            "type_digest is not bound to an admitted source type",
-        ))
+        return Ok(SourceBatchMapper::Github);
     }
+    let stored = lookup()
+        .map_err(ApplyError::Storage)?
+        .filter(|stored| registered_descriptor_matches_batch(stored, batch))
+        .ok_or_else(unbound_type_revision)?;
+    Ok(SourceBatchMapper::Registered(
+        ProposedSourceTypeDescriptor {
+            contract_version: stored.contract_version,
+            family: stored.family,
+            source: stored.source,
+            record_kind: stored.record_kind,
+            schema_revision: stored.schema_revision,
+            digest: stored.digest,
+        },
+    ))
 }
 
 impl PreparedBatch {
@@ -821,28 +834,9 @@ impl SekaiDb {
     }
 
     fn source_batch_mapper(&self, batch: &SourceBatch) -> Result<SourceBatchMapper, ApplyError> {
-        if batch.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
-            return Ok(SourceBatchMapper::Github);
-        }
-        let stored = self
-            .get_source_type_descriptor(&batch.namespace, &batch.type_digest)
-            .map_err(ApplyError::Storage)?;
-        let Some(stored) = stored else {
-            return Err(unbound_type_revision());
-        };
-        if !registered_descriptor_matches_batch(&stored, batch) {
-            return Err(unbound_type_revision());
-        }
-        Ok(SourceBatchMapper::Registered(
-            ProposedSourceTypeDescriptor {
-                contract_version: stored.contract_version,
-                family: stored.family,
-                source: stored.source,
-                record_kind: stored.record_kind,
-                schema_revision: stored.schema_revision,
-                digest: stored.digest,
-            },
-        ))
+        source_batch_mapper(batch, || {
+            self.get_source_type_descriptor(&batch.namespace, &batch.type_digest)
+        })
     }
 
     fn persist_source_batch_open(
@@ -2506,7 +2500,7 @@ fn persist_schema_quarantine(
     Ok(result)
 }
 
-fn unbound_type_revision() -> ApplyError {
+pub(crate) fn unbound_type_revision() -> ApplyError {
     ApplyError::denied(
         "unbound_type_revision",
         "type_digest is not bound to an admitted source type",
@@ -2528,7 +2522,7 @@ fn registered_descriptor_matches_batch(
         && stored.record_kind == expected_kind
 }
 
-fn registered_descriptor_authorizes_batch(
+pub(crate) fn registered_descriptor_authorizes_batch(
     stored: &StoredSourceTypeDescriptor,
     batch: &SourceBatch,
 ) -> bool {
@@ -3075,9 +3069,9 @@ mod tests {
     }
 
     #[test]
-    fn postgres_mapper_fails_closed_for_non_github_digest() {
+    fn mapper_fails_closed_for_an_unadmitted_registered_digest() {
         assert!(matches!(
-            mapper_for_github_or_unbound(&batch("", "cursor:1", "batch-1")),
+            source_batch_mapper(&batch("", "cursor:1", "batch-1"), || unreachable!()),
             Ok(SourceBatchMapper::Github)
         ));
         let mut registered = batch("", "cursor:1", "batch-1");
@@ -3090,7 +3084,7 @@ mod tests {
         registered.records[0].type_name = "Alert".into();
         redigest(&mut registered);
         assert_eq!(
-            mapper_for_github_or_unbound(&registered)
+            source_batch_mapper(&registered, || Ok(None))
                 .unwrap_err()
                 .code(),
             Some("unbound_type_revision")

@@ -103,6 +103,7 @@ mod postgres_portfolio;
 mod postgres_retention;
 mod postgres_routing_profile;
 mod postgres_schema;
+mod postgres_source_registry;
 mod postgres_team_namespace;
 mod postgres_workflow_action;
 pub(crate) mod schema_plane;
