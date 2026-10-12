@@ -330,7 +330,7 @@ pub fn publish_function_revision(
             gate.verdict()
         ));
     }
-    db.create_function(function)
+    db.publish_gated_function(function)
 }
 
 fn function_revision_manifest(

@@ -26,8 +26,8 @@ use crate::sekai::document::{
     retrieve_document,
 };
 use crate::sekai::function::{
-    Function, FunctionBudget, FunctionHost, FunctionInvocation, LlmStepHost, PipelineStep,
-    invoke_with_llm, validate_function,
+    Function, FunctionBudget, FunctionHost, FunctionInvocation, LLM_FUNCTION_REQUIRES_GATE,
+    LlmStepHost, PipelineStep, invoke_with_llm, validate_function,
 };
 use crate::sekai::governed_action_type::{GovernedActionType, OBJECT_MUTATION_CREATE};
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
@@ -109,6 +109,9 @@ pub fn extract_from_rendition(
     } = request;
     validate_function(function)?;
     let llm = llm_step(function)?;
+    if !db.function_gate_approved(function)? {
+        return Err(LLM_FUNCTION_REQUIRES_GATE.into());
+    }
     if object_kind.trim().is_empty() {
         return Err("function document extract requires object_kind".into());
     }
@@ -845,6 +848,19 @@ mod tests {
         output: serde_json::Value,
         authorize_write: &dyn Fn(&Object) -> Result<(), String>,
     ) -> Result<(FunctionDocumentExtract, Option<serde_json::Value>), String> {
+        if !runtime.function_gate_approved(function).unwrap() {
+            runtime.publish_gated_function(function).unwrap();
+        }
+        extract_published(runtime, function, text, output, authorize_write)
+    }
+
+    fn extract_published(
+        runtime: &RuntimeDb,
+        function: &Function,
+        text: &str,
+        output: serde_json::Value,
+        authorize_write: &dyn Fn(&Object) -> Result<(), String>,
+    ) -> Result<(FunctionDocumentExtract, Option<serde_json::Value>), String> {
         let llm = RecordingHost {
             output,
             bound: Mutex::new(None),
@@ -1150,6 +1166,36 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "write denied for inv-1");
+        assert!(runtime.get_object("inv-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn extract_refuses_a_revision_that_was_not_published() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        set_policy(&runtime, ActionDecision::Allow);
+        let unpublished = |function: &Function| {
+            extract_published(
+                &runtime,
+                function,
+                EXTRACTED,
+                invoice_output(900_000),
+                &|_| Ok(()),
+            )
+            .unwrap_err()
+        };
+        assert_eq!(
+            unpublished(&extract_function(800_000)),
+            LLM_FUNCTION_REQUIRES_GATE
+        );
+        runtime
+            .publish_gated_function(&extract_function(800_000))
+            .unwrap();
+        assert_eq!(
+            unpublished(&extract_function(500_000)),
+            LLM_FUNCTION_REQUIRES_GATE
+        );
         assert!(runtime.get_object("inv-1").unwrap().is_none());
     }
 

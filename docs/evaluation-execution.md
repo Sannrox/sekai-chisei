@@ -86,6 +86,13 @@ evidence with the existing `stochastic_model/v1` rubric
 (`chisei.bounded-rubric-score/v1`). A mean score below the manifest threshold
 is a `deny` on publish.
 
+Publish is the only way to store a revision with an LLM step: it records an
+approval for the revision digest, then stores the revision. `CreateFunction`
+refuses an LLM step, and `InvokeFunction` and document extraction refuse an
+LLM revision whose digest has no approval ("LLM function revisions require an
+allowing evaluation gate"). Revisions stored before approvals existed stay
+unapproved until they pass the gate again.
+
 Retained outputs inherit the fixture inputs' markings (the most restrictive
 union of the lattice). The evaluator route sees those retained evidence
 objects only when its classification ceiling covers the inherited marking;

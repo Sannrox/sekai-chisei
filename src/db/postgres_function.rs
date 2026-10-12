@@ -32,6 +32,27 @@ impl PostgresDb {
             })
     }
 
+    pub fn approve_function_gate(&self, function_digest: &str, name: &str) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_function_gate_approvals (function_digest, name)
+                 VALUES ($1, $2) ON CONFLICT (function_digest) DO NOTHING",
+                &[&function_digest, &name],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn function_gate_approved(&self, function_digest: &str) -> Result<bool, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT 1 FROM sekai_function_gate_approvals WHERE function_digest = $1",
+                &[&function_digest],
+            )
+            .map(|row| row.is_some())
+            .map_err(|error| error.to_string())
+    }
+
     pub fn get_function(&self, name: &str) -> Result<Option<Function>, String> {
         self.connection()?
             .query_opt(

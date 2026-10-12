@@ -61,6 +61,17 @@ pub(super) async fn invoke_function(
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("not found"))?;
     crate::sekai::function::validate_function(&function).map_err(Status::invalid_argument)?;
+    if crate::sekai::function::has_llm_step(&function)
+        && !service
+            .db
+            .runtime()
+            .function_gate_approved(&function)
+            .map_err(Status::internal)?
+    {
+        return Err(Status::failed_precondition(
+            crate::sekai::function::LLM_FUNCTION_REQUIRES_GATE,
+        ));
+    }
     let budget = input
         .budget
         .map(|budget| crate::sekai::function::FunctionBudget {
