@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Connector certifications persist on PostgreSQL with the SQLite certify, get,
+  verify, revoke, and supersession semantics. Adds PostgreSQL migration
+  `0055_connector_certifications` (#1481).
+
 - Source-webhook key pins and registered source-type descriptors persist on
   PostgreSQL, and PostgreSQL `ApplySourceBatch` admits batches for live
   registered descriptors. Register, inspect, and retire descriptor RPCs and

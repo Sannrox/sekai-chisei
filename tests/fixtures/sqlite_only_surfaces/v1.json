@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 29,
+  "limit": 28,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -77,11 +77,6 @@
       "id": "ChiseiService.GetGunshiAllocationStatus",
       "kind": "rpc",
       "methods": ["get_gunshi_allocation_state"]
-    },
-    {
-      "id": "admin.connector-certification",
-      "kind": "admin",
-      "methods": ["get_connector_certification", "commit_connector_certifications"]
     },
     {
       "id": "admin.warehouse-projection",

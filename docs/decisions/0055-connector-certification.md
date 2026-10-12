@@ -30,7 +30,8 @@ idempotent. Recertification uses a predecessor. Revocation is terminal
 for that certification identity. Hidden secret fields, unknown
 connectors, package/type-digest change, and foreign owners fail closed.
 
-SQLite is the reference store. PostgreSQL stays unavailable.
+SQLite is the reference store. PostgreSQL persists the same records
+(#1481).
 
 ## Alternatives considered
 

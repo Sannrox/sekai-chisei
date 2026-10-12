@@ -6245,9 +6245,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::connector_certification::ConnectorCertification>, String> {
         match self {
             Self::Sqlite(db) => db.get_connector_certification(namespace, certification_id),
-            Self::Postgres(_) => {
-                Err(crate::sekai::connector_certification::POSTGRES_UNAVAILABLE.into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_connector_certification(namespace, certification_id)
+            }),
         }
     }
 
@@ -6257,8 +6257,8 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::connector_certification::ConnectorCertification>, String> {
         match self {
             Self::Sqlite(db) => db.list_connector_certifications(namespace),
-            Self::Postgres(_) => {
-                Err(crate::sekai::connector_certification::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_connector_certifications(namespace))
             }
         }
     }
@@ -6269,9 +6269,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.commit_connector_certifications(certifications),
-            Self::Postgres(_) => {
-                Err(crate::sekai::connector_certification::POSTGRES_UNAVAILABLE.into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.commit_connector_certifications(certifications)
+            }),
         }
     }
 
@@ -6282,8 +6282,8 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.cas_connector_certification(expected, next),
-            Self::Postgres(_) => {
-                Err(crate::sekai::connector_certification::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.cas_connector_certification(expected, next))
             }
         }
     }

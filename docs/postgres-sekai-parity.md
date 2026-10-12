@@ -76,6 +76,12 @@ PostgreSQL conformance remains an ignored isolated-database test behind
 the community `RuntimeDb` dispatcher stay SQLite-only; the transform path
 uses each backend's native dataset-row APIs.
 
+The reusable `sekai.connector-certification/v1` admin projection shares
+certify, get, verify, revoke, and supersession identities across SQLite and
+PostgreSQL. A revoked or unknown certification fails verification on both
+backends. Normal CI runs SQLite; PostgreSQL conformance remains an ignored
+isolated-database test behind `SEKAI_TEST_POSTGRES_URL`.
+
 The product loop (ontology apply, seed, object reads, object-set evaluate,
 governed Action submit and read, operation receipt, and object-security
 activation with a denied read) runs on community PostgreSQL with SQLite
@@ -129,6 +135,7 @@ Evidence is checked in as:
 | #666 | Governed definition branch and immutable revision foundation |
 | #667 (first slice) | Activated object-security revisions and direct read/list enforcement |
 | #1287 | In-process governed transform JobSpec, checkpoint, and run receipt |
+| #1481 | Connector certification certify/get/verify/revoke on PostgreSQL |
 
 ## Still outside this parent
 
@@ -165,6 +172,9 @@ SEKAI_TEST_POSTGRES_URL=... \
 
 SEKAI_TEST_POSTGRES_URL=... \
   cargo test postgres_concurrent_callback_and_cancel_race -- --ignored --nocapture
+
+SEKAI_TEST_POSTGRES_URL=... \
+  cargo test --test it connector_certification_backend_conformance -- --ignored
 ```
 
 The ordered-feed migration is additive and one-way on both backends. Version 1

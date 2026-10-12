@@ -25,4 +25,8 @@ fn operator_page_documents_the_connectors_cli() {
         OPERATOR.contains("sekaictl admin connectors"),
         "operator page must document the connectors CLI"
     );
+    assert!(
+        OPERATOR.contains("SQLite and PostgreSQL store certifications"),
+        "operator page must name both community backends"
+    );
 }

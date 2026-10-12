@@ -104,6 +104,8 @@ const GOVERNED_DOCUMENTS_SCHEMA: &str = include_str!("postgres/0052_governed_doc
 const TRANSFORM_RUN_MARKINGS_SCHEMA: &str =
     include_str!("postgres/0053_transform_run_markings.sql");
 const SOURCE_REGISTRY_SCHEMA: &str = include_str!("postgres/0054_source_registry.sql");
+const CONNECTOR_CERTIFICATIONS_SCHEMA: &str =
+    include_str!("postgres/0055_connector_certifications.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -461,6 +463,12 @@ const MIGRATIONS: &[Migration] = &[
         53,
         "source_registry",
         SOURCE_REGISTRY_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        54,
+        "connector_certifications",
+        CONNECTOR_CERTIFICATIONS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -1300,6 +1308,16 @@ mod tests {
                 "missing PostgreSQL source-registry table {table}"
             );
         }
+        assert!(
+            CONNECTOR_CERTIFICATIONS_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_connector_certifications"),
+            "missing PostgreSQL connector-certification table"
+        );
+        assert!(
+            CONNECTOR_CERTIFICATIONS_SCHEMA
+                .contains("sekai_connector_certifications_live_identity"),
+            "missing PostgreSQL live-certification unique index"
+        );
         for table in ["sekai_governed_documents", "sekai_governed_renditions"] {
             assert!(
                 GOVERNED_DOCUMENTS_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),

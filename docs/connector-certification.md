@@ -40,4 +40,7 @@ gettable and fail verify.
 | Unknown, foreign, superseded, revoked, secret-bearing, or digest-mismatched certification | `connector certification is unavailable` |
 | Unknown contract revision | `connector certification revision is unsupported` |
 
-SQLite stores certifications. PostgreSQL surfaces stay unavailable.
+SQLite and PostgreSQL store certifications with the same identities and
+fail-closed rules. Normal CI runs SQLite; PostgreSQL conformance is the
+ignored `connector_certification_backend_conformance` test behind
+`SEKAI_TEST_POSTGRES_URL`.
