@@ -102,6 +102,7 @@ mikura-ingest = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
 fs2 = "0.4.3"
 
 [dev-dependencies]
+sekai-client = { path = "crates/sekai-client" }
 sekai-connector-template = { path = "crates/sekai-connector-template" }
 rusqlite = { version = "0.40", features = ["trace"] }
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }

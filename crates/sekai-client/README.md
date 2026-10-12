@@ -20,7 +20,10 @@ The `0.1.x` surface provides:
 - typed gRPC status mapping that distinguishes authentication, authorization,
   policy, budget, and transport outcomes;
 - cancellable `PlanExecution` and `ExecutePlanStream` calls;
-- operation-event reporting and receipt lookup; and
+- operation-event reporting and receipt lookup;
+- a versioned runtime-claim module (`sekai.sdk-runtime-claim/v1`) for Action
+  and isolated-process transform work, with typed fence, contention, denial,
+  and unavailability errors; and
 - an explicit native raw tonic escape hatch for unsupported RPCs.
 
 `CoreLoopTransport` is injectable, so deterministic tests and hosts such as

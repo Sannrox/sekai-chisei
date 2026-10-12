@@ -1,7 +1,8 @@
 # Runtime claim API for admitted Action work
 
 Issues: [#399](https://github.com/Sannrox/sekai-chisei/issues/399),
-[#412](https://github.com/Sannrox/sekai-chisei/issues/412).
+[#412](https://github.com/Sannrox/sekai-chisei/issues/412),
+[#1389](https://github.com/Sannrox/sekai-chisei/issues/1389).
 Effects: [governed-action-effects.md](governed-action-effects.md).  
 Research freeze: [research/395-action-effect-mapping.md](research/395-action-effect-mapping.md).
 
@@ -17,6 +18,29 @@ ack terminal outcomes. The plane never spawns processes or holds model tools.
 
 These claim RPCs are classified `experimental` and are rejected unless
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
+
+## Versioned client
+
+Workers pin `sekai-client` (`sekai.sdk-runtime-claim/v1`) rather than copying
+raw tonic claim calls. The module lives in `sekai-client` so Action hosts and
+isolated-process transform runners share one crate with `sekai-proto` and the
+compatibility matrix. `CoreLoopClient::runtime_claim()` lists and claims by
+dispatch kind, heartbeats, acks, reports claim events, streams admitted
+transform input snapshots, and writes fenced transform results.
+
+Typed errors keep fence loss, idle, contention, denial, and unavailability
+distinct. `SdkError` does not retain server status text, so the client maps
+by RPC role: list `FailedPrecondition` is unavailability (including the
+experimental gate); initial `Claim*` `FailedPrecondition` is contention;
+heartbeat, ack, report, and transform read/write `FailedPrecondition` is
+fence loss; empty-queue `ClaimTransformWork` `NotFound` is idle; a targeted
+`run_id` that is gone or held is contention; `ClaimActionWork` `NotFound` is
+a missing effect, not an empty queue. Streamed transform-input item errors
+use the same owned-fence mapping. Fence loss is never
+success or idle. Enable experimental RPCs on the plane before polling.
+
+The client does not change claim, lease, or fencing semantics on the server
+and does not embed credentials or provider routing.
 
 ## RPCs
 

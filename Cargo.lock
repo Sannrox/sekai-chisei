@@ -2547,6 +2547,7 @@ dependencies = [
  "rusqlite",
  "same-file",
  "sekai-admin-client",
+ "sekai-client",
  "sekai-connector-template",
  "sekai-domain",
  "sekai-obs",
