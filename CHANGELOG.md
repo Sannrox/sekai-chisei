@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Function document extraction resolves the namespace action policy for every
+  extraction: `deny` refuses, `require_approval` parks the Action at any
+  confidence, and `allow` writes only at or above the threshold. A direct
+  write also runs the caller's CreateObject authorization, which
+  `FunctionDocumentExtractRequest.authorize_write` now requires (#1382).
+
 - Connector certifications persist on PostgreSQL with the SQLite certify, get,
   verify, revoke, and supersession semantics. Adds PostgreSQL migration
   `0055_connector_certifications` (#1481).
