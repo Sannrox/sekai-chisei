@@ -101,6 +101,15 @@ impl<'a> ActionWorkLifecycle<'a> {
         actor: &str,
         now_ms: i64,
     ) -> Result<ClaimedActionWork, ActionWorkLifecycleError> {
+        // Re-validate `act` before returning a fence so a disabled or removed
+        // delegator cannot reach the side effect. Missing records stay the
+        // persist seam's problem (NotFound / not claimable), matching the
+        // #1423 apply-time follow-up rather than changing claim taxonomy.
+        if let Some(reason) = self.delegator_apply_refusal(command.effect_id)?
+            && reason != DelegatorApplyRefusal::RecordMissing
+        {
+            return self.fail_closed_delegator_claim(command, actor, now_ms, reason);
+        }
         let stored = self
             .db
             .claim_action_work(
@@ -291,6 +300,45 @@ impl<'a> ActionWorkLifecycle<'a> {
                 now_ms,
             )
             .map_err(classify_report_error)
+    }
+
+    fn fail_closed_delegator_claim(
+        &self,
+        command: ClaimActionWork<'_>,
+        actor: &str,
+        now_ms: i64,
+        reason: DelegatorApplyRefusal,
+    ) -> Result<ClaimedActionWork, ActionWorkLifecycleError> {
+        // Take the fence only to fail-ack. The caller never receives Claimed,
+        // so the side effect does not run, and the item leaves the claimable
+        // queue so later valid work is not stuck behind it.
+        let stored = self
+            .db
+            .claim_action_work(
+                command.effect_id,
+                command.runtime_id,
+                command.request_id,
+                command.ttl_ms,
+                now_ms,
+            )
+            .map_err(classify_claim_error)?;
+        let failed = self
+            .db
+            .ack_action_work(
+                command.effect_id,
+                command.runtime_id,
+                stored.claim_generation,
+                &stored.claim_fencing_token,
+                ACK_OUTCOME_FAILED,
+                reason.as_str(),
+                now_ms,
+            )
+            .map_err(classify_ack_error)?;
+        self.record_delegator_refusal_receipt(&failed, command.runtime_id, reason, now_ms)?;
+        self.record_ack_audit(&failed, actor, command.runtime_id, now_ms);
+        Err(ActionWorkLifecycleError::FailedPrecondition(
+            reason.as_str().into(),
+        ))
     }
 
     fn delegator_apply_refusal(
@@ -1726,12 +1774,135 @@ mod tests {
         assert_eq!(replayed.effect.status, EFFECT_STATUS_COMPLETED);
     }
 
+    fn claim_refused(db: &RuntimeDb, effect: &ActionEffect) -> ActionWorkLifecycleError {
+        ActionWorkLifecycle::new(db)
+            .claim(
+                ClaimActionWork {
+                    effect_id: &effect.effect_id,
+                    runtime_id: "shikigami",
+                    request_id: "claim-1",
+                    ttl_ms: 60_000,
+                },
+                "operator",
+                100,
+            )
+            .expect_err("delegator refusal must fail closed at claim")
+    }
+
     #[test]
-    fn claim_still_succeeds_after_delegator_is_disabled() {
+    fn claim_is_refused_after_delegator_is_disabled() {
         let (db, effect, _) = seed_delegated_apply_path();
         db.revoke_principal_credential(DELEGATOR).unwrap();
-        let claimed = claim_effect(&db, &effect);
+        let error = claim_refused(&db, &effect);
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_DISABLED.into())
+        );
+        let stored = db.get_action_effect(&effect.effect_id).unwrap().unwrap();
+        assert_eq!(stored.status, EFFECT_STATUS_FAILED);
+        assert_eq!(stored.failure_reason, DELEGATOR_DISABLED);
+        assert_eq!(
+            receipt_reason(&db, &effect.operation_id).as_deref(),
+            Some(DELEGATOR_DISABLED)
+        );
+    }
+
+    #[test]
+    fn claim_is_refused_when_delegator_is_not_a_member() {
+        let (db, effect, grant) = seed_delegated_apply_path();
+        db.delete_grant(&grant.id).unwrap();
+        let error = claim_refused(&db, &effect);
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_NOT_MEMBER.into())
+        );
+        let stored = db.get_action_effect(&effect.effect_id).unwrap().unwrap();
+        assert_eq!(stored.status, EFFECT_STATUS_FAILED);
+    }
+
+    #[test]
+    fn claim_is_refused_when_delegator_grant_is_missing() {
+        let (db, effect, grant) = seed_delegated_apply_path();
+        db.create_grant(&Grant {
+            id: grant.id,
+            object_id: grant.object_id,
+            principal: grant.principal,
+            role: Role::Viewer,
+            created: grant.created,
+        })
+        .unwrap();
+        let error = claim_refused(&db, &effect);
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_GRANT_MISSING.into())
+        );
+        let stored = db.get_action_effect(&effect.effect_id).unwrap().unwrap();
+        assert_eq!(stored.status, EFFECT_STATUS_FAILED);
+    }
+
+    #[test]
+    fn refused_delegator_claim_drains_so_later_work_remains_claimable() {
+        let (db, blocked, _) = seed_delegated_apply_path();
+        db.revoke_principal_credential(DELEGATOR).unwrap();
+        let _ = claim_refused(&db, &blocked);
+        let later = plan_effects_for_admit(
+            "ai-2",
+            "acme",
+            "op-2",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            20,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        db.put_action_effects(std::slice::from_ref(&later)).unwrap();
+        seed_admitted_instance(&db, &later, None);
+        let claimed = claim_effect(&db, &later);
         assert_eq!(claimed.status, "claimed");
+        let blocked_stored = db.get_action_effect(&blocked.effect_id).unwrap().unwrap();
+        assert_eq!(blocked_stored.status, EFFECT_STATUS_FAILED);
+    }
+
+    #[test]
+    fn scheduled_claim_does_not_run_after_delegator_credentials_are_removed() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        for credential in db.list_credentials(Some(DELEGATOR), None).unwrap() {
+            db.revoke_principal_credential(&credential.principal)
+                .unwrap();
+        }
+        let remaining = db.list_credentials(Some(DELEGATOR), None).unwrap();
+        assert!(
+            remaining
+                .iter()
+                .all(|credential| credential.status != "active"),
+            "removed scheduled owner must not remain enabled"
+        );
+        let error = claim_refused(&db, &effect);
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_DISABLED.into())
+        );
+    }
+
+    #[test]
+    fn claim_is_refused_when_delegator_has_no_credential_rows() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect_row(&db);
+        seed_admitted_instance(&db, &effect, Some(DELEGATOR));
+        seed_open_receipt(&db, &effect);
+        let (_, grants) = db
+            .ensure_team_namespace("acme", DELEGATOR, Role::Editor, "local")
+            .unwrap();
+        assert!(
+            grants.iter().any(|grant| grant.principal == DELEGATOR),
+            "membership without credentials still exists"
+        );
+        let error = claim_refused(&db, &effect);
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(DELEGATOR_DISABLED.into())
+        );
     }
 
     #[test]

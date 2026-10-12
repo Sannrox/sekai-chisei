@@ -5,11 +5,13 @@
 //! codes onto fence loss, contention, denial, and unavailability without
 //! embedding credentials or provider semantics.
 //!
-//! `SdkError` does not retain server status text. Owned-claim RPCs
-//! (heartbeat, ack, report, transform read/write) treat `FailedPrecondition`
-//! as fence loss. Initial `Claim*` `FailedPrecondition` is contention.
-//! Empty-queue `ClaimTransformWork` is `NotFound` (idle); a targeted run_id
-//! that is gone or held is contention. Fence loss is never mapped to idle.
+//! `SdkError` does not retain arbitrary server status text. Allowlisted
+//! `delegator_*` tokens are kept as `reason_code` so claim and owned-claim
+//! RPCs can surface them instead of collapsing to contention or fence loss.
+//! Other owned-claim `FailedPrecondition` stays fence loss. Other initial
+//! `Claim*` `FailedPrecondition` stays contention. Empty-queue
+//! `ClaimTransformWork` is `NotFound` (idle); a targeted run_id that is gone
+//! or held is contention. Fence loss is never mapped to idle.
 
 use std::fmt;
 use std::time::Duration;
@@ -34,6 +36,12 @@ use futures_core::Stream;
 use crate::{
     CallOptions, CancellableStream, CoreLoopClient, GrpcTransport, SdkError, SdkErrorCode,
 };
+
+/// Machine-readable claim/apply refusals reused from the identity contract.
+pub const DELEGATOR_DISABLED: &str = "delegator_disabled";
+pub const DELEGATOR_NOT_MEMBER: &str = "delegator_not_member";
+pub const DELEGATOR_GRANT_MISSING: &str = "delegator_grant_missing";
+pub const DELEGATOR_RECORD_MISSING: &str = "delegator_record_missing";
 
 const LIST_ACTION: &str = "/sekai.SekaiService/ListClaimableActionWork";
 const CLAIM_ACTION: &str = "/sekai.SekaiService/ClaimActionWork";
@@ -79,19 +87,33 @@ pub enum ClaimAttempt<T> {
 }
 
 /// Typed claim-protocol failure. Fence loss stays distinct from idle,
-/// contention, denial, and unavailability.
+/// contention, denial, unavailability, and delegator refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeClaimError {
     Contention,
     FenceLost,
+    DelegatorRefused(&'static str),
     Denied(SdkError),
     Unavailable(SdkError),
     Invalid(SdkError),
     Transport(SdkError),
 }
 
+pub(crate) fn allowlisted_reason_code(message: &str) -> Option<&'static str> {
+    match message.trim() {
+        DELEGATOR_DISABLED => Some(DELEGATOR_DISABLED),
+        DELEGATOR_NOT_MEMBER => Some(DELEGATOR_NOT_MEMBER),
+        DELEGATOR_GRANT_MISSING => Some(DELEGATOR_GRANT_MISSING),
+        DELEGATOR_RECORD_MISSING => Some(DELEGATOR_RECORD_MISSING),
+        _ => None,
+    }
+}
+
 impl RuntimeClaimError {
     fn from_sdk(error: SdkError, owned_fence: bool) -> Self {
+        if let Some(reason) = error.reason_code {
+            return Self::DelegatorRefused(reason);
+        }
         match error.code {
             SdkErrorCode::FailedPrecondition if owned_fence => Self::FenceLost,
             SdkErrorCode::FailedPrecondition => Self::Contention,
@@ -116,6 +138,9 @@ impl RuntimeClaimError {
     }
 
     fn from_action_claim(error: SdkError) -> Result<ClaimAttempt<std::convert::Infallible>, Self> {
+        if let Some(reason) = error.reason_code {
+            return Err(Self::DelegatorRefused(reason));
+        }
         match error.code {
             SdkErrorCode::FailedPrecondition => Ok(ClaimAttempt::Contended),
             _ => Err(Self::from_sdk(error, false)),
@@ -126,6 +151,9 @@ impl RuntimeClaimError {
         error: SdkError,
         run_id: &str,
     ) -> Result<ClaimAttempt<std::convert::Infallible>, Self> {
+        if let Some(reason) = error.reason_code {
+            return Err(Self::DelegatorRefused(reason));
+        }
         match error.code {
             SdkErrorCode::NotFound if run_id.trim().is_empty() => Ok(ClaimAttempt::Idle),
             SdkErrorCode::NotFound | SdkErrorCode::FailedPrecondition => {
@@ -145,6 +173,7 @@ impl fmt::Display for RuntimeClaimError {
         match self {
             Self::Contention => formatter.write_str("claim lost to contention"),
             Self::FenceLost => formatter.write_str("claim fence was lost"),
+            Self::DelegatorRefused(reason) => write!(formatter, "delegator refused: {reason}"),
             Self::Denied(error) => write!(formatter, "claim denied: {error}"),
             Self::Unavailable(error) => write!(formatter, "claim unavailable: {error}"),
             Self::Invalid(error) => write!(formatter, "claim request invalid: {error}"),
@@ -642,6 +671,57 @@ mod tests {
             RuntimeClaimError::from_action_claim(SdkError::new(SdkErrorCode::FailedPrecondition))
                 .expect("contention is a claim attempt");
         assert!(matches!(mapped, ClaimAttempt::Contended));
+    }
+
+    fn sdk_with_reason(code: SdkErrorCode, reason: &'static str) -> SdkError {
+        let mut error = SdkError::new(code);
+        error.reason_code = Some(reason);
+        error
+    }
+
+    #[test]
+    fn claim_delegator_refusal_is_not_contention() {
+        let error = RuntimeClaimError::from_action_claim(sdk_with_reason(
+            SdkErrorCode::FailedPrecondition,
+            DELEGATOR_DISABLED,
+        ))
+        .expect_err("delegator refusal is not a claim attempt");
+        assert!(
+            matches!(
+                error,
+                RuntimeClaimError::DelegatorRefused(DELEGATOR_DISABLED)
+            ),
+            "{error}"
+        );
+        assert_eq!(error.to_string(), "delegator refused: delegator_disabled");
+    }
+
+    #[test]
+    fn ack_delegator_refusal_is_not_fence_lost() {
+        let error = RuntimeClaimError::from_sdk(
+            sdk_with_reason(SdkErrorCode::FailedPrecondition, DELEGATOR_NOT_MEMBER),
+            true,
+        );
+        assert!(
+            matches!(
+                error,
+                RuntimeClaimError::DelegatorRefused(DELEGATOR_NOT_MEMBER)
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn allowlisted_reason_codes_are_the_identity_tokens() {
+        assert_eq!(
+            allowlisted_reason_code("delegator_grant_missing"),
+            Some(DELEGATOR_GRANT_MISSING)
+        );
+        assert_eq!(allowlisted_reason_code("already claimed"), None);
+        assert_eq!(
+            allowlisted_reason_code(" delegator_disabled "),
+            Some(DELEGATOR_DISABLED)
+        );
     }
 
     #[test]

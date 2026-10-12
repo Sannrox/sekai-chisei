@@ -192,7 +192,8 @@ Upgrade notes:
 
 - Enterprise identity extensions require a tenant on every authenticated context. Bind or replace tenantless service and gateway credentials before upgrade. Community installs without an extension keep existing credential behavior (#1418).
 - Identity extension implementers must advertise `sekai.identity-extension/v2` and populate space, space role, and `act`. Older extension versions fail closed. Protocol field numbers are unchanged ([ADR 0099](docs/decisions/0099-shared-identity-and-tenancy.md), #1415, #1417).
-- Delegated apply re-checks the retained `act` principal. Disabled, removed, or under-privileged delegators refuse with `delegator_disabled`, `delegator_not_member`, or `delegator_grant_missing`. Missing planning receipt, action effect, or action instance also refuses apply (#1419, #1423). Claim-time re-validation remains open (#1421).
+- Delegated apply re-checks the retained `act` principal. Disabled, removed, or under-privileged delegators refuse with `delegator_disabled`, `delegator_not_member`, or `delegator_grant_missing`. Missing planning receipt, action effect, or action instance also refuses apply (#1419, #1423).
+- Claim of `runtime_dispatch` work re-checks the same `act` facts before the worker receives a fence, so a disabled or removed delegator cannot reach the side effect. The refused item is failed so later claimable work is not stuck behind it. Community mode treats a principal with no credential rows as disabled. The runtime-claim client surfaces `delegator_*` instead of contention or fence loss (#1421).
 - Delegated calls use the service subject, or the intersection of service and human row, property, ACL, and marking authority when `act` is present (#1422).
 - Indexed `EvaluateObjectSet` authorizes the live object and fails closed on authorization outages (#1422).
 - No store schema migration. A binary or image rollback to 1.2.1 restores prior identity behavior.
