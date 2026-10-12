@@ -115,6 +115,8 @@ fn main() -> Result<(), String> {
             time_limit_ms: 0,
         }),
         isolated_process: None,
+        schedule: None,
+        trigger: None,
     };
     let prepared = transform.prepare().map_err(|error| error.message())?;
     db.put_governed_transform(&prepared, 10)?;

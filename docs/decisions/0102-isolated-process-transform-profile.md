@@ -9,7 +9,8 @@
 - Superseded by: none
 - Related: [ADR 0097](0097-in-process-transform-host.md),
   [ADR 0101](0101-analytical-transform-profile.md),
-  [ADR 0074](0074-plane-owned-transforms.md)
+  [ADR 0074](0074-plane-owned-transforms.md),
+  [ADR 0103](0103-transform-schedule-and-dependency-graph.md)
 
 ## Context
 

@@ -52,6 +52,7 @@ impl SekaiServiceImpl {
         entries.push(hosted_transform_capability(experimental));
         entries.push(analytical_transform_capability(experimental));
         entries.push(isolated_transform_capability(experimental));
+        entries.push(scheduler_transform_capability(experimental));
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -94,7 +95,8 @@ fn capability_product_tier(name: &str) -> &'static str {
         crate::rpc_maturity::EXPERIMENTAL_CAPABILITY => "core",
         crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY
         | crate::sekai::governed_transform::ANALYTICAL_COMPUTE_CAPABILITY
-        | crate::sekai::governed_transform::ISOLATED_COMPUTE_CAPABILITY => "core",
+        | crate::sekai::governed_transform::ISOLATED_COMPUTE_CAPABILITY
+        | crate::sekai::governed_transform::SCHEDULER_COMPUTE_CAPABILITY => "core",
         semantic::CAPABILITY_EXPAND_RELATIONS
         | semantic::CAPABILITY_RETRIEVE_CONTEXT
         | semantic::CAPABILITY_EXPLAIN_DERIVATION => "core",
@@ -161,6 +163,20 @@ fn isolated_transform_capability(enabled: bool) -> CapabilityEntry {
         "transform",
         "sekai.ClaimTransformWorkRequest",
         "sekai.WriteTransformRunResultResponse",
+    );
+    entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
+    entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry
+}
+
+fn scheduler_transform_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        crate::sekai::governed_transform::SCHEDULER_COMPUTE_CAPABILITY.into(),
+        "Plane-owned scheduled and change-triggered transform admission. Idempotent ticks, dependency graph, and output freshness.".into(),
+        "transform",
+        "sekai.TickGovernedTransformsRequest",
+        "sekai.TickGovernedTransformsResponse",
     );
     entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
@@ -476,6 +492,18 @@ mod tests {
             crate::sekai::governed_transform::ISOLATED_COMPUTE_CAPABILITY
         );
         let on = isolated_transform_capability(true);
+        assert_eq!(on.lifecycle_state, "active");
+    }
+
+    #[test]
+    fn scheduler_transform_capability_is_disabled_when_experimental_rpcs_are_off() {
+        let off = scheduler_transform_capability(false);
+        assert_eq!(off.lifecycle_state, "disabled");
+        assert_eq!(
+            off.name,
+            crate::sekai::governed_transform::SCHEDULER_COMPUTE_CAPABILITY
+        );
+        let on = scheduler_transform_capability(true);
         assert_eq!(on.lifecycle_state, "active");
     }
 }

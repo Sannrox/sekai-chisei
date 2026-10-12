@@ -4,8 +4,8 @@ use postgres::{GenericClient, IsolationLevel, Row};
 
 use crate::db::object_sync::{
     ApplyError, PreparedBatch, PreparedRecord, registered_descriptor_authorizes_batch,
-    require_authorized_object_snapshot, source_batch_mapper, unbound_type_revision,
-    validate_binding,
+    require_authorized_object_snapshot, source_batch_mapper, source_batch_trigger_ids,
+    unbound_type_revision, validate_binding,
 };
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_audit::{insert_changes, lock_object_lifecycle};
@@ -86,13 +86,13 @@ impl PostgresDb {
         })
         .map_err(|error| error.to_string())?;
         let prepared = PreparedBatch::new(batch, &mapper).map_err(|error| error.to_string())?;
-        match self
+        let (result, newly_committed) = match self
             .persist_source_batch_open(batch, &prepared, now_ms)
             .map_err(|error| error.to_string())?
         {
-            OpenDisposition::Committed(result) => Ok(*result),
-            OpenDisposition::Open => self
-                .commit_source_batch(
+            OpenDisposition::Committed(result) => (*result, false),
+            OpenDisposition::Open => (
+                self.commit_source_batch(
                     batch,
                     &prepared,
                     authenticated_producer,
@@ -100,8 +100,23 @@ impl PostgresDb {
                     expected_policy_generation,
                     authorized_objects,
                 )
-                .map_err(|error| error.to_string()),
+                .map_err(|error| error.to_string())?,
+                true,
+            ),
+        };
+        if newly_committed && result.transaction.status == SourceBatchStatus::Committed {
+            let ids = source_batch_trigger_ids(&result);
+            // Best-effort: ingest must not fail closed on trigger bugs, and a
+            // committed replay must not emit a second run.
+            let _ = self.note_source_change(
+                &batch.namespace,
+                &ids,
+                crate::sekai::governed_transform::TRANSFORM_TRIGGER_SOURCE_BATCH,
+                &batch.batch_digest,
+                now_ms,
+            );
         }
+        Ok(result)
     }
 
     fn persist_source_batch_open(

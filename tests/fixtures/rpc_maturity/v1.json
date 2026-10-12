@@ -403,6 +403,33 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "TickGovernedTransforms",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetTransformOutputState",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CancelGovernedTransformRun",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ClaimTransformWork",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

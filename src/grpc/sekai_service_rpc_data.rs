@@ -1376,6 +1376,21 @@ pub(super) async fn put_governed_transform(
         definition_digest: proto.definition_digest,
         analytical,
         isolated_process,
+        schedule: if proto.schedule_every_ms > 0 {
+            Some(crate::sekai::governed_transform::TransformSchedule {
+                every_ms: proto.schedule_every_ms,
+            })
+        } else {
+            None
+        },
+        trigger: if proto.trigger_on_input_commit {
+            Some(crate::sekai::governed_transform::TransformTrigger {
+                on_input_commit: true,
+                debounce_ms: proto.trigger_debounce_ms,
+            })
+        } else {
+            None
+        },
     }
     .prepare()
     .map_err(|error| Status::invalid_argument(error.message()))?;
@@ -1798,6 +1813,20 @@ fn to_proto_transform(
             .as_ref()
             .map(|spec| spec.runtime_image.clone())
             .unwrap_or_default(),
+        schedule_every_ms: transform
+            .schedule
+            .as_ref()
+            .map(|schedule| schedule.every_ms)
+            .unwrap_or(0),
+        trigger_on_input_commit: transform
+            .trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.on_input_commit),
+        trigger_debounce_ms: transform
+            .trigger
+            .as_ref()
+            .map(|trigger| trigger.debounce_ms)
+            .unwrap_or(0),
     }
 }
 
@@ -1883,7 +1912,85 @@ fn to_proto_transform_run(run: &crate::sekai::governed_transform::TransformRun) 
         engine: run.engine.clone(),
         runtime_image: run.runtime_image.clone(),
         dispatch_status: run.dispatch_status.clone(),
+        trigger_cause: run.trigger_cause.clone(),
+        trigger_ref: run.trigger_ref.clone(),
     }
+}
+
+pub(super) async fn tick_governed_transforms(
+    service: &SekaiServiceImpl,
+    req: Request<TickGovernedTransformsRequest>,
+) -> Result<Response<TickGovernedTransformsResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let now_ms = {
+        let requested = req.into_inner().now_ms;
+        if requested > 0 {
+            requested
+        } else {
+            now_millis()
+        }
+    };
+    let runs = service
+        .db
+        .runtime()
+        .tick_governed_transforms(now_ms)
+        .map_err(Status::internal)?
+        .iter()
+        .map(to_proto_transform_run)
+        .collect();
+    Ok(Response::new(TickGovernedTransformsResponse { runs }))
+}
+
+pub(super) async fn get_transform_output_state(
+    service: &SekaiServiceImpl,
+    req: Request<GetTransformOutputStateRequest>,
+) -> Result<Response<GetTransformOutputStateResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let input = req.into_inner();
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
+    let state = service
+        .db
+        .runtime()
+        .get_transform_output_state(&input.namespace, &input.dataset_id)
+        .map_err(Status::internal)?;
+    Ok(Response::new(GetTransformOutputStateResponse {
+        state: state.map(|state| TransformOutputState {
+            namespace: state.namespace,
+            dataset_id: state.dataset_id,
+            freshness: state.freshness,
+            upstream_version: state.upstream_version,
+            blocked_run_id: state.blocked_run_id,
+            updated_at_ms: state.updated_at_ms,
+        }),
+    }))
+}
+
+pub(super) async fn cancel_governed_transform_run(
+    service: &SekaiServiceImpl,
+    req: Request<CancelGovernedTransformRunRequest>,
+) -> Result<Response<CancelGovernedTransformRunResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let run_id = req.into_inner().run_id;
+    let run = service
+        .db
+        .runtime()
+        .cancel_governed_transform_run(&run_id, now_millis())
+        .map_err(|error| {
+            if error.contains("not found") {
+                Status::not_found(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
+    Ok(Response::new(CancelGovernedTransformRunResponse {
+        run: Some(to_proto_transform_run(&run)),
+    }))
 }
 
 fn map_document_error(error: String) -> Status {

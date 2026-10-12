@@ -13972,6 +13972,8 @@ async fn list_governed_transforms_returns_definitions_and_runs_for_authorized_pr
         definition_digest: String::new(),
         analytical: None,
         isolated_process: None,
+        schedule: None,
+        trigger: None,
     }
     .prepare()
     .unwrap();
@@ -14092,6 +14094,8 @@ async fn isolated_process_claim_and_write_back_are_namespace_authorized() {
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
         }),
+        schedule: None,
+        trigger: None,
     }
     .prepare()
     .unwrap();
@@ -14274,6 +14278,8 @@ async fn isolated_process_input_stream_requires_dataset_read() {
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
         }),
+        schedule: None,
+        trigger: None,
     }
     .prepare()
     .unwrap();
