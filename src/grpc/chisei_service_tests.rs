@@ -8926,6 +8926,19 @@ fn leak_audit_records_scan_truncated_evidence() {
 }
 
 #[test]
+fn truncated_scan_maps_to_stable_egress_decision_reason() {
+    let decisions = leak_findings_to_decisions(
+        "openai",
+        true,
+        &crate::chisei::privacy::check_payload("hello", &[], &[], true),
+    );
+    assert_eq!(
+        decisions[0].reasons,
+        vec![crate::chisei::privacy::SCAN_TRUNCATED_REASON.to_string()]
+    );
+}
+
+#[test]
 fn privacy_entity_created_after_first_scan_is_blocked() {
     let svc = memory_service();
     let first = svc
