@@ -1023,16 +1023,28 @@ impl SekaiDb {
         self.list_objects_page(&effective_filter)
     }
 
+    /// One unfiltered page (no principal, marking, or policy filter) without `excluded_kinds`.
+    pub fn list_objects_excluding_kinds(
+        &self,
+        filter: &ListFilter,
+        excluded_kinds: &[&str],
+    ) -> Result<Vec<Object>, String> {
+        let conn = self.conn();
+        Self::list_objects_page_on_conn(&conn, filter, excluded_kinds)
+    }
+
     fn list_objects_page(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         let conn = self.conn();
-        Self::list_objects_page_on_conn(&conn, filter)
+        Self::list_objects_page_on_conn(&conn, filter, &[])
     }
 
     fn list_objects_page_on_conn(
         conn: &Connection,
         filter: &ListFilter,
+        excluded_kinds: &[&str],
     ) -> Result<Vec<Object>, String> {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
+        let kind_exclusion = crate::domain::excluded_kinds_sql("kind", excluded_kinds)?;
         let order_sql = build_order_by_sql(
             filter.order_by.as_str(),
             filter.descending,
@@ -1046,8 +1058,8 @@ impl SekaiDb {
             filter.limit.min(MAX_LIST_LIMIT)
         };
         let mut sql = format!(
-            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}",
-            query.where_sql
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}",
+            query.where_sql, kind_exclusion
         );
         if let Some(order_sql) = order_sql.as_deref() {
             sql.push_str(order_sql);
@@ -1081,7 +1093,7 @@ impl SekaiDb {
     ) -> Result<(Vec<Object>, i32), String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let objects = Self::list_objects_page_on_conn(&tx, filter)?;
+        let objects = Self::list_objects_page_on_conn(&tx, filter, &[])?;
         let query = build_list_query(filter).map_err(|e| e.to_string())?;
         let total = tx
             .query_row(

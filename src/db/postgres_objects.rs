@@ -327,6 +327,16 @@ impl PostgresDb {
             .map(|result| result.0)
     }
 
+    /// One unfiltered page (no principal or policy filter) without `excluded_kinds`.
+    pub fn list_objects_excluding_kinds(
+        &self,
+        filter: &ListFilter,
+        excluded_kinds: &[&str],
+    ) -> Result<Vec<Object>, String> {
+        self.list_objects_query(filter, None, None, excluded_kinds)
+            .map(|result| result.0)
+    }
+
     pub fn list_all_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         let mut effective_filter = filter.clone();
         effective_filter.limit = i32::MAX;

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The privacy entity scan lists at most 501 objects in one query that
+  excludes `leak_rule` in SQL, instead of paging up to 1000 objects and
+  filtering in Rust, and fingerprints the set with a streaming digest
+  instead of formatting, sorting, and joining strings (#1491).
+
 - `sekai-client` publishes a versioned runtime-claim module
   (`sekai.sdk-runtime-claim/v1`) so Action and isolated-process transform
   workers share list, claim, heartbeat, ack, claim-event, streamed input

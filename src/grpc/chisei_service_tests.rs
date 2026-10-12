@@ -8776,6 +8776,53 @@ fn privacy_entity_scan_does_not_list_past_entity_scan_limit() {
 }
 
 #[test]
+fn entity_scan_listing_excludes_leak_rules_inside_the_query() {
+    let svc = memory_service();
+    let object = |id: &str, kind: &str| Object {
+        id: id.into(),
+        kind: kind.into(),
+        name: id.into(),
+        namespace: "alpha".into(),
+        external_id: String::new(),
+        properties: std::collections::HashMap::new(),
+        created: 0,
+        updated: 0,
+    };
+    // Leak rules sort first by id, so filtering after a bounded page would miss assets.
+    for id in ["a-leak-1", "a-leak-2", "a-leak-3"] {
+        svc.db
+            .runtime()
+            .create_object(&object(id, "leak_rule"))
+            .unwrap();
+    }
+    for id in ["b-asset-1", "b-asset-2"] {
+        svc.db
+            .runtime()
+            .create_object(&object(id, "asset"))
+            .unwrap();
+    }
+    let listed = svc
+        .db
+        .runtime()
+        .list_objects_excluding_kinds(
+            &ListFilter {
+                namespace: Some("alpha".into()),
+                limit: 2,
+                ..Default::default()
+            },
+            &["leak_rule"],
+        )
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<Vec<_>>(),
+        ["b-asset-1", "b-asset-2"]
+    );
+}
+
+#[test]
 fn privacy_entity_scan_allows_harmless_payload_when_namespace_has_many_leak_rules() {
     let svc = memory_service();
     let extra = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize + 100;
