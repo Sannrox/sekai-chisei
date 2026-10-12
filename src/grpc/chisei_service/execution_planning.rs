@@ -397,12 +397,9 @@ impl ChiseiServiceImpl {
                 &leak_findings,
             ));
             self.record_leak_audit("leak_check", &input.request_id, &provider, &leak_findings);
-            if leak_findings
-                .iter()
-                .any(|finding| finding.action == LeakAction::Block)
-            {
+            if let Some(refusal) = crate::chisei::privacy::blocking_refusal(&leak_findings) {
                 executable = false;
-                warnings.push("privacy leak checker blocked outbound payload".into());
+                warnings.push(refusal.into());
             }
         }
         if data_class == DataClass::Sensitive

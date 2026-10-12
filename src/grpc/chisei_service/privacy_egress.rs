@@ -200,7 +200,7 @@ impl ChiseiServiceImpl {
             "scan_truncated".to_string(),
             findings
                 .iter()
-                .any(|finding| finding.rule_label == crate::chisei::privacy::SCAN_TRUNCATED_LABEL)
+                .any(LeakFinding::is_scan_truncated)
                 .to_string(),
         );
         evidence.insert(

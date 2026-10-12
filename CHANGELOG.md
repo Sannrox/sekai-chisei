@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The egress entity scan no longer truncates at 500 literals. Every name and
+  external id of the up to 500 scanned objects is checked, so namespaces with
+  more than about 250 named objects stop refusing all `Sensitive` egress to
+  non-safe providers. A truncated scan (more than 500 objects) now refuses
+  with `privacy_scan_truncated: ...` and the `EgressDecision` reason
+  `privacy_scan_truncated`, distinct from a leak match. See
+  `docs/egress-privacy-scan.md` (#1372).
+
 - Connector certifications persist on PostgreSQL with the SQLite certify, get,
   verify, revoke, and supersession semantics. Adds PostgreSQL migration
   `0055_connector_certifications` (#1481).

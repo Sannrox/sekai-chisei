@@ -6,9 +6,16 @@ use std::sync::{Arc, Mutex};
 
 pub const ENTITY_SCAN_OPT_OUT_KEY: &str = "chisei.egress.entity_scan";
 /// Bound on objects fetched for entity literals. Reference-platform analog: Object Search pageSize.
+/// It is the only completeness bound: every literal from an in-window object is scanned.
 pub const ENTITY_SCAN_LIMIT: i32 = 500;
-pub const ENTITY_LITERAL_LIMIT: usize = 500;
 pub const SCAN_TRUNCATED_LABEL: &str = "scan_truncated";
+/// Stable egress decision reason when the entity scan window overflowed.
+pub const SCAN_TRUNCATED_REASON: &str = "privacy_scan_truncated";
+/// Refusal for an incomplete entity scan; distinct from a leak match.
+pub const SCAN_TRUNCATED_REFUSAL: &str =
+    "privacy_scan_truncated: entity scan incomplete, outbound payload blocked";
+/// Refusal for a blocking leak-rule or known-entity match.
+pub const LEAK_BLOCKED_REFUSAL: &str = "privacy leak checker blocked outbound payload";
 const MIN_ENTITY_LEN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,10 +174,9 @@ impl PrivacyScanCache {
                 } else {
                     objects.as_slice()
                 };
-                let (literals, literal_truncated) = entity_scan_literals(scanned);
                 (
-                    Some(Arc::new(literals)),
-                    listed_overflow || literal_truncated,
+                    Some(Arc::new(entity_scan_literals(scanned))),
+                    listed_overflow,
                 )
             }
             None => (None, false),
@@ -282,6 +288,14 @@ pub struct LeakFinding {
     pub match_count: usize,
 }
 
+impl LeakFinding {
+    /// The synthetic finding `check_payload` adds for a truncated scan. Rule and entity
+    /// findings always match at least once, so a user rule labelled `scan_truncated` is not one.
+    pub fn is_scan_truncated(&self) -> bool {
+        self.rule_label == SCAN_TRUNCATED_LABEL && self.match_count == 0
+    }
+}
+
 pub fn safe_providers(config: &Config) -> HashSet<String> {
     let mut providers = HashSet::from(["ollama".to_string()]);
     providers.extend(
@@ -313,10 +327,11 @@ pub fn gate_reason(data_class: DataClass, task_class: TaskClass, provider: &str)
     )
 }
 
-pub fn entity_scan_literals(objects: &[Object]) -> (Vec<String>, bool) {
+/// Distinct name and external_id literals (at least MIN_ENTITY_LEN chars) of objects that
+/// did not opt out. Callers bound `objects` to ENTITY_SCAN_LIMIT, so at most two literals each.
+pub fn entity_scan_literals(objects: &[Object]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut literals = Vec::new();
-    let mut truncated = false;
     for obj in objects {
         if obj
             .properties
@@ -330,20 +345,27 @@ pub fn entity_scan_literals(objects: &[Object]) -> (Vec<String>, bool) {
             if trimmed.chars().count() < MIN_ENTITY_LEN {
                 continue;
             }
-            let key = trimmed.to_ascii_lowercase();
-            if seen.insert(key) {
-                if literals.len() >= ENTITY_LITERAL_LIMIT {
-                    truncated = true;
-                    break;
-                }
+            if seen.insert(trimmed.to_ascii_lowercase()) {
                 literals.push(trimmed.to_string());
             }
         }
-        if truncated {
-            break;
-        }
     }
-    (literals, truncated)
+    literals
+}
+
+/// Refusal message for findings that block egress: an incomplete scan wins over a match,
+/// so operators can tell "too many objects to prove safety" from "payload leaks".
+pub fn blocking_refusal(findings: &[LeakFinding]) -> Option<&'static str> {
+    if findings.iter().any(LeakFinding::is_scan_truncated) {
+        Some(SCAN_TRUNCATED_REFUSAL)
+    } else if findings
+        .iter()
+        .any(|finding| finding.action == LeakAction::Block)
+    {
+        Some(LEAK_BLOCKED_REFUSAL)
+    } else {
+        None
+    }
 }
 
 pub fn check_payload(
@@ -490,25 +512,81 @@ mod tests {
         );
     }
 
-    #[test]
-    fn entity_scan_literals_flags_truncation_at_literal_cap() {
-        let objects: Vec<Object> = (0..=ENTITY_LITERAL_LIMIT)
+    fn named_scan_objects(count: usize) -> Vec<Object> {
+        (0..count)
             .map(|index| Object {
-                id: format!("o{index}"),
-                kind: "asset".into(),
-                name: format!("Name{index:04}"),
+                id: format!("o{index:04}"),
+                kind: "customer".into(),
+                name: format!("Customer {index:04}"),
                 namespace: "alpha".into(),
-                external_id: String::new(),
+                external_id: format!("cust:{index:04}"),
                 properties: HashMap::new(),
                 created: 0,
                 updated: 0,
             })
-            .collect();
-        let (literals, truncated) = entity_scan_literals(&objects);
-        assert!(truncated);
-        assert_eq!(literals.len(), ENTITY_LITERAL_LIMIT);
-        assert_eq!(literals[0], "Name0000");
-        assert_eq!(literals.last().map(String::as_str), Some("Name0499"));
+            .collect()
+    }
+
+    #[test]
+    fn named_objects_within_the_window_never_truncate_the_scan() {
+        for count in [250, 251, ENTITY_SCAN_LIMIT as usize] {
+            let scan = PrivacyScanCache::default()
+                .load(
+                    "alpha",
+                    true,
+                    || Ok::<_, ()>(Vec::new()),
+                    || Ok(named_scan_objects(count)),
+                )
+                .unwrap();
+            assert!(!scan.truncated, "{count} named objects truncated the scan");
+            assert_eq!(scan.entities.len(), count * 2);
+            assert!(check_payload("hello", &scan.rules, &scan.entities, false).is_empty());
+            let last = format!("Customer {:04}", count - 1);
+            assert!(
+                !check_payload(&format!("about {last}"), &[], &scan.entities, false).is_empty(),
+                "{last} must still be scanned"
+            );
+        }
+    }
+
+    #[test]
+    fn named_objects_past_the_window_truncate_the_scan() {
+        let scan = PrivacyScanCache::default()
+            .load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(Vec::new()),
+                || Ok(named_scan_objects(ENTITY_SCAN_LIMIT as usize + 1)),
+            )
+            .unwrap();
+        assert!(scan.truncated);
+        assert_eq!(scan.entities.len(), ENTITY_SCAN_LIMIT as usize * 2);
+    }
+
+    #[test]
+    fn blocking_refusal_distinguishes_truncated_scan_from_leak_match() {
+        let leak = LeakFinding {
+            rule_label: "known_entity:SecretCo".into(),
+            action: LeakAction::Block,
+            match_count: 1,
+        };
+        let truncated = check_payload("hello", &[], &[], true);
+        assert_eq!(blocking_refusal(&truncated), Some(SCAN_TRUNCATED_REFUSAL));
+        assert_eq!(
+            blocking_refusal(std::slice::from_ref(&leak)),
+            Some(LEAK_BLOCKED_REFUSAL)
+        );
+        assert_eq!(
+            blocking_refusal(&[truncated[0].clone(), leak]),
+            Some(SCAN_TRUNCATED_REFUSAL)
+        );
+        assert_eq!(blocking_refusal(&[]), None);
+        let user_rule = LeakFinding {
+            rule_label: SCAN_TRUNCATED_LABEL.into(),
+            action: LeakAction::Redact,
+            match_count: 1,
+        };
+        assert_eq!(blocking_refusal(&[user_rule]), None);
     }
 
     #[test]
@@ -535,7 +613,7 @@ mod tests {
                 updated: 0,
             },
         ];
-        assert_eq!(entity_scan_literals(&objects).0, vec!["asset:ABC"]);
+        assert_eq!(entity_scan_literals(&objects), vec!["asset:ABC"]);
     }
 
     #[test]

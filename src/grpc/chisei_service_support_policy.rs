@@ -489,10 +489,14 @@ pub(super) fn leak_findings_to_decisions(
             external,
             included: vec![],
             redacted: vec![],
-            reasons: vec![format!(
-                "leak_checker {} {} match(es)",
-                finding.rule_label, finding.match_count
-            )],
+            reasons: vec![if finding.is_scan_truncated() {
+                crate::chisei::privacy::SCAN_TRUNCATED_REASON.into()
+            } else {
+                format!(
+                    "leak_checker {} {} match(es)",
+                    finding.rule_label, finding.match_count
+                )
+            }],
         })
         .collect()
 }
