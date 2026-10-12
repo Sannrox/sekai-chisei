@@ -46,9 +46,9 @@ They stay out of the default RPC surface.
 pack. `lifecycle_state` is `disabled` unless the runtime flag or build
 feature is on. Visibility of that entry is not permission to invoke an
 experimental RPC. The core pack also reports `sekai.transforms.projection`
-as the in-process transform host; its `lifecycle_state` is `disabled` unless
-the experimental RPC gate is on, matching `sekai.rpc.experimental`. Put/run/get
-RPCs stay experimental.
+and `sekai.transforms.analytical` as the in-process transform host; their
+`lifecycle_state` is `disabled` unless the experimental RPC gate is on,
+matching `sekai.rpc.experimental`. Put/run/get/list RPCs stay experimental.
 
 SDK generation for the stable set succeeds without a denylist. Experimental
 and `remove` RPCs are omitted automatically.
@@ -110,6 +110,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.ListGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.ListGovernedTransformRuns` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
 | `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `experimental` |
 | `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |

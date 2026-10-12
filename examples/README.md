@@ -27,6 +27,16 @@ cargo test --locked --test epistemic_replication_example
 See [the fixture walkthrough](../docs/epistemic-replication-example.md) for the
 exact commands and the bounded report fields.
 
+## analytical_transform
+
+[analytical_transform.rs](analytical_transform.rs) seeds two datasets that back
+an object type, runs a join + aggregate analytical transform, and prints the
+run receipt (rows in/out, definition and input digests, lineage parent):
+
+```bash
+cargo run --example analytical_transform
+```
+
 ## governed_fact_profile
 
 [governed_fact_profile.rs](governed_fact_profile.rs) shows an external software

@@ -10,7 +10,8 @@
 - Related: [ADR 0072](0072-in-process-function-host.md),
   [ADR 0073](0073-source-and-action-objects.md),
   [ADR 0074](0074-plane-owned-transforms.md),
-  [ADR 0036](0036-open-table-projections.md)
+  [ADR 0036](0036-open-table-projections.md),
+  [ADR 0101](0101-analytical-transform-profile.md)
 
 ## Context
 

@@ -122,6 +122,7 @@ impl SekaiDb {
         enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
         schema_plane: crate::db::schema_plane::SchemaPlane,
     ) -> Result<Self, String> {
+        crate::sekai::transform_engine::install_engine_allocator();
         let persistent = path != ":memory:";
         if persistent && pool_max == 0 {
             return Err("SQLite pool size must be greater than zero".into());

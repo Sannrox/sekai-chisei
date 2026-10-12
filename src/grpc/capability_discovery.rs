@@ -50,6 +50,7 @@ impl SekaiServiceImpl {
         let experimental = crate::rpc_maturity::experimental_rpcs_enabled();
         entries.push(experimental_rpc_capability(experimental));
         entries.push(hosted_transform_capability(experimental));
+        entries.push(analytical_transform_capability(experimental));
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -90,7 +91,8 @@ fn base_capability(
 fn capability_product_tier(name: &str) -> &'static str {
     match name {
         crate::rpc_maturity::EXPERIMENTAL_CAPABILITY => "core",
-        crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY => "core",
+        crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY
+        | crate::sekai::governed_transform::ANALYTICAL_COMPUTE_CAPABILITY => "core",
         semantic::CAPABILITY_EXPAND_RELATIONS
         | semantic::CAPABILITY_RETRIEVE_CONTEXT
         | semantic::CAPABILITY_EXPLAIN_DERIVATION => "core",
@@ -126,6 +128,20 @@ fn hosted_transform_capability(enabled: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY.into(),
         "In-process governed dataset transform host. Put, run, and inspect a JobSpec; outputs are datasets.".into(),
+        "transform",
+        "sekai.PutGovernedTransformRequest",
+        "sekai.PutGovernedTransformResponse",
+    );
+    entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
+    entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry
+}
+
+fn analytical_transform_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        crate::sekai::governed_transform::ANALYTICAL_COMPUTE_CAPABILITY.into(),
+        "In-process analytical SQL transform profile. Multi-input join, aggregate, and derived columns on governed datasets.".into(),
         "transform",
         "sekai.PutGovernedTransformRequest",
         "sekai.PutGovernedTransformResponse",
@@ -423,5 +439,15 @@ mod tests {
 
         let on = hosted_transform_capability(true);
         assert_eq!(on.lifecycle_state, "active");
+    }
+
+    #[test]
+    fn analytical_transform_capability_is_disabled_when_experimental_rpcs_are_off() {
+        let off = analytical_transform_capability(false);
+        assert_eq!(off.lifecycle_state, "disabled");
+        assert_eq!(
+            off.name,
+            crate::sekai::governed_transform::ANALYTICAL_COMPUTE_CAPABILITY
+        );
     }
 }
