@@ -445,6 +445,7 @@ impl ChiseiServiceImpl {
             Vec::new()
         };
 
+        self.enforce_model_review_admission(requested_namespace, &model, actor)?;
         Ok(PolicyResolution {
                 runtime,
                 model,

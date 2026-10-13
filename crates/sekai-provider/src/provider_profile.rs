@@ -233,13 +233,17 @@ where
 }
 
 pub fn provider_registry_snapshot() -> ProviderRegistry {
-    if let Ok(registry) = REQUEST_PROVIDER_REGISTRY.try_with(Clone::clone) {
-        return registry;
-    }
-    AUTHORITATIVE_PROVIDER_REGISTRY
-        .read()
-        .expect("provider registry lock is not poisoned")
-        .clone()
+    request_scoped_provider_registry().unwrap_or_else(|| {
+        AUTHORITATIVE_PROVIDER_REGISTRY
+            .read()
+            .expect("provider registry lock is not poisoned")
+            .clone()
+    })
+}
+
+/// The request-scoped registry when one is installed for this execution.
+pub fn request_scoped_provider_registry() -> Option<ProviderRegistry> {
+    REQUEST_PROVIDER_REGISTRY.try_with(Clone::clone).ok()
 }
 
 pub fn provider_registry_state_version() -> u64 {

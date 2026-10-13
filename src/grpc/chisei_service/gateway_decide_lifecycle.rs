@@ -260,11 +260,19 @@ impl ChiseiServiceImpl {
                 Err(status) => {
                     // Capability-document failures use FailedPrecondition so a
                     // mixed native catalog or provider matrix is
-                    // capability_unsupported, not policy_denied.
+                    // capability_unsupported, not policy_denied. Model review
+                    // refusals stay a distinct deny reason.
                     let reason = match status.code() {
                         tonic::Code::ResourceExhausted => GatewayDecideDenyReason::BudgetDenied,
                         tonic::Code::FailedPrecondition => {
                             GatewayDecideDenyReason::CapabilityUnsupported
+                        }
+                        tonic::Code::PermissionDenied
+                            if crate::chisei::model_review::AdmissionRefusal::matches_message(
+                                status.message(),
+                            ) =>
+                        {
+                            GatewayDecideDenyReason::ModelReviewDenied
                         }
                         tonic::Code::PermissionDenied => GatewayDecideDenyReason::ResidencyDenied,
                         tonic::Code::InvalidArgument => GatewayDecideDenyReason::PolicyDenied,

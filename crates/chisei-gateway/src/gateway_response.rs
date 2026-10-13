@@ -1327,7 +1327,11 @@ pub(super) fn json_error_with_retry_safety(
 pub(super) fn stable_gateway_error_code(error_type: &str) -> &'static str {
     match error_type {
         "authentication_error" | "invalid_api_key" | "unauthorized" => "authentication_error",
-        "policy_denied" | "governance_denied" | "context_denied" => "policy_denied",
+        "policy_denied"
+        | "governance_denied"
+        | "context_denied"
+        | "residency_denied"
+        | "model_review_denied" => "policy_denied",
         "budget_exceeded" => "budget_exceeded",
         "capability_unsupported"
         | "unsupported_cross_provider_stream"

@@ -40,7 +40,10 @@ not tenant routes and are not admitted through this hook.
 
 Durable review state for that identity is stored per namespace (#1493). The
 empty namespace is the instance default; a named namespace may override it.
-`admit_model` still defaults to admit until #1494 consumes the stored state.
+Route admission (#1494) refuses a model that is not `enabled` for the
+namespace, identity, and residency region before this hook runs, and records
+the refusal on the decision ledger. `admit_model` remains an additional
+enterprise gate.
 
 ## Behavior
 

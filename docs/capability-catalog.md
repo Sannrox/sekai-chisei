@@ -251,7 +251,9 @@ default; a named namespace overrides it. Identity is provider, canonical model,
 and optional artifact digest. Family enablement is per namespace and
 `ResidencyPolicy` region label; a per-model row overrides the family. Named
 namespaces require namespace administration; the empty namespace requires
-credential admin (`root` / `local`). Route admission enforcement is #1494.
+credential admin (`root` / `local`). Route admission (#1494) default-denies
+any model that is not `enabled` for the namespace, identity, and residency
+region at native planning and execution, gateway decide, and hosted routes.
 `sekaictl admin model-review` is the operator CLI.
 
 ### Customer-hosted profiles (#1171)

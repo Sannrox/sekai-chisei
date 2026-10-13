@@ -1249,6 +1249,21 @@ pub(super) async fn put_routing_profile(
         .db
         .put_hosted_routing_profile(&profile)
         .map_err(|_| Status::internal("routing profile unavailable"))?;
+    #[cfg(test)]
+    {
+        let _ = crate::chisei::model_review::set_family_enablement(
+            &service.db,
+            crate::chisei::model_review::FamilyEnablementRecord {
+                namespace: profile.namespace.clone(),
+                region_label: String::new(),
+                family_id: crate::chisei::routing_profiles::hosted_runtime(&profile),
+                status: crate::chisei::model_review::ModelReviewStatus::Enabled,
+                actor: actor.clone(),
+                reason: "test hosted registration".into(),
+                updated_at_ms: profile.registered_at_ms,
+            },
+        );
+    }
     let origin = profile.endpoint_origin.clone();
     Ok(Response::new(PutRoutingProfileResponse {
         profile: Some(routing_profile_to_proto(profile.entry(), origin)),

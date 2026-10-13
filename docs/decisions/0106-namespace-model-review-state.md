@@ -38,7 +38,8 @@ concept: policies are namespace-scoped and residency uses region labels.
    region-scoped family. A hosted profile cannot override an inherited
    operator restriction. `RuntimeBackend::initialize` does not
    run it, so Sekai-only and Chisei-only schema planes stay intact. Route
-   admission enforcement is deferred to #1494.
+   admission (#1494) consumes this state and default-denies unless the
+   effective status is `enabled`.
 
 ## Alternatives considered
 
@@ -53,6 +54,8 @@ concept: policies are namespace-scoped and residency uses region labels.
   `chisei_model_family_enablement` on SQLite and PostgreSQL.
 - Experimental Chisei RPCs and `sekaictl admin model-review` are the operator
   surface. GATE:mig applies to the new tables and the backfill.
+- After #1494, native planning and execution, gateway decide, and hosted
+  routes refuse any model that is not `enabled` and record the refusal.
 
 ## Validation
 

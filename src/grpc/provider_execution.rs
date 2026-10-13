@@ -105,7 +105,7 @@ pub async fn execute_native_content_request_stream(
     authenticated_context: Option<&crate::enterprise::AuthenticatedContext>,
     request: ProviderContentExecutionRequest,
 ) -> Result<ProviderExecutionStream, Status> {
-    let mut registry = refresh_provider_registry(config).await?;
+    let mut registry = execution_registry(config).await?;
     if let Some(hosted) = &request.hosted {
         registry = registry.with_hosted_endpoints(std::slice::from_ref(&hosted.endpoint));
     }
@@ -246,7 +246,7 @@ async fn execute_chat_request_stream_with_cache(
     prompt_cache: llm::PromptCacheIntent,
     execution_authentication: Option<ExecutionAuthentication<'_>>,
 ) -> Result<ProviderExecutionStream, Status> {
-    let mut registry = refresh_provider_registry(config).await?;
+    let mut registry = execution_registry(config).await?;
     if let Some(hosted) = &r.hosted {
         registry = registry.with_hosted_endpoints(std::slice::from_ref(&hosted.endpoint));
     }
@@ -659,6 +659,15 @@ fn estimate_content_request(request: &ProviderContentExecutionRequest) -> i32 {
     i32::try_from(bytes.div_ceil(4))
         .unwrap_or(i32::MAX)
         .saturating_add(request.max_tokens.max(0))
+}
+
+async fn execution_registry(
+    config: &Config,
+) -> Result<crate::provider_profile::ProviderRegistry, Status> {
+    if let Some(registry) = crate::provider_profile::request_scoped_provider_registry() {
+        return Ok(registry);
+    }
+    refresh_provider_registry(config).await
 }
 
 async fn refresh_provider_registry(

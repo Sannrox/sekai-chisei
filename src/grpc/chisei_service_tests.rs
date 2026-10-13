@@ -11831,3 +11831,344 @@ fn split_store_namespace_authorization_reads_sekai_grants() {
         assert_eq!(denied.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
 }
+
+fn review_admission_service() -> ChiseiServiceImpl {
+    crate::chisei::model_review::without_registry_family_seed(|| {
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let mut cfg = config(":memory:");
+        cfg.openai_api_key = Some("synthetic-server-side-key".into());
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg)
+    })
+}
+
+fn openai_sales_policy() -> crate::chisei::policy::Policy {
+    crate::chisei::policy::Policy {
+        allowed_runtimes: vec!["openai".into()],
+        allowed_models: vec!["gpt-5.5".into(), "openai/gpt-5.5".into()],
+        default_runtime: "openai".into(),
+        default_model: "gpt-5.5".into(),
+        data_class: "unclassified".into(),
+    }
+}
+
+fn enable_family(svc: &ChiseiServiceImpl, namespace: &str, family: &str, region: &str) {
+    crate::chisei::model_review::set_family_enablement(
+        &svc.db,
+        crate::chisei::model_review::FamilyEnablementRecord {
+            namespace: namespace.into(),
+            region_label: region.into(),
+            family_id: family.into(),
+            status: crate::chisei::model_review::ModelReviewStatus::Enabled,
+            actor: "alice".into(),
+            reason: "admission fixture".into(),
+            updated_at_ms: 1,
+        },
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn unreviewed_model_is_refused_at_native_planning() {
+    let svc = review_admission_service();
+    svc.policy
+        .set_namespace_policy("sales", openai_sales_policy());
+    let error = svc
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(ExecutionInput {
+                request_id: "review-plan-1".into(),
+                namespace: "sales".into(),
+                spec: "Summarize.".into(),
+                preferred_model: "gpt-5.5".into(),
+                preferred_runtime: "openai".into(),
+                max_tokens: 32,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert!(
+        error
+            .message()
+            .contains(crate::chisei::model_review::REFUSAL_NOT_ENABLED),
+        "{}",
+        error.message()
+    );
+}
+
+#[tokio::test]
+async fn unreviewed_model_is_refused_at_gateway_decide() {
+    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
+
+    let svc = review_admission_service();
+    svc.policy
+        .set_namespace_policy("sales", openai_sales_policy());
+    svc.policy
+        .set_context_admission_policy(
+            "sales",
+            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+        )
+        .unwrap();
+    let mut request = Request::new(DecideGatewayExecutionRequest {
+        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+        namespace: "sales".into(),
+        requested_model: "gpt-5.5".into(),
+        operation_class: "chat".into(),
+        estimated_cost_usd_micros: 0,
+        correlation_operation_id: "op-review-1".into(),
+        correlation_attempt: 1,
+        estimated_tokens: 10,
+        task_class: "interactive".into(),
+        preferred_runtime: "openai".into(),
+        project: "sales".into(),
+        agent: "local".into(),
+        key_id: String::new(),
+        work_unit: String::new(),
+        local_free_available: false,
+        user_id: "local".into(),
+        route_override: String::new(),
+        capability_requirements_json: Vec::new(),
+        expected_calls: 1,
+        pipeline_spec: String::new(),
+    });
+    request
+        .metadata_mut()
+        .insert("x-principal", "local".parse().unwrap());
+    let denied = svc
+        .decide_gateway_execution(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!denied.admitted, "{denied:?}");
+    assert_eq!(denied.deny_reason, "model_review_denied");
+    assert!(
+        denied
+            .deny_message
+            .contains(crate::chisei::model_review::REFUSAL_NOT_ENABLED),
+        "{}",
+        denied.deny_message
+    );
+}
+
+#[tokio::test]
+async fn residency_mismatch_is_refused_when_family_is_enabled_elsewhere() {
+    let svc = review_admission_service();
+    svc.policy
+        .set_namespace_policy("sales", openai_sales_policy());
+    svc.policy
+        .set_residency_policy(
+            "sales",
+            crate::chisei::residency::ResidencyPolicy {
+                policy_id: "res-1".into(),
+                version: "1".into(),
+                allowed_regions: ["eu".into()].into_iter().collect(),
+                provider_regions: [("openai".into(), "eu".into())].into_iter().collect(),
+                model_regions: Default::default(),
+                allowed_data_classes: Default::default(),
+            },
+        )
+        .unwrap();
+    enable_family(&svc, "sales", "openai", "us");
+    let error = svc
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(ExecutionInput {
+                request_id: "review-region-1".into(),
+                namespace: "sales".into(),
+                spec: "Summarize.".into(),
+                preferred_model: "gpt-5.5".into(),
+                preferred_runtime: "openai".into(),
+                max_tokens: 32,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert!(
+        error
+            .message()
+            .contains(crate::chisei::model_review::REFUSAL_RESIDENCY_MISMATCH),
+        "{}",
+        error.message()
+    );
+}
+
+#[tokio::test]
+async fn enabled_family_keeps_backfilled_routes_working() {
+    let svc = review_admission_service();
+    svc.policy
+        .set_namespace_policy("sales", openai_sales_policy());
+    enable_family(&svc, "", "openai", "");
+    let plan = svc
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(ExecutionInput {
+                request_id: "review-enabled-1".into(),
+                namespace: "sales".into(),
+                spec: "Summarize.".into(),
+                preferred_model: "gpt-5.5".into(),
+                preferred_runtime: "openai".into(),
+                max_tokens: 32,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert!(plan.executable, "{plan:?}");
+}
+
+#[tokio::test]
+async fn unreviewed_model_is_refused_at_native_execute() {
+    let svc = review_admission_service();
+    svc.policy
+        .set_namespace_policy("sales", openai_sales_policy());
+    enable_family(&svc, "", "openai", "");
+    let plan = svc
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(ExecutionInput {
+                request_id: "review-execute-1".into(),
+                namespace: "sales".into(),
+                spec: "Summarize.".into(),
+                preferred_model: "gpt-5.5".into(),
+                preferred_runtime: "openai".into(),
+                max_tokens: 32,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    crate::chisei::model_review::revoke_family_enablement(
+        &svc.db,
+        crate::chisei::model_review::FamilyEnablementRecord {
+            namespace: String::new(),
+            region_label: String::new(),
+            family_id: "openai".into(),
+            status: crate::chisei::model_review::ModelReviewStatus::Enabled,
+            actor: "alice".into(),
+            reason: "revoke before execute".into(),
+            updated_at_ms: 2,
+        },
+    )
+    .unwrap();
+    let error = match svc
+        .execute_plan(Request::new(ExecutePlanRequest { plan: Some(plan) }))
+        .await
+    {
+        Ok(_) => panic!("expected execute to refuse an unreviewed model"),
+        Err(status) => status,
+    };
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert!(
+        error
+            .message()
+            .contains(crate::chisei::model_review::REFUSAL_NOT_ENABLED),
+        "{}",
+        error.message()
+    );
+    let decisions = svc
+        .db
+        .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+            actor: Some("local".into()),
+            action: Some(crate::chisei::model_review::ACTION_ADMIT_DENIED.into()),
+            target_id: None,
+            after: 0,
+            limit: 10,
+            offset: 0,
+        })
+        .unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|row| row.reason == crate::chisei::model_review::REFUSAL_NOT_ENABLED),
+        "{decisions:?}"
+    );
+}
+
+#[tokio::test]
+async fn unreviewed_hosted_route_is_refused_at_planning() {
+    let mut config = config(":memory:");
+    config.routing_endpoint_allowlist =
+        crate::chisei::routing_profiles::endpoint_allowlist_from("https://models.example.com");
+    config.routing_credential_refs = vec!["ACME".into()];
+    let svc = crate::chisei::model_review::without_registry_family_seed(|| {
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        ChiseiServiceImpl::new(
+            crate::db::store::ChiseiStore::from_shared_runtime(db),
+            config.clone(),
+        )
+    });
+    svc.put_routing_profile(Request::new(PutRoutingProfileRequest {
+        namespace: "sales".into(),
+        name: "acme-llm".into(),
+        endpoint_url: "https://models.example.com".into(),
+        model_patterns: vec!["acme-*".into()],
+        credential_ref: "ACME".into(),
+    }))
+    .await
+    .unwrap();
+    crate::chisei::model_review::revoke_family_enablement(
+        &svc.db,
+        crate::chisei::model_review::FamilyEnablementRecord {
+            namespace: "sales".into(),
+            region_label: String::new(),
+            family_id: "hosted.acme-llm".into(),
+            status: crate::chisei::model_review::ModelReviewStatus::Enabled,
+            actor: "alice".into(),
+            reason: "revoke hosted family".into(),
+            updated_at_ms: 2,
+        },
+    )
+    .unwrap();
+    svc.policy.set_namespace_policy(
+        "sales",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["hosted.acme-llm".into()],
+            allowed_models: vec!["hosted.acme-llm/acme-1".into()],
+            default_runtime: "hosted.acme-llm".into(),
+            default_model: "hosted.acme-llm/acme-1".into(),
+            data_class: "unclassified".into(),
+        },
+    );
+    let error = svc
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(ExecutionInput {
+                request_id: "review-hosted-1".into(),
+                namespace: "sales".into(),
+                spec: "Summarize.".into(),
+                preferred_model: "hosted.acme-llm/acme-1".into(),
+                preferred_runtime: "hosted.acme-llm".into(),
+                max_tokens: 32,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert!(
+        error
+            .message()
+            .contains(crate::chisei::model_review::REFUSAL_NOT_ENABLED),
+        "{}",
+        error.message()
+    );
+}
