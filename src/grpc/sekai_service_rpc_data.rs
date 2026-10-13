@@ -1428,7 +1428,10 @@ pub(super) async fn run_governed_transform(
             }
         })?;
     Ok(Response::new(RunGovernedTransformResponse {
-        run: Some(to_proto_transform_run(&run)),
+        run: Some(to_proto_transform_run(
+            &run,
+            caller_can_read_run_datasets(service, &principals, &run),
+        )),
     }))
 }
 pub(super) async fn get_governed_transform_run(
@@ -1443,8 +1446,10 @@ pub(super) async fn get_governed_transform_run(
         .get_governed_transform_run(&req.into_inner().run_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("not found"))?;
+    check_team_namespace(service.db.runtime(), &principals, &run.namespace, false)?;
+    let reveal = caller_can_read_run_datasets(service, &principals, &run);
     Ok(Response::new(GetGovernedTransformRunResponse {
-        run: Some(to_proto_transform_run(&run)),
+        run: Some(to_proto_transform_run(&run, reveal)),
     }))
 }
 pub(super) async fn list_governed_transforms(
@@ -1484,7 +1489,10 @@ pub(super) async fn list_governed_transform_runs(
         .list_governed_transform_runs(&input.namespace, limit)
         .map_err(Status::internal)?
         .iter()
-        .map(to_proto_transform_run)
+        .map(|run| {
+            let reveal = caller_can_read_run_datasets(service, &principals, run);
+            to_proto_transform_run(run, reveal)
+        })
         .collect();
     Ok(Response::new(ListGovernedTransformRunsResponse { runs }))
 }
@@ -1602,6 +1610,8 @@ pub(super) async fn read_transform_run_inputs(
         runtime_id: input.runtime_id,
         claim_generation: input.claim_generation,
         fencing_token: input.fencing_token,
+        partition_key: input.partition_key,
+        max_bytes: input.max_bytes,
         ..crate::sekai::governed_transform::WriteTransformRunCommand::default()
     };
     let rows = service
@@ -1623,6 +1633,7 @@ pub(super) async fn read_transform_run_inputs(
                 dataset_id: row.dataset_id,
                 row_id: row.row_id,
                 values: row.values,
+                partition_key: row.partition_key,
             }),
         })
     }));
@@ -1653,6 +1664,17 @@ pub(super) async fn write_transform_run_result(
         output_digest: input.output_digest,
         quarantined: input.quarantined,
         quality_rule: input.quality_rule,
+        replaced_partitions: input
+            .partitions
+            .into_iter()
+            .map(
+                |partition| crate::sekai::governed_transform::TransformPartitionWrite {
+                    partition_key: partition.partition_key,
+                    rows: partition.rows.into_iter().map(|row| row.values).collect(),
+                },
+            )
+            .collect(),
+        ..crate::sekai::governed_transform::WriteTransformRunCommand::default()
     };
     let run = service
         .db
@@ -1660,7 +1682,10 @@ pub(super) async fn write_transform_run_result(
         .write_transform_run(command, now_millis())
         .map_err(transform_work_status)?;
     Ok(Response::new(WriteTransformRunResultResponse {
-        run: Some(to_proto_transform_run(&run)),
+        run: Some(to_proto_transform_run(
+            &run,
+            caller_can_read_run_datasets(service, &principals, &run),
+        )),
     }))
 }
 
@@ -1890,7 +1915,81 @@ fn from_proto_isolated(
     })
 }
 
-fn to_proto_transform_run(run: &crate::sekai::governed_transform::TransformRun) -> TransformRun {
+fn caller_can_read_run_datasets(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    run: &crate::sekai::governed_transform::TransformRun,
+) -> bool {
+    let transform = if run.profile == crate::sekai::governed_transform::ISOLATED_CLASS {
+        service
+            .db
+            .runtime()
+            .admitted_isolated_transform(&run.run_id)
+            .ok()
+            .flatten()
+    } else {
+        service
+            .db
+            .runtime()
+            .get_governed_transform(&run.namespace, &run.transform_id)
+            .ok()
+            .flatten()
+    };
+    let Some(transform) = transform else {
+        return false;
+    };
+    if transform.definition_digest != run.definition_digest {
+        return false;
+    }
+    let mut dataset_ids: Vec<String> = transform
+        .input_bindings()
+        .into_iter()
+        .map(|(_, dataset_id)| dataset_id)
+        .collect();
+    dataset_ids.push(transform.output_dataset_id);
+    for dataset_id in dataset_ids {
+        let Ok(Some(dataset)) = service.db.runtime().get_dataset(&dataset_id) else {
+            return false;
+        };
+        if check_dataset_access(
+            service.db.runtime(),
+            &service.security,
+            principals,
+            &dataset,
+            false,
+        )
+        .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn to_proto_partition(
+    partition: &crate::sekai::governed_transform::TransformPartition,
+    reveal_partition_keys: bool,
+) -> TransformPartition {
+    let identity = if reveal_partition_keys {
+        partition.partition_key.clone()
+    } else {
+        crate::sekai::governed_transform::REDACTED_PARTITION_IDENTITY.into()
+    };
+    TransformPartition {
+        partition_key: identity.clone(),
+        digest: if reveal_partition_keys {
+            partition.digest.clone()
+        } else {
+            identity
+        },
+        rows: partition.rows,
+    }
+}
+
+fn to_proto_transform_run(
+    run: &crate::sekai::governed_transform::TransformRun,
+    reveal_partition_keys: bool,
+) -> TransformRun {
     TransformRun {
         run_id: run.run_id.clone(),
         namespace: run.namespace.clone(),
@@ -1914,6 +2013,16 @@ fn to_proto_transform_run(run: &crate::sekai::governed_transform::TransformRun) 
         dispatch_status: run.dispatch_status.clone(),
         trigger_cause: run.trigger_cause.clone(),
         trigger_ref: run.trigger_ref.clone(),
+        input_partitions: run
+            .input_partitions
+            .iter()
+            .map(|partition| to_proto_partition(partition, reveal_partition_keys))
+            .collect(),
+        output_partitions: run
+            .output_partitions
+            .iter()
+            .map(|partition| to_proto_partition(partition, reveal_partition_keys))
+            .collect(),
     }
 }
 
@@ -1938,7 +2047,10 @@ pub(super) async fn tick_governed_transforms(
         .tick_governed_transforms(now_ms)
         .map_err(Status::internal)?
         .iter()
-        .map(to_proto_transform_run)
+        .map(|run| {
+            let reveal = caller_can_read_run_datasets(service, &principals, run);
+            to_proto_transform_run(run, reveal)
+        })
         .collect();
     Ok(Response::new(TickGovernedTransformsResponse { runs }))
 }
@@ -1989,7 +2101,10 @@ pub(super) async fn cancel_governed_transform_run(
             }
         })?;
     Ok(Response::new(CancelGovernedTransformRunResponse {
-        run: Some(to_proto_transform_run(&run)),
+        run: Some(to_proto_transform_run(
+            &run,
+            caller_can_read_run_datasets(service, &principals, &run),
+        )),
     }))
 }
 

@@ -113,6 +113,9 @@ const ISOLATED_TRANSFORM_WORK_SCHEMA: &str =
 const TRANSFORM_SCHEDULE_SCHEMA: &str = include_str!("postgres/0058_transform_schedule.sql");
 const NAMESPACE_OBJECT_GENERATION_SCHEMA: &str =
     include_str!("postgres/0059_namespace_object_generation.sql");
+const PARTITIONED_TRANSFORM_IO_SCHEMA: &str =
+    include_str!("postgres/0060_partitioned_transform_io.sql");
+const CHISEI_MODEL_REVIEW_SCHEMA: &str = include_str!("postgres/0061_chisei_model_review.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -501,6 +504,18 @@ const MIGRATIONS: &[Migration] = &[
         "namespace_object_generation",
         NAMESPACE_OBJECT_GENERATION_SCHEMA,
         MigrationOwner::Sekai,
+    ),
+    mig(
+        59,
+        "partitioned_transform_io",
+        PARTITIONED_TRANSFORM_IO_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        60,
+        "chisei_model_review",
+        CHISEI_MODEL_REVIEW_SCHEMA,
+        MigrationOwner::Chisei,
     ),
 ];
 
@@ -1367,6 +1382,18 @@ mod tests {
             ISOLATED_TRANSFORM_WORK_SCHEMA
                 .contains("CREATE TABLE IF NOT EXISTS sekai_transform_run_input"),
             "missing PostgreSQL isolated transform input snapshot table"
+        );
+        assert!(
+            PARTITIONED_TRANSFORM_IO_SCHEMA.contains("partition_keys TEXT NOT NULL DEFAULT '[]'"),
+            "missing PostgreSQL dataset partition_keys"
+        );
+        assert!(
+            PARTITIONED_TRANSFORM_IO_SCHEMA.contains("partition_key TEXT NOT NULL DEFAULT ''"),
+            "missing PostgreSQL dataset-row partition_key"
+        );
+        assert!(
+            PARTITIONED_TRANSFORM_IO_SCHEMA.contains("input_partitions TEXT NOT NULL DEFAULT '[]'"),
+            "missing PostgreSQL transform-run partition receipts"
         );
         for table in ["sekai_governed_documents", "sekai_governed_renditions"] {
             assert!(

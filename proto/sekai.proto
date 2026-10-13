@@ -178,6 +178,8 @@ message Dataset {
   repeated ColumnDef columns = 3;
   string object_id = 4;
   int64 created = 5;
+  // Ordered partition column names. Empty keeps a whole-dataset digest.
+  repeated string partition_keys = 6;
 }
 
 message ColumnDef {
@@ -580,6 +582,8 @@ message TransformRun {
   string dispatch_status = 20;
   string trigger_cause = 21;
   string trigger_ref = 22;
+  repeated TransformPartition input_partitions = 23;
+  repeated TransformPartition output_partitions = 24;
 }
 message TickGovernedTransformsRequest {
   int64 now_ms = 1;
@@ -678,6 +682,16 @@ message TransformRunInputRow {
   string dataset_id = 2;
   int64 row_id = 3;
   map<string, string> values = 4;
+  string partition_key = 5;
+}
+message TransformPartition {
+  string partition_key = 1;
+  string digest = 2;
+  int32 rows = 3;
+}
+message TransformPartitionWrite {
+  string partition_key = 1;
+  repeated TransformRunInputRow rows = 2;
 }
 message ReadTransformRunInputsRequest {
   string run_id = 1;
@@ -690,6 +704,10 @@ message ReadTransformRunInputsRequest {
   // Empty alias reads every input in (alias, row_id) order; pass the last
   // row's alias here to continue that overview. Named alias ignores this.
   string after_alias = 8;
+  // Unset reads every partition. Empty string selects the empty identity
+  // (a missing single-column partition value) and must not mean "all".
+  optional string partition_key = 9;
+  int64 max_bytes = 10;
 }
 message ReadTransformRunInputsResponse {
   TransformRunInputRow row = 1;
@@ -703,6 +721,7 @@ message WriteTransformRunResultRequest {
   string output_digest = 6;
   bool quarantined = 7;
   string quality_rule = 8;
+  repeated TransformPartitionWrite partitions = 9;
 }
 message WriteTransformRunResultResponse {
   TransformRun run = 1;

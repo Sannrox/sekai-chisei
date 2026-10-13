@@ -1591,6 +1591,60 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "SetModelReview",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "RevokeModelReview",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ListModelReviews",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "SetModelFamilyEnablement",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "RevokeModelFamilyEnablement",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ListModelFamilyEnablement",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "PlanExecution",
       "storage_path": "chisei.policy, chisei.budget, chisei.execution",
       "real_backend": "yes",

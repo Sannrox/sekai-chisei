@@ -1,4 +1,4 @@
-use crate::db::postgres::PostgresDb;
+use crate::db::postgres::{PostgresDb, lock_dataset_rows};
 use crate::sekai::dataset::{
     ColumnDef, Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable,
 };
@@ -8,16 +8,18 @@ impl PostgresDb {
     pub fn create_dataset(&self, dataset: &Dataset) -> Result<(), String> {
         validate_columns(&dataset.columns)?;
         let columns = encode_columns(&dataset.columns)?;
+        let partition_keys = crate::sekai::dataset::encode_partition_keys(&dataset.partition_keys)?;
         self.connection()?
             .execute(
-                "INSERT INTO sekai_datasets (id,name,columns,object_id,created)
-                 VALUES ($1,$2,$3,$4,$5)",
+                "INSERT INTO sekai_datasets (id,name,columns,object_id,created,partition_keys)
+                 VALUES ($1,$2,$3,$4,$5,$6)",
                 &[
                     &dataset.id,
                     &dataset.name,
                     &columns,
                     &dataset.object_id,
                     &dataset.created,
+                    &partition_keys,
                 ],
             )
             .map(|_| ())
@@ -27,22 +29,60 @@ impl PostgresDb {
     pub fn update_dataset(&self, dataset: &Dataset) -> Result<(), String> {
         validate_columns(&dataset.columns)?;
         let columns = encode_columns(&dataset.columns)?;
-        let changed = self
-            .connection()?
+        let partition_keys = crate::sekai::dataset::encode_partition_keys(&dataset.partition_keys)?;
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_dataset_rows(&mut tx, &dataset.id)?;
+        let previous_json: Option<String> = tx
+            .query_opt(
+                "SELECT partition_keys FROM sekai_datasets WHERE id=$1",
+                &[&dataset.id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        let Some(previous_json) = previous_json else {
+            return Err(format!("dataset {:?} not found", dataset.id));
+        };
+        let previous = crate::sekai::dataset::parse_partition_keys(&previous_json)?;
+        let changed = tx
             .execute(
-                "UPDATE sekai_datasets SET name=$2, columns=$3 WHERE id=$1",
-                &[&dataset.id, &dataset.name, &columns],
+                "UPDATE sekai_datasets SET name=$2, columns=$3, partition_keys=$4 WHERE id=$1",
+                &[&dataset.id, &dataset.name, &columns, &partition_keys],
             )
             .map_err(|error| error.to_string())?;
-        (changed == 1)
-            .then_some(())
-            .ok_or_else(|| format!("dataset {:?} not found", dataset.id))
+        if changed != 1 {
+            return Err(format!("dataset {:?} not found", dataset.id));
+        }
+        if previous != dataset.partition_keys {
+            let rows = tx
+                .query(
+                    "SELECT id, data FROM sekai_dataset_rows WHERE dataset_id=$1",
+                    &[&dataset.id],
+                )
+                .map_err(|error| error.to_string())?;
+            for row in rows {
+                let id: i64 = row.get(0);
+                let data: String = row.get(1);
+                let partition_key = crate::sekai::dataset::partition_key_for_row_json(
+                    &dataset.partition_keys,
+                    &data,
+                )?;
+                tx.execute(
+                    "UPDATE sekai_dataset_rows SET partition_key=$1 WHERE id=$2",
+                    &[&partition_key, &id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn get_dataset(&self, id: &str) -> Result<Option<Dataset>, String> {
         self.connection()?
             .query_opt(
-                "SELECT id,name,columns,object_id,created FROM sekai_datasets WHERE id=$1",
+                "SELECT id,name,columns,object_id,created,partition_keys FROM sekai_datasets WHERE id=$1",
                 &[&id],
             )
             .map_err(|error| error.to_string())?
@@ -53,7 +93,7 @@ impl PostgresDb {
     pub fn list_datasets(&self) -> Result<Vec<Dataset>, String> {
         self.connection()?
             .query(
-                "SELECT id,name,columns,object_id,created FROM sekai_datasets ORDER BY id",
+                "SELECT id,name,columns,object_id,created,partition_keys FROM sekai_datasets ORDER BY id",
                 &[],
             )
             .map_err(|error| error.to_string())?
@@ -72,19 +112,24 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         crate::db::postgres::lock_dataset_rows(&mut transaction, dataset_id)?;
-        if transaction
-            .query_opt("SELECT 1 FROM sekai_datasets WHERE id=$1", &[&dataset_id])
+        let keys_json: Option<String> = transaction
+            .query_opt(
+                "SELECT partition_keys FROM sekai_datasets WHERE id=$1",
+                &[&dataset_id],
+            )
             .map_err(|error| error.to_string())?
-            .is_none()
-        {
+            .map(|row| row.get(0));
+        let Some(keys_json) = keys_json else {
             return Err("dataset not found".into());
-        }
+        };
+        let keys = crate::sekai::dataset::parse_partition_keys(&keys_json)?;
         for row in rows {
             let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+            let partition_key = crate::sekai::governed_transform::partition_value(&keys, row);
             transaction
                 .execute(
-                    "INSERT INTO sekai_dataset_rows (dataset_id,data) VALUES ($1,$2)",
-                    &[&dataset_id, &data],
+                    "INSERT INTO sekai_dataset_rows (dataset_id,data,partition_key) VALUES ($1,$2,$3)",
+                    &[&dataset_id, &data, &partition_key],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -177,6 +222,15 @@ impl PostgresDb {
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        lock_dataset_rows(&mut transaction, dataset_id)?;
+        let keys_json: String = transaction
+            .query_one(
+                "SELECT partition_keys FROM sekai_datasets WHERE id=$1",
+                &[&dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        let keys = crate::sekai::dataset::parse_partition_keys(&keys_json)?;
         let rows = transaction
             .query(
                 "SELECT id,data FROM sekai_dataset_rows WHERE dataset_id=$1 ORDER BY id FOR UPDATE",
@@ -205,15 +259,24 @@ impl PostgresDb {
                 continue;
             }
             let data = serde_json::to_string(&values).map_err(|error| error.to_string())?;
+            let partition_key = crate::sekai::governed_transform::partition_value(&keys, &values);
             transaction
                 .execute(
-                    "UPDATE sekai_dataset_rows SET data=$1 WHERE id=$2 AND dataset_id=$3",
-                    &[&data, &id, &dataset_id],
+                    "UPDATE sekai_dataset_rows SET data=$1, partition_key=$2 WHERE id=$3 AND dataset_id=$4",
+                    &[&data, &partition_key, &id, &dataset_id],
                 )
                 .map_err(|error| error.to_string())?;
             result.rows_updated += 1;
             result.fields_redacted += changed;
         }
+        crate::db::postgres_governed_transform::redact_transform_partition_receipts_pg(
+            &mut transaction,
+            dataset_id,
+            keys.is_empty()
+                || keys
+                    .iter()
+                    .any(|key| fields.iter().any(|field| field == key)),
+        )?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
@@ -314,12 +377,14 @@ fn row_to_dataset(row: postgres::Row) -> Result<Dataset, String> {
             classification,
         })
         .collect();
+    let keys: String = row.try_get(5).unwrap_or_else(|_| "[]".into());
     Ok(Dataset {
         id: row.get(0),
         name: row.get(1),
         columns,
         object_id: row.get(3),
         created: row.get(4),
+        partition_keys: crate::sekai::dataset::parse_partition_keys(&keys)?,
     })
 }
 

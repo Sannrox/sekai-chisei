@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub const CONTRACT_VERSION: &str = "sekai.governed-transform/v1";
@@ -51,6 +51,13 @@ pub const TRANSFORM_DEFINITION_CHANGED: &str = "transform definition changed";
 /// Reference-platform analog: governed incremental `semantic_version` / `v2_semantics`
 /// force a SNAPSHOT rebuild; old encodings are not folded as the new sum.
 pub const OUTPUT_DIGEST_PREFIX: &str = "sha256-sum-v1:";
+/// Sorted map of partition identity to `sha256-sum-v1:` member digest.
+/// Does not fold into `OUTPUT_DIGEST_PREFIX` (#1358 / ADR 0103).
+pub const PARTITIONED_DIGEST_PREFIX: &str = "sha256-partitions-v1:";
+/// Receipt identity when the caller cannot read the bound datasets.
+/// Not derived from the partition value, so it is not dictionary-attackable.
+pub const REDACTED_PARTITION_IDENTITY: &str = "redacted";
+pub const DATASET_PARTITION_CONTRACT: &str = "sekai.dataset-partition/v1";
 
 const FORBIDDEN_KEYS: &[&str] = &[
     "password",
@@ -206,6 +213,12 @@ pub struct TransformRun {
     /// Schedule bucket, upstream run id, source batch digest, or cancelled run.
     #[serde(default)]
     pub trigger_ref: String,
+    /// Partitions read for this run. Empty on unpartitioned historical rows.
+    #[serde(default)]
+    pub input_partitions: Vec<TransformPartition>,
+    /// Partitions written for this run. Empty on unpartitioned historical rows.
+    #[serde(default)]
+    pub output_partitions: Vec<TransformPartition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -231,6 +244,22 @@ pub struct TransformRunInputRow {
     pub dataset_id: String,
     pub row_id: i64,
     pub values: HashMap<String, String>,
+    pub partition_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformPartition {
+    pub partition_key: String,
+    pub digest: String,
+    pub rows: i32,
+    #[serde(default)]
+    pub dataset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransformPartitionWrite {
+    pub partition_key: String,
+    pub rows: Vec<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -243,6 +272,17 @@ pub struct WriteTransformRunCommand {
     pub output_digest: String,
     pub quarantined: bool,
     pub quality_rule: String,
+    pub replaced_partitions: Vec<TransformPartitionWrite>,
+    pub partition_key: Option<String>,
+    pub max_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreparedPartitionCommit {
+    pub envelope_digest: String,
+    pub written: Vec<TransformPartition>,
+    pub replacements: Vec<(String, Vec<HashMap<String, String>>)>,
+    pub merged_rows: Vec<HashMap<String, String>>,
 }
 
 impl GovernedTransform {
@@ -727,10 +767,13 @@ pub fn bind_checkpoint(
     incremental: bool,
     checkpoint: Option<(TransformCheckpoint, String)>,
     definition_digest: &str,
+    partition_keys: &[String],
 ) -> (bool, Option<TransformCheckpoint>) {
     match checkpoint {
         Some((pin, digest)) => (
-            incremental && digest == definition_digest && parse_output_digest(&pin.2).is_some(),
+            incremental
+                && digest == definition_digest
+                && live_output_digest_matches_keys(&pin.2, partition_keys),
             Some(pin),
         ),
         None => (false, None),
@@ -916,6 +959,8 @@ pub fn compute_run_tables_until(
         dispatch_status: String::new(),
         trigger_cause: String::new(),
         trigger_ref: String::new(),
+        input_partitions: Vec::new(),
+        output_partitions: Vec::new(),
     };
     (run, output_rows)
 }
@@ -970,6 +1015,8 @@ pub fn admit_isolated_run(
         dispatch_status: TRANSFORM_WORK_PENDING.into(),
         trigger_cause: String::new(),
         trigger_ref: String::new(),
+        input_partitions: Vec::new(),
+        output_partitions: Vec::new(),
     })
 }
 
@@ -1047,6 +1094,8 @@ fn quarantined_run(
             dispatch_status: String::new(),
             trigger_cause: String::new(),
             trigger_ref: String::new(),
+            input_partitions: Vec::new(),
+            output_partitions: Vec::new(),
         },
         Vec::new(),
     )
@@ -1109,6 +1158,8 @@ pub(crate) fn budget_quarantined_run(
         dispatch_status: String::new(),
         trigger_cause: String::new(),
         trigger_ref: String::new(),
+        input_partitions: Vec::new(),
+        output_partitions: Vec::new(),
     }
 }
 
@@ -1118,6 +1169,14 @@ pub(crate) fn row_payload_bytes(row: &HashMap<String, String>) -> u64 {
             .saturating_add(value.len() as u64)
             .saturating_add(32)
     })
+}
+
+pub(crate) fn row_stream_bytes(row: &TransformRunInputRow) -> u64 {
+    row_payload_bytes(&row.values)
+        .saturating_add(row.alias.len() as u64)
+        .saturating_add(row.dataset_id.len() as u64)
+        .saturating_add(row.partition_key.len() as u64)
+        .saturating_add(96)
 }
 
 pub(crate) struct InputLoadBudget {
@@ -1325,7 +1384,27 @@ fn encode_digest(bytes: [u8; 32]) -> String {
 }
 
 pub fn parse_output_digest(value: &str) -> Option<[u8; 32]> {
-    let hex = value.strip_prefix(OUTPUT_DIGEST_PREFIX)?;
+    parse_prefixed_digest(value, OUTPUT_DIGEST_PREFIX)
+}
+
+pub fn parse_partitioned_digest(value: &str) -> Option<[u8; 32]> {
+    parse_prefixed_digest(value, PARTITIONED_DIGEST_PREFIX)
+}
+
+pub fn live_output_digest_is_current(value: &str) -> bool {
+    parse_output_digest(value).is_some() || parse_partitioned_digest(value).is_some()
+}
+
+pub fn live_output_digest_matches_keys(value: &str, keys: &[String]) -> bool {
+    if keys.is_empty() {
+        parse_output_digest(value).is_some()
+    } else {
+        parse_partitioned_digest(value).is_some()
+    }
+}
+
+fn parse_prefixed_digest(value: &str, prefix: &str) -> Option<[u8; 32]> {
+    let hex = value.strip_prefix(prefix)?;
     if hex.len() != 64 {
         return None;
     }
@@ -1335,6 +1414,309 @@ pub fn parse_output_digest(value: &str) -> Option<[u8; 32]> {
         out[index] = u8::from_str_radix(text, 16).ok()?;
     }
     Some(out)
+}
+
+/// Rewrite receipt identities after a partition-key field is redacted.
+pub fn rewrite_partition_identities(
+    receipts: &mut [TransformPartition],
+    replacements: &HashMap<String, String>,
+) -> bool {
+    let mut changed = false;
+    for receipt in receipts {
+        if let Some(new_key) = replacements.get(&receipt.partition_key)
+            && new_key != &receipt.partition_key
+        {
+            receipt.partition_key = new_key.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub fn redact_run_partition_receipts(
+    dataset_id: &str,
+    input_partitions: &mut [TransformPartition],
+    output_partitions: &mut [TransformPartition],
+) -> bool {
+    let mut changed = false;
+    for receipt in input_partitions
+        .iter_mut()
+        .chain(output_partitions.iter_mut())
+    {
+        if receipt.dataset_id != dataset_id {
+            continue;
+        }
+        if !receipt.partition_key.is_empty() && receipt.partition_key != "[redacted]" {
+            receipt.partition_key = "[redacted]".into();
+            changed = true;
+        }
+        if !receipt.digest.is_empty() && receipt.digest != "[redacted]" {
+            receipt.digest = "[redacted]".into();
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub fn partition_value(keys: &[String], row: &HashMap<String, String>) -> String {
+    match keys {
+        [] => String::new(),
+        [key] => row.get(key).cloned().unwrap_or_default(),
+        keys => {
+            let parts: Vec<&str> = keys
+                .iter()
+                .map(|key| row.get(key).map(String::as_str).unwrap_or(""))
+                .collect();
+            serde_json::to_string(&parts).unwrap_or_default()
+        }
+    }
+}
+
+pub fn group_rows_by_partition(
+    keys: &[String],
+    rows: &[HashMap<String, String>],
+) -> BTreeMap<String, Vec<HashMap<String, String>>> {
+    let mut grouped = BTreeMap::new();
+    for row in rows {
+        grouped
+            .entry(partition_value(keys, row))
+            .or_insert_with(Vec::new)
+            .push(row.clone());
+    }
+    grouped
+}
+
+pub fn partitioned_dataset_digest(partitions: &BTreeMap<String, String>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PARTITIONED_DIGEST_PREFIX.as_bytes());
+    for (key, digest) in partitions {
+        hash_field(&mut hasher, key);
+        hash_field(&mut hasher, digest);
+    }
+    encode_prefixed_digest(PARTITIONED_DIGEST_PREFIX, hasher.finalize().into())
+}
+
+fn encode_prefixed_digest(prefix: &str, bytes: [u8; 32]) -> String {
+    let mut hex = String::with_capacity(prefix.len() + 64);
+    hex.push_str(prefix);
+    for byte in bytes {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    hex
+}
+
+pub fn partition_records(
+    keys: &[String],
+    rows: &[HashMap<String, String>],
+    dataset_id: &str,
+) -> Vec<TransformPartition> {
+    group_rows_by_partition(keys, rows)
+        .into_iter()
+        .map(|(partition_key, rows)| TransformPartition {
+            digest: rows_digest(&rows),
+            rows: rows.len() as i32,
+            partition_key,
+            dataset_id: dataset_id.to_string(),
+        })
+        .collect()
+}
+
+/// Receipts for each input using that dataset's own `partition_keys`.
+/// Unpartitioned inputs are omitted; they must not borrow another input's keys.
+pub fn input_partition_receipts<I>(inputs: I) -> Vec<TransformPartition>
+where
+    I: IntoIterator<Item = (String, Vec<String>, Vec<HashMap<String, String>>)>,
+{
+    let mut receipts = Vec::new();
+    for (dataset_id, keys, rows) in inputs {
+        if keys.is_empty() {
+            continue;
+        }
+        receipts.extend(partition_records(&keys, &rows, &dataset_id));
+    }
+    receipts
+}
+
+/// Group snapshot rows by `(alias, partition_key)` so two inputs that share an
+/// identity stay separate receipts. Callers omit unpartitioned datasets.
+pub fn receipts_from_snapshot_rows<I>(rows: I) -> Vec<TransformPartition>
+where
+    I: IntoIterator<Item = TransformRunInputRow>,
+{
+    let mut grouped: BTreeMap<(String, String, String), Vec<HashMap<String, String>>> =
+        BTreeMap::new();
+    for row in rows {
+        grouped
+            .entry((row.alias, row.dataset_id, row.partition_key))
+            .or_default()
+            .push(row.values);
+    }
+    grouped
+        .into_iter()
+        .map(
+            |((_, dataset_id, partition_key), rows)| TransformPartition {
+                digest: rows_digest(&rows),
+                rows: rows.len() as i32,
+                partition_key,
+                dataset_id,
+            },
+        )
+        .collect()
+}
+
+pub fn trim_page_to_bytes(
+    rows: Vec<TransformRunInputRow>,
+    max_bytes: i64,
+) -> Vec<TransformRunInputRow> {
+    if max_bytes <= 0 || rows.is_empty() {
+        return rows;
+    }
+    let cap = max_bytes as u64;
+    let mut used = 0u64;
+    let mut kept = Vec::new();
+    for row in rows {
+        let size = row_stream_bytes(&row);
+        if !kept.is_empty() && used.saturating_add(size) > cap {
+            break;
+        }
+        used = used.saturating_add(size);
+        kept.push(row);
+    }
+    kept
+}
+
+pub fn prepare_partition_commit(
+    keys: &[String],
+    live: &[HashMap<String, String>],
+    writes: &[TransformPartitionWrite],
+    output_digest: &str,
+) -> Result<PreparedPartitionCommit, String> {
+    if keys.is_empty() {
+        return Err("partition write requires dataset partition_keys".into());
+    }
+    if writes.is_empty() {
+        return Err("partition write requires replaced partitions".into());
+    }
+    let mut grouped = group_rows_by_partition(keys, live);
+    let mut replacements = Vec::new();
+    let mut written = Vec::new();
+    let mut seen = HashSet::new();
+    for write in writes {
+        let key = write.partition_key.as_str();
+        if !seen.insert(key.to_string()) {
+            return Err(format!("duplicate partition write for {key}"));
+        }
+        for row in &write.rows {
+            if partition_value(keys, row) != key {
+                return Err(format!("row does not belong to partition {key}"));
+            }
+        }
+        grouped.insert(key.to_string(), write.rows.clone());
+        replacements.push((key.to_string(), write.rows.clone()));
+        written.push(TransformPartition {
+            partition_key: key.to_string(),
+            digest: rows_digest(&write.rows),
+            rows: write.rows.len() as i32,
+            dataset_id: String::new(),
+        });
+    }
+    let mut member_digests = BTreeMap::new();
+    let mut merged_rows = Vec::new();
+    for (key, rows) in &grouped {
+        if rows.is_empty() {
+            continue;
+        }
+        member_digests.insert(key.clone(), rows_digest(rows));
+        merged_rows.extend(rows.iter().cloned());
+    }
+    let envelope_digest = partitioned_dataset_digest(&member_digests);
+    if envelope_digest != output_digest {
+        return Err(TRANSFORM_DIGEST_MISMATCH.into());
+    }
+    Ok(PreparedPartitionCommit {
+        envelope_digest,
+        written,
+        replacements,
+        merged_rows,
+    })
+}
+
+/// Whole-dataset digest: `sha256-sum-v1:` when unpartitioned, otherwise the
+/// `sha256-partitions-v1:` envelope over member `sha256-sum-v1:` digests.
+pub fn dataset_digest(keys: &[String], rows: &[HashMap<String, String>]) -> String {
+    if keys.is_empty() {
+        return rows_digest(rows);
+    }
+    partitioned_dataset_digest(
+        &group_rows_by_partition(keys, rows)
+            .into_iter()
+            .map(|(key, rows)| (key, rows_digest(&rows)))
+            .collect(),
+    )
+}
+
+/// Incremental projection rewrites only partitions that received new output
+/// rows. Untouched live partitions stay on disk.
+pub fn rewritten_partitions(
+    keys: &[String],
+    live: &[HashMap<String, String>],
+    new_output: &[HashMap<String, String>],
+) -> Vec<(String, Vec<HashMap<String, String>>)> {
+    if keys.is_empty() || new_output.is_empty() {
+        return Vec::new();
+    }
+    let live_groups = group_rows_by_partition(keys, live);
+    group_rows_by_partition(keys, new_output)
+        .into_iter()
+        .map(|(key, new_rows)| {
+            let mut merged = live_groups.get(&key).cloned().unwrap_or_default();
+            merged.extend(new_rows);
+            (key, merged)
+        })
+        .collect()
+}
+
+pub fn receipts_for_touched_partitions(
+    keys: &[String],
+    live_after: &[HashMap<String, String>],
+    new_output: &[HashMap<String, String>],
+    dataset_id: &str,
+) -> Vec<TransformPartition> {
+    let live_groups = group_rows_by_partition(keys, live_after);
+    group_rows_by_partition(keys, new_output)
+        .into_keys()
+        .map(|key| {
+            let rows = live_groups.get(&key).cloned().unwrap_or_default();
+            TransformPartition {
+                partition_key: key,
+                digest: rows_digest(&rows),
+                rows: rows.len() as i32,
+                dataset_id: dataset_id.to_string(),
+            }
+        })
+        .collect()
+}
+
+pub fn partitions_from_replacements(
+    replacements: &[(String, Vec<HashMap<String, String>>)],
+    dataset_id: &str,
+) -> Vec<TransformPartition> {
+    replacements
+        .iter()
+        .map(|(partition_key, rows)| TransformPartition {
+            partition_key: partition_key.clone(),
+            digest: rows_digest(rows),
+            rows: rows.len() as i32,
+            dataset_id: dataset_id.to_string(),
+        })
+        .collect()
+}
+
+pub fn bind_receipts_to_dataset(receipts: &mut [TransformPartition], dataset_id: &str) {
+    for receipt in receipts {
+        receipt.dataset_id = dataset_id.to_string();
+    }
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1563,15 +1945,15 @@ mod tests {
     fn bind_checkpoint_drops_a_pin_from_a_different_digest() {
         let pin = (7, "run".into(), rows_digest(&[]));
         let (incremental, checkpoint) =
-            bind_checkpoint(true, Some((pin.clone(), "old".into())), "new");
+            bind_checkpoint(true, Some((pin.clone(), "old".into())), "new", &[]);
         assert!(!incremental);
         assert_eq!(checkpoint.as_ref(), Some(&pin));
         let (incremental, checkpoint) =
-            bind_checkpoint(true, Some((pin.clone(), "same".into())), "same");
+            bind_checkpoint(true, Some((pin.clone(), "same".into())), "same", &[]);
         assert!(incremental);
         assert_eq!(checkpoint.as_ref(), Some(&pin));
         let (incremental, checkpoint) =
-            bind_checkpoint(false, Some((pin.clone(), "same".into())), "same");
+            bind_checkpoint(false, Some((pin.clone(), "same".into())), "same", &[]);
         assert!(!incremental);
         assert_eq!(checkpoint, Some(pin));
     }
@@ -1580,17 +1962,41 @@ mod tests {
     fn bind_checkpoint_forces_rebuild_for_old_or_malformed_output_digest() {
         let definition = "same";
         let old = (7, "run".into(), format!("sha256:{}", "ab".repeat(32)));
-        let (incremental, checkpoint) =
-            bind_checkpoint(true, Some((old.clone(), definition.into())), definition);
+        let (incremental, checkpoint) = bind_checkpoint(
+            true,
+            Some((old.clone(), definition.into())),
+            definition,
+            &[],
+        );
         assert!(!incremental);
         assert_eq!(checkpoint.as_ref(), Some(&old));
         let empty = (7, "run".into(), String::new());
-        let (incremental, _) = bind_checkpoint(true, Some((empty, definition.into())), definition);
+        let (incremental, _) =
+            bind_checkpoint(true, Some((empty, definition.into())), definition, &[]);
         assert!(!incremental);
         let malformed = (7, "run".into(), "sha256-sum-v1:zzzz".into());
         let (incremental, _) =
-            bind_checkpoint(true, Some((malformed, definition.into())), definition);
+            bind_checkpoint(true, Some((malformed, definition.into())), definition, &[]);
         assert!(!incremental);
+        let partitioned = (
+            7,
+            "run".into(),
+            partitioned_dataset_digest(&BTreeMap::new()),
+        );
+        let (incremental, _) = bind_checkpoint(
+            true,
+            Some((partitioned.clone(), definition.into())),
+            definition,
+            &[],
+        );
+        assert!(!incremental);
+        let (incremental, _) = bind_checkpoint(
+            true,
+            Some((partitioned, definition.into())),
+            definition,
+            &["region".into()],
+        );
+        assert!(incremental);
     }
 
     #[test]
@@ -1790,6 +2196,8 @@ mod tests {
             dispatch_status: String::new(),
             trigger_cause: String::new(),
             trigger_ref: String::new(),
+            input_partitions: Vec::new(),
+            output_partitions: Vec::new(),
         }
     }
 
@@ -2051,5 +2459,290 @@ mod tests {
             crate::sekai::transform_engine::BUDGET_MEMORY
         );
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn input_partition_receipts_use_each_input_keys() {
+        let left_keys = vec!["region".into()];
+        let right_keys = vec!["customer_id".into()];
+        let left = vec![HashMap::from([
+            ("id".into(), "c1".into()),
+            ("region".into(), "east".into()),
+        ])];
+        let right = vec![HashMap::from([
+            ("id".into(), "o1".into()),
+            ("customer_id".into(), "c1".into()),
+        ])];
+        let receipts = input_partition_receipts([
+            ("customers".into(), left_keys, left),
+            ("orders".into(), right_keys, right),
+            (
+                "plain".into(),
+                Vec::new(),
+                vec![HashMap::from([("id".into(), "x".into())])],
+            ),
+        ]);
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].partition_key, "east");
+        assert_eq!(receipts[0].dataset_id, "customers");
+        assert_eq!(receipts[1].partition_key, "c1");
+        assert_eq!(receipts[1].dataset_id, "orders");
+    }
+
+    #[test]
+    fn snapshot_receipts_keep_each_input_partition_separate() {
+        let receipts = receipts_from_snapshot_rows([
+            TransformRunInputRow {
+                alias: "left".into(),
+                dataset_id: "customers".into(),
+                row_id: 1,
+                values: HashMap::from([("region".into(), "east".into())]),
+                partition_key: "east".into(),
+            },
+            TransformRunInputRow {
+                alias: "right".into(),
+                dataset_id: "orders".into(),
+                row_id: 1,
+                values: HashMap::from([("region".into(), "east".into())]),
+                partition_key: "east".into(),
+            },
+            TransformRunInputRow {
+                alias: "left".into(),
+                dataset_id: "customers".into(),
+                row_id: 2,
+                values: HashMap::from([("region".into(), String::new())]),
+                partition_key: String::new(),
+            },
+        ]);
+        assert_eq!(receipts.len(), 3);
+        assert_eq!(receipts[0].partition_key, "");
+        assert_eq!(receipts[1].partition_key, "east");
+        assert_eq!(receipts[2].partition_key, "east");
+        assert_eq!(receipts[0].rows, 1);
+        assert_eq!(receipts[1].rows, 1);
+        assert_eq!(receipts[2].rows, 1);
+    }
+
+    #[test]
+    fn trim_page_counts_partition_identity_bytes() {
+        let row = |key: &str| TransformRunInputRow {
+            alias: "in".into(),
+            dataset_id: "ds".into(),
+            row_id: 1,
+            values: HashMap::from([("region".into(), key.into())]),
+            partition_key: key.into(),
+        };
+        let big = "e".repeat(200);
+        let first = row(&big);
+        let cap = row_stream_bytes(&first) as i64 + 10;
+        let page = trim_page_to_bytes(vec![first, row(&big)], cap);
+        assert_eq!(page.len(), 1);
+    }
+
+    #[test]
+    fn rewritten_partitions_keeps_untouched_keys_off_the_list() {
+        let keys = vec!["region".into()];
+        let live = vec![
+            HashMap::from([("id".into(), "1".into()), ("region".into(), "east".into())]),
+            HashMap::from([("id".into(), "2".into()), ("region".into(), "west".into())]),
+        ];
+        let added = vec![HashMap::from([
+            ("id".into(), "3".into()),
+            ("region".into(), "east".into()),
+        ])];
+        let rewritten = rewritten_partitions(&keys, &live, &added);
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(rewritten[0].0, "east");
+        assert_eq!(rewritten[0].1.len(), 2);
+        assert!(dataset_digest(&keys, &live).starts_with(PARTITIONED_DIGEST_PREFIX));
+    }
+
+    #[test]
+    fn partitioned_digest_does_not_fold_as_sum_v1() {
+        let mut partitions = BTreeMap::new();
+        partitions.insert(
+            "east".into(),
+            rows_digest(&[HashMap::from([("id".into(), "1".into())])]),
+        );
+        let digest = partitioned_dataset_digest(&partitions);
+        assert!(digest.starts_with(PARTITIONED_DIGEST_PREFIX));
+        assert!(parse_output_digest(&digest).is_none());
+        assert!(parse_partitioned_digest(&digest).is_some());
+        assert!(fold_output_digest(&digest, &[]).is_none());
+    }
+
+    #[test]
+    fn prepare_partition_commit_keeps_untouched_rows() {
+        let keys = vec!["region".into()];
+        let live = vec![
+            HashMap::from([("id".into(), "1".into()), ("region".into(), "east".into())]),
+            HashMap::from([("id".into(), "2".into()), ("region".into(), "west".into())]),
+        ];
+        let west = vec![HashMap::from([
+            ("id".into(), "2".into()),
+            ("region".into(), "west".into()),
+            ("keep".into(), "yes".into()),
+        ])];
+        let mut merged_groups = group_rows_by_partition(&keys, &live);
+        merged_groups.insert("west".into(), west.clone());
+        let envelope = partitioned_dataset_digest(
+            &merged_groups
+                .iter()
+                .map(|(key, rows)| (key.clone(), rows_digest(rows)))
+                .collect(),
+        );
+        let prepared = prepare_partition_commit(
+            &keys,
+            &live,
+            &[TransformPartitionWrite {
+                partition_key: "west".into(),
+                rows: west,
+            }],
+            &envelope,
+        )
+        .unwrap();
+        assert_eq!(prepared.written.len(), 1);
+        assert_eq!(prepared.written[0].partition_key, "west");
+        assert_eq!(prepared.merged_rows.len(), 2);
+        assert!(
+            prepare_partition_commit(
+                &keys,
+                &live,
+                &[TransformPartitionWrite {
+                    partition_key: "west".into(),
+                    rows: vec![HashMap::from([
+                        ("id".into(), "2".into()),
+                        ("region".into(), "west".into())
+                    ])],
+                }],
+                "sha256-sum-v1:deadbeef",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prepare_partition_commit_drops_empty_partitions_from_envelope() {
+        let keys = vec!["region".into()];
+        let live = vec![
+            HashMap::from([("id".into(), "1".into()), ("region".into(), "east".into())]),
+            HashMap::from([("id".into(), "2".into()), ("region".into(), "west".into())]),
+        ];
+        let remaining = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("region".into(), "east".into()),
+        ])];
+        let envelope = dataset_digest(&keys, &remaining);
+        let prepared = prepare_partition_commit(
+            &keys,
+            &live,
+            &[TransformPartitionWrite {
+                partition_key: "west".into(),
+                rows: Vec::new(),
+            }],
+            &envelope,
+        )
+        .unwrap();
+        assert_eq!(prepared.written[0].rows, 0);
+        assert_eq!(prepared.envelope_digest, envelope);
+        assert_eq!(prepared.merged_rows, remaining);
+    }
+
+    #[test]
+    fn rewrite_partition_identities_replaces_matching_keys() {
+        let mut receipts = vec![
+            TransformPartition {
+                partition_key: "east".into(),
+                digest: "d1".into(),
+                rows: 1,
+                dataset_id: "in".into(),
+            },
+            TransformPartition {
+                partition_key: "west".into(),
+                digest: "d2".into(),
+                rows: 1,
+                dataset_id: "out".into(),
+            },
+        ];
+        let replacements = HashMap::from([("east".into(), "[redacted]".into())]);
+        assert!(rewrite_partition_identities(&mut receipts, &replacements));
+        assert_eq!(receipts[0].partition_key, "[redacted]");
+        assert_eq!(receipts[1].partition_key, "west");
+        receipts[0].partition_key = "east".into();
+        assert!(redact_run_partition_receipts("in", &mut receipts, &mut []));
+        assert_eq!(receipts[0].partition_key, "[redacted]");
+        assert_eq!(receipts[0].digest, "[redacted]");
+        assert_eq!(receipts[1].partition_key, "west");
+        assert_eq!(receipts[1].digest, "d2");
+        let mut empty = [TransformPartition {
+            partition_key: String::new(),
+            digest: "d3".into(),
+            rows: 1,
+            dataset_id: "in".into(),
+        }];
+        assert!(redact_run_partition_receipts("in", &mut empty, &mut []));
+        assert!(empty[0].partition_key.is_empty());
+        assert_eq!(empty[0].digest, "[redacted]");
+    }
+
+    #[test]
+    fn prepare_partition_commit_rejects_duplicate_partition_identity() {
+        let keys = vec!["region".into()];
+        let live = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("region".into(), "east".into()),
+        ])];
+        let first = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("region".into(), "east".into()),
+            ("keep".into(), "first".into()),
+        ])];
+        let second = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("region".into(), "east".into()),
+            ("keep".into(), "second".into()),
+        ])];
+        let envelope = dataset_digest(&keys, &second);
+        let error = prepare_partition_commit(
+            &keys,
+            &live,
+            &[
+                TransformPartitionWrite {
+                    partition_key: "east".into(),
+                    rows: first,
+                },
+                TransformPartitionWrite {
+                    partition_key: "east".into(),
+                    rows: second,
+                },
+            ],
+            &envelope,
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate partition write"));
+    }
+
+    #[test]
+    fn composite_partition_value_does_not_collide_on_embedded_separators() {
+        let keys = vec!["left".into(), "right".into()];
+        let first = HashMap::from([
+            ("left".into(), "a\u{1f}b".into()),
+            ("right".into(), "c".into()),
+        ]);
+        let second = HashMap::from([
+            ("left".into(), "a".into()),
+            ("right".into(), "b\u{1f}c".into()),
+        ]);
+        assert_ne!(
+            partition_value(&keys, &first),
+            partition_value(&keys, &second)
+        );
+        assert_eq!(
+            partition_value(
+                &["region".into()],
+                &HashMap::from([("region".into(), "east".into())])
+            ),
+            "east"
+        );
     }
 }

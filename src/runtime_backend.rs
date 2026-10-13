@@ -268,6 +268,8 @@ impl RuntimeBackend {
                 };
                 capabilities.validate_required(COMMUNITY_REQUIRED_SURFACES)?;
                 reject_tenant_surfaces(&capabilities)?;
+                // GATE:mig backfill is `sekaictl admin model-review backfill`.
+                // initialize is shared by SchemaPlane::Sekai and SchemaPlane::Chisei.
                 Ok(Self {
                     db: Arc::new(RuntimeDb::Sqlite(sqlite)),
                     capabilities,

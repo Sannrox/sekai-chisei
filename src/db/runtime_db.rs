@@ -5255,6 +5255,163 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_all_hosted_routing_profiles(
+        &self,
+    ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String> {
+        use crate::db::chisei_routing_profile::ChiseiRoutingProfileBackend;
+        match self {
+            Self::Sqlite(db) => db.list_all_hosted_routing_profiles(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiRoutingProfileBackend::list_all_hosted_routing_profiles(db.as_ref())
+            }),
+        }
+    }
+
+    pub fn put_model_review_record(
+        &self,
+        record: &crate::chisei::model_review::ModelReviewRecord,
+    ) -> Result<(), String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.put_model_review_record(record),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::put_model_review_record(db.as_ref(), record)
+            }),
+        }
+    }
+
+    pub fn insert_model_review_record_if_absent(
+        &self,
+        record: &crate::chisei::model_review::ModelReviewRecord,
+    ) -> Result<bool, String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.insert_model_review_record_if_absent(record),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::insert_model_review_record_if_absent(db.as_ref(), record)
+            }),
+        }
+    }
+
+    pub fn get_model_review_record(
+        &self,
+        namespace: &str,
+        provider: &str,
+        model: &str,
+        artifact_digest: &str,
+    ) -> Result<Option<crate::chisei::model_review::ModelReviewRecord>, String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => {
+                db.get_model_review_record(namespace, provider, model, artifact_digest)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::get_model_review_record(
+                    db.as_ref(),
+                    namespace,
+                    provider,
+                    model,
+                    artifact_digest,
+                )
+            }),
+        }
+    }
+
+    pub fn list_model_review_records(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::chisei::model_review::ModelReviewRecord>, String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.list_model_review_records(namespace),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::list_model_review_records(db.as_ref(), namespace)
+            }),
+        }
+    }
+
+    pub fn put_family_enablement_record(
+        &self,
+        record: &crate::chisei::model_review::FamilyEnablementRecord,
+    ) -> Result<(), String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.put_family_enablement_record(record),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::put_family_enablement_record(db.as_ref(), record)
+            }),
+        }
+    }
+
+    pub fn insert_family_enablement_record_if_absent(
+        &self,
+        record: &crate::chisei::model_review::FamilyEnablementRecord,
+    ) -> Result<bool, String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.insert_family_enablement_record_if_absent(record),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::insert_family_enablement_record_if_absent(
+                    db.as_ref(),
+                    record,
+                )
+            }),
+        }
+    }
+
+    pub fn get_family_enablement_record(
+        &self,
+        namespace: &str,
+        region_label: &str,
+        family_id: &str,
+    ) -> Result<Option<crate::chisei::model_review::FamilyEnablementRecord>, String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.get_family_enablement_record(namespace, region_label, family_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::get_family_enablement_record(
+                    db.as_ref(),
+                    namespace,
+                    region_label,
+                    family_id,
+                )
+            }),
+        }
+    }
+
+    pub fn list_family_enablement_records(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::chisei::model_review::FamilyEnablementRecord>, String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.list_family_enablement_records(namespace),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::list_family_enablement_records(db.as_ref(), namespace)
+            }),
+        }
+    }
+
+    pub fn model_review_row_count(&self) -> Result<i64, String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.model_review_row_count(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::model_review_row_count(db.as_ref())
+            }),
+        }
+    }
+
+    pub fn family_enablement_row_count(&self) -> Result<i64, String> {
+        use crate::db::chisei_model_review::ChiseiModelReviewBackend;
+        match self {
+            Self::Sqlite(db) => db.family_enablement_row_count(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReviewBackend::family_enablement_row_count(db.as_ref())
+            }),
+        }
+    }
+
     pub fn put_permit(
         &self,
         permit: &Permit,

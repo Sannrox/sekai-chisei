@@ -4044,6 +4044,7 @@ async fn dataset_rpc_round_trip() {
                 }],
                 object_id: "".into(),
                 created: 1,
+                partition_keys: Vec::new(),
             }),
         }))
         .await
@@ -4116,6 +4117,7 @@ async fn list_datasets_omits_bindings_above_marking_ceiling() {
             columns: vec![],
             object_id: "marked-dataset-object".into(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
     svc.db
@@ -4126,6 +4128,7 @@ async fn list_datasets_omits_bindings_above_marking_ceiling() {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
     let denied = svc
@@ -4304,6 +4307,7 @@ async fn catalog_listings_omit_bindings_when_object_policy_cannot_be_evaluated()
             columns: vec![],
             object_id: "policy-outage-object".into(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
     svc.db
@@ -4314,6 +4318,7 @@ async fn catalog_listings_omit_bindings_when_object_policy_cannot_be_evaluated()
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
     svc.db
@@ -4412,6 +4417,7 @@ async fn discoverer_lists_catalog_and_is_denied_object_reads() {
             columns: vec![],
             object_id: "catalog-bound".into(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
     svc.db
@@ -4422,6 +4428,7 @@ async fn discoverer_lists_catalog_and_is_denied_object_reads() {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
 
@@ -4533,6 +4540,7 @@ async fn discoverer_lists_catalog_and_is_denied_object_reads() {
             columns: vec![],
             object_id: "marked-catalog-bound".into(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
     svc.db
@@ -4586,6 +4594,7 @@ async fn query_rows_reports_corrupt_storage_as_internal() {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         }),
     }))
     .await
@@ -4627,6 +4636,7 @@ async fn update_dataset_requires_write_access_to_existing_binding() {
             }],
             object_id: "protected-object".into(),
             created: 1,
+            partition_keys: Vec::new(),
         }),
     }))
     .await
@@ -4650,6 +4660,7 @@ async fn update_dataset_requires_write_access_to_existing_binding() {
                     columns: vec![],
                     object_id: String::new(),
                     created: 999,
+                    partition_keys: Vec::new(),
                 }),
             },
             "intruder",
@@ -4679,6 +4690,7 @@ async fn update_unbound_dataset_requires_gateway_service_principal() {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         }),
     }))
     .await
@@ -4694,6 +4706,7 @@ async fn update_unbound_dataset_requires_gateway_service_principal() {
             }],
             object_id: String::new(),
             created: 999,
+            partition_keys: Vec::new(),
         }),
     };
 
@@ -4729,6 +4742,7 @@ async fn update_unbound_dataset_requires_gateway_service_principal() {
                     }],
                     object_id: String::new(),
                     created: 1000,
+                    partition_keys: Vec::new(),
                 }),
             },
             "local",
@@ -4747,6 +4761,7 @@ async fn update_unbound_dataset_requires_gateway_service_principal() {
             columns: vec![],
             object_id: String::new(),
             created: 2,
+            partition_keys: Vec::new(),
         }),
     }))
     .await
@@ -4760,6 +4775,7 @@ async fn update_unbound_dataset_requires_gateway_service_principal() {
                     columns: vec![],
                     object_id: String::new(),
                     created: 2,
+                    partition_keys: Vec::new(),
                 }),
             },
             "gateway-prod",
@@ -13949,6 +13965,7 @@ async fn list_governed_transforms_returns_definitions_and_runs_for_authorized_pr
         }],
         object_id: String::new(),
         created: 1,
+        partition_keys: Vec::new(),
     };
     runtime.create_dataset(&dataset("in")).unwrap();
     runtime.create_dataset(&dataset("out")).unwrap();
@@ -14054,6 +14071,169 @@ async fn list_governed_transforms_returns_definitions_and_runs_for_authorized_pr
 }
 
 #[tokio::test]
+async fn get_transform_run_redacts_partition_keys_without_dataset_read() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, REDACTED_PARTITION_IDENTITY, TransformStep,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    runtime
+        .create_object(&domain::Object {
+            id: "secret-in".into(),
+            kind: "artifact".into(),
+            name: "in".into(),
+            namespace: "ops".into(),
+            external_id: "artifact:secret-in".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    runtime
+        .create_object(&domain::Object {
+            id: "secret-out".into(),
+            kind: "artifact".into(),
+            name: "out".into(),
+            namespace: "ops".into(),
+            external_id: "artifact:secret-out".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let dataset = |id: &str, object_id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            },
+            ColumnDef {
+                name: "region".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            },
+        ],
+        object_id: object_id.into(),
+        created: 1,
+        partition_keys: vec!["region".into()],
+    };
+    runtime.create_dataset(&dataset("in", "secret-in")).unwrap();
+    runtime
+        .create_dataset(&dataset("out", "secret-out"))
+        .unwrap();
+    runtime
+        .append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("region".into(), "east".into()),
+            ])],
+        )
+        .unwrap();
+    let owner_in = security::Grant {
+        id: "owner-in".into(),
+        object_id: "secret-in".into(),
+        principal: "alice".into(),
+        role: security::Role::Admin,
+        created: 0,
+    };
+    let owner_out = security::Grant {
+        id: "owner-out".into(),
+        object_id: "secret-out".into(),
+        principal: "alice".into(),
+        role: security::Role::Admin,
+        created: 0,
+    };
+    runtime.create_grant(&owner_in).unwrap();
+    runtime.create_grant(&owner_out).unwrap();
+    svc.security.add_grant(&owner_in);
+    svc.security.add_grant(&owner_out);
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ops".into(),
+        transform_id: "t1".into(),
+        input_dataset_id: "in".into(),
+        output_dataset_id: "out".into(),
+        steps: vec![TransformStep {
+            kind: "project".into(),
+            column: String::new(),
+            op: String::new(),
+            value: String::new(),
+            columns: vec!["id".into(), "region".into()],
+        }],
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: None,
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .unwrap();
+    runtime.put_governed_transform(&transform, 10).unwrap();
+    let stored = runtime
+        .run_governed_transform("ops", "t1", false, 20)
+        .unwrap();
+    let request = GetGovernedTransformRunRequest {
+        run_id: stored.run_id.clone(),
+    };
+    let revealed = svc
+        .get_governed_transform_run(with_named_principal(request.clone(), "alice"))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(revealed.output_partitions[0].partition_key, "east");
+    let redacted = svc
+        .get_governed_transform_run(with_named_principal(request.clone(), "bob"))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(
+        redacted.output_partitions[0].partition_key,
+        REDACTED_PARTITION_IDENTITY
+    );
+    assert_eq!(
+        redacted.output_partitions[0].digest,
+        REDACTED_PARTITION_IDENTITY
+    );
+    assert_ne!(
+        redacted.output_partitions[0].digest,
+        revealed.output_partitions[0].digest
+    );
+    let mut updated = transform;
+    updated.steps[0].columns = vec!["id".into()];
+    updated.definition_digest.clear();
+    runtime
+        .put_governed_transform(&updated.prepare().unwrap(), 30)
+        .unwrap();
+    let stale = svc
+        .get_governed_transform_run(with_named_principal(request.clone(), "alice"))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(
+        stale.output_partitions[0].partition_key,
+        REDACTED_PARTITION_IDENTITY
+    );
+    let denied = svc
+        .get_governed_transform_run(Request::new(request))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test]
 async fn isolated_process_claim_and_write_back_are_namespace_authorized() {
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use crate::sekai::governed_transform::{
@@ -14073,6 +14253,7 @@ async fn isolated_process_claim_and_write_back_are_namespace_authorized() {
         }],
         object_id: String::new(),
         created: 1,
+        partition_keys: Vec::new(),
     };
     runtime.create_dataset(&dataset("in")).unwrap();
     runtime.create_dataset(&dataset("out")).unwrap();
@@ -14152,6 +14333,7 @@ async fn isolated_process_claim_and_write_back_are_namespace_authorized() {
                 after_row_id: 0,
                 limit: 100,
                 after_alias: String::new(),
+                ..Default::default()
             },
             "local",
         ))
@@ -14178,11 +14360,13 @@ async fn isolated_process_claim_and_write_back_are_namespace_authorized() {
                         dataset_id: "out".into(),
                         row_id: 0,
                         values: values.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 output_digest: rows_digest(&output),
                 quarantined: false,
                 quality_rule: String::new(),
+                ..Default::default()
             },
             "local",
         ))
@@ -14223,6 +14407,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         }],
         object_id: object_id.into(),
         created: 1,
+        partition_keys: Vec::new(),
     };
     for (id, name) in [("secret-in", "in"), ("secret-out", "out")] {
         runtime
@@ -14310,6 +14495,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         after_row_id: 0,
         limit: 100,
         after_alias: String::new(),
+        ..Default::default()
     };
     let denied_read = match svc
         .read_transform_run_inputs(with_named_principal(read_req(), "local"))
@@ -14353,11 +14539,13 @@ async fn isolated_process_input_stream_requires_dataset_read() {
                 dataset_id: "out".into(),
                 row_id: 0,
                 values: values.clone(),
+                ..Default::default()
             })
             .collect(),
         output_digest: rows_digest(&output),
         quarantined: false,
         quality_rule: String::new(),
+        ..Default::default()
     };
     let denied_write = svc
         .write_transform_run_result(with_named_principal(write_req(), "local"))

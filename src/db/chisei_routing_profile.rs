@@ -22,6 +22,9 @@ pub trait ChiseiRoutingProfileBackend: Send + Sync {
         profile_id: &str,
         now_ms: i64,
     ) -> Result<bool, String>;
+
+    /// Every unrevoked hosted profile, all namespaces.
+    fn list_all_hosted_routing_profiles(&self) -> Result<Vec<HostedRoutingProfile>, String>;
 }
 
 pub(crate) fn decode_model_patterns(json: &str) -> Result<Vec<String>, String> {
@@ -166,6 +169,57 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
             .map(|updated| updated == 1)
             .map_err(|error| error.to_string())
     }
+
+    fn list_all_hosted_routing_profiles(&self) -> Result<Vec<HostedRoutingProfile>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT namespace, profile_id, endpoint_origin, model_patterns_json, credential_ref,
+                        registered_by, registered_at_ms
+                 FROM chisei_routing_profiles
+                 WHERE revoked_at_ms IS NULL
+                 ORDER BY namespace, profile_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .map(
+                |(
+                    namespace,
+                    profile_id,
+                    endpoint_origin,
+                    patterns,
+                    credential_ref,
+                    registered_by,
+                    at,
+                )| {
+                    Ok(HostedRoutingProfile {
+                        namespace,
+                        profile_id,
+                        endpoint_origin,
+                        model_patterns: decode_model_patterns(&patterns)?,
+                        credential_ref,
+                        registered_by,
+                        registered_at_ms: at,
+                    })
+                },
+            )
+            .collect()
+    }
 }
 
 impl ChiseiRoutingProfileBackend for PostgresDb {
@@ -187,5 +241,9 @@ impl ChiseiRoutingProfileBackend for PostgresDb {
         now_ms: i64,
     ) -> Result<bool, String> {
         PostgresDb::revoke_hosted_routing_profile(self, namespace, profile_id, now_ms)
+    }
+
+    fn list_all_hosted_routing_profiles(&self) -> Result<Vec<HostedRoutingProfile>, String> {
+        PostgresDb::list_all_hosted_routing_profiles(self)
     }
 }

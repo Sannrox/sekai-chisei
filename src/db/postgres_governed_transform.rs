@@ -19,11 +19,13 @@ use crate::sekai::governed_transform::{
     TRANSFORM_WORK_CLAIMED, TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED,
     TRANSFORM_WORK_PENDING, TransformInputRows, TransformOutputState, TransformRun,
     TransformRunInputRow, TransformWork, WriteTransformRunCommand, admit_isolated_run,
-    bind_checkpoint, bind_isolated_write_lineage, budget_quarantined_run, checkpoint_after_id,
-    compute_run_tables_until, derive_transform_markings, evaluate_quality,
-    fold_live_output_marking, fold_output_digest, normalize_transform_claim_ttl_ms,
-    refuse_dependency_cycle, require_bound_output_for_markings, rows_digest, schedule_due_bucket,
-    transform_claim_fence_matches, transform_work_is_claimable, trigger_is_due,
+    bind_checkpoint, bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
+    checkpoint_after_id, compute_run_tables_until, dataset_digest, derive_transform_markings,
+    evaluate_quality, fold_live_output_marking, fold_output_digest, input_partition_receipts,
+    normalize_transform_claim_ttl_ms, partition_records, partition_value, prepare_partition_commit,
+    receipts_for_touched_partitions, redact_run_partition_receipts, refuse_dependency_cycle,
+    require_bound_output_for_markings, rows_digest, schedule_due_bucket,
+    transform_claim_fence_matches, transform_work_is_claimable, trigger_is_due, trim_page_to_bytes,
 };
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 
@@ -147,8 +149,13 @@ impl PostgresDb {
         lock_ids.push(transform.output_dataset_id.as_str());
         lock_transform_datasets(&mut tx, &lock_ids)?;
         let stored = load_checkpoint(&mut tx, namespace, transform_id)?;
-        let (mut incremental, checkpoint) =
-            bind_checkpoint(incremental, stored, &transform.definition_digest);
+        let output_keys = load_dataset_partition_keys_pg(&mut tx, &transform.output_dataset_id)?;
+        let (mut incremental, checkpoint) = bind_checkpoint(
+            incremental,
+            stored,
+            &transform.definition_digest,
+            &output_keys,
+        );
         if !transform.allows_incremental() {
             incremental = false;
         }
@@ -232,14 +239,12 @@ impl PostgresDb {
         run.markings_in = markings_in;
         run.markings_out = markings_out;
         run.stamp_trigger(TRANSFORM_TRIGGER_MANUAL, "");
+        run.input_partitions = input_receipts_from_loaded_pg(&mut tx, &bindings, &loaded)?;
         if run.quarantined {
             if !incremental {
-                let live: Vec<HashMap<String, String>> =
-                    load_row_records(&mut tx, &transform.output_dataset_id, 0, None)?
-                        .into_iter()
-                        .map(|(_, row)| row)
-                        .collect();
-                run.output_digest = rows_digest(&live);
+                let live = live_output_rows_pg(&mut tx, &transform.output_dataset_id)?;
+                let keys = load_dataset_partition_keys_pg(&mut tx, &transform.output_dataset_id)?;
+                run.output_digest = dataset_digest(&keys, &live);
             }
             insert_transform_run(&mut tx, &run)?;
             after_run_committed_pg(&mut tx, &transform, &run, now_ms)?;
@@ -247,22 +252,16 @@ impl PostgresDb {
             return Ok(run);
         }
         require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
-        if !incremental {
-            tx.execute(
-                "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
-                &[&transform.output_dataset_id],
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        insert_output_rows(&mut tx, &transform.output_dataset_id, &output_rows)?;
-        run.output_digest = if incremental {
-            checkpoint
-                .as_ref()
-                .and_then(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
-                .ok_or_else(|| "checkpoint digest encoding is not current".to_string())?
-        } else {
-            rows_digest(&output_rows)
-        };
+        persist_computed_output_pg(
+            &mut tx,
+            &transform,
+            &bindings,
+            &loaded,
+            incremental,
+            checkpoint.as_ref(),
+            &output_rows,
+            &mut run,
+        )?;
         stamp_object_marking(&mut tx, &output_object_id, &run.markings_out, now_ms)?;
         insert_transform_run(&mut tx, &run)?;
         tx.execute(
@@ -384,7 +383,8 @@ impl PostgresDb {
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
-                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
+                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
+                        input_partitions, output_partitions
                  FROM sekai_governed_transform_run WHERE run_id = $1",
                 &[&run_id],
             )
@@ -422,7 +422,8 @@ impl PostgresDb {
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
-                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
+                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
+                        input_partitions, output_partitions
                  FROM sekai_governed_transform_run
                  WHERE namespace = $1
                  ORDER BY created_at_ms DESC, run_id DESC
@@ -558,6 +559,8 @@ impl PostgresDb {
             after_alias,
             after_row_id,
             limit,
+            command.partition_key.as_deref(),
+            command.max_bytes,
         )
     }
 
@@ -676,18 +679,111 @@ fn insert_output_rows(
     if rows.is_empty() {
         return Ok(());
     }
-    let payloads: Vec<String> = rows
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<_, _>>()
-        .map_err(|error| error.to_string())?;
-    tx.execute(
-        "INSERT INTO sekai_dataset_rows (dataset_id, data)
+    let keys = load_dataset_partition_keys_pg(tx, dataset_id)?;
+    if keys.is_empty() {
+        let payloads: Vec<String> = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
+        return tx
+            .execute(
+                "INSERT INTO sekai_dataset_rows (dataset_id, data)
          SELECT $1, unnest($2::text[])",
-        &[&dataset_id, &payloads],
-    )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+                &[&dataset_id, &payloads],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+    }
+    for row in rows {
+        let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
+             VALUES ($1, $2, $3)",
+            &[&dataset_id, &data, &partition_value(&keys, row)],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn live_output_rows_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+) -> Result<Vec<HashMap<String, String>>, String> {
+    Ok(load_row_records(tx, dataset_id, 0, None)?
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_computed_output_pg(
+    tx: &mut postgres::Transaction<'_>,
+    transform: &GovernedTransform,
+    bindings: &[(String, String)],
+    loaded: &[(String, Vec<String>, Vec<DatasetRowRecord>)],
+    incremental: bool,
+    checkpoint: Option<&crate::sekai::governed_transform::TransformCheckpoint>,
+    output_rows: &[HashMap<String, String>],
+    run: &mut TransformRun,
+) -> Result<(), String> {
+    let keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
+    run.input_partitions = input_receipts_from_loaded_pg(tx, bindings, loaded)?;
+    if keys.is_empty() {
+        if !incremental {
+            tx.execute(
+                "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
+                &[&transform.output_dataset_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        insert_output_rows(tx, &transform.output_dataset_id, output_rows)?;
+        run.output_digest = if incremental {
+            checkpoint
+                .and_then(|checkpoint| fold_output_digest(&checkpoint.2, output_rows))
+                .ok_or_else(|| "checkpoint digest encoding is not current".to_string())?
+        } else {
+            rows_digest(output_rows)
+        };
+        return Ok(());
+    }
+    if incremental {
+        insert_output_rows(tx, &transform.output_dataset_id, output_rows)?;
+    } else {
+        tx.execute(
+            "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
+            &[&transform.output_dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+        insert_output_rows(tx, &transform.output_dataset_id, output_rows)?;
+        run.output_partitions = partition_records(&keys, output_rows, &transform.output_dataset_id);
+    }
+    let live = live_output_rows_pg(tx, &transform.output_dataset_id)?;
+    if incremental {
+        run.output_partitions = receipts_for_touched_partitions(
+            &keys,
+            &live,
+            output_rows,
+            &transform.output_dataset_id,
+        );
+    }
+    run.output_digest = dataset_digest(&keys, &live);
+    Ok(())
+}
+
+fn input_receipts_from_loaded_pg(
+    tx: &mut postgres::Transaction<'_>,
+    bindings: &[(String, String)],
+    loaded: &[(String, Vec<String>, Vec<DatasetRowRecord>)],
+) -> Result<Vec<crate::sekai::governed_transform::TransformPartition>, String> {
+    let mut inputs = Vec::new();
+    for ((_, dataset_id), (_, _, records)) in bindings.iter().zip(loaded.iter()) {
+        let keys = load_dataset_partition_keys_pg(tx, dataset_id)?;
+        let rows = records.iter().map(|(_, row)| row.clone()).collect();
+        inputs.push((dataset_id.clone(), keys, rows));
+    }
+    Ok(input_partition_receipts(inputs))
 }
 
 fn load_row_records(
@@ -732,13 +828,17 @@ fn insert_transform_run(
 ) -> Result<(), String> {
     let incremental: i16 = i16::from(run.incremental);
     let quarantined: i16 = i16::from(run.quarantined);
+    let input_partitions =
+        serde_json::to_string(&run.input_partitions).map_err(|error| error.to_string())?;
+    let output_partitions =
+        serde_json::to_string(&run.output_partitions).map_err(|error| error.to_string())?;
     tx.execute(
         "INSERT INTO sekai_governed_transform_run
          (run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
           last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
           lineage_parent, created_at_ms, markings_in, markings_out,
-          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)",
+          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref, input_partitions, output_partitions)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)",
         &[
             &run.run_id,
             &run.namespace,
@@ -762,6 +862,8 @@ fn insert_transform_run(
             &run.dispatch_status,
             &run.trigger_cause,
             &run.trigger_ref,
+            &input_partitions,
+            &output_partitions,
         ],
     )
     .map(|_| ())
@@ -794,6 +896,14 @@ fn row_to_run(row: Row) -> Result<TransformRun, String> {
         dispatch_status: row.try_get(19).unwrap_or_default(),
         trigger_cause: row.try_get(20).unwrap_or_default(),
         trigger_ref: row.try_get(21).unwrap_or_default(),
+        input_partitions: serde_json::from_str(
+            &row.try_get::<_, String>(22).unwrap_or_else(|_| "[]".into()),
+        )
+        .unwrap_or_default(),
+        output_partitions: serde_json::from_str(
+            &row.try_get::<_, String>(23).unwrap_or_else(|_| "[]".into()),
+        )
+        .unwrap_or_default(),
     })
 }
 
@@ -934,6 +1044,7 @@ fn admit_isolated_postgres(
         .map_err(|error| error.message())?;
     run.markings_in = markings_in;
     run.markings_out = markings_out;
+    run.input_partitions = input_receipts_from_loaded_pg(tx, &bindings, &loaded)?;
     insert_transform_run(tx, &run)?;
     persist_run_input_snapshot_pg(tx, &run.run_id, &bindings, &loaded)?;
     let spec = transform
@@ -1055,7 +1166,8 @@ fn write_transform_run_pg(
             "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                     last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                     lineage_parent, created_at_ms, markings_in, markings_out,
-                    profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
+                    profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
+                        input_partitions, output_partitions
              FROM sekai_governed_transform_run WHERE run_id = $1",
             &[&command.run_id],
         )
@@ -1063,11 +1175,32 @@ fn write_transform_run_pg(
         .map(row_to_run)
         .transpose()?
         .ok_or("transform run not found")?;
-    let computed = rows_digest(&command.rows);
-    if !command.quarantined && computed != command.output_digest {
-        return Err(TRANSFORM_DIGEST_MISMATCH.into());
-    }
-    let quality_error = evaluate_quality(&command.rows, &transform.quality_rule)
+    let keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
+    let partition_commit = if command.quarantined {
+        None
+    } else if command.replaced_partitions.is_empty() {
+        if dataset_digest(&keys, &command.rows) != command.output_digest {
+            return Err(TRANSFORM_DIGEST_MISMATCH.into());
+        }
+        None
+    } else {
+        let live_rows: Vec<HashMap<String, String>> =
+            load_row_records(tx, &transform.output_dataset_id, 0, None)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect();
+        Some(prepare_partition_commit(
+            &keys,
+            &live_rows,
+            &command.replaced_partitions,
+            &command.output_digest,
+        )?)
+    };
+    let quality_rows = partition_commit
+        .as_ref()
+        .map(|commit| commit.merged_rows.as_slice())
+        .unwrap_or(command.rows.as_slice());
+    let quality_error = evaluate_quality(quality_rows, &transform.quality_rule)
         .err()
         .map(|error| error.message());
     let quarantined = command.quarantined || quality_error.is_some();
@@ -1087,7 +1220,8 @@ fn write_transform_run_pg(
                 .into_iter()
                 .map(|(_, row)| row)
                 .collect();
-        run.output_digest = rows_digest(&live);
+        let keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
+        run.output_digest = dataset_digest(&keys, &live);
         if !output_object_id.trim().is_empty() {
             lock_object_lifecycle(tx, &output_object_id)?;
         }
@@ -1124,14 +1258,27 @@ fn write_transform_run_pg(
     let live_output = load_object_marking_token(tx, &output_object_id)?;
     run.markings_out = fold_live_output_marking(None, &run.markings_out, live_output.as_deref())?;
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
-    tx.execute(
-        "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
-        &[&transform.output_dataset_id],
-    )
-    .map_err(|error| error.to_string())?;
-    insert_output_rows(tx, &transform.output_dataset_id, &command.rows)?;
-    run.output_digest = computed;
-    run.rows_out = command.rows.len() as i32;
+    if let Some(commit) = partition_commit {
+        replace_output_partitions_pg(tx, &transform.output_dataset_id, &commit.replacements)?;
+        run.output_digest = commit.envelope_digest.clone();
+        run.rows_out = commit.merged_rows.len() as i32;
+        run.output_partitions = commit.written;
+        bind_receipts_to_dataset(&mut run.output_partitions, &transform.output_dataset_id);
+    } else {
+        tx.execute(
+            "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
+            &[&transform.output_dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+        insert_output_rows(tx, &transform.output_dataset_id, &command.rows)?;
+        run.output_digest = dataset_digest(&keys, &command.rows);
+        run.rows_out = command.rows.len() as i32;
+        run.output_partitions = if keys.is_empty() {
+            Vec::new()
+        } else {
+            partition_records(&keys, &command.rows, &transform.output_dataset_id)
+        };
+    }
     run.quarantined = false;
     run.dispatch_status = TRANSFORM_WORK_COMPLETED.into();
     run.engine = work.engine.clone();
@@ -1191,7 +1338,8 @@ fn load_transform_run_pg(
         "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                 last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                 lineage_parent, created_at_ms, markings_in, markings_out,
-                profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
+                profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
+                        input_partitions, output_partitions
          FROM sekai_governed_transform_run WHERE run_id = $1",
         &[&run_id],
     )
@@ -1317,13 +1465,22 @@ fn persist_run_input_snapshot_pg(
 ) -> Result<(), String> {
     // Snapshot is the admitted pin: persist the full loaded set, not a stream.
     for ((alias, dataset_id), (_, _, records)) in bindings.iter().zip(loaded.iter()) {
+        let keys = load_dataset_partition_keys_pg(tx, dataset_id)?;
         for (row_id, values) in records {
             let values_json = serde_json::to_string(values).map_err(|error| error.to_string())?;
+            let partition_key = partition_value(&keys, values);
             tx.execute(
                 "INSERT INTO sekai_transform_run_input
-                 (run_id, alias, dataset_id, row_id, values_json)
-                 VALUES ($1,$2,$3,$4,$5)",
-                &[&run_id, alias, dataset_id, row_id, &values_json],
+                 (run_id, alias, dataset_id, row_id, values_json, partition_key)
+                 VALUES ($1,$2,$3,$4,$5,$6)",
+                &[
+                    &run_id,
+                    alias,
+                    dataset_id,
+                    row_id,
+                    &values_json,
+                    &partition_key,
+                ],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -1361,6 +1518,7 @@ fn parse_admitted_definition(
     Ok(transform)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_run_input_snapshot_pg(
     tx: &mut postgres::Transaction<'_>,
     run_id: &str,
@@ -1368,31 +1526,54 @@ fn load_run_input_snapshot_pg(
     after_alias: &str,
     after_row_id: i64,
     limit: i64,
+    partition_key: Option<&str>,
+    max_bytes: i64,
 ) -> Result<Vec<TransformRunInputRow>, String> {
     let cap = if limit <= 0 { 1_000 } else { limit.min(5_000) };
     let wanted = alias.trim();
     let after = after_alias.trim();
+    let (wanted_partition, has_selector) = match partition_key {
+        Some(key) => (key, 1i32),
+        None => ("", 0i32),
+    };
     // Empty alias walks every input in (alias, row_id) order. Continue with
     // after_alias + after_row_id from the last row. Named alias stays per input.
+    // Unset selector ($6 = 0) reads every partition; empty string is an identity.
     let rows = if wanted.is_empty() {
         tx.query(
-            "SELECT alias, dataset_id, row_id, values_json
+            "SELECT alias, dataset_id, row_id, values_json, partition_key
              FROM sekai_transform_run_input
              WHERE run_id = $1
+               AND ($6 = 0 OR partition_key = $5)
                AND (alias > $2 OR (alias = $2 AND row_id > $3))
              ORDER BY alias, row_id
              LIMIT $4",
-            &[&run_id, &after, &after_row_id, &cap],
+            &[
+                &run_id,
+                &after,
+                &after_row_id,
+                &cap,
+                &wanted_partition,
+                &has_selector,
+            ],
         )
         .map_err(|error| error.to_string())?
     } else {
         tx.query(
-            "SELECT alias, dataset_id, row_id, values_json
+            "SELECT alias, dataset_id, row_id, values_json, partition_key
              FROM sekai_transform_run_input
              WHERE run_id = $1 AND alias = $2 AND row_id > $3
+               AND ($6 = 0 OR partition_key = $5)
              ORDER BY row_id
              LIMIT $4",
-            &[&run_id, &wanted, &after_row_id, &cap],
+            &[
+                &run_id,
+                &wanted,
+                &after_row_id,
+                &cap,
+                &wanted_partition,
+                &has_selector,
+            ],
         )
         .map_err(|error| error.to_string())?
     };
@@ -1406,9 +1587,49 @@ fn load_run_input_snapshot_pg(
             dataset_id: row.get(1),
             row_id: row.get(2),
             values,
+            partition_key: row.try_get(4).unwrap_or_default(),
         });
     }
-    Ok(out)
+    Ok(trim_page_to_bytes(out, max_bytes))
+}
+
+fn load_dataset_partition_keys_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+) -> Result<Vec<String>, String> {
+    let json: String = tx
+        .query_opt(
+            "SELECT partition_keys FROM sekai_datasets WHERE id = $1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.try_get(0).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|| "[]".into());
+    crate::sekai::dataset::parse_partition_keys(&json)
+}
+
+fn replace_output_partitions_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    replacements: &[(String, Vec<HashMap<String, String>>)],
+) -> Result<(), String> {
+    for (partition_key, rows) in replacements {
+        tx.execute(
+            "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1 AND partition_key = $2",
+            &[&dataset_id, partition_key],
+        )
+        .map_err(|error| error.to_string())?;
+        for row in rows {
+            let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
+                 VALUES ($1, $2, $3)",
+                &[&dataset_id, &data, partition_key],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn delete_run_input_snapshot_pg(
@@ -1423,18 +1644,69 @@ fn delete_run_input_snapshot_pg(
     .map_err(|error| error.to_string())
 }
 
+pub(crate) fn redact_transform_partition_receipts_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    redact_snapshots: bool,
+) -> Result<(), String> {
+    if redact_snapshots {
+        tx.execute(
+            "UPDATE sekai_transform_run_input SET partition_key = '[redacted]'
+             WHERE dataset_id = $1 AND partition_key != '' AND partition_key != '[redacted]'",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let rows = tx
+        .query(
+            "SELECT run_id, input_partitions, output_partitions
+             FROM sekai_governed_transform_run
+             FOR UPDATE",
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let run_id: String = row.get(0);
+        let input_json: String = row.get(1);
+        let output_json: String = row.get(2);
+        let mut input_partitions: Vec<crate::sekai::governed_transform::TransformPartition> =
+            serde_json::from_str(&input_json).unwrap_or_default();
+        let mut output_partitions: Vec<crate::sekai::governed_transform::TransformPartition> =
+            serde_json::from_str(&output_json).unwrap_or_default();
+        if !redact_run_partition_receipts(dataset_id, &mut input_partitions, &mut output_partitions)
+        {
+            continue;
+        }
+        let input_json =
+            serde_json::to_string(&input_partitions).map_err(|error| error.to_string())?;
+        let output_json =
+            serde_json::to_string(&output_partitions).map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE sekai_governed_transform_run
+             SET input_partitions = $1, output_partitions = $2
+             WHERE run_id = $3",
+            &[&input_json, &output_json, &run_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn persist_transform_run_pg(
     tx: &mut postgres::Transaction<'_>,
     run: &TransformRun,
 ) -> Result<(), String> {
     let incremental: i16 = i16::from(run.incremental);
     let quarantined: i16 = i16::from(run.quarantined);
+    let output_partitions =
+        serde_json::to_string(&run.output_partitions).map_err(|error| error.to_string())?;
     tx.execute(
         "UPDATE sekai_governed_transform_run SET
             output_digest = $2, last_input_row_id = $3, incremental = $4, quarantined = $5,
             quality_rule = $6, rows_in = $7, rows_out = $8, lineage_parent = $9,
             markings_in = $10, markings_out = $11, profile = $12, engine = $13,
-            runtime_image = $14, dispatch_status = $15, trigger_cause = $16, trigger_ref = $17
+            runtime_image = $14, dispatch_status = $15, trigger_cause = $16, trigger_ref = $17,
+            output_partitions = $18
          WHERE run_id = $1",
         &[
             &run.run_id,
@@ -1454,6 +1726,7 @@ fn persist_transform_run_pg(
             &run.dispatch_status,
             &run.trigger_cause,
             &run.trigger_ref,
+            &output_partitions,
         ],
     )
     .map(|_| ())
@@ -1931,8 +2204,13 @@ fn run_in_process_pg(
     lock_ids.push(transform.output_dataset_id.as_str());
     lock_transform_datasets(tx, &lock_ids)?;
     let stored = load_checkpoint(tx, &transform.namespace, &transform.transform_id)?;
-    let (mut incremental, checkpoint) =
-        bind_checkpoint(incremental, stored, &transform.definition_digest);
+    let output_keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
+    let (mut incremental, checkpoint) = bind_checkpoint(
+        incremental,
+        stored,
+        &transform.definition_digest,
+        &output_keys,
+    );
     if !transform.allows_incremental() {
         incremental = false;
     }
@@ -2015,35 +2293,27 @@ fn run_in_process_pg(
         };
     run.markings_in = markings_in;
     run.markings_out = markings_out;
+    run.input_partitions = input_receipts_from_loaded_pg(tx, &bindings, &loaded)?;
     if run.quarantined {
         if !incremental {
-            let live: Vec<HashMap<String, String>> =
-                load_row_records(tx, &transform.output_dataset_id, 0, None)?
-                    .into_iter()
-                    .map(|(_, row)| row)
-                    .collect();
-            run.output_digest = rows_digest(&live);
+            let live = live_output_rows_pg(tx, &transform.output_dataset_id)?;
+            let keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
+            run.output_digest = dataset_digest(&keys, &live);
         }
         insert_transform_run(tx, &run)?;
         return Ok(run);
     }
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
-    if !incremental {
-        tx.execute(
-            "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
-            &[&transform.output_dataset_id],
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    insert_output_rows(tx, &transform.output_dataset_id, &output_rows)?;
-    run.output_digest = if incremental {
-        checkpoint
-            .as_ref()
-            .and_then(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
-            .ok_or_else(|| "checkpoint digest encoding is not current".to_string())?
-    } else {
-        rows_digest(&output_rows)
-    };
+    persist_computed_output_pg(
+        tx,
+        transform,
+        &bindings,
+        &loaded,
+        incremental,
+        checkpoint.as_ref(),
+        &output_rows,
+        &mut run,
+    )?;
     stamp_object_marking(tx, &output_object_id, &run.markings_out, now_ms)?;
     insert_transform_run(tx, &run)?;
     tx.execute(
@@ -2193,6 +2463,8 @@ fn cancel_governed_transform_run_pg(
                 dispatch_status: TRANSFORM_WORK_CANCELLED.into(),
                 trigger_cause: TRANSFORM_TRIGGER_CANCELLED.into(),
                 trigger_ref: run.run_id.clone(),
+                input_partitions: Vec::new(),
+                output_partitions: Vec::new(),
             };
             insert_transform_run(tx, &skip)?;
         }
@@ -2207,9 +2479,9 @@ mod tests {
     use crate::sekai::dataset::{ColumnDef, Dataset, RowQuery};
     use crate::sekai::governed_transform::{
         AnalyticalSpec, CONTRACT_VERSION, ISOLATED_CLASS, IsolatedProcessSpec,
-        TRANSFORM_DEPENDENCY_CYCLE, TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE,
-        TRANSFORM_TRIGGER_UPSTREAM, TransformInput, TransformSchedule, TransformStep,
-        TransformTrigger,
+        PARTITIONED_DIGEST_PREFIX, TRANSFORM_DEPENDENCY_CYCLE, TRANSFORM_TRIGGER_MANUAL,
+        TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_UPSTREAM, TransformInput, TransformSchedule,
+        TransformStep, TransformTrigger,
     };
 
     fn dataset(id: &str) -> Dataset {
@@ -2230,7 +2502,36 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         }
+    }
+
+    fn partitioned_dataset(id: &str) -> Dataset {
+        let mut dataset = dataset(id);
+        dataset.columns.push(ColumnDef {
+            name: "region".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        });
+        dataset.partition_keys = vec!["region".into()];
+        dataset
+    }
+
+    type DatasetRows = Vec<HashMap<String, String>>;
+
+    fn east_west_rows() -> (DatasetRows, DatasetRows) {
+        (
+            vec![HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "east".into()),
+            ])],
+            vec![HashMap::from([
+                ("id".into(), "2".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "west".into()),
+            ])],
+        )
     }
 
     fn step_filter() -> TransformStep {
@@ -2599,6 +2900,7 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         };
         let orders = Dataset {
             id: "orders".into(),
@@ -2622,6 +2924,7 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         };
         db.create_dataset(&customers).unwrap();
         db.create_dataset(&orders).unwrap();
@@ -2831,6 +3134,7 @@ mod tests {
                     output_digest: rows_digest(&output),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 50,
             )
@@ -2891,6 +3195,7 @@ mod tests {
                     output_digest: rows_digest(&output_rows),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 50,
             )
@@ -2947,6 +3252,7 @@ mod tests {
                     output_digest: "ignored".into(),
                     quarantined: true,
                     quality_rule: "worker-failed".into(),
+                    ..WriteTransformRunCommand::default()
                 },
                 50,
             )
@@ -2994,6 +3300,7 @@ mod tests {
                     output_digest: "ignored".into(),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 40,
             )
@@ -3185,6 +3492,7 @@ mod tests {
                     output_digest: rows_digest(&output),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 40,
             )
@@ -3250,6 +3558,7 @@ mod tests {
                 output_digest: rows_digest(&output),
                 quarantined: false,
                 quality_rule: String::new(),
+                ..WriteTransformRunCommand::default()
             },
             40,
         )
@@ -3421,6 +3730,45 @@ mod tests {
 
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_schedule_partitioned_run_records_partition_digest() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "east".into()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = projection("t1", "in", "out");
+        transform.steps = vec![TransformStep {
+            kind: "project".into(),
+            column: String::new(),
+            op: String::new(),
+            value: String::new(),
+            columns: vec!["id".into(), "keep".into(), "region".into()],
+        }];
+        transform.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.tick_governed_transforms(1_500).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0]
+                .output_digest
+                .starts_with(PARTITIONED_DIGEST_PREFIX)
+        );
+        assert_eq!(first[0].input_partitions.len(), 1);
+        assert_eq!(first[0].input_partitions[0].partition_key, "east");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
     fn postgres_upstream_commit_triggers_downstream_once() {
         let scratch = ScratchDatabase::create();
         let db = scratch.connect();
@@ -3453,5 +3801,454 @@ mod tests {
         assert_eq!(down_run.trigger_cause, TRANSFORM_TRIGGER_UPSTREAM);
         assert_eq!(down_run.trigger_ref, up.run_id);
         assert_eq!(db.tick_governed_transforms(30).unwrap().len(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_streamed_read_stays_inside_byte_bound() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let mut rows = Vec::new();
+        for i in 0..20 {
+            rows.push(HashMap::from([
+                ("id".into(), i.to_string()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), if i < 10 { "east" } else { "west" }.into()),
+            ]));
+        }
+        db.append_dataset_rows("in", &rows).unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let mut fence = WriteTransformRunCommand {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            max_bytes: 40,
+            ..WriteTransformRunCommand::default()
+        };
+        let mut seen = Vec::new();
+        let mut after_alias = String::new();
+        let mut after_row_id = 0;
+        loop {
+            let page = db
+                .read_transform_run_input(&fence, "", &after_alias, after_row_id, 100, 40)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            let page_bytes: u64 = page
+                .iter()
+                .map(crate::sekai::governed_transform::row_stream_bytes)
+                .sum();
+            assert!(
+                page_bytes <= 40 || page.len() == 1,
+                "page exceeded bound: {page_bytes}"
+            );
+            after_alias = page.last().unwrap().alias.clone();
+            after_row_id = page.last().unwrap().row_id;
+            fence.partition_key = None;
+            seen.extend(page);
+        }
+        assert_eq!(seen.len(), 20);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_partition_write_back_rewrites_one_partition() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let (east, west) = east_west_rows();
+        db.append_dataset_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let first_output = vec![east[0].clone(), west[0].clone()];
+        let keys = vec!["region".into()];
+        let first_envelope = crate::sekai::governed_transform::partitioned_dataset_digest(
+            &crate::sekai::governed_transform::group_rows_by_partition(&keys, &first_output)
+                .into_iter()
+                .map(|(key, rows)| (key, crate::sekai::governed_transform::rows_digest(&rows)))
+                .collect(),
+        );
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id.clone(),
+                    runtime_id: work.claim_owner.clone(),
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token.clone(),
+                    replaced_partitions: vec![
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "east".into(),
+                            rows: east.clone(),
+                        },
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "west".into(),
+                            rows: west.clone(),
+                        },
+                    ],
+                    output_digest: first_envelope,
+                    ..WriteTransformRunCommand::default()
+                },
+                50,
+            )
+            .unwrap();
+        assert_eq!(committed.output_partitions.len(), 2);
+        let west_digest = committed
+            .output_partitions
+            .iter()
+            .find(|partition| partition.partition_key == "west")
+            .unwrap()
+            .digest
+            .clone();
+
+        db.put_governed_transform(&isolated_transform(), 60)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 70).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", &admitted.run_id, 60_000, 80)
+            .unwrap()
+            .expect("claimable work");
+        let mut new_east = east.clone();
+        new_east[0].insert("keep".into(), "derived".into());
+        let merged = vec![new_east[0].clone(), west[0].clone()];
+        let envelope = crate::sekai::governed_transform::partitioned_dataset_digest(
+            &crate::sekai::governed_transform::group_rows_by_partition(&keys, &merged)
+                .into_iter()
+                .map(|(key, rows)| (key, crate::sekai::governed_transform::rows_digest(&rows)))
+                .collect(),
+        );
+        let second = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    replaced_partitions: vec![
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "east".into(),
+                            rows: new_east,
+                        },
+                    ],
+                    output_digest: envelope,
+                    ..WriteTransformRunCommand::default()
+                },
+                90,
+            )
+            .unwrap();
+        assert_eq!(second.output_partitions.len(), 1);
+        assert_eq!(second.output_partitions[0].partition_key, "east");
+        let live = db.query_dataset_rows("out", &RowQuery::default()).unwrap();
+        assert_eq!(live.len(), 2);
+        let west_live = live
+            .iter()
+            .find(|row| row.get("region").map(String::as_str) == Some("west"))
+            .unwrap();
+        assert_eq!(west_live.get("id").map(String::as_str), Some("2"));
+        assert_eq!(
+            crate::sekai::governed_transform::rows_digest(std::slice::from_ref(west_live)),
+            west_digest
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_isolated_process_failed_partition_write_keeps_previous_output() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let (east, west) = east_west_rows();
+        db.append_dataset_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let first_output = vec![east[0].clone(), west[0].clone()];
+        let keys = vec!["region".into()];
+        let first_envelope = crate::sekai::governed_transform::partitioned_dataset_digest(
+            &crate::sekai::governed_transform::group_rows_by_partition(&keys, &first_output)
+                .into_iter()
+                .map(|(key, rows)| (key, crate::sekai::governed_transform::rows_digest(&rows)))
+                .collect(),
+        );
+        db.write_transform_run(
+            WriteTransformRunCommand {
+                run_id: work.run_id,
+                runtime_id: work.claim_owner,
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token,
+                replaced_partitions: vec![
+                    crate::sekai::governed_transform::TransformPartitionWrite {
+                        partition_key: "east".into(),
+                        rows: east.clone(),
+                    },
+                    crate::sekai::governed_transform::TransformPartitionWrite {
+                        partition_key: "west".into(),
+                        rows: west.clone(),
+                    },
+                ],
+                output_digest: first_envelope,
+                ..WriteTransformRunCommand::default()
+            },
+            50,
+        )
+        .unwrap();
+        let before = db.query_dataset_rows("out", &RowQuery::default()).unwrap();
+        db.put_governed_transform(&isolated_transform(), 60)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 70).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", &admitted.run_id, 60_000, 80)
+            .unwrap()
+            .expect("claimable work");
+        let error = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    replaced_partitions: vec![
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "east".into(),
+                            rows: east,
+                        },
+                    ],
+                    output_digest: "sha256-sum-v1:not-the-envelope".into(),
+                    ..WriteTransformRunCommand::default()
+                },
+                90,
+            )
+            .unwrap_err();
+        assert!(error.contains("digest"));
+        assert_eq!(
+            db.query_dataset_rows("out", &RowQuery::default()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_incremental_run_rewrites_only_changed_partition() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let (east, west) = east_west_rows();
+        db.append_dataset_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(first.output_digest.starts_with("sha256-partitions-v1:"));
+        assert_eq!(first.output_partitions.len(), 2);
+        let before = db.list_dataset_row_records("out").unwrap();
+        let west_ids: Vec<i64> = before
+            .iter()
+            .filter(|(_, row)| row.get("region").map(String::as_str) == Some("west"))
+            .map(|(id, _)| *id)
+            .collect();
+        let east_ids: Vec<i64> = before
+            .iter()
+            .filter(|(_, row)| row.get("region").map(String::as_str) == Some("east"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(west_ids.len(), 1);
+        assert_eq!(east_ids.len(), 1);
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "3".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "east".into()),
+            ])],
+        )
+        .unwrap();
+        let second = db.run_governed_transform("ops", "t1", true, 30).unwrap();
+        assert_eq!(second.rows_in, 1);
+        assert_eq!(second.output_partitions.len(), 1);
+        assert_eq!(second.output_partitions[0].partition_key, "east");
+        assert_ne!(second.output_digest, first.output_digest);
+        let after = db.list_dataset_row_records("out").unwrap();
+        let west_after: Vec<i64> = after
+            .iter()
+            .filter(|(_, row)| row.get("region").map(String::as_str) == Some("west"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(west_after, west_ids);
+        let east_after: Vec<i64> = after
+            .iter()
+            .filter(|(_, row)| row.get("region").map(String::as_str) == Some("east"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(east_after.starts_with(&east_ids));
+        assert_eq!(after.len(), 3);
+        let live: Vec<_> = after.into_iter().map(|(_, row)| row).collect();
+        assert_eq!(
+            second.output_digest,
+            crate::sekai::governed_transform::dataset_digest(&["region".into()], &live)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_quality_failure_keeps_input_partition_receipts() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        db.append_dataset_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), String::new()),
+                ("region".into(), "east".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: vec!["id".into(), "keep".into(), "region".into()],
+            }],
+            quality_rule: "required:keep".into(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let failed = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(failed.quarantined);
+        assert_eq!(failed.input_partitions.len(), 1);
+        assert_eq!(failed.input_partitions[0].partition_key, "east");
+        assert_eq!(failed.input_partitions[0].rows, 1);
+        assert!(
+            db.query_dataset_rows("out", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn sensitive_partitioned_dataset(id: &str) -> Dataset {
+        let mut dataset = partitioned_dataset(id);
+        for column in &mut dataset.columns {
+            if column.name == "region" {
+                column.classification = "sensitive".into();
+            }
+        }
+        dataset
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_redact_dataset_fields_rewrites_transform_partition_receipts() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&sensitive_partitioned_dataset("in"))
+            .unwrap();
+        db.create_dataset(&sensitive_partitioned_dataset("out"))
+            .unwrap();
+        let (east, west) = east_west_rows();
+        db.append_dataset_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: vec!["id".into(), "keep".into(), "region".into()],
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(
+            run.input_partitions
+                .iter()
+                .any(|partition| partition.partition_key == "east")
+        );
+        db.redact_dataset_fields("in", "sensitive", &[]).unwrap();
+        let after_input = db.get_governed_transform_run(&run.run_id).unwrap().unwrap();
+        assert!(
+            after_input
+                .input_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]")
+        );
+        assert!(
+            after_input
+                .output_partitions
+                .iter()
+                .any(|partition| partition.partition_key == "east")
+        );
+        db.redact_dataset_fields("out", "sensitive", &[]).unwrap();
+        let after_output = db.get_governed_transform_run(&run.run_id).unwrap().unwrap();
+        assert!(
+            after_output
+                .output_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]")
+        );
     }
 }

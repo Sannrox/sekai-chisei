@@ -28,6 +28,7 @@ fn dataset(id: &str, columns: &[&str], object_id: &str) -> Dataset {
         columns: columns.iter().copied().map(column).collect(),
         object_id: object_id.into(),
         created: 1,
+        partition_keys: Vec::new(),
     }
 }
 

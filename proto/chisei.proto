@@ -997,6 +997,71 @@ message RevokeRoutingProfileRequest {
   string profile_id = 2;
 }
 message RevokeRoutingProfileResponse { bool revoked = 1; }
+
+// Per-namespace model review state and family enablement (#1493). Scope is
+// the namespace (global "" is the instance default). Identity is provider,
+// canonical model, and optional artifact digest. Family enablement is per
+// namespace and ResidencyPolicy region label; a per-model row overrides it.
+message ModelReviewIdentity {
+  string provider = 1;
+  string model = 2;
+  string artifact_digest = 3;
+}
+message ModelReviewRecord {
+  string namespace = 1;
+  ModelReviewIdentity identity = 2;
+  string status = 3;
+  string actor = 4;
+  string reason = 5;
+  int64 updated_at_ms = 6;
+}
+message FamilyEnablementRecord {
+  string namespace = 1;
+  string region_label = 2;
+  string family_id = 3;
+  string status = 4;
+  string actor = 5;
+  string reason = 6;
+  int64 updated_at_ms = 7;
+}
+message SetModelReviewRequest {
+  string namespace = 1;
+  ModelReviewIdentity identity = 2;
+  string status = 3;
+  string reason = 4;
+}
+message SetModelReviewResponse { ModelReviewRecord record = 1; }
+message RevokeModelReviewRequest {
+  string namespace = 1;
+  ModelReviewIdentity identity = 2;
+  string reason = 3;
+}
+message RevokeModelReviewResponse { ModelReviewRecord record = 1; }
+message ListModelReviewsRequest { string namespace = 1; }
+message ListModelReviewsResponse {
+  repeated ModelReviewRecord records = 1;
+  string contract_version = 2;
+}
+message SetModelFamilyEnablementRequest {
+  string namespace = 1;
+  string region_label = 2;
+  string family_id = 3;
+  string status = 4;
+  string reason = 5;
+}
+message SetModelFamilyEnablementResponse { FamilyEnablementRecord record = 1; }
+message RevokeModelFamilyEnablementRequest {
+  string namespace = 1;
+  string region_label = 2;
+  string family_id = 3;
+  string reason = 4;
+}
+message RevokeModelFamilyEnablementResponse { FamilyEnablementRecord record = 1; }
+message ListModelFamilyEnablementRequest { string namespace = 1; }
+message ListModelFamilyEnablementResponse {
+  repeated FamilyEnablementRecord records = 1;
+  string contract_version = 2;
+}
 message ListRoutingProfilesResponse {
   repeated RoutingProfile profiles = 1;
   string contract_version = 2;
@@ -1606,6 +1671,12 @@ service ChiseiService {
   rpc ListRoutingProfiles(ListRoutingProfilesRequest) returns (ListRoutingProfilesResponse);
   rpc PutRoutingProfile(PutRoutingProfileRequest) returns (PutRoutingProfileResponse);
   rpc RevokeRoutingProfile(RevokeRoutingProfileRequest) returns (RevokeRoutingProfileResponse);
+  rpc SetModelReview(SetModelReviewRequest) returns (SetModelReviewResponse);
+  rpc RevokeModelReview(RevokeModelReviewRequest) returns (RevokeModelReviewResponse);
+  rpc ListModelReviews(ListModelReviewsRequest) returns (ListModelReviewsResponse);
+  rpc SetModelFamilyEnablement(SetModelFamilyEnablementRequest) returns (SetModelFamilyEnablementResponse);
+  rpc RevokeModelFamilyEnablement(RevokeModelFamilyEnablementRequest) returns (RevokeModelFamilyEnablementResponse);
+  rpc ListModelFamilyEnablement(ListModelFamilyEnablementRequest) returns (ListModelFamilyEnablementResponse);
   // Executes a previously governed plan through the selected provider adapter.
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
   // Parallel fail-closed content path. Older servers return UNIMPLEMENTED.
