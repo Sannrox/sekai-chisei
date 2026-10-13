@@ -496,6 +496,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListObjectChanges"
             | "GetPublishedDefinitionRevision"
             | "GetDefinitionMember"
+            | "GetDefinitionCertificationGate"
+            | "PutDefinitionCertification"
             | "GetDefinitionBranch"
             | "CreateDefinitionBranch"
             | "ApplyDefinitionBranchEdit"

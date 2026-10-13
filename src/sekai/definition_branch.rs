@@ -353,14 +353,18 @@ impl DefinitionRevision {
         if self.contract_version != REVISION_CONTRACT_VERSION {
             return Err("definition revision contract version is unsupported".into());
         }
-        let prepared = prepare_revision(
+        // Content identity does not include `published`. Direct construction of
+        // a published agent revision is still refused by `prepare_revision`;
+        // certified merge flips the flag on an already-bound draft.
+        let mut prepared = prepare_revision(
             &self.namespace,
             &self.parent_revision_digest,
             self.members.clone(),
-            self.published,
+            false,
             &self.created_by,
             self.created_at_ms,
         )?;
+        prepared.published = self.published;
         if prepared != *self {
             return Err("definition revision content binding is invalid".into());
         }
@@ -737,6 +741,40 @@ mod tests {
         .unwrap();
         assert_eq!(first.revision_digest, second.revision_digest);
         assert_ne!(first.revision_digest, different_parent.revision_digest);
+    }
+
+    #[test]
+    fn published_agent_revision_verifies_after_certified_flag_flip() {
+        let agent = DefinitionMemberInput {
+            member_kind: "agent".into(),
+            member_id: "triage".into(),
+            ..input(
+                r#"{"contract_version":"sekai.agent-definition/v1","name":"Triage","task_class":"lookup","instructions":"Inspect records.","allowed_action_types":["Ticket.inspect"]}"#,
+            )
+        }
+        .prepare("team-a")
+        .unwrap();
+        let draft = prepare_revision(
+            "team-a",
+            "",
+            [DefinitionRevisionMember {
+                member_kind: agent.member_kind,
+                member_id: agent.member_id,
+                member_digest: agent.member_digest,
+            }],
+            false,
+            "author",
+            1,
+        )
+        .unwrap();
+        let mut published = draft.clone();
+        published.published = true;
+        published.verify().unwrap();
+        assert!(
+            prepare_revision("team-a", "", published.members.clone(), true, "author", 1,)
+                .unwrap_err()
+                .contains("agent_promotion_requires_certification")
+        );
     }
 
     #[test]

@@ -120,6 +120,8 @@ const ROUTING_PROFILE_ARTIFACT_DIGEST_SCHEMA: &str =
     include_str!("postgres/0062_routing_profile_artifact_digest.sql");
 const CHISEI_MODEL_RELEASE_EVIDENCE_SCHEMA: &str =
     include_str!("postgres/0063_chisei_model_release_evidence.sql");
+const AGENT_DEFINITION_CERTIFICATION_SCHEMA: &str =
+    include_str!("postgres/0064_agent_definition_certification.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -534,6 +536,12 @@ const MIGRATIONS: &[Migration] = &[
         "chisei_model_release_evidence",
         CHISEI_MODEL_RELEASE_EVIDENCE_SCHEMA,
         MigrationOwner::Chisei,
+    ),
+    mig(
+        63,
+        "agent_definition_certification",
+        AGENT_DEFINITION_CERTIFICATION_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 

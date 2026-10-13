@@ -12472,9 +12472,154 @@ async fn agent_definition_member_read_crosses_server_transport() {
 
 #[test]
 fn agent_certification_refusal_has_public_precondition_status() {
-    let error = map_definition_write_error("agent_promotion_requires_certification".into());
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(error.message(), "agent_promotion_requires_certification");
+    for reason in [
+        "agent_promotion_requires_certification",
+        "agent_promotion_certification_revoked",
+        "agent_promotion_certification_stale",
+        "agent_promotion_certification_failed",
+    ] {
+        let error = map_definition_write_error(reason.into());
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), reason);
+    }
+}
+
+#[tokio::test]
+async fn definition_certification_gate_rpc_reports_bound_states() {
+    let svc = service();
+    let namespace = "definition-cert";
+    let parent = seed_definition_parent(&svc, namespace);
+    grant_source_namespace(&svc, namespace, "root", security::Role::Admin);
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: "create-cert".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let applied = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "agent".into(),
+                    member_id: "triage".into(),
+                    member_digest: String::new(),
+                    definition_json: serde_json::json!({
+                        "contract_version": "sekai.agent-definition/v1",
+                        "name": "Triage",
+                        "task_class": "lookup",
+                        "instructions": "Inspect records.",
+                        "allowed_action_types": ["Ticket.inspect"]
+                    })
+                    .to_string(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "edit-agent".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let digest = applied.revision.unwrap().revision_digest;
+    let missing = svc
+        .get_definition_certification_gate(with_named_principal(
+            GetDefinitionCertificationGateRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!missing.admitted);
+    assert_eq!(missing.certification_status, "missing");
+    assert_eq!(missing.refusal, "agent_promotion_requires_certification");
+    let put = |baseline: &str, latest: &str, expires: i64, revoked: i64| {
+        PutDefinitionCertificationRequest {
+            namespace: namespace.into(),
+            revision_digest: digest.clone(),
+            suite_id: "agent-suite".into(),
+            certification_id: "agent-cert".into(),
+            baseline_status: baseline.into(),
+            latest_status: latest.into(),
+            expires_at_ms: expires,
+            revoked_at_ms: revoked,
+        }
+    };
+    let revoked = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "pass", 4_102_444_800_000, 4),
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!revoked.admitted);
+    assert_eq!(revoked.certification_status, "revoked");
+    assert_eq!(revoked.refusal, "agent_promotion_certification_revoked");
+    let stale = svc
+        .put_definition_certification(with_named_principal(put("pass", "pass", 1, 0), "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!stale.admitted);
+    assert_eq!(stale.certification_status, "stale");
+    assert_eq!(stale.refusal, "agent_promotion_certification_stale");
+    let failed = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "fail", 4_102_444_800_000, 0),
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!failed.admitted);
+    assert_eq!(failed.certification_status, "fail");
+    assert_eq!(failed.refusal, "agent_promotion_certification_failed");
+    let admitted = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "pass", 4_102_444_800_000, 0),
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(admitted.admitted);
+    assert_eq!(admitted.certification_status, "admitted");
+    assert!(admitted.refusal.is_empty());
+    let reported = svc
+        .get_definition_certification_gate(with_named_principal(
+            GetDefinitionCertificationGateRequest {
+                namespace: namespace.into(),
+                revision_digest: digest,
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert_eq!(reported, admitted);
 }
 
 /// Scoped draft transport retains store retry/conflict authority and never admits promotion.

@@ -246,6 +246,32 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutDefinitionCertification",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/definition_branch_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetDefinitionCertificationGate",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/definition_branch_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetPublishedDefinitionRevision",
       "kind": "persistent",
       "surfaces": [

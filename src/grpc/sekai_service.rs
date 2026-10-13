@@ -430,6 +430,20 @@ impl SekaiService for SekaiServiceImpl {
         rpc_definitions::get_definition_member(self, req).await
     }
 
+    async fn put_definition_certification(
+        &self,
+        req: Request<PutDefinitionCertificationRequest>,
+    ) -> Result<Response<PutDefinitionCertificationResponse>, Status> {
+        rpc_definitions::put_definition_certification(self, req).await
+    }
+
+    async fn get_definition_certification_gate(
+        &self,
+        req: Request<GetDefinitionCertificationGateRequest>,
+    ) -> Result<Response<GetDefinitionCertificationGateResponse>, Status> {
+        rpc_definitions::get_definition_certification_gate(self, req).await
+    }
+
     async fn get_definition_branch(
         &self,
         req: Request<GetDefinitionBranchRequest>,
