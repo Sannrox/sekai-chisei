@@ -1390,6 +1390,7 @@ mod tests {
             endpoint_origin: "https://models.example".into(),
             model_patterns: patterns.iter().map(|pattern| (*pattern).into()).collect(),
             credential_ref: "ACME".into(),
+            artifact_digest: None,
             registered_by: "root".into(),
             registered_at_ms: 1,
         }

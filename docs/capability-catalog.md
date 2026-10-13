@@ -282,6 +282,11 @@ wired for hosted routes.
   and fails later pins closed.
 - Only the endpoint's origin is kept. It must serve the OpenAI-compatible
   chat completions API under `/v1`.
+- `artifact_digest` (optional, `sha256:<64 lowercase hex>`) declares the
+  weights the endpoint serves. It is stored with the profile, listed back, and
+  passed to `EnterpriseExtension::admit_model`, so an extension can admit the
+  route only at a pinned digest. It is the namespace admin's claim, not
+  evidence that the endpoint serves those weights (#1499).
 
 Execution covers `PlanExecution`/`ExecutePlanStream` and
 `PlanContentExecution`/`ExecuteContentPlanStream` under the same rules

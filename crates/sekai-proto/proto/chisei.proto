@@ -970,6 +970,10 @@ message RoutingProfile {
   string lifecycle = 5;
   // Customer-hosted profiles only: the operator-allowlisted endpoint origin.
   string endpoint_origin = 6;
+  // Customer-hosted profiles only: the declared weights digest
+  // (`sha256:<64 hex>`), or empty when unpinned. A claim used for enterprise
+  // model admission, not evidence that the endpoint serves those weights.
+  string artifact_digest = 7;
 }
 message ListRoutingProfilesRequest { string namespace = 1; }
 // Registers or replaces a customer-hosted profile `hosted:<name>` in one
@@ -984,6 +988,8 @@ message PutRoutingProfileRequest {
   string endpoint_url = 3;
   repeated string model_patterns = 4;
   string credential_ref = 5;
+  // Optional weights digest, `sha256:<64 lowercase hex>`; empty means unpinned.
+  string artifact_digest = 6;
 }
 message PutRoutingProfileResponse { RoutingProfile profile = 1; }
 message RevokeRoutingProfileRequest {
