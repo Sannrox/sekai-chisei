@@ -33,6 +33,16 @@ impl ChiseiServiceImpl {
         model_review::admit_enabled_route(&self.db, namespace, &identity, &region, actor)
             .map_err(model_review_denied)
     }
+
+    pub(super) fn review_admits_candidate(&self, namespace: &str, model: &str) -> bool {
+        let Ok(identity) = model_review::identity_from_model(model) else {
+            return false;
+        };
+        let region = self
+            .policy
+            .admission_region(namespace, &identity.provider, &identity.model);
+        model_review::route_is_enabled(&self.db, namespace, &identity, &region)
+    }
 }
 
 fn model_review_denied(refusal: AdmissionRefusal) -> Status {
