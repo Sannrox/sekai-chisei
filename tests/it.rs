@@ -23,6 +23,7 @@ mod chisei_external_permit_backend_conformance;
 mod chisei_gateway_audit_backend_conformance;
 mod chisei_governed_subject_provenance_backend_conformance;
 mod chisei_kioku_backend_conformance;
+mod chisei_model_review_backend_conformance;
 mod chisei_plane_process_adr;
 mod chisei_policy_backend_conformance;
 mod chisei_portfolio_backend_conformance;
@@ -70,6 +71,7 @@ mod lakehouse_snapshot_adr;
 mod managed_shikigami_routing_fixture;
 mod mcp_adapter;
 mod model_platform_adr;
+mod namespace_model_review_adr;
 mod namespace_object_generation_adr;
 mod native_server_smoke;
 mod object_change_subscription_adr;
@@ -173,6 +175,7 @@ const GROUPED_MODULES: &[&str] = &[
     "chisei_gateway_audit_backend_conformance",
     "chisei_governed_subject_provenance_backend_conformance",
     "chisei_kioku_backend_conformance",
+    "chisei_model_review_backend_conformance",
     "chisei_plane_process_adr",
     "chisei_policy_backend_conformance",
     "chisei_portfolio_backend_conformance",
@@ -220,6 +223,7 @@ const GROUPED_MODULES: &[&str] = &[
     "managed_shikigami_routing_fixture",
     "mcp_adapter",
     "model_platform_adr",
+    "namespace_model_review_adr",
     "namespace_object_generation_adr",
     "native_server_smoke",
     "object_change_subscription_adr",
@@ -378,6 +382,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 121);
+    assert_eq!(GROUPED_MODULES.len(), 123);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

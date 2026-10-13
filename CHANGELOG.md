@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Channel operators can persist per-namespace model review state and family
+  enablement keyed by the #1352 identity and `ResidencyPolicy` region labels.
+  Missing state is `disallowed`; a per-model row overrides its provider family
+  in the same namespace; a named namespace (model, then family) overrides the
+  instance default. Admin RPCs and
+  `sekaictl admin model-review` set, revoke, and list with a decision-ledger
+  reason. Operators run a one-shot backfill to mark currently routed hosted
+  families and registry-canonical policy models `enabled` when still
+  `disallowed`. Route admission
+  still defaults to admit until #1494. Adds ADR 0106 and PostgreSQL migration
+  `0061_chisei_model_review` (#1493).
+
 - Governed transforms stream claim reads inside a byte bound, persist
   optional dataset `partition_keys`, and write named partitions atomically.
   `sekai-client::claim` exposes the partition selector and `max_bytes`.

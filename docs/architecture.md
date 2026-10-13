@@ -22,7 +22,7 @@ OpenAI / Anthropic clients        Native integrations
             +-------------+--------------+
                           v
                     Chisei decisions
-              policy | budget | routing
+              policy | budget | routing | model review
               approval | eval | learning
                           |
                           v

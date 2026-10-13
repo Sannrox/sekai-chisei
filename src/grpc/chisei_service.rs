@@ -78,6 +78,8 @@ use support_policy::*;
 mod rpc_control;
 #[path = "chisei_service_rpc_execution.rs"]
 mod rpc_execution;
+#[path = "chisei_service_rpc_model_review.rs"]
+mod rpc_model_review;
 
 #[cfg(test)]
 use crate::chisei::policy::ContextAdmissionAction;
@@ -717,6 +719,48 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<RevokeRoutingProfileRequest>,
     ) -> Result<Response<RevokeRoutingProfileResponse>, Status> {
         rpc_execution::revoke_routing_profile(self, req).await
+    }
+
+    async fn set_model_review(
+        &self,
+        req: Request<SetModelReviewRequest>,
+    ) -> Result<Response<SetModelReviewResponse>, Status> {
+        rpc_model_review::set_model_review(self, req).await
+    }
+
+    async fn revoke_model_review(
+        &self,
+        req: Request<RevokeModelReviewRequest>,
+    ) -> Result<Response<RevokeModelReviewResponse>, Status> {
+        rpc_model_review::revoke_model_review(self, req).await
+    }
+
+    async fn list_model_reviews(
+        &self,
+        req: Request<ListModelReviewsRequest>,
+    ) -> Result<Response<ListModelReviewsResponse>, Status> {
+        rpc_model_review::list_model_reviews(self, req).await
+    }
+
+    async fn set_model_family_enablement(
+        &self,
+        req: Request<SetModelFamilyEnablementRequest>,
+    ) -> Result<Response<SetModelFamilyEnablementResponse>, Status> {
+        rpc_model_review::set_model_family_enablement(self, req).await
+    }
+
+    async fn revoke_model_family_enablement(
+        &self,
+        req: Request<RevokeModelFamilyEnablementRequest>,
+    ) -> Result<Response<RevokeModelFamilyEnablementResponse>, Status> {
+        rpc_model_review::revoke_model_family_enablement(self, req).await
+    }
+
+    async fn list_model_family_enablement(
+        &self,
+        req: Request<ListModelFamilyEnablementRequest>,
+    ) -> Result<Response<ListModelFamilyEnablementResponse>, Status> {
+        rpc_model_review::list_model_family_enablement(self, req).await
     }
 
     async fn execute_plan_stream(

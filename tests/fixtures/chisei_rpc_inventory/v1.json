@@ -320,6 +320,84 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "SetModelReview",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_model_review_backend_conformance.rs",
+        "src/db/postgres_model_review.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "RevokeModelReview",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_model_review_backend_conformance.rs",
+        "src/db/postgres_model_review.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ListModelReviews",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_model_review_backend_conformance.rs",
+        "src/db/postgres_model_review.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "SetModelFamilyEnablement",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_model_review_backend_conformance.rs",
+        "src/db/postgres_model_review.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "RevokeModelFamilyEnablement",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_model_review_backend_conformance.rs",
+        "src/db/postgres_model_review.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ListModelFamilyEnablement",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_model_review_backend_conformance.rs",
+        "src/db/postgres_model_review.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "PlanExecution",
       "kind": "computed",
       "surfaces": [],
@@ -529,13 +607,14 @@
     "src/db/postgres_kioku.rs",
     "src/db/postgres_portfolio.rs",
     "tests/chisei_budget_backend_conformance.rs",
-    "tests/chisei_evaluation_plan_backend_conformance.rs",
     "tests/chisei_eval_backend_conformance.rs",
+    "tests/chisei_evaluation_plan_backend_conformance.rs",
     "tests/chisei_execution_backend_conformance.rs",
     "tests/chisei_external_action_backend_conformance.rs",
     "tests/chisei_external_permit_backend_conformance.rs",
     "tests/chisei_gateway_audit_backend_conformance.rs",
     "tests/chisei_kioku_backend_conformance.rs",
+    "tests/chisei_model_review_backend_conformance.rs",
     "tests/chisei_policy_backend_conformance.rs",
     "tests/chisei_portfolio_backend_conformance.rs",
     "tests/chisei_postgres_inventory_conformance.rs",

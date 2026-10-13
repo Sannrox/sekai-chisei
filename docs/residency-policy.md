@@ -62,3 +62,10 @@ single-plane control-plane configuration today.
   [research/291-federation-profile.md](research/291-federation-profile.md) and
   [federation-profile.md](federation-profile.md); #291)
 - Durable residency policy object schema / SetResidencyPolicy RPC (follow-up)
+
+## Model family enablement (#1493)
+
+Family enablement is keyed by namespace and a region label taken from
+`provider_regions` / `model_regions`. It does not add a deployment-environment
+label: one Chisei instance is one environment. Per-model review state overrides
+the family. Admission enforcement is #1494.

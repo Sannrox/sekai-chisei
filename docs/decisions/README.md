@@ -127,3 +127,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0103: The plane admits scheduled and change-triggered transform runs](0103-transform-schedule-and-dependency-graph.md)
 - [ADR 0104: Per-namespace object change generation keys the privacy scan cache](0104-namespace-object-change-generation.md)
 - [ADR 0105: Partitioned streaming I/O for governed transforms](0105-partitioned-transform-io.md)
+- [ADR 0106: Namespace-scoped model review state and family enablement](0106-namespace-model-review-state.md)

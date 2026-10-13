@@ -241,6 +241,19 @@ and `routing_profile_pinned`, so an unpinned plan still records the route it
 took. This catalog is not the gateway's `chisei.provider-capabilities/v1`
 matrix, and the two are not interchangeable.
 
+### Model review state (#1493)
+
+`ChiseiService.SetModelReview`, `RevokeModelReview`, `ListModelReviews`,
+`SetModelFamilyEnablement`, `RevokeModelFamilyEnablement`, and
+`ListModelFamilyEnablement` (experimental) persist per-namespace review state
+under contract `chisei.model-review/v1`. The empty namespace is the instance
+default; a named namespace overrides it. Identity is provider, canonical model,
+and optional artifact digest. Family enablement is per namespace and
+`ResidencyPolicy` region label; a per-model row overrides the family. Named
+namespaces require namespace administration; the empty namespace requires
+credential admin (`root` / `local`). Route admission enforcement is #1494.
+`sekaictl admin model-review` is the operator CLI.
+
 ### Customer-hosted profiles (#1171)
 
 `ChiseiService.PutRoutingProfile` and `RevokeRoutingProfile` (experimental)
