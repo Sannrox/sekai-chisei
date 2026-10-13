@@ -30,6 +30,7 @@ use sekai_chisei::grpc::pb::chisei::{
     ChatMessage, ExecutePlanRequest, ExecutionInput, GetEffectivePolicySummaryRequest,
     GetOperationReceiptRequest, ListKiokuCandidatesRequest, ListRoutingProfilesRequest,
     PlanExecutionRequest, RecordUsageRequest, SetBudgetLimitRequest,
+    SetModelFamilyEnablementRequest,
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
@@ -355,6 +356,28 @@ impl NativeServer {
         ChiseiServiceClient::new(self.channel().await)
     }
 
+    async fn enable_review_families(&self) {
+        let mut chisei = self.chisei().await;
+        for family in ["openai", "ollama", "anthropic", "xai", "native"] {
+            let mut request = Request::new(SetModelFamilyEnablementRequest {
+                namespace: String::new(),
+                region_label: String::new(),
+                family_id: family.into(),
+                status: "enabled".into(),
+                reason: "smoke fixture".into(),
+            });
+            request
+                .metadata_mut()
+                .insert("x-principal", "local".parse().unwrap());
+            chisei
+                .set_model_family_enablement(request)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("enable {family} model review: {error}\n{}", self.logs())
+                });
+        }
+    }
+
     async fn channel(&self) -> sekai_chisei::grpc::client::GatewayClient {
         connect_sekai(&self.socket_str())
             .await
@@ -465,6 +488,7 @@ fn stdout(output: &Output) -> String {
 async fn mocked_server() -> (FakeLlm, NativeServer) {
     let fake = FakeLlm::spawn().await;
     let server = NativeServer::spawn_with_ollama(Some(&fake.url));
+    server.enable_review_families().await;
     (fake, server)
 }
 

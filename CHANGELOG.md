@@ -10,9 +10,15 @@
   `sekaictl admin model-review` set, revoke, and list with a decision-ledger
   reason. Operators run a one-shot backfill to mark currently routed hosted
   families and registry-canonical policy models `enabled` when still
-  `disallowed`. Route admission
-  still defaults to admit until #1494. Adds ADR 0106 and PostgreSQL migration
+  `disallowed`. Adds ADR 0106 and PostgreSQL migration
   `0061_chisei_model_review` (#1493).
+
+- Route admission default-denies any model that is not `enabled` for the
+  namespace, #1352 identity, and `ResidencyPolicy` region: native planning
+  and execution, gateway decide, and customer-hosted routes. Refusals use a
+  stable reason (`model_review.not_enabled` or
+  `model_review.residency_mismatch`) and a decision-ledger row. Backfilled
+  routes keep working (#1494).
 
 - Governed transforms stream claim reads inside a byte bound, persist
   optional dataset `partition_keys`, and write named partitions atomically.

@@ -96,17 +96,16 @@ impl ChiseiServiceImpl {
             .input
             .as_ref()
             .ok_or_else(|| Status::data_loss("content execution input missing"))?;
-        let provider = crate::llm::provider_name(&execution.resolved_model).to_string();
-        let effective_policy = self.policy.effective_policy(&input.namespace);
+        let namespace = input.namespace.clone();
+        let resolved_model = execution.resolved_model.clone();
+        let planning_actor = execution.planning_actor.clone();
+        let provider = crate::llm::provider_name(&resolved_model).to_string();
+        let effective_policy = self.policy.effective_policy(&namespace);
         let data_class = self.data_class(effective_policy.as_ref());
         self.policy
-            .enforce_residency(
-                &input.namespace,
-                &provider,
-                &execution.resolved_model,
-                data_class.as_str(),
-            )
+            .enforce_residency(&namespace, &provider, &resolved_model, data_class.as_str())
             .map_err(Status::permission_denied)?;
+        self.enforce_model_review_admission(&namespace, &resolved_model, &planning_actor)?;
 
         let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
         let provider_is_safe =
@@ -321,145 +320,182 @@ impl ChiseiServiceImpl {
                 .map_err(Status::internal)?;
             return Err(Status::permission_denied(error));
         }
-        self.enforce_execution_provider_privacy(&execution, &input, &actor, &provider, data_class)?;
-        if !has_content_disclosure_evidence(&execution, &plan.content_messages, &provider) {
-            record_failed_operation_on(
-                self.db.runtime(),
-                &execution,
-                &actor,
-                "egress_evidence_missing",
-            )
-            .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "content execution plan missing disclosure evidence",
-            ));
-        }
-        self.enforce_execution_payload_privacy(&execution, &input, &actor, &provider, data_class)?;
-        let resolved_text = domain_messages
-            .iter()
-            .flat_map(|message| &message.parts)
-            .filter_map(|part| match &part.payload {
-                DomainPayload::Text(text) => Some(text.as_str()),
-                DomainPayload::Bytes(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let leak_findings = self.leak_findings_for_payload(
-            &input.namespace,
-            &provider,
-            data_class,
-            &resolved_text,
-        )?;
-        if !leak_findings.is_empty() {
-            self.record_leak_audit(
-                "content_leak_check",
-                &input.request_id,
-                &provider,
-                &leak_findings,
-            );
-            record_failed_operation_on(
-                self.db.runtime(),
-                &execution,
-                &actor,
-                "content_leak_check_denied",
-            )
-            .map_err(Status::internal)?;
-            return Err(Status::permission_denied(
-                "privacy policy requires content redaction or blocking",
-            ));
-        }
-        self.record_egress_audit(
-            "execute_content",
-            &input.request_id,
-            &provider,
-            &execution.resolved_model,
-            &execution.egress_decisions,
-        );
+        let provider_stream = self
+            .with_execution_registry(
+                async {
+                    if let Err(status) = self.enforce_model_review_admission(
+                        &input.namespace,
+                        &execution.resolved_model,
+                        &actor,
+                    ) {
+                        record_failed_operation_on(
+                            self.db.runtime(),
+                            &execution,
+                            &actor,
+                            "model_review_denied",
+                        )
+                        .map_err(Status::internal)?;
+                        return Err(status);
+                    }
+                    self.enforce_execution_provider_privacy(
+                        &execution, &input, &actor, &provider, data_class,
+                    )?;
+                    if !has_content_disclosure_evidence(
+                        &execution,
+                        &plan.content_messages,
+                        &provider,
+                    ) {
+                        record_failed_operation_on(
+                            self.db.runtime(),
+                            &execution,
+                            &actor,
+                            "egress_evidence_missing",
+                        )
+                        .map_err(Status::internal)?;
+                        return Err(Status::failed_precondition(
+                            "content execution plan missing disclosure evidence",
+                        ));
+                    }
+                    self.enforce_execution_payload_privacy(
+                        &execution, &input, &actor, &provider, data_class,
+                    )?;
+                    let resolved_text = domain_messages
+                        .iter()
+                        .flat_map(|message| &message.parts)
+                        .filter_map(|part| match &part.payload {
+                            DomainPayload::Text(text) => Some(text.as_str()),
+                            DomainPayload::Bytes(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let leak_findings = self.leak_findings_for_payload(
+                        &input.namespace,
+                        &provider,
+                        data_class,
+                        &resolved_text,
+                    )?;
+                    if !leak_findings.is_empty() {
+                        self.record_leak_audit(
+                            "content_leak_check",
+                            &input.request_id,
+                            &provider,
+                            &leak_findings,
+                        );
+                        record_failed_operation_on(
+                            self.db.runtime(),
+                            &execution,
+                            &actor,
+                            "content_leak_check_denied",
+                        )
+                        .map_err(Status::internal)?;
+                        return Err(Status::permission_denied(
+                            "privacy policy requires content redaction or blocking",
+                        ));
+                    }
+                    self.record_egress_audit(
+                        "execute_content",
+                        &input.request_id,
+                        &provider,
+                        &execution.resolved_model,
+                        &execution.egress_decisions,
+                    );
 
-        let hosted = if provider == "hosted" {
-            match self.admit_hosted_execution(
-                &input.namespace,
-                &execution.resolved_model,
-                context.is_some(),
-            ) {
-                Ok(hosted) => Some(hosted),
-                Err(status) => {
+                    let hosted = if provider == "hosted" {
+                        match self.admit_hosted_execution(
+                            &input.namespace,
+                            &execution.resolved_model,
+                            context.is_some(),
+                            &actor,
+                        ) {
+                            Ok(hosted) => Some(hosted),
+                            Err(status) => {
+                                record_failed_operation_on(
+                                    self.db.runtime(),
+                                    &execution,
+                                    &actor,
+                                    "hosted_route_unavailable",
+                                )
+                                .map_err(Status::internal)?;
+                                return Err(status);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    {
+                        let mut plans = self
+                            .planned_content_executions
+                            .lock()
+                            .expect("planned content executions poisoned");
+                        plans
+                            .remove(requested_plan_id)
+                            .ok_or_else(|| Status::not_found("content execution plan not found"))?;
+                    }
+
+                    self.invalidate_ineligible_execution_memory_holdouts(
+                        &execution.plan_id,
+                        &actor,
+                        &execution.memory_holdouts,
+                    )?;
+                    self.record_execution_memory_injections(
+                        &execution.plan_id,
+                        &actor,
+                        &execution.memory_references,
+                    )?;
+                    let normalized_user_id = if input.user_id.is_empty() {
+                        "default".to_string()
+                    } else {
+                        input.user_id.clone()
+                    };
+                    let mut system = execution.prepared_system.clone();
+                    if !execution.enriched_spec.trim().is_empty() {
+                        if !system.is_empty() {
+                            system.push_str("\n\n");
+                        }
+                        system.push_str("[Task spec]\n");
+                        system.push_str(&execution.enriched_spec);
+                    }
+                    let provider_request = ProviderContentExecutionRequest {
+                        model: execution.resolved_model.clone(),
+                        system,
+                        messages: domain_messages,
+                        tools: execution.tools.clone(),
+                        max_tokens: execution.max_tokens,
+                        user_id: Some(normalized_user_id),
+                        hosted,
+                    };
+                    match execute_native_content_request_stream(
+                        &self.config,
+                        self.budget.clone(),
+                        self.db.runtime(),
+                        context.as_ref(),
+                        provider_request,
+                    )
+                    .await
+                    {
+                        Ok(stream) => Ok(stream),
+                        Err(status) => {
+                            record_failed_operation_on(
+                                self.db.runtime(),
+                                &execution,
+                                &actor,
+                                "content_stream_start_failed",
+                            )
+                            .map_err(Status::internal)?;
+                            Err(status)
+                        }
+                    }
+                },
+                || {
                     record_failed_operation_on(
                         self.db.runtime(),
                         &execution,
                         &actor,
-                        "hosted_route_unavailable",
+                        "content_stream_start_failed",
                     )
-                    .map_err(Status::internal)?;
-                    return Err(status);
-                }
-            }
-        } else {
-            None
-        };
-        {
-            let mut plans = self
-                .planned_content_executions
-                .lock()
-                .expect("planned content executions poisoned");
-            plans
-                .remove(requested_plan_id)
-                .ok_or_else(|| Status::not_found("content execution plan not found"))?;
-        }
-
-        self.invalidate_ineligible_execution_memory_holdouts(
-            &execution.plan_id,
-            &actor,
-            &execution.memory_holdouts,
-        )?;
-        self.record_execution_memory_injections(
-            &execution.plan_id,
-            &actor,
-            &execution.memory_references,
-        )?;
-        let normalized_user_id = if input.user_id.is_empty() {
-            "default".to_string()
-        } else {
-            input.user_id.clone()
-        };
-        let mut system = execution.prepared_system.clone();
-        if !execution.enriched_spec.trim().is_empty() {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str("[Task spec]\n");
-            system.push_str(&execution.enriched_spec);
-        }
-        let provider_request = ProviderContentExecutionRequest {
-            model: execution.resolved_model.clone(),
-            system,
-            messages: domain_messages,
-            tools: execution.tools.clone(),
-            max_tokens: execution.max_tokens,
-            user_id: Some(normalized_user_id),
-            hosted,
-        };
-        let provider_stream = match execute_native_content_request_stream(
-            &self.config,
-            self.budget.clone(),
-            self.db.runtime(),
-            context.as_ref(),
-            provider_request,
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(status) => {
-                record_failed_operation_on(
-                    self.db.runtime(),
-                    &execution,
-                    &actor,
-                    "content_stream_start_failed",
-                )
-                .map_err(Status::internal)?;
-                return Err(status);
-            }
-        };
+                },
+            )
+            .await?;
         let attempt_started_at_ms = chrono::Utc::now().timestamp_millis();
         let db = self.db.clone();
         let evolve_history = self.evolve_history.clone();

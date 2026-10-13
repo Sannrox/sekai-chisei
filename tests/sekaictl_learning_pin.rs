@@ -307,6 +307,29 @@ async fn an_activated_learning_pinned_on_the_next_plan_is_cited_and_fails_closed
     seed_learning(&Server::db_path(dir.path()), "verified-op");
     let ollama = fake_ollama().await;
     let server = Server::spawn(dir, &ollama);
+    for family in ["openai", "ollama", "anthropic", "xai", "native"] {
+        let output = server.sekaictl(&[
+            "admin",
+            "model-review",
+            "family-set",
+            "--namespace",
+            "",
+            "--family",
+            family,
+            "--status",
+            "enabled",
+            "--reason",
+            "learning-pin fixture",
+            "--actor",
+            "local",
+        ]);
+        assert!(
+            output.status.success(),
+            "enable {family}: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            server.logs()
+        );
+    }
 
     // The first plan is the verified operation; its receipt is the evidence.
     let first = plan(&server, "verified-op", NAMESPACE, None)

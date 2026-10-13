@@ -501,6 +501,16 @@ impl PolicyResolver {
         self.residency.get(namespace)
     }
 
+    /// Region label used for family enablement lookup (#1494). Empty when no
+    /// residency policy tags the provider or model.
+    pub fn admission_region(&self, namespace: &str, provider: &str, model: &str) -> String {
+        self.residency
+            .evaluate_namespace(namespace, provider, model, "unclassified")
+            .ok()
+            .and_then(|decision| decision.model_region.or(decision.provider_region))
+            .unwrap_or_default()
+    }
+
     /// Fail closed when a residency policy is configured for the namespace.
     pub fn enforce_residency(
         &self,

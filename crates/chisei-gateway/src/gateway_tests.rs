@@ -179,6 +179,8 @@ async fn gateway_errors_include_stable_codes() {
         ("usage_recovery_required", "request_conflict"),
         ("governance_precondition", "request_conflict"),
         ("unsupported_cross_provider_route", "capability_unsupported"),
+        ("residency_denied", "policy_denied"),
+        ("model_review_denied", "policy_denied"),
     ] {
         assert_eq!(stable_gateway_error_code(legacy), stable);
     }
@@ -3313,14 +3315,13 @@ async fn spawn_control_plane_from_db(
 ) -> (String, Arc<RuntimeDb>) {
     let sekai_store = sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone());
     let sekai_svc = SekaiServiceImpl::new(sekai_store.clone());
-    let chisei_svc = ChiseiServiceImpl::new(
-        sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db.clone()),
-        config,
-    )
-    .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(
-        sekai_store,
-    ))
-    .unwrap();
+    let chisei_store = sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db.clone());
+    let _ = sekai_chisei::chisei::model_review::enable_registry_provider_families(&chisei_store);
+    let chisei_svc = ChiseiServiceImpl::new(chisei_store, config)
+        .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(
+            sekai_store,
+        ))
+        .unwrap();
     chisei_svc.seed_allow_by_default_context_admission(&["default", "sekai-chisei"]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

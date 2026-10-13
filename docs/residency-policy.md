@@ -68,4 +68,5 @@ single-plane control-plane configuration today.
 Family enablement is keyed by namespace and a region label taken from
 `provider_regions` / `model_regions`. It does not add a deployment-environment
 label: one Chisei instance is one environment. Per-model review state overrides
-the family. Admission enforcement is #1494.
+the family. Route admission (#1494) uses that region label and default-denies
+unless the effective state is `enabled`.

@@ -39,6 +39,7 @@ impl ChiseiServiceImpl {
         namespace: &str,
         model: &str,
         enterprise: bool,
+        actor: &str,
     ) -> Result<HostedExecution, Status> {
         use crate::chisei::routing_profiles as profiles;
         if enterprise {
@@ -92,6 +93,7 @@ impl ChiseiServiceImpl {
         let endpoint = profiles::hosted_endpoints(std::slice::from_ref(&profile))
             .pop()
             .ok_or_else(unavailable)?;
+        self.enforce_model_review_admission(namespace, model, actor)?;
         Ok(HostedExecution {
             endpoint,
             credential: crate::enterprise::SecretValue::new(secret),
@@ -267,90 +269,132 @@ impl ChiseiServiceImpl {
                 .map_err(Status::internal)?;
             return Err(Status::permission_denied(error));
         }
-        self.enforce_execution_provider_privacy(&plan, &input, &actor, &provider, data_class)?;
-        if crate::chisei::egress::is_external_provider(&provider)
-            && plan.egress_decisions.is_empty()
-        {
-            record_failed_operation_on(self.db.runtime(), &plan, &actor, "egress_evidence_missing")
-                .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "external execution plan missing egress decisions",
-            ));
-        }
-        let normalized_user_id = if input.user_id.is_empty() {
-            "default".to_string()
-        } else {
-            input.user_id.clone()
-        };
-        self.enforce_execution_payload_privacy(&plan, &input, &actor, &provider, data_class)?;
-        self.record_egress_audit(
-            "execute_context",
-            &input.request_id,
-            &provider,
-            &plan.resolved_model,
-            &plan.egress_decisions,
-        );
-        let hosted = if provider == "hosted" {
-            match self.admit_hosted_execution(
-                &input.namespace,
-                &plan.resolved_model,
-                context.is_some(),
-            ) {
-                Ok(hosted) => Some(hosted),
-                Err(status) => {
+        let chat_stream = self
+            .with_execution_registry(
+                async {
+                    if let Err(status) = self.enforce_model_review_admission(
+                        &input.namespace,
+                        &plan.resolved_model,
+                        &actor,
+                    ) {
+                        record_failed_operation_on(
+                            self.db.runtime(),
+                            &plan,
+                            &actor,
+                            "model_review_denied",
+                        )
+                        .map_err(Status::internal)?;
+                        return Err(status);
+                    }
+                    self.enforce_execution_provider_privacy(
+                        &plan, &input, &actor, &provider, data_class,
+                    )?;
+                    if crate::chisei::egress::is_external_provider(&provider)
+                        && plan.egress_decisions.is_empty()
+                    {
+                        record_failed_operation_on(
+                            self.db.runtime(),
+                            &plan,
+                            &actor,
+                            "egress_evidence_missing",
+                        )
+                        .map_err(Status::internal)?;
+                        return Err(Status::failed_precondition(
+                            "external execution plan missing egress decisions",
+                        ));
+                    }
+                    let normalized_user_id = if input.user_id.is_empty() {
+                        "default".to_string()
+                    } else {
+                        input.user_id.clone()
+                    };
+                    self.enforce_execution_payload_privacy(
+                        &plan, &input, &actor, &provider, data_class,
+                    )?;
+                    self.record_egress_audit(
+                        "execute_context",
+                        &input.request_id,
+                        &provider,
+                        &plan.resolved_model,
+                        &plan.egress_decisions,
+                    );
+                    let hosted = if provider == "hosted" {
+                        match self.admit_hosted_execution(
+                            &input.namespace,
+                            &plan.resolved_model,
+                            context.is_some(),
+                            &actor,
+                        ) {
+                            Ok(hosted) => Some(hosted),
+                            Err(status) => {
+                                record_failed_operation_on(
+                                    self.db.runtime(),
+                                    &plan,
+                                    &actor,
+                                    "hosted_route_unavailable",
+                                )
+                                .map_err(Status::internal)?;
+                                return Err(status);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let llm_req = ProviderExecutionRequest {
+                        model: plan.resolved_model.clone(),
+                        system: plan.prepared_system.clone(),
+                        messages: plan.prepared_messages.clone(),
+                        tools: plan.tools.clone(),
+                        max_tokens: plan.max_tokens,
+                        user_id: Some(normalized_user_id),
+                        hosted,
+                    };
+                    self.invalidate_ineligible_execution_memory_holdouts(
+                        &plan.plan_id,
+                        &actor,
+                        &plan.memory_holdouts,
+                    )?;
+                    self.record_execution_memory_injections(
+                        &plan.plan_id,
+                        &actor,
+                        &plan.memory_references,
+                    )?;
+
+                    let cacheable_message_count =
+                        native_cacheable_message_count(&input, &plan.prepared_messages);
+                    match execute_native_chat_request_stream(
+                        &self.config,
+                        self.budget.clone(),
+                        self.db.runtime(),
+                        context.as_ref(),
+                        llm_req,
+                        cacheable_message_count,
+                    )
+                    .await
+                    {
+                        Ok(stream) => Ok(stream),
+                        Err(status) => {
+                            record_failed_operation_on(
+                                self.db.runtime(),
+                                &plan,
+                                &actor,
+                                "model_stream_start_failed",
+                            )
+                            .map_err(Status::internal)?;
+                            Err(status)
+                        }
+                    }
+                },
+                || {
                     record_failed_operation_on(
                         self.db.runtime(),
                         &plan,
                         &actor,
-                        "hosted_route_unavailable",
+                        "model_stream_start_failed",
                     )
-                    .map_err(Status::internal)?;
-                    return Err(status);
-                }
-            }
-        } else {
-            None
-        };
-        let llm_req = ProviderExecutionRequest {
-            model: plan.resolved_model.clone(),
-            system: plan.prepared_system.clone(),
-            messages: plan.prepared_messages.clone(),
-            tools: plan.tools.clone(),
-            max_tokens: plan.max_tokens,
-            user_id: Some(normalized_user_id),
-            hosted,
-        };
-        self.invalidate_ineligible_execution_memory_holdouts(
-            &plan.plan_id,
-            &actor,
-            &plan.memory_holdouts,
-        )?;
-        self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
-
-        let cacheable_message_count =
-            native_cacheable_message_count(&input, &plan.prepared_messages);
-        let chat_stream = match execute_native_chat_request_stream(
-            &self.config,
-            self.budget.clone(),
-            self.db.runtime(),
-            context.as_ref(),
-            llm_req,
-            cacheable_message_count,
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(status) => {
-                record_failed_operation_on(
-                    self.db.runtime(),
-                    &plan,
-                    &actor,
-                    "model_stream_start_failed",
-                )
-                .map_err(Status::internal)?;
-                return Err(status);
-            }
-        };
+                },
+            )
+            .await?;
         let db = self.db.clone();
         let evolve_history = self.evolve_history.clone();
         let request_id = input.request_id.clone();

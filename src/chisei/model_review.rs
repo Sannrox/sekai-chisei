@@ -7,9 +7,13 @@
 //! and per `ResidencyPolicy` region label; a per-model row overrides its
 //! family in the same namespace. A named namespace is resolved (model, then
 //! family) before the instance default. Default is `disallowed`. Route
-//! admission enforcement is #1494.
+//! admission (#1494) refuses any model that is not `enabled` for the
+//! namespace, identity, and residency region before a provider call.
 
 use std::collections::{BTreeSet, HashMap};
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use crate::chisei::decision_ledger::Decision;
 use crate::chisei::model_availability::AvailableModel;
@@ -24,8 +28,18 @@ pub const ACTION_SET: &str = "model_review.set";
 pub const ACTION_REVOKE: &str = "model_review.revoke";
 pub const ACTION_FAMILY_SET: &str = "model_family.set";
 pub const ACTION_FAMILY_REVOKE: &str = "model_family.revoke";
+pub const ACTION_ADMIT_DENIED: &str = "model_review.admit_denied";
+pub const REFUSAL_NOT_ENABLED: &str = "model_review.not_enabled";
+pub const REFUSAL_RESIDENCY_MISMATCH: &str = "model_review.residency_mismatch";
 const BACKFILL_ACTOR: &str = "chisei.model-review.backfill";
 const BACKFILL_REASON: &str = "currently routed at review-state introduction";
+const TEST_SEED_ACTOR: &str = "chisei.model-review.test-seed";
+const TEST_SEED_REASON: &str = "test fixture registry family enablement";
+
+#[cfg(test)]
+thread_local! {
+    static SKIP_REGISTRY_FAMILY_SEED: Cell<bool> = const { Cell::new(false) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelReviewStatus {
@@ -295,6 +309,246 @@ pub fn effective_review_status(
         }
     }
     ModelReviewStatus::Disallowed
+}
+
+/// Stable admission refusal. `reason` is the public code; `status` is the
+/// effective review state that was not `enabled`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRefusal {
+    pub reason: &'static str,
+    pub status: ModelReviewStatus,
+    pub namespace: String,
+    pub provider: String,
+    pub model: String,
+    pub region: String,
+}
+
+impl AdmissionRefusal {
+    pub fn as_str(&self) -> &'static str {
+        self.reason
+    }
+
+    pub fn matches_message(message: &str) -> bool {
+        message.starts_with(REFUSAL_NOT_ENABLED) || message.starts_with(REFUSAL_RESIDENCY_MISMATCH)
+    }
+
+    pub fn message(&self) -> String {
+        format!(
+            "{}: model {}/{} is {} for namespace {:?} region {:?}",
+            self.reason,
+            self.provider,
+            self.model,
+            self.status.as_str(),
+            self.namespace,
+            self.region
+        )
+    }
+}
+
+/// Resolve a planned model id to the #1352 identity used by review rows.
+/// Hosted ids stay identifiable when the request-scoped registry snapshot is
+/// not installed (live execute re-admits from the stored plan).
+pub fn identity_from_model(model: &str) -> Result<ModelIdentity, String> {
+    identity_from_registry(
+        model,
+        &crate::provider_profile::provider_registry_snapshot(),
+    )
+}
+
+pub fn identity_from_registry(
+    model: &str,
+    registry: &crate::provider_profile::ProviderRegistry,
+) -> Result<ModelIdentity, String> {
+    match registry.resolve_model(model) {
+        Ok(resolved) => Ok(identity_from_resolved(&resolved, registry)),
+        Err(error) => {
+            let Some(provider) = crate::provider_profile::hosted_provider_of(model) else {
+                return Err(error);
+            };
+            let digest = registry
+                .profile(provider)
+                .and_then(|profile| profile.artifact_digest.clone())
+                .unwrap_or_default();
+            Ok(ModelIdentity {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                upstream_model: model.to_string(),
+                profile_version: String::new(),
+                artifact_digest: (!digest.is_empty()).then_some(digest),
+                endpoint: String::new(),
+            })
+        }
+    }
+}
+
+fn identity_from_resolved(
+    resolved: &crate::provider_profile::ResolvedProviderModel,
+    registry: &crate::provider_profile::ProviderRegistry,
+) -> ModelIdentity {
+    let digest = registry
+        .profile(&resolved.provider)
+        .and_then(|profile| profile.artifact_digest.clone())
+        .unwrap_or_default();
+    ModelIdentity {
+        provider: resolved.provider.clone(),
+        model: resolved.canonical_model.clone(),
+        upstream_model: resolved.upstream_model.clone(),
+        profile_version: resolved.profile_version.clone(),
+        artifact_digest: (!digest.is_empty()).then_some(digest),
+        endpoint: String::new(),
+    }
+}
+
+fn load_review_state(
+    db: &ChiseiStore,
+    namespace: &str,
+) -> Result<(Vec<ModelReviewRecord>, Vec<FamilyEnablementRecord>), String> {
+    let mut models = list_model_reviews(db, namespace)?;
+    let mut families = list_family_enablement(db, namespace)?;
+    if !namespace.is_empty() {
+        models.extend(list_model_reviews(db, "")?);
+        families.extend(list_family_enablement(db, "")?);
+    }
+    Ok((models, families))
+}
+
+fn family_enabled_in_other_region(
+    families: &[FamilyEnablementRecord],
+    namespace: &str,
+    identity: &ModelIdentity,
+    region: &str,
+) -> bool {
+    families.iter().any(|record| {
+        record.status == ModelReviewStatus::Enabled
+            && !record.region_label.is_empty()
+            && record.region_label != region
+            && (record.namespace == namespace || record.namespace.is_empty())
+            && family_specificity(identity, &record.family_id).is_some()
+    })
+}
+
+fn audit_admission_refusal(
+    db: &ChiseiStore,
+    actor: &str,
+    identity: &ModelIdentity,
+    namespace: &str,
+    region: &str,
+    refusal: &AdmissionRefusal,
+) -> Result<(), String> {
+    db.record_decision(&Decision {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: actor.to_string(),
+        action: ACTION_ADMIT_DENIED.into(),
+        reason: refusal.reason.into(),
+        evidence: HashMap::from([
+            ("contract_version".into(), MODEL_REVIEW_CONTRACT.into()),
+            ("namespace".into(), namespace.into()),
+            ("provider".into(), identity.provider.clone()),
+            ("model".into(), identity.model.clone()),
+            (
+                "artifact_digest".into(),
+                identity.artifact_digest.clone().unwrap_or_default(),
+            ),
+            ("region".into(), region.into()),
+            ("status".into(), refusal.status.as_str().into()),
+            ("refusal".into(), refusal.reason.into()),
+        ]),
+        target_id: format!(
+            "model-review-admit:{}:{}:{}:{}:{}",
+            namespace,
+            identity.provider,
+            identity.model,
+            identity.artifact_digest.as_deref().unwrap_or(""),
+            region
+        ),
+        outcome: "denied".into(),
+    })
+}
+
+/// Default-deny route admission: only `enabled` proceeds. Every refusal is
+/// written to the decision ledger.
+pub fn admit_enabled_route(
+    db: &ChiseiStore,
+    namespace: &str,
+    identity: &ModelIdentity,
+    region: &str,
+    actor: &str,
+) -> Result<(), AdmissionRefusal> {
+    let refusal_for = |status: ModelReviewStatus, reason: &'static str| AdmissionRefusal {
+        reason,
+        status,
+        namespace: namespace.into(),
+        provider: identity.provider.clone(),
+        model: identity.model.clone(),
+        region: region.into(),
+    };
+    let (models, families) = match load_review_state(db, namespace) {
+        Ok(state) => state,
+        Err(_) => {
+            let refusal = refusal_for(ModelReviewStatus::Disallowed, REFUSAL_NOT_ENABLED);
+            let _ = audit_admission_refusal(db, actor, identity, namespace, region, &refusal);
+            return Err(refusal);
+        }
+    };
+    let status = effective_review_status(&models, &families, namespace, identity, region);
+    if status == ModelReviewStatus::Enabled {
+        return Ok(());
+    }
+    let reason = if family_enabled_in_other_region(&families, namespace, identity, region) {
+        REFUSAL_RESIDENCY_MISMATCH
+    } else {
+        REFUSAL_NOT_ENABLED
+    };
+    let refusal = refusal_for(status, reason);
+    let _ = audit_admission_refusal(db, actor, identity, namespace, region, &refusal);
+    Err(refusal)
+}
+
+/// Enable every provider in the live registry as an unscoped instance-default
+/// family. Library and process tests use this so existing routes keep working
+/// after default-deny; operators run `sekaictl admin model-review backfill`.
+pub fn enable_registry_provider_families(db: &ChiseiStore) -> Result<usize, String> {
+    let mut written = 0;
+    for profile in crate::provider_profile::provider_registry_snapshot().profiles {
+        let record = FamilyEnablementRecord {
+            namespace: String::new(),
+            region_label: String::new(),
+            family_id: profile.provider,
+            status: ModelReviewStatus::Enabled,
+            actor: TEST_SEED_ACTOR.into(),
+            reason: TEST_SEED_REASON.into(),
+            updated_at_ms: 1,
+        };
+        record.validate()?;
+        if db.insert_family_enablement_record_if_absent(&record)? {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+#[cfg(test)]
+pub(crate) fn without_registry_family_seed<T>(f: impl FnOnce() -> T) -> T {
+    SKIP_REGISTRY_FAMILY_SEED.with(|flag| {
+        let previous = flag.replace(true);
+        struct Reset<'a> {
+            flag: &'a Cell<bool>,
+            previous: bool,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.flag.set(self.previous);
+            }
+        }
+        let _reset = Reset { flag, previous };
+        f()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn registry_family_seed_skipped() -> bool {
+    SKIP_REGISTRY_FAMILY_SEED.with(Cell::get)
 }
 
 fn model_status(
@@ -1653,5 +1907,115 @@ mod tests {
         assert!(decisions.iter().any(|row| row.action == ACTION_SET));
         assert!(decisions.iter().any(|row| row.action == ACTION_REVOKE));
         assert!(decisions.iter().all(|row| !row.reason.is_empty()));
+    }
+
+    #[test]
+    fn unreviewed_model_is_refused_and_audited() {
+        let db = ChiseiStore::memory();
+        let identity = identity("gpt-4", None);
+        let error = admit_enabled_route(&db, "sales", &identity, "", "alice").unwrap_err();
+        assert_eq!(error.reason, REFUSAL_NOT_ENABLED);
+        assert_eq!(error.status, ModelReviewStatus::Disallowed);
+        let decisions = db
+            .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+                actor: Some("alice".into()),
+                action: Some(ACTION_ADMIT_DENIED.into()),
+                target_id: None,
+                after: 0,
+                limit: 10,
+                offset: 0,
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].reason, REFUSAL_NOT_ENABLED);
+        assert_eq!(decisions[0].outcome, "denied");
+    }
+
+    #[test]
+    fn enabled_model_is_admitted() {
+        let db = ChiseiStore::memory();
+        set_model_review(
+            &db,
+            model_row("sales", "gpt-4", "", ModelReviewStatus::Enabled),
+        )
+        .unwrap();
+        admit_enabled_route(&db, "sales", &identity("gpt-4", None), "", "alice").unwrap();
+        let decisions = db
+            .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+                actor: Some("alice".into()),
+                action: Some(ACTION_ADMIT_DENIED.into()),
+                target_id: None,
+                after: 0,
+                limit: 10,
+                offset: 0,
+            })
+            .unwrap();
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn residency_mismatch_is_refused_even_when_the_family_is_enabled() {
+        let db = ChiseiStore::memory();
+        set_family_enablement(
+            &db,
+            family_row("sales", "openai", "us", ModelReviewStatus::Enabled),
+        )
+        .unwrap();
+        let error =
+            admit_enabled_route(&db, "sales", &identity("gpt-4", None), "eu", "alice").unwrap_err();
+        assert_eq!(error.reason, REFUSAL_RESIDENCY_MISMATCH);
+        let decisions = db
+            .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+                actor: Some("alice".into()),
+                action: Some(ACTION_ADMIT_DENIED.into()),
+                target_id: None,
+                after: 0,
+                limit: 10,
+                offset: 0,
+            })
+            .unwrap();
+        assert_eq!(decisions[0].reason, REFUSAL_RESIDENCY_MISMATCH);
+    }
+
+    #[test]
+    fn hosted_identity_uses_the_same_admission_check() {
+        let db = ChiseiStore::memory();
+        let identity = hosted_identity("hosted.acme/widget-1");
+        let error = admit_enabled_route(&db, "sales", &identity, "", "alice").unwrap_err();
+        assert_eq!(error.reason, REFUSAL_NOT_ENABLED);
+        set_family_enablement(
+            &db,
+            family_row("sales", "hosted.acme", "", ModelReviewStatus::Enabled),
+        )
+        .unwrap();
+        admit_enabled_route(&db, "sales", &identity, "", "alice").unwrap();
+    }
+
+    #[test]
+    fn identity_from_model_keeps_hosted_ids_without_a_registry_snapshot() {
+        let identity = identity_from_model("hosted.acme/widget-1").unwrap();
+        assert_eq!(identity.provider, "hosted.acme");
+        assert_eq!(identity.model, "hosted.acme/widget-1");
+    }
+
+    #[test]
+    fn backfilled_family_keeps_the_route_admitted() {
+        let db = ChiseiStore::memory();
+        let hosted = hosted_acme(&["widget-*"]);
+        backfill_enabled_if_empty(
+            &db,
+            &[],
+            &family_from_hosted(std::slice::from_ref(&hosted)),
+            1,
+        )
+        .unwrap();
+        admit_enabled_route(
+            &db,
+            "sales",
+            &hosted_identity("hosted.acme/widget-1"),
+            "",
+            "alice",
+        )
+        .unwrap();
     }
 }

@@ -277,10 +277,13 @@ async fn grpc_chat_round_trip_with_local_ollama() {
 
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(ChiseiServiceServer::new(ChiseiServiceImpl::new(
-                sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
-                config,
-            )))
+            .add_service(ChiseiServiceServer::new({
+                let chisei_store = sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db);
+                let _ = sekai_chisei::chisei::model_review::enable_registry_provider_families(
+                    &chisei_store,
+                );
+                ChiseiServiceImpl::new(chisei_store, config)
+            }))
             .serve(addr)
             .await
             .expect("serve test gRPC server");
@@ -413,10 +416,14 @@ async fn delegation_chain_keeps_private_context_local() {
     let server_db = db.clone();
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(ChiseiServiceServer::new(ChiseiServiceImpl::new(
-                sekai_chisei::db::store::ChiseiStore::from_shared_runtime(server_db),
-                config,
-            )))
+            .add_service(ChiseiServiceServer::new({
+                let chisei_store =
+                    sekai_chisei::db::store::ChiseiStore::from_shared_runtime(server_db);
+                let _ = sekai_chisei::chisei::model_review::enable_registry_provider_families(
+                    &chisei_store,
+                );
+                ChiseiServiceImpl::new(chisei_store, config)
+            }))
             .serve(addr)
             .await
             .expect("serve test gRPC server");
