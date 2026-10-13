@@ -1143,12 +1143,11 @@ pub(super) async fn list_routing_profiles(
     let hosted = hosted_profiles_for(service, &namespace)?;
     let profiles = crate::chisei::routing_profiles::list_routing_profiles(&registry)
         .into_iter()
-        .map(|profile| routing_profile_to_proto(profile, None))
-        .chain(
-            hosted
-                .iter()
-                .map(|profile| routing_profile_to_proto(profile.entry(), Some(profile))),
-        )
+        .map(|profile| routing_profile_to_proto(profile, String::new()))
+        .chain(hosted.into_iter().map(|profile| {
+            let origin = profile.endpoint_origin.clone();
+            routing_profile_to_proto(profile.entry(), origin)
+        }))
         .collect();
     Ok(Response::new(ListRoutingProfilesResponse {
         profiles,
@@ -1156,10 +1155,9 @@ pub(super) async fn list_routing_profiles(
     }))
 }
 
-/// `hosted` carries the customer-hosted fields; provider entries have none.
 fn routing_profile_to_proto(
     profile: crate::chisei::routing_profiles::RoutingProfileEntry,
-    hosted: Option<&crate::chisei::routing_profiles::HostedRoutingProfile>,
+    endpoint_origin: String,
 ) -> RoutingProfile {
     RoutingProfile {
         profile_id: profile.profile_id,
@@ -1167,12 +1165,7 @@ fn routing_profile_to_proto(
         runtime: profile.runtime,
         model_patterns: profile.model_patterns,
         lifecycle: profile.lifecycle,
-        endpoint_origin: hosted
-            .map(|hosted| hosted.endpoint_origin.clone())
-            .unwrap_or_default(),
-        artifact_digest: hosted
-            .and_then(|hosted| hosted.artifact_digest.clone())
-            .unwrap_or_default(),
+        endpoint_origin,
     }
 }
 
@@ -1239,7 +1232,6 @@ pub(super) async fn put_routing_profile(
             endpoint_url: request.endpoint_url,
             model_patterns: request.model_patterns,
             credential_ref: request.credential_ref,
-            artifact_digest: request.artifact_digest,
         },
         &service.config.routing_endpoint_allowlist,
         |reference| {
@@ -1257,8 +1249,9 @@ pub(super) async fn put_routing_profile(
         .db
         .put_hosted_routing_profile(&profile)
         .map_err(|_| Status::internal("routing profile unavailable"))?;
+    let origin = profile.endpoint_origin.clone();
     Ok(Response::new(PutRoutingProfileResponse {
-        profile: Some(routing_profile_to_proto(profile.entry(), Some(&profile))),
+        profile: Some(routing_profile_to_proto(profile.entry(), origin)),
     }))
 }
 
