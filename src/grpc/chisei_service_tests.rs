@@ -12121,6 +12121,7 @@ async fn unreviewed_hosted_route_is_refused_at_planning() {
         endpoint_url: "https://models.example.com".into(),
         model_patterns: vec!["acme-*".into()],
         credential_ref: "ACME".into(),
+        artifact_digest: String::new(),
     }))
     .await
     .unwrap();
