@@ -79,4 +79,30 @@ impl PostgresDb {
             .map(|updated| updated == 1)
             .map_err(|error| error.to_string())
     }
+
+    pub fn list_all_hosted_routing_profiles(&self) -> Result<Vec<HostedRoutingProfile>, String> {
+        self.connection()?
+            .query(
+                "SELECT namespace, profile_id, endpoint_origin, model_patterns_json, credential_ref,
+                        registered_by, registered_at_ms
+                 FROM chisei_routing_profiles
+                 WHERE revoked_at_ms IS NULL
+                 ORDER BY namespace, profile_id",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                Ok(HostedRoutingProfile {
+                    namespace: row.get(0),
+                    profile_id: row.get(1),
+                    endpoint_origin: row.get(2),
+                    model_patterns: decode_model_patterns(&row.get::<_, String>(3))?,
+                    credential_ref: row.get(4),
+                    registered_by: row.get(5),
+                    registered_at_ms: row.get(6),
+                })
+            })
+            .collect()
+    }
 }

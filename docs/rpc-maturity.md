@@ -249,6 +249,12 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `ChiseiService.ListRoutingProfiles` | `chisei.provider_registry` | yes | none | `experimental` |
 | `ChiseiService.PutRoutingProfile` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.RevokeRoutingProfile` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.SetModelReview` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.RevokeModelReview` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.ListModelReviews` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.SetModelFamilyEnablement` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.RevokeModelFamilyEnablement` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.ListModelFamilyEnablement` | `chisei.policy` | yes | cli | `experimental` |
 | `ChiseiService.PlanExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.ExecutePlanStream` | `chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.PlanContentExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk | `stable` |

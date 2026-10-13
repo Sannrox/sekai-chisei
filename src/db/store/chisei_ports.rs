@@ -614,6 +614,22 @@ chisei_store_trait! {
 }
 
 chisei_store_trait! {
+    /// Per-namespace model review state and family enablement (#1493).
+    pub trait ChiseiModelReviewStore {
+        fn put_model_review_record(&self, record: &crate::chisei::model_review::ModelReviewRecord) -> Result<(), String>;
+        fn insert_model_review_record_if_absent(&self, record: &crate::chisei::model_review::ModelReviewRecord) -> Result<bool, String>;
+        fn get_model_review_record(&self, namespace: &str, provider: &str, model: &str, artifact_digest: &str) -> Result<Option<crate::chisei::model_review::ModelReviewRecord>, String>;
+        fn list_model_review_records(&self, namespace: &str) -> Result<Vec<crate::chisei::model_review::ModelReviewRecord>, String>;
+        fn put_family_enablement_record(&self, record: &crate::chisei::model_review::FamilyEnablementRecord) -> Result<(), String>;
+        fn insert_family_enablement_record_if_absent(&self, record: &crate::chisei::model_review::FamilyEnablementRecord) -> Result<bool, String>;
+        fn get_family_enablement_record(&self, namespace: &str, region_label: &str, family_id: &str) -> Result<Option<crate::chisei::model_review::FamilyEnablementRecord>, String>;
+        fn list_family_enablement_records(&self, namespace: &str) -> Result<Vec<crate::chisei::model_review::FamilyEnablementRecord>, String>;
+        fn model_review_row_count(&self) -> Result<i64, String>;
+        fn family_enablement_row_count(&self) -> Result<i64, String>;
+    }
+}
+
+chisei_store_trait! {
     /// Hosted routing profiles.
     pub trait ChiseiRoutingProfileStore {
         fn list_hosted_routing_profiles(&self, namespace: &str) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String>;

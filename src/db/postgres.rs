@@ -115,6 +115,7 @@ const NAMESPACE_OBJECT_GENERATION_SCHEMA: &str =
     include_str!("postgres/0059_namespace_object_generation.sql");
 const PARTITIONED_TRANSFORM_IO_SCHEMA: &str =
     include_str!("postgres/0060_partitioned_transform_io.sql");
+const CHISEI_MODEL_REVIEW_SCHEMA: &str = include_str!("postgres/0061_chisei_model_review.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -509,6 +510,12 @@ const MIGRATIONS: &[Migration] = &[
         "partitioned_transform_io",
         PARTITIONED_TRANSFORM_IO_SCHEMA,
         MigrationOwner::Sekai,
+    ),
+    mig(
+        60,
+        "chisei_model_review",
+        CHISEI_MODEL_REVIEW_SCHEMA,
+        MigrationOwner::Chisei,
     ),
 ];
 
