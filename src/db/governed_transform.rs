@@ -1182,6 +1182,7 @@ fn parse_admitted_definition(
     Ok(transform)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_run_input_snapshot(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -1434,6 +1435,7 @@ pub(crate) fn list_row_records_after(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_computed_output(
     tx: &Transaction<'_>,
     transform: &GovernedTransform,
@@ -1654,18 +1656,16 @@ pub(crate) fn redact_transform_partition_receipts(
                  FROM sekai_governed_transform_run",
             )
             .map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        rows
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
     };
     for (run_id, input_json, output_json) in rows {
         let mut input_partitions = parse_partition_json(input_json);
@@ -5552,7 +5552,9 @@ mod tests {
         dataset
     }
 
-    fn east_west_rows() -> (Vec<HashMap<String, String>>, Vec<HashMap<String, String>>) {
+    type DatasetRows = Vec<HashMap<String, String>>;
+
+    fn east_west_rows() -> (DatasetRows, DatasetRows) {
         (
             vec![HashMap::from([
                 ("id".into(), "1".into()),
@@ -5791,7 +5793,7 @@ mod tests {
             .unwrap();
         assert_eq!(west_live.get("id").map(String::as_str), Some("2"));
         assert_eq!(
-            crate::sekai::governed_transform::rows_digest(&[west_live.clone()]),
+            crate::sekai::governed_transform::rows_digest(std::slice::from_ref(west_live)),
             west_digest
         );
         let _ = merged;

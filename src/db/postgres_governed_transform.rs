@@ -717,6 +717,7 @@ fn live_output_rows_pg(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_computed_output_pg(
     tx: &mut postgres::Transaction<'_>,
     transform: &GovernedTransform,
@@ -1517,6 +1518,7 @@ fn parse_admitted_definition(
     Ok(transform)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_run_input_snapshot_pg(
     tx: &mut postgres::Transaction<'_>,
     run_id: &str,
@@ -2515,7 +2517,9 @@ mod tests {
         dataset
     }
 
-    fn east_west_rows() -> (Vec<HashMap<String, String>>, Vec<HashMap<String, String>>) {
+    type DatasetRows = Vec<HashMap<String, String>>;
+
+    fn east_west_rows() -> (DatasetRows, DatasetRows) {
         (
             vec![HashMap::from([
                 ("id".into(), "1".into()),
@@ -3958,7 +3962,7 @@ mod tests {
             .unwrap();
         assert_eq!(west_live.get("id").map(String::as_str), Some("2"));
         assert_eq!(
-            crate::sekai::governed_transform::rows_digest(&[west_live.clone()]),
+            crate::sekai::governed_transform::rows_digest(std::slice::from_ref(west_live)),
             west_digest
         );
     }
