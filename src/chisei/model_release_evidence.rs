@@ -626,10 +626,10 @@ pub fn identity_from_hosted_profile(
         endpoint: profile.evidence_endpoint.clone(),
     };
     identity.validate()?;
-    if let Some(digest) = profile.artifact_digest.as_deref() {
-        if digest != identity.artifact_digest {
-            return Err("evidence_artifact_digest must match the profile artifact_digest".into());
-        }
+    if let Some(digest) = profile.artifact_digest.as_deref()
+        && digest != identity.artifact_digest
+    {
+        return Err("evidence_artifact_digest must match the profile artifact_digest".into());
     }
     Ok(Some(identity))
 }

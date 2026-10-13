@@ -238,13 +238,13 @@ pub fn admit_hosted_profile(
                 ));
             }
         }
-        if let Some(digest) = artifact_digest.as_deref() {
-            if digest != input.evidence_artifact_digest.trim() {
-                return Err(
-                    "invalid_argument: evidence_artifact_digest must match artifact_digest when both are set"
-                        .into(),
-                );
-            }
+        if let Some(digest) = artifact_digest.as_deref()
+            && digest != input.evidence_artifact_digest.trim()
+        {
+            return Err(
+                "invalid_argument: evidence_artifact_digest must match artifact_digest when both are set"
+                    .into(),
+            );
         }
     }
     Ok(HostedRoutingProfile {
