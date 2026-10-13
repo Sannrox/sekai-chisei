@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Merging a definition proposal that changes an agent-definition member
+  requires a current, non-revoked, baseline-passing certification bound to
+  the candidate revision (ADR 0079). Missing, stale, failed, or revoked
+  evidence is `failed_precondition`. Direct publish of an agent member is
+  still refused. Experimental `PutDefinitionCertification` and
+  `GetDefinitionCertificationGate` bind and report that gate. Adds PostgreSQL
+  migration `0064_agent_definition_certification` (`GATE:mig`, #1353).
+
 - Opt-in customer-hosted routes can require current Tenkai-signed runtime
   evidence (`tenkai.model_runtime_evidence.v1`) before admission. Chisei
   verifies signatures against installed trust roots, ledgers which evidence

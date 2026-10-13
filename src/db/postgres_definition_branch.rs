@@ -26,6 +26,7 @@ impl PostgresDb {
         if !revision.published {
             return Err("seed revision must be published".into());
         }
+        crate::sekai::agent_promotion::refuse_direct_agent_publication(revision)?;
         validate_revision_members(revision, members)?;
         let mut connection = self.connection()?;
         let mut transaction = connection
@@ -540,6 +541,18 @@ impl PostgresDb {
             &candidate,
             &candidate_members,
         )?;
+        let bound = get_agent_definition_certification_postgres(
+            &mut transaction,
+            &proposal.namespace,
+            &candidate.revision_digest,
+            true,
+        )?;
+        crate::sekai::agent_promotion::require_agent_promotion(
+            &published_revision.members,
+            &candidate.members,
+            bound.as_ref(),
+            now_ms,
+        )?;
         let receipt_id = merge_receipt_id(
             &proposal.namespace,
             &proposal.proposal_id,
@@ -950,6 +963,116 @@ fn mark_revision_published_postgres(
         return Err("definition_revision_not_found: candidate revision is unavailable".into());
     }
     Ok(published)
+}
+
+fn get_agent_definition_certification_postgres(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    revision_digest: &str,
+    for_update: bool,
+) -> Result<Option<crate::sekai::agent_promotion::AgentDefinitionCertification>, String> {
+    let lock = if for_update { " FOR UPDATE" } else { "" };
+    Ok(client
+        .query_opt(
+            &format!(
+                "SELECT suite_id, certification_id, baseline_status, latest_status,
+                        expires_at_ms, revoked_at_ms, bound_by, bound_at_ms
+                 FROM sekai_agent_definition_certifications
+                 WHERE namespace=$1 AND revision_digest=$2{lock}"
+            ),
+            &[&namespace, &revision_digest],
+        )
+        .map_err(|error| error.to_string())?
+        .map(
+            |row| crate::sekai::agent_promotion::AgentDefinitionCertification {
+                namespace: namespace.into(),
+                revision_digest: revision_digest.into(),
+                suite_id: row.get(0),
+                certification_id: row.get(1),
+                baseline_status: row.get(2),
+                latest_status: row.get(3),
+                expires_at_ms: row.get(4),
+                revoked_at_ms: row.get(5),
+                bound_by: row.get(6),
+                bound_at_ms: row.get(7),
+            },
+        ))
+}
+
+impl PostgresDb {
+    pub fn put_agent_definition_certification(
+        &self,
+        certification: &crate::sekai::agent_promotion::AgentDefinitionCertification,
+    ) -> Result<(), String> {
+        certification.validate()?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_published_head(&mut transaction, &certification.namespace)?;
+        transaction
+            .execute(
+                "INSERT INTO sekai_agent_definition_certifications (
+                    namespace, revision_digest, suite_id, certification_id,
+                    baseline_status, latest_status, expires_at_ms, revoked_at_ms,
+                    bound_by, bound_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (namespace, revision_digest) DO UPDATE SET
+                    suite_id=EXCLUDED.suite_id,
+                    certification_id=EXCLUDED.certification_id,
+                    baseline_status=EXCLUDED.baseline_status,
+                    latest_status=EXCLUDED.latest_status,
+                    expires_at_ms=EXCLUDED.expires_at_ms,
+                    revoked_at_ms=EXCLUDED.revoked_at_ms,
+                    bound_by=EXCLUDED.bound_by,
+                    bound_at_ms=EXCLUDED.bound_at_ms",
+                &[
+                    &certification.namespace,
+                    &certification.revision_digest,
+                    &certification.suite_id,
+                    &certification.certification_id,
+                    &certification.baseline_status,
+                    &certification.latest_status,
+                    &certification.expires_at_ms,
+                    &certification.revoked_at_ms,
+                    &certification.bound_by,
+                    &certification.bound_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn get_agent_definition_certification(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<crate::sekai::agent_promotion::AgentDefinitionCertification>, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT suite_id, certification_id, baseline_status, latest_status,
+                        expires_at_ms, revoked_at_ms, bound_by, bound_at_ms
+                 FROM sekai_agent_definition_certifications
+                 WHERE namespace=$1 AND revision_digest=$2",
+                &[&namespace, &revision_digest],
+            )
+            .map_err(|error| error.to_string())?
+            .map(
+                |row| crate::sekai::agent_promotion::AgentDefinitionCertification {
+                    namespace: namespace.into(),
+                    revision_digest: revision_digest.into(),
+                    suite_id: row.get(0),
+                    certification_id: row.get(1),
+                    baseline_status: row.get(2),
+                    latest_status: row.get(3),
+                    expires_at_ms: row.get(4),
+                    revoked_at_ms: row.get(5),
+                    bound_by: row.get(6),
+                    bound_at_ms: row.get(7),
+                },
+            ))
+    }
 }
 
 fn load_revision_postgres(

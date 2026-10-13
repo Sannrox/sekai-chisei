@@ -1338,6 +1338,45 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_agent_definition_certification(
+        &self,
+        certification: &crate::sekai::agent_promotion::AgentDefinitionCertification,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::put_agent_definition_certification(
+                db.as_ref(),
+                certification,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::put_agent_definition_certification(
+                    db.as_ref(),
+                    certification,
+                )
+            }),
+        }
+    }
+
+    pub fn get_agent_definition_certification(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<crate::sekai::agent_promotion::AgentDefinitionCertification>, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::get_agent_definition_certification(
+                db.as_ref(),
+                namespace,
+                revision_digest,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::get_agent_definition_certification(
+                    db.as_ref(),
+                    namespace,
+                    revision_digest,
+                )
+            }),
+        }
+    }
+
     pub fn put_governed_subject_provenance_export(
         &self,
         actor: &str,

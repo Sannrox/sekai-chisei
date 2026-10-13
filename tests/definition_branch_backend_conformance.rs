@@ -2,6 +2,10 @@ use std::sync::{Arc, Barrier};
 
 use sekai_chisei::db::definition_branch::DefinitionBranchBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_chisei::sekai::agent_promotion::{
+    AgentDefinitionCertification, REFUSAL_FAILED, REFUSAL_MISSING, REFUSAL_REVOKED, REFUSAL_STALE,
+    STATUS_FAIL, STATUS_PASS,
+};
 use sekai_chisei::sekai::definition_branch::{
     ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput, DefinitionMemberRef,
     DefinitionRevisionMember, DefinitionWriteResult, branch_pin_digest, prepare_revision,
@@ -1138,7 +1142,7 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
             branch_id: "feature".into(),
             proposal_id: "agent-proposal".into(),
             base_digest: parent.clone(),
-            candidate_digest: second.revision.revision_digest,
+            candidate_digest: second.revision.revision_digest.clone(),
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "agent-propose".into(),
@@ -1169,13 +1173,99 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
             9,
         )
         .unwrap_err();
-    assert_eq!(error, "agent_promotion_requires_certification");
+    assert_eq!(error, REFUSAL_MISSING);
     assert_eq!(
         db.get_published_definition_revision(namespace)
             .unwrap()
             .unwrap()
             .revision_digest,
         parent
+    );
+    let mut certification = AgentDefinitionCertification {
+        namespace: namespace.into(),
+        revision_digest: second.revision.revision_digest.clone(),
+        suite_id: "agent-suite".into(),
+        certification_id: "agent-cert".into(),
+        baseline_status: STATUS_PASS.into(),
+        latest_status: STATUS_PASS.into(),
+        expires_at_ms: 1_000,
+        revoked_at_ms: 0,
+        bound_by: "reviewer".into(),
+        bound_at_ms: 9,
+    };
+    certification.revoked_at_ms = 4;
+    db.put_agent_definition_certification(&certification)
+        .unwrap();
+    assert_eq!(
+        db.merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "agent-proposal".into(),
+                expected_published_digest: parent.clone(),
+                idempotency_key: "agent-merge-revoked".into(),
+            },
+            "author",
+            9,
+        )
+        .unwrap_err(),
+        REFUSAL_REVOKED
+    );
+    certification.revoked_at_ms = 0;
+    certification.expires_at_ms = 9;
+    db.put_agent_definition_certification(&certification)
+        .unwrap();
+    assert_eq!(
+        db.merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "agent-proposal".into(),
+                expected_published_digest: parent.clone(),
+                idempotency_key: "agent-merge-stale".into(),
+            },
+            "author",
+            9,
+        )
+        .unwrap_err(),
+        REFUSAL_STALE
+    );
+    certification.expires_at_ms = 1_000;
+    certification.latest_status = STATUS_FAIL.into();
+    db.put_agent_definition_certification(&certification)
+        .unwrap();
+    assert_eq!(
+        db.merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "agent-proposal".into(),
+                expected_published_digest: parent.clone(),
+                idempotency_key: "agent-merge-failed".into(),
+            },
+            "author",
+            9,
+        )
+        .unwrap_err(),
+        REFUSAL_FAILED
+    );
+    certification.latest_status = STATUS_PASS.into();
+    db.put_agent_definition_certification(&certification)
+        .unwrap();
+    db.merge_definition_proposal(
+        &MergeDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "agent-proposal".into(),
+            expected_published_digest: parent.clone(),
+            idempotency_key: "agent-merge-certified".into(),
+        },
+        "author",
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        second.revision.revision_digest
     );
     let prepared = agent.prepare(namespace).unwrap();
     assert!(
@@ -1189,7 +1279,7 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
             }],
             true,
             "author",
-            10
+            11
         )
         .unwrap_err()
         .contains("agent_promotion_requires_certification")

@@ -238,10 +238,17 @@ corrupt or incorrectly bound content returns a generic Internal status.
 
 The RPC is experimental and disabled unless the server sets
 `SEKAI_EXPERIMENTAL_RPCS=1` or builds with `experimental-rpcs`. This does not change
-credential scopes or resource grants. Agent-containing revisions cannot be
-published or merged: `agent_promotion_requires_certification` preserves the
-[certification decision](decisions/0079-evaluation-promotion-gate.md) until its
-promotion integration is delivered. See [ADR 0093](decisions/0093-agent-drafts-use-definition-members.md).
+credential scopes or resource grants. Merging a proposal that changes an
+agent-definition member requires a current, non-revoked, baseline-passing
+certification bound to the candidate revision
+([ADR 0079](decisions/0079-evaluation-promotion-gate.md)). Missing, stale,
+failed, or revoked evidence is `failed_precondition` with a stable
+`agent_promotion_*` reason. Direct publish of an agent member is still
+refused. `PutDefinitionCertification` binds a snapshot to the candidate
+revision; `GetDefinitionCertificationGate` reports the same admitted or
+refused state the merge uses. Proposals that do not change agent members are
+unchanged.
+See [ADR 0093](decisions/0093-agent-drafts-use-definition-members.md).
 
 ### Scoped draft authoring
 

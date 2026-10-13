@@ -104,6 +104,17 @@ pub trait DefinitionBranchBackend: Send + Sync {
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String>;
+
+    fn put_agent_definition_certification(
+        &self,
+        certification: &crate::sekai::agent_promotion::AgentDefinitionCertification,
+    ) -> Result<(), String>;
+
+    fn get_agent_definition_certification(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<crate::sekai::agent_promotion::AgentDefinitionCertification>, String>;
 }
 
 macro_rules! forward {
@@ -224,6 +235,21 @@ macro_rules! forward {
         ) -> Result<DefinitionWriteResult, String> {
             <$target>::close_definition_proposal(self, request, actor, now_ms)
         }
+
+        fn put_agent_definition_certification(
+            &self,
+            certification: &crate::sekai::agent_promotion::AgentDefinitionCertification,
+        ) -> Result<(), String> {
+            <$target>::put_agent_definition_certification(self, certification)
+        }
+
+        fn get_agent_definition_certification(
+            &self,
+            namespace: &str,
+            revision_digest: &str,
+        ) -> Result<Option<crate::sekai::agent_promotion::AgentDefinitionCertification>, String> {
+            <$target>::get_agent_definition_certification(self, namespace, revision_digest)
+        }
     };
 }
 
@@ -324,6 +350,20 @@ impl SekaiDb {
                 CREATE INDEX IF NOT EXISTS idx_definition_proposal_branch
                     ON sekai_definition_proposals(namespace, branch_id, created_at_ms, proposal_id);
 
+                CREATE TABLE IF NOT EXISTS sekai_agent_definition_certifications (
+                    namespace TEXT NOT NULL,
+                    revision_digest TEXT NOT NULL,
+                    suite_id TEXT NOT NULL,
+                    certification_id TEXT NOT NULL,
+                    baseline_status TEXT NOT NULL,
+                    latest_status TEXT NOT NULL,
+                    expires_at_ms INTEGER NOT NULL,
+                    revoked_at_ms INTEGER NOT NULL DEFAULT 0,
+                    bound_by TEXT NOT NULL,
+                    bound_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY(namespace, revision_digest)
+                );
+
                 INSERT OR IGNORE INTO sekai_definition_published_heads (
                     namespace, revision_digest, updated_at_ms
                 )
@@ -408,6 +448,7 @@ impl SekaiDb {
         if !revision.published {
             return Err("seed revision must be published".into());
         }
+        crate::sekai::agent_promotion::refuse_direct_agent_publication(revision)?;
         validate_revision_members(revision, members)?;
         let mut connection = self.conn();
         let transaction = connection
@@ -883,6 +924,17 @@ impl SekaiDb {
             &candidate,
             &candidate_members,
         )?;
+        let bound = get_agent_definition_certification_sqlite(
+            &transaction,
+            &proposal.namespace,
+            &candidate.revision_digest,
+        )?;
+        crate::sekai::agent_promotion::require_agent_promotion(
+            &published_revision.members,
+            &candidate.members,
+            bound.as_ref(),
+            now_ms,
+        )?;
         let receipt_id = merge_receipt_id(
             &proposal.namespace,
             &proposal.proposal_id,
@@ -1083,6 +1135,87 @@ fn insert_revision_sqlite(
         )
         .map_err(|error| error.to_string())?;
     Ok(revision.clone())
+}
+
+fn get_agent_definition_certification_sqlite(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    revision_digest: &str,
+) -> Result<Option<crate::sekai::agent_promotion::AgentDefinitionCertification>, String> {
+    connection
+        .query_row(
+            "SELECT suite_id, certification_id, baseline_status, latest_status,
+                    expires_at_ms, revoked_at_ms, bound_by, bound_at_ms
+             FROM sekai_agent_definition_certifications
+             WHERE namespace=?1 AND revision_digest=?2",
+            params![namespace, revision_digest],
+            |row| {
+                Ok(
+                    crate::sekai::agent_promotion::AgentDefinitionCertification {
+                        namespace: namespace.into(),
+                        revision_digest: revision_digest.into(),
+                        suite_id: row.get(0)?,
+                        certification_id: row.get(1)?,
+                        baseline_status: row.get(2)?,
+                        latest_status: row.get(3)?,
+                        expires_at_ms: row.get(4)?,
+                        revoked_at_ms: row.get(5)?,
+                        bound_by: row.get(6)?,
+                        bound_at_ms: row.get(7)?,
+                    },
+                )
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+impl SekaiDb {
+    pub fn put_agent_definition_certification(
+        &self,
+        certification: &crate::sekai::agent_promotion::AgentDefinitionCertification,
+    ) -> Result<(), String> {
+        certification.validate()?;
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_agent_definition_certifications (
+                    namespace, revision_digest, suite_id, certification_id,
+                    baseline_status, latest_status, expires_at_ms, revoked_at_ms,
+                    bound_by, bound_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(namespace, revision_digest) DO UPDATE SET
+                    suite_id=excluded.suite_id,
+                    certification_id=excluded.certification_id,
+                    baseline_status=excluded.baseline_status,
+                    latest_status=excluded.latest_status,
+                    expires_at_ms=excluded.expires_at_ms,
+                    revoked_at_ms=excluded.revoked_at_ms,
+                    bound_by=excluded.bound_by,
+                    bound_at_ms=excluded.bound_at_ms",
+                params![
+                    certification.namespace,
+                    certification.revision_digest,
+                    certification.suite_id,
+                    certification.certification_id,
+                    certification.baseline_status,
+                    certification.latest_status,
+                    certification.expires_at_ms,
+                    certification.revoked_at_ms,
+                    certification.bound_by,
+                    certification.bound_at_ms,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn get_agent_definition_certification(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<crate::sekai::agent_promotion::AgentDefinitionCertification>, String> {
+        get_agent_definition_certification_sqlite(&self.conn(), namespace, revision_digest)
+    }
 }
 
 fn load_revision_sqlite(

@@ -122,6 +122,155 @@ pub(super) async fn get_definition_member(
     }))
 }
 
+fn to_proto_definition_certification_gate(
+    gate: &crate::sekai::agent_promotion::AgentPromotionGate,
+) -> DefinitionCertificationGate {
+    DefinitionCertificationGate {
+        namespace: gate.namespace.clone(),
+        revision_digest: gate.revision_digest.clone(),
+        suite_id: gate.suite_id.clone(),
+        certification_id: gate.certification_id.clone(),
+        certification_status: gate.certification_status.clone(),
+        baseline_status: gate.baseline_status.clone(),
+        latest_status: gate.latest_status.clone(),
+        expires_at_ms: gate.expires_at_ms,
+        admitted: gate.admitted,
+        refusal: gate.refusal.clone(),
+    }
+}
+
+pub(super) async fn put_definition_certification(
+    service: &SekaiServiceImpl,
+    req: Request<PutDefinitionCertificationRequest>,
+) -> Result<Response<PutDefinitionCertificationResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    definition_branch_domain::validate_digest("revision_digest", &input.revision_digest)
+        .map_err(Status::invalid_argument)?;
+    authorize_definition_revision(
+        service,
+        &principals,
+        &input.namespace,
+        &input.revision_digest,
+        false,
+    )?;
+    let candidate = service
+        .db
+        .runtime()
+        .get_definition_revision(&input.namespace, &input.revision_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?
+        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    for member in &candidate.members {
+        if member.member_kind != crate::sekai::agent_promotion::MEMBER_KIND_AGENT {
+            continue;
+        }
+        authorize_definition_member_write(
+            service,
+            &principals,
+            &member.member_kind,
+            &member.member_id,
+        )?;
+    }
+    let actor = principals
+        .first()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    // #1353 binds an operator snapshot to the candidate. Merge admits that
+    // snapshot; it does not re-run suites or resolve a separate envelope.
+    let certification = crate::sekai::agent_promotion::AgentDefinitionCertification {
+        namespace: input.namespace,
+        revision_digest: input.revision_digest,
+        suite_id: input.suite_id,
+        certification_id: input.certification_id,
+        baseline_status: input.baseline_status,
+        latest_status: input.latest_status,
+        expires_at_ms: input.expires_at_ms,
+        revoked_at_ms: input.revoked_at_ms,
+        bound_by: actor.clone(),
+        bound_at_ms: now_millis(),
+    };
+    certification.validate().map_err(Status::invalid_argument)?;
+    service
+        .db
+        .runtime()
+        .put_agent_definition_certification(&certification)
+        .map_err(Status::internal)?;
+    let gate = certification.gate(now_millis());
+    Ok(Response::new(PutDefinitionCertificationResponse {
+        gate: Some(to_proto_definition_certification_gate(&gate)),
+    }))
+}
+
+pub(super) async fn get_definition_certification_gate(
+    service: &SekaiServiceImpl,
+    req: Request<GetDefinitionCertificationGateRequest>,
+) -> Result<Response<GetDefinitionCertificationGateResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    definition_branch_domain::validate_digest("revision_digest", &input.revision_digest)
+        .map_err(Status::invalid_argument)?;
+    authorize_definition_revision(
+        service,
+        &principals,
+        &input.namespace,
+        &input.revision_digest,
+        false,
+    )
+    .map_err(|status| match status.code() {
+        tonic::Code::NotFound => Status::not_found("definition resource unavailable"),
+        tonic::Code::Internal => Status::internal("definition resource unavailable"),
+        _ => status,
+    })?;
+    let candidate = service
+        .db
+        .runtime()
+        .get_definition_revision(&input.namespace, &input.revision_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?
+        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    let published = service
+        .db
+        .runtime()
+        .get_published_definition_revision(&input.namespace)
+        .map_err(|_| Status::internal("definition resource unavailable"))?;
+    let from = published
+        .as_ref()
+        .map(|revision| revision.members.as_slice())
+        .unwrap_or(&[]);
+    let bound = service
+        .db
+        .runtime()
+        .get_agent_definition_certification(&input.namespace, &input.revision_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?;
+    let gate = crate::sekai::agent_promotion::promotion_gate(
+        from,
+        &candidate.members,
+        bound.as_ref(),
+        now_millis(),
+        &input.namespace,
+        &input.revision_digest,
+    );
+    Ok(Response::new(GetDefinitionCertificationGateResponse {
+        gate: Some(to_proto_definition_certification_gate(&gate)),
+    }))
+}
+
 pub(super) async fn get_definition_branch(
     service: &SekaiServiceImpl,
     req: Request<GetDefinitionBranchRequest>,

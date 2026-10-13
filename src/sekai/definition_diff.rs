@@ -212,7 +212,8 @@ pub fn classify_definition_revision_compatibility(
 const MERGE_GATED_KINDS: &[&str] = &["function", "policy", "transform"];
 
 /// Refuse merge when a function, transform, or policy change is breaking,
-/// or when any kind is unknown. The error names `compatibility_gate:{member_kind}`.
+/// or when a non-agent kind is unknown. Agent member changes are owned by
+/// ADR 0079 (`require_agent_promotion`), not `compatibility_gate:agent`.
 /// Breaking object-type and related kinds stay mergeable so checkpointed fact
 /// migration can target the published head.
 pub fn require_merge_compatibility(
@@ -221,21 +222,12 @@ pub fn require_merge_compatibility(
     to: &DefinitionRevision,
     to_members: &[DefinitionMember],
 ) -> Result<(), String> {
-    // ADR 0079: ordinary proposal approval cannot substitute for bound certification.
-    // Agent drafts cannot promote until a certification integration is delivered.
-    if from
-        .members
-        .iter()
-        .chain(&to.members)
-        .any(|member| member.member_kind == "agent")
-    {
-        return Err("agent_promotion_requires_certification".into());
-    }
     let report = classify_definition_revision_compatibility(from, from_members, to, to_members)?;
     let gate = report.reasons.iter().find(|reason| {
-        reason.class == "unknown"
-            || (reason.class == "breaking"
-                && MERGE_GATED_KINDS.contains(&reason.member_kind.as_str()))
+        reason.member_kind != crate::sekai::agent_promotion::MEMBER_KIND_AGENT
+            && (reason.class == "unknown"
+                || (reason.class == "breaking"
+                    && MERGE_GATED_KINDS.contains(&reason.member_kind.as_str())))
     });
     match gate {
         Some(reason) => Err(format!("compatibility_gate:{}", reason.member_kind)),
