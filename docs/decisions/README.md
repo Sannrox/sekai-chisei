@@ -128,3 +128,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0104: Per-namespace object change generation keys the privacy scan cache](0104-namespace-object-change-generation.md)
 - [ADR 0105: Partitioned streaming I/O for governed transforms](0105-partitioned-transform-io.md)
 - [ADR 0106: Namespace-scoped model review state and family enablement](0106-namespace-model-review-state.md)
+- [ADR 0107: Two-way model-release evidence for opt-in hosted routes](0107-model-release-evidence.md)

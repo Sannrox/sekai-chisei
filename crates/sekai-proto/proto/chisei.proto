@@ -974,6 +974,12 @@ message RoutingProfile {
   // (`sha256:<64 hex>`), or empty when unpinned. A claim used for enterprise
   // model admission, not evidence that the endpoint serves those weights.
   string artifact_digest = 7;
+  bool require_runtime_evidence = 8;
+  string evidence_provider = 9;
+  string evidence_model = 10;
+  string evidence_profile_version = 11;
+  string evidence_artifact_digest = 12;
+  string evidence_endpoint = 13;
 }
 message ListRoutingProfilesRequest { string namespace = 1; }
 // Registers or replaces a customer-hosted profile `hosted:<name>` in one
@@ -990,6 +996,12 @@ message PutRoutingProfileRequest {
   string credential_ref = 5;
   // Optional weights digest, `sha256:<64 lowercase hex>`; empty means unpinned.
   string artifact_digest = 6;
+  bool require_runtime_evidence = 7;
+  string evidence_provider = 8;
+  string evidence_model = 9;
+  string evidence_profile_version = 10;
+  string evidence_artifact_digest = 11;
+  string evidence_endpoint = 12;
 }
 message PutRoutingProfileResponse { RoutingProfile profile = 1; }
 message RevokeRoutingProfileRequest {
@@ -1062,6 +1074,36 @@ message ListModelFamilyEnablementResponse {
   repeated FamilyEnablementRecord records = 1;
   string contract_version = 2;
 }
+// Two-way model-release evidence (#1396). Operators install Tenkai trust
+// roots, ingest signed runtime evidence, and export signed evaluation
+// evidence. Opt-in on PutRoutingProfile; default routes stay unchanged.
+message ModelReleaseIdentity {
+  string provider = 1;
+  string model = 2;
+  string profile_version = 3;
+  string artifact_digest = 4;
+  string endpoint = 5;
+}
+message PutModelReleaseTrustRequest { string roots_json = 1; }
+message PutModelReleaseTrustResponse { string roots_json = 1; }
+message PutModelRuntimeEvidenceRequest { string evidence_json = 1; }
+message PutModelRuntimeEvidenceResponse { string evidence_json = 1; }
+message GetModelRuntimeEvidenceRequest { ModelReleaseIdentity identity = 1; }
+message GetModelRuntimeEvidenceResponse { string evidence_json = 1; }
+message ExportModelEvaluationEvidenceRequest {
+  ModelReleaseIdentity identity = 1;
+  string eval_suite_id = 2;
+  string baseline_run_id = 3;
+  string candidate_run_id = 4;
+  string eval_run_id = 5;
+}
+message ExportModelEvaluationEvidenceResponse { string evidence_json = 1; }
+message PutModelReleaseFeedbackRequest {
+  string namespace = 1;
+  ModelReleaseIdentity identity = 2;
+  string note = 3;
+}
+message PutModelReleaseFeedbackResponse { string id = 1; }
 message ListRoutingProfilesResponse {
   repeated RoutingProfile profiles = 1;
   string contract_version = 2;
@@ -1677,6 +1719,11 @@ service ChiseiService {
   rpc SetModelFamilyEnablement(SetModelFamilyEnablementRequest) returns (SetModelFamilyEnablementResponse);
   rpc RevokeModelFamilyEnablement(RevokeModelFamilyEnablementRequest) returns (RevokeModelFamilyEnablementResponse);
   rpc ListModelFamilyEnablement(ListModelFamilyEnablementRequest) returns (ListModelFamilyEnablementResponse);
+  rpc PutModelReleaseTrust(PutModelReleaseTrustRequest) returns (PutModelReleaseTrustResponse);
+  rpc PutModelRuntimeEvidence(PutModelRuntimeEvidenceRequest) returns (PutModelRuntimeEvidenceResponse);
+  rpc GetModelRuntimeEvidence(GetModelRuntimeEvidenceRequest) returns (GetModelRuntimeEvidenceResponse);
+  rpc ExportModelEvaluationEvidence(ExportModelEvaluationEvidenceRequest) returns (ExportModelEvaluationEvidenceResponse);
+  rpc PutModelReleaseFeedback(PutModelReleaseFeedbackRequest) returns (PutModelReleaseFeedbackResponse);
   // Executes a previously governed plan through the selected provider adapter.
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
   // Parallel fail-closed content path. Older servers return UNIMPLEMENTED.

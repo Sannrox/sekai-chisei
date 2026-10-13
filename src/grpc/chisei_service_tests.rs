@@ -10795,7 +10795,7 @@ async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed()
             endpoint_url: endpoint_url.into(),
             model_patterns: vec!["acme-*".into()],
             credential_ref: credential_ref.into(),
-            artifact_digest: String::new(),
+            ..Default::default()
         };
 
     // Registration refusals: not an admin, egress outside the allowlist, a
@@ -11090,7 +11090,7 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
                 endpoint_url: format!("{origin}/v1"),
                 model_patterns: vec!["acme-*".into()],
                 credential_ref: "ACME".into(),
-                artifact_digest: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -11284,7 +11284,7 @@ async fn customer_hosted_routes_serve_content_execution_from_live_state() {
                 endpoint_url: origin.clone(),
                 model_patterns: vec!["acme-*".into()],
                 credential_ref: "ACME".into(),
-                artifact_digest: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -11472,7 +11472,7 @@ async fn hosted_routes_never_fall_back_and_read_the_catalog_only_when_authorized
             endpoint_url: origin.clone(),
             model_patterns: vec!["acme-*".into()],
             credential_ref: "ACME".into(),
-            artifact_digest: String::new(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -11532,7 +11532,7 @@ async fn hosted_routes_never_fall_back_and_read_the_catalog_only_when_authorized
             endpoint_url: origin.clone(),
             model_patterns: vec!["acme-*".into()],
             credential_ref: "ACME".into(),
-            artifact_digest: String::new(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -11654,7 +11654,7 @@ async fn a_policy_mirrored_from_the_routing_list_admits_the_hosted_route() {
             endpoint_url: "https://models.example.com".into(),
             model_patterns: vec!["acme-*".into()],
             credential_ref: "ACME".into(),
-            artifact_digest: String::new(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -12216,7 +12216,7 @@ async fn unreviewed_hosted_route_is_refused_at_planning() {
         endpoint_url: "https://models.example.com".into(),
         model_patterns: vec!["acme-*".into()],
         credential_ref: "ACME".into(),
-        artifact_digest: String::new(),
+        ..Default::default()
     }))
     .await
     .unwrap();

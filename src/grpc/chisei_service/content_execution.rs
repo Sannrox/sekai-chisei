@@ -106,6 +106,11 @@ impl ChiseiServiceImpl {
             .enforce_residency(&namespace, &provider, &resolved_model, data_class.as_str())
             .map_err(Status::permission_denied)?;
         self.enforce_model_review_admission(&namespace, &resolved_model, &planning_actor)?;
+        self.enforce_model_release_evidence_admission(
+            &namespace,
+            &resolved_model,
+            &planning_actor,
+        )?;
 
         let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
         let provider_is_safe =
@@ -337,6 +342,7 @@ impl ChiseiServiceImpl {
                         .map_err(Status::internal)?;
                         return Err(status);
                     }
+                    // Hosted evidence is admitted from the loaded profile (#1186).
                     self.enforce_execution_provider_privacy(
                         &execution, &input, &actor, &provider, data_class,
                     )?;
@@ -413,7 +419,7 @@ impl ChiseiServiceImpl {
                                     self.db.runtime(),
                                     &execution,
                                     &actor,
-                                    "hosted_route_unavailable",
+                                    self.hosted_admission_failure_reason(&status),
                                 )
                                 .map_err(Status::internal)?;
                                 return Err(status);

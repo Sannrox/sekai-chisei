@@ -242,27 +242,29 @@ impl ChiseiServiceImpl {
             route_override: r.route_override.trim().to_string(),
             capability_requirements_json: r.capability_requirements_json.clone(),
         };
-        let (route, policy_resolution) =
-            match self.resolve_policy_for_actor(policy_request, &actor).await {
-                Ok(resolution) => {
-                    if !resolution.route_bias.trim().is_empty() {
-                        route_bias = resolution.route_bias.clone();
-                    }
-                    (
-                        Ok((
-                            resolution.runtime.clone(),
-                            resolution.model.clone(),
-                            resolution.policy_version.clone(),
-                        )),
-                        Some(resolution),
-                    )
+        let (route, policy_resolution) = match self
+            .resolve_policy_for_actor(policy_request, &actor)
+            .await
+        {
+            Ok(resolution) => {
+                if !resolution.route_bias.trim().is_empty() {
+                    route_bias = resolution.route_bias.clone();
                 }
-                Err(status) => {
-                    // Capability-document failures use FailedPrecondition so a
-                    // mixed native catalog or provider matrix is
-                    // capability_unsupported, not policy_denied. Model review
-                    // refusals stay a distinct deny reason.
-                    let reason = match status.code() {
+                (
+                    Ok((
+                        resolution.runtime.clone(),
+                        resolution.model.clone(),
+                        resolution.policy_version.clone(),
+                    )),
+                    Some(resolution),
+                )
+            }
+            Err(status) => {
+                // Capability-document failures use FailedPrecondition so a
+                // mixed native catalog or provider matrix is
+                // capability_unsupported, not policy_denied. Model review
+                // refusals stay a distinct deny reason.
+                let reason = match status.code() {
                         tonic::Code::ResourceExhausted => GatewayDecideDenyReason::BudgetDenied,
                         tonic::Code::FailedPrecondition => {
                             GatewayDecideDenyReason::CapabilityUnsupported
@@ -274,13 +276,20 @@ impl ChiseiServiceImpl {
                         {
                             GatewayDecideDenyReason::ModelReviewDenied
                         }
+                        tonic::Code::PermissionDenied
+                            if crate::chisei::model_release_evidence::ModelReleaseEvidenceFailure::matches_message(
+                                status.message(),
+                            ) =>
+                        {
+                            GatewayDecideDenyReason::ModelReleaseDenied
+                        }
                         tonic::Code::PermissionDenied => GatewayDecideDenyReason::ResidencyDenied,
                         tonic::Code::InvalidArgument => GatewayDecideDenyReason::PolicyDenied,
                         _ => GatewayDecideDenyReason::PolicyDenied,
                     };
-                    (Err((reason, status.message().to_string())), None)
-                }
-            };
+                (Err((reason, status.message().to_string())), None)
+            }
+        };
 
         let grant = budget_grant_id(
             &budget_subject,

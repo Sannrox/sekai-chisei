@@ -181,6 +181,7 @@ async fn gateway_errors_include_stable_codes() {
         ("unsupported_cross_provider_route", "capability_unsupported"),
         ("residency_denied", "policy_denied"),
         ("model_review_denied", "policy_denied"),
+        ("model_release_denied", "policy_denied"),
     ] {
         assert_eq!(stable_gateway_error_code(legacy), stable);
     }

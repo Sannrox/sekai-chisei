@@ -94,6 +94,7 @@ impl ChiseiServiceImpl {
             .pop()
             .ok_or_else(unavailable)?;
         self.enforce_model_review_admission(namespace, model, actor)?;
+        self.enforce_model_release_evidence_for_profile(&profile, model, actor)?;
         Ok(HostedExecution {
             endpoint,
             credential: crate::enterprise::SecretValue::new(secret),
@@ -286,6 +287,7 @@ impl ChiseiServiceImpl {
                         .map_err(Status::internal)?;
                         return Err(status);
                     }
+                    // Hosted evidence is admitted from the loaded profile (#1186).
                     self.enforce_execution_provider_privacy(
                         &plan, &input, &actor, &provider, data_class,
                     )?;
@@ -331,7 +333,7 @@ impl ChiseiServiceImpl {
                                     self.db.runtime(),
                                     &plan,
                                     &actor,
-                                    "hosted_route_unavailable",
+                                    self.hosted_admission_failure_reason(&status),
                                 )
                                 .map_err(Status::internal)?;
                                 return Err(status);

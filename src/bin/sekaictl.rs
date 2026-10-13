@@ -127,6 +127,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
         }
+        "model-release-evidence" => {
+            sekai_chisei::model_release_evidence_cli::run_model_release_evidence_command(
+                args.into_iter().skip(1).collect(),
+            )
+            .await
+        }
         "autonomy" => {
             sekai_chisei::autonomous_envelope_cli::run_autonomy_command(
                 args.into_iter().skip(1).collect(),
@@ -521,6 +527,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("lakehouse"), _) => ("lakehouse", 2),
         (Some("providers"), _) => ("providers", 2),
         (Some("model-review"), _) => ("model-review", 2),
+        (Some("model-release-evidence"), _) => ("model-release-evidence", 2),
         (Some("autonomy"), _) => ("autonomy", 2),
         (Some("store"), _) => ("store", 2),
         _ => return Err("unknown admin command".to_string()),
@@ -752,6 +759,9 @@ fn print_admin_usage() {
          Model review:\n\
            sekaictl admin model-review ...\n\
          \n\
+         Model-release evidence:\n\
+           sekaictl admin model-release-evidence ...\n\
+         \n\
          Autonomy:\n\
            sekaictl admin autonomy ...\n\
          \n\
@@ -801,6 +811,9 @@ fn expert_usage(command: &str) -> Option<String> {
         "lakehouse" => Some(sekai_chisei::lakehouse_snapshot_cli::usage().to_string()),
         "providers" => Some(sekai_chisei::model_platform_cli::usage().to_string()),
         "model-review" => Some(sekai_chisei::model_review_cli::usage().to_string()),
+        "model-release-evidence" => {
+            Some(sekai_chisei::model_release_evidence_cli::usage().to_string())
+        }
         "autonomy" => Some(sekai_chisei::autonomous_envelope_cli::usage().to_string()),
         "store" => Some(sekai_chisei::store_relocate::usage().to_string()),
         _ => None,
@@ -838,6 +851,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "lakehouse" => Some("admin lakehouse"),
         "providers" => Some("admin providers"),
         "model-review" => Some("admin model-review"),
+        "model-release-evidence" => Some("admin model-release-evidence"),
         "autonomy" => Some("admin autonomy"),
         _ => None,
     }

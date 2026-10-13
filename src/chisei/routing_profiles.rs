@@ -31,7 +31,7 @@ const MAX_IDENTIFIER_BYTES: usize = 64;
 const MAX_MODEL_PATTERNS: usize = 32;
 
 /// One customer-hosted route registered by a namespace administrator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostedRoutingProfile {
     pub namespace: String,
     /// Full profile id, `hosted:<name>`.
@@ -45,6 +45,13 @@ pub struct HostedRoutingProfile {
     pub artifact_digest: Option<String>,
     pub registered_by: String,
     pub registered_at_ms: i64,
+    /// When set, admit this route only with current Tenkai runtime evidence (#1396).
+    pub require_runtime_evidence: bool,
+    pub evidence_provider: String,
+    pub evidence_model: String,
+    pub evidence_profile_version: String,
+    pub evidence_artifact_digest: String,
+    pub evidence_endpoint: String,
 }
 
 impl HostedRoutingProfile {
@@ -78,6 +85,12 @@ pub struct HostedRoutingProfileInput {
     pub credential_ref: String,
     /// Optional `sha256:<64 hex>`; empty means unpinned.
     pub artifact_digest: String,
+    pub require_runtime_evidence: bool,
+    pub evidence_provider: String,
+    pub evidence_model: String,
+    pub evidence_profile_version: String,
+    pub evidence_artifact_digest: String,
+    pub evidence_endpoint: String,
 }
 
 /// The operator's endpoint allowlist, as canonical origins.
@@ -205,6 +218,35 @@ pub fn admit_hosted_profile(
             );
         }
     };
+    if input.require_runtime_evidence {
+        for (label, value) in [
+            ("evidence_provider", input.evidence_provider.trim()),
+            ("evidence_model", input.evidence_model.trim()),
+            (
+                "evidence_profile_version",
+                input.evidence_profile_version.trim(),
+            ),
+            (
+                "evidence_artifact_digest",
+                input.evidence_artifact_digest.trim(),
+            ),
+            ("evidence_endpoint", input.evidence_endpoint.trim()),
+        ] {
+            if value.is_empty() {
+                return Err(format!(
+                    "invalid_argument: {label} is required when require_runtime_evidence is set"
+                ));
+            }
+        }
+        if let Some(digest) = artifact_digest.as_deref()
+            && digest != input.evidence_artifact_digest.trim()
+        {
+            return Err(
+                "invalid_argument: evidence_artifact_digest must match artifact_digest when both are set"
+                    .into(),
+            );
+        }
+    }
     Ok(HostedRoutingProfile {
         namespace: input.namespace,
         profile_id: format!("{HOSTED_PROFILE_PREFIX}{}", input.name),
@@ -214,6 +256,12 @@ pub fn admit_hosted_profile(
         artifact_digest,
         registered_by: registered_by.into(),
         registered_at_ms: now_ms,
+        require_runtime_evidence: input.require_runtime_evidence,
+        evidence_provider: input.evidence_provider.trim().into(),
+        evidence_model: input.evidence_model.trim().into(),
+        evidence_profile_version: input.evidence_profile_version.trim().into(),
+        evidence_artifact_digest: input.evidence_artifact_digest.trim().into(),
+        evidence_endpoint: input.evidence_endpoint.trim().into(),
     })
 }
 
@@ -452,7 +500,7 @@ mod tests {
             endpoint_url: endpoint_url.into(),
             model_patterns: vec!["acme-*".into(), " acme-*".into()],
             credential_ref: credential_ref.into(),
-            artifact_digest: String::new(),
+            ..Default::default()
         }
     }
 
@@ -589,6 +637,36 @@ mod tests {
         assert_eq!(
             endpoints[0].artifact_digest.as_deref(),
             Some(pinned.as_str())
+        );
+    }
+
+    #[test]
+    fn evidence_digest_must_match_a_pinned_artifact_digest() {
+        let pinned = format!("sha256:{}", "ab".repeat(32));
+        let other = format!("sha256:{}", "cd".repeat(32));
+        let admit = |digest: &str, evidence: &str| {
+            let mut request = input("https://models.example.com/v1", "ACME_KEY");
+            request.artifact_digest = digest.into();
+            request.require_runtime_evidence = true;
+            request.evidence_provider = "hosted.acme".into();
+            request.evidence_model = "qwen".into();
+            request.evidence_profile_version = "v1".into();
+            request.evidence_artifact_digest = evidence.into();
+            request.evidence_endpoint = "served://acme".into();
+            admit_hosted_profile(
+                request,
+                &["https://models.example.com".to_string()],
+                |_| true,
+                "admin",
+                1,
+            )
+        };
+        assert!(admit(&pinned, &pinned).is_ok());
+        assert!(admit("", &pinned).is_ok());
+        assert!(
+            admit(&pinned, &other)
+                .unwrap_err()
+                .contains("evidence_artifact_digest must match artifact_digest")
         );
     }
 }

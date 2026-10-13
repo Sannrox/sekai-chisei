@@ -439,7 +439,10 @@ impl ChiseiServiceImpl {
                     !safe_only
                         || crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers)
                 })
-                .filter(|candidate| self.review_admits_candidate(requested_namespace, candidate))
+                .filter(|candidate| {
+                    self.review_admits_candidate(requested_namespace, candidate)
+                        && self.evidence_admits_candidate(requested_namespace, candidate)
+                })
                 .take(8)
                 .collect()
         } else {
@@ -447,6 +450,7 @@ impl ChiseiServiceImpl {
         };
 
         self.enforce_model_review_admission(requested_namespace, &model, actor)?;
+        self.enforce_model_release_evidence_admission(requested_namespace, &model, actor)?;
         Ok(PolicyResolution {
                 runtime,
                 model,

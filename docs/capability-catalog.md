@@ -256,6 +256,18 @@ any model that is not `enabled` for the namespace, identity, and residency
 region at native planning and execution, gateway decide, and hosted routes.
 `sekaictl admin model-review` is the operator CLI.
 
+### Model-release evidence (#1396)
+
+`ChiseiService.PutModelReleaseTrust`, `PutModelRuntimeEvidence`,
+`GetModelRuntimeEvidence`, `ExportModelEvaluationEvidence`, and
+`PutModelReleaseFeedback` (experimental) persist two-way release evidence
+under contract `chisei.model-release-evidence/v1`. Operators install Tenkai
+trust roots and ingest signed runtime JSON. A customer-hosted profile may set
+`require_runtime_evidence` and bind the evidence identity (including artifact
+digest). Route admission then refuses missing, stale, or invalid evidence.
+Chisei signs evaluation evidence from pinned eval comparisons; it does not
+run canaries. `sekaictl admin model-release-evidence` is the operator CLI.
+
 ### Customer-hosted profiles (#1171)
 
 `ChiseiService.PutRoutingProfile` and `RevokeRoutingProfile` (experimental)

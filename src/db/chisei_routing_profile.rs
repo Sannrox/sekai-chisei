@@ -31,6 +31,41 @@ pub(crate) fn decode_model_patterns(json: &str) -> Result<Vec<String>, String> {
     serde_json::from_str(json).map_err(|error| format!("corrupt routing profile: {error}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hosted_profile_from_parts(
+    namespace: String,
+    profile_id: String,
+    endpoint_origin: String,
+    patterns: &str,
+    credential_ref: String,
+    artifact_digest: Option<String>,
+    registered_by: String,
+    registered_at_ms: i64,
+    require_runtime_evidence: bool,
+    evidence_provider: String,
+    evidence_model: String,
+    evidence_profile_version: String,
+    evidence_artifact_digest: String,
+    evidence_endpoint: String,
+) -> Result<HostedRoutingProfile, String> {
+    Ok(HostedRoutingProfile {
+        namespace,
+        profile_id,
+        endpoint_origin,
+        model_patterns: decode_model_patterns(patterns)?,
+        credential_ref,
+        artifact_digest,
+        registered_by,
+        registered_at_ms,
+        require_runtime_evidence,
+        evidence_provider,
+        evidence_model,
+        evidence_profile_version,
+        evidence_artifact_digest,
+        evidence_endpoint,
+    })
+}
+
 impl SekaiDb {
     pub(crate) fn migrate_routing_profiles(&self) -> Result<(), String> {
         self.conn()
@@ -45,6 +80,12 @@ impl SekaiDb {
                     registered_at_ms INTEGER NOT NULL,
                     revoked_at_ms INTEGER,
                     artifact_digest TEXT,
+                    require_runtime_evidence INTEGER NOT NULL DEFAULT 0,
+                    evidence_provider TEXT NOT NULL DEFAULT '',
+                    evidence_model TEXT NOT NULL DEFAULT '',
+                    evidence_profile_version TEXT NOT NULL DEFAULT '',
+                    evidence_artifact_digest TEXT NOT NULL DEFAULT '',
+                    evidence_endpoint TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (namespace, profile_id)
                  );",
             )
@@ -74,8 +115,10 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                 "INSERT INTO chisei_routing_profiles (
                     namespace, profile_id, endpoint_origin, model_patterns_json,
                     credential_ref, registered_by, registered_at_ms, revoked_at_ms,
-                    artifact_digest
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
+                    artifact_digest, require_runtime_evidence, evidence_provider,
+                    evidence_model, evidence_profile_version, evidence_artifact_digest,
+                    evidence_endpoint
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT (namespace, profile_id) DO UPDATE SET
                     endpoint_origin = excluded.endpoint_origin,
                     model_patterns_json = excluded.model_patterns_json,
@@ -83,7 +126,13 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     artifact_digest = excluded.artifact_digest,
                     registered_by = excluded.registered_by,
                     registered_at_ms = excluded.registered_at_ms,
-                    revoked_at_ms = NULL",
+                    revoked_at_ms = NULL,
+                    require_runtime_evidence = excluded.require_runtime_evidence,
+                    evidence_provider = excluded.evidence_provider,
+                    evidence_model = excluded.evidence_model,
+                    evidence_profile_version = excluded.evidence_profile_version,
+                    evidence_artifact_digest = excluded.evidence_artifact_digest,
+                    evidence_endpoint = excluded.evidence_endpoint",
                 rusqlite::params![
                     profile.namespace,
                     profile.profile_id,
@@ -93,6 +142,12 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     profile.registered_by,
                     profile.registered_at_ms,
                     profile.artifact_digest,
+                    profile.require_runtime_evidence as i64,
+                    profile.evidence_provider,
+                    profile.evidence_model,
+                    profile.evidence_profile_version,
+                    profile.evidence_artifact_digest,
+                    profile.evidence_endpoint,
                 ],
             )
             .map(|_| ())
@@ -107,7 +162,9 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
         let mut statement = conn
             .prepare(
                 "SELECT profile_id, endpoint_origin, model_patterns_json, credential_ref,
-                        registered_by, registered_at_ms, artifact_digest
+                        registered_by, registered_at_ms, artifact_digest,
+                        require_runtime_evidence, evidence_provider, evidence_model,
+                        evidence_profile_version, evidence_artifact_digest, evidence_endpoint
                  FROM chisei_routing_profiles
                  WHERE namespace = ?1 AND revoked_at_ms IS NULL
                  ORDER BY profile_id",
@@ -123,6 +180,12 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -137,18 +200,30 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     credential_ref,
                     registered_by,
                     at,
-                    digest,
+                    artifact_digest,
+                    require,
+                    ev_provider,
+                    ev_model,
+                    ev_version,
+                    ev_digest,
+                    ev_endpoint,
                 )| {
-                    Ok(HostedRoutingProfile {
-                        namespace: namespace.into(),
+                    hosted_profile_from_parts(
+                        namespace.into(),
                         profile_id,
                         endpoint_origin,
-                        model_patterns: decode_model_patterns(&patterns)?,
+                        &patterns,
                         credential_ref,
-                        artifact_digest: digest,
+                        artifact_digest,
                         registered_by,
-                        registered_at_ms: at,
-                    })
+                        at,
+                        require != 0,
+                        ev_provider,
+                        ev_model,
+                        ev_version,
+                        ev_digest,
+                        ev_endpoint,
+                    )
                 },
             )
             .collect()
@@ -175,7 +250,9 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
         let mut statement = conn
             .prepare(
                 "SELECT namespace, profile_id, endpoint_origin, model_patterns_json, credential_ref,
-                        registered_by, registered_at_ms, artifact_digest
+                        registered_by, registered_at_ms, artifact_digest,
+                        require_runtime_evidence, evidence_provider, evidence_model,
+                        evidence_profile_version, evidence_artifact_digest, evidence_endpoint
                  FROM chisei_routing_profiles
                  WHERE revoked_at_ms IS NULL
                  ORDER BY namespace, profile_id",
@@ -192,6 +269,12 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -208,17 +291,29 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     registered_by,
                     at,
                     artifact_digest,
+                    require,
+                    ev_provider,
+                    ev_model,
+                    ev_version,
+                    ev_digest,
+                    ev_endpoint,
                 )| {
-                    Ok(HostedRoutingProfile {
+                    hosted_profile_from_parts(
                         namespace,
                         profile_id,
                         endpoint_origin,
-                        model_patterns: decode_model_patterns(&patterns)?,
+                        &patterns,
                         credential_ref,
                         artifact_digest,
                         registered_by,
-                        registered_at_ms: at,
-                    })
+                        at,
+                        require != 0,
+                        ev_provider,
+                        ev_model,
+                        ev_version,
+                        ev_digest,
+                        ev_endpoint,
+                    )
                 },
             )
             .collect()

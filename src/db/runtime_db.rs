@@ -5412,6 +5412,130 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_model_release_trust(
+        &self,
+        roots: &crate::chisei::model_release_evidence::EvaluationTrustRoots,
+        updated_at_ms: i64,
+    ) -> Result<(), String> {
+        use crate::db::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
+        match self {
+            Self::Sqlite(db) => db.put_model_release_trust(roots, updated_at_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReleaseEvidenceBackend::put_model_release_trust(
+                    db.as_ref(),
+                    roots,
+                    updated_at_ms,
+                )
+            }),
+        }
+    }
+
+    pub fn get_model_release_trust(
+        &self,
+    ) -> Result<Option<crate::chisei::model_release_evidence::EvaluationTrustRoots>, String> {
+        use crate::db::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
+        match self {
+            Self::Sqlite(db) => db.get_model_release_trust(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReleaseEvidenceBackend::get_model_release_trust(db.as_ref())
+            }),
+        }
+    }
+
+    pub fn put_model_runtime_evidence(
+        &self,
+        evidence: &crate::chisei::model_release_evidence::ModelRuntimeEvidence,
+        ingested_at_ms: i64,
+    ) -> Result<(), String> {
+        use crate::db::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
+        match self {
+            Self::Sqlite(db) => db.put_model_runtime_evidence(evidence, ingested_at_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReleaseEvidenceBackend::put_model_runtime_evidence(
+                    db.as_ref(),
+                    evidence,
+                    ingested_at_ms,
+                )
+            }),
+        }
+    }
+
+    pub fn get_model_runtime_evidence(
+        &self,
+        identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity,
+    ) -> Result<Option<String>, String> {
+        use crate::db::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
+        match self {
+            Self::Sqlite(db) => db.get_model_runtime_evidence(identity),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReleaseEvidenceBackend::get_model_runtime_evidence(db.as_ref(), identity)
+            }),
+        }
+    }
+
+    pub fn put_model_evaluation_export(
+        &self,
+        evidence: &crate::chisei::model_release_evidence::ModelEvaluationEvidence,
+        exported_at_ms: i64,
+    ) -> Result<(), String> {
+        use crate::db::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
+        match self {
+            Self::Sqlite(db) => db.put_model_evaluation_export(evidence, exported_at_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReleaseEvidenceBackend::put_model_evaluation_export(
+                    db.as_ref(),
+                    evidence,
+                    exported_at_ms,
+                )
+            }),
+        }
+    }
+
+    pub fn get_model_evaluation_export(
+        &self,
+        identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity,
+    ) -> Result<Option<String>, String> {
+        use crate::db::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
+        match self {
+            Self::Sqlite(db) => db.get_model_evaluation_export(identity),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReleaseEvidenceBackend::get_model_evaluation_export(
+                    db.as_ref(),
+                    identity,
+                )
+            }),
+        }
+    }
+
+    pub fn put_model_release_feedback(
+        &self,
+        record: &crate::chisei::model_release_evidence::ModelReleaseFeedback,
+    ) -> Result<(), String> {
+        use crate::db::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
+        match self {
+            Self::Sqlite(db) => db.put_model_release_feedback(record),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReleaseEvidenceBackend::put_model_release_feedback(db.as_ref(), record)
+            }),
+        }
+    }
+
+    pub fn list_model_release_feedback(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::chisei::model_release_evidence::ModelReleaseFeedback>, String> {
+        use crate::db::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
+        match self {
+            Self::Sqlite(db) => db.list_model_release_feedback(namespace),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiModelReleaseEvidenceBackend::list_model_release_feedback(
+                    db.as_ref(),
+                    namespace,
+                )
+            }),
+        }
+    }
+
     pub fn put_permit(
         &self,
         permit: &Permit,

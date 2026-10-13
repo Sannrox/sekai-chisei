@@ -15,6 +15,7 @@ fn profile(namespace: &str, name: &str, origin: &str) -> HostedRoutingProfile {
         artifact_digest: None,
         registered_by: "admin".into(),
         registered_at_ms: 1,
+        ..Default::default()
     }
 }
 
