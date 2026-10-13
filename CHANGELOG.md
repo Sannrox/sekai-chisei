@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Registered customer-hosted routing profiles carry an optional
+  `artifact_digest` (`PutRoutingProfileRequest` and `RoutingProfile` field),
+  stored on SQLite and PostgreSQL and passed to
+  `EnterpriseExtension::admit_model`, so digest-pinned admission works for
+  registered routes. Adds PostgreSQL migration
+  `0062_routing_profile_artifact_digest` (#1499).
+
 - Channel operators can persist per-namespace model review state and family
   enablement keyed by the #1352 identity and `ResidencyPolicy` region labels.
   Missing state is `disallowed`; a per-model row overrides its provider family

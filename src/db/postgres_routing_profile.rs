@@ -88,7 +88,7 @@ impl PostgresDb {
         self.connection()?
             .query(
                 "SELECT namespace, profile_id, endpoint_origin, model_patterns_json, credential_ref,
-                        registered_by, registered_at_ms
+                        registered_by, registered_at_ms, artifact_digest
                  FROM chisei_routing_profiles
                  WHERE revoked_at_ms IS NULL
                  ORDER BY namespace, profile_id",
@@ -103,6 +103,7 @@ impl PostgresDb {
                     endpoint_origin: row.get(2),
                     model_patterns: decode_model_patterns(&row.get::<_, String>(3))?,
                     credential_ref: row.get(4),
+                    artifact_digest: row.get(7),
                     registered_by: row.get(5),
                     registered_at_ms: row.get(6),
                 })

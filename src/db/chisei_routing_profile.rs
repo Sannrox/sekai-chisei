@@ -175,7 +175,7 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
         let mut statement = conn
             .prepare(
                 "SELECT namespace, profile_id, endpoint_origin, model_patterns_json, credential_ref,
-                        registered_by, registered_at_ms
+                        registered_by, registered_at_ms, artifact_digest
                  FROM chisei_routing_profiles
                  WHERE revoked_at_ms IS NULL
                  ORDER BY namespace, profile_id",
@@ -191,6 +191,7 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -206,6 +207,7 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     credential_ref,
                     registered_by,
                     at,
+                    artifact_digest,
                 )| {
                     Ok(HostedRoutingProfile {
                         namespace,
@@ -213,6 +215,7 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                         endpoint_origin,
                         model_patterns: decode_model_patterns(&patterns)?,
                         credential_ref,
+                        artifact_digest,
                         registered_by,
                         registered_at_ms: at,
                     })
