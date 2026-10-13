@@ -505,6 +505,21 @@ pub fn admit_enabled_route(
     Err(refusal)
 }
 
+/// Whether the route would be admitted. Does not write the decision ledger:
+/// unused failover candidates are filtered, not refused.
+pub fn route_is_enabled(
+    db: &ChiseiStore,
+    namespace: &str,
+    identity: &ModelIdentity,
+    region: &str,
+) -> bool {
+    let Ok((models, families)) = load_review_state(db, namespace) else {
+        return false;
+    };
+    effective_review_status(&models, &families, namespace, identity, region)
+        == ModelReviewStatus::Enabled
+}
+
 /// Enable every provider in the live registry as an unscoped instance-default
 /// family. Library and process tests use this so existing routes keep working
 /// after default-deny; operators run `sekaictl admin model-review backfill`.
@@ -1952,6 +1967,39 @@ mod tests {
             })
             .unwrap();
         assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn unreviewed_sibling_is_not_an_enabled_failover_route() {
+        let db = ChiseiStore::memory();
+        set_model_review(
+            &db,
+            model_row("sales", "gpt-5.5", "", ModelReviewStatus::Enabled),
+        )
+        .unwrap();
+        assert!(route_is_enabled(
+            &db,
+            "sales",
+            &identity("gpt-5.5", None),
+            ""
+        ));
+        assert!(!route_is_enabled(
+            &db,
+            "sales",
+            &identity("gpt-5.5-mini", None),
+            ""
+        ));
+        let decisions = db
+            .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+                actor: None,
+                action: Some(ACTION_ADMIT_DENIED.into()),
+                target_id: None,
+                after: 0,
+                limit: 10,
+                offset: 0,
+            })
+            .unwrap();
+        assert!(decisions.is_empty(), "{decisions:?}");
     }
 
     #[test]

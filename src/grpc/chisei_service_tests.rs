@@ -11870,6 +11870,26 @@ fn enable_family(svc: &ChiseiServiceImpl, namespace: &str, family: &str, region:
     .unwrap();
 }
 
+fn enable_model(svc: &ChiseiServiceImpl, namespace: &str, model: &str) {
+    let identity = crate::chisei::model_review::identity_from_model(model).unwrap();
+    crate::chisei::model_review::set_model_review(
+        &svc.db,
+        crate::chisei::model_review::ModelReviewRecord {
+            namespace: namespace.into(),
+            identity: crate::chisei::model_review::ModelReviewIdentity::new(
+                identity.provider,
+                identity.model,
+                identity.artifact_digest.unwrap_or_default(),
+            ),
+            status: crate::chisei::model_review::ModelReviewStatus::Enabled,
+            actor: "alice".into(),
+            reason: "admission fixture".into(),
+            updated_at_ms: 1,
+        },
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn unreviewed_model_is_refused_at_native_planning() {
     let svc = review_admission_service();
@@ -11953,6 +11973,81 @@ async fn unreviewed_model_is_refused_at_gateway_decide() {
         "{}",
         denied.deny_message
     );
+}
+
+#[tokio::test]
+async fn unreviewed_fallback_is_omitted_from_gateway_decide() {
+    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
+
+    let svc = review_admission_service();
+    svc.policy.set_namespace_policy(
+        "sales",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+            default_runtime: "openai".into(),
+            default_model: "gpt-5.5".into(),
+            data_class: "unclassified".into(),
+        },
+    );
+    svc.policy
+        .set_context_admission_policy(
+            "sales",
+            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+        )
+        .unwrap();
+    enable_model(&svc, "sales", "gpt-5.5");
+    let mut request = Request::new(DecideGatewayExecutionRequest {
+        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+        namespace: "sales".into(),
+        requested_model: "gpt-5.5".into(),
+        operation_class: "chat".into(),
+        estimated_cost_usd_micros: 0,
+        correlation_operation_id: "op-review-fallback-1".into(),
+        correlation_attempt: 1,
+        estimated_tokens: 10,
+        task_class: "interactive".into(),
+        preferred_runtime: "openai".into(),
+        project: "sales".into(),
+        agent: "local".into(),
+        key_id: String::new(),
+        work_unit: String::new(),
+        local_free_available: false,
+        user_id: "local".into(),
+        route_override: String::new(),
+        capability_requirements_json: Vec::new(),
+        expected_calls: 1,
+        pipeline_spec: String::new(),
+    });
+    request
+        .metadata_mut()
+        .insert("x-principal", "local".parse().unwrap());
+    let admitted = svc
+        .decide_gateway_execution(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(admitted.admitted, "{admitted:?}");
+    assert_eq!(admitted.resolved_model, "gpt-5.5");
+    assert!(
+        admitted
+            .fallback_models
+            .iter()
+            .all(|model| !model.contains("gpt-5.5-mini")),
+        "{admitted:?}"
+    );
+    let decisions = svc
+        .db
+        .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+            actor: None,
+            action: Some(crate::chisei::model_review::ACTION_ADMIT_DENIED.into()),
+            target_id: None,
+            after: 0,
+            limit: 10,
+            offset: 0,
+        })
+        .unwrap();
+    assert!(decisions.is_empty(), "{decisions:?}");
 }
 
 #[tokio::test]
