@@ -113,6 +113,8 @@ const ISOLATED_TRANSFORM_WORK_SCHEMA: &str =
 const TRANSFORM_SCHEDULE_SCHEMA: &str = include_str!("postgres/0058_transform_schedule.sql");
 const NAMESPACE_OBJECT_GENERATION_SCHEMA: &str =
     include_str!("postgres/0059_namespace_object_generation.sql");
+const ROUTING_PROFILE_ARTIFACT_DIGEST_SCHEMA: &str =
+    include_str!("postgres/0060_routing_profile_artifact_digest.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -501,6 +503,12 @@ const MIGRATIONS: &[Migration] = &[
         "namespace_object_generation",
         NAMESPACE_OBJECT_GENERATION_SCHEMA,
         MigrationOwner::Sekai,
+    ),
+    mig(
+        59,
+        "routing_profile_artifact_digest",
+        ROUTING_PROFILE_ARTIFACT_DIGEST_SCHEMA,
+        MigrationOwner::Chisei,
     ),
 ];
 

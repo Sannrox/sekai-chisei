@@ -30,8 +30,8 @@ Before a provider execution's credential lookup, and for keyless providers
 too, Chisei passes the resolved `ModelIdentity` to
 `EnterpriseExtension::admit_model`: provider,
 canonical and upstream model, profile version, the pinned `artifact_digest`
-when the route carries one (a hosted endpoint's `artifact_digest`; registered
-hosted routes do not pin one yet), and the endpoint base URL that will receive the
+when the route carries one (a registered hosted route's `artifact_digest`),
+and the endpoint base URL that will receive the
 prompt (the same value the provider client is built with). The default admits.
 `PermissionDenied` refuses with `PERMISSION_DENIED` ("model not admitted") and
 `Unavailable` with `UNAVAILABLE`; no provider call is made either way.

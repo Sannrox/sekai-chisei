@@ -40,6 +40,9 @@ pub struct HostedRoutingProfile {
     pub endpoint_origin: String,
     pub model_patterns: Vec<String>,
     pub credential_ref: String,
+    /// Digest of the weights the endpoint is declared to serve (`sha256:<64 hex>`),
+    /// passed to enterprise model admission. A namespace admin's claim, not evidence.
+    pub artifact_digest: Option<String>,
     pub registered_by: String,
     pub registered_at_ms: i64,
 }
@@ -73,6 +76,8 @@ pub struct HostedRoutingProfileInput {
     pub endpoint_url: String,
     pub model_patterns: Vec<String>,
     pub credential_ref: String,
+    /// Optional `sha256:<64 hex>`; empty means unpinned.
+    pub artifact_digest: String,
 }
 
 /// The operator's endpoint allowlist, as canonical origins.
@@ -191,14 +196,33 @@ pub fn admit_hosted_profile(
     if !credential_resolves(&input.credential_ref) {
         return Err("failed_precondition: credential reference does not resolve".into());
     }
+    let artifact_digest = match input.artifact_digest.trim() {
+        "" => None,
+        digest if valid_sha256_digest(digest) => Some(digest.to_string()),
+        _ => {
+            return Err(
+                "invalid_argument: artifact_digest must be sha256:<64 lowercase hex>".into(),
+            );
+        }
+    };
     Ok(HostedRoutingProfile {
         namespace: input.namespace,
         profile_id: format!("{HOSTED_PROFILE_PREFIX}{}", input.name),
         endpoint_origin: origin,
         model_patterns: patterns,
         credential_ref: input.credential_ref,
+        artifact_digest,
         registered_by: registered_by.into(),
         registered_at_ms: now_ms,
+    })
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
     })
 }
 
@@ -270,8 +294,7 @@ pub fn hosted_endpoints(
                     .to_string(),
                 origin: profile.endpoint_origin.clone(),
                 model_patterns: profile.model_patterns.clone(),
-                // Registered routes do not pin weights yet (#1396).
-                artifact_digest: None,
+                artifact_digest: profile.artifact_digest.clone(),
             })
         })
         .collect()
@@ -429,6 +452,7 @@ mod tests {
             endpoint_url: endpoint_url.into(),
             model_patterns: vec!["acme-*".into(), " acme-*".into()],
             credential_ref: credential_ref.into(),
+            artifact_digest: String::new(),
         }
     }
 
@@ -531,6 +555,40 @@ mod tests {
         assert_eq!(
             check_pin(&registry, &revoked_egress, "hosted:acme-llm", "openai"),
             Err("routing profile unavailable")
+        );
+    }
+
+    #[test]
+    fn artifact_digest_is_optional_validated_and_reaches_the_hosted_endpoint() {
+        let admit = |digest: &str| {
+            let mut request = input("https://models.example.com/v1", "ACME_KEY");
+            request.artifact_digest = digest.into();
+            admit_hosted_profile(
+                request,
+                &["https://models.example.com".to_string()],
+                |_| true,
+                "admin",
+                1,
+            )
+        };
+        assert_eq!(admit("").unwrap().artifact_digest, None);
+        let pinned = format!("sha256:{}", "ab".repeat(32));
+        let profile = admit(&pinned).unwrap();
+        assert_eq!(profile.artifact_digest.as_deref(), Some(pinned.as_str()));
+        for bad in [
+            "sha256:ab",
+            "md5:00",
+            &format!("sha256:{}", "AB".repeat(32)),
+        ] {
+            assert!(
+                admit(bad).unwrap_err().starts_with("invalid_argument"),
+                "{bad}"
+            );
+        }
+        let endpoints = hosted_endpoints(std::slice::from_ref(&profile));
+        assert_eq!(
+            endpoints[0].artifact_digest.as_deref(),
+            Some(pinned.as_str())
         );
     }
 }

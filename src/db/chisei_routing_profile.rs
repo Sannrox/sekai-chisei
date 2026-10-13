@@ -41,10 +41,24 @@ impl SekaiDb {
                     registered_by TEXT NOT NULL,
                     registered_at_ms INTEGER NOT NULL,
                     revoked_at_ms INTEGER,
+                    artifact_digest TEXT,
                     PRIMARY KEY (namespace, profile_id)
                  );",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // Stores created before #1499 lack the digest column.
+        match self.conn().execute(
+            "ALTER TABLE chisei_routing_profiles ADD COLUMN artifact_digest TEXT",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 
@@ -56,12 +70,14 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
             .execute(
                 "INSERT INTO chisei_routing_profiles (
                     namespace, profile_id, endpoint_origin, model_patterns_json,
-                    credential_ref, registered_by, registered_at_ms, revoked_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                    credential_ref, registered_by, registered_at_ms, revoked_at_ms,
+                    artifact_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
                  ON CONFLICT (namespace, profile_id) DO UPDATE SET
                     endpoint_origin = excluded.endpoint_origin,
                     model_patterns_json = excluded.model_patterns_json,
                     credential_ref = excluded.credential_ref,
+                    artifact_digest = excluded.artifact_digest,
                     registered_by = excluded.registered_by,
                     registered_at_ms = excluded.registered_at_ms,
                     revoked_at_ms = NULL",
@@ -73,6 +89,7 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     profile.credential_ref,
                     profile.registered_by,
                     profile.registered_at_ms,
+                    profile.artifact_digest,
                 ],
             )
             .map(|_| ())
@@ -87,7 +104,7 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
         let mut statement = conn
             .prepare(
                 "SELECT profile_id, endpoint_origin, model_patterns_json, credential_ref,
-                        registered_by, registered_at_ms
+                        registered_by, registered_at_ms, artifact_digest
                  FROM chisei_routing_profiles
                  WHERE namespace = ?1 AND revoked_at_ms IS NULL
                  ORDER BY profile_id",
@@ -102,6 +119,7 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -109,13 +127,22 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
             .map_err(|error| error.to_string())?;
         rows.into_iter()
             .map(
-                |(profile_id, endpoint_origin, patterns, credential_ref, registered_by, at)| {
+                |(
+                    profile_id,
+                    endpoint_origin,
+                    patterns,
+                    credential_ref,
+                    registered_by,
+                    at,
+                    digest,
+                )| {
                     Ok(HostedRoutingProfile {
                         namespace: namespace.into(),
                         profile_id,
                         endpoint_origin,
                         model_patterns: decode_model_patterns(&patterns)?,
                         credential_ref,
+                        artifact_digest: digest,
                         registered_by,
                         registered_at_ms: at,
                     })

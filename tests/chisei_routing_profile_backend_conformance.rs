@@ -12,6 +12,7 @@ fn profile(namespace: &str, name: &str, origin: &str) -> HostedRoutingProfile {
         endpoint_origin: origin.into(),
         model_patterns: vec!["acme-*".into()],
         credential_ref: "ACME".into(),
+        artifact_digest: None,
         registered_by: "admin".into(),
         registered_at_ms: 1,
     }
@@ -38,9 +39,10 @@ fn exercise(db: &dyn ChiseiRoutingProfileBackend, prefix: &str) {
     assert_eq!(listed[0], first);
     assert_eq!(db.list_hosted_routing_profiles(&foreign).unwrap().len(), 1);
 
-    // Re-registering replaces the profile in place.
+    // Re-registering replaces the profile in place, including the weights digest.
     let replaced = HostedRoutingProfile {
         model_patterns: vec!["acme-2-*".into()],
+        artifact_digest: Some(format!("sha256:{}", "ab".repeat(32))),
         registered_at_ms: 2,
         ..first.clone()
     };

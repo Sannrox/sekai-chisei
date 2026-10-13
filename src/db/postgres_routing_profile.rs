@@ -12,12 +12,14 @@ impl PostgresDb {
             .execute(
                 "INSERT INTO chisei_routing_profiles (
                     namespace, profile_id, endpoint_origin, model_patterns_json,
-                    credential_ref, registered_by, registered_at_ms, revoked_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+                    credential_ref, registered_by, registered_at_ms, revoked_at_ms,
+                    artifact_digest
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)
                  ON CONFLICT (namespace, profile_id) DO UPDATE SET
                     endpoint_origin = EXCLUDED.endpoint_origin,
                     model_patterns_json = EXCLUDED.model_patterns_json,
                     credential_ref = EXCLUDED.credential_ref,
+                    artifact_digest = EXCLUDED.artifact_digest,
                     registered_by = EXCLUDED.registered_by,
                     registered_at_ms = EXCLUDED.registered_at_ms,
                     revoked_at_ms = NULL",
@@ -29,6 +31,7 @@ impl PostgresDb {
                     &profile.credential_ref,
                     &profile.registered_by,
                     &profile.registered_at_ms,
+                    &profile.artifact_digest,
                 ],
             )
             .map(|_| ())
@@ -42,7 +45,7 @@ impl PostgresDb {
         self.connection()?
             .query(
                 "SELECT profile_id, endpoint_origin, model_patterns_json, credential_ref,
-                        registered_by, registered_at_ms
+                        registered_by, registered_at_ms, artifact_digest
                  FROM chisei_routing_profiles
                  WHERE namespace = $1 AND revoked_at_ms IS NULL
                  ORDER BY profile_id",
@@ -57,6 +60,7 @@ impl PostgresDb {
                     endpoint_origin: row.get(1),
                     model_patterns: decode_model_patterns(&row.get::<_, String>(2))?,
                     credential_ref: row.get(3),
+                    artifact_digest: row.get(6),
                     registered_by: row.get(4),
                     registered_at_ms: row.get(5),
                 })
