@@ -238,6 +238,7 @@ mod tests {
             }],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         }
     }
 

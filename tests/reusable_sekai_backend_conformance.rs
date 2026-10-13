@@ -31,6 +31,7 @@ fn exercise_datasets(db: &dyn DatasetBackend, prefix: &str) {
         ],
         object_id: String::new(),
         created: 10,
+        partition_keys: Vec::new(),
     };
     db.create_dataset(&dataset).unwrap();
     assert!(db.create_dataset(&dataset).is_err());

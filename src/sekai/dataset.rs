@@ -1,5 +1,5 @@
 use crate::db::sekai::SekaiDb;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -41,6 +41,7 @@ pub struct Dataset {
     pub columns: Vec<ColumnDef>,
     pub object_id: String,
     pub created: i64,
+    pub partition_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +93,54 @@ fn parse_columns(value: &str) -> Result<Vec<ColumnDef>, String> {
     }
 }
 
+pub(crate) fn encode_partition_keys(keys: &[String]) -> Result<String, String> {
+    serde_json::to_string(keys).map_err(|error| error.to_string())
+}
+
+pub(crate) fn parse_partition_keys(value: &str) -> Result<Vec<String>, String> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(value).map_err(|error| format!("corrupt dataset partition_keys: {error}"))
+}
+
+pub(crate) fn partition_key_for_row_json(keys: &[String], data: &str) -> Result<String, String> {
+    let row: HashMap<String, String> =
+        serde_json::from_str(data).map_err(|error| format!("corrupt dataset row: {error}"))?;
+    Ok(crate::sekai::governed_transform::partition_value(
+        keys, &row,
+    ))
+}
+
+fn reindex_dataset_partition_keys(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    keys: &[String],
+) -> Result<(), String> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, data FROM sekai_dataset_rows WHERE dataset_id = ?1")
+            .map_err(|error| error.to_string())?;
+        let mapped = stmt
+            .query_map(params![dataset_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for (id, data) in rows {
+        let partition_key = partition_key_for_row_json(keys, &data)?;
+        tx.execute(
+            "UPDATE sekai_dataset_rows SET partition_key = ?1 WHERE id = ?2",
+            params![partition_key, id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn compare_numeric(left: &str, right: &str, op: &str) -> bool {
     let (Ok(left), Ok(right)) = (left.parse::<f64>(), right.parse::<f64>()) else {
         return false;
@@ -137,6 +186,19 @@ impl SekaiDb {
             );",
         )
         .map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "ALTER TABLE sekai_datasets ADD COLUMN partition_keys TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sekai_dataset_rows ADD COLUMN partition_key TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dataset_rows_partition
+             ON sekai_dataset_rows(dataset_id, partition_key)",
+            [],
+        );
         let stored: Option<String> = conn
             .query_row(
                 "SELECT columns FROM sekai_datasets WHERE id='llm_calls'",
@@ -203,8 +265,8 @@ impl SekaiDb {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-        conn.execute("INSERT INTO sekai_datasets (id,name,columns,object_id,created) VALUES (?1,?2,?3,?4,?5)",
-            params![d.id, d.name, cols, d.object_id, d.created]).map_err(|e| e.to_string())?;
+        conn.execute("INSERT INTO sekai_datasets (id,name,columns,object_id,created,partition_keys) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![d.id, d.name, cols, d.object_id, d.created, encode_partition_keys(&d.partition_keys)?]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -217,7 +279,18 @@ impl SekaiDb {
                 ));
             }
         }
-        let conn = self.conn();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let previous_json: String = tx
+            .query_row(
+                "SELECT partition_keys FROM sekai_datasets WHERE id=?1",
+                params![d.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("dataset {:?} not found", d.id))?;
+        let previous = parse_partition_keys(&previous_json)?;
         let cols = serde_json::to_string(
             &d.columns
                 .iter()
@@ -231,22 +304,31 @@ impl SekaiDb {
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| error.to_string())?;
-        let changed = conn
+        let changed = tx
             .execute(
-                "UPDATE sekai_datasets SET name=?2, columns=?3 WHERE id=?1",
-                params![d.id, d.name, cols],
+                "UPDATE sekai_datasets SET name=?2, columns=?3, partition_keys=?4 WHERE id=?1",
+                params![
+                    d.id,
+                    d.name,
+                    cols,
+                    encode_partition_keys(&d.partition_keys)?
+                ],
             )
             .map_err(|error| error.to_string())?;
-        (changed == 1)
-            .then_some(())
-            .ok_or_else(|| format!("dataset {:?} not found", d.id))
+        if changed != 1 {
+            return Err(format!("dataset {:?} not found", d.id));
+        }
+        if previous != d.partition_keys {
+            reindex_dataset_partition_keys(&tx, &d.id, &d.partition_keys)?;
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn get_dataset(&self, id: &str) -> Result<Option<Dataset>, String> {
         let conn = self.conn();
         let row = conn
             .query_row(
-                "SELECT id,name,columns,object_id,created FROM sekai_datasets WHERE id=?1",
+                "SELECT id,name,columns,object_id,created,partition_keys FROM sekai_datasets WHERE id=?1",
                 params![id],
                 |row| {
                     Ok((
@@ -255,18 +337,20 @@ impl SekaiDb {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5).unwrap_or_else(|_| "[]".into()),
                     ))
                 },
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        row.map(|(id, name, cols_str, object_id, created)| {
+        row.map(|(id, name, cols_str, object_id, created, keys)| {
             Ok(Dataset {
                 id,
                 name,
                 columns: parse_columns(&cols_str)?,
                 object_id,
                 created,
+                partition_keys: parse_partition_keys(&keys)?,
             })
         })
         .transpose()
@@ -275,18 +359,20 @@ impl SekaiDb {
     pub fn list_datasets(&self) -> Result<Vec<Dataset>, String> {
         let conn = self.conn();
         let mut stmt = conn
-            .prepare("SELECT id,name,columns,object_id,created FROM sekai_datasets")
+            .prepare("SELECT id,name,columns,object_id,created,partition_keys FROM sekai_datasets")
             .map_err(|e| e.to_string())?;
         let mut results = Vec::new();
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let cols_str: String = row.get(2).map_err(|e| e.to_string())?;
+            let keys: String = row.get(5).unwrap_or_else(|_| "[]".into());
             results.push(Dataset {
                 id: row.get(0).map_err(|e| e.to_string())?,
                 name: row.get(1).map_err(|e| e.to_string())?,
                 columns: parse_columns(&cols_str)?,
                 object_id: row.get(3).map_err(|e| e.to_string())?,
                 created: row.get(4).map_err(|e| e.to_string())?,
+                partition_keys: parse_partition_keys(&keys)?,
             });
         }
         Ok(results)
@@ -300,19 +386,47 @@ impl SekaiDb {
         if rows.is_empty() {
             return Ok(0);
         }
-        let payloads: Vec<String> = rows
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<_, _>>()
-            .map_err(|error| error.to_string())?;
-        let json = serde_json::to_string(&payloads).map_err(|error| error.to_string())?;
-        self.conn()
-            .execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let keys_json: String = tx
+            .query_row(
+                "SELECT partition_keys FROM sekai_datasets WHERE id = ?1",
+                params![dataset_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| "[]".into());
+        let keys = parse_partition_keys(&keys_json)?;
+        if keys.is_empty() {
+            let payloads: Vec<String> = rows
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<_, _>>()
+                .map_err(|error| error.to_string())?;
+            let json = serde_json::to_string(&payloads).map_err(|error| error.to_string())?;
+            tx.execute(
                 "INSERT INTO sekai_dataset_rows (dataset_id, data)
                  SELECT ?1, value FROM json_each(?2)",
                 params![dataset_id, json],
             )
             .map_err(|error| error.to_string())?;
+        } else {
+            for row in rows {
+                let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+                tx.execute(
+                    "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        dataset_id,
+                        data,
+                        crate::sekai::governed_transform::partition_value(&keys, row)
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())?;
         i32::try_from(rows.len()).map_err(|_| "too many dataset rows".into())
     }
 
@@ -432,6 +546,14 @@ impl SekaiDb {
 
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let keys_json: String = tx
+            .query_row(
+                "SELECT partition_keys FROM sekai_datasets WHERE id=?1",
+                params![dataset_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let keys = parse_partition_keys(&keys_json)?;
         let rows = {
             let mut stmt = tx
                 .prepare("SELECT id,data FROM sekai_dataset_rows WHERE dataset_id=?1 ORDER BY id")
@@ -463,14 +585,20 @@ impl SekaiDb {
                 continue;
             }
             let data = serde_json::to_string(&values).map_err(|e| e.to_string())?;
+            let partition_key = crate::sekai::governed_transform::partition_value(&keys, &values);
             tx.execute(
-                "UPDATE sekai_dataset_rows SET data=?1 WHERE id=?2 AND dataset_id=?3",
-                params![data, id, dataset_id],
+                "UPDATE sekai_dataset_rows SET data=?1, partition_key=?2 WHERE id=?3 AND dataset_id=?4",
+                params![data, partition_key, id, dataset_id],
             )
             .map_err(|e| e.to_string())?;
             result.rows_updated += 1;
             result.fields_redacted += changed;
         }
+        crate::db::governed_transform::redact_transform_partition_receipts(
+            &tx,
+            dataset_id,
+            keys.is_empty() || keys.iter().any(|key| fields.contains(&key.as_str())),
+        )?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(result)
     }
@@ -550,8 +678,6 @@ fn matches_row_filters(row: &HashMap<String, String>, filters: &[RowFilter]) -> 
     true
 }
 
-use rusqlite::OptionalExtension;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,6 +706,7 @@ mod tests {
             ],
             object_id: "".into(),
             created: 100,
+            partition_keys: Vec::new(),
         };
         db.create_dataset(&ds).unwrap();
 
@@ -635,6 +762,80 @@ mod tests {
     }
 
     #[test]
+    fn update_dataset_reindexes_row_partition_keys() {
+        let db = setup();
+        let mut dataset = Dataset {
+            id: "ds1".into(),
+            name: "metrics".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                ColumnDef {
+                    name: "region".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+            ],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        };
+        db.create_dataset(&dataset).unwrap();
+        db.append_rows(
+            "ds1",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("region".into(), "east".into()),
+            ])],
+        )
+        .unwrap();
+        dataset.partition_keys = vec!["region".into()];
+        db.update_dataset(&dataset).unwrap();
+        let key: String = db
+            .conn()
+            .query_row(
+                "SELECT partition_key FROM sekai_dataset_rows WHERE dataset_id = 'ds1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "east");
+    }
+
+    #[test]
+    fn redact_dataset_fields_rewrites_partition_key() {
+        let db = setup();
+        db.create_dataset(&Dataset {
+            id: "ds1".into(),
+            name: "metrics".into(),
+            columns: vec![ColumnDef {
+                name: "region".into(),
+                col_type: "string".into(),
+                classification: "sensitive".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: vec!["region".into()],
+        })
+        .unwrap();
+        db.append_rows("ds1", &[HashMap::from([("region".into(), "east".into())])])
+            .unwrap();
+        db.redact_dataset_fields("ds1", "sensitive", &[]).unwrap();
+        let key: String = db
+            .conn()
+            .query_row(
+                "SELECT partition_key FROM sekai_dataset_rows WHERE dataset_id = 'ds1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "[redacted]");
+    }
+
+    #[test]
     fn query_rows_rejects_corrupt_stored_json() {
         let db = setup();
         db.create_dataset(&Dataset {
@@ -643,6 +844,7 @@ mod tests {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
         db.conn()
@@ -690,6 +892,7 @@ mod tests {
             }],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
         db.append_rows("nums", &[HashMap::from([("val".into(), "N/A".into())])])
@@ -742,6 +945,7 @@ mod tests {
             }],
             object_id: "object-a".into(),
             created: 100,
+            partition_keys: Vec::new(),
         };
         db.create_dataset(&dataset).unwrap();
         db.append_rows(
@@ -835,6 +1039,7 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
         db.append_rows(
@@ -905,6 +1110,7 @@ mod tests {
             }],
             object_id: "".into(),
             created: 0,
+            partition_keys: Vec::new(),
         };
         db.create_dataset(&ds).unwrap();
         db.append_rows(

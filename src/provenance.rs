@@ -496,6 +496,7 @@ mod tests {
             }],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
         db.append_rows(
@@ -541,6 +542,7 @@ mod tests {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
         db.append_rows(
@@ -582,6 +584,7 @@ mod tests {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
         db.append_rows(
@@ -702,6 +705,7 @@ mod tests {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
         db.append_rows(
@@ -770,6 +774,7 @@ mod tests {
             columns: vec![],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         })
         .unwrap();
         db.append_rows(

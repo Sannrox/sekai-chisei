@@ -1219,6 +1219,7 @@ pub(super) async fn ensure_llm_calls_dataset(
         columns,
         object_id: String::new(),
         created: Utc::now().timestamp_millis(),
+        partition_keys: Vec::new(),
     };
     match sekai
         .create_dataset(gateway_request(CreateDatasetRequest {

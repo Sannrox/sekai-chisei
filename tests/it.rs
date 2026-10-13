@@ -83,6 +83,7 @@ mod object_sync_backend_conformance;
 mod ollama_e2e;
 mod operation_correlation_adr;
 mod parked_work_backend_conformance;
+mod partitioned_transform_io_adr;
 mod perf_gate_cli;
 mod performance_manifest;
 mod policy_decision_pdp;
@@ -232,6 +233,7 @@ const GROUPED_MODULES: &[&str] = &[
     "ollama_e2e",
     "operation_correlation_adr",
     "parked_work_backend_conformance",
+    "partitioned_transform_io_adr",
     "perf_gate_cli",
     "performance_manifest",
     "policy_decision_pdp",
@@ -376,6 +378,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 120);
+    assert_eq!(GROUPED_MODULES.len(), 121);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

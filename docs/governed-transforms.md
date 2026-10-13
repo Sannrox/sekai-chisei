@@ -5,7 +5,8 @@ Sekai hosts an in-process dataset transform class
 [ADR 0097](decisions/0097-in-process-transform-host.md),
 [ADR 0101](decisions/0101-analytical-transform-profile.md),
 [ADR 0102](decisions/0102-isolated-process-transform-profile.md),
-[ADR 0103](decisions/0103-transform-schedule-and-dependency-graph.md)). A JobSpec
+[ADR 0103](decisions/0103-transform-schedule-and-dependency-graph.md),
+[ADR 0105](decisions/0105-partitioned-transform-io.md)). A JobSpec
 names input and output datasets and a list of `filter` / `project` steps, the
 analytical SQL profile with one or more named inputs, or an
 `isolated_process` profile that admits work for an external runner. In-process
@@ -16,6 +17,20 @@ transaction against the admitted JobSpec. Claim, heartbeat, input, and
 write-back RPCs require credential admin. Workers pin
 `sekai-client::claim` rather than copying those RPCs. Objects stay
 Action-written.
+
+A dataset may declare ordered `partition_keys`. Empty keys keep the
+whole-dataset `sha256-sum-v1:` digest. Partitioned datasets use
+`sha256-partitions-v1:` over a sorted map of partition identity to that
+partition's `sha256-sum-v1:` digest; the prefixes do not fold into each
+other. Isolated `ReadTransformRunInputs` stays row maps on gRPC. A page may
+name a partition and a byte cap; an unset selector reads every partition and
+the empty string selects the empty identity. Resume is `(partition_key, alias,
+after_row_id)`. Isolated write-back may replace named output partitions in
+the same transaction as the receipt. Incremental in-process projection
+appends into partitions whose new rows changed; untouched output partitions
+stay on disk and historical output row IDs stay stable. Get/List/run/write-back
+replace partition identities and member digests with `redacted` unless the
+caller can read the datasets bound by the run's definition. Arrow/Parquet remains out of scope (#879).
 
 The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `GetGovernedTransformRun`, `ListGovernedTransforms`,

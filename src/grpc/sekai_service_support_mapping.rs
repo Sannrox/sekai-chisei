@@ -779,6 +779,7 @@ pub(super) fn to_proto_dataset(d: &dataset::Dataset) -> Dataset {
             .collect(),
         object_id: d.object_id.clone(),
         created: d.created,
+        partition_keys: d.partition_keys.clone(),
     }
 }
 pub(super) fn from_proto_dataset(d: &Dataset) -> dataset::Dataset {
@@ -796,6 +797,7 @@ pub(super) fn from_proto_dataset(d: &Dataset) -> dataset::Dataset {
             .collect(),
         object_id: d.object_id.clone(),
         created: d.created,
+        partition_keys: d.partition_keys.clone(),
     }
 }
 pub(super) fn from_proto_row_filters(filters: &[RowFilter]) -> Vec<dataset::RowFilter> {
