@@ -221,6 +221,11 @@ impl ChiseiServiceImpl {
             &evidence_context_gates,
             &run.evidence_references,
         )?;
+        self.enforce_model_review_admission(
+            &input.namespace,
+            &resolved_model,
+            authenticated_actor,
+        )?;
         let egress_decisions =
             build_egress_decisions(&run.egress_records, &provider, provider_is_external);
         let prepared_messages = build_prepared_messages(&input, &run.prepared_spec);

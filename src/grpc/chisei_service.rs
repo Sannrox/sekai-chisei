@@ -64,6 +64,7 @@ mod governed_subject_lifecycle;
 mod gunshi_issuance_lifecycle;
 mod kioku_candidate_governance;
 mod live_model;
+mod model_review_admission;
 mod native_execution_lifecycle;
 mod policy_resolution;
 mod privacy_egress;
@@ -308,6 +309,10 @@ impl ChiseiServiceImpl {
         >,
     ) -> Self {
         let db = db.into();
+        #[cfg(test)]
+        if !crate::chisei::model_review::registry_family_seed_skipped() {
+            let _ = crate::chisei::model_review::enable_registry_provider_families(&db);
+        }
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
@@ -385,6 +390,10 @@ impl ChiseiServiceImpl {
         budget: Arc<BudgetTracker>,
     ) -> Self {
         let db = db.into();
+        #[cfg(test)]
+        if !crate::chisei::model_review::registry_family_seed_skipped() {
+            let _ = crate::chisei::model_review::enable_registry_provider_families(&db);
+        }
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());

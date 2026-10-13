@@ -238,6 +238,8 @@ impl GatewayStack {
 
         let setup_codex = sekaictl(
             &socket,
+            &sekai_db,
+            &chisei_db,
             &log_path,
             &[
                 "admin",
@@ -267,6 +269,8 @@ impl GatewayStack {
 
         let setup_claude = sekaictl(
             &socket,
+            &sekai_db,
+            &chisei_db,
             &log_path,
             &[
                 "admin",
@@ -293,6 +297,38 @@ impl GatewayStack {
             ],
         );
         assert_success(&setup_claude, "gateway setup claude", &logs(&log_path));
+
+        // The shipped binary default-denies unreviewed families. Smoke setup
+        // mirrors the operator CLI: enable the instance-default families the
+        // gateway routes use. Policy still refuses cross-provider models.
+        for family in ["openai", "anthropic"] {
+            let enabled = sekaictl(
+                &socket,
+                &sekai_db,
+                &chisei_db,
+                &log_path,
+                &[
+                    "admin",
+                    "model-review",
+                    "family-set",
+                    "--namespace",
+                    "",
+                    "--family",
+                    family,
+                    "--status",
+                    "enabled",
+                    "--reason",
+                    "gateway smoke fixture",
+                    "--actor",
+                    "local",
+                ],
+            );
+            assert_success(
+                &enabled,
+                &format!("enable {family} model review"),
+                &logs(&log_path),
+            );
+        }
 
         let mut gateway = None;
         let mut base = String::new();
@@ -535,14 +571,37 @@ async fn wait_for_http(url: &str, log_path: &Path, budget: Duration) -> bool {
     }
 }
 
-fn sekaictl(socket: &Path, log_path: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sekaictl"))
-        .args(args)
-        .env("SEKAI_SOCKET", socket)
-        .env_remove("CHISEI_GRPC_URL")
-        .env_remove("SEKAI_CREDENTIAL")
-        .output()
-        .unwrap_or_else(|error| panic!("sekaictl {args:?}: {error}\n{}", logs(log_path)))
+fn sekaictl(
+    socket: &Path,
+    sekai_db: &Path,
+    chisei_db: &Path,
+    log_path: &Path,
+    args: &[&str],
+) -> Output {
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+            .args(args)
+            .env("SEKAI_SOCKET", socket)
+            .env("SEKAI_DB_PATH", sekai_db)
+            .env("CHISEI_DB_PATH", chisei_db)
+            .env_remove("SEKAI_DB_BACKEND")
+            .env_remove("DATABASE_URL")
+            .env_remove("CHISEI_GRPC_URL")
+            .env_remove("SEKAI_CREDENTIAL")
+            .output()
+            .unwrap_or_else(|error| panic!("sekaictl {args:?}: {error}\n{}", logs(log_path)))
+    };
+    let mut output = run();
+    for attempt in 1..8 {
+        if output.status.success()
+            || !String::from_utf8_lossy(&output.stderr).contains("database is locked")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100 * attempt));
+        output = run();
+    }
+    output
 }
 
 fn assert_success(output: &Output, label: &str, logs: &str) {
