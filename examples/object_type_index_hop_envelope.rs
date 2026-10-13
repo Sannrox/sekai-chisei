@@ -187,6 +187,7 @@ fn create_kind(
         columns,
         object_id: String::new(),
         created: 1,
+        partition_keys: Vec::new(),
     })?;
     let mut batch = Vec::with_capacity(1_000);
     for id in 0..rows {

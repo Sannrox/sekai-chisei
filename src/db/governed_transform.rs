@@ -10,11 +10,13 @@ use crate::sekai::governed_transform::{
     TRANSFORM_WORK_CLAIMED, TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED,
     TRANSFORM_WORK_PENDING, TransformInputRows, TransformOutputState, TransformRun,
     TransformRunInputRow, TransformWork, WriteTransformRunCommand, admit_isolated_run,
-    bind_checkpoint, bind_isolated_write_lineage, budget_quarantined_run, checkpoint_after_id,
-    compute_run_tables_until, derive_transform_markings, evaluate_quality,
-    fold_live_output_marking, fold_output_digest, normalize_transform_claim_ttl_ms,
-    refuse_dependency_cycle, require_bound_output_for_markings, rows_digest, schedule_due_bucket,
-    transform_claim_fence_matches, transform_work_is_claimable, trigger_is_due,
+    bind_checkpoint, bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
+    checkpoint_after_id, compute_run_tables_until, dataset_digest, derive_transform_markings,
+    evaluate_quality, fold_live_output_marking, fold_output_digest, input_partition_receipts,
+    normalize_transform_claim_ttl_ms, partition_records, partition_value, prepare_partition_commit,
+    receipts_for_touched_partitions, redact_run_partition_receipts, refuse_dependency_cycle,
+    require_bound_output_for_markings, rows_digest, schedule_due_bucket,
+    transform_claim_fence_matches, transform_work_is_claimable, trigger_is_due, trim_page_to_bytes,
 };
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -142,6 +144,26 @@ impl SekaiDb {
         let _ = self.conn().execute(
             "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN trigger_ref TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_transform_run_input
+             ADD COLUMN partition_key TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_run
+             ADD COLUMN input_partitions TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_run
+             ADD COLUMN output_partitions TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_checkpoint
+             ADD COLUMN input_partition_digests TEXT NOT NULL DEFAULT '{}'",
             [],
         );
         self.conn()
@@ -370,7 +392,8 @@ impl SekaiDb {
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
-                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
+                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
+                        input_partitions, output_partitions
                  FROM sekai_governed_transform_run WHERE run_id = ?1",
                 params![run_id],
                 map_transform_run,
@@ -411,7 +434,8 @@ impl SekaiDb {
                 "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
-                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
+                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
+                        input_partitions, output_partitions
                  FROM sekai_governed_transform_run
                  WHERE namespace = ?1
                  ORDER BY created_at_ms DESC, run_id DESC
@@ -537,6 +561,8 @@ impl SekaiDb {
             after_alias,
             after_row_id,
             limit,
+            command.partition_key.as_deref(),
+            command.max_bytes,
         )
     }
 
@@ -585,8 +611,13 @@ fn run_governed_transform_tx(
         return Err("dataset not found".into());
     }
     let stored = load_checkpoint(tx, namespace, transform_id)?;
-    let (mut incremental, checkpoint) =
-        bind_checkpoint(incremental, stored, &transform.definition_digest);
+    let output_keys = load_dataset_partition_keys(tx, &transform.output_dataset_id)?;
+    let (mut incremental, checkpoint) = bind_checkpoint(
+        incremental,
+        stored,
+        &transform.definition_digest,
+        &output_keys,
+    );
     if !transform.allows_incremental() {
         incremental = false;
     }
@@ -668,6 +699,7 @@ fn run_governed_transform_tx(
     run.markings_in = markings_in;
     run.markings_out = markings_out;
     run.stamp_trigger(trigger_cause, trigger_ref);
+    run.input_partitions = input_receipts_from_loaded(tx, &bindings, &loaded)?;
     if run.quarantined {
         if !incremental {
             run.output_digest = live_output_digest(tx, &transform.output_dataset_id)?;
@@ -677,22 +709,16 @@ fn run_governed_transform_tx(
         return Ok(run);
     }
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
-    if !incremental {
-        tx.execute(
-            "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
-            params![transform.output_dataset_id],
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    append_output_rows(tx, &transform.output_dataset_id, &output_rows)?;
-    run.output_digest = if incremental {
-        checkpoint
-            .as_ref()
-            .and_then(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
-            .ok_or_else(|| "checkpoint digest encoding is not current".to_string())?
-    } else {
-        rows_digest(&output_rows)
-    };
+    persist_computed_output(
+        tx,
+        &transform,
+        &bindings,
+        &loaded,
+        incremental,
+        checkpoint.as_ref(),
+        &output_rows,
+        &mut run,
+    )?;
     stamp_object_marking(tx, &output_object_id, &run.markings_out, now_ms)?;
     insert_transform_run(tx, &run)?;
     tx.execute(
@@ -763,6 +789,7 @@ fn admit_isolated_process_tx(
         .map_err(|error| error.message())?;
     run.markings_in = markings_in;
     run.markings_out = markings_out;
+    run.input_partitions = input_receipts_from_loaded(tx, &bindings, &loaded)?;
     insert_transform_run(tx, &run)?;
     persist_run_input_snapshot(tx, &run.run_id, &bindings, &loaded)?;
     let spec = transform
@@ -881,11 +908,28 @@ fn write_transform_run_tx(
     }
     let transform = load_admitted_transform(tx, &work)?;
     let mut run = load_transform_run(tx, &command.run_id)?.ok_or("transform run not found")?;
-    let computed = rows_digest(&command.rows);
-    if !command.quarantined && computed != command.output_digest {
-        return Err(TRANSFORM_DIGEST_MISMATCH.into());
-    }
-    let quality_error = evaluate_quality(&command.rows, &transform.quality_rule)
+    let keys = load_dataset_partition_keys(tx, &transform.output_dataset_id)?;
+    let partition_commit = if command.quarantined {
+        None
+    } else if command.replaced_partitions.is_empty() {
+        if dataset_digest(&keys, &command.rows) != command.output_digest {
+            return Err(TRANSFORM_DIGEST_MISMATCH.into());
+        }
+        None
+    } else {
+        let live_rows = live_output_rows(tx, &transform.output_dataset_id)?;
+        Some(prepare_partition_commit(
+            &keys,
+            &live_rows,
+            &command.replaced_partitions,
+            &command.output_digest,
+        )?)
+    };
+    let quality_rows = partition_commit
+        .as_ref()
+        .map(|commit| commit.merged_rows.as_slice())
+        .unwrap_or(command.rows.as_slice());
+    let quality_error = evaluate_quality(quality_rows, &transform.quality_rule)
         .err()
         .map(|error| error.message());
     let quarantined = command.quarantined || quality_error.is_some();
@@ -929,14 +973,27 @@ fn write_transform_run_tx(
     run.markings_out =
         fold_live_output_marking(lattice.as_ref(), &run.markings_out, live_output.as_deref())?;
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
-    tx.execute(
-        "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
-        params![transform.output_dataset_id],
-    )
-    .map_err(|error| error.to_string())?;
-    append_output_rows(tx, &transform.output_dataset_id, &command.rows)?;
-    run.output_digest = computed;
-    run.rows_out = command.rows.len() as i32;
+    if let Some(commit) = partition_commit {
+        replace_output_partitions(tx, &transform.output_dataset_id, &commit.replacements)?;
+        run.output_digest = commit.envelope_digest.clone();
+        run.rows_out = commit.merged_rows.len() as i32;
+        run.output_partitions = commit.written;
+        bind_receipts_to_dataset(&mut run.output_partitions, &transform.output_dataset_id);
+    } else {
+        tx.execute(
+            "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
+            params![transform.output_dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+        append_output_rows(tx, &transform.output_dataset_id, &command.rows)?;
+        run.output_digest = dataset_digest(&keys, &command.rows);
+        run.rows_out = command.rows.len() as i32;
+        run.output_partitions = if keys.is_empty() {
+            Vec::new()
+        } else {
+            partition_records(&keys, &command.rows, &transform.output_dataset_id)
+        };
+    }
     run.quarantined = false;
     run.dispatch_status = TRANSFORM_WORK_COMPLETED.into();
     run.engine = work.engine.clone();
@@ -1004,7 +1061,8 @@ fn load_transform_run(tx: &Transaction<'_>, run_id: &str) -> Result<Option<Trans
         "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
                 last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                 lineage_parent, created_at_ms, markings_in, markings_out,
-                profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref
+                profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
+                        input_partitions, output_partitions
          FROM sekai_governed_transform_run WHERE run_id = ?1",
         params![run_id],
         map_transform_run,
@@ -1072,13 +1130,22 @@ fn persist_run_input_snapshot(
 ) -> Result<(), String> {
     // Snapshot is the admitted pin: persist the full loaded set, not a stream.
     for ((alias, dataset_id), (_, _, records)) in bindings.iter().zip(loaded.iter()) {
+        let keys = load_dataset_partition_keys(tx, dataset_id)?;
         for (row_id, values) in records {
             let values_json = serde_json::to_string(values).map_err(|error| error.to_string())?;
+            let partition_key = partition_value(&keys, values);
             tx.execute(
                 "INSERT INTO sekai_transform_run_input
-                 (run_id, alias, dataset_id, row_id, values_json)
-                 VALUES (?1,?2,?3,?4,?5)",
-                params![run_id, alias, dataset_id, row_id, values_json],
+                 (run_id, alias, dataset_id, row_id, values_json, partition_key)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    run_id,
+                    alias,
+                    dataset_id,
+                    row_id,
+                    values_json,
+                    partition_key
+                ],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -1122,16 +1189,24 @@ fn load_run_input_snapshot(
     after_alias: &str,
     after_row_id: i64,
     limit: i64,
+    partition_key: Option<&str>,
+    max_bytes: i64,
 ) -> Result<Vec<TransformRunInputRow>, String> {
     let cap = if limit <= 0 { 1_000 } else { limit.min(5_000) };
     let wanted = alias.trim();
+    let (wanted_partition, has_selector) = match partition_key {
+        Some(key) => (key, 1i64),
+        None => ("", 0i64),
+    };
     // Empty alias walks every input in (alias, row_id) order. Continue with
     // after_alias + after_row_id from the last row. Named alias stays per input.
+    // Unset selector (?6 = 0) reads every partition; empty string is an identity.
     let mut stmt = if wanted.is_empty() {
         tx.prepare(
-            "SELECT alias, dataset_id, row_id, values_json
+            "SELECT alias, dataset_id, row_id, values_json, partition_key
              FROM sekai_transform_run_input
              WHERE run_id = ?1
+               AND (?6 = 0 OR partition_key = ?5)
                AND (alias > ?2 OR (alias = ?2 AND row_id > ?3))
              ORDER BY alias, row_id
              LIMIT ?4",
@@ -1139,9 +1214,10 @@ fn load_run_input_snapshot(
         .map_err(|error| error.to_string())?
     } else {
         tx.prepare(
-            "SELECT alias, dataset_id, row_id, values_json
+            "SELECT alias, dataset_id, row_id, values_json, partition_key
              FROM sekai_transform_run_input
              WHERE run_id = ?1 AND alias = ?2 AND row_id > ?3
+               AND (?6 = 0 OR partition_key = ?5)
              ORDER BY row_id
              LIMIT ?4",
         )
@@ -1149,32 +1225,64 @@ fn load_run_input_snapshot(
     };
     let mapped = if wanted.is_empty() {
         stmt.query_map(
-            params![run_id, after_alias.trim(), after_row_id, cap],
+            params![
+                run_id,
+                after_alias.trim(),
+                after_row_id,
+                cap,
+                wanted_partition,
+                has_selector
+            ],
             map_snapshot_row,
         )
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?
     } else {
-        stmt.query_map(params![run_id, wanted, after_row_id, cap], map_snapshot_row)
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
+        stmt.query_map(
+            params![
+                run_id,
+                wanted,
+                after_row_id,
+                cap,
+                wanted_partition,
+                has_selector
+            ],
+            map_snapshot_row,
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
     };
-    mapped.into_iter().map(parse_snapshot_row).collect()
+    let rows = mapped
+        .into_iter()
+        .map(parse_snapshot_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(trim_page_to_bytes(rows, max_bytes))
 }
 
-fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, i64, String)> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+fn map_snapshot_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, String, i64, String, String)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get::<_, String>(4).unwrap_or_default(),
+    ))
 }
 
-fn parse_snapshot_row(row: (String, String, i64, String)) -> Result<TransformRunInputRow, String> {
-    let (alias, dataset_id, row_id, values_json) = row;
+fn parse_snapshot_row(
+    row: (String, String, i64, String, String),
+) -> Result<TransformRunInputRow, String> {
+    let (alias, dataset_id, row_id, values_json, partition_key) = row;
     Ok(TransformRunInputRow {
         alias,
         dataset_id,
         row_id,
         values: serde_json::from_str(&values_json).map_err(|error| error.to_string())?,
+        partition_key,
     })
 }
 
@@ -1188,12 +1296,14 @@ fn delete_run_input_snapshot(tx: &Transaction<'_>, run_id: &str) -> Result<(), S
 }
 
 fn persist_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(), String> {
+    let output_partitions = encode_partition_json(&run.output_partitions)?;
     tx.execute(
         "UPDATE sekai_governed_transform_run SET
             output_digest = ?2, last_input_row_id = ?3, incremental = ?4, quarantined = ?5,
             quality_rule = ?6, rows_in = ?7, rows_out = ?8, lineage_parent = ?9,
             markings_in = ?10, markings_out = ?11, profile = ?12, engine = ?13,
-            runtime_image = ?14, dispatch_status = ?15, trigger_cause = ?16, trigger_ref = ?17
+            runtime_image = ?14, dispatch_status = ?15, trigger_cause = ?16, trigger_ref = ?17,
+            output_partitions = ?18
          WHERE run_id = ?1",
         params![
             run.run_id,
@@ -1212,7 +1322,8 @@ fn persist_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(),
             run.runtime_image,
             run.dispatch_status,
             run.trigger_cause,
-            run.trigger_ref
+            run.trigger_ref,
+            output_partitions
         ],
     )
     .map(|_| ())
@@ -1323,12 +1434,78 @@ pub(crate) fn list_row_records_after(
     Ok(results)
 }
 
+fn persist_computed_output(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    bindings: &[(String, String)],
+    loaded: &[(String, Vec<String>, Vec<DatasetRowRecord>)],
+    incremental: bool,
+    checkpoint: Option<&crate::sekai::governed_transform::TransformCheckpoint>,
+    output_rows: &[HashMap<String, String>],
+    run: &mut TransformRun,
+) -> Result<(), String> {
+    let keys = load_dataset_partition_keys(tx, &transform.output_dataset_id)?;
+    run.input_partitions = input_receipts_from_loaded(tx, bindings, loaded)?;
+    if keys.is_empty() {
+        if !incremental {
+            tx.execute(
+                "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
+                params![transform.output_dataset_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        append_output_rows(tx, &transform.output_dataset_id, output_rows)?;
+        run.output_digest = if incremental {
+            checkpoint
+                .and_then(|checkpoint| fold_output_digest(&checkpoint.2, output_rows))
+                .ok_or_else(|| "checkpoint digest encoding is not current".to_string())?
+        } else {
+            rows_digest(output_rows)
+        };
+        return Ok(());
+    }
+    if incremental {
+        append_output_rows(tx, &transform.output_dataset_id, output_rows)?;
+    } else {
+        tx.execute(
+            "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
+            params![transform.output_dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+        append_output_rows(tx, &transform.output_dataset_id, output_rows)?;
+        run.output_partitions = partition_records(&keys, output_rows, &transform.output_dataset_id);
+    }
+    let live = live_output_rows(tx, &transform.output_dataset_id)?;
+    if incremental {
+        run.output_partitions = receipts_for_touched_partitions(
+            &keys,
+            &live,
+            output_rows,
+            &transform.output_dataset_id,
+        );
+    }
+    run.output_digest = dataset_digest(&keys, &live);
+    Ok(())
+}
+
+fn input_receipts_from_loaded(
+    tx: &Transaction<'_>,
+    bindings: &[(String, String)],
+    loaded: &[(String, Vec<String>, Vec<DatasetRowRecord>)],
+) -> Result<Vec<crate::sekai::governed_transform::TransformPartition>, String> {
+    let mut inputs = Vec::new();
+    for ((_, dataset_id), (_, _, records)) in bindings.iter().zip(loaded.iter()) {
+        let keys = load_dataset_partition_keys(tx, dataset_id)?;
+        let rows = records.iter().map(|(_, row)| row.clone()).collect();
+        inputs.push((dataset_id.clone(), keys, rows));
+    }
+    Ok(input_partition_receipts(inputs))
+}
+
 fn live_output_digest(tx: &Transaction<'_>, dataset_id: &str) -> Result<String, String> {
-    let live: Vec<HashMap<String, String>> = list_row_records_after(tx, dataset_id, 0, None)?
-        .into_iter()
-        .map(|(_, row)| row)
-        .collect();
-    Ok(rows_digest(&live))
+    let live = live_output_rows(tx, dataset_id)?;
+    let keys = load_dataset_partition_keys(tx, dataset_id)?;
+    Ok(dataset_digest(&keys, &live))
 }
 
 pub(crate) fn append_output_rows(
@@ -1339,19 +1516,83 @@ pub(crate) fn append_output_rows(
     if rows.is_empty() {
         return Ok(());
     }
-    let payloads: Vec<String> = rows
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<_, _>>()
-        .map_err(|error| error.to_string())?;
-    let json = serde_json::to_string(&payloads).map_err(|error| error.to_string())?;
-    tx.execute(
-        "INSERT INTO sekai_dataset_rows (dataset_id, data)
+    let keys = load_dataset_partition_keys(tx, dataset_id)?;
+    if keys.is_empty() {
+        let payloads: Vec<String> = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
+        let json = serde_json::to_string(&payloads).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_dataset_rows (dataset_id, data)
          SELECT ?1, value FROM json_each(?2)",
-        params![dataset_id, json],
-    )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+            params![dataset_id, json],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    } else {
+        for row in rows {
+            let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
+                 VALUES (?1, ?2, ?3)",
+                params![dataset_id, data, partition_value(&keys, row)],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+fn load_dataset_partition_keys(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+) -> Result<Vec<String>, String> {
+    let json: String = tx
+        .query_row(
+            "SELECT partition_keys FROM sekai_datasets WHERE id = ?1",
+            params![dataset_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| "[]".into());
+    crate::sekai::dataset::parse_partition_keys(&json)
+}
+
+fn live_output_rows(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+) -> Result<Vec<HashMap<String, String>>, String> {
+    Ok(list_row_records_after(tx, dataset_id, 0, None)?
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect())
+}
+
+fn replace_output_partitions(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    replacements: &[(String, Vec<HashMap<String, String>>)],
+) -> Result<(), String> {
+    for (partition_key, rows) in replacements {
+        tx.execute(
+            "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1 AND partition_key = ?2",
+            params![dataset_id, partition_key],
+        )
+        .map_err(|error| error.to_string())?;
+        for row in rows {
+            let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
+                 VALUES (?1, ?2, ?3)",
+                params![dataset_id, data, partition_key],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn map_transform_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformRun> {
@@ -1378,17 +1619,86 @@ fn map_transform_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformRun> 
         dispatch_status: row.get(19).unwrap_or_default(),
         trigger_cause: row.get(20).unwrap_or_default(),
         trigger_ref: row.get(21).unwrap_or_default(),
+        input_partitions: parse_partition_json(row.get(22).unwrap_or_else(|_| "[]".into())),
+        output_partitions: parse_partition_json(row.get(23).unwrap_or_else(|_| "[]".into())),
     })
 }
 
+fn parse_partition_json(json: String) -> Vec<crate::sekai::governed_transform::TransformPartition> {
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+fn encode_partition_json(
+    partitions: &[crate::sekai::governed_transform::TransformPartition],
+) -> Result<String, String> {
+    serde_json::to_string(partitions).map_err(|error| error.to_string())
+}
+
+pub(crate) fn redact_transform_partition_receipts(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    redact_snapshots: bool,
+) -> Result<(), String> {
+    if redact_snapshots {
+        tx.execute(
+            "UPDATE sekai_transform_run_input SET partition_key = '[redacted]'
+             WHERE dataset_id = ?1 AND partition_key != '' AND partition_key != '[redacted]'",
+            params![dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let rows = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT run_id, input_partitions, output_partitions
+                 FROM sekai_governed_transform_run",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    for (run_id, input_json, output_json) in rows {
+        let mut input_partitions = parse_partition_json(input_json);
+        let mut output_partitions = parse_partition_json(output_json);
+        if !redact_run_partition_receipts(dataset_id, &mut input_partitions, &mut output_partitions)
+        {
+            continue;
+        }
+        tx.execute(
+            "UPDATE sekai_governed_transform_run
+             SET input_partitions = ?1, output_partitions = ?2
+             WHERE run_id = ?3",
+            params![
+                encode_partition_json(&input_partitions)?,
+                encode_partition_json(&output_partitions)?,
+                run_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(), String> {
+    let input_partitions = encode_partition_json(&run.input_partitions)?;
+    let output_partitions = encode_partition_json(&run.output_partitions)?;
     tx.execute(
         "INSERT INTO sekai_governed_transform_run
          (run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
           last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
           lineage_parent, created_at_ms, markings_in, markings_out,
-          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref, input_partitions, output_partitions)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
         params![
             run.run_id,
             run.namespace,
@@ -1411,7 +1721,9 @@ pub(crate) fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> 
             run.runtime_image,
             run.dispatch_status,
             run.trigger_cause,
-            run.trigger_ref
+            run.trigger_ref,
+            input_partitions,
+            output_partitions
         ],
     )
     .map(|_| ())
@@ -2220,6 +2532,8 @@ fn skip_downstream_pending_tx(
             dispatch_status: TRANSFORM_WORK_CANCELLED.into(),
             trigger_cause: TRANSFORM_TRIGGER_CANCELLED.into(),
             trigger_ref: cancelled.run_id.clone(),
+            input_partitions: Vec::new(),
+            output_partitions: Vec::new(),
         };
         insert_transform_run(tx, &skip)?;
     }
@@ -2232,11 +2546,11 @@ mod tests {
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use crate::sekai::governed_transform::{
         AnalyticalSpec, CONTRACT_VERSION, GovernedTransform, ISOLATED_CLASS, IsolatedProcessSpec,
-        STALE_TRANSFORM_ADMISSION, TRANSFORM_DEPENDENCY_CYCLE, TRANSFORM_OUTPUT_BLOCKED,
-        TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE, TRANSFORM_TRIGGER_CANCELLED,
-        TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_SOURCE_BATCH,
-        TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED, TransformInput, TransformSchedule,
-        TransformStep, TransformTrigger,
+        PARTITIONED_DIGEST_PREFIX, STALE_TRANSFORM_ADMISSION, TRANSFORM_DEPENDENCY_CYCLE,
+        TRANSFORM_OUTPUT_BLOCKED, TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE,
+        TRANSFORM_TRIGGER_CANCELLED, TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE,
+        TRANSFORM_TRIGGER_SOURCE_BATCH, TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED,
+        TransformInput, TransformSchedule, TransformStep, TransformTrigger,
     };
 
     fn db() -> SekaiDb {
@@ -2261,6 +2575,7 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         }
     }
 
@@ -2380,6 +2695,55 @@ mod tests {
         assert!(failed.quarantined);
         assert!(failed.quality_rule.contains("required:keep"));
         assert_eq!(db.query_rows("out", &Default::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn quality_failure_keeps_input_partition_receipts() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), String::new()),
+                ("region".into(), "east".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: vec!["id".into(), "keep".into(), "region".into()],
+            }],
+            quality_rule: "required:keep".into(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let failed = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(failed.quarantined);
+        assert_eq!(failed.input_partitions.len(), 1);
+        assert_eq!(failed.input_partitions[0].partition_key, "east");
+        assert_eq!(failed.input_partitions[0].rows, 1);
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3239,6 +3603,7 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         };
         let orders = Dataset {
             id: "orders".into(),
@@ -3262,6 +3627,7 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         };
         db.create_dataset(&customers).unwrap();
         db.create_dataset(&orders).unwrap();
@@ -3331,6 +3697,117 @@ mod tests {
         let live = db.query_rows("out", &Default::default()).unwrap();
         assert_eq!(live[0].get("region").map(String::as_str), Some("east"));
         assert_eq!(live[0].get("orders").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn analytical_join_records_each_input_partition() {
+        let db = db();
+        let customers = Dataset {
+            id: "customers".into(),
+            name: "customers".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                ColumnDef {
+                    name: "region".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+            ],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: vec!["region".into()],
+        };
+        let orders = Dataset {
+            id: "orders".into(),
+            name: "orders".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                ColumnDef {
+                    name: "customer_id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                ColumnDef {
+                    name: "amount".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+            ],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: vec!["customer_id".into()],
+        };
+        db.create_dataset(&customers).unwrap();
+        db.create_dataset(&orders).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "customers",
+            &[
+                HashMap::from([("id".into(), "c1".into()), ("region".into(), "east".into())]),
+                HashMap::from([("id".into(), "c2".into()), ("region".into(), "west".into())]),
+            ],
+        )
+        .unwrap();
+        db.append_rows(
+            "orders",
+            &[HashMap::from([
+                ("id".into(), "o1".into()),
+                ("customer_id".into(), "c1".into()),
+                ("amount".into(), "10".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "join1".into(),
+            input_dataset_id: "customers".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: Some(AnalyticalSpec {
+                inputs: vec![
+                    TransformInput {
+                        alias: "customers".into(),
+                        dataset_id: "customers".into(),
+                    },
+                    TransformInput {
+                        alias: "orders".into(),
+                        dataset_id: "orders".into(),
+                    },
+                ],
+                sql: "SELECT c.region AS region, COUNT(*) AS orders FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region".into(),
+                memory_limit_bytes: 0,
+                time_limit_ms: 0,
+            }),
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db
+            .run_governed_transform("ops", "join1", false, 20)
+            .unwrap();
+        let keys: Vec<_> = run
+            .input_partitions
+            .iter()
+            .map(|partition| partition.partition_key.as_str())
+            .collect();
+        assert!(keys.contains(&"east"));
+        assert!(keys.contains(&"west"));
+        assert!(keys.contains(&"c1"));
+        assert!(!run.output_digest.starts_with(PARTITIONED_DIGEST_PREFIX));
     }
 
     #[test]
@@ -3460,6 +3937,7 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         };
         let orders = Dataset {
             id: "orders".into(),
@@ -3483,6 +3961,7 @@ mod tests {
             ],
             object_id: String::new(),
             created: 1,
+            partition_keys: Vec::new(),
         };
         db.create_dataset(&customers).unwrap();
         db.create_dataset(&orders).unwrap();
@@ -3566,6 +4045,7 @@ mod tests {
             }],
             object_id: "cust-obj".into(),
             created: 1,
+            partition_keys: Vec::new(),
         };
         customers.columns.push(ColumnDef {
             name: "region".into(),
@@ -3589,6 +4069,7 @@ mod tests {
             ],
             object_id: "ord-obj".into(),
             created: 1,
+            partition_keys: Vec::new(),
         };
         let mut output = dataset("out");
         output.object_id = "out-obj".into();
@@ -3734,6 +4215,7 @@ mod tests {
                     output_digest: rows_digest(&output),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 50,
             )
@@ -3792,6 +4274,7 @@ mod tests {
                     output_digest: rows_digest(&output_rows),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 50,
             )
@@ -3846,6 +4329,7 @@ mod tests {
                     output_digest: "ignored".into(),
                     quarantined: true,
                     quality_rule: "worker-failed".into(),
+                    ..WriteTransformRunCommand::default()
                 },
                 50,
             )
@@ -3893,6 +4377,7 @@ mod tests {
                 output_digest: rows_digest(&first_rows),
                 quarantined: false,
                 quality_rule: String::new(),
+                ..WriteTransformRunCommand::default()
             },
             40,
         )
@@ -3925,6 +4410,7 @@ mod tests {
                     output_digest: rows_digest(&second_rows),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 70,
             )
@@ -3983,6 +4469,7 @@ mod tests {
                 output_digest: rows_digest(&newer_rows),
                 quarantined: false,
                 quality_rule: String::new(),
+                ..WriteTransformRunCommand::default()
             },
             50,
         )
@@ -4002,6 +4489,7 @@ mod tests {
                     output_digest: rows_digest(&older_rows),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 60,
             )
@@ -4045,6 +4533,7 @@ mod tests {
                     output_digest: "ignored".into(),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 40,
             )
@@ -4094,6 +4583,7 @@ mod tests {
                     output_digest: "sha256-sum-v1:deadbeef".into(),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 40,
             )
@@ -4271,6 +4761,7 @@ mod tests {
                     output_digest: rows_digest(&output),
                     quarantined: false,
                     quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
                 },
                 40,
             )
@@ -4334,6 +4825,7 @@ mod tests {
                 output_digest: rows_digest(&output),
                 quarantined: false,
                 quality_rule: String::new(),
+                ..WriteTransformRunCommand::default()
             },
             40,
         )
@@ -4593,6 +5085,43 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].trigger_ref, "2");
         assert_ne!(second[0].run_id, first[0].run_id);
+    }
+
+    #[test]
+    fn schedule_partitioned_run_records_partition_digest() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "east".into()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = projection("t1", "in", "out");
+        transform.steps = vec![TransformStep {
+            kind: "project".into(),
+            column: String::new(),
+            op: String::new(),
+            value: String::new(),
+            columns: vec!["id".into(), "keep".into(), "region".into()],
+        }];
+        transform.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.tick_governed_transforms(1_500).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0]
+                .output_digest
+                .starts_with(PARTITIONED_DIGEST_PREFIX)
+        );
+        assert_eq!(first[0].input_partitions.len(), 1);
+        assert_eq!(first[0].input_partitions[0].partition_key, "east");
     }
 
     #[test]
@@ -4908,6 +5437,7 @@ mod tests {
                 output_digest: rows_digest(&output),
                 quarantined: false,
                 quality_rule: String::new(),
+                ..WriteTransformRunCommand::default()
             },
             50,
         )
@@ -5009,5 +5539,952 @@ mod tests {
         assert_eq!(admitted[0].transform_id, "iso2");
         let claimable = db.list_claimable_transform_work("ops", 1_500, 10).unwrap();
         assert_eq!(claimable.len(), 2);
+    }
+
+    fn partitioned_dataset(id: &str) -> Dataset {
+        let mut dataset = dataset(id);
+        dataset.columns.push(ColumnDef {
+            name: "region".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        });
+        dataset.partition_keys = vec!["region".into()];
+        dataset
+    }
+
+    fn east_west_rows() -> (Vec<HashMap<String, String>>, Vec<HashMap<String, String>>) {
+        (
+            vec![HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "east".into()),
+            ])],
+            vec![HashMap::from([
+                ("id".into(), "2".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "west".into()),
+            ])],
+        )
+    }
+
+    #[test]
+    fn isolated_process_streamed_read_stays_inside_byte_bound() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let mut rows = Vec::new();
+        for i in 0..20 {
+            rows.push(HashMap::from([
+                ("id".into(), i.to_string()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), if i < 10 { "east" } else { "west" }.into()),
+            ]));
+        }
+        db.append_rows("in", &rows).unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let mut fence = WriteTransformRunCommand {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            max_bytes: 40,
+            ..WriteTransformRunCommand::default()
+        };
+        let mut seen = Vec::new();
+        let mut after_alias = String::new();
+        let mut after_row_id = 0;
+        loop {
+            let page = db
+                .read_transform_run_input(&fence, "", &after_alias, after_row_id, 100, 40)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            let page_bytes: u64 = page
+                .iter()
+                .map(crate::sekai::governed_transform::row_stream_bytes)
+                .sum();
+            assert!(
+                page_bytes <= 40 || page.len() == 1,
+                "page exceeded bound: {page_bytes}"
+            );
+            after_alias = page.last().unwrap().alias.clone();
+            after_row_id = page.last().unwrap().row_id;
+            fence.partition_key = None;
+            seen.extend(page);
+        }
+        assert_eq!(seen.len(), 20);
+    }
+
+    #[test]
+    fn isolated_process_streamed_read_selects_empty_partition_identity() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[
+                HashMap::from([
+                    ("id".into(), "1".into()),
+                    ("keep".into(), "yes".into()),
+                    ("region".into(), "east".into()),
+                ]),
+                HashMap::from([("id".into(), "2".into()), ("keep".into(), "yes".into())]),
+            ],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let fence = WriteTransformRunCommand {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            partition_key: Some(String::new()),
+            ..WriteTransformRunCommand::default()
+        };
+        let page = db
+            .read_transform_run_input(&fence, "", "", 0, 100, 40)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].partition_key, "");
+        assert_eq!(page[0].values.get("id").map(String::as_str), Some("2"));
+        let output = vec![HashMap::from([
+            ("id".into(), "2".into()),
+            ("keep".into(), "yes".into()),
+            ("region".into(), "east".into()),
+        ])];
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: fence.run_id,
+                    runtime_id: fence.runtime_id,
+                    claim_generation: fence.claim_generation,
+                    fencing_token: fence.fencing_token,
+                    rows: output.clone(),
+                    output_digest: crate::sekai::governed_transform::dataset_digest(
+                        &["region".into()],
+                        &output,
+                    ),
+                    ..WriteTransformRunCommand::default()
+                },
+                50,
+            )
+            .unwrap();
+        assert!(
+            committed
+                .input_partitions
+                .iter()
+                .any(|partition| partition.partition_key.is_empty()),
+            "empty partition identity must remain on the input receipt"
+        );
+    }
+
+    #[test]
+    fn isolated_process_partition_write_back_rewrites_one_partition() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let (east, west) = east_west_rows();
+        db.append_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let first_output = vec![east[0].clone(), west[0].clone()];
+        let keys = vec!["region".into()];
+        let first_envelope = crate::sekai::governed_transform::partitioned_dataset_digest(
+            &crate::sekai::governed_transform::group_rows_by_partition(&keys, &first_output)
+                .into_iter()
+                .map(|(key, rows)| (key, crate::sekai::governed_transform::rows_digest(&rows)))
+                .collect(),
+        );
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id.clone(),
+                    runtime_id: work.claim_owner.clone(),
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token.clone(),
+                    replaced_partitions: vec![
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "east".into(),
+                            rows: east.clone(),
+                        },
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "west".into(),
+                            rows: west.clone(),
+                        },
+                    ],
+                    output_digest: first_envelope,
+                    ..WriteTransformRunCommand::default()
+                },
+                50,
+            )
+            .unwrap();
+        assert_eq!(committed.output_partitions.len(), 2);
+        let west_digest = committed
+            .output_partitions
+            .iter()
+            .find(|partition| partition.partition_key == "west")
+            .unwrap()
+            .digest
+            .clone();
+
+        db.put_governed_transform(&isolated_transform(), 60)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 70).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", &admitted.run_id, 60_000, 80)
+            .unwrap()
+            .expect("claimable work");
+        let mut new_east = east.clone();
+        new_east[0].insert("keep".into(), "derived".into());
+        let merged = vec![new_east[0].clone(), west[0].clone()];
+        let envelope = crate::sekai::governed_transform::partitioned_dataset_digest(
+            &crate::sekai::governed_transform::group_rows_by_partition(&keys, &merged)
+                .into_iter()
+                .map(|(key, rows)| (key, crate::sekai::governed_transform::rows_digest(&rows)))
+                .collect(),
+        );
+        let second = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    replaced_partitions: vec![
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "east".into(),
+                            rows: new_east,
+                        },
+                    ],
+                    output_digest: envelope,
+                    ..WriteTransformRunCommand::default()
+                },
+                90,
+            )
+            .unwrap();
+        assert_eq!(second.output_partitions.len(), 1);
+        assert_eq!(second.output_partitions[0].partition_key, "east");
+        let live = db.query_rows("out", &Default::default()).unwrap();
+        assert_eq!(live.len(), 2);
+        let west_live = live
+            .iter()
+            .find(|row| row.get("region").map(String::as_str) == Some("west"))
+            .unwrap();
+        assert_eq!(west_live.get("id").map(String::as_str), Some("2"));
+        assert_eq!(
+            crate::sekai::governed_transform::rows_digest(&[west_live.clone()]),
+            west_digest
+        );
+        let _ = merged;
+    }
+
+    #[test]
+    fn isolated_process_failed_partition_write_keeps_previous_output() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let (east, west) = east_west_rows();
+        db.append_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let first_output = vec![east[0].clone(), west[0].clone()];
+        let keys = vec!["region".into()];
+        let first_envelope = crate::sekai::governed_transform::partitioned_dataset_digest(
+            &crate::sekai::governed_transform::group_rows_by_partition(&keys, &first_output)
+                .into_iter()
+                .map(|(key, rows)| (key, crate::sekai::governed_transform::rows_digest(&rows)))
+                .collect(),
+        );
+        db.write_transform_run(
+            WriteTransformRunCommand {
+                run_id: work.run_id,
+                runtime_id: work.claim_owner,
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token,
+                replaced_partitions: vec![
+                    crate::sekai::governed_transform::TransformPartitionWrite {
+                        partition_key: "east".into(),
+                        rows: east.clone(),
+                    },
+                    crate::sekai::governed_transform::TransformPartitionWrite {
+                        partition_key: "west".into(),
+                        rows: west.clone(),
+                    },
+                ],
+                output_digest: first_envelope,
+                ..WriteTransformRunCommand::default()
+            },
+            50,
+        )
+        .unwrap();
+        let before = db.query_rows("out", &Default::default()).unwrap();
+        db.put_governed_transform(&isolated_transform(), 60)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 70).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", &admitted.run_id, 60_000, 80)
+            .unwrap()
+            .expect("claimable work");
+        let error = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    replaced_partitions: vec![
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "east".into(),
+                            rows: east,
+                        },
+                    ],
+                    output_digest: "sha256-sum-v1:not-the-envelope".into(),
+                    ..WriteTransformRunCommand::default()
+                },
+                90,
+            )
+            .unwrap_err();
+        assert!(error.contains("digest"));
+        assert_eq!(db.query_rows("out", &Default::default()).unwrap(), before);
+    }
+
+    #[test]
+    fn isolated_process_quarantined_partition_write_skips_digest() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let (east, west) = east_west_rows();
+        db.append_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let first_output = vec![east[0].clone(), west[0].clone()];
+        let keys = vec!["region".into()];
+        let first_envelope = crate::sekai::governed_transform::partitioned_dataset_digest(
+            &crate::sekai::governed_transform::group_rows_by_partition(&keys, &first_output)
+                .into_iter()
+                .map(|(key, rows)| (key, crate::sekai::governed_transform::rows_digest(&rows)))
+                .collect(),
+        );
+        db.write_transform_run(
+            WriteTransformRunCommand {
+                run_id: work.run_id,
+                runtime_id: work.claim_owner,
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token,
+                replaced_partitions: vec![
+                    crate::sekai::governed_transform::TransformPartitionWrite {
+                        partition_key: "east".into(),
+                        rows: east.clone(),
+                    },
+                    crate::sekai::governed_transform::TransformPartitionWrite {
+                        partition_key: "west".into(),
+                        rows: west.clone(),
+                    },
+                ],
+                output_digest: first_envelope,
+                ..WriteTransformRunCommand::default()
+            },
+            50,
+        )
+        .unwrap();
+        let before = db.query_rows("out", &Default::default()).unwrap();
+        db.put_governed_transform(&isolated_transform(), 60)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 70).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", &admitted.run_id, 60_000, 80)
+            .unwrap()
+            .expect("claimable work");
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    replaced_partitions: vec![
+                        crate::sekai::governed_transform::TransformPartitionWrite {
+                            partition_key: "east".into(),
+                            rows: east,
+                        },
+                    ],
+                    output_digest: "sha256-sum-v1:not-the-envelope".into(),
+                    quarantined: true,
+                    quality_rule: "worker failed".into(),
+                    ..WriteTransformRunCommand::default()
+                },
+                90,
+            )
+            .unwrap();
+        assert!(committed.quarantined);
+        assert!(!committed.input_partitions.is_empty());
+        assert_eq!(committed.quality_rule, "worker failed");
+        assert_eq!(db.query_rows("out", &Default::default()).unwrap(), before);
+    }
+
+    #[test]
+    fn isolated_process_write_back_keeps_receipts_for_shared_dataset_aliases() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let (east, west) = east_west_rows();
+        db.append_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "iso1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                inputs: vec![
+                    TransformInput {
+                        alias: "left".into(),
+                        dataset_id: "in".into(),
+                    },
+                    TransformInput {
+                        alias: "right".into(),
+                        dataset_id: "in".into(),
+                    },
+                ],
+            }),
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let output = vec![east[0].clone(), west[0].clone()];
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    rows: output.clone(),
+                    output_digest: crate::sekai::governed_transform::dataset_digest(
+                        &["region".into()],
+                        &output,
+                    ),
+                    ..WriteTransformRunCommand::default()
+                },
+                40,
+            )
+            .unwrap();
+        let easts = committed
+            .input_partitions
+            .iter()
+            .filter(|partition| partition.partition_key == "east")
+            .count();
+        assert_eq!(easts, 2);
+    }
+
+    #[test]
+    fn incremental_run_rewrites_only_changed_partition() {
+        let db = db();
+        db.create_dataset(&partitioned_dataset("in")).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        let (east, west) = east_west_rows();
+        db.append_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(first.output_digest.starts_with("sha256-partitions-v1:"));
+        assert_eq!(first.output_partitions.len(), 2);
+        let before = db.list_dataset_row_records_after("out", 0).unwrap();
+        let west_ids: Vec<i64> = before
+            .iter()
+            .filter(|(_, row)| row.get("region").map(String::as_str) == Some("west"))
+            .map(|(id, _)| *id)
+            .collect();
+        let east_ids: Vec<i64> = before
+            .iter()
+            .filter(|(_, row)| row.get("region").map(String::as_str) == Some("east"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(west_ids.len(), 1);
+        assert_eq!(east_ids.len(), 1);
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "3".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "east".into()),
+            ])],
+        )
+        .unwrap();
+        let second = db.run_governed_transform("ops", "t1", true, 30).unwrap();
+        assert_eq!(second.rows_in, 1);
+        assert_eq!(second.output_partitions.len(), 1);
+        assert_eq!(second.output_partitions[0].partition_key, "east");
+        assert_ne!(second.output_digest, first.output_digest);
+        let after = db.list_dataset_row_records_after("out", 0).unwrap();
+        let west_after: Vec<i64> = after
+            .iter()
+            .filter(|(_, row)| row.get("region").map(String::as_str) == Some("west"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(west_after, west_ids);
+        let east_after: Vec<i64> = after
+            .iter()
+            .filter(|(_, row)| row.get("region").map(String::as_str) == Some("east"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(east_after.starts_with(&east_ids));
+        assert_eq!(after.len(), 3);
+        let live: Vec<_> = after.into_iter().map(|(_, row)| row).collect();
+        assert_eq!(
+            second.output_digest,
+            crate::sekai::governed_transform::dataset_digest(&["region".into()], &live)
+        );
+    }
+
+    fn sensitive_partitioned_dataset(id: &str) -> Dataset {
+        let mut dataset = partitioned_dataset(id);
+        for column in &mut dataset.columns {
+            if column.name == "region" {
+                column.classification = "sensitive".into();
+            }
+        }
+        dataset
+    }
+
+    #[test]
+    fn redact_dataset_fields_rewrites_transform_partition_receipts() {
+        let db = db();
+        db.create_dataset(&sensitive_partitioned_dataset("in"))
+            .unwrap();
+        db.create_dataset(&sensitive_partitioned_dataset("out"))
+            .unwrap();
+        let (east, west) = east_west_rows();
+        db.append_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: vec!["id".into(), "keep".into(), "region".into()],
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(
+            run.input_partitions
+                .iter()
+                .any(|partition| partition.partition_key == "east")
+        );
+        db.redact_dataset_fields("in", "sensitive", &[]).unwrap();
+        let after_input = db.get_governed_transform_run(&run.run_id).unwrap().unwrap();
+        assert!(
+            after_input
+                .input_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]"
+                    && partition.digest == "[redacted]")
+        );
+        assert!(
+            after_input
+                .output_partitions
+                .iter()
+                .any(|partition| partition.partition_key == "east")
+        );
+        db.redact_dataset_fields("out", "sensitive", &[]).unwrap();
+        let after_output = db.get_governed_transform_run(&run.run_id).unwrap().unwrap();
+        assert!(
+            after_output
+                .output_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]")
+        );
+    }
+
+    #[test]
+    fn redact_dataset_fields_rewrites_removed_partition_receipts() {
+        let db = db();
+        db.create_dataset(&sensitive_partitioned_dataset("in"))
+            .unwrap();
+        db.create_dataset(&sensitive_partitioned_dataset("out"))
+            .unwrap();
+        let (east, west) = east_west_rows();
+        db.append_rows("in", &[east[0].clone(), west[0].clone()])
+            .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: vec!["id".into(), "keep".into(), "region".into()],
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(
+            first
+                .output_partitions
+                .iter()
+                .any(|partition| partition.partition_key == "east")
+        );
+        let replace = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "filter".into(),
+                column: "region".into(),
+                op: "eq".into(),
+                value: "west".into(),
+                columns: Vec::new(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&replace, 30).unwrap();
+        let second = db.run_governed_transform("ops", "t1", false, 40).unwrap();
+        assert!(
+            second
+                .output_partitions
+                .iter()
+                .all(|partition| partition.partition_key != "east")
+        );
+        db.redact_dataset_fields("out", "sensitive", &[]).unwrap();
+        let stored = db
+            .get_governed_transform_run(&first.run_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .output_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]")
+        );
+    }
+
+    #[test]
+    fn redact_dataset_fields_rewrites_receipts_after_transform_rebind() {
+        let db = db();
+        db.create_dataset(&sensitive_partitioned_dataset("in"))
+            .unwrap();
+        db.create_dataset(&sensitive_partitioned_dataset("other"))
+            .unwrap();
+        db.create_dataset(&sensitive_partitioned_dataset("out"))
+            .unwrap();
+        let (east, _) = east_west_rows();
+        db.append_rows("in", &[east[0].clone()]).unwrap();
+        db.append_rows("other", &[east[0].clone()]).unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let output = vec![east[0].clone()];
+        let committed = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    rows: output.clone(),
+                    output_digest: crate::sekai::governed_transform::dataset_digest(
+                        &["region".into()],
+                        &output,
+                    ),
+                    ..WriteTransformRunCommand::default()
+                },
+                40,
+            )
+            .unwrap();
+        assert!(
+            committed
+                .input_partitions
+                .iter()
+                .any(|partition| partition.partition_key == "east")
+        );
+        let rebound = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "iso1".into(),
+            input_dataset_id: "other".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                inputs: vec![TransformInput {
+                    alias: "input".into(),
+                    dataset_id: "other".into(),
+                }],
+            }),
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&rebound, 50).unwrap();
+        db.redact_dataset_fields("in", "sensitive", &[]).unwrap();
+        let stored = db
+            .get_governed_transform_run(&committed.run_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .input_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]")
+        );
+        assert!(
+            stored
+                .output_partitions
+                .iter()
+                .any(|partition| partition.partition_key == "east")
+        );
+    }
+
+    #[test]
+    fn redact_dataset_fields_rewrites_receipts_after_partition_keys_cleared() {
+        let db = db();
+        db.create_dataset(&sensitive_partitioned_dataset("in"))
+            .unwrap();
+        db.create_dataset(&sensitive_partitioned_dataset("out"))
+            .unwrap();
+        let (east, _) = east_west_rows();
+        db.append_rows("in", &[east[0].clone()]).unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: vec!["id".into(), "keep".into(), "region".into()],
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        let mut dataset = db.get_dataset("in").unwrap().unwrap();
+        dataset.partition_keys = Vec::new();
+        db.update_dataset(&dataset).unwrap();
+        db.redact_dataset_fields("in", "sensitive", &[]).unwrap();
+        let stored = db.get_governed_transform_run(&run.run_id).unwrap().unwrap();
+        assert!(
+            stored
+                .input_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]")
+        );
+    }
+
+    #[test]
+    fn redact_unrelated_field_keeps_partition_selectors() {
+        let db = db();
+        let mut input = partitioned_dataset("in");
+        input.columns.push(ColumnDef {
+            name: "secret".into(),
+            col_type: "string".into(),
+            classification: "sensitive".into(),
+        });
+        db.create_dataset(&input).unwrap();
+        db.create_dataset(&partitioned_dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+                ("region".into(), "east".into()),
+                ("secret".into(), "hidden".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        db.redact_dataset_fields("in", "sensitive", &[]).unwrap();
+        let fence = WriteTransformRunCommand {
+            run_id: work.run_id.clone(),
+            runtime_id: work.claim_owner.clone(),
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token.clone(),
+            partition_key: Some("east".into()),
+            ..WriteTransformRunCommand::default()
+        };
+        let page = db
+            .read_transform_run_input(&fence, "", "", 0, 100, 40)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].partition_key, "east");
+        let stored = db
+            .get_governed_transform_run(&work.run_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .input_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]")
+        );
+    }
+
+    #[test]
+    fn redact_dataset_fields_rewrites_receipts_after_partition_keys_change() {
+        let db = db();
+        db.create_dataset(&sensitive_partitioned_dataset("in"))
+            .unwrap();
+        db.create_dataset(&sensitive_partitioned_dataset("out"))
+            .unwrap();
+        let (east, _) = east_west_rows();
+        db.append_rows("in", &[east[0].clone()]).unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: vec!["id".into(), "keep".into(), "region".into()],
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        let mut dataset = db.get_dataset("in").unwrap().unwrap();
+        dataset.partition_keys = vec!["id".into()];
+        db.update_dataset(&dataset).unwrap();
+        db.redact_dataset_fields("in", "sensitive", &[]).unwrap();
+        let stored = db.get_governed_transform_run(&run.run_id).unwrap().unwrap();
+        assert!(
+            stored
+                .input_partitions
+                .iter()
+                .all(|partition| partition.partition_key == "[redacted]"
+                    && partition.digest == "[redacted]")
+        );
     }
 }

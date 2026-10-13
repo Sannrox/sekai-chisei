@@ -1716,6 +1716,7 @@ mod tests {
                 ],
                 object_id: String::new(),
                 created: 1,
+                partition_keys: Vec::new(),
             })
             .unwrap();
         svc.db
@@ -1804,6 +1805,7 @@ mod tests {
                 }],
                 object_id: String::new(),
                 created: 1,
+                partition_keys: Vec::new(),
             })
             .unwrap();
         let quarantined = svc
@@ -1868,6 +1870,7 @@ mod tests {
                 ],
                 object_id: String::new(),
                 created: 1,
+                partition_keys: Vec::new(),
             })
             .unwrap();
         svc.db
@@ -3328,6 +3331,7 @@ mod tests {
                     .collect(),
                 object_id: String::new(),
                 created: 1,
+                partition_keys: Vec::new(),
             })
             .unwrap();
         svc.db.runtime().append_rows(dataset_id, &rows).unwrap();

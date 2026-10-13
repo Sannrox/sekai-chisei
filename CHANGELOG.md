@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Governed transforms stream claim reads inside a byte bound, persist
+  optional dataset `partition_keys`, and write named partitions atomically.
+  `sekai-client::claim` exposes the partition selector and `max_bytes`.
+  Partitioned datasets use `sha256-partitions-v1:` (not folded into
+  `sha256-sum-v1:`). Incremental in-process projection appends into changed
+  partitions so historical output row IDs stay stable. Adds ADR 0105 and
+  PostgreSQL migration `0060_partitioned_transform_io` (`GATE:mig`, #1388).
+
 - Sensitive egress reuses compiled entity literals from a per-namespace
   object-change generation instead of listing the graph on every cache hit.
   SQLite and PostgreSQL advance that generation in the same transaction as

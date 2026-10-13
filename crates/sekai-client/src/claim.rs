@@ -221,6 +221,18 @@ pub enum ActionAck {
     },
 }
 
+/// Page selector for a fenced transform input stream.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct TransformRead {
+    pub alias: String,
+    pub after_alias: String,
+    pub after_row_id: i64,
+    pub limit: i32,
+    /// Unset reads every partition. `Some("")` selects the empty identity.
+    pub partition_key: Option<String>,
+    pub max_bytes: i64,
+}
+
 /// Fenced write-back payload for an isolated-process run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransformWrite {
@@ -228,6 +240,7 @@ pub struct TransformWrite {
     pub output_digest: String,
     pub quarantined: bool,
     pub quality_rule: String,
+    pub partitions: Vec<crate::protocol::sekai::TransformPartitionWrite>,
 }
 
 /// Stream of transform input rows whose item errors use the claim taxonomy.
@@ -570,6 +583,25 @@ impl<'a> RuntimeClaimClient<'a> {
         after_row_id: i64,
         limit: i32,
     ) -> Result<TransformInputStream, RuntimeClaimError> {
+        self.read_transform_input_page(
+            fence,
+            TransformRead {
+                alias: alias.into(),
+                after_alias: after_alias.into(),
+                after_row_id,
+                limit,
+                partition_key: None,
+                max_bytes: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn read_transform_input_page(
+        &self,
+        fence: &TransformFence,
+        read: TransformRead,
+    ) -> Result<TransformInputStream, RuntimeClaimError> {
         let inner = self
             .client
             .raw()
@@ -580,10 +612,12 @@ impl<'a> RuntimeClaimClient<'a> {
                     runtime_id: fence.runtime_id.clone(),
                     claim_generation: fence.generation,
                     fencing_token: fence.fencing_token.clone(),
-                    alias: alias.into(),
-                    after_row_id,
-                    limit,
-                    after_alias: after_alias.into(),
+                    alias: read.alias,
+                    after_row_id: read.after_row_id,
+                    limit: read.limit,
+                    after_alias: read.after_alias,
+                    partition_key: read.partition_key,
+                    max_bytes: read.max_bytes,
                 },
                 self.options(false),
             )
@@ -608,6 +642,7 @@ impl<'a> RuntimeClaimClient<'a> {
                 output_digest: write.output_digest,
                 quarantined: write.quarantined,
                 quality_rule: write.quality_rule,
+                partitions: write.partitions,
             },
             false,
             true,

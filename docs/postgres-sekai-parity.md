@@ -70,11 +70,13 @@ The reusable `sekai.governed-transform/v1` class shares JobSpec, checkpoint,
 and run-receipt persistence across SQLite and PostgreSQL. Execution is the
 in-process `projection` host
 ([ADR 0097](decisions/0097-in-process-transform-host.md),
-[governed-transforms.md](governed-transforms.md)). Normal CI runs SQLite;
-PostgreSQL conformance remains an ignored isolated-database test behind
-`SEKAI_TEST_POSTGRES_URL`. Dataset row `append_rows` / `query_rows` through
-the community `RuntimeDb` dispatcher stay SQLite-only; the transform path
-uses each backend's native dataset-row APIs.
+[governed-transforms.md](governed-transforms.md)). Isolated-process claim
+I/O and partitioned write-back share the same envelope
+([ADR 0105](decisions/0105-partitioned-transform-io.md), #1388). Normal CI
+runs SQLite; PostgreSQL conformance remains an ignored isolated-database
+test behind `SEKAI_TEST_POSTGRES_URL`. Dataset row `append_rows` /
+`query_rows` through the community `RuntimeDb` dispatcher stay SQLite-only;
+the transform path uses each backend's native dataset-row APIs.
 
 The reusable `sekai.connector-certification/v1` admin projection shares
 certify, get, verify, revoke, and supersession identities across SQLite and
@@ -135,6 +137,7 @@ Evidence is checked in as:
 | #666 | Governed definition branch and immutable revision foundation |
 | #667 (first slice) | Activated object-security revisions and direct read/list enforcement |
 | #1287 | In-process governed transform JobSpec, checkpoint, and run receipt |
+| #1388 | Partitioned streaming transform I/O and atomic partition write-back |
 | #1481 | Connector certification certify/get/verify/revoke on PostgreSQL |
 
 ## Still outside this parent

@@ -175,6 +175,7 @@ fn seed_transform(db: &RuntimeDb, prefix: &str) {
         }],
         object_id: String::new(),
         created: 1,
+        partition_keys: Vec::new(),
     };
     db.create_dataset(&dataset("in")).unwrap();
     db.create_dataset(&dataset("out")).unwrap();
@@ -353,10 +354,12 @@ async fn exercise_transform(db: RuntimeDb, prefix: &str) {
             dataset_id: format!("{prefix}-out"),
             row_id: 0,
             values: output[0].clone(),
+            partition_key: String::new(),
         }],
         output_digest: rows_digest(&output),
         quarantined: false,
         quality_rule: String::new(),
+        partitions: Vec::new(),
     };
     let refused = claim
         .write_transform_result(&stale, write.clone())

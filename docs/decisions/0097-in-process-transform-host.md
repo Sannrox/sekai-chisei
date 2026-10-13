@@ -13,7 +13,8 @@
   [ADR 0036](0036-open-table-projections.md),
   [ADR 0101](0101-analytical-transform-profile.md),
   [ADR 0102](0102-isolated-process-transform-profile.md),
-  [ADR 0103](0103-transform-schedule-and-dependency-graph.md)
+  [ADR 0103](0103-transform-schedule-and-dependency-graph.md),
+  [ADR 0105](0105-partitioned-transform-io.md)
 
 ## Context
 
