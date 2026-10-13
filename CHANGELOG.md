@@ -2,13 +2,6 @@
 
 ## Unreleased
 
-- Registered customer-hosted routing profiles carry an optional
-  `artifact_digest` (`PutRoutingProfileRequest` and `RoutingProfile` field),
-  stored on SQLite and PostgreSQL and passed to
-  `EnterpriseExtension::admit_model`, so digest-pinned admission works for
-  registered routes. Adds PostgreSQL migration
-  `0060_routing_profile_artifact_digest` (#1499).
-
 - Sensitive egress reuses compiled entity literals from a per-namespace
   object-change generation instead of listing the graph on every cache hit.
   SQLite and PostgreSQL advance that generation in the same transaction as
