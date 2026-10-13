@@ -75,6 +75,7 @@ pub mod event_stream_cli;
 pub mod image_cli;
 pub mod lakehouse_snapshot_cli;
 pub mod model_platform_cli;
+pub mod model_release_evidence_cli;
 pub mod model_review_cli;
 pub mod open_table_cli;
 pub mod receipt_cli;

@@ -18,8 +18,8 @@ pub use chisei_ports::{
     ChiseiBudgetStore, ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiEvalStore,
     ChiseiEvaluationStore, ChiseiEvolveStore, ChiseiExternalActionStore, ChiseiGatewayStore,
     ChiseiGovernedSubjectStore, ChiseiGunshiStore, ChiseiKiokuStore, ChiseiLearningChangeStore,
-    ChiseiModelReviewStore, ChiseiObservationStore, ChiseiPermitStore, ChiseiPortfolioStore,
-    ChiseiReceiptStore, ChiseiRoutingProfileStore,
+    ChiseiModelReleaseEvidenceStore, ChiseiModelReviewStore, ChiseiObservationStore,
+    ChiseiPermitStore, ChiseiPortfolioStore, ChiseiReceiptStore, ChiseiRoutingProfileStore,
 };
 
 /// Sekai-owned facts and commits. Chisei code must not construct or hold this.

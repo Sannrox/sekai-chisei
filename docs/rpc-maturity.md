@@ -255,6 +255,11 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `ChiseiService.SetModelFamilyEnablement` | `chisei.policy` | yes | cli | `experimental` |
 | `ChiseiService.RevokeModelFamilyEnablement` | `chisei.policy` | yes | cli | `experimental` |
 | `ChiseiService.ListModelFamilyEnablement` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.PutModelReleaseTrust` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.PutModelRuntimeEvidence` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.GetModelRuntimeEvidence` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.ExportModelEvaluationEvidence` | `chisei.policy` | yes | cli | `experimental` |
+| `ChiseiService.PutModelReleaseFeedback` | `chisei.policy` | yes | cli | `experimental` |
 | `ChiseiService.PlanExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.ExecutePlanStream` | `chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.PlanContentExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk | `stable` |

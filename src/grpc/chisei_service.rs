@@ -79,6 +79,8 @@ use support_policy::*;
 mod rpc_control;
 #[path = "chisei_service_rpc_execution.rs"]
 mod rpc_execution;
+#[path = "chisei_service_rpc_model_release_evidence.rs"]
+mod rpc_model_release_evidence;
 #[path = "chisei_service_rpc_model_review.rs"]
 mod rpc_model_review;
 
@@ -770,6 +772,41 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ListModelFamilyEnablementRequest>,
     ) -> Result<Response<ListModelFamilyEnablementResponse>, Status> {
         rpc_model_review::list_model_family_enablement(self, req).await
+    }
+
+    async fn put_model_release_trust(
+        &self,
+        req: Request<PutModelReleaseTrustRequest>,
+    ) -> Result<Response<PutModelReleaseTrustResponse>, Status> {
+        rpc_model_release_evidence::put_model_release_trust(self, req).await
+    }
+
+    async fn put_model_runtime_evidence(
+        &self,
+        req: Request<PutModelRuntimeEvidenceRequest>,
+    ) -> Result<Response<PutModelRuntimeEvidenceResponse>, Status> {
+        rpc_model_release_evidence::put_model_runtime_evidence(self, req).await
+    }
+
+    async fn get_model_runtime_evidence(
+        &self,
+        req: Request<GetModelRuntimeEvidenceRequest>,
+    ) -> Result<Response<GetModelRuntimeEvidenceResponse>, Status> {
+        rpc_model_release_evidence::get_model_runtime_evidence(self, req).await
+    }
+
+    async fn export_model_evaluation_evidence(
+        &self,
+        req: Request<ExportModelEvaluationEvidenceRequest>,
+    ) -> Result<Response<ExportModelEvaluationEvidenceResponse>, Status> {
+        rpc_model_release_evidence::export_model_evaluation_evidence(self, req).await
+    }
+
+    async fn put_model_release_feedback(
+        &self,
+        req: Request<PutModelReleaseFeedbackRequest>,
+    ) -> Result<Response<PutModelReleaseFeedbackResponse>, Status> {
+        rpc_model_release_evidence::put_model_release_feedback(self, req).await
     }
 
     async fn execute_plan_stream(

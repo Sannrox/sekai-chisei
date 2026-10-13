@@ -1331,7 +1331,8 @@ pub(super) fn stable_gateway_error_code(error_type: &str) -> &'static str {
         | "governance_denied"
         | "context_denied"
         | "residency_denied"
-        | "model_review_denied" => "policy_denied",
+        | "model_review_denied"
+        | "model_release_denied" => "policy_denied",
         "budget_exceeded" => "budget_exceeded",
         "capability_unsupported"
         | "unsupported_cross_provider_stream"

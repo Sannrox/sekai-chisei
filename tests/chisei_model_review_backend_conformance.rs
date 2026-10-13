@@ -111,7 +111,9 @@ fn exercise(store: &ChiseiStore, prefix: &str) {
     assert!(
         decisions
             .iter()
-            .filter(|row| row.action.starts_with("model_"))
+            .filter(|row| {
+                row.action.starts_with("model_review.") || row.action.starts_with("model_family.")
+            })
             .all(|row| row.evidence.get("contract_version")
                 == Some(&MODEL_REVIEW_CONTRACT.to_string()))
     );

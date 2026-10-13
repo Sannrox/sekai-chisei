@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Opt-in customer-hosted routes can require current Tenkai-signed runtime
+  evidence (`tenkai.model_runtime_evidence.v1`) before admission. Chisei
+  verifies signatures against installed trust roots, ledgers which evidence
+  admitted a route, signs `chisei.model_evaluation_evidence.v1` from pinned
+  `EvalStore::compare_runs` results, and stores operator feedback. Default
+  routes stay unchanged. Adds ADR 0107, `sekaictl admin model-release-evidence`,
+  experimental RPCs, and PostgreSQL migration
+  `0063_chisei_model_release_evidence` (`GATE:mig`, #1396).
+
 - Registered customer-hosted routing profiles carry an optional
   `artifact_digest` (`PutRoutingProfileRequest` and `RoutingProfile` field),
   stored on SQLite and PostgreSQL and passed to

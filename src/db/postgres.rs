@@ -118,6 +118,8 @@ const PARTITIONED_TRANSFORM_IO_SCHEMA: &str =
 const CHISEI_MODEL_REVIEW_SCHEMA: &str = include_str!("postgres/0061_chisei_model_review.sql");
 const ROUTING_PROFILE_ARTIFACT_DIGEST_SCHEMA: &str =
     include_str!("postgres/0062_routing_profile_artifact_digest.sql");
+const CHISEI_MODEL_RELEASE_EVIDENCE_SCHEMA: &str =
+    include_str!("postgres/0063_chisei_model_release_evidence.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -523,6 +525,14 @@ const MIGRATIONS: &[Migration] = &[
         61,
         "routing_profile_artifact_digest",
         ROUTING_PROFILE_ARTIFACT_DIGEST_SCHEMA,
+        MigrationOwner::Chisei,
+    ),
+    // #1499 shipped version 61 on main. Evidence is 62 so those installs
+    // upgrade; this branch never published 61 as evidence.
+    mig(
+        62,
+        "chisei_model_release_evidence",
+        CHISEI_MODEL_RELEASE_EVIDENCE_SCHEMA,
         MigrationOwner::Chisei,
     ),
 ];

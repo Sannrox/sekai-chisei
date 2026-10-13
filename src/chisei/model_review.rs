@@ -1393,6 +1393,7 @@ mod tests {
             artifact_digest: None,
             registered_by: "root".into(),
             registered_at_ms: 1,
+            ..Default::default()
         }
     }
 

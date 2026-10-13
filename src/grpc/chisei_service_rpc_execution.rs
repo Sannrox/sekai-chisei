@@ -1173,6 +1173,24 @@ fn routing_profile_to_proto(
         artifact_digest: hosted
             .and_then(|hosted| hosted.artifact_digest.clone())
             .unwrap_or_default(),
+        require_runtime_evidence: hosted
+            .map(|profile| profile.require_runtime_evidence)
+            .unwrap_or(false),
+        evidence_provider: hosted
+            .map(|profile| profile.evidence_provider.clone())
+            .unwrap_or_default(),
+        evidence_model: hosted
+            .map(|profile| profile.evidence_model.clone())
+            .unwrap_or_default(),
+        evidence_profile_version: hosted
+            .map(|profile| profile.evidence_profile_version.clone())
+            .unwrap_or_default(),
+        evidence_artifact_digest: hosted
+            .map(|profile| profile.evidence_artifact_digest.clone())
+            .unwrap_or_default(),
+        evidence_endpoint: hosted
+            .map(|profile| profile.evidence_endpoint.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1240,6 +1258,12 @@ pub(super) async fn put_routing_profile(
             model_patterns: request.model_patterns,
             credential_ref: request.credential_ref,
             artifact_digest: request.artifact_digest,
+            require_runtime_evidence: request.require_runtime_evidence,
+            evidence_provider: request.evidence_provider,
+            evidence_model: request.evidence_model,
+            evidence_profile_version: request.evidence_profile_version,
+            evidence_artifact_digest: request.evidence_artifact_digest,
+            evidence_endpoint: request.evidence_endpoint,
         },
         &service.config.routing_endpoint_allowlist,
         |reference| {
@@ -1253,6 +1277,10 @@ pub(super) async fn put_routing_profile(
         chrono::Utc::now().timestamp_millis(),
     )
     .map_err(routing_profile_admission_status)?;
+    if profile.require_runtime_evidence {
+        crate::chisei::model_release_evidence::identity_from_hosted_profile(&profile)
+            .map_err(Status::invalid_argument)?;
+    }
     service
         .db
         .put_hosted_routing_profile(&profile)

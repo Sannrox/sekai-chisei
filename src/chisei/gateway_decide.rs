@@ -18,6 +18,7 @@ pub enum GatewayDecideDenyReason {
     BudgetDenied,
     ResidencyDenied,
     ModelReviewDenied,
+    ModelReleaseDenied,
     InvalidRequest,
 }
 
@@ -30,6 +31,7 @@ impl GatewayDecideDenyReason {
             Self::BudgetDenied => "budget_denied",
             Self::ResidencyDenied => "residency_denied",
             Self::ModelReviewDenied => "model_review_denied",
+            Self::ModelReleaseDenied => "model_release_denied",
             Self::InvalidRequest => "invalid_request",
         }
     }

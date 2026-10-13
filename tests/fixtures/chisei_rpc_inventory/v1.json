@@ -320,6 +320,76 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "PutModelReleaseTrust",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_model_release_evidence_backend_conformance.rs",
+        "src/db/postgres_model_release_evidence.rs",
+        "src/chisei/model_release_evidence.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "PutModelRuntimeEvidence",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_model_release_evidence_backend_conformance.rs",
+        "src/db/postgres_model_release_evidence.rs",
+        "src/chisei/model_release_evidence.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetModelRuntimeEvidence",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_model_release_evidence_backend_conformance.rs",
+        "src/db/postgres_model_release_evidence.rs",
+        "src/chisei/model_release_evidence.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ExportModelEvaluationEvidence",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_model_release_evidence_backend_conformance.rs",
+        "src/db/postgres_model_release_evidence.rs",
+        "src/chisei/model_release_evidence.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "PutModelReleaseFeedback",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_model_release_evidence_backend_conformance.rs",
+        "src/db/postgres_model_release_evidence.rs",
+        "src/chisei/model_release_evidence.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "SetModelReview",
       "kind": "persistent",
       "surfaces": [
@@ -614,6 +684,7 @@
     "tests/chisei_external_permit_backend_conformance.rs",
     "tests/chisei_gateway_audit_backend_conformance.rs",
     "tests/chisei_kioku_backend_conformance.rs",
+    "tests/chisei_model_release_evidence_backend_conformance.rs",
     "tests/chisei_model_review_backend_conformance.rs",
     "tests/chisei_policy_backend_conformance.rs",
     "tests/chisei_portfolio_backend_conformance.rs",

@@ -1645,6 +1645,51 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "PutModelReleaseTrust",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "PutModelRuntimeEvidence",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetModelRuntimeEvidence",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ExportModelEvaluationEvidence",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "PutModelReleaseFeedback",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "PlanExecution",
       "storage_path": "chisei.policy, chisei.budget, chisei.execution",
       "real_backend": "yes",

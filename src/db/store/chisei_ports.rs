@@ -630,6 +630,20 @@ chisei_store_trait! {
 }
 
 chisei_store_trait! {
+    /// Signed model-release evidence, trust roots, and feedback (#1396).
+    pub trait ChiseiModelReleaseEvidenceStore {
+        fn put_model_release_trust(&self, roots: &crate::chisei::model_release_evidence::EvaluationTrustRoots, updated_at_ms: i64) -> Result<(), String>;
+        fn get_model_release_trust(&self) -> Result<Option<crate::chisei::model_release_evidence::EvaluationTrustRoots>, String>;
+        fn put_model_runtime_evidence(&self, evidence: &crate::chisei::model_release_evidence::ModelRuntimeEvidence, ingested_at_ms: i64) -> Result<(), String>;
+        fn get_model_runtime_evidence(&self, identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity) -> Result<Option<String>, String>;
+        fn put_model_evaluation_export(&self, evidence: &crate::chisei::model_release_evidence::ModelEvaluationEvidence, exported_at_ms: i64) -> Result<(), String>;
+        fn get_model_evaluation_export(&self, identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity) -> Result<Option<String>, String>;
+        fn put_model_release_feedback(&self, record: &crate::chisei::model_release_evidence::ModelReleaseFeedback) -> Result<(), String>;
+        fn list_model_release_feedback(&self, namespace: &str) -> Result<Vec<crate::chisei::model_release_evidence::ModelReleaseFeedback>, String>;
+    }
+}
+
+chisei_store_trait! {
     /// Hosted routing profiles.
     pub trait ChiseiRoutingProfileStore {
         fn list_hosted_routing_profiles(&self, namespace: &str) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String>;
