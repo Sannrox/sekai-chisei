@@ -56,6 +56,15 @@ impl SekaiStore {
     /// default evidence lattice when none is configured); anything but an
     /// explicit lattice deny clears. Storage errors and an ambiguous trusted
     /// principal profile are errors, which callers treat as a deny.
+    /// Raw `classification_ceiling` of `principal`'s trusted profile, the
+    /// marking ceiling of a service principal; `None` when unset.
+    pub fn principal_classification_ceiling(
+        &self,
+        principal: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(trusted_principal_authority(self.runtime(), principal)?.classification_token)
+    }
+
     pub fn principal_marking_clearance(
         &self,
         operation_id: &str,

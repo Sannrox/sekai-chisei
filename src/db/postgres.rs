@@ -124,6 +124,7 @@ const AGENT_DEFINITION_CERTIFICATION_SCHEMA: &str =
     include_str!("postgres/0064_agent_definition_certification.sql");
 const DEFINITION_PROPOSAL_MERGED_HISTORY_SCHEMA: &str =
     include_str!("postgres/0065_definition_proposal_merged_history.sql");
+const SERVICE_PRINCIPALS_SCHEMA: &str = include_str!("postgres/0066_service_principals.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -549,6 +550,12 @@ const MIGRATIONS: &[Migration] = &[
         64,
         "definition_proposal_merged_history",
         DEFINITION_PROPOSAL_MERGED_HISTORY_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        65,
+        "service_principals",
+        SERVICE_PRINCIPALS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

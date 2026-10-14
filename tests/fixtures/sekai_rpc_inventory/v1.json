@@ -1720,6 +1720,45 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "PutServicePrincipal",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.credentials"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_rpc_service_principals.rs",
+        "tests/service_principal_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetServicePrincipal",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.credentials"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_rpc_service_principals.rs",
+        "tests/service_principal_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DeleteServicePrincipal",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.credentials"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_rpc_service_principals.rs",
+        "tests/service_principal_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "SetActionPolicy",
       "kind": "persistent",
       "surfaces": [

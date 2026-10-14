@@ -99,6 +99,7 @@ pub mod schema;
 pub mod security;
 pub mod semantic;
 pub mod sentinel;
+pub mod service_principal;
 pub mod skillextract;
 pub mod source_health;
 pub mod source_quarantine;
