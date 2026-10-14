@@ -165,6 +165,8 @@ pub struct SekaiServiceImpl {
     pub(super) object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead,
     pub(super) cross_store:
         Option<std::sync::Arc<crate::composition::cross_store_admission::CrossStoreAdmission>>,
+    /// Signs runtime tokens for granted Action work claims; none issues none.
+    pub(super) runtime_token_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
 }
 
 impl SekaiServiceImpl {
@@ -197,6 +199,7 @@ impl SekaiServiceImpl {
                 crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
             object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
             cross_store: None,
+            runtime_token_authority: None,
         }
     }
 
@@ -217,7 +220,18 @@ impl SekaiServiceImpl {
                 crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
             object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
             cross_store: None,
+            runtime_token_authority: None,
         }
+    }
+
+    /// Mint runtime tokens in Action work claim responses with `authority`,
+    /// the same key the authentication boundary verifies them with.
+    pub fn with_runtime_token_authority(
+        mut self,
+        authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+    ) -> Self {
+        self.runtime_token_authority = authority;
+        self
     }
 
     pub fn with_cross_store_admission(

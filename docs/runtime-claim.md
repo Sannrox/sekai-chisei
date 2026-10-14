@@ -72,6 +72,25 @@ and does not embed credentials or provider routing.
 - Multi-site pins are **not** applied to claim keys in v1 (single-site / fail-open
   documentation only). Graph leases remain the site-pinned primitive.
 
+## Runtime tokens
+
+When the plane has an assertion signing key (`SEKAI_ASSERTION_ISSUER`,
+`SEKAI_ASSERTION_AUDIENCE`, `SEKAI_ASSERTION_HMAC_KEY`) and the claiming
+credential carries a tenant, `ClaimActionWork` also returns `runtime_token`
+and `runtime_token_expires_at_ms` (ADR 0099, #1507). The token is bound to the
+claiming principal, tenant, namespace, effect, runtime and claim generation.
+It expires at the claim expiry, the claiming credential's expiry, or after 15
+minutes, whichever is first. `HeartbeatActionClaim` returns a refreshed token
+for the extended claim; refreshes never outlive the claiming credential.
+
+The token authenticates only `HeartbeatActionClaim`, `AckActionWork` and
+`ReportActionClaimEvent` for that exact claim. It is refused at or after its
+expiry, for another effect, namespace, runtime or generation, and when the
+installed identity extension no longer places the namespace in the token's
+tenant. Without a signing key or a tenant the fields stay empty, and hosts keep
+using their own credential. Claim RPCs are now available to tenant-scoped
+credentials under the same namespace and tenant checks as other Action RPCs.
+
 ## Host responsibilities
 
 1. Authenticate as a principal with team-namespace write on the work namespace.

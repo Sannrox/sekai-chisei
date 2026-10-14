@@ -102,27 +102,26 @@ impl AssertionAuthority {
 
     pub fn sign(&self, assertion: &IdentityAssertion) -> Result<String, String> {
         let payload = serde_json::to_vec(assertion).map_err(|error| error.to_string())?;
+        self.seal(ASSERTION_TOKEN_PREFIX, &payload)
+    }
+
+    /// HMAC-seal `payload` as `<prefix><payload>.<signature>`. The prefix
+    /// keeps token families apart; each family also pins its own version.
+    pub(crate) fn seal(&self, prefix: &str, payload: &[u8]) -> Result<String, String> {
         let mut mac = HmacSha256::new_from_slice(&self.key).map_err(|error| error.to_string())?;
-        mac.update(&payload);
+        mac.update(payload);
         let sig = mac.finalize().into_bytes();
         Ok(format!(
-            "{ASSERTION_TOKEN_PREFIX}{}.{}",
+            "{prefix}{}.{}",
             URL_SAFE_NO_PAD.encode(payload),
             URL_SAFE_NO_PAD.encode(sig)
         ))
     }
 
-    pub fn verify(
-        &self,
-        token: &str,
-        now: i64,
-        caller_tenant_header: Option<&str>,
-    ) -> Result<AuthenticatedContext, AssertionReject> {
-        if caller_tenant_header.is_some() {
-            return Err(AssertionReject::CallerTenantHeader);
-        }
+    /// Check a token sealed by [`Self::seal`] under `prefix` and return its payload.
+    pub(crate) fn open(&self, prefix: &str, token: &str) -> Result<Vec<u8>, AssertionReject> {
         let rest = token
-            .strip_prefix(ASSERTION_TOKEN_PREFIX)
+            .strip_prefix(prefix)
             .ok_or(AssertionReject::Signature)?;
         let (payload_b64, sig_b64) = rest.split_once('.').ok_or(AssertionReject::Signature)?;
         let payload = URL_SAFE_NO_PAD
@@ -136,6 +135,19 @@ impl AssertionAuthority {
         mac.update(&payload);
         mac.verify_slice(&signature)
             .map_err(|_| AssertionReject::Signature)?;
+        Ok(payload)
+    }
+
+    pub fn verify(
+        &self,
+        token: &str,
+        now: i64,
+        caller_tenant_header: Option<&str>,
+    ) -> Result<AuthenticatedContext, AssertionReject> {
+        if caller_tenant_header.is_some() {
+            return Err(AssertionReject::CallerTenantHeader);
+        }
+        let payload = self.open(ASSERTION_TOKEN_PREFIX, token)?;
         let assertion: IdentityAssertion =
             serde_json::from_slice(&payload).map_err(|_| AssertionReject::Signature)?;
         if assertion.contract_version != IDENTITY_ASSERTION_VERSION {

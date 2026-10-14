@@ -351,12 +351,62 @@ fn finish_authenticated(
     Ok(req)
 }
 
+impl TokenAuthInterceptor {
+    /// Admit a runtime token (#1507) for the follow-up calls on its claim only.
+    /// Handlers then check the claim binding and the namespace's tenant.
+    fn authenticate_runtime_token(
+        &self,
+        req: Request<()>,
+        token: &str,
+    ) -> Result<Request<()>, Status> {
+        let refuse = |status: Status| {
+            reject_unauthorized();
+            status
+        };
+        let Some(authority) = &self.assertion_authority else {
+            return Err(refuse(Status::unauthenticated("invalid token")));
+        };
+        if req.metadata().get(TENANT_CONTEXT_HEADER).is_some() {
+            return Err(refuse(assertion_reject_status(
+                crate::identity_assertion::AssertionReject::CallerTenantHeader,
+            )));
+        }
+        let claims = crate::runtime_token::RuntimeTokenClaims::verify(
+            authority,
+            token,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|reject| refuse(assertion_reject_status(reject)))?;
+        let claimed_work_rpc =
+            rpc_identity::request_rpc_method(&req).is_some_and(|(service, method)| {
+                service == "sekai.SekaiService"
+                    && crate::runtime_token::RUNTIME_TOKEN_METHODS.contains(&method)
+            });
+        if !claimed_work_rpc {
+            return Err(Status::permission_denied(
+                "runtime token admits only calls for its claimed work",
+            ));
+        }
+        let mut req = finish_authenticated_audited(
+            self.db.runtime(),
+            req,
+            claims.authenticated_context(),
+            true,
+        )?;
+        req.extensions_mut().insert(claims);
+        Ok(req)
+    }
+}
+
 impl tonic::service::Interceptor for TokenAuthInterceptor {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
         let Some(token) = Self::parse_bearer_token(req.metadata()) else {
             reject_unauthorized();
             return Err(Status::unauthenticated("missing authorization"));
         };
+        if crate::runtime_token::is_runtime_token(&token) {
+            return self.authenticate_runtime_token(req, &token);
+        }
         if crate::identity_assertion::is_assertion_token(&token) {
             let tenant_header = req
                 .metadata()
@@ -510,6 +560,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetActionEffect"
             | "ListActionEffects"
             | "ListClaimableActionWork"
+            | "ClaimActionWork"
+            | "HeartbeatActionClaim"
+            | "AckActionWork"
+            | "ReportActionClaimEvent"
             | "PlanExecution"
             | "ExecutePlanStream"
             | "PlanContentExecution"
@@ -1144,7 +1198,8 @@ pub fn build_services_for_plane(
     } else {
         sekai_service::SekaiServiceImpl::wrong_plane_placeholder(sekai_store.clone())
     }
-    .with_site_id(config.site_id.clone());
+    .with_site_id(config.site_id.clone())
+    .with_runtime_token_authority(config.assertion_authority()?.map(Arc::new));
     if plane == ProcessPlane::Combined {
         let clerk = Arc::new(
             crate::composition::cross_store_admission::CrossStoreAdmission::new(
@@ -1326,6 +1381,9 @@ fn spawn_health_reporter(
         }
     });
 }
+
+#[cfg(test)]
+mod runtime_token_tests;
 
 #[cfg(test)]
 mod tests {

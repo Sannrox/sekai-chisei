@@ -1584,6 +1584,14 @@ message ClaimActionWorkResponse {
   ActionEffect effect = 1;
   ActionWorkContinuation continuation = 2;
   ActionWorkPark park = 3;
+  // Short-lived runtime token bound to the claiming principal, tenant,
+  // namespace, effect, runtime and claim generation. It authenticates
+  // HeartbeatActionClaim, AckActionWork and ReportActionClaimEvent for this
+  // claim only. Empty when the plane has no signing key or the caller has no
+  // tenant; callers then keep using their own credential.
+  string runtime_token = 4;
+  // Never later than effect.claim_expires_at_ms. Zero when runtime_token is empty.
+  int64 runtime_token_expires_at_ms = 5;
 }
 message HeartbeatActionClaimRequest {
   string effect_id = 1;
@@ -1592,7 +1600,12 @@ message HeartbeatActionClaimRequest {
   string fencing_token = 4;
   int64 ttl_ms = 5;
 }
-message HeartbeatActionClaimResponse { ActionEffect effect = 1; }
+message HeartbeatActionClaimResponse {
+  ActionEffect effect = 1;
+  // Refreshed runtime token for the extended claim; same rules as on claim.
+  string runtime_token = 2;
+  int64 runtime_token_expires_at_ms = 3;
+}
 message AckActionWorkRequest {
   string effect_id = 1;
   string runtime_id = 2;
