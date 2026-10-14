@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Experimental `ListPublishedDefinitionRevisions` returns a namespace's published
+  definition merge history newest first, with optional member-change filter and
+  keyset pagination. Auth matches `GetPublishedDefinitionRevision`. Adds
+  PostgreSQL migration `0065_definition_proposal_merged_history` (`GATE:mig`,
+  #1354).
+
 - `ClaimActionWork` returns a short-lived runtime token bound to the claiming
   principal, tenant, namespace, effect, runtime and claim generation when an
   assertion signing key is configured and the caller has a tenant;

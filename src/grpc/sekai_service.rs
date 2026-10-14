@@ -514,6 +514,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_definitions::get_published_definition_revision(self, req).await
     }
 
+    async fn list_published_definition_revisions(
+        &self,
+        req: Request<ListPublishedDefinitionRevisionsRequest>,
+    ) -> Result<Response<ListPublishedDefinitionRevisionsResponse>, Status> {
+        rpc_definitions::list_published_definition_revisions(self, req).await
+    }
+
     async fn compare_definition_revisions(
         &self,
         req: Request<CompareDefinitionRevisionsRequest>,

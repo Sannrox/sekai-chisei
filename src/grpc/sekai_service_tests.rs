@@ -1663,6 +1663,519 @@ async fn definition_proposal_rpc_publishes_or_rejects_without_partial_head_move(
     );
 }
 
+async fn publish_definition_history_entry(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    parent: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    upserts: Vec<DefinitionMemberInput>,
+) -> (String, String) {
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            parent_revision_digest: parent.into(),
+            idempotency_key: format!("{branch_id}-create"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let applied = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: branch_id.into(),
+                expected_head_digest: parent.into(),
+                upserts,
+                removals: Vec::new(),
+                idempotency_key: format!("{branch_id}-edit"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let candidate = applied.revision.unwrap().revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            proposal_id: proposal_id.into(),
+            base_digest: parent.into(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("{branch_id}-propose"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: proposal_id.into(),
+            idempotency_key: format!("{branch_id}-approve"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: proposal_id.into(),
+                expected_published_digest: parent.into(),
+                idempotency_key: format!("{branch_id}-merge"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    (
+        merged.published_revision.unwrap().revision_digest,
+        merged.receipt_id,
+    )
+}
+
+#[tokio::test]
+async fn list_published_definition_revisions_chains_filters_and_paginates() {
+    let svc = service();
+    let namespace = "history-team";
+    let parent = seed_definition_parent(&svc, namespace);
+    let (first, first_receipt) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "hist-1",
+        "hist-cs-1",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    let (second, second_receipt) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &first,
+        "hist-2",
+        "hist-cs-2",
+        vec![
+            DefinitionMemberInput {
+                member_kind: "object_type".into(),
+                member_id: "Ticket".into(),
+                definition_json: r#"{"name":"Ticket","properties":["title","body"]}"#.into(),
+                member_digest: String::new(),
+            },
+            DefinitionMemberInput {
+                member_kind: "ontology_class".into(),
+                member_id: "TicketClass".into(),
+                definition_json: r#"{"name":"TicketClass"}"#.into(),
+                member_digest: String::new(),
+            },
+        ],
+    )
+    .await;
+    let (third, third_receipt) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &second,
+        "hist-3",
+        "hist-cs-3",
+        vec![DefinitionMemberInput {
+            member_kind: "action_type".into(),
+            member_id: "AssignTicket".into(),
+            definition_json: r#"{"name":"AssignTicket"}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+
+    let listed = svc
+        .list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: String::new(),
+                member_id: String::new(),
+                page_token: String::new(),
+                page_size: 0,
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(listed.next_page_token.is_empty());
+    assert_eq!(listed.entries.len(), 3);
+    assert_eq!(
+        listed
+            .entries
+            .iter()
+            .map(|entry| entry.revision_digest.as_str())
+            .collect::<Vec<_>>(),
+        vec![third.as_str(), second.as_str(), first.as_str()]
+    );
+    assert_eq!(listed.entries[0].previous_published_digest, second);
+    assert_eq!(listed.entries[1].previous_published_digest, first);
+    assert_eq!(
+        listed.entries[2].previous_published_digest,
+        parent.revision_digest
+    );
+    assert_eq!(
+        listed
+            .entries
+            .iter()
+            .map(|entry| entry.receipt_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            third_receipt.as_str(),
+            second_receipt.as_str(),
+            first_receipt.as_str()
+        ]
+    );
+    for entry in &listed.entries {
+        assert_eq!(entry.actor, "root");
+        let proposal = svc
+            .get_definition_proposal(with_named_principal(
+                GetDefinitionProposalRequest {
+                    namespace: namespace.into(),
+                    proposal_id: entry.proposal_id.clone(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .proposal
+            .unwrap();
+        assert_eq!(proposal.receipt_id, entry.receipt_id);
+        assert_eq!(proposal.status, "merged");
+    }
+
+    let ticket = svc
+        .list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: "object_type".into(),
+                member_id: "Ticket".into(),
+                page_token: String::new(),
+                page_size: 50,
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        ticket
+            .entries
+            .iter()
+            .map(|entry| entry.revision_digest.as_str())
+            .collect::<Vec<_>>(),
+        vec![second.as_str(), first.as_str()]
+    );
+
+    let first_page = svc
+        .list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: String::new(),
+                member_id: String::new(),
+                page_token: String::new(),
+                page_size: 2,
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.entries.len(), 2);
+    assert!(!first_page.next_page_token.is_empty());
+    publish_definition_history_entry(
+        &svc,
+        namespace,
+        &third,
+        "hist-4",
+        "hist-cs-4",
+        vec![DefinitionMemberInput {
+            member_kind: "ontology_class".into(),
+            member_id: "LaterClass".into(),
+            definition_json: r#"{"name":"LaterClass"}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    let second_page = svc
+        .list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: String::new(),
+                member_id: String::new(),
+                page_token: first_page.next_page_token,
+                page_size: 2,
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.entries.len(), 1);
+    assert_eq!(second_page.entries[0].revision_digest, first);
+    assert!(second_page.next_page_token.is_empty());
+
+    assert_eq!(
+        svc.list_published_definition_revisions(Request::new(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: String::new(),
+                member_id: String::new(),
+                page_token: String::new(),
+                page_size: 10,
+            },
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::Unauthenticated
+    );
+    let get_as_tester = svc
+        .get_published_definition_revision(with_named_principal(
+            GetPublishedDefinitionRevisionRequest {
+                namespace: namespace.into(),
+            },
+            "tester",
+        ))
+        .await;
+    let list_as_tester = svc
+        .list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: String::new(),
+                member_id: String::new(),
+                page_token: String::new(),
+                page_size: 10,
+            },
+            "tester",
+        ))
+        .await;
+    assert_eq!(
+        get_as_tester.as_ref().err().map(|error| error.code()),
+        list_as_tester.as_ref().err().map(|error| error.code())
+    );
+    let get_missing = svc
+        .get_published_definition_revision(with_named_principal(
+            GetPublishedDefinitionRevisionRequest {
+                namespace: "history-missing".into(),
+            },
+            "root",
+        ))
+        .await;
+    let list_missing = svc
+        .list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: "history-missing".into(),
+                member_kind: String::new(),
+                member_id: String::new(),
+                page_token: String::new(),
+                page_size: 10,
+            },
+            "root",
+        ))
+        .await;
+    assert_eq!(
+        get_missing.as_ref().err().map(|error| error.code()),
+        list_missing.as_ref().err().map(|error| error.code())
+    );
+    assert_eq!(get_missing.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(
+        svc.list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: "object_type".into(),
+                member_id: String::new(),
+                page_token: String::new(),
+                page_size: 10,
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        svc.list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: " object_type".into(),
+                member_id: "Ticket".into(),
+                page_token: String::new(),
+                page_size: 10,
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        svc.list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: String::new(),
+                member_id: String::new(),
+                page_token: "not-a-token".into(),
+                page_size: 10,
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let current = svc
+        .get_published_definition_revision(with_named_principal(
+            GetPublishedDefinitionRevisionRequest {
+                namespace: namespace.into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "hist-drop-class".into(),
+            parent_revision_digest: current.clone(),
+            idempotency_key: "hist-drop-class-create".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let dropped = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "hist-drop-class".into(),
+                expected_head_digest: current.clone(),
+                upserts: Vec::new(),
+                removals: vec![DefinitionMemberRef {
+                    member_kind: "ontology_class".into(),
+                    member_id: "TicketClass".into(),
+                }],
+                idempotency_key: "hist-drop-class-edit".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let candidate = dropped.revision.unwrap().revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: "hist-drop-class".into(),
+            proposal_id: "hist-cs-drop".into(),
+            base_digest: current.clone(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "hist-drop-class-propose".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "hist-cs-drop".into(),
+            idempotency_key: "hist-drop-class-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "hist-cs-drop".into(),
+            expected_published_digest: current,
+            idempotency_key: "hist-drop-class-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let protected = security::Grant {
+        id: "history-ticketclass-reader".into(),
+        object_id: ontology_class_object_id("TicketClass"),
+        principal: "other-reader".into(),
+        role: security::Role::Viewer,
+        created: 1,
+    };
+    svc.security.add_grant(&protected);
+    assert!(
+        !svc.get_published_definition_revision(with_named_principal(
+            GetPublishedDefinitionRevisionRequest {
+                namespace: namespace.into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .members
+        .iter()
+        .any(|member| member.member_id == "TicketClass")
+    );
+    svc.list_published_definition_revisions(with_named_principal(
+        ListPublishedDefinitionRevisionsRequest {
+            namespace: namespace.into(),
+            member_kind: String::new(),
+            member_id: String::new(),
+            page_token: String::new(),
+            page_size: 10,
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: "ontology_class".into(),
+                member_id: "TicketClass".into(),
+                page_token: String::new(),
+                page_size: 10,
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::NotFound
+    );
+}
+
 fn source_batch(
     namespace: &str,
     producer: &str,

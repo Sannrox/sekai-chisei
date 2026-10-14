@@ -2482,6 +2482,29 @@ message GetPublishedDefinitionRevisionResponse {
   DefinitionRevision revision = 1;
 }
 
+message PublishedDefinitionRevisionHistoryEntry {
+  string revision_digest = 1;
+  string previous_published_digest = 2;
+  string proposal_id = 3;
+  string receipt_id = 4;
+  string actor = 5;
+  int64 published_at_ms = 6;
+}
+
+message ListPublishedDefinitionRevisionsRequest {
+  string namespace = 1;
+  string member_kind = 2;
+  string member_id = 3;
+  string page_token = 4;
+  int32 page_size = 5;
+}
+
+message ListPublishedDefinitionRevisionsResponse {
+  repeated PublishedDefinitionRevisionHistoryEntry entries = 1;
+  string next_page_token = 2;
+}
+
+
 message DefinitionMemberChange {
   string member_kind = 1;
   string member_id = 2;
@@ -2704,6 +2727,7 @@ service SekaiService {
   rpc GetDefinitionCertificationGate(GetDefinitionCertificationGateRequest) returns (GetDefinitionCertificationGateResponse);
   rpc CloseDefinitionProposal(CloseDefinitionProposalRequest) returns (CloseDefinitionProposalResponse);
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
+  rpc ListPublishedDefinitionRevisions(ListPublishedDefinitionRevisionsRequest) returns (ListPublishedDefinitionRevisionsResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);

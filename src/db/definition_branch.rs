@@ -13,8 +13,10 @@ use crate::sekai::definition_branch::{
 use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
     DefinitionProposal, DefinitionProposalApproval, DefinitionProposalMergeResult,
-    MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
-    merge_receipt_id, reject_foreign_member_grants, require_descendant_candidate,
+    MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, PublishedDefinitionHistoryStore,
+    PublishedDefinitionRevisionHistoryEntry, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
+    history_entry_from_merged_proposal, list_published_definition_history, merge_receipt_id,
+    reject_foreign_member_grants, require_descendant_candidate,
 };
 
 pub const POSTGRES_DEFINITION_BRANCH_SURFACE: &str = "sekai.definition-branch";
@@ -70,6 +72,15 @@ pub trait DefinitionBranchBackend: Send + Sync {
         &self,
         namespace: &str,
     ) -> Result<Option<DefinitionRevision>, String>;
+
+    fn list_published_definition_revisions(
+        &self,
+        namespace: &str,
+        member_kind: &str,
+        member_id: &str,
+        page_token: &str,
+        page_size: i32,
+    ) -> Result<(Vec<PublishedDefinitionRevisionHistoryEntry>, String), String>;
 
     fn get_definition_proposal(
         &self,
@@ -190,6 +201,24 @@ macro_rules! forward {
             namespace: &str,
         ) -> Result<Option<DefinitionRevision>, String> {
             <$target>::get_published_definition_revision(self, namespace)
+        }
+
+        fn list_published_definition_revisions(
+            &self,
+            namespace: &str,
+            member_kind: &str,
+            member_id: &str,
+            page_token: &str,
+            page_size: i32,
+        ) -> Result<(Vec<PublishedDefinitionRevisionHistoryEntry>, String), String> {
+            <$target>::list_published_definition_revisions(
+                self,
+                namespace,
+                member_kind,
+                member_id,
+                page_token,
+                page_size,
+            )
         }
 
         fn get_definition_proposal(
@@ -349,6 +378,8 @@ impl SekaiDb {
                 );
                 CREATE INDEX IF NOT EXISTS idx_definition_proposal_branch
                     ON sekai_definition_proposals(namespace, branch_id, created_at_ms, proposal_id);
+                CREATE INDEX IF NOT EXISTS idx_definition_proposal_merged_history
+                    ON sekai_definition_proposals(namespace, status, updated_at_ms, proposal_id);
 
                 CREATE TABLE IF NOT EXISTS sekai_agent_definition_certifications (
                     namespace TEXT NOT NULL,
@@ -682,6 +713,26 @@ impl SekaiDb {
             return Ok(None);
         };
         load_revision_sqlite(&connection, namespace, &digest)
+    }
+
+    pub fn list_published_definition_revisions(
+        &self,
+        namespace: &str,
+        member_kind: &str,
+        member_id: &str,
+        page_token: &str,
+        page_size: i32,
+    ) -> Result<(Vec<PublishedDefinitionRevisionHistoryEntry>, String), String> {
+        let connection = self.conn();
+        let mut store = SqliteHistoryStore(&connection);
+        list_published_definition_history(
+            &mut store,
+            namespace,
+            member_kind,
+            member_id,
+            page_token,
+            page_size,
+        )
     }
 
     pub fn get_definition_proposal(
@@ -1541,6 +1592,80 @@ fn replay_sqlite(
     serde_json::from_str(&result_json)
         .map(Some)
         .map_err(|error| format!("corrupt definition replay result: {error}"))
+}
+
+struct SqliteHistoryStore<'a>(&'a rusqlite::Connection);
+
+impl PublishedDefinitionHistoryStore for SqliteHistoryStore<'_> {
+    fn fetch_merged_history(
+        &mut self,
+        namespace: &str,
+        cursor: Option<(i64, String)>,
+        limit: usize,
+    ) -> Result<Vec<PublishedDefinitionRevisionHistoryEntry>, String> {
+        fetch_merged_history_sqlite(self.0, namespace, cursor, limit)
+    }
+
+    fn load_history_revision(
+        &mut self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<DefinitionRevision>, String> {
+        load_revision_sqlite(self.0, namespace, revision_digest)
+    }
+}
+
+fn fetch_merged_history_sqlite(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    cursor: Option<(i64, String)>,
+    limit: usize,
+) -> Result<Vec<PublishedDefinitionRevisionHistoryEntry>, String> {
+    let has_cursor = i32::from(cursor.is_some());
+    let (ms, proposal_id) = cursor.unwrap_or((0, String::new()));
+    let mut statement = connection
+        .prepare(
+            "SELECT p.body_json, p.receipt_id, p.updated_at_ms, p.proposal_id, a.actor
+             FROM sekai_definition_proposals p
+             INNER JOIN sekai_definition_branch_audit a
+               ON a.namespace = p.namespace
+              AND a.branch_id = p.proposal_id
+              AND a.action = 'merge_proposal'
+             WHERE p.namespace = ?1
+               AND p.status = 'merged'
+               AND p.receipt_id != ''
+               AND (?2 = 0 OR p.updated_at_ms < ?3 OR (p.updated_at_ms = ?3 AND p.proposal_id < ?4))
+             ORDER BY p.updated_at_ms DESC, p.proposal_id DESC
+             LIMIT ?5",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![namespace, has_cursor, ms, proposal_id, limit as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (body_json, receipt_id, updated_at_ms, proposal_id, actor) =
+            row.map_err(|error| error.to_string())?;
+        entries.push(history_entry_from_merged_proposal(
+            &body_json,
+            receipt_id,
+            updated_at_ms,
+            proposal_id,
+            actor,
+        )?);
+    }
+    Ok(entries)
 }
 
 #[allow(clippy::too_many_arguments)]

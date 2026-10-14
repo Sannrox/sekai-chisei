@@ -13,8 +13,10 @@ use crate::sekai::definition_branch::{
 use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
     DefinitionProposal, DefinitionProposalApproval, DefinitionProposalMergeResult,
-    MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
-    merge_receipt_id, reject_foreign_member_grants, require_descendant_candidate,
+    MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, PublishedDefinitionHistoryStore,
+    PublishedDefinitionRevisionHistoryEntry, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
+    history_entry_from_merged_proposal, list_published_definition_history, merge_receipt_id,
+    reject_foreign_member_grants, require_descendant_candidate,
 };
 
 impl PostgresDb {
@@ -279,6 +281,26 @@ impl PostgresDb {
             return Ok(None);
         };
         load_revision_postgres(&mut *connection, namespace, &digest)
+    }
+
+    pub fn list_published_definition_revisions(
+        &self,
+        namespace: &str,
+        member_kind: &str,
+        member_id: &str,
+        page_token: &str,
+        page_size: i32,
+    ) -> Result<(Vec<PublishedDefinitionRevisionHistoryEntry>, String), String> {
+        let mut connection = self.connection()?;
+        let mut store = PostgresHistoryStore(&mut *connection);
+        list_published_definition_history(
+            &mut store,
+            namespace,
+            member_kind,
+            member_id,
+            page_token,
+            page_size,
+        )
     }
 
     pub fn get_definition_proposal(
@@ -1221,6 +1243,74 @@ fn replay_postgres(
     serde_json::from_str(&result_json)
         .map(Some)
         .map_err(|error| format!("corrupt definition replay result: {error}"))
+}
+
+struct PostgresHistoryStore<'a, C: GenericClient>(&'a mut C);
+
+impl<C: GenericClient> PublishedDefinitionHistoryStore for PostgresHistoryStore<'_, C> {
+    fn fetch_merged_history(
+        &mut self,
+        namespace: &str,
+        cursor: Option<(i64, String)>,
+        limit: usize,
+    ) -> Result<Vec<PublishedDefinitionRevisionHistoryEntry>, String> {
+        fetch_merged_history_postgres(self.0, namespace, cursor, limit)
+    }
+
+    fn load_history_revision(
+        &mut self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<DefinitionRevision>, String> {
+        load_revision_postgres(self.0, namespace, revision_digest)
+    }
+}
+
+fn fetch_merged_history_postgres(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    cursor: Option<(i64, String)>,
+    limit: usize,
+) -> Result<Vec<PublishedDefinitionRevisionHistoryEntry>, String> {
+    let has_cursor: i32 = i32::from(cursor.is_some());
+    let (ms, proposal_id) = match cursor {
+        Some((ms, proposal_id)) => (ms, proposal_id),
+        None => (0, String::new()),
+    };
+    let limit = limit as i64;
+    let rows = client
+        .query(
+            "SELECT p.body_json, p.receipt_id, p.updated_at_ms, p.proposal_id, a.actor
+             FROM sekai_definition_proposals p
+             INNER JOIN sekai_definition_branch_audit a
+               ON a.namespace = p.namespace
+              AND a.branch_id = p.proposal_id
+              AND a.action = 'merge_proposal'
+             WHERE p.namespace = $1
+               AND p.status = 'merged'
+               AND p.receipt_id <> ''
+               AND ($2 = 0 OR p.updated_at_ms < $3 OR (p.updated_at_ms = $3 AND p.proposal_id < $4))
+             ORDER BY p.updated_at_ms DESC, p.proposal_id DESC
+             LIMIT $5",
+            &[&namespace, &has_cursor, &ms, &proposal_id, &limit],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let body_json: String = row.get(0);
+        let receipt_id: String = row.get(1);
+        let updated_at_ms: i64 = row.get(2);
+        let proposal_id: String = row.get(3);
+        let actor: String = row.get(4);
+        entries.push(history_entry_from_merged_proposal(
+            &body_json,
+            receipt_id,
+            updated_at_ms,
+            proposal_id,
+            actor,
+        )?);
+    }
+    Ok(entries)
 }
 
 #[allow(clippy::too_many_arguments)]

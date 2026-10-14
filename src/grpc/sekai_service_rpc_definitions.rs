@@ -695,6 +695,84 @@ pub(super) async fn get_published_definition_revision(
         revision: Some(to_proto_definition_revision(&revision)),
     }))
 }
+pub(super) async fn list_published_definition_revisions(
+    service: &SekaiServiceImpl,
+    req: Request<ListPublishedDefinitionRevisionsRequest>,
+) -> Result<Response<ListPublishedDefinitionRevisionsResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    let revision = service
+        .db
+        .runtime()
+        .get_published_definition_revision(&input.namespace)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    authorize_definition_revision(
+        service,
+        &principals,
+        &revision.namespace,
+        &revision.revision_digest,
+        true,
+    )?;
+    definition_proposal_domain::validate_list_published_history_request(
+        &input.namespace,
+        &input.member_kind,
+        &input.member_id,
+        &input.page_token,
+    )
+    .map_err(Status::invalid_argument)?;
+    if !input.member_kind.trim().is_empty() {
+        authorize_definition_member_read(
+            service,
+            &principals,
+            &input.member_kind,
+            &input.member_id,
+        )?;
+    }
+    let (entries, next_page_token) = service
+        .db
+        .runtime()
+        .list_published_definition_revisions(
+            &input.namespace,
+            &input.member_kind,
+            &input.member_id,
+            &input.page_token,
+            input.page_size,
+        )
+        .map_err(|error| {
+            if error.starts_with("invalid_definition_history_page_token")
+                || error.starts_with("definition_history_invalid_member_filter")
+                || error.starts_with("canonical ")
+            {
+                Status::invalid_argument(error)
+            } else {
+                Status::internal("definition revision unavailable")
+            }
+        })?;
+    Ok(Response::new(ListPublishedDefinitionRevisionsResponse {
+        entries: entries
+            .into_iter()
+            .map(|entry| PublishedDefinitionRevisionHistoryEntry {
+                revision_digest: entry.revision_digest,
+                previous_published_digest: entry.previous_published_digest,
+                proposal_id: entry.proposal_id,
+                receipt_id: entry.receipt_id,
+                actor: entry.actor,
+                published_at_ms: entry.published_at_ms,
+            })
+            .collect(),
+        next_page_token,
+    }))
+}
 pub(super) async fn compare_definition_revisions(
     service: &SekaiServiceImpl,
     req: Request<CompareDefinitionRevisionsRequest>,
