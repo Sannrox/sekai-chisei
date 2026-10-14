@@ -680,6 +680,23 @@ mod tests {
     }
 
     #[test]
+    fn community_manifest_flags_service_principal_token_rpc_as_identity_vocabulary() {
+        let result = validate_community_surface(&CommunitySurfaceManifest {
+            grpc_methods: &["SekaiService/IssueServicePrincipalToken"],
+            gateway_routes: &[],
+            configuration_keys: &[],
+            accepted_authority_metadata: &[],
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            [CommunitySurfaceViolation {
+                surface: "grpc",
+                value: "SekaiService/IssueServicePrincipalToken".into(),
+            }]
+        );
+    }
+
+    #[test]
     fn community_manifest_rejects_plural_identity_aliases() {
         let result = validate_community_surface(&CommunitySurfaceManifest {
             grpc_methods: &["SessionsService/List", "TokensService/Issue"],

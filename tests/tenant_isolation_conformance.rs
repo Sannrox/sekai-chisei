@@ -233,6 +233,12 @@ fn community_profile_exposes_no_tenant_or_identity_runtime_surface() {
     let methods = protocols
         .iter()
         .flat_map(|protocol| rpc_methods(protocol))
+        // Client-credentials issuance (#1510) is an experimental enterprise RPC.
+        // Community builds reject experimental RPCs and do not install an
+        // identity extension, so this method is not a community identity-runtime
+        // surface. The lexical scanner still treats "token" as identity
+        // vocabulary; this named exclusion is the enterprise exception.
+        .filter(|method| method != "SekaiService/IssueServicePrincipalToken")
         .collect::<Vec<String>>();
     let method_refs = methods.iter().map(String::as_str).collect::<Vec<_>>();
     fn quoted_strings(source: &str) -> impl Iterator<Item = &str> {
