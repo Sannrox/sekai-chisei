@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Gunshi allocation state (`IssueGunshiRecommendations`,
+  `SetGunshiAllocationPolicy`, `GetGunshiAllocationStatus`) persists on
+  community PostgreSQL with the same CAS install/update behavior as SQLite
+  (#1474). The three RPCs leave the shrink-only SQLite-only list. Adds
+  PostgreSQL migration `0067_chisei_gunshi_allocation_state` (`GATE:mig`, #1474).
+
 - Service tokens are held to their live service-principal registration:
   requests outside the namespace allowlist, `SubmitActionInstance` and
   `ClaimActionWork` outside the registered Action types, and objects above the

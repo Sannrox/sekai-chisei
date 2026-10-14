@@ -406,7 +406,7 @@ capability-package certifications,
 federation network contracts,
 versioned client packages,
 and (on the Chisei side)
-online permit redeem, Gunshi allocation state, and
+online permit redeem and
 `GetEffectivePolicySummary` budget-limit projection — see the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
