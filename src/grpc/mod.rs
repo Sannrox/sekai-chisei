@@ -545,6 +545,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "Traverse"
             | "ListObjectChanges"
             | "GetPublishedDefinitionRevision"
+            | "ListPublishedDefinitionRevisions"
             | "GetDefinitionMember"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"

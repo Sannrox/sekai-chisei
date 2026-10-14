@@ -122,6 +122,8 @@ const CHISEI_MODEL_RELEASE_EVIDENCE_SCHEMA: &str =
     include_str!("postgres/0063_chisei_model_release_evidence.sql");
 const AGENT_DEFINITION_CERTIFICATION_SCHEMA: &str =
     include_str!("postgres/0064_agent_definition_certification.sql");
+const DEFINITION_PROPOSAL_MERGED_HISTORY_SCHEMA: &str =
+    include_str!("postgres/0065_definition_proposal_merged_history.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -541,6 +543,12 @@ const MIGRATIONS: &[Migration] = &[
         63,
         "agent_definition_certification",
         AGENT_DEFINITION_CERTIFICATION_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        64,
+        "definition_proposal_merged_history",
+        DEFINITION_PROPOSAL_MERGED_HISTORY_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

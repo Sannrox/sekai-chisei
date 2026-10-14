@@ -98,6 +98,202 @@ pub struct DefinitionProposalMergeResult {
     pub receipt_id: String,
 }
 
+/// One published merge in a namespace's revision history (#1354).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedDefinitionRevisionHistoryEntry {
+    pub revision_digest: String,
+    pub previous_published_digest: String,
+    pub proposal_id: String,
+    pub receipt_id: String,
+    pub actor: String,
+    pub published_at_ms: i64,
+}
+
+pub const HISTORY_DEFAULT_PAGE_SIZE: usize = 50;
+pub const HISTORY_MAX_PAGE_SIZE: usize = 200;
+
+pub fn validate_history_member_filter(member_kind: &str, member_id: &str) -> Result<(), String> {
+    match (member_kind.trim().is_empty(), member_id.trim().is_empty()) {
+        (true, true) | (false, false) => Ok(()),
+        _ => Err(
+            "definition_history_invalid_member_filter: member_kind and member_id must both be set or both empty"
+                .into(),
+        ),
+    }
+}
+
+pub fn clamp_history_page_size(requested: i32) -> usize {
+    if requested <= 0 {
+        HISTORY_DEFAULT_PAGE_SIZE
+    } else {
+        (requested as usize).min(HISTORY_MAX_PAGE_SIZE)
+    }
+}
+
+pub fn decode_history_page_token(token: &str) -> Result<Option<(i64, String)>, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let Some((ms, proposal_id)) = token.split_once('|') else {
+        return Err(
+            "invalid_definition_history_page_token: expected published_at_ms|proposal_id".into(),
+        );
+    };
+    if proposal_id.is_empty() {
+        return Err("invalid_definition_history_page_token: proposal_id is empty".into());
+    }
+    let ms = ms.parse::<i64>().map_err(|_| {
+        "invalid_definition_history_page_token: published_at_ms is not an integer".to_string()
+    })?;
+    Ok(Some((ms, proposal_id.to_string())))
+}
+
+pub fn encode_history_page_token(published_at_ms: i64, proposal_id: &str) -> String {
+    format!("{published_at_ms}|{proposal_id}")
+}
+
+pub fn paginate_history_entries(
+    mut entries: Vec<PublishedDefinitionRevisionHistoryEntry>,
+    page_size: usize,
+) -> (Vec<PublishedDefinitionRevisionHistoryEntry>, String) {
+    let next_page_token = if entries.len() > page_size {
+        let last = &entries[page_size - 1];
+        encode_history_page_token(last.published_at_ms, &last.proposal_id)
+    } else {
+        String::new()
+    };
+    entries.truncate(page_size);
+    (entries, next_page_token)
+}
+
+/// True when `member_kind`/`member_id` was added, removed, or digest-changed
+/// between the previous published revision and `current`.
+pub fn history_member_changed(
+    current: &DefinitionRevision,
+    previous: Option<&DefinitionRevision>,
+    member_kind: &str,
+    member_id: &str,
+) -> bool {
+    fn digest_of<'a>(
+        revision: &'a DefinitionRevision,
+        member_kind: &str,
+        member_id: &str,
+    ) -> Option<&'a str> {
+        revision.members.iter().find_map(|member| {
+            (member.member_kind == member_kind && member.member_id == member_id)
+                .then_some(member.member_digest.as_str())
+        })
+    }
+    digest_of(current, member_kind, member_id)
+        != previous.and_then(|revision| digest_of(revision, member_kind, member_id))
+}
+
+pub trait PublishedDefinitionHistoryStore {
+    fn fetch_merged_history(
+        &mut self,
+        namespace: &str,
+        cursor: Option<(i64, String)>,
+        limit: usize,
+    ) -> Result<Vec<PublishedDefinitionRevisionHistoryEntry>, String>;
+
+    fn load_history_revision(
+        &mut self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<DefinitionRevision>, String>;
+}
+
+pub fn history_entry_from_merged_proposal(
+    body_json: &str,
+    receipt_id: String,
+    updated_at_ms: i64,
+    proposal_id: String,
+    actor: String,
+) -> Result<PublishedDefinitionRevisionHistoryEntry, String> {
+    let proposal: DefinitionProposal = serde_json::from_str(body_json)
+        .map_err(|error| format!("corrupt definition proposal: {error}"))?;
+    if proposal.proposal_id != proposal_id {
+        return Err("corrupt definition proposal: lookup identity mismatch".into());
+    }
+    Ok(PublishedDefinitionRevisionHistoryEntry {
+        revision_digest: proposal.candidate_digest,
+        previous_published_digest: proposal.base_digest,
+        proposal_id,
+        receipt_id,
+        actor,
+        published_at_ms: updated_at_ms,
+    })
+}
+
+pub fn validate_list_published_history_request(
+    namespace: &str,
+    member_kind: &str,
+    member_id: &str,
+    page_token: &str,
+) -> Result<(), String> {
+    validate_namespace(namespace)?;
+    validate_history_member_filter(member_kind, member_id)?;
+    if !member_kind.trim().is_empty() {
+        validate_identifier("member_kind", member_kind, MAX_DEFINITION_ID_BYTES)?;
+        validate_identifier("member_id", member_id, MAX_DEFINITION_ID_BYTES)?;
+    }
+    decode_history_page_token(page_token).map(|_| ())
+}
+
+pub fn list_published_definition_history(
+    store: &mut dyn PublishedDefinitionHistoryStore,
+    namespace: &str,
+    member_kind: &str,
+    member_id: &str,
+    page_token: &str,
+    page_size: i32,
+) -> Result<(Vec<PublishedDefinitionRevisionHistoryEntry>, String), String> {
+    validate_list_published_history_request(namespace, member_kind, member_id, page_token)?;
+    let kind = member_kind.trim();
+    let id = member_id.trim();
+    let page_size = clamp_history_page_size(page_size);
+    let mut cursor = decode_history_page_token(page_token)?;
+    let filter = !kind.is_empty();
+    let mut matched = Vec::new();
+    loop {
+        let fetch = if filter {
+            (page_size + 1).max(32)
+        } else {
+            page_size + 1
+        };
+        let batch = store.fetch_merged_history(namespace, cursor.clone(), fetch)?;
+        let exhausted = batch.len() < fetch;
+        for row in batch {
+            cursor = Some((row.published_at_ms, row.proposal_id.clone()));
+            if filter {
+                let current = store
+                    .load_history_revision(namespace, &row.revision_digest)?
+                    .ok_or_else(|| {
+                        "definition_history_revision_missing: merged candidate is absent"
+                            .to_string()
+                    })?;
+                let previous = if row.previous_published_digest.is_empty() {
+                    None
+                } else {
+                    store.load_history_revision(namespace, &row.previous_published_digest)?
+                };
+                if !history_member_changed(&current, previous.as_ref(), kind, id) {
+                    continue;
+                }
+            }
+            matched.push(row);
+            if matched.len() == page_size + 1 {
+                break;
+            }
+        }
+        if matched.len() == page_size + 1 || exhausted {
+            break;
+        }
+    }
+    Ok(paginate_history_entries(matched, page_size))
+}
+
 impl CreateDefinitionProposal {
     pub fn prepare(&self) -> Result<(Vec<String>, Vec<String>, String, String), String> {
         validate_namespace(&self.namespace)?;
@@ -650,5 +846,86 @@ mod tests {
         let error = require_descendant_candidate(&sibling, &base, |_| Ok(None)).unwrap_err();
         assert!(error.contains("incompatible_definition_proposal_candidate"));
         assert!(!error.contains("AlreadyExists"));
+    }
+
+    #[test]
+    fn history_page_token_round_trips_and_rejects_junk() {
+        let token = encode_history_page_token(42, "cs-1");
+        assert_eq!(
+            decode_history_page_token(&token).unwrap(),
+            Some((42, "cs-1".into()))
+        );
+        assert_eq!(decode_history_page_token("").unwrap(), None);
+        assert!(
+            decode_history_page_token("not-a-token")
+                .unwrap_err()
+                .contains("invalid_definition_history_page_token")
+        );
+        assert!(
+            decode_history_page_token("x|cs-1")
+                .unwrap_err()
+                .contains("published_at_ms")
+        );
+        assert!(
+            validate_history_member_filter("object_type", "")
+                .unwrap_err()
+                .contains("definition_history_invalid_member_filter")
+        );
+        validate_history_member_filter("", "").unwrap();
+        validate_history_member_filter("object_type", "Ticket").unwrap();
+        assert!(
+            validate_list_published_history_request("team-a", " object_type", "Ticket", "")
+                .unwrap_err()
+                .contains("canonical member_kind required")
+        );
+        validate_list_published_history_request("team-a", "object_type", "Ticket", "").unwrap();
+    }
+
+    #[test]
+    fn history_member_changed_detects_add_remove_and_digest() {
+        let ticket = |digest: &str| DefinitionRevisionMember {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            member_digest: digest.into(),
+        };
+        let current = DefinitionRevision {
+            contract_version: crate::sekai::definition_branch::REVISION_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            revision_digest: digest('c'),
+            parent_revision_digest: digest('b'),
+            members: vec![ticket("sha256:new")],
+            published: true,
+            created_by: "author".into(),
+            created_at_ms: 2,
+        };
+        let previous = DefinitionRevision {
+            members: vec![ticket("sha256:old")],
+            revision_digest: digest('b'),
+            ..current.clone()
+        };
+        assert!(history_member_changed(
+            &current,
+            Some(&previous),
+            "object_type",
+            "Ticket"
+        ));
+        assert!(!history_member_changed(
+            &current,
+            Some(&current),
+            "object_type",
+            "Ticket"
+        ));
+        assert!(history_member_changed(
+            &current,
+            None,
+            "object_type",
+            "Ticket"
+        ));
+        assert!(!history_member_changed(
+            &current,
+            Some(&previous),
+            "ontology_class",
+            "TicketClass"
+        ));
     }
 }

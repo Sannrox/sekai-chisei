@@ -1286,6 +1286,258 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
     );
 }
 
+fn publish_revision(
+    db: &dyn DefinitionBranchBackend,
+    namespace: &str,
+    parent_digest: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    upserts: Vec<DefinitionMemberInput>,
+    t: i64,
+) -> (String, String) {
+    db.create_definition_branch(
+        &CreateDefinitionBranch {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            parent_revision_digest: parent_digest.into(),
+            idempotency_key: format!("{branch_id}-create"),
+        },
+        "author",
+        t,
+    )
+    .unwrap();
+    let DefinitionWriteResult::ApplyEdit { result } = db
+        .apply_definition_branch_edit(
+            &ApplyDefinitionBranchEdit {
+                namespace: namespace.into(),
+                branch_id: branch_id.into(),
+                expected_head_digest: parent_digest.into(),
+                upserts,
+                removals: Vec::new(),
+                idempotency_key: format!("{branch_id}-edit"),
+            },
+            "author",
+            t + 1,
+        )
+        .unwrap()
+    else {
+        panic!("expected branch edit");
+    };
+    let candidate = result.revision.revision_digest.clone();
+    db.create_definition_proposal(
+        &CreateDefinitionProposal {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            proposal_id: proposal_id.into(),
+            base_digest: parent_digest.into(),
+            candidate_digest: candidate,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("{branch_id}-propose"),
+        },
+        "author",
+        t + 2,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: proposal_id.into(),
+            idempotency_key: format!("{branch_id}-approve"),
+        },
+        "merger",
+        t + 3,
+    )
+    .unwrap();
+    let DefinitionWriteResult::MergeProposal { result } = db
+        .merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: proposal_id.into(),
+                expected_published_digest: parent_digest.into(),
+                idempotency_key: format!("{branch_id}-merge"),
+            },
+            "merger",
+            t + 4,
+        )
+        .unwrap()
+    else {
+        panic!("expected merge");
+    };
+    assert!(!result.receipt_id.is_empty());
+    (
+        result.published_revision.revision_digest.clone(),
+        result.receipt_id.clone(),
+    )
+}
+
+fn exercise_published_revision_history(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let (parent, _) = seed(db, namespace);
+    let (first, first_receipt) = publish_revision(
+        db,
+        namespace,
+        &parent,
+        "hist-1",
+        "hist-cs-1",
+        vec![member(
+            namespace,
+            "Ticket",
+            r#"{"name":"Ticket","properties":["title"]}"#,
+        )],
+        20,
+    );
+    let (second, second_receipt) = publish_revision(
+        db,
+        namespace,
+        &first,
+        "hist-2",
+        "hist-cs-2",
+        vec![
+            member(
+                namespace,
+                "Ticket",
+                r#"{"name":"Ticket","properties":["title","body"]}"#,
+            ),
+            typed_member(
+                namespace,
+                "ontology_class",
+                "TicketClass",
+                r#"{"name":"TicketClass"}"#,
+            ),
+        ],
+        30,
+    );
+    let (third, third_receipt) = publish_revision(
+        db,
+        namespace,
+        &second,
+        "hist-3",
+        "hist-cs-3",
+        vec![typed_member(
+            namespace,
+            "action_type",
+            "AssignTicket",
+            r#"{"name":"AssignTicket"}"#,
+        )],
+        40,
+    );
+
+    let (entries, token) = db
+        .list_published_definition_revisions(namespace, "", "", "", 0)
+        .unwrap();
+    assert!(token.is_empty());
+    assert_eq!(entries.len(), 3);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.revision_digest.as_str())
+            .collect::<Vec<_>>(),
+        vec![third.as_str(), second.as_str(), first.as_str()]
+    );
+    assert_eq!(entries[0].previous_published_digest, second);
+    assert_eq!(entries[1].previous_published_digest, first);
+    assert_eq!(entries[2].previous_published_digest, parent);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.proposal_id.as_str())
+            .collect::<Vec<_>>(),
+        ["hist-cs-3", "hist-cs-2", "hist-cs-1"]
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.receipt_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            third_receipt.as_str(),
+            second_receipt.as_str(),
+            first_receipt.as_str()
+        ]
+    );
+    for entry in &entries {
+        assert_eq!(entry.actor, "merger");
+        let proposal = db
+            .get_definition_proposal(namespace, &entry.proposal_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.receipt_id, entry.receipt_id);
+        assert_eq!(proposal.status, STATUS_MERGED);
+        assert_eq!(proposal.candidate_digest, entry.revision_digest);
+    }
+
+    let (ticket, _) = db
+        .list_published_definition_revisions(namespace, "object_type", "Ticket", "", 50)
+        .unwrap();
+    assert_eq!(
+        ticket
+            .iter()
+            .map(|entry| entry.revision_digest.as_str())
+            .collect::<Vec<_>>(),
+        vec![second.as_str(), first.as_str()]
+    );
+    let (ontology, _) = db
+        .list_published_definition_revisions(namespace, "ontology_class", "TicketClass", "", 50)
+        .unwrap();
+    assert_eq!(ontology.len(), 1);
+    assert_eq!(ontology[0].revision_digest, second);
+    let (action, _) = db
+        .list_published_definition_revisions(namespace, "action_type", "AssignTicket", "", 50)
+        .unwrap();
+    assert_eq!(action.len(), 1);
+    assert_eq!(action[0].revision_digest, third);
+
+    let (page1, next) = db
+        .list_published_definition_revisions(namespace, "", "", "", 2)
+        .unwrap();
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1[0].revision_digest, third);
+    assert_eq!(page1[1].revision_digest, second);
+    assert!(!next.is_empty());
+    let (page2, done) = db
+        .list_published_definition_revisions(namespace, "", "", &next, 2)
+        .unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].revision_digest, first);
+    assert!(done.is_empty());
+
+    publish_revision(
+        db,
+        namespace,
+        &third,
+        "hist-4",
+        "hist-cs-4",
+        vec![typed_member(
+            namespace,
+            "ontology_class",
+            "LaterClass",
+            r#"{"name":"LaterClass"}"#,
+        )],
+        50,
+    );
+    let (stable, still_done) = db
+        .list_published_definition_revisions(namespace, "", "", &next, 2)
+        .unwrap();
+    assert_eq!(stable.len(), 1);
+    assert_eq!(stable[0].revision_digest, first);
+    assert!(still_done.is_empty());
+    let (newest, _) = db
+        .list_published_definition_revisions(namespace, "", "", "", 1)
+        .unwrap();
+    assert_ne!(newest[0].revision_digest, third);
+
+    assert!(
+        db.list_published_definition_revisions(namespace, "object_type", "", "", 10)
+            .unwrap_err()
+            .contains("definition_history_invalid_member_filter")
+    );
+    assert!(
+        db.list_published_definition_revisions(namespace, "", "", "not-a-token", 10)
+            .unwrap_err()
+            .contains("invalid_definition_history_page_token")
+    );
+}
+
 #[test]
 fn sqlite_definition_branch_backend_conformance() {
     exercise_agent_draft(&SekaiDb::new(":memory:").unwrap(), "sqlite-agent");
@@ -1295,6 +1547,7 @@ fn sqlite_definition_branch_backend_conformance() {
     exercise_revision_compatibility(&SekaiDb::new(":memory:").unwrap(), "sqlite-compat");
     exercise_coordinated_artifact_merge(&SekaiDb::new(":memory:").unwrap(), "sqlite-four-kind");
     exercise_named_compatibility_gate_refusal(&SekaiDb::new(":memory:").unwrap(), "sqlite-gate");
+    exercise_published_revision_history(&SekaiDb::new(":memory:").unwrap(), "sqlite-history");
     exercise_concurrent_stale_head(
         Arc::new(SekaiDb::new(":memory:").unwrap()),
         "sqlite-definition-concurrent",
@@ -1327,6 +1580,7 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_revision_compatibility(db.as_ref(), &format!("{prefix}-compat"));
     exercise_coordinated_artifact_merge(db.as_ref(), &format!("{prefix}-four-kind"));
     exercise_named_compatibility_gate_refusal(db.as_ref(), &format!("{prefix}-gate"));
+    exercise_published_revision_history(db.as_ref(), &format!("{prefix}-history"));
     exercise_concurrent_stale_head(db.clone(), &format!("{prefix}-concurrent"));
     exercise_concurrent_genesis_seed(db, &format!("{prefix}-genesis"));
 }

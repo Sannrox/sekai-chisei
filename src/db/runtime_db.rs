@@ -1217,6 +1217,36 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_published_definition_revisions(
+        &self,
+        namespace: &str,
+        member_kind: &str,
+        member_id: &str,
+        page_token: &str,
+        page_size: i32,
+    ) -> Result<(Vec<PublishedDefinitionRevisionHistoryEntry>, String), String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::list_published_definition_revisions(
+                db.as_ref(),
+                namespace,
+                member_kind,
+                member_id,
+                page_token,
+                page_size,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::list_published_definition_revisions(
+                    db.as_ref(),
+                    namespace,
+                    member_kind,
+                    member_id,
+                    page_token,
+                    page_size,
+                )
+            }),
+        }
+    }
+
     pub fn get_definition_proposal(
         &self,
         namespace: &str,

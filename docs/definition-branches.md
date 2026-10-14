@@ -9,7 +9,7 @@ Branch, proposal, compare, compatibility, and fact-migration RPCs are
 classified `experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1`
 or the `experimental-rpcs` Cargo feature is enabled. See
 [rpc-maturity.md](rpc-maturity.md). `GetPublishedDefinitionRevision` stays
-`stable`.
+`stable`. `ListPublishedDefinitionRevisions` is an additive experimental read of merge history.
 
 ## Contract
 
@@ -89,6 +89,7 @@ receipt.
 `reason_code` (`operator_abort`, `superseded`, or `policy_denied`) without
 moving the published head. Merge of a closed proposal remains denied.
 `GetPublishedDefinitionRevision` returns the current published pointer.
+`ListPublishedDefinitionRevisions` returns that namespace's published merge history, newest first. Each entry names the published revision digest, previous published digest, merged proposal id, merge receipt id, actor, and time. Optional `member_kind` and `member_id` must both be set or both empty and keep only merges that added, removed, or digest-changed that member. Pagination is keyset on merge time then proposal id so a concurrent merge cannot duplicate or skip an earlier page. Auth matches `GetPublishedDefinitionRevision`. A nonempty member filter also reauthorizes that member the same way `GetDefinitionMember` does, so a later removal cannot disclose its history to a caller without that grant. The RPC does not restore or roll back a revision.
 
 `CompareDefinitionRevisions` takes two revision digests in one namespace. It
 reauthorizes every member on both revisions, then reports added, removed, and
