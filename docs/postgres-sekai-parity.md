@@ -107,9 +107,10 @@ Query-time ontology entailment stays backend-scoped on `RetrieveContext` /
 [rpc-maturity.md](rpc-maturity.md),
 [ADR 0001](decisions/0001-query-time-ontology-entailment.md), and
 [capability catalog](capability-catalog.md)).
-Admin projections on that list still include governed images
-(`sekai.governed-image/v1`; see
-[ADR 0050](decisions/0050-governed-images.md)). Versioned client packages
+Governed images, renditions, and annotations (`sekai.governed-image/v1`; see
+[ADR 0050](decisions/0050-governed-images.md)) persist on community
+PostgreSQL (#1479). Registered Iceberg/Parquet open-table projections persist
+on community PostgreSQL (#1479). Versioned client packages
 (`sekai.client-package/v1`; see
 [ADR 0051](decisions/0051-versioned-client-packages.md)) persist on community
 PostgreSQL (#1477). Capability-package certifications persist on community
@@ -147,6 +148,7 @@ Evidence is checked in as:
 | #1476 | Signed namespace snapshots, peer grants, and imported-assertion provenance |
 | #1477 | Versioned client packages |
 | #1478 | Capability-package certifications |
+| #1479 | Governed images and open-table projections |
 
 ## Still outside this parent
 

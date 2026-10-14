@@ -66,6 +66,7 @@ mod gateway_http_smoke;
 mod geospatial_query_adr;
 mod governed_fact_backend_conformance;
 mod governed_image_adr;
+mod governed_image_backend_conformance;
 mod graph_backend_conformance;
 mod guarded_mutation_backend_conformance;
 mod host_executor_permit_conformance;
@@ -89,6 +90,7 @@ mod object_security_value_instance_adr;
 mod object_set_adr;
 mod object_sync_backend_conformance;
 mod ollama_e2e;
+mod open_table_backend_conformance;
 mod operation_correlation_adr;
 mod parked_work_backend_conformance;
 mod partitioned_transform_io_adr;
@@ -225,6 +227,7 @@ const GROUPED_MODULES: &[&str] = &[
     "geospatial_query_adr",
     "governed_fact_backend_conformance",
     "governed_image_adr",
+    "governed_image_backend_conformance",
     "graph_backend_conformance",
     "guarded_mutation_backend_conformance",
     "host_executor_permit_conformance",
@@ -248,6 +251,7 @@ const GROUPED_MODULES: &[&str] = &[
     "object_set_adr",
     "object_sync_backend_conformance",
     "ollama_e2e",
+    "open_table_backend_conformance",
     "operation_correlation_adr",
     "parked_work_backend_conformance",
     "partitioned_transform_io_adr",
@@ -396,6 +400,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 130);
+    assert_eq!(GROUPED_MODULES.len(), 132);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

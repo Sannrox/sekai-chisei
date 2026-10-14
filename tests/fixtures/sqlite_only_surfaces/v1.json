@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 23,
+  "limit": 21,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -96,16 +96,6 @@
       "id": "admin.autonomous-envelope",
       "kind": "admin",
       "methods": ["get_autonomous_envelope", "put_autonomous_envelope"]
-    },
-    {
-      "id": "admin.governed-image",
-      "kind": "admin",
-      "methods": ["put_governed_image", "get_governed_image"]
-    },
-    {
-      "id": "admin.open-table",
-      "kind": "admin",
-      "methods": ["put_open_table_source", "get_open_table_source"]
     },
     {
       "id": "admin.data-quality",

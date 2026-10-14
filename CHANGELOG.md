@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Governed images, renditions, and annotations, and registered Iceberg/Parquet
+  open-table projections persist on community PostgreSQL with the same owner
+  CAS, parent, tombstone, and snapshot-digest behavior as SQLite (#1479).
+  `admin.governed-image` and `admin.open-table` leave the shrink-only
+  SQLite-only list. Adds PostgreSQL migration
+  `0072_governed_images_and_open_tables` (`GATE:mig`, #1479).
+
 - Capability-package certifications persist on community PostgreSQL with the
   same certify, replay, supersede, and revoke behavior as SQLite (#1478).
   `admin.capability-package` leaves the shrink-only SQLite-only list. Adds
