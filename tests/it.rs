@@ -12,6 +12,7 @@ mod agent_instruction_sync;
 mod autonomous_envelope_adr;
 mod capability_authoring;
 mod capability_package_adr;
+mod capability_package_backend_conformance;
 mod chisei_budget_backend_conformance;
 mod chisei_eval_backend_conformance;
 mod chisei_evaluation_execution_backend_conformance;
@@ -170,6 +171,7 @@ const GROUPED_MODULES: &[&str] = &[
     "autonomous_envelope_adr",
     "capability_authoring",
     "capability_package_adr",
+    "capability_package_backend_conformance",
     "chisei_budget_backend_conformance",
     "chisei_eval_backend_conformance",
     "chisei_evaluation_execution_backend_conformance",
@@ -394,6 +396,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 129);
+    assert_eq!(GROUPED_MODULES.len(), 130);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

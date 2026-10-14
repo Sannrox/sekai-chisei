@@ -402,7 +402,6 @@ reconciliation. Known community Postgres fail-closed exceptions include query-ti
 entailment, registered Iceberg/Parquet snapshot projections,
 governed documents and renditions,
 governed images, renditions, and annotations,
-capability-package certifications,
 and (on the Chisei side)
 online permit redeem and
 `GetEffectivePolicySummary` budget-limit projection — see the parity guides.

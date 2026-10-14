@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 24,
+  "limit": 23,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -96,11 +96,6 @@
       "id": "admin.autonomous-envelope",
       "kind": "admin",
       "methods": ["get_autonomous_envelope", "put_autonomous_envelope"]
-    },
-    {
-      "id": "admin.capability-package",
-      "kind": "admin",
-      "methods": ["get_capability_package", "commit_capability_packages"]
     },
     {
       "id": "admin.governed-image",
