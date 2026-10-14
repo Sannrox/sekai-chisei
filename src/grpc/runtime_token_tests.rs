@@ -232,6 +232,7 @@ fn forged(plane: &Plane, claimed: &crate::grpc::pb::sekai::ActionEffect) -> Runt
         claim_generation: claimed.claim_generation,
         expires_at_ms: claimed.claim_expires_at_ms,
         authority_expires_at_ms: i64::MAX,
+        service_principal: false,
         jti: "forged".into(),
     }
 }

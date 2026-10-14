@@ -102,7 +102,7 @@ tenant-less caller can only create tenant-less registrations. Every listed
 namespace must pass the caller's tenant check. The marking ceiling is the
 principal profile's `classification_ceiling`, reported read-only. Built-in
 principals cannot be registered, and registrations never hold a secret: the
-identity extension issues credentials. Scope enforcement is a separate change.
+identity extension issues credentials.
 
 `IssueServicePrincipalToken` (#1510) is the client-credentials call: the
 identity-extension issuance hook verifies the secret for a registered
@@ -113,6 +113,14 @@ never a user). The RPC is refused when no identity extension is installed, the
 principal is not registered, or the credentials are invalid; an expired token
 is refused at the boundary. The RPC is `experimental` (enable
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` build feature).
+
+Every request made with a service token is held to the live registration
+(#1511). The shared namespace and tenant check refuses a namespace outside the
+allowlist; `SubmitActionInstance` and `ClaimActionWork` refuse an Action type
+outside the registration; object reads apply the principal profile's
+`classification_ceiling` as for any principal. A runtime token from a claim
+made with a service token stays within the same scope, and removing the
+registration revokes both tokens. Other callers are unaffected.
 
 ## Host responsibilities
 

@@ -113,7 +113,10 @@ impl ServiceTokenClaims {
             contract_version: IDENTITY_EXTENSION_VERSION,
             principal: AuthenticatedPrincipal {
                 subject: self.subject.clone(),
-                credential_id: self.credential_id.clone(),
+                credential_id: format!(
+                    "{SERVICE_PRINCIPAL_CREDENTIAL_PREFIX}{}",
+                    self.credential_id
+                ),
             },
             credential_kind: CredentialKind::Machine,
             tenant: Some(TenantContext {
@@ -130,6 +133,20 @@ impl ServiceTokenClaims {
             expires_at: self.expires_at_ms.div_euclid(1_000),
         }
     }
+}
+
+/// Credential-id prefix that marks a context as a registered service
+/// principal (#1511), both for service tokens and for runtime tokens derived
+/// from them. Scope enforcement keys on it and fails closed when the
+/// registration is gone.
+pub const SERVICE_PRINCIPAL_CREDENTIAL_PREFIX: &str = "service-principal:";
+
+/// Whether `context` acts as a registered service principal.
+pub fn is_service_principal_context(context: &AuthenticatedContext) -> bool {
+    context
+        .principal
+        .credential_id
+        .starts_with(SERVICE_PRINCIPAL_CREDENTIAL_PREFIX)
 }
 
 pub fn is_service_token(token: &str) -> bool {

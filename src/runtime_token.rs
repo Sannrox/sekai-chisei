@@ -52,6 +52,10 @@ pub struct RuntimeTokenClaims {
     /// Expiry of the credential the claim was made with. Refreshed tokens
     /// keep it, so heartbeats never outlive the originating authority.
     pub authority_expires_at_ms: i64,
+    /// Claimed by a registered service principal, so follow-up calls stay
+    /// within its registered scope (#1511).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_principal: bool,
     pub jti: String,
 }
 
@@ -97,6 +101,7 @@ impl RuntimeTokenClaims {
                 .min(now_ms.saturating_add(RUNTIME_TOKEN_MAX_LIFETIME_MS))
                 .min(authority_expires_at_ms),
             authority_expires_at_ms,
+            service_principal: crate::service_token::is_service_principal_context(context),
             jti: uuid::Uuid::new_v4().to_string(),
         })
     }
@@ -164,7 +169,15 @@ impl RuntimeTokenClaims {
             contract_version: IDENTITY_EXTENSION_VERSION,
             principal: AuthenticatedPrincipal {
                 subject: self.subject.clone(),
-                credential_id: format!("runtime-token:{}", self.jti),
+                credential_id: if self.service_principal {
+                    format!(
+                        "{}runtime-token:{}",
+                        crate::service_token::SERVICE_PRINCIPAL_CREDENTIAL_PREFIX,
+                        self.jti
+                    )
+                } else {
+                    format!("runtime-token:{}", self.jti)
+                },
             },
             credential_kind: CredentialKind::Machine,
             tenant: Some(TenantContext {

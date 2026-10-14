@@ -153,6 +153,11 @@ pub(super) async fn submit_action_instance(
         &namespace,
         true,
     )?;
+    enforce_service_principal_action_type(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.type_id,
+    )?;
     let operation_id = crate::sekai::operation_correlation::bind_submit_identity(
         header_operation_id.as_deref(),
         &inner.request_id,
@@ -929,6 +934,25 @@ fn runtime_token_for(
     Ok((token, claims.expires_at_ms))
 }
 
+/// Keep claimed work of a service-principal caller, and every follow-up call
+/// on it, within the live registration's Action types.
+fn enforce_service_principal_effect_type(
+    service: &SekaiServiceImpl,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    effect: &crate::sekai::action_effect::ActionEffect,
+) -> Result<(), Status> {
+    if service_principal_scope(service.db.runtime(), tenant_context)?.is_none() {
+        return Ok(());
+    }
+    let instance = service
+        .db
+        .runtime()
+        .get_action_instance(&effect.instance_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::permission_denied("action effect unavailable"))?;
+    enforce_service_principal_action_type(service.db.runtime(), tenant_context, &instance.type_id)
+}
+
 /// Authorize a follow-up call on claimed work: a runtime token must cover
 /// this exact claim, and the caller needs namespace write under its tenant.
 fn authorize_claimed_work_call(
@@ -961,7 +985,8 @@ fn authorize_claimed_work_call(
         tenant_context,
         &effect.namespace,
         true,
-    )
+    )?;
+    enforce_service_principal_effect_type(service, tenant_context, effect)
 }
 
 pub(super) async fn claim_action_work(
@@ -995,6 +1020,7 @@ pub(super) async fn claim_action_work(
         &existing.namespace,
         true,
     )?;
+    enforce_service_principal_effect_type(service, tenant_context.as_ref(), &existing)?;
     let actor = principals.first().cloned().unwrap_or_default();
     let now = now_millis();
     let claimed = ActionWorkLifecycle::new(service.db.runtime())
