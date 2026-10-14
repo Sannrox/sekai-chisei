@@ -396,16 +396,68 @@ impl TokenAuthInterceptor {
         req.extensions_mut().insert(claims);
         Ok(req)
     }
+
+    /// Admit a service-principal token (#1510) as the registered machine
+    /// identity. Scope enforcement on Action RPCs is #1511.
+    fn authenticate_service_token(
+        &self,
+        req: Request<()>,
+        token: &str,
+    ) -> Result<Request<()>, Status> {
+        let refuse = |status: Status| {
+            reject_unauthorized();
+            status
+        };
+        let Some(authority) = &self.assertion_authority else {
+            return Err(refuse(Status::unauthenticated("invalid token")));
+        };
+        if req.metadata().get(TENANT_CONTEXT_HEADER).is_some() {
+            return Err(refuse(assertion_reject_status(
+                crate::identity_assertion::AssertionReject::CallerTenantHeader,
+            )));
+        }
+        let claims = crate::service_token::ServiceTokenClaims::verify(
+            authority,
+            token,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|reject| refuse(assertion_reject_status(reject)))?;
+        let registration = self
+            .db
+            .runtime()
+            .get_service_principal(&claims.subject)
+            .map_err(|_| refuse(Status::unauthenticated("invalid token")))?
+            .filter(|registration| registration.tenant_id == claims.tenant_id);
+        if registration.is_none() {
+            return Err(refuse(Status::unauthenticated("invalid token")));
+        }
+        let context = claims.authenticated_context();
+        if context.credential_kind != crate::enterprise::CredentialKind::Machine {
+            return Err(refuse(Status::unauthenticated("invalid token")));
+        }
+        finish_authenticated_audited(self.db.runtime(), req, context, true)
+    }
 }
 
 impl tonic::service::Interceptor for TokenAuthInterceptor {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+        let issue_service_token =
+            rpc_identity::request_rpc_method(&req).is_some_and(|(service, method)| {
+                service == "sekai.SekaiService" && method == "IssueServicePrincipalToken"
+            });
+        if issue_service_token {
+            // Client credentials in the request body are the authentication.
+            return Ok(req);
+        }
         let Some(token) = Self::parse_bearer_token(req.metadata()) else {
             reject_unauthorized();
             return Err(Status::unauthenticated("missing authorization"));
         };
         if crate::runtime_token::is_runtime_token(&token) {
             return self.authenticate_runtime_token(req, &token);
+        }
+        if crate::service_token::is_service_token(&token) {
+            return self.authenticate_service_token(req, &token);
         }
         if crate::identity_assertion::is_assertion_token(&token) {
             let tenant_header = req
@@ -568,6 +620,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "PutServicePrincipal"
             | "GetServicePrincipal"
             | "DeleteServicePrincipal"
+            | "IssueServicePrincipalToken"
             | "PlanExecution"
             | "ExecutePlanStream"
             | "PlanContentExecution"
@@ -1391,6 +1444,9 @@ mod runtime_token_tests;
 
 #[cfg(test)]
 mod service_principal_tests;
+
+#[cfg(test)]
+mod service_token_tests;
 
 #[cfg(test)]
 mod tests {

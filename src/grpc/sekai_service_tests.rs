@@ -211,6 +211,10 @@ fn enterprise_rejects_community_credentials_on_every_rpc() {
                 .strip_prefix("rpc ")
                 .and_then(|rpc| rpc.split_once('(').map(|(name, _)| name.trim()))
         }) {
+            if service == "sekai.SekaiService" && method == "IssueServicePrincipalToken" {
+                // Client-credentials issuance authenticates from the request body.
+                continue;
+            }
             let mut request = Request::new(());
             request.metadata_mut().insert(
                 "authorization",
@@ -14299,6 +14303,10 @@ fn guest_credentials_reach_only_namespace_checked_rpcs() {
                 .strip_prefix("rpc ")
                 .and_then(|rpc| rpc.split_once('(').map(|(name, _)| name.trim()))
         }) {
+            if service == "sekai.SekaiService" && method == "IssueServicePrincipalToken" {
+                // Client-credentials issuance authenticates from the request body.
+                continue;
+            }
             let mut request = Request::new(());
             request.metadata_mut().insert(
                 "authorization",

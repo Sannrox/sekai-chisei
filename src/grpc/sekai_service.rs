@@ -1017,6 +1017,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_service_principals::delete_service_principal(self, req).await
     }
 
+    async fn issue_service_principal_token(
+        &self,
+        req: Request<IssueServicePrincipalTokenRequest>,
+    ) -> Result<Response<IssueServicePrincipalTokenResponse>, Status> {
+        rpc_service_principals::issue_service_principal_token(self, req).await
+    }
+
     async fn set_action_policy(
         &self,
         req: Request<SetActionPolicyRequest>,

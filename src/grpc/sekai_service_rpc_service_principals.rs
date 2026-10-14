@@ -161,3 +161,59 @@ pub(super) async fn delete_service_principal(
         .map_err(Status::internal)?;
     Ok(Response::new(DeleteServicePrincipalResponse { deleted }))
 }
+
+pub(super) async fn issue_service_principal_token(
+    service: &SekaiServiceImpl,
+    req: Request<IssueServicePrincipalTokenRequest>,
+) -> Result<Response<IssueServicePrincipalTokenResponse>, Status> {
+    let Some(extension) = service.db.runtime().enterprise_extension() else {
+        return Err(Status::failed_precondition(
+            "identity extension is required",
+        ));
+    };
+    let Some(authority) = service.runtime_token_authority.as_deref() else {
+        return Err(Status::failed_precondition(
+            "service token issuance requires a configured assertion signing key",
+        ));
+    };
+    let input = req.into_inner();
+    if input.principal.trim().is_empty() || input.client_secret.is_empty() {
+        return Err(Status::invalid_argument(
+            "principal and client_secret required",
+        ));
+    }
+    let registration = service
+        .db
+        .runtime()
+        .get_service_principal(&input.principal)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("service principal not found"))?;
+    if registration.tenant_id.trim().is_empty() {
+        return Err(Status::failed_precondition(
+            "service token issuance requires a tenant-bound registration",
+        ));
+    }
+    let grant = extension
+        .issue_service_principal_token(crate::enterprise::ServicePrincipalTokenRequest {
+            principal: registration.principal.clone(),
+            client_secret: crate::enterprise::SecretValue::new(input.client_secret),
+            tenant_id: registration.tenant_id.clone(),
+            namespaces: registration.namespaces.clone(),
+            action_types: registration.action_types.clone(),
+        })
+        .map_err(extension_status)?;
+    let now_ms = now_millis();
+    let claims = crate::service_token::ServiceTokenClaims::for_grant(
+        authority,
+        &registration,
+        &grant.credential_id,
+        grant.expires_at_ms,
+        now_ms,
+    )
+    .ok_or_else(|| Status::failed_precondition("service token grant is not issuable"))?;
+    let token = claims.sign(authority).map_err(Status::internal)?;
+    Ok(Response::new(IssueServicePrincipalTokenResponse {
+        token,
+        expires_at_ms: claims.expires_at_ms,
+    }))
+}

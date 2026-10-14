@@ -375,6 +375,41 @@ pub struct AccessCredentialRequest {
     pub resource: String,
 }
 
+/// Client-credentials input for a registered service principal (#1510).
+///
+/// Core supplies the live registration; the extension only verifies the
+/// secret it owns. Debug redacts `client_secret`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ServicePrincipalTokenRequest {
+    pub principal: String,
+    pub client_secret: SecretValue,
+    pub tenant_id: String,
+    pub namespaces: Vec<String>,
+    pub action_types: Vec<String>,
+}
+
+impl fmt::Debug for ServicePrincipalTokenRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServicePrincipalTokenRequest")
+            .field("principal", &self.principal)
+            .field("client_secret", &"[REDACTED]")
+            .field("tenant_id", &self.tenant_id)
+            .field("namespaces", &self.namespaces)
+            .field("action_types", &self.action_types)
+            .finish()
+    }
+}
+
+/// Extension grant after client-credentials verification. Core signs the
+/// returned identity as a service token; `expires_at_ms` is a millisecond
+/// Unix timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServicePrincipalTokenGrant {
+    pub credential_id: String,
+    pub expires_at_ms: i64,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AccessCredential {
     pub credential: SecretValue,
@@ -644,6 +679,24 @@ pub trait EnterpriseExtension: Send + Sync {
         let _ = (context, provider);
         Err(ExtensionError::Unavailable(
             "tenant-scoped provider credentials are not implemented".into(),
+        ))
+    }
+
+    /// Verify client credentials for a registered service principal and grant
+    /// a short-lived tenant-bound token (#1510).
+    ///
+    /// Default: unavailable. Core looks up the registration first and only
+    /// then calls this hook. Implementations must not log or persist
+    /// `client_secret`. A successful grant is a service identity, never a
+    /// user identity. Core signs and verifies the token with the plane
+    /// assertion key from #1507.
+    fn issue_service_principal_token(
+        &self,
+        request: ServicePrincipalTokenRequest,
+    ) -> Result<ServicePrincipalTokenGrant, ExtensionError> {
+        let _ = request;
+        Err(ExtensionError::Unavailable(
+            "service-principal token issuance is not implemented".into(),
         ))
     }
 }
@@ -1020,5 +1073,24 @@ mod tests {
         assert!(rendered.contains("cred-1"));
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("sk-live-secret"));
+    }
+
+    #[test]
+    fn service_principal_issuance_defaults_unavailable_and_redacts_secret() {
+        let request = ServicePrincipalTokenRequest {
+            principal: "worker-a".into(),
+            client_secret: SecretValue::new("client-secret"),
+            tenant_id: "tenant-a".into(),
+            namespaces: vec!["ns-a".into()],
+            action_types: vec!["dispatch".into()],
+        };
+        let rendered = format!("{request:?}");
+        assert!(rendered.contains("worker-a"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("client-secret"));
+        assert!(matches!(
+            FakeExtension.issue_service_principal_token(request),
+            Err(ExtensionError::Unavailable(_))
+        ));
     }
 }

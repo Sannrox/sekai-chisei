@@ -102,8 +102,17 @@ tenant-less caller can only create tenant-less registrations. Every listed
 namespace must pass the caller's tenant check. The marking ceiling is the
 principal profile's `classification_ceiling`, reported read-only. Built-in
 principals cannot be registered, and registrations never hold a secret: the
-identity extension issues credentials. Token issuance and scope enforcement
-are separate changes.
+identity extension issues credentials. Scope enforcement is a separate change.
+
+`IssueServicePrincipalToken` (#1510) is the client-credentials call: the
+identity-extension issuance hook verifies the secret for a registered
+tenant-bound principal, and the plane signs a short-lived service token with
+the same assertion key as runtime tokens (#1507). The authentication boundary
+admits that token as the registered service principal (a machine identity,
+never a user). The RPC is refused when no identity extension is installed, the
+principal is not registered, or the credentials are invalid; an expired token
+is refused at the boundary. The RPC is `experimental` (enable
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` build feature).
 
 ## Host responsibilities
 
