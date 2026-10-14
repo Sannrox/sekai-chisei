@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Signed namespace snapshot export/import, peer namespace grants, and imported
+  assertion provenance persist on community PostgreSQL with the same sequence,
+  upsert, and list behavior as SQLite (#1476). `admin.federation-snapshot`
+  leaves the shrink-only SQLite-only list. Adds PostgreSQL migration
+  `0069_federation_snapshots_and_provenance` (`GATE:mig`, #1476).
+
 - Federation network contracts, site/peer profile tables, governed conflicts,
   and revocations persist on community PostgreSQL with the same install, CAS,
   and list behavior as SQLite (#1475). `admin.federation-network` leaves the

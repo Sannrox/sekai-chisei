@@ -142,6 +142,7 @@ Evidence is checked in as:
 | #1388 | Partitioned streaming transform I/O and atomic partition write-back |
 | #1481 | Connector certification certify/get/verify/revoke on PostgreSQL |
 | #1475 | Federation network contracts, site/peer tables, conflicts, and revocations |
+| #1476 | Signed namespace snapshots, peer grants, and imported-assertion provenance |
 
 ## Still outside this parent
 

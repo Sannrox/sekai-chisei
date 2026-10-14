@@ -1,5 +1,5 @@
-//! PostgreSQL persistence for federation network, profile, conflict, and
-//! revocation stores (#1475).
+//! PostgreSQL persistence for federation network, profile, conflict,
+//! revocation, snapshot, grant, and peer-import stores (#1475, #1476).
 
 use crate::db::postgres::PostgresDb;
 use crate::sekai::federation_conflict::FederationConflict;
@@ -9,6 +9,10 @@ use crate::sekai::federation_network::{
 };
 use crate::sekai::federation_profile::{FederationPeer, LocalSiteIdentity};
 use crate::sekai::federation_revocation::FederationRevocation;
+use crate::sekai::namespace_snapshot::{
+    PeerNamespaceGrant, SnapshotExportRecord, SnapshotFact, SnapshotImportRecord,
+};
+use crate::sekai::peer_import::{PeerImportRecord, PeerTrustRoot};
 
 impl PostgresDb {
     pub fn put_federation_local_site(&self, site: &LocalSiteIdentity) -> Result<(), String> {
@@ -378,6 +382,323 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
+
+    pub fn put_peer_trust_root(&self, root: &PeerTrustRoot) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_peer_trust_roots
+                    (namespace, site_identity, key_id, public_key_hex, enabled, created_by, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (namespace, site_identity, key_id) DO UPDATE SET
+                    public_key_hex = EXCLUDED.public_key_hex,
+                    enabled = EXCLUDED.enabled,
+                    created_by = EXCLUDED.created_by,
+                    created_at_ms = EXCLUDED.created_at_ms",
+                &[
+                    &root.namespace,
+                    &root.site_identity,
+                    &root.key_id,
+                    &root.public_key_hex,
+                    &root.enabled,
+                    &root.created_by,
+                    &root.created_at_ms,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_peer_trust_roots(&self, namespace: &str) -> Result<Vec<PeerTrustRoot>, String> {
+        self.connection()?
+            .query(
+                "SELECT namespace, site_identity, key_id, public_key_hex, enabled, created_by, created_at_ms
+                 FROM sekai_peer_trust_roots
+                 WHERE namespace = $1
+                 ORDER BY site_identity, key_id",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                Ok(PeerTrustRoot {
+                    namespace: row.get(0),
+                    site_identity: row.get(1),
+                    key_id: row.get(2),
+                    public_key_hex: row.get(3),
+                    enabled: row.get(4),
+                    created_by: row.get(5),
+                    created_at_ms: row.get(6),
+                })
+            })
+            .collect()
+    }
+
+    pub fn put_peer_import(&self, record: &PeerImportRecord) -> Result<(), String> {
+        let json = serde_json::to_string(record)
+            .map_err(|error| format!("encode peer import: {error}"))?;
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_peer_imports (import_id, namespace, record_json, imported_at_ms)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &record.import_id,
+                    &record.namespace,
+                    &json,
+                    &record.imported_at_ms,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn get_peer_import(&self, import_id: &str) -> Result<Option<PeerImportRecord>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT record_json FROM sekai_peer_imports WHERE import_id = $1",
+                &[&import_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| decode_peer_import(&row.get::<_, String>(0)))
+            .transpose()
+    }
+
+    pub fn put_federation_namespace_grant(&self, grant: &PeerNamespaceGrant) -> Result<(), String> {
+        let json = serde_json::to_string(grant)
+            .map_err(|error| format!("encode namespace grant: {error}"))?;
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_federation_namespace_grants
+                    (grant_id, peer_site_id, namespace, record_json, revoked, granted_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (grant_id) DO UPDATE SET
+                    peer_site_id = EXCLUDED.peer_site_id,
+                    namespace = EXCLUDED.namespace,
+                    record_json = EXCLUDED.record_json,
+                    revoked = EXCLUDED.revoked,
+                    granted_at_ms = EXCLUDED.granted_at_ms",
+                &[
+                    &grant.grant_id,
+                    &grant.peer_site_id,
+                    &grant.namespace,
+                    &json,
+                    &grant.revoked,
+                    &grant.granted_at_ms,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn get_federation_namespace_grant(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<PeerNamespaceGrant>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT record_json FROM sekai_federation_namespace_grants WHERE grant_id = $1",
+                &[&grant_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| decode_grant(&row.get::<_, String>(0)))
+            .transpose()
+    }
+
+    pub fn list_federation_namespace_grants(
+        &self,
+        namespace: Option<&str>,
+        peer_site_id: Option<&str>,
+    ) -> Result<Vec<PeerNamespaceGrant>, String> {
+        self.connection()?
+            .query(
+                "SELECT record_json FROM sekai_federation_namespace_grants
+                 WHERE ($1::text IS NULL OR namespace = $1)
+                   AND ($2::text IS NULL OR peer_site_id = $2)
+                 ORDER BY granted_at_ms ASC, grant_id ASC",
+                &[&namespace, &peer_site_id],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| decode_grant(&row.get::<_, String>(0)))
+            .collect()
+    }
+
+    pub fn reserve_federation_snapshot_sequence(&self, namespace: &str) -> Result<u64, String> {
+        let sequence: i64 = self
+            .connection()?
+            .query_one(
+                "INSERT INTO sekai_federation_snapshot_sequences (namespace, next_sequence)
+                 VALUES ($1, 1::bigint)
+                 ON CONFLICT (namespace) DO UPDATE SET
+                    next_sequence = sekai_federation_snapshot_sequences.next_sequence + 1
+                 RETURNING next_sequence",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        Ok(sequence as u64)
+    }
+
+    pub fn put_federation_snapshot_export(
+        &self,
+        export: &SnapshotExportRecord,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(export)
+            .map_err(|error| format!("encode snapshot export: {error}"))?;
+        let sequence = export.sequence as i64;
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_federation_snapshot_exports
+                    (snapshot_digest, namespace, sequence, record_json, exported_at_ms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (snapshot_digest) DO UPDATE SET
+                    namespace = EXCLUDED.namespace,
+                    sequence = EXCLUDED.sequence,
+                    record_json = EXCLUDED.record_json,
+                    exported_at_ms = EXCLUDED.exported_at_ms",
+                &[
+                    &export.snapshot_digest,
+                    &export.namespace,
+                    &sequence,
+                    &json,
+                    &export.exported_at_ms,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn put_federation_snapshot_import(
+        &self,
+        record: &SnapshotImportRecord,
+        facts: &[SnapshotFact],
+        conflicts: &[FederationConflict],
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(record)
+            .map_err(|error| format!("encode snapshot import: {error}"))?;
+        let sequence = record.sequence as i64;
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| format!("begin snapshot import: {error}"))?;
+        tx.execute(
+            "INSERT INTO sekai_federation_snapshot_imports
+                (import_id, namespace, peer_site_id, snapshot_digest, sequence, record_json, imported_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &record.import_id,
+                &record.namespace,
+                &record.peer_site_id,
+                &record.snapshot_digest,
+                &sequence,
+                &json,
+                &record.imported_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        for fact in facts {
+            let fact_json = serde_json::to_string(fact)
+                .map_err(|error| format!("encode snapshot fact: {error}"))?;
+            tx.execute(
+                "INSERT INTO sekai_federation_snapshot_facts (import_id, object_id, fact_json)
+                 VALUES ($1, $2, $3)",
+                &[&record.import_id, &fact.object_id, &fact_json],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        for conflict in conflicts {
+            let conflict_json = serde_json::to_string(conflict)
+                .map_err(|error| format!("encode federation conflict: {error}"))?;
+            tx.execute(
+                "INSERT INTO sekai_federation_conflicts
+                    (conflict_id, namespace, object_id, status, record_json, updated_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (conflict_id) DO UPDATE SET
+                    namespace = EXCLUDED.namespace,
+                    object_id = EXCLUDED.object_id,
+                    status = EXCLUDED.status,
+                    record_json = EXCLUDED.record_json,
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[
+                    &conflict.conflict_id,
+                    &conflict.namespace,
+                    &conflict.object_id,
+                    &conflict.status,
+                    &conflict_json,
+                    &conflict.updated_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit()
+            .map_err(|error| format!("commit snapshot import: {error}"))?;
+        Ok(())
+    }
+
+    pub fn get_federation_snapshot_import(
+        &self,
+        import_id: &str,
+    ) -> Result<Option<SnapshotImportRecord>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT record_json FROM sekai_federation_snapshot_imports WHERE import_id = $1",
+                &[&import_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| decode_snapshot_import(&row.get::<_, String>(0)))
+            .transpose()
+    }
+
+    pub fn latest_federation_snapshot_import(
+        &self,
+        peer_site_id: &str,
+        namespace: &str,
+    ) -> Result<Option<SnapshotImportRecord>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT record_json FROM sekai_federation_snapshot_imports
+                 WHERE peer_site_id = $1 AND namespace = $2
+                 ORDER BY sequence DESC, imported_at_ms DESC
+                 LIMIT 1",
+                &[&peer_site_id, &namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| decode_snapshot_import(&row.get::<_, String>(0)))
+            .transpose()
+    }
+
+    pub fn list_federation_snapshot_imports(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<SnapshotImportRecord>, String> {
+        self.connection()?
+            .query(
+                "SELECT record_json FROM sekai_federation_snapshot_imports
+                 WHERE ($1::text IS NULL OR namespace = $1)
+                 ORDER BY imported_at_ms ASC, import_id ASC",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| decode_snapshot_import(&row.get::<_, String>(0)))
+            .collect()
+    }
+
+    pub fn list_federation_snapshot_facts(
+        &self,
+        import_id: &str,
+    ) -> Result<Vec<SnapshotFact>, String> {
+        self.connection()?
+            .query(
+                "SELECT fact_json FROM sekai_federation_snapshot_facts
+                 WHERE import_id = $1
+                 ORDER BY object_id ASC",
+                &[&import_id],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| decode_snapshot_fact(&row.get::<_, String>(0)))
+            .collect()
+    }
 }
 
 fn decode_peer(json: &str) -> Result<FederationPeer, String> {
@@ -398,4 +719,20 @@ fn decode_contract(json: &str) -> Result<NetworkContract, String> {
 
 fn decode_exchange(json: &str) -> Result<NetworkExchange, String> {
     serde_json::from_str(json).map_err(|error| format!("decode federation exchange: {error}"))
+}
+
+fn decode_grant(json: &str) -> Result<PeerNamespaceGrant, String> {
+    serde_json::from_str(json).map_err(|error| format!("decode namespace grant: {error}"))
+}
+
+fn decode_snapshot_import(json: &str) -> Result<SnapshotImportRecord, String> {
+    serde_json::from_str(json).map_err(|error| format!("decode snapshot import: {error}"))
+}
+
+fn decode_snapshot_fact(json: &str) -> Result<SnapshotFact, String> {
+    serde_json::from_str(json).map_err(|error| format!("decode snapshot fact: {error}"))
+}
+
+fn decode_peer_import(json: &str) -> Result<PeerImportRecord, String> {
+    serde_json::from_str(json).map_err(|error| format!("decode peer import: {error}"))
 }

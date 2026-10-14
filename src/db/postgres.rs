@@ -129,6 +129,8 @@ const CHISEI_GUNSHI_ALLOCATION_STATE_SCHEMA: &str =
     include_str!("postgres/0067_chisei_gunshi_allocation_state.sql");
 const FEDERATION_NETWORK_AND_PROFILE_SCHEMA: &str =
     include_str!("postgres/0068_federation_network_and_profile.sql");
+const FEDERATION_SNAPSHOTS_AND_PROVENANCE_SCHEMA: &str =
+    include_str!("postgres/0069_federation_snapshots_and_provenance.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -572,6 +574,12 @@ const MIGRATIONS: &[Migration] = &[
         67,
         "federation_network_and_profile",
         FEDERATION_NETWORK_AND_PROFILE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        68,
+        "federation_snapshots_and_provenance",
+        FEDERATION_SNAPSHOTS_AND_PROVENANCE_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
