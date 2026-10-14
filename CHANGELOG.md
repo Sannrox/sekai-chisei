@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Concurrent Chisei SQLite opens serialize lookup-index backfill with
+  `BEGIN IMMEDIATE`, skip it after `PRAGMA user_version` is set, and create the
+  unique lookup index with `IF NOT EXISTS`, so a second opener no longer fails
+  with `index already exists` (#1394).
+
 - Property `order_by` on object lists extracts the sort value once per matching
   row (SQLite `MATERIALIZED` CTE, PostgreSQL `LATERAL` with `OFFSET 0`) instead
   of repeating JSON extraction in every `ORDER BY` term (#1374).
