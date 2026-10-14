@@ -7494,7 +7494,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::client_package::ClientPackage>, String> {
         match self {
             Self::Sqlite(db) => db.get_client_package(namespace, package_id),
-            Self::Postgres(_) => Err(crate::sekai::client_package::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_client_package(namespace, package_id))
+            }
         }
     }
 
@@ -7504,7 +7506,9 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::client_package::ClientPackage>, String> {
         match self {
             Self::Sqlite(db) => db.list_client_packages(namespace),
-            Self::Postgres(_) => Err(crate::sekai::client_package::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_client_packages(namespace))
+            }
         }
     }
 
@@ -7514,7 +7518,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.commit_client_packages(packages),
-            Self::Postgres(_) => Err(crate::sekai::client_package::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.commit_client_packages(packages))
+            }
         }
     }
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Versioned client packages persist on community PostgreSQL with the same
+  publish, replay, live-identity, and supersede behavior as SQLite (#1477).
+  `admin.client-package` leaves the shrink-only SQLite-only list. Adds
+  PostgreSQL migration `0070_client_packages` (`GATE:mig`, #1477).
+
 - Signed namespace snapshot export/import, peer namespace grants, and imported
   assertion provenance persist on community PostgreSQL with the same sequence,
   upsert, and list behavior as SQLite (#1476). `admin.federation-snapshot`

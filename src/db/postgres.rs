@@ -131,6 +131,7 @@ const FEDERATION_NETWORK_AND_PROFILE_SCHEMA: &str =
     include_str!("postgres/0068_federation_network_and_profile.sql");
 const FEDERATION_SNAPSHOTS_AND_PROVENANCE_SCHEMA: &str =
     include_str!("postgres/0069_federation_snapshots_and_provenance.sql");
+const CLIENT_PACKAGES_SCHEMA: &str = include_str!("postgres/0070_client_packages.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -580,6 +581,12 @@ const MIGRATIONS: &[Migration] = &[
         68,
         "federation_snapshots_and_provenance",
         FEDERATION_SNAPSHOTS_AND_PROVENANCE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        69,
+        "client_packages",
+        CLIENT_PACKAGES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

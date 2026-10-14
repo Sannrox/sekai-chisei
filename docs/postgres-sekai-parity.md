@@ -109,9 +109,10 @@ Query-time ontology entailment stays backend-scoped on `RetrieveContext` /
 [capability catalog](capability-catalog.md)).
 Admin projections on that list still include governed images
 (`sekai.governed-image/v1`; see
-[ADR 0050](decisions/0050-governed-images.md)) and versioned client packages
+[ADR 0050](decisions/0050-governed-images.md)). Versioned client packages
 (`sekai.client-package/v1`; see
-[ADR 0051](decisions/0051-versioned-client-packages.md)).
+[ADR 0051](decisions/0051-versioned-client-packages.md)) persist on community
+PostgreSQL (#1477).
 
 Evidence is checked in as:
 
@@ -143,6 +144,7 @@ Evidence is checked in as:
 | #1481 | Connector certification certify/get/verify/revoke on PostgreSQL |
 | #1475 | Federation network contracts, site/peer tables, conflicts, and revocations |
 | #1476 | Signed namespace snapshots, peer grants, and imported-assertion provenance |
+| #1477 | Versioned client packages |
 
 ## Still outside this parent
 

@@ -12,7 +12,7 @@ pub const SQLITE_ONLY_SURFACES_CONTRACT: &str = "sekai.sqlite-only-surfaces/v1";
 pub const SQLITE_ONLY_SURFACES_JSON: &str =
     include_str!("../tests/fixtures/sqlite_only_surfaces/v1.json");
 pub const RUNTIME_DB_SRC: &str = include_str!("db/runtime_db.rs");
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 25;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -542,6 +542,12 @@ mod tests {
                 && !closed.contains("put_peer_import")
                 && !closed.contains("put_federation_namespace_grant"),
             "dual-backend federation snapshots, grants, and peer-import must not look sqlite-only"
+        );
+        assert!(
+            !closed.contains("get_client_package")
+                && !closed.contains("commit_client_packages")
+                && !closed.contains("list_client_packages"),
+            "dual-backend client packages must not look sqlite-only"
         );
     }
 }
