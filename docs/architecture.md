@@ -399,9 +399,8 @@ mutations, team-namespace bootstrap, principal credentials, coordination and
 work admission, external evidence admission and
 projection, policy attestations, handoffs, retention, scoped content, and
 reconciliation. Known community Postgres fail-closed exceptions include query-time ontology
-entailment, registered Iceberg/Parquet snapshot projections,
+entailment,
 governed documents and renditions,
-governed images, renditions, and annotations,
 and (on the Chisei side)
 online permit redeem and
 `GetEffectivePolicySummary` budget-limit projection — see the parity guides.

@@ -133,6 +133,8 @@ const FEDERATION_SNAPSHOTS_AND_PROVENANCE_SCHEMA: &str =
     include_str!("postgres/0069_federation_snapshots_and_provenance.sql");
 const CLIENT_PACKAGES_SCHEMA: &str = include_str!("postgres/0070_client_packages.sql");
 const CAPABILITY_PACKAGES_SCHEMA: &str = include_str!("postgres/0071_capability_packages.sql");
+const GOVERNED_IMAGES_AND_OPEN_TABLES_SCHEMA: &str =
+    include_str!("postgres/0072_governed_images_and_open_tables.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -594,6 +596,12 @@ const MIGRATIONS: &[Migration] = &[
         70,
         "capability_packages",
         CAPABILITY_PACKAGES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        71,
+        "governed_images_and_open_tables",
+        GOVERNED_IMAGES_AND_OPEN_TABLES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

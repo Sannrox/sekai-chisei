@@ -12,7 +12,7 @@ pub const SQLITE_ONLY_SURFACES_CONTRACT: &str = "sekai.sqlite-only-surfaces/v1";
 pub const SQLITE_ONLY_SURFACES_JSON: &str =
     include_str!("../tests/fixtures/sqlite_only_surfaces/v1.json");
 pub const RUNTIME_DB_SRC: &str = include_str!("db/runtime_db.rs");
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 23;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 21;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -554,6 +554,21 @@ mod tests {
                 && !closed.contains("commit_capability_packages")
                 && !closed.contains("cas_capability_package"),
             "dual-backend capability packages must not look sqlite-only"
+        );
+        assert!(
+            !closed.contains("put_governed_image")
+                && !closed.contains("get_governed_image")
+                && !closed.contains("put_governed_image_rendition")
+                && !closed.contains("tombstone_governed_image")
+                && !closed.contains("put_governed_image_annotation"),
+            "dual-backend governed images must not look sqlite-only"
+        );
+        assert!(
+            !closed.contains("put_open_table_source")
+                && !closed.contains("get_open_table_source")
+                && !closed.contains("put_open_table_snapshot")
+                && !closed.contains("get_open_table_snapshot"),
+            "dual-backend open-table projections must not look sqlite-only"
         );
     }
 }
