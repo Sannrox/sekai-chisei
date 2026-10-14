@@ -182,7 +182,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.EnsureTeamNamespace` | `sekai.team-namespaces, sekai.authorization, sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RecordDecision` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListDecisions` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.ListObjectChanges` | `sekai.audit, sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ListObjectChanges` | `sekai.audit, sekai.graph` | sqlite only | none | `experimental` |
 | `SekaiService.GetAttestation` | `sekai.attestations, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListAttestations` | `sekai.attestations, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.VerifyAttestation` | `sekai.attestations, sekai.audit` | yes | none | `experimental` |
@@ -234,7 +234,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetProvenanceReport` | `sekai.audit, sekai.evidence, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RegisterEvidenceSchema` | `sekai.evidence` | yes | example | `stable` |
 | `SekaiService.ListEvidenceAdapters` | `sekai.evidence` | yes | none | `experimental` |
-| `SekaiService.SubmitEvidence` | `sekai.evidence` | yes | example | `stable` |
+| `SekaiService.SubmitEvidence` | `sekai.evidence` | sqlite only | example | `stable` |
 | `SekaiService.GetEvidenceSubmission` | `sekai.evidence` | yes | none | `experimental` |
 | `SekaiService.ListEvidenceSubmissions` | `sekai.evidence` | yes | none | `experimental` |
 | `SekaiService.CreateHandoff` | `sekai.handoffs` | yes | none | `experimental` |

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The shrink-only SQLite-only list now includes `ListObjectChanges` and
+  `SubmitEvidence`. Community PostgreSQL answers `UNAVAILABLE` for object-change
+  listing and execution-evidence admission before that work, instead of
+  `INTERNAL` after a partial write. Handler evidence methods are an explicit
+  table so a renamed RuntimeDb helper cannot hide a SQLite-only RPC (#1373).
+
 - Experimental `PutServicePrincipal`, `GetServicePrincipal` and
   `DeleteServicePrincipal` register a worker as a service principal with
   allowed Action types and a namespace allowlist, owned by the caller's

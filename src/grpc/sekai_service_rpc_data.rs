@@ -768,6 +768,11 @@ pub(super) async fn list_object_changes(
     let principals = caller_principals(&req);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     require_authenticated(&principals)?;
+    if service.db.runtime().backend_name() == "postgres" {
+        return Err(Status::unavailable(
+            "list_visible_object_changes is unavailable on the PostgreSQL community runtime",
+        ));
+    }
     let inner = req.into_inner();
     check_object_namespace_access(service.db.runtime(), &principals, &inner.object_id, false)?;
     check_read(&service.security, &inner.object_id, &principals)?;
@@ -839,7 +844,7 @@ pub(super) async fn list_object_changes(
             .db
             .runtime()
             .object_change_kind(&inner.object_id)
-            .map_err(Status::internal)?,
+            .map_err(map_runtime_store_error)?,
     };
     let schema = service
         .schema_definitions
@@ -864,7 +869,7 @@ pub(super) async fn list_object_changes(
         .db
         .runtime()
         .list_visible_object_changes(&inner.object_id, inner.limit, inner.offset)
-        .map_err(Status::internal)?
+        .map_err(map_runtime_store_error)?
         .into_iter()
         .map(|change| {
             let mut mapped = if let Some(kind) = object_kind.as_deref() {

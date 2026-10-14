@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 28,
+  "limit": 30,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -52,6 +52,20 @@
       "id": "SekaiService.DeleteOntologyRelation",
       "kind": "rpc",
       "methods": ["delete_ontology_relation_with_audit"]
+    },
+    {
+      "id": "SekaiService.ListObjectChanges",
+      "kind": "rpc",
+      "methods": ["list_visible_object_changes"]
+    },
+    {
+      "id": "SekaiService.SubmitEvidence",
+      "kind": "rpc",
+      "methods": [
+        "validate_execution_evidence_envelope",
+        "reject_evidence_submission",
+        "record_execution_evidence"
+      ]
     },
     {
       "id": "ChiseiService.RedeemExternalActionPermit",

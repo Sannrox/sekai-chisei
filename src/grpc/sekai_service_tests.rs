@@ -3083,6 +3083,29 @@ fn activated_direct_read_error_hides_only_permission_denials() {
 }
 
 #[test]
+fn postgres_object_change_store_maps_to_unavailable() {
+    let status = map_runtime_store_error(
+        "list_visible_object_changes is unavailable on the PostgreSQL community runtime".into(),
+    );
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    let status = map_runtime_store_error("sqlite busy".into());
+    assert_eq!(status.code(), tonic::Code::Internal);
+}
+
+#[test]
+fn postgres_execution_evidence_admission_maps_to_unavailable() {
+    let status =
+        map_evidence_admission_lifecycle_error(EvidenceAdmissionLifecycleError::Admission(
+            "record_execution_evidence is unavailable on the PostgreSQL community runtime".into(),
+        ));
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    let status = map_evidence_admission_lifecycle_error(
+        EvidenceAdmissionLifecycleError::Rejection("invalid_execution_evidence".into()),
+    );
+    assert_eq!(status.code(), tonic::Code::Internal);
+}
+
+#[test]
 fn read_root_hides_denials_and_preserves_outages() {
     assert_eq!(
         hide_read_root_as_missing(Status::permission_denied("access denied")).code(),
