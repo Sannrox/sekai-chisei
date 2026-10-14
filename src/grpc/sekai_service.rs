@@ -59,6 +59,8 @@ mod rpc_leases;
 mod rpc_objects;
 #[path = "sekai_service_rpc_retrieval.rs"]
 mod rpc_retrieval;
+#[path = "sekai_service_rpc_service_principals.rs"]
+mod rpc_service_principals;
 
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -992,6 +994,27 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ReportActionClaimEventRequest>,
     ) -> Result<Response<ReportActionClaimEventResponse>, Status> {
         rpc_actions::report_action_claim_event(self, req).await
+    }
+
+    async fn put_service_principal(
+        &self,
+        req: Request<PutServicePrincipalRequest>,
+    ) -> Result<Response<PutServicePrincipalResponse>, Status> {
+        rpc_service_principals::put_service_principal(self, req).await
+    }
+
+    async fn get_service_principal(
+        &self,
+        req: Request<GetServicePrincipalRequest>,
+    ) -> Result<Response<GetServicePrincipalResponse>, Status> {
+        rpc_service_principals::get_service_principal(self, req).await
+    }
+
+    async fn delete_service_principal(
+        &self,
+        req: Request<DeleteServicePrincipalRequest>,
+    ) -> Result<Response<DeleteServicePrincipalResponse>, Status> {
+        rpc_service_principals::delete_service_principal(self, req).await
     }
 
     async fn set_action_policy(

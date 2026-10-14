@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Experimental `PutServicePrincipal`, `GetServicePrincipal` and
+  `DeleteServicePrincipal` register a worker as a service principal with
+  allowed Action types and a namespace allowlist, owned by the caller's
+  authenticated tenant. The marking ceiling is read from the principal
+  profile's `classification_ceiling`. No secret is stored; issuance and
+  enforcement follow separately. Adds PostgreSQL migration
+  `0066_service_principals` (`GATE:mig`, #1508).
+
 - Experimental `ListPublishedDefinitionRevisions` returns a namespace's published
   definition merge history newest first, with optional member-change filter and
   keyset pagination. Auth matches `GetPublishedDefinitionRevision`. Adds

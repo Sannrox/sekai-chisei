@@ -1632,6 +1632,31 @@ message AckActionWorkResponse {
   bool replay = 3;
 }
 
+// Scope registration of a worker acting as a service principal (#1508,
+// ADR 0099). Holds no credential: tokens come from the identity extension.
+message ServicePrincipal {
+  string principal = 1;
+  // Owning tenant. Must be the caller's authenticated tenant; empty only when
+  // the caller has no tenant authority.
+  string tenant_id = 2;
+  // Namespaces the principal may address. Required, sorted and unique.
+  repeated string namespaces = 3;
+  // Action type ids the principal may run. Required, sorted and unique.
+  repeated string action_types = 4;
+  // Read-only: the principal profile's classification_ceiling, which is the
+  // principal's marking ceiling. Empty when the profile sets none.
+  string classification_ceiling = 5;
+  string registered_by = 6;
+  int64 created_at_ms = 7;
+  int64 updated_at_ms = 8;
+}
+message PutServicePrincipalRequest { ServicePrincipal service_principal = 1; }
+message PutServicePrincipalResponse { ServicePrincipal service_principal = 1; }
+message GetServicePrincipalRequest { string principal = 1; }
+message GetServicePrincipalResponse { ServicePrincipal service_principal = 1; }
+message DeleteServicePrincipalRequest { string principal = 1; }
+message DeleteServicePrincipalResponse { bool deleted = 1; }
+
 message ActionWorkPark {
   string park_id = 1;
   string effect_id = 2;
@@ -2849,6 +2874,9 @@ service SekaiService {
   rpc HeartbeatActionClaim(HeartbeatActionClaimRequest) returns (HeartbeatActionClaimResponse);
   rpc AckActionWork(AckActionWorkRequest) returns (AckActionWorkResponse);
   rpc ReportActionClaimEvent(ReportActionClaimEventRequest) returns (ReportActionClaimEventResponse);
+  rpc PutServicePrincipal(PutServicePrincipalRequest) returns (PutServicePrincipalResponse);
+  rpc GetServicePrincipal(GetServicePrincipalRequest) returns (GetServicePrincipalResponse);
+  rpc DeleteServicePrincipal(DeleteServicePrincipalRequest) returns (DeleteServicePrincipalResponse);
   rpc SetActionPolicy(SetActionPolicyRequest) returns (SetActionPolicyResponse);
   rpc GetActionPolicy(GetActionPolicyRequest) returns (GetActionPolicyResponse);
   rpc ListActionPolicies(ListActionPoliciesRequest) returns (ListActionPoliciesResponse);

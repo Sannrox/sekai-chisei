@@ -565,6 +565,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "HeartbeatActionClaim"
             | "AckActionWork"
             | "ReportActionClaimEvent"
+            | "PutServicePrincipal"
+            | "GetServicePrincipal"
+            | "DeleteServicePrincipal"
             | "PlanExecution"
             | "ExecutePlanStream"
             | "PlanContentExecution"
@@ -1385,6 +1388,9 @@ fn spawn_health_reporter(
 
 #[cfg(test)]
 mod runtime_token_tests;
+
+#[cfg(test)]
+mod service_principal_tests;
 
 #[cfg(test)]
 mod tests {

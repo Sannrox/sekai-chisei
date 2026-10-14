@@ -91,6 +91,20 @@ tenant. Without a signing key or a tenant the fields stay empty, and hosts keep
 using their own credential. Claim RPCs are now available to tenant-scoped
 credentials under the same namespace and tenant checks as other Action RPCs.
 
+## Service principals
+
+Administrators (`root`, `local`, or an admin grant on `service_principals`)
+register a worker as a service principal with `PutServicePrincipal`, read it
+with `GetServicePrincipal`, and remove it with `DeleteServicePrincipal`
+(#1508, ADR 0099). A registration names the allowed Action types and a
+namespace allowlist, and is owned by the caller's authenticated tenant; a
+tenant-less caller can only create tenant-less registrations. Every listed
+namespace must pass the caller's tenant check. The marking ceiling is the
+principal profile's `classification_ceiling`, reported read-only. Built-in
+principals cannot be registered, and registrations never hold a secret: the
+identity extension issues credentials. Token issuance and scope enforcement
+are separate changes.
+
 ## Host responsibilities
 
 1. Authenticate as a principal with team-namespace write on the work namespace.

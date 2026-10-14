@@ -1368,6 +1368,43 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_service_principal(
+        &self,
+        registration: &crate::sekai::service_principal::ServicePrincipalRegistration,
+    ) -> Result<Option<crate::sekai::service_principal::ServicePrincipalRegistration>, String> {
+        match self {
+            Self::Sqlite(db) => db.put_service_principal(registration),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_service_principal(registration))
+            }
+        }
+    }
+
+    pub fn get_service_principal(
+        &self,
+        principal: &str,
+    ) -> Result<Option<crate::sekai::service_principal::ServicePrincipalRegistration>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_service_principal(principal),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_service_principal(principal))
+            }
+        }
+    }
+
+    pub fn delete_service_principal(
+        &self,
+        principal: &str,
+        tenant_id: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.delete_service_principal(principal, tenant_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.delete_service_principal(principal, tenant_id)
+            }),
+        }
+    }
+
     pub fn put_agent_definition_certification(
         &self,
         certification: &crate::sekai::agent_promotion::AgentDefinitionCertification,

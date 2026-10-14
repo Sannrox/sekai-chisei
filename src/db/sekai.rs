@@ -274,6 +274,7 @@ impl SekaiDb {
         self.migrate_audit()?;
         self.migrate_object_sync()?;
         self.migrate_definition_branches()?;
+        self.migrate_service_principals()?;
         self.migrate_object_security()?;
         self.migrate_ledger()?;
         self.migrate_retention()?;
