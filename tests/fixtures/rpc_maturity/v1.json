@@ -1836,7 +1836,7 @@
       "service": "ChiseiService",
       "rpc": "IssueGunshiRecommendations",
       "storage_path": "chisei.learning, chisei.execution",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "remove",
       "product_tier": "experimental"
@@ -1845,7 +1845,7 @@
       "service": "ChiseiService",
       "rpc": "SetGunshiAllocationPolicy",
       "storage_path": "chisei.learning",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "remove",
       "product_tier": "experimental"
@@ -1854,7 +1854,7 @@
       "service": "ChiseiService",
       "rpc": "GetGunshiAllocationStatus",
       "storage_path": "chisei.learning",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "remove",
       "product_tier": "experimental"

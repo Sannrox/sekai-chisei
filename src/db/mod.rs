@@ -94,6 +94,7 @@ mod postgres_governed_subject_provenance;
 mod postgres_governed_transform;
 mod postgres_grants;
 mod postgres_guarded_mutation;
+mod postgres_gunshi;
 mod postgres_handoff;
 mod postgres_kioku;
 mod postgres_lease;

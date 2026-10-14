@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 30,
+  "limit": 27,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -76,21 +76,6 @@
       "id": "ChiseiService.GetEffectivePolicySummary",
       "kind": "rpc",
       "methods": ["budget_limits_for_scope"]
-    },
-    {
-      "id": "ChiseiService.IssueGunshiRecommendations",
-      "kind": "rpc",
-      "methods": ["get_gunshi_allocation_state"]
-    },
-    {
-      "id": "ChiseiService.SetGunshiAllocationPolicy",
-      "kind": "rpc",
-      "methods": ["put_gunshi_allocation_state_cas"]
-    },
-    {
-      "id": "ChiseiService.GetGunshiAllocationStatus",
-      "kind": "rpc",
-      "methods": ["get_gunshi_allocation_state"]
     },
     {
       "id": "admin.warehouse-projection",

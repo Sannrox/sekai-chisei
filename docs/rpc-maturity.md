@@ -276,9 +276,9 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `ChiseiService.GetQualityTrend` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.ListKiokuCandidates` | `chisei.learning` | yes | none | `remove` |
 | `ChiseiService.ReviewKiokuMemory` | `chisei.learning` | yes | none | `remove` |
-| `ChiseiService.IssueGunshiRecommendations` | `chisei.learning, chisei.execution` | sqlite only | none | `remove` |
-| `ChiseiService.SetGunshiAllocationPolicy` | `chisei.learning` | sqlite only | none | `remove` |
-| `ChiseiService.GetGunshiAllocationStatus` | `chisei.learning` | sqlite only | none | `remove` |
+| `ChiseiService.IssueGunshiRecommendations` | `chisei.learning, chisei.execution` | yes | none | `remove` |
+| `ChiseiService.SetGunshiAllocationPolicy` | `chisei.learning` | yes | none | `remove` |
+| `ChiseiService.GetGunshiAllocationStatus` | `chisei.learning` | yes | none | `remove` |
 | `ChiseiService.ClaimGatewayDispatch` | `gateway.governance, chisei.execution` | yes | host | `stable` |
 | `ChiseiService.PutEvaluatorDefinition` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |

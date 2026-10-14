@@ -170,7 +170,9 @@
       "surfaces": [],
       "evidence": [
         "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs"
+        "src/db/chisei.rs",
+        "src/db/postgres_gunshi.rs",
+        "tests/chisei_gunshi_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.learning"
@@ -241,7 +243,9 @@
         "tests/chisei_execution_backend_conformance.rs",
         "src/db/postgres_chisei_receipts.rs",
         "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs"
+        "src/db/postgres_kioku.rs",
+        "src/db/postgres_gunshi.rs",
+        "tests/chisei_gunshi_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.learning",
@@ -618,7 +622,9 @@
       ],
       "evidence": [
         "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs"
+        "src/db/chisei.rs",
+        "src/db/postgres_gunshi.rs",
+        "tests/chisei_gunshi_backend_conformance.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -674,6 +680,7 @@
     "src/db/postgres_eval.rs",
     "src/db/postgres_external_action.rs",
     "src/db/postgres_external_permit.rs",
+    "src/db/postgres_gunshi.rs",
     "src/db/postgres_kioku.rs",
     "src/db/postgres_portfolio.rs",
     "tests/chisei_budget_backend_conformance.rs",
@@ -683,6 +690,7 @@
     "tests/chisei_external_action_backend_conformance.rs",
     "tests/chisei_external_permit_backend_conformance.rs",
     "tests/chisei_gateway_audit_backend_conformance.rs",
+    "tests/chisei_gunshi_backend_conformance.rs",
     "tests/chisei_kioku_backend_conformance.rs",
     "tests/chisei_model_release_evidence_backend_conformance.rs",
     "tests/chisei_model_review_backend_conformance.rs",
@@ -732,7 +740,9 @@
       "surface": "chisei.learning",
       "evidence": [
         "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs"
+        "src/db/postgres_kioku.rs",
+        "tests/chisei_gunshi_backend_conformance.rs",
+        "src/db/postgres_gunshi.rs"
       ],
       "note": "dual-backend harness proven"
     },

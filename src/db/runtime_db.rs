@@ -5258,10 +5258,9 @@ impl RuntimeDb {
     pub fn get_gunshi_allocation_state(&self, namespace: &str) -> Result<Option<String>, String> {
         match self {
             Self::Sqlite(db) => db.get_gunshi_allocation_state(namespace),
-            Self::Postgres(_) => Err(
-                "get_gunshi_allocation_state is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_gunshi_allocation_state(namespace))
+            }
         }
     }
 
@@ -5281,10 +5280,15 @@ impl RuntimeDb {
                 state_json,
                 expected_revision,
             ),
-            Self::Postgres(_) => Err(
-                "put_gunshi_allocation_state_cas is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_gunshi_allocation_state_cas(
+                    namespace,
+                    revision_id,
+                    changed_at_ms,
+                    state_json,
+                    expected_revision,
+                )
+            }),
         }
     }
 

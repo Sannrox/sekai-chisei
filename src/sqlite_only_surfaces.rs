@@ -12,7 +12,7 @@ pub const SQLITE_ONLY_SURFACES_CONTRACT: &str = "sekai.sqlite-only-surfaces/v1";
 pub const SQLITE_ONLY_SURFACES_JSON: &str =
     include_str!("../tests/fixtures/sqlite_only_surfaces/v1.json");
 pub const RUNTIME_DB_SRC: &str = include_str!("db/runtime_db.rs");
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 30;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 27;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -522,6 +522,11 @@ mod tests {
         assert!(
             !closed.contains("put_object_security_policy"),
             "dual-backend object security must not look sqlite-only"
+        );
+        assert!(
+            !closed.contains("get_gunshi_allocation_state")
+                && !closed.contains("put_gunshi_allocation_state_cas"),
+            "dual-backend Gunshi allocation must not look sqlite-only"
         );
     }
 }

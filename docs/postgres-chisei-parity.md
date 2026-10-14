@@ -22,7 +22,7 @@ projections are the shrink-only list
 | `chisei.portfolio` | Proven | `tests/chisei_portfolio_backend_conformance.rs` |
 | `chisei.policy` | Proven (graph objects) | `tests/chisei_policy_backend_conformance.rs` |
 | `chisei.approvals` | Proven for issue/revoke/policy; online redeem SQLite-only | `tests/chisei_external_action_backend_conformance.rs`, `tests/chisei_external_permit_backend_conformance.rs`; list entry `ChiseiService.RedeemExternalActionPermit` |
-| `chisei.learning` | Proven for Kioku lifecycle; Gunshi allocation SQLite-only | `tests/chisei_kioku_backend_conformance.rs`; list entries `ChiseiService.*Gunshi*` |
+| `chisei.learning` | Proven for Kioku lifecycle and Gunshi allocation | `tests/chisei_kioku_backend_conformance.rs`, `tests/chisei_gunshi_backend_conformance.rs` |
 | `chisei.data-quality-rule` | SQLite-only | list entry `admin.data-quality`; see [data-quality-rules.md](data-quality-rules.md) |
 | `chisei.observations` | Proven | eval sample harness |
 | `gateway.governance` | Proven | receipt aliases + gateway audit harness |
@@ -56,9 +56,8 @@ named in
 - Tenant state, OIDC, and OAuth
 - Host-local permit verification crypto (`verify_for_executor`) — never a
   control-plane dual-backend claim
-- Control-plane online redeem, Gunshi allocation, and
-  `GetEffectivePolicySummary` budget-limit projection (see the shrink-only
-  list)
+- Control-plane online redeem and `GetEffectivePolicySummary` budget-limit
+  projection (see the shrink-only list)
 
 ## Operator posture
 
@@ -66,6 +65,5 @@ SQLite remains the default community backend. Combined PostgreSQL opens
 `SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
 A single `DATABASE_URL` is retired and refuses boot. Use that dest-pair for dual-backend budget
 reserve/usage, policy, execution, Kioku, and gateway governance. Prefer SQLite
-when hosts must redeem online permits, read `GetEffectivePolicySummary` budget
-limits, or use Gunshi auto-allocation durability (see
-[configuration.md](configuration.md) and #238).
+when hosts must redeem online permits or read `GetEffectivePolicySummary` budget
+limits (see [configuration.md](configuration.md) and #238).
