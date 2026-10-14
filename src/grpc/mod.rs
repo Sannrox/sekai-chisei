@@ -1446,6 +1446,9 @@ mod runtime_token_tests;
 mod service_principal_tests;
 
 #[cfg(test)]
+mod service_scope_tests;
+
+#[cfg(test)]
 mod service_token_tests;
 
 #[cfg(test)]

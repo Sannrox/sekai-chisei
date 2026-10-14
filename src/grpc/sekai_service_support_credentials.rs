@@ -478,6 +478,43 @@ pub(super) fn enforce_namespace_tenant_context(
     )
 }
 
+/// Live scope registration of a service-principal caller (#1511), or `None`
+/// for any other caller. A service-principal context whose registration is
+/// gone or belongs to another tenant is refused, so enforcement fails closed.
+pub(super) fn service_principal_scope(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Result<Option<crate::sekai::service_principal::ServicePrincipalRegistration>, Status> {
+    let Some(context) = tenant_context
+        .filter(|context| crate::service_token::is_service_principal_context(context))
+    else {
+        return Ok(None);
+    };
+    let tenant_id = context
+        .tenant
+        .as_ref()
+        .map(|tenant| tenant.tenant_id.as_str());
+    db.get_service_principal(&context.principal.subject)
+        .map_err(Status::internal)?
+        .filter(|registration| Some(registration.tenant_id.as_str()) == tenant_id)
+        .map(Some)
+        .ok_or_else(|| Status::permission_denied("service principal registration unavailable"))
+}
+
+/// Refuse a service-principal caller outside its registered Action types.
+pub(super) fn enforce_service_principal_action_type(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    type_id: &str,
+) -> Result<(), Status> {
+    match service_principal_scope(db, tenant_context)? {
+        Some(scope) if !scope.action_types.iter().any(|allowed| allowed == type_id) => Err(
+            Status::permission_denied("action type outside the service principal scope"),
+        ),
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn enforce_namespace_tenant_context_for(
     db: &RuntimeDb,
     tenant_context: Option<&RequestEnterpriseContext>,
@@ -486,6 +523,13 @@ pub(super) fn enforce_namespace_tenant_context_for(
 ) -> Result<(), Status> {
     let write = action == crate::enterprise::NamespaceAction::Write;
     let result = (|| {
+        if service_principal_scope(db, tenant_context)?
+            .is_some_and(|scope| !scope.namespaces.iter().any(|allowed| allowed == namespace))
+        {
+            return Err(Status::permission_denied(
+                "namespace outside the service principal scope",
+            ));
+        }
         if let Some(context) = tenant_context {
             context.authorize_space(action).map_err(extension_status)?;
             context

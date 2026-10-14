@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Service tokens are held to their live service-principal registration:
+  requests outside the namespace allowlist, `SubmitActionInstance` and
+  `ClaimActionWork` outside the registered Action types, and objects above the
+  profile `classification_ceiling` are refused. Runtime tokens from a claim
+  made with a service token stay within the same scope; removing the
+  registration revokes both. Other callers are unaffected (#1511).
+
 - Experimental `IssueServicePrincipalToken` exchanges client credentials for a
   short-lived tenant-bound service token through an identity-extension issuance
   hook (#1510). The plane reuses the #1507 assertion signing key; the
