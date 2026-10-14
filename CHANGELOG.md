@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Capability-package certifications persist on community PostgreSQL with the
+  same certify, replay, supersede, and revoke behavior as SQLite (#1478).
+  `admin.capability-package` leaves the shrink-only SQLite-only list. Adds
+  PostgreSQL migration `0071_capability_packages` (`GATE:mig`, #1478).
+
 - Versioned client packages persist on community PostgreSQL with the same
   publish, replay, live-identity, and supersede behavior as SQLite (#1477).
   `admin.client-package` leaves the shrink-only SQLite-only list. Adds

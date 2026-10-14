@@ -112,7 +112,8 @@ Admin projections on that list still include governed images
 [ADR 0050](decisions/0050-governed-images.md)). Versioned client packages
 (`sekai.client-package/v1`; see
 [ADR 0051](decisions/0051-versioned-client-packages.md)) persist on community
-PostgreSQL (#1477).
+PostgreSQL (#1477). Capability-package certifications persist on community
+PostgreSQL (#1478).
 
 Evidence is checked in as:
 
@@ -145,6 +146,7 @@ Evidence is checked in as:
 | #1475 | Federation network contracts, site/peer tables, conflicts, and revocations |
 | #1476 | Signed namespace snapshots, peer grants, and imported-assertion provenance |
 | #1477 | Versioned client packages |
+| #1478 | Capability-package certifications |
 
 ## Still outside this parent
 

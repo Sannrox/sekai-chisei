@@ -7532,7 +7532,9 @@ impl RuntimeDb {
     {
         match self {
             Self::Sqlite(db) => db.get_capability_package(namespace, certification_id),
-            Self::Postgres(_) => Err(crate::sekai::capability_package::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_capability_package(namespace, certification_id)
+            }),
         }
     }
 
@@ -7542,7 +7544,9 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::capability_package::CapabilityPackageCertification>, String> {
         match self {
             Self::Sqlite(db) => db.list_capability_packages(namespace),
-            Self::Postgres(_) => Err(crate::sekai::capability_package::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_capability_packages(namespace))
+            }
         }
     }
 
@@ -7552,7 +7556,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.commit_capability_packages(packages),
-            Self::Postgres(_) => Err(crate::sekai::capability_package::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.commit_capability_packages(packages))
+            }
         }
     }
 
@@ -7563,7 +7569,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.cas_capability_package(expected, next),
-            Self::Postgres(_) => Err(crate::sekai::capability_package::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.cas_capability_package(expected, next))
+            }
         }
     }
 

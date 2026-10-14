@@ -71,6 +71,7 @@ mod postgres_attestation;
 mod postgres_audit;
 mod postgres_authorization;
 mod postgres_budget;
+mod postgres_capability_package;
 mod postgres_chisei_receipts;
 mod postgres_chisei_reservation;
 mod postgres_client_package;
