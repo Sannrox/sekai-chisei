@@ -208,6 +208,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.PutServicePrincipal` | `sekai.credentials` | yes | none | `experimental` |
 | `SekaiService.GetServicePrincipal` | `sekai.credentials` | yes | none | `experimental` |
 | `SekaiService.DeleteServicePrincipal` | `sekai.credentials` | yes | none | `experimental` |
+| `SekaiService.IssueServicePrincipalToken` | `sekai.credentials` | yes | none | `experimental` |
 | `SekaiService.SetActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListActionPolicies` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |

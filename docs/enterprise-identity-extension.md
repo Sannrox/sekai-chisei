@@ -66,7 +66,17 @@ receipt. A missing planning receipt, action effect, or action instance fails
 closed at apply. The runtime-claim client surfaces the `delegator_*` tokens
 instead of collapsing them to contention or fence loss.
 
+## Service-principal issuance
+
+`issue_service_principal_token` is an optional `v2` method. The default is
+unavailable. Core looks up a tenant-bound service-principal registration
+(#1508) first, then asks the extension to verify client credentials it owns.
+A successful grant is a service identity, never a user identity. Core signs
+and verifies the resulting token with the plane assertion key (#1507 / #1510).
+Implementations must not log or persist `client_secret`.
+
 ## Discovery metadata
+
 
 The contract can describe RFC 8414 authorization-server metadata and RFC 9728
 protected-resource metadata. It deliberately does not register corresponding

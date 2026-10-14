@@ -1222,6 +1222,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "IssueServicePrincipalToken",
+      "storage_path": "sekai.credentials",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "SetActionPolicy",
       "storage_path": "sekai.action-definitions, sekai.audit",
       "real_backend": "yes",

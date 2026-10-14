@@ -1657,6 +1657,18 @@ message GetServicePrincipalResponse { ServicePrincipal service_principal = 1; }
 message DeleteServicePrincipalRequest { string principal = 1; }
 message DeleteServicePrincipalResponse { bool deleted = 1; }
 
+// Client-credentials issuance for a registered service principal (#1510).
+// The identity extension verifies the secret; this plane signs the token
+// with the #1507 assertion key. client_secret is never logged or stored.
+message IssueServicePrincipalTokenRequest {
+  string principal = 1;
+  string client_secret = 2;
+}
+message IssueServicePrincipalTokenResponse {
+  string token = 1;
+  int64 expires_at_ms = 2;
+}
+
 message ActionWorkPark {
   string park_id = 1;
   string effect_id = 2;
@@ -2877,6 +2889,7 @@ service SekaiService {
   rpc PutServicePrincipal(PutServicePrincipalRequest) returns (PutServicePrincipalResponse);
   rpc GetServicePrincipal(GetServicePrincipalRequest) returns (GetServicePrincipalResponse);
   rpc DeleteServicePrincipal(DeleteServicePrincipalRequest) returns (DeleteServicePrincipalResponse);
+  rpc IssueServicePrincipalToken(IssueServicePrincipalTokenRequest) returns (IssueServicePrincipalTokenResponse);
   rpc SetActionPolicy(SetActionPolicyRequest) returns (SetActionPolicyResponse);
   rpc GetActionPolicy(GetActionPolicyRequest) returns (GetActionPolicyResponse);
   rpc ListActionPolicies(ListActionPoliciesRequest) returns (ListActionPoliciesResponse);

@@ -1759,6 +1759,20 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "IssueServicePrincipalToken",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.credentials"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_rpc_service_principals.rs",
+        "src/service_token.rs",
+        "src/grpc/service_token_tests.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "SetActionPolicy",
       "kind": "persistent",
       "surfaces": [

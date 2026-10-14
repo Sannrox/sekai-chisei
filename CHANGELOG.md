@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Experimental `IssueServicePrincipalToken` exchanges client credentials for a
+  short-lived tenant-bound service token through an identity-extension issuance
+  hook (#1510). The plane reuses the #1507 assertion signing key; the
+  authentication boundary admits the token as the registered service principal
+  (a machine identity, never a user). Refused without an extension, for an
+  unregistered principal, for invalid credentials, or once expired. Additive
+  experimental RPC; no existing field changes.
+
 - Concurrent Chisei SQLite opens serialize lookup-index backfill with
   `BEGIN IMMEDIATE`, skip it after `PRAGMA user_version` is set, and create the
   unique lookup index with `IF NOT EXISTS`, so a second opener no longer fails
