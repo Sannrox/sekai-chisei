@@ -256,9 +256,31 @@ pub(super) fn to_proto_evidence_submission_result(
             .is_some_and(|projection| projection.projected),
     }
 }
+fn postgres_community_unavailable(error: &str) -> bool {
+    error.contains("unavailable on the PostgreSQL community runtime")
+}
+
+pub(super) fn map_runtime_store_error(error: String) -> Status {
+    if postgres_community_unavailable(&error) {
+        Status::unavailable(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
 pub(super) fn map_evidence_admission_lifecycle_error(
     error: EvidenceAdmissionLifecycleError,
 ) -> Status {
+    let inner = match &error {
+        EvidenceAdmissionLifecycleError::Admission(error)
+        | EvidenceAdmissionLifecycleError::Rejection(error)
+        | EvidenceAdmissionLifecycleError::Projection(error)
+        | EvidenceAdmissionLifecycleError::ExecutionRecording(error)
+        | EvidenceAdmissionLifecycleError::ResultResolution(error) => error.as_str(),
+    };
+    if postgres_community_unavailable(inner) {
+        return Status::unavailable(inner.to_string());
+    }
     match error {
         EvidenceAdmissionLifecycleError::Admission(_) => {
             Status::internal("evidence admission failed")

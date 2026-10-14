@@ -100,6 +100,8 @@ create a scratch database on.
 treat inventory “complete” as dual-backend for these RPCs) live in the
 shrink-only list
 [`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
+Execution-evidence reject and record helpers used by evidence admission stay
+SQLite-only until #1318 (`SekaiService.SubmitEvidence` on that list).
 Query-time ontology entailment stays backend-scoped on `RetrieveContext` /
 `ExpandRelations` (asserted-only on PostgreSQL; see
 [rpc-maturity.md](rpc-maturity.md),

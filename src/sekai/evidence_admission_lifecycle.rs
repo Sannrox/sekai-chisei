@@ -44,6 +44,13 @@ impl<'a> EvidenceAdmissionLifecycle<'a> {
         authenticated_producer: &str,
         now_ms: i64,
     ) -> Result<EvidenceAdmissionOutcome, EvidenceAdmissionLifecycleError> {
+        if envelope.evidence_type == EXECUTION_EVIDENCE_TYPE && self.db.backend_name() == "postgres"
+        {
+            return Err(EvidenceAdmissionLifecycleError::Admission(
+                "record_execution_evidence is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ));
+        }
         let mut admission = self
             .db
             .submit_evidence(envelope, authenticated_producer, now_ms)
