@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Federation network contracts, site/peer profile tables, governed conflicts,
+  and revocations persist on community PostgreSQL with the same install, CAS,
+  and list behavior as SQLite (#1475). `admin.federation-network` leaves the
+  shrink-only SQLite-only list. Namespace snapshots, grants, and peer-import
+  provenance stay SQLite-only until #1476. Adds PostgreSQL migration
+  `0068_federation_network_and_profile` (`GATE:mig`, #1475).
+
 - Gunshi allocation state (`IssueGunshiRecommendations`,
   `SetGunshiAllocationPolicy`, `GetGunshiAllocationStatus`) persists on
   community PostgreSQL with the same CAS install/update behavior as SQLite

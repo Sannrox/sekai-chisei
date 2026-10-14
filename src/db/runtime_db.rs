@@ -6527,10 +6527,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_federation_local_site(site),
-            Self::Postgres(_) => Err(
-                "put_federation_local_site is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_federation_local_site(site))
+            }
         }
     }
 
@@ -6539,10 +6538,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::federation_profile::LocalSiteIdentity>, String> {
         match self {
             Self::Sqlite(db) => db.get_federation_local_site(),
-            Self::Postgres(_) => Err(
-                "get_federation_local_site is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_federation_local_site())
+            }
         }
     }
 
@@ -6552,9 +6550,7 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_federation_peer(peer),
-            Self::Postgres(_) => {
-                Err("put_federation_peer is unavailable on the PostgreSQL community runtime".into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.put_federation_peer(peer)),
         }
     }
 
@@ -6564,8 +6560,8 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::federation_profile::FederationPeer>, String> {
         match self {
             Self::Sqlite(db) => db.get_federation_peer(peer_site_id),
-            Self::Postgres(_) => {
-                Err("get_federation_peer is unavailable on the PostgreSQL community runtime".into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_federation_peer(peer_site_id))
             }
         }
     }
@@ -6575,9 +6571,7 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::federation_profile::FederationPeer>, String> {
         match self {
             Self::Sqlite(db) => db.list_federation_peers(),
-            Self::Postgres(_) => Err(
-                "list_federation_peers is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.list_federation_peers()),
         }
     }
 
@@ -6718,8 +6712,8 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_federation_conflict(record),
-            Self::Postgres(_) => {
-                Err(crate::sekai::federation_conflict::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_federation_conflict(record))
             }
         }
     }
@@ -6730,8 +6724,8 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::federation_conflict::FederationConflict>, String> {
         match self {
             Self::Sqlite(db) => db.get_federation_conflict(conflict_id),
-            Self::Postgres(_) => {
-                Err(crate::sekai::federation_conflict::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_federation_conflict(conflict_id))
             }
         }
     }
@@ -6742,8 +6736,8 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::federation_conflict::FederationConflict>, String> {
         match self {
             Self::Sqlite(db) => db.list_federation_conflicts(namespace),
-            Self::Postgres(_) => {
-                Err(crate::sekai::federation_conflict::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_federation_conflicts(namespace))
             }
         }
     }
@@ -6754,8 +6748,8 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_federation_revocation(record),
-            Self::Postgres(_) => {
-                Err(crate::sekai::federation_revocation::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_federation_revocation(record))
             }
         }
     }
@@ -6767,7 +6761,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::federation_network::NetworkContract>, String> {
         match self {
             Self::Sqlite(db) => db.get_network_contract(namespace, contract_id),
-            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_network_contract(namespace, contract_id))
+            }
         }
     }
 
@@ -6777,7 +6773,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_network_contract(contract),
-            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_network_contract(contract))
+            }
         }
     }
 
@@ -6788,7 +6786,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.cas_network_contract(expected, next),
-            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.cas_network_contract(expected, next))
+            }
         }
     }
 
@@ -6800,7 +6800,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::federation_network::NetworkExchange>, String> {
         match self {
             Self::Sqlite(db) => db.get_network_exchange(namespace, contract_id, exchange_id),
-            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_network_exchange(namespace, contract_id, exchange_id)
+            }),
         }
     }
 
@@ -6810,7 +6812,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_network_exchange(item),
-            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_network_exchange(item))
+            }
         }
     }
 
@@ -7070,8 +7074,8 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::federation_revocation::FederationRevocation>, String> {
         match self {
             Self::Sqlite(db) => db.get_federation_revocation(revocation_id),
-            Self::Postgres(_) => {
-                Err(crate::sekai::federation_revocation::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_federation_revocation(revocation_id))
             }
         }
     }
@@ -7082,8 +7086,8 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::federation_revocation::FederationRevocation>, String> {
         match self {
             Self::Sqlite(db) => db.list_federation_revocations(subject_kind),
-            Self::Postgres(_) => {
-                Err(crate::sekai::federation_revocation::POSTGRES_UNAVAILABLE.into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_federation_revocations(subject_kind))
             }
         }
     }

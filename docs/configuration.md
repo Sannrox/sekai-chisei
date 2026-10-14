@@ -115,7 +115,7 @@ the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts Combine
 capabilities validate. Some public paths remain SQLite-only and fail
 closed on community Postgres (query-time ontology
 entailment, dataset row append/query through `RuntimeDb`, online permit
-redeem/reconcile, federation peer tables, and
+redeem/reconcile, and
 `GetEffectivePolicySummary` budget-limit projection). See
 [postgres-sekai-parity.md](postgres-sekai-parity.md) and
 [postgres-chisei-parity.md](postgres-chisei-parity.md). Backend selection does

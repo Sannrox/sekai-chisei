@@ -88,6 +88,7 @@ mod postgres_event_stream;
 mod postgres_evidence;
 mod postgres_external_action;
 mod postgres_external_permit;
+mod postgres_federation;
 mod postgres_function;
 mod postgres_governed_action_type;
 mod postgres_governed_subject_provenance;

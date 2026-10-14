@@ -127,6 +127,8 @@ const DEFINITION_PROPOSAL_MERGED_HISTORY_SCHEMA: &str =
 const SERVICE_PRINCIPALS_SCHEMA: &str = include_str!("postgres/0066_service_principals.sql");
 const CHISEI_GUNSHI_ALLOCATION_STATE_SCHEMA: &str =
     include_str!("postgres/0067_chisei_gunshi_allocation_state.sql");
+const FEDERATION_NETWORK_AND_PROFILE_SCHEMA: &str =
+    include_str!("postgres/0068_federation_network_and_profile.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -565,6 +567,12 @@ const MIGRATIONS: &[Migration] = &[
         "chisei_gunshi_allocation_state",
         CHISEI_GUNSHI_ALLOCATION_STATE_SCHEMA,
         MigrationOwner::Chisei,
+    ),
+    mig(
+        67,
+        "federation_network_and_profile",
+        FEDERATION_NETWORK_AND_PROFILE_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 
