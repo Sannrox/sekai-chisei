@@ -32,6 +32,7 @@ mod chisei_portfolio_backend_conformance;
 mod chisei_postgres_inventory_conformance;
 mod chisei_routing_profile_backend_conformance;
 mod client_package_adr;
+mod client_package_backend_conformance;
 mod combined_boot_operator_docs;
 mod combined_two_store;
 mod compatibility_matrix;
@@ -189,6 +190,7 @@ const GROUPED_MODULES: &[&str] = &[
     "chisei_postgres_inventory_conformance",
     "chisei_routing_profile_backend_conformance",
     "client_package_adr",
+    "client_package_backend_conformance",
     "combined_boot_operator_docs",
     "combined_two_store",
     "compatibility_matrix",
@@ -392,6 +394,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 128);
+    assert_eq!(GROUPED_MODULES.len(), 129);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

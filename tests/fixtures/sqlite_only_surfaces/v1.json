@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 25,
+  "limit": 24,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -101,11 +101,6 @@
       "id": "admin.capability-package",
       "kind": "admin",
       "methods": ["get_capability_package", "commit_capability_packages"]
-    },
-    {
-      "id": "admin.client-package",
-      "kind": "admin",
-      "methods": ["get_client_package", "commit_client_packages"]
     },
     {
       "id": "admin.governed-image",
