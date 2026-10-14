@@ -34,7 +34,7 @@ template.
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, the gateway, and the Chisei→Sekai hop; never bootstraps server authority |
 | `SEKAI_ASSERTION_ISSUER` | unset | Audience-bound assertion issuer (#888). All three assertion variables must be set together; partial config is refused |
 | `SEKAI_ASSERTION_AUDIENCE` | unset | Audience-bound assertion audience |
-| `SEKAI_ASSERTION_HMAC_KEY` | unset | HMAC key for audience-bound assertions; treat as a secret |
+| `SEKAI_ASSERTION_HMAC_KEY` | unset | HMAC key for audience-bound assertions and Action work runtime tokens; treat as a secret |
 | `SEKAI_MCP_PRINCIPAL` | unset | Authenticated principal for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_NAMESPACE` | unset | Canonical namespace for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for the `sekai-mcp` stdio host. HTTP MCP is `POST /mcp` on `SEKAI_HTTP_PORT`. MCP Preview that may fill uses `LLM_HTTP_REQUEST_TIMEOUT_SECS` (default 120s), not a hard 5s deadline; Submit stays at 5s. |

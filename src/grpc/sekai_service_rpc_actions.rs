@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime_token::{ClaimBinding, RuntimeTokenClaims};
 
 pub(super) async fn put_governed_action_type(
     service: &SekaiServiceImpl,
@@ -898,12 +899,78 @@ pub(super) async fn list_claimable_action_work(
     }
     Ok(Response::new(ListClaimableActionWorkResponse { effects }))
 }
+/// Runtime token for a granted claim (#1507), or empty with zero expiry when
+/// the plane has no signing key or the caller has no tenant.
+fn runtime_token_for(
+    service: &SekaiServiceImpl,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    effect: &crate::sekai::action_effect::ActionEffect,
+    now_ms: i64,
+) -> Result<(String, i64), Status> {
+    let (Some(authority), Some(context)) =
+        (service.runtime_token_authority.as_deref(), tenant_context)
+    else {
+        return Ok((String::new(), 0));
+    };
+    if effect.claim_owner.is_empty() || effect.claim_expires_at_ms <= now_ms {
+        return Ok((String::new(), 0));
+    }
+    let binding = ClaimBinding {
+        namespace: &effect.namespace,
+        effect_id: &effect.effect_id,
+        runtime_id: &effect.claim_owner,
+        claim_generation: effect.claim_generation,
+        claim_expires_at_ms: effect.claim_expires_at_ms,
+    };
+    let Some(claims) = RuntimeTokenClaims::for_claim(authority, context, binding, now_ms) else {
+        return Ok((String::new(), 0));
+    };
+    let token = claims.sign(authority).map_err(Status::internal)?;
+    Ok((token, claims.expires_at_ms))
+}
+
+/// Authorize a follow-up call on claimed work: a runtime token must cover
+/// this exact claim, and the caller needs namespace write under its tenant.
+fn authorize_claimed_work_call(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    runtime_token: Option<&RuntimeTokenClaims>,
+    effect: &crate::sekai::action_effect::ActionEffect,
+    runtime_id: &str,
+    claim_generation: u64,
+) -> Result<(), Status> {
+    // Bind to the stored claim too, so a token for an earlier generation
+    // cannot reach replay paths that return a newer claim's fence.
+    if runtime_token.is_some_and(|claims| {
+        claims.claim_generation != effect.claim_generation
+            || !claims.covers(
+                &effect.namespace,
+                &effect.effect_id,
+                runtime_id,
+                claim_generation,
+            )
+    }) {
+        return Err(Status::permission_denied(
+            "runtime token does not cover this claim",
+        ));
+    }
+    check_team_namespace(service.db.runtime(), principals, &effect.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context,
+        &effect.namespace,
+        true,
+    )
+}
+
 pub(super) async fn claim_action_work(
     service: &SekaiServiceImpl,
     req: Request<ClaimActionWorkRequest>,
 ) -> Result<Response<ClaimActionWorkResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     if inner.effect_id.trim().is_empty() {
         return Err(Status::invalid_argument("effect_id required"));
@@ -922,7 +989,14 @@ pub(super) async fn claim_action_work(
         .ok_or_else(|| Status::not_found("action effect not found"))?;
     // Claim requires namespace write so only authorized hosts can take work.
     check_team_namespace(service.db.runtime(), &principals, &existing.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &existing.namespace,
+        true,
+    )?;
     let actor = principals.first().cloned().unwrap_or_default();
+    let now = now_millis();
     let claimed = ActionWorkLifecycle::new(service.db.runtime())
         .claim(
             ClaimActionWorkCommand {
@@ -932,9 +1006,11 @@ pub(super) async fn claim_action_work(
                 ttl_ms: inner.ttl_ms,
             },
             &actor,
-            now_millis(),
+            now,
         )
         .map_err(action_work_lifecycle_status)?;
+    let (runtime_token, runtime_token_expires_at_ms) =
+        runtime_token_for(service, tenant_context.as_ref(), &claimed.effect, now)?;
     Ok(Response::new(ClaimActionWorkResponse {
         effect: Some(to_proto_action_effect(&claimed.effect)),
         continuation: claimed
@@ -942,6 +1018,8 @@ pub(super) async fn claim_action_work(
             .as_ref()
             .map(to_proto_action_work_continuation),
         park: claimed.park.as_ref().map(to_proto_action_work_park),
+        runtime_token,
+        runtime_token_expires_at_ms,
     }))
 }
 pub(super) async fn heartbeat_action_claim(
@@ -950,6 +1028,8 @@ pub(super) async fn heartbeat_action_claim(
 ) -> Result<Response<HeartbeatActionClaimResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let runtime_token = req.extensions().get::<RuntimeTokenClaims>().cloned();
     let inner = req.into_inner();
     let existing = service
         .db
@@ -957,8 +1037,17 @@ pub(super) async fn heartbeat_action_claim(
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
-    check_team_namespace(service.db.runtime(), &principals, &existing.namespace, true)?;
+    authorize_claimed_work_call(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        runtime_token.as_ref(),
+        &existing,
+        &inner.runtime_id,
+        inner.claim_generation,
+    )?;
     let actor = principals.first().cloned().unwrap_or_default();
+    let now = now_millis();
     let stored = ActionWorkLifecycle::new(service.db.runtime())
         .heartbeat(
             HeartbeatActionClaimCommand {
@@ -969,11 +1058,15 @@ pub(super) async fn heartbeat_action_claim(
                 ttl_ms: inner.ttl_ms,
             },
             &actor,
-            now_millis(),
+            now,
         )
         .map_err(action_work_lifecycle_status)?;
+    let (runtime_token, runtime_token_expires_at_ms) =
+        runtime_token_for(service, tenant_context.as_ref(), &stored, now)?;
     Ok(Response::new(HeartbeatActionClaimResponse {
         effect: Some(to_proto_action_effect(&stored)),
+        runtime_token,
+        runtime_token_expires_at_ms,
     }))
 }
 pub(super) async fn ack_action_work(
@@ -982,6 +1075,8 @@ pub(super) async fn ack_action_work(
 ) -> Result<Response<AckActionWorkResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let runtime_token = req.extensions().get::<RuntimeTokenClaims>().cloned();
     let inner = req.into_inner();
     let existing = service
         .db
@@ -989,7 +1084,15 @@ pub(super) async fn ack_action_work(
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
-    check_team_namespace(service.db.runtime(), &principals, &existing.namespace, true)?;
+    authorize_claimed_work_call(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        runtime_token.as_ref(),
+        &existing,
+        &inner.runtime_id,
+        inner.claim_generation,
+    )?;
     let now = now_millis();
     let actor = principals.first().cloned().unwrap_or_default();
     let acked = ActionWorkLifecycle::new(service.db.runtime())
@@ -1023,6 +1126,8 @@ pub(super) async fn report_action_claim_event(
 ) -> Result<Response<ReportActionClaimEventResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let runtime_token = req.extensions().get::<RuntimeTokenClaims>().cloned();
     let inner = req.into_inner();
     let effect = service
         .db
@@ -1030,7 +1135,15 @@ pub(super) async fn report_action_claim_event(
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
-    check_team_namespace(service.db.runtime(), &principals, &effect.namespace, true)?;
+    authorize_claimed_work_call(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        runtime_token.as_ref(),
+        &effect,
+        &inner.runtime_id,
+        inner.claim_generation,
+    )?;
     let actor = principals.first().cloned().unwrap_or_default();
     let replay = ActionWorkLifecycle::new(service.db.runtime())
         .report_event(

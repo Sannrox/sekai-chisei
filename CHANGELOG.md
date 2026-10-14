@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `ClaimActionWork` returns a short-lived runtime token bound to the claiming
+  principal, tenant, namespace, effect, runtime and claim generation when an
+  assertion signing key is configured and the caller has a tenant;
+  `HeartbeatActionClaim` refreshes it. The token authenticates only the
+  heartbeat, ack and claim-event calls for that claim and expires no later
+  than the claim. New response fields are additive; workers without a token
+  keep using their credential. Claim RPCs now accept tenant-scoped
+  credentials under the usual namespace and tenant checks (#1507).
+
 - Merging a definition proposal that changes an agent-definition member
   requires a current, non-revoked, baseline-passing certification bound to
   the candidate revision (ADR 0079). Missing, stale, failed, or revoked
