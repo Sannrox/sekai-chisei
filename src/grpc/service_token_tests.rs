@@ -233,3 +233,14 @@ async fn expired_token_is_refused() {
     let status = authenticate(&plane, &token, "GetObject").unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
+
+#[test]
+fn issue_rpc_is_admitted_without_a_bearer() {
+    let plane = plane(true);
+    let mut request = Request::new(());
+    request.extensions_mut().insert(tonic::GrpcMethod::new(
+        "sekai.SekaiService",
+        "IssueServicePrincipalToken",
+    ));
+    assert!(plane.interceptor.clone().call(request).is_ok());
+}
