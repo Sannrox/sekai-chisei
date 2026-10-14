@@ -475,6 +475,7 @@ impl PostgresDb {
             .get(0);
 
         let direction = if filter.descending { "DESC" } else { "ASC" };
+        let mut from_sql = "sekai_objects o".to_string();
         let order_expression = match filter.order_by.as_str() {
             "" => "o.id ASC".to_string(),
             "created" => format!("o.created {direction}, o.id ASC"),
@@ -486,8 +487,15 @@ impl PostgresDb {
                     return Err("invalid property order key".into());
                 }
                 params.push(Box::new(key.to_string()));
-                let value = postgres_stored_property_text(&format!("${}", params.len()));
-                let numeric = postgres_numeric_predicate(&value);
+                let key_sql = format!("${}", params.len());
+                // OFFSET 0 is an optimization barrier: sekai_jsonb_object is
+                // IMMUTABLE, so without it the planner inlines the extract into
+                // every ORDER BY term and the LATERAL does not extract once.
+                from_sql = format!(
+                    "sekai_objects o CROSS JOIN LATERAL (SELECT sekai_jsonb_object(o.properties) ->> {key_sql} AS sort_v OFFSET 0) sort_key"
+                );
+                let value = "sort_key.sort_v";
+                let numeric = postgres_numeric_predicate(value);
                 format!(
                     "CASE WHEN {value} IS NULL THEN 1 ELSE 0 END,
                      CASE WHEN {numeric} THEN 0 ELSE 1 END,
@@ -518,7 +526,7 @@ impl PostgresDb {
         let rows = transaction
             .query(
                 &format!(
-                    "SELECT {OBJECT_COLUMNS} FROM sekai_objects o{where_sql}
+                    "SELECT {OBJECT_COLUMNS} FROM {from_sql}{where_sql}
                      ORDER BY {order_expression}
                      LIMIT {limit_parameter} OFFSET {offset_parameter}"
                 ),

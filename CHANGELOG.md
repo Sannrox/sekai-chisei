@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Property `order_by` on object lists extracts the sort value once per matching
+  row (SQLite `MATERIALIZED` CTE, PostgreSQL `LATERAL` with `OFFSET 0`) instead
+  of repeating JSON extraction in every `ORDER BY` term (#1374).
+
 - The shrink-only SQLite-only list now includes `ListObjectChanges` and
   `SubmitEvidence`. Community PostgreSQL answers `UNAVAILABLE` for object-change
   listing and execution-evidence admission before that work, instead of
