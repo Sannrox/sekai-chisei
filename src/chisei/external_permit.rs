@@ -1303,6 +1303,42 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_chisei_sqlite_opens_do_not_race_on_lookup_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-open.db");
+        let path = path.to_str().unwrap().to_string();
+        drop(ChiseiStore::open_sqlite(&path));
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let path = path.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let opened = std::panic::catch_unwind(|| ChiseiStore::open_sqlite(&path));
+                let _ = tx.send(opened.map(|_| ()));
+            });
+        }
+        drop(tx);
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            results.push(
+                rx.recv_timeout(Duration::from_secs(30))
+                    .expect("concurrent open did not finish within 30s"),
+            );
+        }
+        assert!(
+            results.iter().all(|result| result.is_ok()),
+            "concurrent opens failed: {results:?}"
+        );
+    }
+
+    #[test]
     fn concurrent_replicas_cannot_exceed_the_permit_envelope() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replica.db");
@@ -1312,16 +1348,18 @@ mod tests {
         persist_authorization(&db, &record);
         db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         drop(db);
+        let stores = [
+            ChiseiStore::open_sqlite(path.to_str().unwrap()),
+            ChiseiStore::open_sqlite(path.to_str().unwrap()),
+        ];
         let barrier = Arc::new(Barrier::new(2));
         let (tx, rx) = mpsc::channel();
-        for ordinal in 0..2 {
+        for (ordinal, db) in stores.into_iter().enumerate() {
             let barrier = barrier.clone();
-            let path = path.clone();
             let permit = permit.clone();
             let key = key.clone();
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
                 barrier.wait();
                 let result = db.redeem_permit(
                     &permit,

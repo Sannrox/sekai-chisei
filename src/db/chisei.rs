@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::sekai::SekaiDb;
 use crate::chisei::{
@@ -42,6 +42,8 @@ fn outcome_evidence(event: &OperationReceiptEvent) -> Result<Option<(&str, f64, 
         .map_err(|_| "outcome evidence passed flag must be boolean".to_string())?;
     Ok(Some((metric, value, passed)))
 }
+
+const CHISEI_LOOKUP_INDEX_BACKFILL_VERSION: i64 = 1;
 
 impl SekaiDb {
     /// Per-store receipt table, including Combined Split admission receipts
@@ -95,7 +97,7 @@ impl SekaiDb {
     }
 
     pub(crate) fn migrate_chisei(&self) -> Result<(), String> {
-        let conn = self.conn();
+        let mut conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chisei_eval_suites (
                 id TEXT PRIMARY KEY,
@@ -208,7 +210,14 @@ impl SekaiDb {
                 Err(err) => return Err(err.to_string()),
             }
         }
-        conn.execute_batch(
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let schema_version: i64 = tx
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if schema_version < CHISEI_LOOKUP_INDEX_BACKFILL_VERSION {
+            tx.execute_batch(
             r#"WITH candidates AS (
                SELECT receipts.operation_id,
                       json_extract(
@@ -307,7 +316,7 @@ impl SekaiDb {
                AND instr(substr(request_id, 8), ':') > 1;
              CREATE UNIQUE INDEX IF NOT EXISTS idx_chisei_operation_receipts_request
                ON chisei_operation_receipts(request_id) WHERE request_id IS NOT NULL;
-             CREATE UNIQUE INDEX idx_chisei_operation_receipts_lookup
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_chisei_operation_receipts_lookup
                ON chisei_operation_receipts(caller_scope, lookup_request_id)
                WHERE caller_scope IS NOT NULL AND lookup_request_id IS NOT NULL;
              INSERT OR IGNORE INTO chisei_gateway_request_aliases(
@@ -335,8 +344,18 @@ impl SekaiDb {
                         AND json_extract(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.attributes.lookup_request_id') != ''
                       LIMIT 1)
                    ) IS NOT NULL;"#,
+            )
+            .map_err(|error| error.to_string())?;
+            tx.pragma_update(None, "user_version", CHISEI_LOOKUP_INDEX_BACKFILL_VERSION)
+                .map_err(|error| error.to_string())?;
+        }
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chisei_operation_receipts_lookup
+               ON chisei_operation_receipts(caller_scope, lookup_request_id)
+               WHERE caller_scope IS NOT NULL AND lookup_request_id IS NOT NULL;",
         )
         .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         match conn.execute(
             "ALTER TABLE chisei_eval_iterations ADD COLUMN namespace TEXT NOT NULL DEFAULT ''",
             [],
@@ -2077,6 +2096,7 @@ mod tests {
             )
             .unwrap();
 
+        db.conn().pragma_update(None, "user_version", 0).unwrap();
         db.migrate_chisei().unwrap();
         assert!(
             db.find_operation_receipt_by_request_id("missing")
@@ -2097,6 +2117,7 @@ mod tests {
                    WHERE caller_scope IS NOT NULL AND lookup_request_id IS NOT NULL;",
             )
             .unwrap();
+        db.conn().pragma_update(None, "user_version", 0).unwrap();
         db.migrate_chisei().unwrap();
         let aliases: i64 = db
             .conn()
@@ -2135,6 +2156,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        db.conn().pragma_update(None, "user_version", 0).unwrap();
         db.migrate_chisei().unwrap();
         let retired: i64 = db
             .conn()
@@ -2155,6 +2177,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        db.conn().pragma_update(None, "user_version", 0).unwrap();
         db.migrate_chisei().unwrap();
         let retired: i64 = db
             .conn()

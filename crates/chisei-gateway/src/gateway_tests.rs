@@ -1207,6 +1207,7 @@ fn gateway_success_receipt_uses_canonical_complete_shape() {
     receipt_db
         .gateway_test_execute_batch(
             "DROP INDEX idx_chisei_operation_receipts_lookup;
+             PRAGMA user_version=0;
              UPDATE chisei_operation_receipts
              SET caller_scope=NULL, request_id='chisei:scope-a:legacy', updated_at=999
              WHERE operation_id='other-scope-operation';",
