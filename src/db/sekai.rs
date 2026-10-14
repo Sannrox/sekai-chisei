@@ -1081,11 +1081,6 @@ impl SekaiDb {
     ) -> Result<Vec<Object>, String> {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
         let kind_exclusion = crate::domain::excluded_kinds_sql("kind", excluded_kinds)?;
-        let order_sql = build_order_by_sql(
-            filter.order_by.as_str(),
-            filter.descending,
-            &mut query.params,
-        )?;
         let effective_limit = if filter.limit == i32::MAX {
             i32::MAX
         } else if filter.limit <= 0 {
@@ -1093,13 +1088,12 @@ impl SekaiDb {
         } else {
             filter.limit.min(MAX_LIST_LIMIT)
         };
-        let mut sql = format!(
-            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}",
-            query.where_sql, kind_exclusion
-        );
-        if let Some(order_sql) = order_sql.as_deref() {
-            sql.push_str(order_sql);
-        }
+        let mut sql = list_objects_select_sql(
+            &format!("FROM sekai_objects{}{}", query.where_sql, kind_exclusion),
+            filter.order_by.as_str(),
+            filter.descending,
+            &mut query.params,
+        )?;
         sql.push_str(&format!(
             " LIMIT ?{} OFFSET ?{}",
             query.params.len() + 1,
@@ -1256,11 +1250,6 @@ impl SekaiDb {
         let (policy_filter, mut policy_params) =
             build_sqlite_object_security_filter(policy_context, query.params.len())?;
         query.params.append(&mut policy_params);
-        let order_sql = build_order_by_sql(
-            filter.order_by.as_str(),
-            filter.descending,
-            &mut query.params,
-        )?;
         let effective_limit = if filter.limit == i32::MAX {
             i32::MAX
         } else if filter.limit <= 0 {
@@ -1268,13 +1257,15 @@ impl SekaiDb {
         } else {
             filter.limit.min(MAX_LIST_LIMIT)
         };
-        let mut list_sql = format!(
-            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}{}{}{}",
-            query.where_sql, visibility_filter, marking_filter, policy_filter, kind_exclusion
-        );
-        if let Some(order_sql) = order_sql.as_deref() {
-            list_sql.push_str(order_sql);
-        }
+        let mut list_sql = list_objects_select_sql(
+            &format!(
+                "FROM sekai_objects{}{}{}{}{}",
+                query.where_sql, visibility_filter, marking_filter, policy_filter, kind_exclusion
+            ),
+            filter.order_by.as_str(),
+            filter.descending,
+            &mut query.params,
+        )?;
         list_sql.push_str(&format!(
             " LIMIT ?{} OFFSET ?{}",
             query.params.len() + 1,
@@ -2255,11 +2246,42 @@ fn build_numeric_or_text_expr(left_expr: &str, value_param: &str, compare: &str)
     )
 }
 
-fn build_order_by_sql(
+const LIST_OBJECT_COLUMNS: &str =
+    "id, kind, name, namespace, external_id, properties, created, updated";
+
+fn property_value_order_sql(value_expr: &str, descending: bool) -> String {
+    let direction = if descending { "DESC" } else { "ASC" };
+    format!(
+        " ORDER BY CASE WHEN {value_expr} IS NULL THEN 1 ELSE 0 END, CASE WHEN is_numeric_text({value_expr}) THEN 0 ELSE 1 END, CASE WHEN is_numeric_text({value_expr}) THEN CAST({value_expr} AS REAL) ELSE CAST(NULL AS REAL) END {direction}, CASE WHEN is_numeric_text({value_expr}) THEN '' ELSE {value_expr} END {direction}, id ASC"
+    )
+}
+
+/// List SELECT that extracts a property sort key once per matching row.
+fn list_objects_select_sql(
+    from_and_where: &str,
     order_by: &str,
     descending: bool,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-) -> Result<Option<String>, String> {
+) -> Result<String, String> {
+    if let Some(key) = order_by.strip_prefix("property:") {
+        if !is_valid_property_key(key) {
+            return Err(format!("invalid property key: {key}"));
+        }
+        params.push(Box::new(format!("$.{key}")));
+        let path_expr = format!("?{}", params.len());
+        let order_sql = property_value_order_sql("sort_v", descending);
+        return Ok(format!(
+            "WITH listed AS MATERIALIZED (SELECT {LIST_OBJECT_COLUMNS}, json_extract(properties, {path_expr}) AS sort_v {from_and_where}) SELECT {LIST_OBJECT_COLUMNS} FROM listed{order_sql}"
+        ));
+    }
+    let mut sql = format!("SELECT {LIST_OBJECT_COLUMNS} {from_and_where}");
+    if let Some(order_sql) = build_order_by_sql(order_by, descending)? {
+        sql.push_str(&order_sql);
+    }
+    Ok(sql)
+}
+
+fn build_order_by_sql(order_by: &str, descending: bool) -> Result<Option<String>, String> {
     if order_by.is_empty() {
         return Ok(Some(" ORDER BY id ASC".to_string()));
     }
@@ -2274,21 +2296,11 @@ fn build_order_by_sql(
         "updated" => {
             format!(" ORDER BY updated {direction}, id ASC")
         }
+        _ if order_by.starts_with("property:") => {
+            return Err("property order_by must use list_objects_select_sql".into());
+        }
         _ => {
-            if let Some(key) = order_by.strip_prefix("property:") {
-                if !is_valid_property_key(key) {
-                    return Err(format!("invalid property key: {key}"));
-                }
-                let path = format!("$.{key}");
-                let path_expr = format!("?{}", params.len() + 1);
-                params.push(Box::new(path));
-                let value_expr = format!("json_extract(properties, {path_expr})");
-                format!(
-                    " ORDER BY CASE WHEN {value_expr} IS NULL THEN 1 ELSE 0 END, CASE WHEN is_numeric_text({value_expr}) THEN 0 ELSE 1 END, CASE WHEN is_numeric_text({value_expr}) THEN CAST({value_expr} AS REAL) ELSE CAST(NULL AS REAL) END {direction}, CASE WHEN is_numeric_text({value_expr}) THEN '' ELSE {value_expr} END {direction}, id ASC"
-                )
-            } else {
-                return Err(format!("unsupported order_by: {order_by}"));
-            }
+            return Err(format!("unsupported order_by: {order_by}"));
         }
     };
     Ok(Some(order_sql))
@@ -2876,6 +2888,22 @@ mod tests {
         assert_eq!(ordered[0].id, "public");
         assert_eq!(ordered[1].id, "alice-only");
         assert_eq!(ordered[2].id, "no-tier");
+    }
+
+    #[test]
+    fn property_order_extracts_json_once() {
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let sql = list_objects_select_sql(
+            "FROM sekai_objects WHERE kind = ?1",
+            "property:tier",
+            false,
+            &mut params,
+        )
+        .unwrap();
+        assert_eq!(sql.matches("json_extract").count(), 1, "{sql}");
+        assert!(sql.contains("MATERIALIZED"), "{sql}");
+        assert!(sql.contains("AS sort_v"), "{sql}");
+        assert_eq!(params.len(), 1);
     }
 
     #[test]
