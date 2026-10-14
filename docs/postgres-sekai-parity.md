@@ -141,6 +141,7 @@ Evidence is checked in as:
 | #1287 | In-process governed transform JobSpec, checkpoint, and run receipt |
 | #1388 | Partitioned streaming transform I/O and atomic partition write-back |
 | #1481 | Connector certification certify/get/verify/revoke on PostgreSQL |
+| #1475 | Federation network contracts, site/peer tables, conflicts, and revocations |
 
 ## Still outside this parent
 

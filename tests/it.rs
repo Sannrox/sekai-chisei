@@ -58,6 +58,7 @@ mod epistemic_interop_conformance;
 mod epistemic_metadata_conformance;
 mod evidence_backend_conformance;
 mod experimental_rpc_operator_docs;
+mod federation_backend_conformance;
 mod federation_network_adr;
 mod gateway_http_smoke;
 mod geospatial_query_adr;
@@ -214,6 +215,7 @@ const GROUPED_MODULES: &[&str] = &[
     "epistemic_metadata_conformance",
     "evidence_backend_conformance",
     "experimental_rpc_operator_docs",
+    "federation_backend_conformance",
     "federation_network_adr",
     "gateway_http_smoke",
     "geospatial_query_adr",
@@ -390,6 +392,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 127);
+    assert_eq!(GROUPED_MODULES.len(), 128);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }
