@@ -75,7 +75,7 @@ impl SekaiServiceImpl {
                 "principal:* external IDs are reserved for principal_profile objects",
             ));
         }
-        enforce_namespace_tenant_context(
+        enforce_collaboration_namespace(
             self.db.runtime(),
             tenant_context.as_ref(),
             &object.namespace,
@@ -96,7 +96,7 @@ impl SekaiServiceImpl {
             &object.namespace,
         )?;
         if let Some(precondition) = &precondition {
-            enforce_namespace_tenant_context(
+            enforce_collaboration_namespace(
                 self.db.runtime(),
                 tenant_context.as_ref(),
                 &precondition.namespace,
@@ -122,7 +122,7 @@ impl SekaiServiceImpl {
         }
         let domain_object = from_proto_obj(&object);
         validate_written_access_marking(self.db.runtime(), &domain_object)?;
-        if !guest_object_permitted(
+        if !collaboration_object_permitted(
             self.db.runtime(),
             tenant_context.as_ref(),
             &domain_object,
@@ -314,7 +314,7 @@ impl SekaiServiceImpl {
             validate_principal_profile_object(&object)?;
         }
         if let Some(existing) = &existing {
-            enforce_namespace_tenant_context(
+            enforce_collaboration_namespace(
                 self.db.runtime(),
                 tenant_context.as_ref(),
                 &existing.namespace,
@@ -322,7 +322,7 @@ impl SekaiServiceImpl {
             )?;
             check_team_namespace(self.db.runtime(), &principals, &existing.namespace, true)?;
         }
-        enforce_namespace_tenant_context(
+        enforce_collaboration_namespace(
             self.db.runtime(),
             tenant_context.as_ref(),
             &object.namespace,
@@ -354,7 +354,7 @@ impl SekaiServiceImpl {
             )?;
         }
         if let Some(precondition) = &precondition {
-            enforce_namespace_tenant_context(
+            enforce_collaboration_namespace(
                 self.db.runtime(),
                 tenant_context.as_ref(),
                 &precondition.namespace,
@@ -383,7 +383,7 @@ impl SekaiServiceImpl {
         }
         let mut domain_object = from_proto_obj(&object);
         validate_written_access_marking(self.db.runtime(), &domain_object)?;
-        if !guest_object_permitted(
+        if !collaboration_object_permitted(
             self.db.runtime(),
             tenant_context.as_ref(),
             &domain_object,
@@ -624,7 +624,7 @@ impl SekaiServiceImpl {
             )?;
         }
         if let Some(precondition) = &precondition {
-            enforce_namespace_tenant_context(
+            enforce_collaboration_namespace(
                 self.db.runtime(),
                 tenant_context.as_ref(),
                 &precondition.namespace,
@@ -652,7 +652,7 @@ impl SekaiServiceImpl {
                 .map_err(map_lease_lifecycle_error)?;
         }
         if let Some(existing) = &expected {
-            enforce_namespace_tenant_context(
+            enforce_collaboration_namespace(
                 self.db.runtime(),
                 tenant_context.as_ref(),
                 &existing.namespace,

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- A space can be shared across tenants when both the owning tenant and the
+  member's home tenant approve. The owning tenant names the namespaces, kinds,
+  and marking ceiling the space exposes. Members act under their own home
+  tenant; storage keys stay per tenant. One-sided approval grants nothing.
+  Withdrawal applies to the next request. Only exposed namespaces, kinds, and
+  markings are visible; history hides values written while the object was
+  above the ceiling and redacts old values when no retained prior write
+  attests their original marking. Every cross-tenant access through the space is
+  audited (`tenant.shared_space_access`) with the owning resource tenant
+  even when membership is denied. Unshared spaces are unchanged
+  (`GATE:break`, #1434).
+
 - Isolated transform claims persist a per-run tenant concurrency hold and
   release it once on write, cancel, reclaim, or terminal lease failure
   (`0074_transform_quota_hold`, GATE:mig). The submitting tenant is stored on

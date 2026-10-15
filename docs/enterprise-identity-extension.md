@@ -127,6 +127,43 @@ tenant, space, the namespace (or the RPC, when the interceptor rejects it
 first), and the operation. Ceiling denials use operation `ceiling` and the
 object id. A denied guest read looks like a missing object.
 
+## Shared spaces
+
+A space is a permission scope, not a storage key. Unshared spaces stay
+tenant-local: the space role only constrains grants the member already has.
+A space becomes shared when the owning tenant exposes named namespaces,
+object kinds, and a marking ceiling, and each participating tenant's
+administrator approves membership of its own principals (#1434). Members
+act under their own home tenant; storage keys stay those of the resource
+tenant. One-sided approval grants nothing.
+
+Core admits a shared-space member only on the object get, list, create,
+update, delete, and history paths that also enforce the grant, and only
+when the installed extension's `authorize_shared_space` returns
+`Granted` for that space. Its default is `Unshared` (today's path).
+`Granted` exposes only the listed namespaces, kinds, and markings.
+`Denied` refuses one-sided approval, withdrawal, or a shared space that
+does not expose the namespace, and still names the owning tenant so
+denied audits keep `resource_tenant`. Other RPCs do not inherit the
+grant, and `authorize_authenticated_context` does not treat a shared-space
+grant as general namespace authorization. Core calls the hook on every
+object request and caches nothing, so withdrawal by either administrator
+applies to the next request. Only
+exposed kinds are visible; an object whose `access_marking` the ceiling
+does not cover is missing on get, excluded from list results and totals,
+and refused on create, update, and delete. History applies the same
+ceiling to each change, so values written while the object was above the
+ceiling stay hidden after a later downgrade. When no retained prior write
+attests a value's original marking, that old value is redacted. Later
+marking events are not treated as creation evidence. Coverage uses the namespace's activated
+classification lattice when one exists, otherwise the default evidence
+ordinal. Without an extension a space is never shared. Every shared-space
+decision, allowed or denied, is audited as `tenant.shared_space_access`
+with the principal, home tenant, resource tenant, space, the namespace or
+object id, and the operation. Kind and ceiling denials use operations
+`kind` and `ceiling`. A denied shared-space read looks like a missing
+object. Guests stay on the guest path; this hook is for non-guest members.
+
 ## Discovery
 
 An administrator-approved discovery rule names which tenants, principals,
@@ -163,6 +200,12 @@ GATE:break: `home_tenant` (#1432) is a new Rust field on the `v2` context.
 Extensions that build `AuthenticatedContext` must set it (`None` keeps
 same-tenant behavior). No existing field changes meaning, the default guest
 hook fails closed, and no protocol field numbers change, so the contract
+version stays `v2`.
+
+GATE:break: `authorize_shared_space` (#1434) is an optional `v2` method.
+The default is `Unshared`. Extensions that share a space return `Granted`
+or `Denied { owner_tenant }` so a withdrawn or one-sided rule still names
+the resource tenant. No protocol field numbers change, so the contract
 version stays `v2`.
 
 GATE:break: `authorize_discovery` (#1435) is a new optional `v2` method.

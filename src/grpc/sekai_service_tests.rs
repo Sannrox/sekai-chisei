@@ -15774,6 +15774,858 @@ fn discovery_withdrawal_is_next_request_and_audited() {
     assert_eq!(outcomes, ["denied", "allowed"]);
 }
 
+/// Member of `tenant-home` acting at home through shared space `collab` (#1434).
+fn shared_space_member() -> crate::enterprise::AuthenticatedContext {
+    crate::enterprise::AuthenticatedContext {
+        tenant: Some(crate::enterprise::TenantContext {
+            tenant_id: "tenant-home".into(),
+            subject: "subject-a".into(),
+        }),
+        space: Some("collab".into()),
+        space_role: Some(crate::enterprise::SpaceRole::Viewer),
+        scopes: vec!["sekai.read".into(), "sekai.write".into()],
+        ..test_tenant_context()
+    }
+}
+
+#[derive(Clone)]
+struct SharedSpaceState {
+    owner_approved: bool,
+    member_approved: bool,
+    grant: Option<crate::enterprise::SharedSpaceGrant>,
+}
+
+/// Dual-approval shared space on `ops`; `None` grant or a false side withdraws it.
+struct SharedSpaceExtension(std::sync::Mutex<SharedSpaceState>);
+
+impl SharedSpaceExtension {
+    fn granting() -> Self {
+        Self(std::sync::Mutex::new(SharedSpaceState {
+            owner_approved: true,
+            member_approved: true,
+            grant: Some(crate::enterprise::SharedSpaceGrant {
+                owner_tenant: "tenant-test".into(),
+                namespaces: vec!["ops".into()],
+                kinds: vec!["widget".into()],
+                marking_ceiling: "internal".into(),
+            }),
+        }))
+    }
+}
+
+impl crate::enterprise::EnterpriseExtension for SharedSpaceExtension {
+    fn authenticate_bearer(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authenticate_bearer(bearer_token)
+    }
+
+    fn authenticate_context(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError> {
+        let issued = TestEnterpriseExtension.authenticate_context(bearer_token)?;
+        Ok(crate::enterprise::AuthenticatedContext {
+            expires_at: i64::MAX,
+            issuer: issued.issuer,
+            resource: issued.resource,
+            ..shared_space_member()
+        })
+    }
+
+    fn tenant_context(
+        &self,
+        principal: &crate::enterprise::AuthenticatedPrincipal,
+    ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+        Ok(crate::enterprise::TenantContext {
+            tenant_id: "tenant-home".into(),
+            subject: principal.subject.clone(),
+        })
+    }
+
+    fn authorize_namespace(
+        &self,
+        context: &crate::enterprise::TenantContext,
+        namespace: &str,
+        action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authorize_namespace(context, namespace, action)
+    }
+
+    fn authorize_shared_space(
+        &self,
+        context: &crate::enterprise::AuthenticatedContext,
+        namespace: &str,
+        _action: crate::enterprise::NamespaceAction,
+    ) -> Result<crate::enterprise::SharedSpaceAuthorization, crate::enterprise::ExtensionError>
+    {
+        if context.named_space() != Some("collab") {
+            return Ok(crate::enterprise::SharedSpaceAuthorization::Unshared);
+        }
+        let state = self.0.lock().unwrap();
+        let owner_tenant = state
+            .grant
+            .as_ref()
+            .map(|grant| grant.owner_tenant.clone())
+            .unwrap_or_else(|| "tenant-test".into());
+        if !(state.owner_approved && state.member_approved) {
+            return Ok(crate::enterprise::SharedSpaceAuthorization::Denied { owner_tenant });
+        }
+        let Some(grant) = state.grant.clone() else {
+            return Ok(crate::enterprise::SharedSpaceAuthorization::Denied { owner_tenant });
+        };
+        if grant.exposes_namespace(namespace) {
+            Ok(crate::enterprise::SharedSpaceAuthorization::Granted(grant))
+        } else {
+            Ok(crate::enterprise::SharedSpaceAuthorization::Denied {
+                owner_tenant: grant.owner_tenant,
+            })
+        }
+    }
+
+    fn authorize_unscoped_namespace(
+        &self,
+        principal: &crate::enterprise::AuthenticatedPrincipal,
+        namespace: &str,
+        action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authorize_unscoped_namespace(principal, namespace, action)
+    }
+}
+
+fn shared_space_service(extension: Arc<SharedSpaceExtension>) -> SekaiServiceImpl {
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension)).unwrap(),
+    )));
+    SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
+}
+
+fn shared_space_decisions(db: &RuntimeDb) -> Vec<crate::sekai::audit::Decision> {
+    db.list_decisions(&crate::sekai::decision_ledger::DecisionFilter {
+        action: Some("tenant.shared_space_access".into()),
+        limit: 100,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+fn seed_ops(svc: &SekaiServiceImpl, id: &str, kind: &str, marking: &str) {
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: id.into(),
+            kind: kind.into(),
+            name: id.into(),
+            namespace: "ops".into(),
+            external_id: format!("{kind}:{id}"),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                marking.into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+}
+
+fn pin_shared_space_profile(svc: &SekaiServiceImpl, ceiling: &str) {
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "profile-subject-a".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "subject-a".into(),
+            namespace: "ops".into(),
+            external_id: markings::principal_profile_external_id("subject-a"),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    ceiling.into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    grant_object_role(svc, "profile-subject-a", "root", security::Role::Admin);
+}
+
+fn shared_space_get(id: &str) -> Request<GetObjectRequest> {
+    let mut req = with_named_principal(GetObjectRequest { id: id.into() }, "subject-a");
+    req.extensions_mut().insert(shared_space_member());
+    req
+}
+
+fn shared_space_list(namespace: &str, kind: &str) -> Request<ListObjectsRequest> {
+    let mut req = with_named_principal(
+        ListObjectsRequest {
+            filter: Some(ListFilter {
+                namespace: namespace.into(),
+                kind: kind.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "subject-a",
+    );
+    req.extensions_mut().insert(shared_space_member());
+    req
+}
+
+#[test]
+fn shared_space_membership_needs_approval_from_both_sides() {
+    let extension = Arc::new(SharedSpaceExtension::granting());
+    let db = RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension.clone())).unwrap(),
+    ));
+    let member = shared_space_member();
+    assert!(enforce_collaboration_namespace(&db, Some(&member), "ops", false).is_ok());
+    // Non-object RPCs must not inherit the grant.
+    assert!(enforce_namespace_tenant_context(&db, Some(&member), "ops", false).is_err());
+    let discoverer = crate::enterprise::AuthenticatedContext {
+        space_role: Some(crate::enterprise::SpaceRole::Discoverer),
+        ..member.clone()
+    };
+    assert!(enforce_collaboration_namespace(&db, Some(&discoverer), "ops", false).is_err());
+
+    for (owner, participant) in [(true, false), (false, true), (false, false)] {
+        let grant = extension.0.lock().unwrap().grant.clone();
+        *extension.0.lock().unwrap() = SharedSpaceState {
+            owner_approved: owner,
+            member_approved: participant,
+            grant,
+        };
+        assert!(
+            enforce_collaboration_namespace(&db, Some(&member), "ops", false).is_err(),
+            "owner={owner} member={participant}"
+        );
+    }
+
+    let decisions = shared_space_decisions(&db);
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.outcome == "allowed"
+                && decision.target_id == "ops"
+                && decision.evidence["home_tenant"] == "tenant-home"
+                && decision.evidence["resource_tenant"] == "tenant-test"
+                && decision.evidence["space"] == "collab")
+    );
+    assert!(
+        decisions
+            .iter()
+            .filter(|decision| decision.outcome == "denied" && decision.target_id == "ops")
+            .count()
+            >= 3
+    );
+    assert!(
+        decisions
+            .iter()
+            .filter(|decision| decision.outcome == "denied" && decision.target_id == "ops")
+            .all(|decision| decision.evidence["resource_tenant"] == "tenant-test")
+    );
+}
+
+#[tokio::test]
+async fn shared_space_exposes_only_named_namespaces_kinds_and_markings() {
+    let svc = shared_space_service(Arc::new(SharedSpaceExtension::granting()));
+    pin_shared_space_profile(&svc, "restricted");
+    seed_ops(&svc, "w-internal", "widget", "internal");
+    seed_ops(&svc, "w-confidential", "widget", "confidential");
+    seed_ops(&svc, "note-internal", "note", "internal");
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "other-ns".into(),
+            kind: "widget".into(),
+            name: "other-ns".into(),
+            namespace: "secrets".into(),
+            external_id: "widget:other-ns".into(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "internal".into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+
+    assert_eq!(
+        svc.get_object(shared_space_get("w-internal"))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap()
+            .id,
+        "w-internal"
+    );
+    for missing in [
+        "w-confidential",
+        "note-internal",
+        "other-ns",
+        "no-such-object",
+    ] {
+        let denied = svc.get_object(shared_space_get(missing)).await.unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound, "{missing}");
+    }
+
+    let listed = svc
+        .list_objects(shared_space_list("ops", "widget"))
+        .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<_> = listed
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect();
+    assert_eq!(ids, ["w-internal"]);
+    assert_eq!(listed.total, 1);
+
+    let secrets = svc
+        .list_objects(shared_space_list("secrets", "widget"))
+        .await;
+    assert!(
+        secrets.as_ref().map_or(true, |response| {
+            response.get_ref().objects.is_empty() && response.get_ref().total == 0
+        }),
+        "{secrets:?}"
+    );
+
+    let decisions = shared_space_decisions(svc.db.runtime());
+    assert!(decisions.iter().any(|decision| {
+        decision.target_id == "w-internal"
+            && decision.outcome == "allowed"
+            && decision.evidence["resource_tenant"] == "tenant-test"
+            && decision.evidence["operation"] == "read"
+    }));
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.target_id == "w-confidential"
+                && decision.outcome == "denied"
+                && decision.evidence["operation"] == "ceiling"
+                && decision.evidence["home_tenant"] == "tenant-home"
+                && decision.evidence["resource_tenant"] == "tenant-test"
+                && decision.evidence["space"] == "collab")
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.target_id == "note-internal"
+                && decision.outcome == "denied"
+                && decision.evidence["operation"] == "kind")
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.target_id == "secrets" && decision.outcome == "denied")
+    );
+}
+
+#[tokio::test]
+async fn shared_space_does_not_admit_link_reads() {
+    let svc = shared_space_service(Arc::new(SharedSpaceExtension::granting()));
+    pin_shared_space_profile(&svc, "restricted");
+    seed_ops(&svc, "w-internal", "widget", "internal");
+    assert!(svc.get_object(shared_space_get("w-internal")).await.is_ok());
+    let mut req = with_named_principal(
+        GetLinksRequest {
+            object_id: "w-internal".into(),
+            relation: String::new(),
+            direction: String::new(),
+        },
+        "subject-a",
+    );
+    req.extensions_mut().insert(shared_space_member());
+    let denied = svc.get_links(req).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::NotFound, "{denied}");
+}
+
+#[tokio::test]
+async fn shared_space_withdrawal_denies_the_next_request() {
+    let extension = Arc::new(SharedSpaceExtension::granting());
+    let svc = shared_space_service(extension.clone());
+    pin_shared_space_profile(&svc, "restricted");
+    seed_ops(&svc, "w-internal", "widget", "internal");
+    assert_eq!(
+        svc.get_object(shared_space_get("w-internal"))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap()
+            .id,
+        "w-internal"
+    );
+
+    extension.0.lock().unwrap().member_approved = false;
+    assert_eq!(
+        svc.get_object(shared_space_get("w-internal"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+
+    extension.0.lock().unwrap().member_approved = true;
+    extension.0.lock().unwrap().owner_approved = false;
+    assert_eq!(
+        svc.get_object(shared_space_get("w-internal"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+
+    let decisions = shared_space_decisions(svc.db.runtime());
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.outcome == "allowed"
+                && decision.target_id == "ops"
+                && decision.evidence["home_tenant"] == "tenant-home"
+                && decision.evidence["resource_tenant"] == "tenant-test"
+                && decision.evidence["space"] == "collab"
+                && decision.actor == "subject-a")
+    );
+    assert!(
+        decisions
+            .iter()
+            .filter(|decision| decision.outcome == "denied" && decision.target_id == "ops")
+            .count()
+            >= 2
+    );
+    assert!(
+        decisions
+            .iter()
+            .filter(|decision| decision.outcome == "denied" && decision.target_id == "ops")
+            .all(|decision| decision.evidence["resource_tenant"] == "tenant-test")
+    );
+}
+
+#[tokio::test]
+async fn shared_space_history_hides_unexposed_kinds_and_markings() {
+    let svc = shared_space_service(Arc::new(SharedSpaceExtension::granting()));
+    pin_shared_space_profile(&svc, "restricted");
+    seed_ops(&svc, "w-internal", "widget", "internal");
+    seed_ops(&svc, "w-confidential", "widget", "confidential");
+    seed_ops(&svc, "note-internal", "note", "internal");
+
+    let history = |id: &str| {
+        let mut req = with_named_principal(
+            ListObjectChangesRequest {
+                object_id: id.into(),
+                limit: 10,
+                offset: 0,
+            },
+            "subject-a",
+        );
+        req.extensions_mut().insert(shared_space_member());
+        req
+    };
+    assert!(svc.list_object_changes(history("w-internal")).await.is_ok());
+    for hidden in ["w-confidential", "note-internal"] {
+        assert_eq!(
+            svc.list_object_changes(history(hidden))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound,
+            "{hidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_space_history_omits_values_written_under_a_higher_marking() {
+    let svc = shared_space_service(Arc::new(SharedSpaceExtension::granting()));
+    pin_shared_space_profile(&svc, "restricted");
+    seed_ops(&svc, "w-internal", "widget", "internal");
+    let runtime = svc.db.runtime();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "secret-while-confidential".into(),
+            object_id: "w-internal".into(),
+            field: "properties.secret_note".into(),
+            old_value: String::new(),
+            new_value: "classified note".into(),
+            changed_by: "owner".into(),
+            timestamp: 1,
+        })
+        .unwrap();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "downgrade-marking".into(),
+            object_id: "w-internal".into(),
+            field: format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY),
+            old_value: "confidential".into(),
+            new_value: "internal".into(),
+            changed_by: "owner".into(),
+            timestamp: 2,
+        })
+        .unwrap();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "note-after-downgrade".into(),
+            object_id: "w-internal".into(),
+            field: "properties.secret_note".into(),
+            old_value: "classified note".into(),
+            new_value: "public note".into(),
+            changed_by: "owner".into(),
+            timestamp: 3,
+        })
+        .unwrap();
+
+    let history = |limit: i32, offset: i32| {
+        let mut req = with_named_principal(
+            ListObjectChangesRequest {
+                object_id: "w-internal".into(),
+                limit,
+                offset,
+            },
+            "subject-a",
+        );
+        req.extensions_mut().insert(shared_space_member());
+        req
+    };
+    let changes = svc
+        .list_object_changes(history(10, 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert!(
+        changes.iter().all(|change| {
+            change.old_value != "classified note"
+                && change.new_value != "classified note"
+                && change.old_value != "confidential"
+        }),
+        "{changes:?}"
+    );
+    assert!(
+        changes.iter().any(|change| {
+            change.field == "properties.secret_note" && change.new_value == "public note"
+        }),
+        "{changes:?}"
+    );
+    let newest = svc
+        .list_object_changes(history(1, 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert_eq!(newest.len(), 1, "{newest:?}");
+    assert_eq!(newest[0].new_value, "public note");
+    assert_ne!(newest[0].old_value, "classified note");
+
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "raise-marking".into(),
+            object_id: "w-internal".into(),
+            field: format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY),
+            old_value: "internal".into(),
+            new_value: "confidential".into(),
+            changed_by: "owner".into(),
+            timestamp: 4,
+        })
+        .unwrap();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "secret-after-raise".into(),
+            object_id: "w-internal".into(),
+            field: "properties.secret_note".into(),
+            old_value: "public note".into(),
+            new_value: "later classified".into(),
+            changed_by: "owner".into(),
+            timestamp: 5,
+        })
+        .unwrap();
+    let after_raise = svc
+        .list_object_changes(history(1, 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert_eq!(after_raise.len(), 1, "{after_raise:?}");
+    assert_eq!(after_raise[0].new_value, "public note", "{after_raise:?}");
+
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "same-ms-raise".into(),
+            object_id: "w-internal".into(),
+            field: format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY),
+            old_value: "internal".into(),
+            new_value: "confidential".into(),
+            changed_by: "owner".into(),
+            timestamp: 6,
+        })
+        .unwrap();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "same-ms-secret".into(),
+            object_id: "w-internal".into(),
+            field: "properties.secret_note".into(),
+            old_value: "public note".into(),
+            new_value: "same-ms classified".into(),
+            changed_by: "owner".into(),
+            timestamp: 6,
+        })
+        .unwrap();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "same-ms-downgrade".into(),
+            object_id: "w-internal".into(),
+            field: format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY),
+            old_value: "confidential".into(),
+            new_value: "internal".into(),
+            changed_by: "owner".into(),
+            timestamp: 6,
+        })
+        .unwrap();
+    let same_ms = svc
+        .list_object_changes(history(10, 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert!(
+        same_ms
+            .iter()
+            .all(|change| change.new_value != "same-ms classified"
+                && change.old_value != "same-ms classified"),
+        "{same_ms:?}"
+    );
+}
+
+#[test]
+fn unshared_space_history_stays_on_the_store_path() {
+    let extension = Arc::new(SharedSpaceExtension::granting());
+    let db = RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension)).unwrap(),
+    ));
+    let local = crate::enterprise::AuthenticatedContext {
+        space: Some("local".into()),
+        space_role: Some(crate::enterprise::SpaceRole::Viewer),
+        ..test_tenant_context()
+    };
+    let object = domain::Object {
+        id: "local-widget".into(),
+        kind: "widget".into(),
+        name: "local-widget".into(),
+        namespace: "allowed".into(),
+        external_id: "widget:local-widget".into(),
+        properties: HashMap::new(),
+        created: 0,
+        updated: 0,
+    };
+    assert!(
+        visible_collaboration_history_page(&db, Some(&local), Some(&object), 10, 0)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
+    let svc = shared_space_service(Arc::new(SharedSpaceExtension::granting()));
+    pin_shared_space_profile(&svc, "restricted");
+    seed_ops(&svc, "w-internal", "widget", "internal");
+    let runtime = svc.db.runtime();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "created-confidential".into(),
+            object_id: "w-internal".into(),
+            field: format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY),
+            old_value: "confidential".into(),
+            new_value: "internal".into(),
+            changed_by: "owner".into(),
+            timestamp: 1,
+        })
+        .unwrap();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "first-note-after-create".into(),
+            object_id: "w-internal".into(),
+            field: "properties.secret_note".into(),
+            old_value: "created classified".into(),
+            new_value: "public note".into(),
+            changed_by: "owner".into(),
+            timestamp: 2,
+        })
+        .unwrap();
+    let mut req = with_named_principal(
+        ListObjectChangesRequest {
+            object_id: "w-internal".into(),
+            limit: 10,
+            offset: 0,
+        },
+        "subject-a",
+    );
+    req.extensions_mut().insert(shared_space_member());
+    let changes = svc
+        .list_object_changes(req)
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    let note = changes
+        .iter()
+        .find(|change| change.field == "properties.secret_note")
+        .expect("visible post-downgrade note");
+    assert_eq!(note.new_value, "public note");
+    assert_ne!(note.old_value, "created classified");
+}
+
+#[tokio::test]
+async fn shared_space_history_redacts_old_values_when_retention_removes_exposure() {
+    let svc = shared_space_service(Arc::new(SharedSpaceExtension::granting()));
+    pin_shared_space_profile(&svc, "restricted");
+    seed_ops(&svc, "w-internal", "widget", "internal");
+    let runtime = svc.db.runtime();
+    // Retention deleted the confidential write and its downgrade. This
+    // retained update still carries the classified text in old_value.
+    // Later internal→confidential→internal marking events must not be
+    // treated as creation-time evidence that the old value was internal.
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "retained-after-purge".into(),
+            object_id: "w-internal".into(),
+            field: "properties.secret_note".into(),
+            old_value: "classified note".into(),
+            new_value: "public note".into(),
+            changed_by: "owner".into(),
+            timestamp: 3,
+        })
+        .unwrap();
+    let marking = format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY);
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "later-raise".into(),
+            object_id: "w-internal".into(),
+            field: marking.clone(),
+            old_value: "internal".into(),
+            new_value: "confidential".into(),
+            changed_by: "owner".into(),
+            timestamp: 4,
+        })
+        .unwrap();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "later-downgrade".into(),
+            object_id: "w-internal".into(),
+            field: marking,
+            old_value: "confidential".into(),
+            new_value: "internal".into(),
+            changed_by: "owner".into(),
+            timestamp: 5,
+        })
+        .unwrap();
+    let mut req = with_named_principal(
+        ListObjectChangesRequest {
+            object_id: "w-internal".into(),
+            limit: 10,
+            offset: 0,
+        },
+        "subject-a",
+    );
+    req.extensions_mut().insert(shared_space_member());
+    let changes = svc
+        .list_object_changes(req)
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    let note = changes
+        .iter()
+        .find(|change| change.field == "properties.secret_note")
+        .expect("visible post-retention note");
+    assert_eq!(note.new_value, "public note");
+    assert_ne!(note.old_value, "classified note");
+    assert!(note.old_value.is_empty(), "{note:?}");
+}
+
+#[tokio::test]
+async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
+    let svc = shared_space_service(Arc::new(SharedSpaceExtension::granting()));
+    pin_shared_space_profile(&svc, "restricted");
+    seed_ops(&svc, "w-internal", "widget", "internal");
+    let runtime = svc.db.runtime();
+    let marking = |id: &str, old: &str, new: &str, timestamp: i64| audit::ObjectChange {
+        id: id.into(),
+        object_id: "w-internal".into(),
+        field: format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY),
+        old_value: old.into(),
+        new_value: new.into(),
+        changed_by: "owner".into(),
+        timestamp,
+    };
+    runtime
+        .record_object_change(&marking("ms-downgrade", "confidential", "internal", 1))
+        .unwrap();
+    runtime
+        .record_object_change(&marking("ms-raise", "internal", "confidential", 1))
+        .unwrap();
+    runtime
+        .record_object_change(&audit::ObjectChange {
+            id: "secret-after-same-ms-raise".into(),
+            object_id: "w-internal".into(),
+            field: "properties.secret_note".into(),
+            old_value: String::new(),
+            new_value: "secret after raise".into(),
+            changed_by: "owner".into(),
+            timestamp: 2,
+        })
+        .unwrap();
+    runtime
+        .record_object_change(&marking("later-downgrade", "confidential", "internal", 3))
+        .unwrap();
+    let mut req = with_named_principal(
+        ListObjectChangesRequest {
+            object_id: "w-internal".into(),
+            limit: 10,
+            offset: 0,
+        },
+        "subject-a",
+    );
+    req.extensions_mut().insert(shared_space_member());
+    let changes = svc
+        .list_object_changes(req)
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert!(
+        changes
+            .iter()
+            .all(|change| change.new_value != "secret after raise"
+                && change.old_value != "secret after raise"),
+        "{changes:?}"
+    );
+}
+
+#[test]
+fn unshared_spaces_keep_the_same_tenant_path() {
+    let extension = Arc::new(SharedSpaceExtension::granting());
+    let db = RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension)).unwrap(),
+    ));
+    let local = crate::enterprise::AuthenticatedContext {
+        space: Some("local".into()),
+        space_role: Some(crate::enterprise::SpaceRole::Viewer),
+        ..test_tenant_context()
+    };
+    assert!(enforce_namespace_tenant_context(&db, Some(&local), "allowed", false).is_ok());
+    assert!(enforce_namespace_tenant_context(&db, Some(&local), "ops", false).is_err());
+    assert!(shared_space_decisions(&db).is_empty());
+}
+
 #[tokio::test]
 async fn list_governed_transforms_returns_definitions_and_runs_for_authorized_principal() {
     use crate::sekai::dataset::{ColumnDef, Dataset};

@@ -96,6 +96,56 @@ impl GuestGrant {
     }
 }
 
+/// What the owning tenant currently exposes through a shared space (#1434).
+///
+/// Membership needs approval from both the owning tenant and the member's
+/// home tenant. The extension owns those approvals and the exposure list;
+/// core enforces the returned namespaces, kinds, and marking ceiling and
+/// asks again on every request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedSpaceGrant {
+    /// Tenant that owns the space and the exposed resources.
+    pub owner_tenant: String,
+    /// Owner namespaces visible through the space.
+    pub namespaces: Vec<String>,
+    /// Object kinds visible through the space.
+    pub kinds: Vec<String>,
+    /// Highest `access_marking` visible through the space.
+    pub marking_ceiling: String,
+}
+
+impl SharedSpaceGrant {
+    pub fn exposes_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.iter().any(|exposed| exposed == namespace)
+    }
+
+    pub fn exposes_kind(&self, kind: &str) -> bool {
+        self.kinds.iter().any(|exposed| exposed == kind)
+    }
+}
+
+/// Outcome of [`EnterpriseExtension::authorize_shared_space`].
+///
+/// `Denied` still names the owning tenant so core can audit
+/// `tenant.shared_space_access.resource_tenant` without treating the
+/// member's home tenant as the resource owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedSpaceAuthorization {
+    Unshared,
+    Granted(SharedSpaceGrant),
+    Denied { owner_tenant: String },
+}
+
+impl SharedSpaceAuthorization {
+    pub fn owner_tenant(&self) -> Option<&str> {
+        match self {
+            Self::Unshared => None,
+            Self::Granted(grant) => Some(grant.owner_tenant.as_str()),
+            Self::Denied { owner_tenant } => Some(owner_tenant.as_str()),
+        }
+    }
+}
+
 /// What one tenant currently allows another to find (#1435). Listing a
 /// tenant, principal, space, or namespace is not a read. Default: nothing
 /// is discoverable across tenants.
@@ -180,6 +230,25 @@ impl AuthenticatedContext {
         let home = self.home_tenant.as_deref()?;
         let acting = self.tenant.as_ref().map(|tenant| tenant.tenant_id.as_str());
         (acting != Some(home)).then_some(home)
+    }
+
+    /// A non-guest context that names a space. Shared-space membership
+    /// (#1434) is decided by the extension; unshared spaces keep today's path.
+    pub fn named_space(&self) -> Option<&str> {
+        if self.guest_home_tenant().is_some() {
+            return None;
+        }
+        self.space
+            .as_deref()
+            .filter(|space| !space.trim().is_empty())
+    }
+
+    /// Home tenant of a shared-space member: they act under their own tenant.
+    pub fn home_tenant_id(&self) -> Option<&str> {
+        self.tenant
+            .as_ref()
+            .map(|tenant| tenant.tenant_id.as_str())
+            .filter(|tenant| !tenant.trim().is_empty())
     }
 
     pub fn authorize_space(&self, action: NamespaceAction) -> Result<(), ExtensionError> {
@@ -649,6 +718,25 @@ pub trait EnterpriseExtension: Send + Sync {
         Err(ExtensionError::PermissionDenied)
     }
 
+    /// Current shared-space decision for a non-guest context that names a
+    /// space (#1434). `Unshared` keeps today's same-tenant path.
+    /// `Granted` admits only the exposed namespaces, kinds, and markings
+    /// after both the owning tenant and the member's home tenant approved
+    /// membership. `Denied` refuses one-sided approval, withdrawal, or a
+    /// space that does not expose this namespace, and still names the
+    /// owning tenant for audit. Default: unshared. Core calls this on
+    /// every request and caches nothing, so withdrawal applies to the next
+    /// one.
+    fn authorize_shared_space(
+        &self,
+        context: &AuthenticatedContext,
+        namespace: &str,
+        action: NamespaceAction,
+    ) -> Result<SharedSpaceAuthorization, ExtensionError> {
+        let _ = (context, namespace, action);
+        Ok(SharedSpaceAuthorization::Unshared)
+    }
+
     /// Current discovery rule for a caller looking at `owner_tenant` (#1435).
     /// `Ok(None)` means no rule: cross-tenant listing and lookup look the
     /// same as a missing target. `Ok(Some(rule))` names the tenants,
@@ -898,6 +986,151 @@ mod tests {
                 Err(ExtensionError::PermissionDenied)
             );
         }
+    }
+
+    #[test]
+    fn shared_space_membership_needs_both_approvals() {
+        struct SharedSpaceExtension {
+            owner_approved: bool,
+            member_approved: bool,
+        }
+
+        impl EnterpriseExtension for SharedSpaceExtension {
+            fn authenticate_bearer(
+                &self,
+                bearer_token: &str,
+            ) -> Result<AuthenticatedPrincipal, ExtensionError> {
+                FakeExtension.authenticate_bearer(bearer_token)
+            }
+
+            fn authenticate_context(
+                &self,
+                bearer_token: &str,
+            ) -> Result<AuthenticatedContext, ExtensionError> {
+                FakeExtension.authenticate_context(bearer_token)
+            }
+
+            fn tenant_context(
+                &self,
+                principal: &AuthenticatedPrincipal,
+            ) -> Result<TenantContext, ExtensionError> {
+                FakeExtension.tenant_context(principal)
+            }
+
+            fn authorize_namespace(
+                &self,
+                context: &TenantContext,
+                namespace: &str,
+                action: NamespaceAction,
+            ) -> Result<(), ExtensionError> {
+                FakeExtension.authorize_namespace(context, namespace, action)
+            }
+
+            fn authorize_unscoped_namespace(
+                &self,
+                principal: &AuthenticatedPrincipal,
+                namespace: &str,
+                action: NamespaceAction,
+            ) -> Result<(), ExtensionError> {
+                FakeExtension.authorize_unscoped_namespace(principal, namespace, action)
+            }
+
+            fn authorize_shared_space(
+                &self,
+                context: &AuthenticatedContext,
+                namespace: &str,
+                _action: NamespaceAction,
+            ) -> Result<SharedSpaceAuthorization, ExtensionError> {
+                if context.named_space() != Some("collab") {
+                    return Ok(SharedSpaceAuthorization::Unshared);
+                }
+                if !(self.owner_approved && self.member_approved) {
+                    return Ok(SharedSpaceAuthorization::Denied {
+                        owner_tenant: "tenant-test".into(),
+                    });
+                }
+                let grant = SharedSpaceGrant {
+                    owner_tenant: "tenant-test".into(),
+                    namespaces: vec!["ops".into()],
+                    kinds: vec!["widget".into()],
+                    marking_ceiling: "internal".into(),
+                };
+                if grant.exposes_namespace(namespace) {
+                    Ok(SharedSpaceAuthorization::Granted(grant))
+                } else {
+                    Ok(SharedSpaceAuthorization::Denied {
+                        owner_tenant: grant.owner_tenant,
+                    })
+                }
+            }
+        }
+
+        let member = AuthenticatedContext {
+            tenant: Some(TenantContext {
+                tenant_id: "tenant-home".into(),
+                subject: "subject-a".into(),
+            }),
+            space: Some("collab".into()),
+            space_role: Some(SpaceRole::Viewer),
+            ..FakeExtension.authenticate_context("test-token").unwrap()
+        };
+        assert_eq!(member.named_space(), Some("collab"));
+        assert_eq!(member.guest_home_tenant(), None);
+        assert_eq!(member.home_tenant_id(), Some("tenant-home"));
+
+        for (owner, participant) in [(true, false), (false, true), (false, false)] {
+            let extension = SharedSpaceExtension {
+                owner_approved: owner,
+                member_approved: participant,
+            };
+            assert_eq!(
+                extension.authorize_shared_space(&member, "ops", NamespaceAction::Read),
+                Ok(SharedSpaceAuthorization::Denied {
+                    owner_tenant: "tenant-test".into(),
+                })
+            );
+            assert_eq!(
+                extension.authorize_authenticated_context(&member, "ops", NamespaceAction::Read),
+                Err(ExtensionError::PermissionDenied)
+            );
+        }
+
+        let both = SharedSpaceExtension {
+            owner_approved: true,
+            member_approved: true,
+        };
+        let SharedSpaceAuthorization::Granted(grant) = both
+            .authorize_shared_space(&member, "ops", NamespaceAction::Read)
+            .unwrap()
+        else {
+            panic!("dual approval exposes ops");
+        };
+        assert!(grant.exposes_namespace("ops"));
+        assert_eq!(
+            both.authorize_shared_space(&member, "secrets", NamespaceAction::Read),
+            Ok(SharedSpaceAuthorization::Denied {
+                owner_tenant: "tenant-test".into(),
+            })
+        );
+        // General namespace authorization must not inherit the grant.
+        assert_eq!(
+            both.authorize_authenticated_context(&member, "ops", NamespaceAction::Read),
+            Err(ExtensionError::PermissionDenied)
+        );
+
+        let unshared = AuthenticatedContext {
+            space: Some("local".into()),
+            space_role: Some(SpaceRole::Viewer),
+            ..FakeExtension.authenticate_context("test-token").unwrap()
+        };
+        assert!(
+            both.authorize_authenticated_context(&unshared, "allowed", NamespaceAction::Read)
+                .is_ok()
+        );
+        assert_eq!(
+            FakeExtension.authorize_shared_space(&member, "ops", NamespaceAction::Read),
+            Ok(SharedSpaceAuthorization::Unshared)
+        );
     }
 
     #[test]
