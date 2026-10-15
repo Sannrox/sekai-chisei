@@ -1768,6 +1768,220 @@ async fn publish_definition_history_entry(
 }
 
 #[tokio::test]
+async fn propose_definition_rollback_restores_as_descendant_and_gates_live_values() {
+    let svc = service();
+    let namespace = "rollback-team";
+    let parent = seed_definition_parent(&svc, namespace);
+    let (first, _) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "rb-a",
+        "rb-cs-a",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    let (second, _) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &first,
+        "rb-b",
+        "rb-cs-b",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","properties":["title","secret"]}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+
+    let proposed = svc
+        .propose_definition_rollback(with_named_principal(
+            ProposeDefinitionRollbackRequest {
+                namespace: namespace.into(),
+                branch_id: "rb-restore".into(),
+                proposal_id: "rb-cs-restore".into(),
+                restore_from_digest: first.clone(),
+                migration_plan_digest: String::new(),
+                idempotency_key: "rb-restore-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let proposal = proposed.proposal.unwrap();
+    let preview = proposed.preview.unwrap();
+    assert_eq!(proposal.base_digest, second);
+    assert_eq!(proposal.restored_from_digest, first);
+    assert_ne!(proposal.candidate_digest, first);
+    assert_eq!(preview.from_revision_digest, second);
+    assert_eq!(preview.to_revision_digest, proposal.candidate_digest);
+    assert!(preview.changed.iter().any(|change| {
+        change.member_id == "Ticket"
+            && change
+                .removed_properties
+                .iter()
+                .any(|property| property == "secret")
+    }));
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "rb-cs-restore".into(),
+            idempotency_key: "rb-restore-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "rb-cs-restore".into(),
+                expected_published_digest: second.clone(),
+                idempotency_key: "rb-restore-merge".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let published = merged.published_revision.unwrap();
+    assert_ne!(published.revision_digest, first);
+    assert_eq!(published.parent_revision_digest, second);
+    assert_eq!(merged.proposal.unwrap().restored_from_digest, first);
+
+    let live_namespace = "rollback-live-team";
+    let live_parent = seed_definition_parent(&svc, live_namespace);
+    let (live_a, _) = publish_definition_history_entry(
+        &svc,
+        live_namespace,
+        &live_parent.revision_digest,
+        "rb-live-a",
+        "rb-live-cs-a",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    let (live_b, _) = publish_definition_history_entry(
+        &svc,
+        live_namespace,
+        &live_a,
+        "rb-live-b",
+        "rb-live-cs-b",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","properties":["title","secret"]}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: format!("{live_namespace}:open"),
+            kind: "Ticket".into(),
+            name: "open".into(),
+            namespace: live_namespace.into(),
+            external_id: format!("{live_namespace}:open"),
+            properties: HashMap::from([
+                ("title".into(), "hello".into()),
+                ("secret".into(), "classified".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.propose_definition_rollback(with_named_principal(
+        ProposeDefinitionRollbackRequest {
+            namespace: live_namespace.into(),
+            branch_id: "rb-live".into(),
+            proposal_id: "rb-live-cs".into(),
+            restore_from_digest: live_a.clone(),
+            migration_plan_digest: String::new(),
+            idempotency_key: "rb-live-1".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: live_namespace.into(),
+            proposal_id: "rb-live-cs".into(),
+            idempotency_key: "rb-live-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: live_namespace.into(),
+                proposal_id: "rb-live-cs".into(),
+                expected_published_digest: live_b.clone(),
+                idempotency_key: "rb-live-merge".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::FailedPrecondition
+    );
+    svc.propose_definition_rollback(with_named_principal(
+        ProposeDefinitionRollbackRequest {
+            namespace: live_namespace.into(),
+            branch_id: "rb-live-plan".into(),
+            proposal_id: "rb-live-cs-plan".into(),
+            restore_from_digest: live_a.clone(),
+            migration_plan_digest: format!("sha256:{}", "c".repeat(64)),
+            idempotency_key: "rb-live-plan-1".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: live_namespace.into(),
+            proposal_id: "rb-live-cs-plan".into(),
+            idempotency_key: "rb-live-plan-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let planned = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: live_namespace.into(),
+                proposal_id: "rb-live-cs-plan".into(),
+                expected_published_digest: live_b,
+                idempotency_key: "rb-live-plan-merge".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(planned.proposal.unwrap().restored_from_digest, live_a);
+}
+
+#[tokio::test]
 async fn list_published_definition_revisions_chains_filters_and_paginates() {
     let svc = service();
     let namespace = "history-team";

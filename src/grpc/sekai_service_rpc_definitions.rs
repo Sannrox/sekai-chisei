@@ -874,6 +874,134 @@ pub(super) async fn list_published_definition_revisions(
         next_page_token,
     }))
 }
+pub(super) async fn propose_definition_rollback(
+    service: &SekaiServiceImpl,
+    req: Request<ProposeDefinitionRollbackRequest>,
+) -> Result<Response<ProposeDefinitionRollbackResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    let published = service
+        .db
+        .runtime()
+        .get_published_definition_revision(&input.namespace)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    authorize_definition_revision(
+        service,
+        &principals,
+        &input.namespace,
+        &published.revision_digest,
+        true,
+    )?;
+    let request = definition_proposal_domain::ProposeDefinitionRollback {
+        namespace: input.namespace,
+        branch_id: input.branch_id,
+        proposal_id: input.proposal_id,
+        restore_from_digest: input.restore_from_digest,
+        expected_published_digest: published.revision_digest.clone(),
+        migration_plan_digest: input.migration_plan_digest,
+        idempotency_key: input.idempotency_key,
+    };
+    request.prepare().map_err(Status::invalid_argument)?;
+    authorize_definition_revision(
+        service,
+        &principals,
+        &request.namespace,
+        &request.restore_from_digest,
+        true,
+    )?;
+    let restore = service
+        .db
+        .runtime()
+        .get_definition_revision(&request.namespace, &request.restore_from_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    for (member_kind, member_id) in
+        definition_proposal_domain::changed_member_refs(&published, &restore)
+    {
+        authorize_definition_member_write(
+            service,
+            principals.as_slice(),
+            &member_kind,
+            &member_id,
+        )?;
+    }
+    let actor = principals
+        .first()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    let result = service
+        .db
+        .runtime()
+        .propose_definition_rollback(&request, actor, now_millis())
+        .map_err(map_definition_write_error)?;
+    let definition_branch_domain::DefinitionWriteResult::CreateProposal { proposal } = result
+    else {
+        return Err(Status::internal("definition replay result is invalid"));
+    };
+    authorize_definition_revision(
+        service,
+        &principals,
+        &proposal.namespace,
+        &proposal.base_digest,
+        true,
+    )?;
+    authorize_definition_revision(
+        service,
+        &principals,
+        &proposal.namespace,
+        &proposal.candidate_digest,
+        false,
+    )?;
+    authorize_proposal_member_writes(
+        service,
+        &principals,
+        &proposal.namespace,
+        &proposal.base_digest,
+        &proposal.candidate_digest,
+    )?;
+    let base = service
+        .db
+        .runtime()
+        .get_definition_revision(&proposal.namespace, &proposal.base_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    let candidate = service
+        .db
+        .runtime()
+        .get_definition_revision(&proposal.namespace, &proposal.candidate_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    let base_members = service
+        .db
+        .runtime()
+        .get_definition_members(&proposal.namespace, &proposal.base_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    let candidate_members = service
+        .db
+        .runtime()
+        .get_definition_members(&proposal.namespace, &proposal.candidate_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    let preview = definition_diff_domain::compare_definition_revisions(
+        &base,
+        &base_members,
+        &candidate,
+        &candidate_members,
+    )
+    .map_err(map_definition_write_error)?;
+    Ok(Response::new(ProposeDefinitionRollbackResponse {
+        proposal: Some(to_proto_definition_proposal(&proposal)),
+        preview: Some(to_proto_definition_revision_diff(&preview)),
+    }))
+}
 pub(super) async fn compare_definition_revisions(
     service: &SekaiServiceImpl,
     req: Request<CompareDefinitionRevisionsRequest>,

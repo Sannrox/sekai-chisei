@@ -8,6 +8,13 @@
   days from bind time. A later unrelated edit cannot restore the author's
   ability to self-certify or to clear `revoked_at_ms` (#1513).
 
+- Experimental `ProposeDefinitionRollback` opens an append-only proposal whose
+  candidate restores a prior published revision as a new descendant of the live
+  head. Merge records `restored_from_digest` on the receipt and refuses when
+  the rollback would drop object or dataset properties still present unless a
+  migration plan digest is pinned (#1390). Additive experimental RPC and JSON
+  fields; no PostgreSQL migration.
+
 - Governed images, renditions, and annotations, and registered Iceberg/Parquet
   open-table projections persist on community PostgreSQL with the same owner
   CAS, parent, tombstone, and snapshot-digest behavior as SQLite (#1479).
