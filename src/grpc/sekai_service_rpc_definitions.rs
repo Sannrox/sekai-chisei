@@ -122,6 +122,58 @@ pub(super) async fn get_definition_member(
     }))
 }
 
+fn stored_suite_result(
+    service: &SekaiServiceImpl,
+    suite_id: &str,
+    certification_id: &str,
+) -> Result<crate::sekai::agent_promotion::StoredSuiteResult, Status> {
+    let run = service
+        .db
+        .runtime()
+        .get_eval_run_record(certification_id)
+        .map_err(|_| {
+            Status::failed_precondition(crate::sekai::agent_promotion::REFUSAL_SUITE_MISSING)
+        })?
+        .ok_or_else(|| {
+            Status::failed_precondition(crate::sekai::agent_promotion::REFUSAL_SUITE_MISSING)
+        })?;
+    if run.suite_id != suite_id {
+        return Err(Status::failed_precondition(
+            crate::sekai::agent_promotion::REFUSAL_SUITE_MISSING,
+        ));
+    }
+    let passed = !run.results.is_empty() && run.results.iter().all(|result| result.passed);
+    Ok(
+        crate::sekai::agent_promotion::StoredSuiteResult::from_run_pass(
+            &run.suite_id,
+            &run.id,
+            passed,
+        ),
+    )
+}
+
+fn map_certification_bind_error(error: String) -> Status {
+    if error.starts_with("agent_promotion_self_certification") {
+        Status::permission_denied(error)
+    } else if error.starts_with("agent_promotion_certification_expiry")
+        || error.starts_with("agent_promotion_certification_status")
+    {
+        Status::invalid_argument(error)
+    } else if error.starts_with("agent_promotion_") {
+        Status::failed_precondition(error)
+    } else {
+        Status::invalid_argument(error)
+    }
+}
+
+fn map_certification_store_error(error: String) -> Status {
+    if error.starts_with("agent_promotion_") {
+        map_certification_bind_error(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
 fn to_proto_definition_certification_gate(
     gate: &crate::sekai::agent_promotion::AgentPromotionGate,
 ) -> DefinitionCertificationGate {
@@ -183,9 +235,52 @@ pub(super) async fn put_definition_certification(
     let actor = principals
         .first()
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
-    // #1353 binds an operator snapshot to the candidate. Merge admits that
-    // snapshot; it does not re-run suites or resolve a separate envelope.
-    let certification = crate::sekai::agent_promotion::AgentDefinitionCertification {
+    let published = service
+        .db
+        .runtime()
+        .get_published_definition_revision(&input.namespace)
+        .map_err(|_| Status::internal("definition resource unavailable"))?;
+    let lineage = crate::sekai::agent_promotion::certification_lineage(
+        &candidate,
+        published.as_ref(),
+        |digest| {
+            service
+                .db
+                .runtime()
+                .get_definition_revision(&input.namespace, digest)
+        },
+    )
+    .map_err(|_| Status::internal("definition resource unavailable"))?;
+    let authors = crate::sekai::agent_promotion::agent_change_authors(&lineage);
+    if principals
+        .iter()
+        .any(|principal| authors.contains(principal))
+    {
+        return Err(Status::permission_denied(
+            crate::sekai::agent_promotion::REFUSAL_SELF_CERTIFY,
+        ));
+    }
+    // Binding copies suite identity and pass/fail from a stored run. Merge
+    // admits that snapshot; it does not re-run suites.
+    let existing = service
+        .db
+        .runtime()
+        .get_agent_definition_certification(&input.namespace, &input.revision_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?;
+    let applying_revoke = existing
+        .as_ref()
+        .is_some_and(|bound| bound.revoked_at_ms == 0)
+        && input.revoked_at_ms > 0;
+    let suite = if applying_revoke {
+        None
+    } else {
+        Some(stored_suite_result(
+            service,
+            &input.suite_id,
+            &input.certification_id,
+        )?)
+    };
+    let requested = crate::sekai::agent_promotion::AgentDefinitionCertification {
         namespace: input.namespace,
         revision_digest: input.revision_digest,
         suite_id: input.suite_id,
@@ -197,12 +292,18 @@ pub(super) async fn put_definition_certification(
         bound_by: actor.clone(),
         bound_at_ms: now_millis(),
     };
-    certification.validate().map_err(Status::invalid_argument)?;
+    let certification = crate::sekai::agent_promotion::bind_certification(
+        &authors,
+        requested,
+        existing.as_ref(),
+        suite.as_ref(),
+    )
+    .map_err(map_certification_bind_error)?;
     service
         .db
         .runtime()
         .put_agent_definition_certification(&certification)
-        .map_err(Status::internal)?;
+        .map_err(map_certification_store_error)?;
     let gate = certification.gate(now_millis());
     Ok(Response::new(PutDefinitionCertificationResponse {
         gate: Some(to_proto_definition_certification_gate(&gate)),

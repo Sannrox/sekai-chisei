@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `PutDefinitionCertification` copies suite identity and pass/fail from a
+  stored eval run, refuses a bind by authors of agent-member changes since
+  the published base, treats revocation as one-way, and caps expiry at 90
+  days from bind time. A later unrelated edit cannot restore the author's
+  ability to self-certify or to clear `revoked_at_ms` (#1513).
+
 - Governed images, renditions, and annotations, and registered Iceberg/Parquet
   open-table projections persist on community PostgreSQL with the same owner
   CAS, parent, tombstone, and snapshot-digest behavior as SQLite (#1479).

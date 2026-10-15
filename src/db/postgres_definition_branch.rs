@@ -1032,6 +1032,16 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_published_head(&mut transaction, &certification.namespace)?;
+        let existing = get_agent_definition_certification_postgres(
+            &mut transaction,
+            &certification.namespace,
+            &certification.revision_digest,
+            true,
+        )?;
+        crate::sekai::agent_promotion::refuse_revoke_undo(
+            existing.as_ref(),
+            certification.revoked_at_ms,
+        )?;
         transaction
             .execute(
                 "INSERT INTO sekai_agent_definition_certifications (
@@ -1045,7 +1055,11 @@ impl PostgresDb {
                     baseline_status=EXCLUDED.baseline_status,
                     latest_status=EXCLUDED.latest_status,
                     expires_at_ms=EXCLUDED.expires_at_ms,
-                    revoked_at_ms=EXCLUDED.revoked_at_ms,
+                    revoked_at_ms=CASE
+                        WHEN sekai_agent_definition_certifications.revoked_at_ms > 0
+                        THEN sekai_agent_definition_certifications.revoked_at_ms
+                        ELSE EXCLUDED.revoked_at_ms
+                    END,
                     bound_by=EXCLUDED.bound_by,
                     bound_at_ms=EXCLUDED.bound_at_ms",
                 &[

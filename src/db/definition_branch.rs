@@ -1227,7 +1227,20 @@ impl SekaiDb {
         certification: &crate::sekai::agent_promotion::AgentDefinitionCertification,
     ) -> Result<(), String> {
         certification.validate()?;
-        self.conn()
+        let mut connection = self.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing = get_agent_definition_certification_sqlite(
+            &transaction,
+            &certification.namespace,
+            &certification.revision_digest,
+        )?;
+        crate::sekai::agent_promotion::refuse_revoke_undo(
+            existing.as_ref(),
+            certification.revoked_at_ms,
+        )?;
+        transaction
             .execute(
                 "INSERT INTO sekai_agent_definition_certifications (
                     namespace, revision_digest, suite_id, certification_id,
@@ -1240,7 +1253,11 @@ impl SekaiDb {
                     baseline_status=excluded.baseline_status,
                     latest_status=excluded.latest_status,
                     expires_at_ms=excluded.expires_at_ms,
-                    revoked_at_ms=excluded.revoked_at_ms,
+                    revoked_at_ms=CASE
+                        WHEN sekai_agent_definition_certifications.revoked_at_ms > 0
+                        THEN sekai_agent_definition_certifications.revoked_at_ms
+                        ELSE excluded.revoked_at_ms
+                    END,
                     bound_by=excluded.bound_by,
                     bound_at_ms=excluded.bound_at_ms",
                 params![
@@ -1256,8 +1273,8 @@ impl SekaiDb {
                     certification.bound_at_ms,
                 ],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn get_agent_definition_certification(

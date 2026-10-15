@@ -572,6 +572,27 @@ const SOURCE_TYPE_DIGEST: &str = source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIG
 const SOURCE_PAYLOAD_DIGEST: &str =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+fn seed_agent_eval_run(svc: &SekaiServiceImpl, id: &str, suite_id: &str, passed: bool) {
+    svc.db
+        .runtime()
+        .put_eval_run(&crate::chisei::eval::Run {
+            id: id.into(),
+            suite_id: suite_id.into(),
+            config_ref: "native-default".into(),
+            results: vec![crate::chisei::eval::CaseResult {
+                case_id: "case-1".into(),
+                passed,
+                status: if passed { "done" } else { "failed" }.into(),
+                result: "result".into(),
+                score: if passed { 100 } else { 0 },
+                reason: String::new(),
+                elapsed: 10,
+            }],
+            timestamp: 1,
+        })
+        .unwrap();
+}
+
 fn grant_source_namespace(
     svc: &SekaiServiceImpl,
     namespace: &str,
@@ -13085,45 +13106,35 @@ async fn definition_certification_gate_rpc_reports_bound_states() {
     assert!(!missing.admitted);
     assert_eq!(missing.certification_status, "missing");
     assert_eq!(missing.refusal, "agent_promotion_requires_certification");
-    let put = |baseline: &str, latest: &str, expires: i64, revoked: i64| {
+    grant_source_namespace(&svc, namespace, "reviewer", security::Role::Admin);
+    for principal in ["root", "reviewer"] {
+        svc.security.add_grant(&security::Grant {
+            id: format!("{namespace}-{principal}-agent-admin"),
+            object_id: "schema:agent:triage".into(),
+            principal: principal.into(),
+            role: security::Role::Admin,
+            created: 1,
+        });
+    }
+    seed_agent_eval_run(&svc, "agent-cert", "agent-suite", true);
+    seed_agent_eval_run(&svc, "agent-cert-fail", "agent-suite", false);
+    let expires = now_millis() + 86_400_000;
+    let put = |cert_id: &str, baseline: &str, latest: &str, expires: i64, revoked: i64| {
         PutDefinitionCertificationRequest {
             namespace: namespace.into(),
             revision_digest: digest.clone(),
             suite_id: "agent-suite".into(),
-            certification_id: "agent-cert".into(),
+            certification_id: cert_id.into(),
             baseline_status: baseline.into(),
             latest_status: latest.into(),
             expires_at_ms: expires,
             revoked_at_ms: revoked,
         }
     };
-    let revoked = svc
-        .put_definition_certification(with_named_principal(
-            put("pass", "pass", 4_102_444_800_000, 4),
-            "root",
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .gate
-        .unwrap();
-    assert!(!revoked.admitted);
-    assert_eq!(revoked.certification_status, "revoked");
-    assert_eq!(revoked.refusal, "agent_promotion_certification_revoked");
-    let stale = svc
-        .put_definition_certification(with_named_principal(put("pass", "pass", 1, 0), "root"))
-        .await
-        .unwrap()
-        .into_inner()
-        .gate
-        .unwrap();
-    assert!(!stale.admitted);
-    assert_eq!(stale.certification_status, "stale");
-    assert_eq!(stale.refusal, "agent_promotion_certification_stale");
     let failed = svc
         .put_definition_certification(with_named_principal(
-            put("pass", "fail", 4_102_444_800_000, 0),
-            "root",
+            put("agent-cert-fail", "fail", "fail", expires, 0),
+            "reviewer",
         ))
         .await
         .unwrap()
@@ -13133,10 +13144,23 @@ async fn definition_certification_gate_rpc_reports_bound_states() {
     assert!(!failed.admitted);
     assert_eq!(failed.certification_status, "fail");
     assert_eq!(failed.refusal, "agent_promotion_certification_failed");
+    let stale = svc
+        .put_definition_certification(with_named_principal(
+            put("agent-cert", "pass", "pass", 1, 0),
+            "reviewer",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!stale.admitted);
+    assert_eq!(stale.certification_status, "stale");
+    assert_eq!(stale.refusal, "agent_promotion_certification_stale");
     let admitted = svc
         .put_definition_certification(with_named_principal(
-            put("pass", "pass", 4_102_444_800_000, 0),
-            "root",
+            put("agent-cert", "pass", "pass", expires, 0),
+            "reviewer",
         ))
         .await
         .unwrap()
@@ -13146,6 +13170,19 @@ async fn definition_certification_gate_rpc_reports_bound_states() {
     assert!(admitted.admitted);
     assert_eq!(admitted.certification_status, "admitted");
     assert!(admitted.refusal.is_empty());
+    let revoked = svc
+        .put_definition_certification(with_named_principal(
+            put("agent-cert", "pass", "pass", expires, 4),
+            "reviewer",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!revoked.admitted);
+    assert_eq!(revoked.certification_status, "revoked");
+    assert_eq!(revoked.refusal, "agent_promotion_certification_revoked");
     let reported = svc
         .get_definition_certification_gate(with_named_principal(
             GetDefinitionCertificationGateRequest {
@@ -13159,7 +13196,362 @@ async fn definition_certification_gate_rpc_reports_bound_states() {
         .into_inner()
         .gate
         .unwrap();
-    assert_eq!(reported, admitted);
+    assert_eq!(reported, revoked);
+}
+
+#[tokio::test]
+async fn definition_certification_refuses_self_certify_revoke_undo_and_caller_statuses() {
+    let svc = service();
+    let namespace = "definition-cert-guard";
+    let parent = seed_definition_parent(&svc, namespace);
+    grant_source_namespace(&svc, namespace, "root", security::Role::Admin);
+    grant_source_namespace(&svc, namespace, "reviewer", security::Role::Admin);
+    for principal in ["root", "reviewer"] {
+        svc.security.add_grant(&security::Grant {
+            id: format!("{namespace}-{principal}-agent-admin"),
+            object_id: "schema:agent:triage".into(),
+            principal: principal.into(),
+            role: security::Role::Admin,
+            created: 1,
+        });
+    }
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: "create-cert-guard".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let applied = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "agent".into(),
+                    member_id: "triage".into(),
+                    member_digest: String::new(),
+                    definition_json: serde_json::json!({
+                        "contract_version": "sekai.agent-definition/v1",
+                        "name": "Triage",
+                        "task_class": "lookup",
+                        "instructions": "Inspect records.",
+                        "allowed_action_types": ["Ticket.inspect"]
+                    })
+                    .to_string(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "edit-agent-guard".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let digest = applied.revision.unwrap().revision_digest;
+    seed_agent_eval_run(&svc, "agent-cert", "agent-suite", true);
+    let expires = now_millis() + 86_400_000;
+    let put = |baseline: &str, latest: &str, expires: i64, revoked: i64, cert_id: &str| {
+        PutDefinitionCertificationRequest {
+            namespace: namespace.into(),
+            revision_digest: digest.clone(),
+            suite_id: "agent-suite".into(),
+            certification_id: cert_id.into(),
+            baseline_status: baseline.into(),
+            latest_status: latest.into(),
+            expires_at_ms: expires,
+            revoked_at_ms: revoked,
+        }
+    };
+    let self_certify = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "pass", expires, 0, "agent-cert"),
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(self_certify.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        self_certify.message(),
+        "agent_promotion_self_certification_forbidden"
+    );
+    let hidden_author = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "pass", expires, 0, "agent-cert"),
+            "reviewer,root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(hidden_author.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        hidden_author.message(),
+        "agent_promotion_self_certification_forbidden"
+    );
+    let missing_suite = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "pass", expires, 0, "missing-cert"),
+            "reviewer",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing_suite.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        missing_suite.message(),
+        "agent_promotion_certification_suite_result_missing"
+    );
+    let caller_status = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "fail", expires, 0, "agent-cert"),
+            "reviewer",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(caller_status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        caller_status.message(),
+        "agent_promotion_certification_status_mismatch"
+    );
+    let forever = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "pass", i64::MAX, 0, "agent-cert"),
+            "reviewer",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(forever.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        forever.message(),
+        "agent_promotion_certification_expiry_exceeds_ttl"
+    );
+    svc.put_definition_certification(with_named_principal(
+        put("pass", "pass", expires, 4, "agent-cert"),
+        "reviewer",
+    ))
+    .await
+    .unwrap();
+    let undo = svc
+        .put_definition_certification(with_named_principal(
+            put("pass", "pass", expires, 0, "agent-cert"),
+            "reviewer",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(undo.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        undo.message(),
+        "agent_promotion_certification_revoke_is_final"
+    );
+}
+
+#[tokio::test]
+async fn definition_certification_refuses_author_after_unrelated_edit() {
+    let svc = service();
+    let namespace = "definition-cert-author-lineage";
+    let parent = seed_definition_parent(&svc, namespace);
+    grant_source_namespace(&svc, namespace, "root", security::Role::Admin);
+    grant_source_namespace(&svc, namespace, "editor", security::Role::Admin);
+    grant_source_namespace(&svc, namespace, "reviewer", security::Role::Admin);
+    for principal in ["root", "editor", "reviewer"] {
+        for object_id in ["schema:agent:triage", "schema:Ticket"] {
+            svc.security.add_grant(&security::Grant {
+                id: format!("{namespace}-{principal}-{object_id}"),
+                object_id: object_id.into(),
+                principal: principal.into(),
+                role: security::Role::Admin,
+                created: 1,
+            });
+        }
+    }
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: "create-cert-author-lineage".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let agent_edit = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "agent".into(),
+                    member_id: "triage".into(),
+                    member_digest: String::new(),
+                    definition_json: serde_json::json!({
+                        "contract_version": "sekai.agent-definition/v1",
+                        "name": "Triage",
+                        "task_class": "lookup",
+                        "instructions": "Inspect records.",
+                        "allowed_action_types": ["Ticket.inspect"]
+                    })
+                    .to_string(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "edit-agent-author-lineage".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let unrelated = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: agent_edit.revision.unwrap().revision_digest,
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    member_digest: String::new(),
+                    definition_json: r#"{"name":"Ticket","title":"Queue"}"#.into(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "edit-ticket-author-lineage".into(),
+            },
+            "editor",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let digest = unrelated.revision.unwrap().revision_digest;
+    seed_agent_eval_run(&svc, "agent-cert", "agent-suite", true);
+    let expires = now_millis() + 86_400_000;
+    let put = PutDefinitionCertificationRequest {
+        namespace: namespace.into(),
+        revision_digest: digest.clone(),
+        suite_id: "agent-suite".into(),
+        certification_id: "agent-cert".into(),
+        baseline_status: "pass".into(),
+        latest_status: "pass".into(),
+        expires_at_ms: expires,
+        revoked_at_ms: 0,
+    };
+    let self_certify = svc
+        .put_definition_certification(with_named_principal(put.clone(), "root"))
+        .await
+        .unwrap_err();
+    assert_eq!(self_certify.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        self_certify.message(),
+        "agent_promotion_self_certification_forbidden"
+    );
+    let admitted = svc
+        .put_definition_certification(with_named_principal(put, "reviewer"))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(admitted.admitted);
+}
+
+#[tokio::test]
+async fn definition_certification_revokes_when_the_suite_run_is_gone() {
+    let svc = service();
+    let namespace = "definition-cert-revoke-missing-suite";
+    let parent = seed_definition_parent(&svc, namespace);
+    grant_source_namespace(&svc, namespace, "root", security::Role::Admin);
+    grant_source_namespace(&svc, namespace, "reviewer", security::Role::Admin);
+    for principal in ["root", "reviewer"] {
+        svc.security.add_grant(&security::Grant {
+            id: format!("{namespace}-{principal}-agent-admin"),
+            object_id: "schema:agent:triage".into(),
+            principal: principal.into(),
+            role: security::Role::Admin,
+            created: 1,
+        });
+    }
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: "create-cert-revoke-missing".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let applied = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "agent".into(),
+                    member_id: "triage".into(),
+                    member_digest: String::new(),
+                    definition_json: serde_json::json!({
+                        "contract_version": "sekai.agent-definition/v1",
+                        "name": "Triage",
+                        "task_class": "lookup",
+                        "instructions": "Inspect records.",
+                        "allowed_action_types": ["Ticket.inspect"]
+                    })
+                    .to_string(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "edit-agent-revoke-missing".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let digest = applied.revision.unwrap().revision_digest;
+    let expires = now_millis() + 86_400_000;
+    svc.db
+        .runtime()
+        .put_agent_definition_certification(
+            &crate::sekai::agent_promotion::AgentDefinitionCertification {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+                suite_id: "agent-suite".into(),
+                certification_id: "missing-run".into(),
+                baseline_status: crate::sekai::agent_promotion::STATUS_PASS.into(),
+                latest_status: crate::sekai::agent_promotion::STATUS_PASS.into(),
+                expires_at_ms: expires,
+                revoked_at_ms: 0,
+                bound_by: "reviewer".into(),
+                bound_at_ms: now_millis(),
+            },
+        )
+        .unwrap();
+    let revoked = svc
+        .put_definition_certification(with_named_principal(
+            PutDefinitionCertificationRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+                suite_id: "agent-suite".into(),
+                certification_id: "missing-run".into(),
+                baseline_status: crate::sekai::agent_promotion::STATUS_PASS.into(),
+                latest_status: crate::sekai::agent_promotion::STATUS_PASS.into(),
+                expires_at_ms: expires,
+                revoked_at_ms: 4,
+            },
+            "reviewer",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!revoked.admitted);
+    assert_eq!(revoked.certification_status, "revoked");
+    assert_eq!(revoked.refusal, "agent_promotion_certification_revoked");
 }
 
 /// Scoped draft transport retains store retry/conflict authority and never admits promotion.

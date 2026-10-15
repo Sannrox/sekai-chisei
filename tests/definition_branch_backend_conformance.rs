@@ -3,8 +3,8 @@ use std::sync::{Arc, Barrier};
 use sekai_chisei::db::definition_branch::DefinitionBranchBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::sekai::agent_promotion::{
-    AgentDefinitionCertification, REFUSAL_FAILED, REFUSAL_MISSING, REFUSAL_REVOKED, REFUSAL_STALE,
-    STATUS_FAIL, STATUS_PASS,
+    AgentDefinitionCertification, REFUSAL_FAILED, REFUSAL_MISSING, REFUSAL_REVOKE_UNDO,
+    REFUSAL_STALE, STATUS_FAIL, STATUS_PASS,
 };
 use sekai_chisei::sekai::definition_branch::{
     ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput, DefinitionMemberRef,
@@ -1187,13 +1187,12 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
         suite_id: "agent-suite".into(),
         certification_id: "agent-cert".into(),
         baseline_status: STATUS_PASS.into(),
-        latest_status: STATUS_PASS.into(),
+        latest_status: STATUS_FAIL.into(),
         expires_at_ms: 1_000,
         revoked_at_ms: 0,
         bound_by: "reviewer".into(),
         bound_at_ms: 9,
     };
-    certification.revoked_at_ms = 4;
     db.put_agent_definition_certification(&certification)
         .unwrap();
     assert_eq!(
@@ -1202,15 +1201,15 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
                 namespace: namespace.into(),
                 proposal_id: "agent-proposal".into(),
                 expected_published_digest: parent.clone(),
-                idempotency_key: "agent-merge-revoked".into(),
+                idempotency_key: "agent-merge-failed".into(),
             },
             "author",
             9,
         )
         .unwrap_err(),
-        REFUSAL_REVOKED
+        REFUSAL_FAILED
     );
-    certification.revoked_at_ms = 0;
+    certification.latest_status = STATUS_PASS.into();
     certification.expires_at_ms = 9;
     db.put_agent_definition_certification(&certification)
         .unwrap();
@@ -1229,24 +1228,6 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
         REFUSAL_STALE
     );
     certification.expires_at_ms = 1_000;
-    certification.latest_status = STATUS_FAIL.into();
-    db.put_agent_definition_certification(&certification)
-        .unwrap();
-    assert_eq!(
-        db.merge_definition_proposal(
-            &MergeDefinitionProposal {
-                namespace: namespace.into(),
-                proposal_id: "agent-proposal".into(),
-                expected_published_digest: parent.clone(),
-                idempotency_key: "agent-merge-failed".into(),
-            },
-            "author",
-            9,
-        )
-        .unwrap_err(),
-        REFUSAL_FAILED
-    );
-    certification.latest_status = STATUS_PASS.into();
     db.put_agent_definition_certification(&certification)
         .unwrap();
     db.merge_definition_proposal(
@@ -1266,6 +1247,22 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
             .unwrap()
             .revision_digest,
         second.revision.revision_digest
+    );
+    certification.revoked_at_ms = 4;
+    db.put_agent_definition_certification(&certification)
+        .unwrap();
+    let mut undo = certification.clone();
+    undo.revoked_at_ms = 0;
+    assert_eq!(
+        db.put_agent_definition_certification(&undo).unwrap_err(),
+        REFUSAL_REVOKE_UNDO
+    );
+    assert_eq!(
+        db.get_agent_definition_certification(namespace, &second.revision.revision_digest)
+            .unwrap()
+            .unwrap()
+            .revoked_at_ms,
+        4
     );
     let prepared = agent.prepare(namespace).unwrap();
     assert!(

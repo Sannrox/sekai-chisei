@@ -45,6 +45,12 @@ The unused certification envelope becomes the promotion record. Routing
 gains a fail-closed check. Operators who need an uncertified route must
 say so in namespace policy.
 
+`PutDefinitionCertification` copies suite identity and pass/fail from a
+stored eval run. Authors of agent-member changes since the published base
+cannot bind the record; a later unrelated edit does not restore that
+ability. Revocation is one-way. Expiry is capped at 90 days from bind time
+so a caller cannot admit a forever-pass snapshot (#1513).
+
 ## Validation
 
 Passing suite → certifiable. Regressing suite → promotion refused with the
