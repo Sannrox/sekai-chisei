@@ -19859,3 +19859,443 @@ async fn isolated_cancel_releases_concurrency_for_next_claim() {
         .unwrap();
     assert_eq!(next.claim_owner, "runner-b");
 }
+
+fn seed_inspect_action_type(svc: &SekaiServiceImpl, namespace: &str) {
+    svc.db
+        .runtime()
+        .put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: namespace.into(),
+                type_id: "Ticket.inspect".into(),
+                version: "1".into(),
+                description: "inspect one ticket".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec![
+                    crate::sekai::governed_action_type::EFFECT_KIND_NOTIFY.into(),
+                ],
+                enabled: true,
+                ..Default::default()
+            },
+            "root",
+            1,
+        )
+        .unwrap();
+}
+
+async fn seed_agent_draft(svc: &SekaiServiceImpl, namespace: &str) -> String {
+    let parent = seed_definition_parent(svc, namespace);
+    grant_source_namespace(svc, namespace, "root", security::Role::Admin);
+    grant_source_namespace(svc, namespace, "reviewer", security::Role::Admin);
+    for principal in ["root", "reviewer"] {
+        svc.security.add_grant(&security::Grant {
+            id: format!("{namespace}-{principal}-agent-admin"),
+            object_id: "schema:agent:triage".into(),
+            principal: principal.into(),
+            role: security::Role::Admin,
+            created: 1,
+        });
+    }
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: format!("create-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.apply_definition_branch_edit(with_named_principal(
+        ApplyDefinitionBranchEditRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            expected_head_digest: parent.revision_digest.clone(),
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "agent".into(),
+                member_id: "triage".into(),
+                member_digest: String::new(),
+                definition_json: serde_json::json!({
+                    "contract_version": "sekai.agent-definition/v1",
+                    "name": "Triage",
+                    "task_class": "lookup",
+                    "instructions": "Inspect records.",
+                    "allowed_action_types": ["Ticket.inspect"]
+                })
+                .to_string(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: format!("edit-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .revision
+    .unwrap()
+    .revision_digest
+}
+
+#[tokio::test]
+async fn agent_dry_run_proposes_actions_without_submitting_and_refuses_disallowed_types() {
+    let mut svc = service();
+    let namespace = "agent-dry-run-submit";
+    let digest = seed_agent_draft(&svc, namespace).await;
+    seed_inspect_action_type(&svc, namespace);
+    let host = std::sync::Arc::new(crate::sekai::agent_dry_run::ScriptedHost {
+        route: Ok("native/scripted".into()),
+        budget: Ok(()),
+        reply: crate::sekai::agent_dry_run::DryRunModelReply {
+            route: "native/scripted".into(),
+            output: "scripted".into(),
+            tool_calls: vec![crate::sekai::agent_dry_run::ToolCall {
+                name: "lookup".into(),
+                arguments_json: r#"{"id":"1"}"#.into(),
+            }],
+            proposed_actions: vec![
+                crate::sekai::agent_dry_run::ProposedAction {
+                    action_type: "Ticket.inspect".into(),
+                    parameters_json: r#"{"id":"1"}"#.into(),
+                },
+                crate::sekai::agent_dry_run::ProposedAction {
+                    action_type: "Ticket.close".into(),
+                    parameters_json: "{}".into(),
+                },
+            ],
+        },
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    svc.dry_run_host = Some(host);
+    let response = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+                member_id: "triage".into(),
+                input: "inspect ticket 1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.actions.len(), 2);
+    assert_eq!(response.actions[0].disposition, "would_submit");
+    assert_eq!(response.actions[0].action_type, "Ticket.inspect");
+    assert_eq!(response.actions[1].disposition, "refused");
+    assert_eq!(response.actions[1].reason, "action_type_not_allowed");
+    assert_eq!(response.model_steps[0].route, "native/scripted");
+    assert_eq!(response.tool_calls[0].name, "lookup");
+    let instances = svc
+        .list_action_instances(with_named_principal(
+            ListActionInstancesRequest {
+                namespace: namespace.into(),
+                ..Default::default()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(instances.instances.is_empty());
+    let effects = svc
+        .list_action_effects(with_named_principal(
+            ListActionEffectsRequest {
+                namespace: namespace.into(),
+                ..Default::default()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(effects.effects.is_empty());
+    let run = svc
+        .db
+        .runtime()
+        .get_eval_run_record(&response.record_id)
+        .unwrap()
+        .expect("dry-run record");
+    assert!(crate::sekai::agent_dry_run::run_is_dry_run(
+        &run.config_ref,
+        &run.suite_id
+    ));
+}
+
+#[tokio::test]
+async fn agent_dry_run_matches_definition_member_unavailable_and_cannot_certify() {
+    let mut svc = service();
+    let namespace = "agent-dry-run-auth";
+    let digest = seed_agent_draft(&svc, namespace).await;
+    let host = std::sync::Arc::new(crate::sekai::agent_dry_run::ScriptedHost::proposing(vec![
+        crate::sekai::agent_dry_run::ProposedAction {
+            action_type: "Ticket.inspect".into(),
+            parameters_json: "{}".into(),
+        },
+    ]));
+    svc.dry_run_host = Some(host);
+    let denied_member = svc
+        .get_definition_member(with_named_principal(
+            GetDefinitionMemberRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+                member_kind: "agent".into(),
+                member_id: "triage".into(),
+            },
+            "stranger",
+        ))
+        .await
+        .unwrap_err();
+    let denied_dry_run = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+                member_id: "triage".into(),
+                input: "inspect".into(),
+            },
+            "stranger",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_dry_run.code(), denied_member.code());
+    assert_eq!(denied_dry_run.message(), denied_member.message());
+    let published = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+                member_id: "triage".into(),
+                input: "inspect".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let expires = now_millis() + 86_400_000;
+    let refused = svc
+        .put_definition_certification(with_named_principal(
+            PutDefinitionCertificationRequest {
+                namespace: namespace.into(),
+                revision_digest: digest,
+                suite_id: format!("dry_run:{namespace}:triage"),
+                certification_id: published.record_id,
+                baseline_status: "pass".into(),
+                latest_status: "pass".into(),
+                expires_at_ms: expires,
+                revoked_at_ms: 0,
+            },
+            "reviewer",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        crate::sekai::agent_dry_run::REFUSAL_DRY_RUN
+    );
+}
+
+#[tokio::test]
+async fn agent_dry_run_reports_admission_and_budget_failures_once() {
+    let mut svc = service();
+    let namespace = "agent-dry-run-guards";
+    let digest = seed_agent_draft(&svc, namespace).await;
+    let admission = std::sync::Arc::new(crate::sekai::agent_dry_run::ScriptedHost {
+        route: Err("model_review.not_enabled".into()),
+        budget: Ok(()),
+        reply: crate::sekai::agent_dry_run::DryRunModelReply {
+            route: String::new(),
+            output: String::new(),
+            tool_calls: Vec::new(),
+            proposed_actions: Vec::new(),
+        },
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    svc.dry_run_host = Some(admission.clone());
+    let denied = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+                member_id: "triage".into(),
+                input: "inspect".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(denied.message(), "model_review.not_enabled");
+    assert_eq!(admission.attempts(), 1);
+    let budget = std::sync::Arc::new(crate::sekai::agent_dry_run::ScriptedHost {
+        route: Ok("native/scripted".into()),
+        budget: Err("budget exceeded".into()),
+        reply: crate::sekai::agent_dry_run::DryRunModelReply {
+            route: String::new(),
+            output: String::new(),
+            tool_calls: Vec::new(),
+            proposed_actions: Vec::new(),
+        },
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    svc.dry_run_host = Some(budget.clone());
+    let limited = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest,
+                member_id: "triage".into(),
+                input: "inspect".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(limited.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(limited.message(), "budget exceeded");
+    assert_eq!(budget.attempts(), 1);
+}
+
+#[tokio::test]
+async fn agent_dry_run_default_host_checks_admission_then_refuses_without_a_completion_host() {
+    let svc = service();
+    let namespace = "agent-dry-run-default-host";
+    let digest = seed_agent_draft(&svc, namespace).await;
+    let missing_route = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+                member_id: "triage".into(),
+                input: "inspect".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing_route.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        missing_route.message(),
+        crate::chisei::model_review::REFUSAL_NOT_ENABLED
+    );
+    svc.db
+        .runtime()
+        .insert_family_enablement_record_if_absent(
+            &crate::chisei::model_review::FamilyEnablementRecord {
+                namespace: namespace.into(),
+                region_label: String::new(),
+                family_id: "native".into(),
+                status: crate::chisei::model_review::ModelReviewStatus::Enabled,
+                actor: "root".into(),
+                reason: "admit dry run".into(),
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+    let no_host = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest,
+                member_id: "triage".into(),
+                input: "inspect".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(no_host.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        no_host.message(),
+        crate::sekai::agent_dry_run::REFUSAL_MODEL_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn agent_dry_run_namespace_revocation_overrides_global_enablement() {
+    let svc = service();
+    let namespace = "agent-dry-run-revoked-family";
+    let digest = seed_agent_draft(&svc, namespace).await;
+    svc.db
+        .runtime()
+        .insert_family_enablement_record_if_absent(
+            &crate::chisei::model_review::FamilyEnablementRecord {
+                namespace: String::new(),
+                region_label: String::new(),
+                family_id: "native".into(),
+                status: crate::chisei::model_review::ModelReviewStatus::Enabled,
+                actor: "root".into(),
+                reason: "global enable".into(),
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+    svc.db
+        .runtime()
+        .insert_family_enablement_record_if_absent(
+            &crate::chisei::model_review::FamilyEnablementRecord {
+                namespace: namespace.into(),
+                region_label: String::new(),
+                family_id: "native".into(),
+                status: crate::chisei::model_review::ModelReviewStatus::Revoked,
+                actor: "root".into(),
+                reason: "namespace revoke".into(),
+                updated_at_ms: 2,
+            },
+        )
+        .unwrap();
+    let denied = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest,
+                member_id: "triage".into(),
+                input: "inspect".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        denied.message(),
+        crate::chisei::model_review::REFUSAL_NOT_ENABLED
+    );
+}
+
+#[tokio::test]
+async fn agent_dry_run_refuses_allowed_actions_that_fail_the_type_schema() {
+    let mut svc = service();
+    let namespace = "agent-dry-run-schema";
+    let digest = seed_agent_draft(&svc, namespace).await;
+    seed_inspect_action_type(&svc, namespace);
+    svc.dry_run_host = Some(std::sync::Arc::new(
+        crate::sekai::agent_dry_run::ScriptedHost::proposing(vec![
+            crate::sekai::agent_dry_run::ProposedAction {
+                action_type: "Ticket.inspect".into(),
+                parameters_json: "{}".into(),
+            },
+        ]),
+    ));
+    let response = svc
+        .dry_run_agent(with_named_principal(
+            DryRunAgentRequest {
+                namespace: namespace.into(),
+                revision_digest: digest,
+                member_id: "triage".into(),
+                input: "inspect".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.actions[0].disposition, "refused");
+    assert_eq!(
+        response.actions[0].reason,
+        crate::sekai::agent_dry_run::REFUSAL_INVALID_PARAMETERS
+    );
+}

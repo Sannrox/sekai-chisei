@@ -666,6 +666,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetDefinitionMember"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
+            | "DryRunAgent"
             | "GetDefinitionBranch"
             | "CreateDefinitionBranch"
             | "ApplyDefinitionBranchEdit"
