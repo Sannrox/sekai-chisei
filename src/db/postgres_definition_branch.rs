@@ -13,10 +13,13 @@ use crate::sekai::definition_branch::{
 use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
     DefinitionProposal, DefinitionProposalApproval, DefinitionProposalMergeResult,
-    MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, PublishedDefinitionHistoryStore,
+    MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, PreparedProposalDigestInput,
+    ProposeDefinitionRollback, PublishedDefinitionHistoryStore,
     PublishedDefinitionRevisionHistoryEntry, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
-    history_entry_from_merged_proposal, list_published_definition_history, merge_receipt_id,
-    reject_foreign_member_grants, require_descendant_candidate,
+    dataset_column_names, history_entry_from_merged_proposal, list_published_definition_history,
+    merge_receipt_id, object_property_keys, proposal_content_digest, reject_foreign_member_grants,
+    require_descendant_candidate, require_rollback_migration_plan,
+    rollback_may_drop_live_object_type_properties, rollback_member_edits,
 };
 
 impl PostgresDb {
@@ -311,6 +314,186 @@ impl PostgresDb {
         load_proposal_postgres(&mut *self.connection()?, namespace, proposal_id)
     }
 
+    pub fn propose_definition_rollback(
+        &self,
+        request: &ProposeDefinitionRollback,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        let request_digest = request.prepare()?;
+        validate_write_context(actor, now_ms)?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_write(&mut transaction, request, actor)?;
+        lock_published_head(&mut transaction, &request.namespace)?;
+        if let Some(replayed) = replay_postgres(
+            &mut transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        if load_proposal_postgres(&mut transaction, &request.namespace, &request.proposal_id)?
+            .is_some()
+        {
+            return Err("definition_proposal_conflict: proposal identity is already in use".into());
+        }
+        if load_branch_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+            true,
+        )?
+        .is_some()
+        {
+            return Err("definition_branch_conflict: branch identity is already in use".into());
+        }
+        let published = load_published_head_postgres(&mut transaction, &request.namespace)?
+            .ok_or_else(|| {
+                "definition_revision_not_found: published head is unavailable".to_string()
+            })?;
+        if published != request.expected_published_digest {
+            return Err(
+                "stale_published_definition_head: expected published digest does not match published head"
+                    .into(),
+            );
+        }
+        if published == request.restore_from_digest {
+            return Err(
+                "definition_proposal_no_change: restore digest must differ from published head"
+                    .into(),
+            );
+        }
+        let published_revision =
+            load_revision_postgres(&mut transaction, &request.namespace, &published)?
+                .filter(|revision| revision.published)
+                .ok_or_else(|| {
+                    "definition_revision_not_found: published revision is unavailable".to_string()
+                })?;
+        let restore = load_revision_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.restore_from_digest,
+        )?
+        .filter(|revision| revision.published)
+        .ok_or_else(|| {
+            "definition_revision_not_found: restore revision is unavailable".to_string()
+        })?;
+        if restore.namespace != request.namespace {
+            return Err("definition_revision_not_found: restore revision is unavailable".into());
+        }
+        let restore_members = load_members_postgres(&mut transaction, &restore)?;
+        let (upserts, removals) = rollback_member_edits(&published_revision, &restore_members)?;
+        let branch = DefinitionBranch {
+            contract_version: crate::sekai::definition_branch::BRANCH_CONTRACT_VERSION.into(),
+            namespace: request.namespace.clone(),
+            branch_id: request.branch_id.clone(),
+            base_revision_digest: published.clone(),
+            head_revision_digest: published.clone(),
+            created_by: actor.into(),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        transaction
+            .execute(
+                "INSERT INTO sekai_definition_branches (
+                    namespace, branch_id, base_revision_digest, head_revision_digest,
+                    created_by, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $6)",
+                &[
+                    &branch.namespace,
+                    &branch.branch_id,
+                    &branch.base_revision_digest,
+                    &branch.head_revision_digest,
+                    &branch.created_by,
+                    &branch.created_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let candidate =
+            match apply_member_changes(&published_revision, &upserts, &removals, actor, now_ms) {
+                Err(error) if error.starts_with("definition_edit_no_change") => {
+                    return Err(
+                        "definition_proposal_no_change: restore matches the published member set"
+                            .into(),
+                    );
+                }
+                other => other?,
+            };
+        insert_members_postgres(&mut transaction, &upserts)?;
+        let revision = insert_revision_postgres(&mut transaction, &candidate)?;
+        let updated = transaction
+            .execute(
+                "UPDATE sekai_definition_branches
+                 SET head_revision_digest=$1, updated_at_ms=$2
+                 WHERE namespace=$3 AND branch_id=$4 AND head_revision_digest=$5",
+                &[
+                    &revision.revision_digest,
+                    &now_ms,
+                    &request.namespace,
+                    &request.branch_id,
+                    &published,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("stale_definition_branch_head: expected head is no longer current".into());
+        }
+        let proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
+            namespace: &request.namespace,
+            branch_id: &request.branch_id,
+            proposal_id: &request.proposal_id,
+            base_digest: &published,
+            candidate_digest: &revision.revision_digest,
+            eval_plan_digests: &[],
+            named_foreign_digests: &[],
+            restored_from_digest: &request.restore_from_digest,
+            migration_plan_digest: &request.migration_plan_digest,
+        })?;
+        let proposal = DefinitionProposal {
+            contract_version: PROPOSAL_CONTRACT_VERSION.into(),
+            namespace: request.namespace.clone(),
+            branch_id: request.branch_id.clone(),
+            proposal_id: request.proposal_id.clone(),
+            base_digest: published.clone(),
+            candidate_digest: revision.revision_digest.clone(),
+            proposal_digest,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            approvals: Vec::new(),
+            status: STATUS_OPEN.into(),
+            created_by: actor.into(),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            receipt_id: String::new(),
+            close_reason_code: String::new(),
+            restored_from_digest: request.restore_from_digest.clone(),
+            migration_plan_digest: request.migration_plan_digest.clone(),
+        };
+        insert_proposal_postgres(&mut transaction, &proposal)?;
+        let result = DefinitionWriteResult::CreateProposal {
+            proposal: proposal.clone(),
+        };
+        persist_result_postgres(
+            &mut transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &published,
+            &proposal.candidate_digest,
+            "propose_rollback",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
     pub fn create_definition_proposal(
         &self,
         request: &CreateDefinitionProposal,
@@ -393,6 +576,8 @@ impl PostgresDb {
             updated_at_ms: now_ms,
             receipt_id: String::new(),
             close_reason_code: String::new(),
+            restored_from_digest: String::new(),
+            migration_plan_digest: String::new(),
         };
         insert_proposal_postgres(&mut transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
@@ -563,6 +748,28 @@ impl PostgresDb {
             &candidate,
             &candidate_members,
         )?;
+        if !proposal.restored_from_digest.is_empty() {
+            if proposal.migration_plan_digest.is_empty() {
+                let rollback_diff = crate::sekai::definition_diff::compare_definition_revisions(
+                    &published_revision,
+                    &published_members,
+                    &candidate,
+                    &candidate_members,
+                )?;
+                if rollback_may_drop_live_object_type_properties(&proposal, &rollback_diff) {
+                    require_rollback_migration_plan(
+                        &proposal,
+                        &rollback_diff,
+                        &list_live_kind_properties_postgres(&mut transaction, &proposal.namespace)?,
+                    )?;
+                }
+            } else {
+                crate::sekai::definition_branch::validate_digest(
+                    "migration_plan_digest",
+                    &proposal.migration_plan_digest,
+                )?;
+            }
+        }
         let bound = get_agent_definition_certification_postgres(
             &mut transaction,
             &proposal.namespace,
@@ -582,6 +789,7 @@ impl PostgresDb {
             &proposal.base_digest,
             &proposal.candidate_digest,
             &published,
+            &proposal.restored_from_digest,
         )?;
         let published_revision = mark_revision_published_postgres(&mut transaction, &candidate)?;
         write_published_head_postgres(
@@ -675,6 +883,39 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
+}
+
+fn list_live_kind_properties_postgres(
+    transaction: &mut Transaction<'_>,
+    namespace: &str,
+) -> Result<Vec<(String, std::collections::BTreeSet<String>)>, String> {
+    let mut live = Vec::new();
+    for row in transaction
+        .query(
+            "SELECT kind, properties FROM sekai_objects WHERE namespace=$1",
+            &[&namespace],
+        )
+        .map_err(|error| error.to_string())?
+    {
+        let kind: String = row.get(0);
+        let properties: String = row.get(1);
+        live.push((kind, object_property_keys(&properties)));
+    }
+    for row in transaction
+        .query(
+            "SELECT o.kind, d.columns
+             FROM sekai_datasets d
+             INNER JOIN sekai_objects o ON o.id = d.object_id
+             WHERE o.namespace=$1",
+            &[&namespace],
+        )
+        .map_err(|error| error.to_string())?
+    {
+        let kind: String = row.get(0);
+        let columns: String = row.get(1);
+        live.push((kind, dataset_column_names(&columns)));
+    }
+    Ok(live)
 }
 
 fn validate_write_context(actor: &str, now_ms: i64) -> Result<(), String> {

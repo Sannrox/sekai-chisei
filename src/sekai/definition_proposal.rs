@@ -11,9 +11,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 use crate::sekai::definition_branch::{
-    DefinitionRevision, MAX_DEFINITION_ID_BYTES, validate_digest, validate_identifier,
-    validate_namespace,
+    DefinitionMember, DefinitionMemberRef, DefinitionRevision, MAX_DEFINITION_ID_BYTES,
+    validate_digest, validate_identifier, validate_namespace,
 };
+use crate::sekai::definition_diff::DefinitionRevisionDiff;
 
 pub const PROPOSAL_CONTRACT_VERSION: &str = "sekai.definition-proposal/v1";
 pub const MAX_PROPOSAL_DIGEST_REFS: usize = 32;
@@ -53,6 +54,10 @@ pub struct DefinitionProposal {
     pub receipt_id: String,
     #[serde(default)]
     pub close_reason_code: String,
+    #[serde(default)]
+    pub restored_from_digest: String,
+    #[serde(default)]
+    pub migration_plan_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +92,21 @@ pub struct CloseDefinitionProposal {
     pub namespace: String,
     pub proposal_id: String,
     pub reason_code: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposeDefinitionRollback {
+    pub namespace: String,
+    pub branch_id: String,
+    pub proposal_id: String,
+    pub restore_from_digest: String,
+    // Captured for compare-and-swap only; omitted from the request digest so
+    // an identical client retry still replays after the published head moves.
+    #[serde(default, skip_serializing)]
+    pub expected_published_digest: String,
+    #[serde(default)]
+    pub migration_plan_digest: String,
     pub idempotency_key: String,
 }
 
@@ -320,15 +340,17 @@ impl CreateDefinitionProposal {
                 "definition_proposal_conflict: eval and foreign digest lists overlap".into(),
             );
         }
-        let proposal_digest = proposal_content_digest(
-            &self.namespace,
-            &self.branch_id,
-            &self.proposal_id,
-            &self.base_digest,
-            &self.candidate_digest,
-            &eval_plan_digests,
-            &named_foreign_digests,
-        )?;
+        let proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
+            namespace: &self.namespace,
+            branch_id: &self.branch_id,
+            proposal_id: &self.proposal_id,
+            base_digest: &self.base_digest,
+            candidate_digest: &self.candidate_digest,
+            eval_plan_digests: &eval_plan_digests,
+            named_foreign_digests: &named_foreign_digests,
+            restored_from_digest: "",
+            migration_plan_digest: "",
+        })?;
         let request_digest = canonical_digest(
             "create_definition_proposal",
             &PreparedProposalDigestInput {
@@ -339,6 +361,8 @@ impl CreateDefinitionProposal {
                 candidate_digest: &self.candidate_digest,
                 eval_plan_digests: &eval_plan_digests,
                 named_foreign_digests: &named_foreign_digests,
+                restored_from_digest: "",
+                migration_plan_digest: "",
             },
         )?;
         Ok((
@@ -391,6 +415,36 @@ impl CloseDefinitionProposal {
     }
 }
 
+impl ProposeDefinitionRollback {
+    pub fn prepare(&self) -> Result<String, String> {
+        validate_namespace(&self.namespace)?;
+        validate_identifier("branch_id", &self.branch_id, MAX_DEFINITION_ID_BYTES)?;
+        validate_identifier("proposal_id", &self.proposal_id, MAX_DEFINITION_ID_BYTES)?;
+        validate_digest("restore_from_digest", &self.restore_from_digest)?;
+        if self.expected_published_digest.is_empty() {
+            return Err(
+                "stale_published_definition_head: expected published digest is required".into(),
+            );
+        }
+        validate_digest("expected_published_digest", &self.expected_published_digest)?;
+        if self.restore_from_digest == self.expected_published_digest {
+            return Err(
+                "definition_proposal_no_change: restore digest must differ from published head"
+                    .into(),
+            );
+        }
+        if !self.migration_plan_digest.is_empty() {
+            validate_digest("migration_plan_digest", &self.migration_plan_digest)?;
+        }
+        validate_identifier(
+            "idempotency_key",
+            &self.idempotency_key,
+            MAX_DEFINITION_ID_BYTES,
+        )?;
+        canonical_digest("propose_definition_rollback", self)
+    }
+}
+
 impl DefinitionProposal {
     pub fn verify(&self) -> Result<(), String> {
         if self.contract_version != PROPOSAL_CONTRACT_VERSION {
@@ -409,15 +463,23 @@ impl DefinitionProposal {
         {
             return Err("definition proposal digest lists are not canonical".into());
         }
-        let expected = proposal_content_digest(
-            &self.namespace,
-            &self.branch_id,
-            &self.proposal_id,
-            &self.base_digest,
-            &self.candidate_digest,
-            &self.eval_plan_digests,
-            &self.named_foreign_digests,
-        )?;
+        if !self.restored_from_digest.is_empty() {
+            validate_digest("restored_from_digest", &self.restored_from_digest)?;
+        }
+        if !self.migration_plan_digest.is_empty() {
+            validate_digest("migration_plan_digest", &self.migration_plan_digest)?;
+        }
+        let expected = proposal_content_digest(&PreparedProposalDigestInput {
+            namespace: &self.namespace,
+            branch_id: &self.branch_id,
+            proposal_id: &self.proposal_id,
+            base_digest: &self.base_digest,
+            candidate_digest: &self.candidate_digest,
+            eval_plan_digests: &self.eval_plan_digests,
+            named_foreign_digests: &self.named_foreign_digests,
+            restored_from_digest: &self.restored_from_digest,
+            migration_plan_digest: &self.migration_plan_digest,
+        })?;
         if expected != self.proposal_digest {
             return Err("definition proposal content binding is invalid".into());
         }
@@ -527,6 +589,7 @@ pub fn merge_receipt_id(
     base_digest: &str,
     candidate_digest: &str,
     previous_published_digest: &str,
+    restored_from_digest: &str,
 ) -> Result<String, String> {
     canonical_digest(
         "definition_proposal_merge_receipt",
@@ -537,8 +600,114 @@ pub fn merge_receipt_id(
             base_digest,
             candidate_digest,
             previous_published_digest,
+            restored_from_digest,
         },
     )
+}
+
+/// Upserts every member of a prior published revision and removes members that
+/// exist only on the live published head, so the candidate matches the restore
+/// set while remaining a descendant of that head.
+pub fn rollback_member_edits(
+    published: &DefinitionRevision,
+    restore_members: &[DefinitionMember],
+) -> Result<(Vec<DefinitionMember>, Vec<DefinitionMemberRef>), String> {
+    let restore_keys = restore_members
+        .iter()
+        .map(|member| (member.member_kind.clone(), member.member_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let removals = published
+        .members
+        .iter()
+        .filter(|member| {
+            !restore_keys.contains(&(member.member_kind.clone(), member.member_id.clone()))
+        })
+        .map(|member| DefinitionMemberRef {
+            member_kind: member.member_kind.clone(),
+            member_id: member.member_id.clone(),
+        })
+        .collect();
+    Ok((restore_members.to_vec(), removals))
+}
+
+pub fn object_property_keys(properties_json: &str) -> BTreeSet<String> {
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(properties_json)
+        .map(|properties| properties.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+pub fn dataset_column_names(columns_json: &str) -> BTreeSet<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(columns_json) else {
+        return BTreeSet::new();
+    };
+    let mut names = BTreeSet::new();
+    let Some(items) = value.as_array() else {
+        return names;
+    };
+    for item in items {
+        match item {
+            serde_json::Value::String(name) => {
+                names.insert(name.clone());
+            }
+            serde_json::Value::Array(tuple) => {
+                if let Some(serde_json::Value::String(name)) = tuple.first() {
+                    names.insert(name.clone());
+                }
+            }
+            serde_json::Value::Object(object) => {
+                if let Some(serde_json::Value::String(name)) = object.get("name") {
+                    names.insert(name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+pub fn rollback_may_drop_live_object_type_properties(
+    proposal: &DefinitionProposal,
+    diff: &DefinitionRevisionDiff,
+) -> bool {
+    if proposal.restored_from_digest.is_empty() || !proposal.migration_plan_digest.is_empty() {
+        return false;
+    }
+    diff.changed
+        .iter()
+        .chain(diff.removed.iter())
+        .any(|change| change.member_kind == "object_type" && !change.removed_properties.is_empty())
+}
+
+pub fn require_rollback_migration_plan(
+    proposal: &DefinitionProposal,
+    diff: &DefinitionRevisionDiff,
+    live_kind_properties: &[(String, BTreeSet<String>)],
+) -> Result<(), String> {
+    if proposal.restored_from_digest.is_empty() {
+        return Ok(());
+    }
+    if !proposal.migration_plan_digest.is_empty() {
+        return validate_digest("migration_plan_digest", &proposal.migration_plan_digest);
+    }
+    let dropping = diff
+        .changed
+        .iter()
+        .chain(diff.removed.iter())
+        .any(|change| {
+            change.member_kind == "object_type"
+                && change.removed_properties.iter().any(|property| {
+                    live_kind_properties
+                        .iter()
+                        .any(|(kind, keys)| kind == &change.member_id && keys.contains(property))
+                })
+        });
+    if dropping {
+        return Err(
+            "definition_rollback_requires_migration_plan: rollback would drop live object or dataset properties"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub fn require_descendant_candidate(
@@ -613,27 +782,10 @@ fn normalize_digest_refs(field: &str, values: &[String]) -> Result<Vec<String>, 
     Ok(unique.into_iter().collect())
 }
 
-fn proposal_content_digest(
-    namespace: &str,
-    branch_id: &str,
-    proposal_id: &str,
-    base_digest: &str,
-    candidate_digest: &str,
-    eval_plan_digests: &[String],
-    named_foreign_digests: &[String],
+pub(crate) fn proposal_content_digest(
+    input: &PreparedProposalDigestInput<'_>,
 ) -> Result<String, String> {
-    canonical_digest(
-        "definition_proposal",
-        &PreparedProposalDigestInput {
-            namespace,
-            branch_id,
-            proposal_id,
-            base_digest,
-            candidate_digest,
-            eval_plan_digests,
-            named_foreign_digests,
-        },
-    )
+    canonical_digest("definition_proposal", input)
 }
 
 #[derive(Serialize)]
@@ -644,17 +796,23 @@ struct MergeReceiptDigestInput<'a> {
     base_digest: &'a str,
     candidate_digest: &'a str,
     previous_published_digest: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    restored_from_digest: &'a str,
 }
 
 #[derive(Serialize)]
-struct PreparedProposalDigestInput<'a> {
-    namespace: &'a str,
-    branch_id: &'a str,
-    proposal_id: &'a str,
-    base_digest: &'a str,
-    candidate_digest: &'a str,
-    eval_plan_digests: &'a [String],
-    named_foreign_digests: &'a [String],
+pub(crate) struct PreparedProposalDigestInput<'a> {
+    pub(crate) namespace: &'a str,
+    pub(crate) branch_id: &'a str,
+    pub(crate) proposal_id: &'a str,
+    pub(crate) base_digest: &'a str,
+    pub(crate) candidate_digest: &'a str,
+    pub(crate) eval_plan_digests: &'a [String],
+    pub(crate) named_foreign_digests: &'a [String],
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub(crate) restored_from_digest: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub(crate) migration_plan_digest: &'a str,
 }
 
 fn canonical_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
@@ -765,16 +923,20 @@ mod tests {
             updated_at_ms: 2,
             receipt_id: String::new(),
             close_reason_code: String::new(),
+            restored_from_digest: String::new(),
+            migration_plan_digest: String::new(),
         };
-        proposal.proposal_digest = proposal_content_digest(
-            &proposal.namespace,
-            &proposal.branch_id,
-            &proposal.proposal_id,
-            &proposal.base_digest,
-            &proposal.candidate_digest,
-            &proposal.eval_plan_digests,
-            &proposal.named_foreign_digests,
-        )
+        proposal.proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
+            namespace: &proposal.namespace,
+            branch_id: &proposal.branch_id,
+            proposal_id: &proposal.proposal_id,
+            base_digest: &proposal.base_digest,
+            candidate_digest: &proposal.candidate_digest,
+            eval_plan_digests: &proposal.eval_plan_digests,
+            named_foreign_digests: &proposal.named_foreign_digests,
+            restored_from_digest: "",
+            migration_plan_digest: "",
+        })
         .unwrap();
         proposal.verify().unwrap();
         proposal.status = STATUS_CLOSED.into();
@@ -927,5 +1089,21 @@ mod tests {
             "ontology_class",
             "TicketClass"
         ));
+    }
+
+    #[test]
+    fn rollback_request_digest_ignores_expected_published_head() {
+        let mut request = ProposeDefinitionRollback {
+            namespace: "team-a".into(),
+            branch_id: "restore".into(),
+            proposal_id: "cs-1".into(),
+            restore_from_digest: digest('a'),
+            expected_published_digest: digest('b'),
+            migration_plan_digest: String::new(),
+            idempotency_key: "rb-1".into(),
+        };
+        let first = request.prepare().unwrap();
+        request.expected_published_digest = digest('c');
+        assert_eq!(first, request.prepare().unwrap());
     }
 }

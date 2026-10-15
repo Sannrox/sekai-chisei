@@ -2450,6 +2450,8 @@ message DefinitionProposal {
   int64 updated_at_ms = 14;
   string receipt_id = 15; // set only after merge
   string close_reason_code = 16; // set only after close
+  string restored_from_digest = 17; // prior published revision restored by this proposal
+  string migration_plan_digest = 18; // pin required when rollback would drop live properties
 }
 
 message CreateDefinitionProposalRequest {
@@ -2539,6 +2541,20 @@ message ListPublishedDefinitionRevisionsRequest {
 message ListPublishedDefinitionRevisionsResponse {
   repeated PublishedDefinitionRevisionHistoryEntry entries = 1;
   string next_page_token = 2;
+}
+
+message ProposeDefinitionRollbackRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string restore_from_digest = 4;
+  string migration_plan_digest = 5;
+  string idempotency_key = 6;
+}
+
+message ProposeDefinitionRollbackResponse {
+  DefinitionProposal proposal = 1;
+  DefinitionRevisionDiff preview = 2;
 }
 
 
@@ -2765,6 +2781,7 @@ service SekaiService {
   rpc CloseDefinitionProposal(CloseDefinitionProposalRequest) returns (CloseDefinitionProposalResponse);
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc ListPublishedDefinitionRevisions(ListPublishedDefinitionRevisionsRequest) returns (ListPublishedDefinitionRevisionsResponse);
+  rpc ProposeDefinitionRollback(ProposeDefinitionRollbackRequest) returns (ProposeDefinitionRollbackResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);

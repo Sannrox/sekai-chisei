@@ -941,6 +941,7 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("fact_migration_rollback_denied")
         || error.starts_with("object_security_denied")
         || error.starts_with("fact_migration_limit")
+        || error.starts_with("definition_rollback_requires_migration_plan")
     {
         Status::failed_precondition("definition write is not current")
     } else if error.starts_with("agent_promotion_") {
@@ -990,6 +991,8 @@ pub(super) fn to_proto_definition_proposal(
         updated_at_ms: proposal.updated_at_ms,
         receipt_id: proposal.receipt_id.clone(),
         close_reason_code: proposal.close_reason_code.clone(),
+        restored_from_digest: proposal.restored_from_digest.clone(),
+        migration_plan_digest: proposal.migration_plan_digest.clone(),
     }
 }
 pub(super) fn authorize_proposal_member_writes(

@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
 
 use sekai_chisei::db::definition_branch::DefinitionBranchBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_chisei::domain::Object;
 use sekai_chisei::sekai::agent_promotion::{
     AgentDefinitionCertification, REFUSAL_FAILED, REFUSAL_MISSING, REFUSAL_REVOKED, REFUSAL_STALE,
     STATUS_FAIL, STATUS_PASS,
@@ -15,7 +17,8 @@ use sekai_chisei::sekai::definition_diff::{
 };
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
-    CreateDefinitionProposal, MergeDefinitionProposal, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
+    CreateDefinitionProposal, MergeDefinitionProposal, ProposeDefinitionRollback, STATUS_CLOSED,
+    STATUS_MERGED, STATUS_OPEN,
 };
 
 fn member(namespace: &str, member_id: &str, definition_json: &str) -> DefinitionMemberInput {
@@ -1286,6 +1289,295 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
     );
 }
 
+fn ticket_object(namespace: &str, id: &str, secret: Option<&str>) -> Object {
+    let mut properties = HashMap::from([("title".into(), "hello".into())]);
+    if let Some(secret) = secret {
+        properties.insert("secret".into(), secret.into());
+    }
+    Object {
+        id: format!("{namespace}:{id}"),
+        kind: "Ticket".into(),
+        name: id.into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:{id}"),
+        properties,
+        created: 1,
+        updated: 1,
+    }
+}
+
+fn seed_ticket(db: &dyn DefinitionBranchBackend, namespace: &str, json: &str) -> String {
+    let input = member(namespace, "Ticket", json);
+    let prepared = input.prepare(namespace).unwrap();
+    let revision = prepare_revision(
+        namespace,
+        "",
+        [DefinitionRevisionMember {
+            member_kind: prepared.member_kind.clone(),
+            member_id: prepared.member_id.clone(),
+            member_digest: prepared.member_digest.clone(),
+        }],
+        true,
+        "root",
+        1,
+    )
+    .unwrap();
+    db.seed_published_definition_revision(&revision, &[prepared])
+        .unwrap();
+    revision.revision_digest
+}
+
+fn member_set(
+    db: &dyn DefinitionBranchBackend,
+    namespace: &str,
+    digest: &str,
+) -> Vec<(String, String, String)> {
+    let mut members = db
+        .get_definition_members(namespace, digest)
+        .unwrap()
+        .into_iter()
+        .map(|member| (member.member_kind, member.member_id, member.member_digest))
+        .collect::<Vec<_>>();
+    members.sort();
+    members
+}
+
+fn exercise_definition_rollback(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let first = seed_ticket(db, namespace, r#"{"name":"Ticket","properties":["title"]}"#);
+    let (second, _) = publish_revision(
+        db,
+        namespace,
+        &first,
+        "rb-forward",
+        "rb-cs-forward",
+        vec![
+            member(
+                namespace,
+                "Ticket",
+                r#"{"name":"Ticket","properties":["title"]}"#,
+            ),
+            typed_member(
+                namespace,
+                "ontology_class",
+                "TicketClass",
+                r#"{"name":"TicketClass"}"#,
+            ),
+        ],
+        10,
+    );
+    assert_ne!(first, second);
+    let DefinitionWriteResult::CreateProposal { proposal } = db
+        .propose_definition_rollback(
+            &ProposeDefinitionRollback {
+                namespace: namespace.into(),
+                branch_id: "rb-restore".into(),
+                proposal_id: "rb-cs-restore".into(),
+                restore_from_digest: first.clone(),
+                expected_published_digest: second.clone(),
+                migration_plan_digest: String::new(),
+                idempotency_key: "rb-restore-1".into(),
+            },
+            "author",
+            20,
+        )
+        .unwrap()
+    else {
+        panic!("expected rollback proposal");
+    };
+    assert_eq!(proposal.status, STATUS_OPEN);
+    assert_eq!(proposal.base_digest, second);
+    assert_eq!(proposal.restored_from_digest, first);
+    assert_ne!(proposal.candidate_digest, first);
+    assert_ne!(proposal.candidate_digest, second);
+    let candidate = db
+        .get_definition_revision(namespace, &proposal.candidate_digest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.parent_revision_digest, second);
+    assert!(!candidate.published);
+    assert_eq!(
+        member_set(db, namespace, &proposal.candidate_digest),
+        member_set(db, namespace, &first)
+    );
+    let replayed = db
+        .propose_definition_rollback(
+            &ProposeDefinitionRollback {
+                namespace: namespace.into(),
+                branch_id: "rb-restore".into(),
+                proposal_id: "rb-cs-restore".into(),
+                restore_from_digest: first.clone(),
+                expected_published_digest: second.clone(),
+                migration_plan_digest: String::new(),
+                idempotency_key: "rb-restore-1".into(),
+            },
+            "author",
+            21,
+        )
+        .unwrap();
+    let DefinitionWriteResult::CreateProposal {
+        proposal: replayed_proposal,
+    } = replayed
+    else {
+        panic!("expected rollback replay");
+    };
+    assert_eq!(replayed_proposal.proposal_digest, proposal.proposal_digest);
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "rb-cs-restore".into(),
+            idempotency_key: "rb-restore-approve".into(),
+        },
+        "merger",
+        22,
+    )
+    .unwrap();
+    let DefinitionWriteResult::MergeProposal { result } = db
+        .merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "rb-cs-restore".into(),
+                expected_published_digest: second.clone(),
+                idempotency_key: "rb-restore-merge".into(),
+            },
+            "merger",
+            23,
+        )
+        .unwrap()
+    else {
+        panic!("expected rollback merge");
+    };
+    assert_eq!(result.previous_published_digest, second);
+    assert_eq!(result.proposal.restored_from_digest, first);
+    assert!(!result.receipt_id.is_empty());
+    let published = db
+        .get_published_definition_revision(namespace)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        published.revision_digest,
+        result.published_revision.revision_digest
+    );
+    assert_ne!(published.revision_digest, first);
+    assert_eq!(published.parent_revision_digest, second);
+    assert_eq!(
+        member_set(db, namespace, &published.revision_digest),
+        member_set(db, namespace, &first)
+    );
+}
+
+fn exercise_rollback_live_values(
+    db: &dyn DefinitionBranchBackend,
+    namespace: &str,
+    insert_ticket: impl FnOnce(),
+) {
+    let first = seed_ticket(db, namespace, r#"{"name":"Ticket","properties":["title"]}"#);
+    let (second, _) = publish_revision(
+        db,
+        namespace,
+        &first,
+        "rb-live-forward",
+        "rb-live-cs-forward",
+        vec![member(
+            namespace,
+            "Ticket",
+            r#"{"name":"Ticket","properties":["title","secret"]}"#,
+        )],
+        30,
+    );
+    insert_ticket();
+    db.propose_definition_rollback(
+        &ProposeDefinitionRollback {
+            namespace: namespace.into(),
+            branch_id: "rb-live".into(),
+            proposal_id: "rb-live-cs".into(),
+            restore_from_digest: first.clone(),
+            expected_published_digest: second.clone(),
+            migration_plan_digest: String::new(),
+            idempotency_key: "rb-live-1".into(),
+        },
+        "author",
+        40,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "rb-live-cs".into(),
+            idempotency_key: "rb-live-approve".into(),
+        },
+        "merger",
+        41,
+    )
+    .unwrap();
+    let error = db
+        .merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "rb-live-cs".into(),
+                expected_published_digest: second.clone(),
+                idempotency_key: "rb-live-merge".into(),
+            },
+            "merger",
+            42,
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("definition_rollback_requires_migration_plan"),
+        "{error}"
+    );
+    let plan = digest('c');
+    db.propose_definition_rollback(
+        &ProposeDefinitionRollback {
+            namespace: namespace.into(),
+            branch_id: "rb-live-plan".into(),
+            proposal_id: "rb-live-cs-plan".into(),
+            restore_from_digest: first.clone(),
+            expected_published_digest: second.clone(),
+            migration_plan_digest: plan.clone(),
+            idempotency_key: "rb-live-plan-1".into(),
+        },
+        "author",
+        43,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "rb-live-cs-plan".into(),
+            idempotency_key: "rb-live-plan-approve".into(),
+        },
+        "merger",
+        44,
+    )
+    .unwrap();
+    let DefinitionWriteResult::MergeProposal { result } = db
+        .merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "rb-live-cs-plan".into(),
+                expected_published_digest: second.clone(),
+                idempotency_key: "rb-live-plan-merge".into(),
+            },
+            "merger",
+            45,
+        )
+        .unwrap()
+    else {
+        panic!("expected planned rollback merge");
+    };
+    assert_eq!(result.proposal.restored_from_digest, first);
+    assert_eq!(result.proposal.migration_plan_digest, plan);
+    let published = db
+        .get_published_definition_revision(namespace)
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.parent_revision_digest, second);
+    assert_eq!(
+        member_set(db, namespace, &published.revision_digest),
+        member_set(db, namespace, &first)
+    );
+}
+
 fn publish_revision(
     db: &dyn DefinitionBranchBackend,
     namespace: &str,
@@ -1548,6 +1840,15 @@ fn sqlite_definition_branch_backend_conformance() {
     exercise_coordinated_artifact_merge(&SekaiDb::new(":memory:").unwrap(), "sqlite-four-kind");
     exercise_named_compatibility_gate_refusal(&SekaiDb::new(":memory:").unwrap(), "sqlite-gate");
     exercise_published_revision_history(&SekaiDb::new(":memory:").unwrap(), "sqlite-history");
+    exercise_definition_rollback(&SekaiDb::new(":memory:").unwrap(), "sqlite-rollback");
+    {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let namespace = "sqlite-rollback-live";
+        exercise_rollback_live_values(&db, namespace, || {
+            db.create_object(&ticket_object(namespace, "open", Some("classified")))
+                .unwrap();
+        });
+    }
     exercise_concurrent_stale_head(
         Arc::new(SekaiDb::new(":memory:").unwrap()),
         "sqlite-definition-concurrent",
@@ -1581,6 +1882,14 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_coordinated_artifact_merge(db.as_ref(), &format!("{prefix}-four-kind"));
     exercise_named_compatibility_gate_refusal(db.as_ref(), &format!("{prefix}-gate"));
     exercise_published_revision_history(db.as_ref(), &format!("{prefix}-history"));
+    exercise_definition_rollback(db.as_ref(), &format!("{prefix}-rollback"));
+    {
+        let namespace = format!("{prefix}-rollback-live");
+        exercise_rollback_live_values(db.as_ref(), &namespace, || {
+            db.create_object(&ticket_object(&namespace, "open", Some("classified")))
+                .unwrap();
+        });
+    }
     exercise_concurrent_stale_head(db.clone(), &format!("{prefix}-concurrent"));
     exercise_concurrent_genesis_seed(db, &format!("{prefix}-genesis"));
 }

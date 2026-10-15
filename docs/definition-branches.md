@@ -3,9 +3,10 @@
 Governed definition branches let an authorized schema author evolve one exact
 namespace-scoped definition revision without changing published definitions or
 runtime facts. The experimental product-tier contract now also publishes or
-rejects one pinned candidate through a proposal, compares two revisions, and
-classifies compatibility. It does not yet preview, rebase, or migrate facts.
-Branch, proposal, compare, compatibility, and fact-migration RPCs are
+rejects one pinned candidate through a proposal, compares two revisions,
+classifies compatibility, and proposes an append-only rollback of a prior
+published revision. Rollback never rewrites history.
+Branch, proposal, rollback, compare, compatibility, and fact-migration RPCs are
 classified `experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1`
 or the `experimental-rpcs` Cargo feature is enabled. See
 [rpc-maturity.md](rpc-maturity.md). `GetPublishedDefinitionRevision` stays
@@ -90,6 +91,21 @@ receipt.
 moving the published head. Merge of a closed proposal remains denied.
 `GetPublishedDefinitionRevision` returns the current published pointer.
 `ListPublishedDefinitionRevisions` returns that namespace's published merge history, newest first. Each entry names the published revision digest, previous published digest, merged proposal id, merge receipt id, actor, and time. Optional `member_kind` and `member_id` must both be set or both empty and keep only merges that added, removed, or digest-changed that member. Pagination is keyset on merge time then proposal id so a concurrent merge cannot duplicate or skip an earlier page. Auth matches `GetPublishedDefinitionRevision`. A nonempty member filter also reauthorizes that member the same way `GetDefinitionMember` does, so a later removal cannot disclose its history to a caller without that grant. The RPC does not restore or roll back a revision.
+
+`ProposeDefinitionRollback` opens a draft whose candidate members match a
+previously published revision `A` while remaining a descendant of the live
+published head `B`. It creates the branch, applies the restore edits, and
+pins the proposal in one transaction. The response returns the proposal and a
+preview diff of `B` versus the candidate. Auth matches
+`CreateDefinitionProposal`: namespace write plus write on every member that
+would change. `restored_from_digest` and optional `migration_plan_digest` are
+additive proposal fields. Merge of that proposal publishes a new revision `C`
+(never a rewrite of `A`) and records `restored_from_digest` on the merge
+receipt. When the rollback would drop object-type properties that live objects
+or datasets still carry, merge without a pinned `migration_plan_digest` fails
+`definition_rollback_requires_migration_plan`. The pin is a digest, not an
+executed fact migration; `ExecuteDefinitionFactMigration` still requires the
+TO revision to already be the published head.
 
 `CompareDefinitionRevisions` takes two revision digests in one namespace. It
 reauthorizes every member on both revisions, then reports added, removed, and
