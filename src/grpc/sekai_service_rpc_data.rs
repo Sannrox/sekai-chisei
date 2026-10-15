@@ -1498,6 +1498,7 @@ pub(super) async fn put_governed_transform(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let proto = req
         .into_inner()
         .transform
@@ -1543,10 +1544,23 @@ pub(super) async fn put_governed_transform(
     }
     .prepare()
     .map_err(|error| Status::invalid_argument(error.message()))?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &transform.namespace,
+            true,
+        )?;
+    }
+    let owner_tenant = tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.as_str())
+        .unwrap_or("");
     service
         .db
         .runtime()
-        .put_governed_transform(&transform, now_millis())
+        .put_governed_transform_owned(&transform, now_millis(), owner_tenant)
         .map_err(Status::internal)?;
     Ok(Response::new(PutGovernedTransformResponse {
         transform: Some(to_proto_transform(&transform)),
@@ -1559,23 +1573,97 @@ pub(super) async fn run_governed_transform(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let actor = principals.first().cloned().unwrap_or_default();
     let input = req.into_inner();
-    let run = service
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &input.namespace,
+            true,
+        )?;
+    }
+    let transform = service
         .db
         .runtime()
-        .run_governed_transform(
-            &input.namespace,
-            &input.transform_id,
-            input.incremental,
+        .get_governed_transform(&input.namespace, &input.transform_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("governed transform not found"))?;
+    let isolated = transform.isolated_process.is_some();
+    let stored_owner = service
+        .db
+        .runtime()
+        .transform_quota_owner(&input.namespace, &input.transform_id)
+        .map_err(Status::internal)?;
+    let caller_has_tenant = tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .is_some();
+    // Put owner is the tenantless runner/admin fallback. An authenticated
+    // caller tenant pays for this Run and cannot spend the Put owner's quota.
+    let owner_ctx = if caller_has_tenant {
+        tenant_context.clone()
+    } else if let Some(tenant_id) = stored_owner.as_deref() {
+        Some(crate::provider_credentials::tenant_context(
+            tenant_id, "local",
+        ))
+    } else {
+        tenant_context.clone()
+    };
+    let quota = service.quota_runtime();
+    let gate = crate::sekai::transform_run_admission::quota_gate(quota.clone());
+    let held = if isolated {
+        None
+    } else {
+        admit_tenant_transform(
+            quota.as_ref(),
+            &gate,
+            owner_ctx.as_ref(),
+            &format!(
+                "transform-run:{}:{}:{}",
+                input.namespace,
+                input.transform_id,
+                now_millis()
+            ),
+            false,
+        )?
+    };
+    let owner_tenant = owner_ctx
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.as_str())
+        .unwrap_or("");
+    let run = match service.db.runtime().run_governed_transform_owned(
+        &input.namespace,
+        &input.transform_id,
+        input.incremental,
+        now_millis(),
+        owner_tenant,
+        &transform.definition_digest,
+    ) {
+        Ok(run) => run,
+        Err(error) => {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            return Err(transform_work_status(error));
+        }
+    };
+    if !isolated {
+        let recorded = record_tenant_transform_usage(
+            quota.as_ref(),
+            owner_ctx
+                .as_ref()
+                .and_then(|context| context.tenant.as_ref())
+                .map(|tenant| tenant.tenant_id.as_str()),
+            &run,
+            &actor,
             now_millis(),
-        )
-        .map_err(|error| {
-            if error.contains("not found") {
-                Status::not_found(error)
-            } else {
-                Status::internal(error)
-            }
-        })?;
+        );
+        release_tenant_transform(service.db.runtime(), &gate, &run.run_id, held.as_ref())?;
+        if recorded? {
+            ack_transform_usage_pending(service.db.runtime(), &run.run_id)?;
+        }
+    }
     Ok(Response::new(RunGovernedTransformResponse {
         run: Some(to_proto_transform_run(
             &run,
@@ -1676,25 +1764,310 @@ pub(super) async fn claim_transform_work(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
-    let claimed = service
-        .db
-        .runtime()
-        .claim_transform_work(
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &input.namespace,
+            true,
+        )?;
+    }
+    let targeted = !input.run_id.trim().is_empty();
+    let mut skipped = Vec::new();
+    let mut exhausted = false;
+    loop {
+        let outcome = match service.db.runtime().claim_transform_work_outcome(
             &input.namespace,
             &input.runtime_id,
             &input.run_id,
             input.ttl_ms,
             now_millis(),
-        )
-        .map_err(transform_work_status)?;
-    match claimed {
-        Some((work, transform)) => Ok(Response::new(ClaimTransformWorkResponse {
-            work: Some(to_proto_transform_work(&work)),
-            transform: Some(to_proto_transform(&transform)),
-        })),
-        None => Err(Status::not_found("no claimable transform work")),
+            &skipped,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(transform_work_status(error)),
+        };
+        let quota = service.quota_runtime();
+        release_failed_transform_quota(
+            service.db.runtime(),
+            quota.clone(),
+            &outcome.failed_run_ids,
+        )?;
+        match outcome.claimed {
+            Some((mut work, transform)) => {
+                // TenantQuotaGate and transform-work live on separate stores.
+                // Folding the gate into the claim transaction is out of this slice.
+                let owner = if work.tenant_id.trim().is_empty() {
+                    tenant_context.clone()
+                } else {
+                    Some(crate::provider_credentials::tenant_context(
+                        &work.tenant_id,
+                        "local",
+                    ))
+                };
+                let prior_admission = if work.claim_generation > 1 {
+                    match service.db.runtime().reclaim_transform_quota_hold(
+                        &work.run_id,
+                        work.claim_generation,
+                        &work.fencing_token,
+                    ) {
+                        Ok(Some((tenant_id, reserved_concurrency, held_generation))) => {
+                            if reserved_concurrency {
+                                if let Err(status) = complete_reserved_transform_quota(
+                                    quota.clone(),
+                                    &work.run_id,
+                                    &tenant_id,
+                                ) {
+                                    let _ = service.db.runtime().restore_transform_quota_hold(
+                                        &work.run_id,
+                                        &tenant_id,
+                                        true,
+                                        held_generation,
+                                    );
+                                    return Err(status);
+                                }
+                            }
+                            true
+                        }
+                        Ok(None) => service
+                            .db
+                            .runtime()
+                            .peek_transform_quota_hold(&work.run_id, work.claim_generation)
+                            .map_err(Status::internal)?
+                            .is_some(),
+                        Err(error) => return Err(Status::internal(error)),
+                    }
+                } else {
+                    false
+                };
+                match admit_tenant_transform(
+                    quota.as_ref(),
+                    &crate::sekai::transform_run_admission::quota_gate(quota.clone()),
+                    owner.as_ref(),
+                    &format!("transform-claim:{}", work.run_id),
+                    prior_admission,
+                ) {
+                    Ok(held) => {
+                        let gate = crate::sekai::transform_run_admission::quota_gate(quota.clone());
+                        let bind_tenant = held
+                            .as_ref()
+                            .map(|admission| admission.tenant_id.as_str())
+                            .or_else(|| {
+                                owner
+                                    .as_ref()
+                                    .and_then(|context| context.tenant.as_ref())
+                                    .map(|tenant| tenant.tenant_id.as_str())
+                            });
+                        if work.tenant_id.trim().is_empty()
+                            && let Some(tenant_id) = bind_tenant
+                        {
+                            match service.db.runtime().bind_transform_work_tenant(
+                                &work.run_id,
+                                tenant_id,
+                                work.claim_generation,
+                                &work.fencing_token,
+                            ) {
+                                Ok(Some(persisted)) => work.tenant_id = persisted,
+                                Ok(None) => {
+                                    if let Some(admission) = held.as_ref() {
+                                        if prior_admission {
+                                            let _ = crate::sekai::transform_run_admission::complete_transform_run(
+                                            &gate, admission,
+                                        );
+                                            restore_request_admission_hold(
+                                                service.db.runtime(),
+                                                &work,
+                                                owner.as_ref(),
+                                            )?;
+                                        } else {
+                                            abandon_or_persist_quota_hold(
+                                                service.db.runtime(),
+                                                &gate,
+                                                admission,
+                                            )?;
+                                        }
+                                    }
+                                    service
+                                        .db
+                                        .runtime()
+                                        .release_transform_claim(
+                                            &work.run_id,
+                                            &work.claim_owner,
+                                            work.claim_generation,
+                                            &work.fencing_token,
+                                            now_millis(),
+                                            outcome.counted_lease_expiry,
+                                        )
+                                        .map_err(transform_work_status)?;
+                                    return Err(Status::failed_precondition(
+                                        crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM,
+                                    ));
+                                }
+                                Err(error) => {
+                                    if let Some(admission) = held.as_ref() {
+                                        if prior_admission {
+                                            let _ = crate::sekai::transform_run_admission::complete_transform_run(
+                                            &gate, admission,
+                                        );
+                                            restore_request_admission_hold(
+                                                service.db.runtime(),
+                                                &work,
+                                                owner.as_ref(),
+                                            )?;
+                                        } else {
+                                            abandon_or_persist_quota_hold(
+                                                service.db.runtime(),
+                                                &gate,
+                                                admission,
+                                            )?;
+                                        }
+                                    }
+                                    service
+                                        .db
+                                        .runtime()
+                                        .release_transform_claim(
+                                            &work.run_id,
+                                            &work.claim_owner,
+                                            work.claim_generation,
+                                            &work.fencing_token,
+                                            now_millis(),
+                                            outcome.counted_lease_expiry,
+                                        )
+                                        .map_err(transform_work_status)?;
+                                    return Err(Status::internal(error));
+                                }
+                            }
+                        }
+                        if let Some(admission) = held {
+                            match service.db.runtime().put_transform_quota_hold(
+                                &work.run_id,
+                                &admission.tenant_id,
+                                admission.reserved_concurrency,
+                                work.claim_generation,
+                                &work.fencing_token,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    if prior_admission {
+                                        crate::sekai::transform_run_admission::complete_transform_run(
+                                        &gate, &admission,
+                                    )
+                                    .map_err(map_quota_error)?;
+                                        restore_request_admission_hold(
+                                            service.db.runtime(),
+                                            &work,
+                                            owner.as_ref(),
+                                        )?;
+                                    } else {
+                                        abandon_or_persist_quota_hold(
+                                            service.db.runtime(),
+                                            &gate,
+                                            &admission,
+                                        )?;
+                                    }
+                                    service
+                                        .db
+                                        .runtime()
+                                        .release_transform_claim(
+                                            &work.run_id,
+                                            &work.claim_owner,
+                                            work.claim_generation,
+                                            &work.fencing_token,
+                                            now_millis(),
+                                            outcome.counted_lease_expiry,
+                                        )
+                                        .map_err(transform_work_status)?;
+                                    return Err(Status::failed_precondition(
+                                        crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM,
+                                    ));
+                                }
+                                Err(error) => {
+                                    if prior_admission {
+                                        let _ = crate::sekai::transform_run_admission::complete_transform_run(
+                                        &gate,
+                                        &admission,
+                                    );
+                                        restore_request_admission_hold(
+                                            service.db.runtime(),
+                                            &work,
+                                            owner.as_ref(),
+                                        )?;
+                                    } else {
+                                        abandon_or_persist_quota_hold(
+                                            service.db.runtime(),
+                                            &gate,
+                                            &admission,
+                                        )?;
+                                    }
+                                    service
+                                        .db
+                                        .runtime()
+                                        .release_transform_claim(
+                                            &work.run_id,
+                                            &work.claim_owner,
+                                            work.claim_generation,
+                                            &work.fencing_token,
+                                            now_millis(),
+                                            outcome.counted_lease_expiry,
+                                        )
+                                        .map_err(transform_work_status)?;
+                                    return Err(Status::internal(error));
+                                }
+                            }
+                        }
+                    }
+                    Err(status) => {
+                        if prior_admission {
+                            restore_request_admission_hold(
+                                service.db.runtime(),
+                                &work,
+                                owner.as_ref(),
+                            )?;
+                        }
+                        service
+                            .db
+                            .runtime()
+                            .release_transform_claim(
+                                &work.run_id,
+                                &work.claim_owner,
+                                work.claim_generation,
+                                &work.fencing_token,
+                                now_millis(),
+                                outcome.counted_lease_expiry,
+                            )
+                            .map_err(transform_work_status)?;
+                        if status.code() == tonic::Code::ResourceExhausted
+                            && !targeted
+                            && skipped.len()
+                                < crate::sekai::governed_transform::MAX_TRANSFORM_CLAIM_QUOTA_SKIPS
+                        {
+                            skipped.push(work.run_id.clone());
+                            exhausted = true;
+                            service
+                                .db
+                                .runtime()
+                                .defer_transform_work(&work.run_id, now_millis())
+                                .map_err(Status::internal)?;
+                            continue;
+                        }
+                        return Err(status);
+                    }
+                }
+                return Ok(Response::new(ClaimTransformWorkResponse {
+                    work: Some(to_proto_transform_work(&work)),
+                    transform: Some(to_proto_transform(&transform)),
+                }));
+            }
+            None => {
+                if exhausted {
+                    return Err(Status::resource_exhausted("tenant quota exceeded"));
+                }
+                return Err(Status::not_found("no claimable transform work"));
+            }
+        }
     }
 }
 pub(super) async fn heartbeat_transform_claim(
@@ -1795,6 +2168,8 @@ pub(super) async fn write_transform_run_result(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let actor = principals.first().cloned().unwrap_or_default();
     let input = req.into_inner();
     let run = service
         .db
@@ -1825,11 +2200,68 @@ pub(super) async fn write_transform_run_result(
             .collect(),
         ..crate::sekai::governed_transform::WriteTransformRunCommand::default()
     };
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &run.namespace,
+            true,
+        )?;
+    }
+    let claim_generation = command.claim_generation;
+    let owner_tenant = service
+        .db
+        .runtime()
+        .transform_work_tenant(&command.run_id)
+        .map_err(Status::internal)?;
     let run = service
         .db
         .runtime()
         .write_transform_run(command, now_millis())
         .map_err(transform_work_status)?;
+    // Hold consume and TenantQuotaGate.complete stay on separate stores.
+    // Folding them into the write transaction is out of this slice. A crash
+    // between take and complete leaves reserved concurrency until the budget
+    // period rolls; that window is accepted here. A complete error after
+    // take restores the hold so a retry can release concurrency.
+    let hold = service
+        .db
+        .runtime()
+        .take_transform_quota_hold(&run.run_id, Some(claim_generation), false)
+        .map_err(Status::internal)?;
+    let caller_tenant = tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.clone());
+    let usage_tenant = hold
+        .as_ref()
+        .map(|(tenant_id, _, _)| tenant_id.as_str())
+        .or(owner_tenant.as_deref())
+        .or(caller_tenant.as_deref());
+    let quota = service.quota_runtime();
+    let completed_at_ms = service
+        .db
+        .runtime()
+        .transform_usage_pending(&run.run_id)
+        .map_err(Status::internal)?
+        .map(|(_, completed_at_ms)| completed_at_ms)
+        .unwrap_or_else(now_millis);
+    let usage =
+        record_tenant_transform_usage(quota.as_ref(), usage_tenant, &run, &actor, completed_at_ms);
+    if let Some((tenant_id, true, held_generation)) = hold.as_ref() {
+        if let Err(status) = complete_reserved_transform_quota(quota, &run.run_id, tenant_id) {
+            let _ = service.db.runtime().restore_transform_quota_hold(
+                &run.run_id,
+                tenant_id,
+                true,
+                *held_generation,
+            );
+            return Err(status);
+        }
+    }
+    if usage? {
+        ack_transform_usage_pending(service.db.runtime(), &run.run_id)?;
+    }
     Ok(Response::new(WriteTransformRunResultResponse {
         run: Some(to_proto_transform_run(
             &run,
@@ -1879,6 +2311,268 @@ fn check_isolated_transform_datasets(
     Ok(())
 }
 
+fn map_quota_error(error: crate::chisei::tenant_quota::TenantQuotaError) -> Status {
+    use crate::chisei::tenant_quota::TenantQuotaError;
+    match error {
+        TenantQuotaError::TenantRequired => Status::unauthenticated(error.to_string()),
+        TenantQuotaError::StaleAssignment { .. } => Status::failed_precondition(error.to_string()),
+        TenantQuotaError::Exhausted { .. } => Status::resource_exhausted(error.to_string()),
+        TenantQuotaError::Storage(message) => Status::internal(message),
+    }
+}
+
+fn admit_tenant_transform(
+    db: &crate::db::runtime_db::RuntimeDb,
+    gate: &crate::chisei::tenant_quota::TenantQuotaGate,
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    run_key: &str,
+    reclaim: bool,
+) -> Result<Option<crate::chisei::tenant_quota::TenantQuotaAdmission>, Status> {
+    let Some(context) = tenant_context else {
+        return Ok(None);
+    };
+    let Some(tenant_id) = context
+        .tenant
+        .as_ref()
+        .map(|tenant| tenant.tenant_id.as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(limits) = crate::sekai::transform_run_admission::configured_limits(db, tenant_id)
+        .map_err(Status::internal)?
+    else {
+        return Ok(None);
+    };
+    crate::sekai::transform_run_admission::admit_transform_run(
+        gate, context, &limits, run_key, reclaim,
+    )
+    .map(Some)
+    .map_err(map_quota_error)
+}
+
+fn release_tenant_transform(
+    db: &crate::db::runtime_db::RuntimeDb,
+    gate: &crate::chisei::tenant_quota::TenantQuotaGate,
+    run_id: &str,
+    held: Option<&crate::chisei::tenant_quota::TenantQuotaAdmission>,
+) -> Result<(), Status> {
+    let Some(admission) = held else {
+        return Ok(());
+    };
+    match crate::sekai::transform_run_admission::complete_transform_run(gate, admission) {
+        Ok(()) => Ok(()),
+        Err(_) if admission.reserved_concurrency => {
+            db.restore_transform_quota_hold(run_id, &admission.tenant_id, true, 0)
+                .map_err(Status::internal)?;
+            Ok(())
+        }
+        Err(error) => Err(map_quota_error(error)),
+    }
+}
+
+fn abandon_or_persist_quota_hold(
+    db: &crate::db::runtime_db::RuntimeDb,
+    gate: &crate::chisei::tenant_quota::TenantQuotaGate,
+    admission: &crate::chisei::tenant_quota::TenantQuotaAdmission,
+) -> Result<(), Status> {
+    match gate.abandon(admission) {
+        Ok(()) => Ok(()),
+        Err(failed)
+            if failed.remaining.reserved_concurrency
+                || failed.remaining.reserved_request
+                || failed.remaining.reserved_tokens > 0 =>
+        {
+            db.restore_abandoned_quota_hold(
+                &failed.remaining.idempotency_key,
+                &failed.remaining.tenant_id,
+                failed.remaining.reserved_concurrency,
+                failed.remaining.reserved_request,
+                failed.remaining.reserved_tokens,
+            )
+            .map_err(Status::internal)?;
+            Ok(())
+        }
+        Err(failed) => Err(map_quota_error(failed.error)),
+    }
+}
+
+fn abandon_tenant_transform(
+    db: &crate::db::runtime_db::RuntimeDb,
+    gate: &crate::chisei::tenant_quota::TenantQuotaGate,
+    held: Option<&crate::chisei::tenant_quota::TenantQuotaAdmission>,
+) -> Result<(), Status> {
+    let Some(admission) = held else {
+        return Ok(());
+    };
+    abandon_or_persist_quota_hold(db, gate, admission)
+}
+
+fn release_failed_transform_quota(
+    db: &crate::db::runtime_db::RuntimeDb,
+    runtime: std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
+    failed_run_ids: &[String],
+) -> Result<(), Status> {
+    for run_id in failed_run_ids {
+        release_claimed_transform_quota(db, runtime.clone(), run_id, None, false)?;
+    }
+    Ok(())
+}
+
+fn release_claimed_transform_quota(
+    db: &crate::db::runtime_db::RuntimeDb,
+    runtime: std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
+    run_id: &str,
+    claim_generation: Option<i64>,
+    older_than: bool,
+) -> Result<bool, Status> {
+    let mut released = false;
+    loop {
+        let Some((tenant_id, reserved_concurrency, held_generation)) = db
+            .take_transform_quota_hold(run_id, claim_generation, older_than)
+            .map_err(Status::internal)?
+        else {
+            return Ok(released);
+        };
+        released = true;
+        if reserved_concurrency {
+            if let Err(status) =
+                complete_reserved_transform_quota(runtime.clone(), run_id, &tenant_id)
+            {
+                let _ = db.restore_transform_quota_hold(run_id, &tenant_id, true, held_generation);
+                return Err(status);
+            }
+        }
+    }
+}
+
+fn release_retryable_transform_quota(
+    db: &crate::db::runtime_db::RuntimeDb,
+    runtime: std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
+    run_id: &str,
+    claim_generation: i64,
+) -> Result<bool, Status> {
+    let Some((tenant_id, reserved_concurrency, held_generation, refund_request, refund_tokens)) =
+        db.take_retryable_quota_hold(run_id, claim_generation)
+            .map_err(Status::internal)?
+    else {
+        return Ok(false);
+    };
+    if refund_request || refund_tokens > 0 {
+        let admission = crate::chisei::tenant_quota::TenantQuotaAdmission {
+            tenant_id: tenant_id.clone(),
+            scope_id: crate::chisei::tenant_quota::tenant_scope_id(&tenant_id),
+            assignment_version: 1,
+            reserved_tokens: refund_tokens,
+            reserved_request: refund_request,
+            reserved_concurrency,
+            idempotency_key: run_id.to_string(),
+        };
+        match crate::sekai::transform_run_admission::quota_gate(runtime.clone()).abandon(&admission)
+        {
+            Ok(()) => return Ok(true),
+            Err(failed) => {
+                let _ = db.restore_abandoned_quota_hold(
+                    run_id,
+                    &failed.remaining.tenant_id,
+                    failed.remaining.reserved_concurrency,
+                    failed.remaining.reserved_request,
+                    failed.remaining.reserved_tokens,
+                );
+                return Err(map_quota_error(failed.error));
+            }
+        }
+    }
+    if reserved_concurrency {
+        if let Err(status) = complete_reserved_transform_quota(runtime, run_id, &tenant_id) {
+            let _ = db.restore_transform_quota_hold(run_id, &tenant_id, true, held_generation);
+            return Err(status);
+        }
+    }
+    Ok(true)
+}
+
+fn restore_request_admission_hold(
+    db: &crate::db::runtime_db::RuntimeDb,
+    work: &crate::sekai::governed_transform::TransformWork,
+    owner: Option<&crate::enterprise::AuthenticatedContext>,
+) -> Result<(), Status> {
+    let tenant_id = if !work.tenant_id.trim().is_empty() {
+        work.tenant_id.trim()
+    } else if let Some(tenant_id) = owner
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.as_str())
+    {
+        tenant_id
+    } else {
+        return Ok(());
+    };
+    db.put_transform_quota_hold(
+        &work.run_id,
+        tenant_id,
+        false,
+        work.claim_generation,
+        &work.fencing_token,
+    )
+    .map(|_| ())
+    .map_err(Status::internal)
+}
+
+fn complete_reserved_transform_quota(
+    runtime: std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
+    run_id: &str,
+    tenant_id: &str,
+) -> Result<(), Status> {
+    let admission = crate::chisei::tenant_quota::TenantQuotaAdmission {
+        tenant_id: tenant_id.into(),
+        scope_id: crate::chisei::tenant_quota::tenant_scope_id(tenant_id),
+        assignment_version: 1,
+        reserved_tokens: 0,
+        reserved_request: false,
+        reserved_concurrency: true,
+        idempotency_key: format!("transform-claim:{run_id}"),
+    };
+    crate::sekai::transform_run_admission::complete_transform_run(
+        &crate::sekai::transform_run_admission::quota_gate(runtime),
+        &admission,
+    )
+    .map_err(map_quota_error)
+}
+
+fn record_tenant_transform_usage(
+    db: &crate::db::runtime_db::RuntimeDb,
+    tenant_id: Option<&str>,
+    run: &crate::sekai::governed_transform::TransformRun,
+    actor: &str,
+    completed_at_ms: i64,
+) -> Result<bool, Status> {
+    let Some(tenant_id) = tenant_id else {
+        return Ok(true);
+    };
+    match crate::sekai::transform_run_admission::record_transform_usage(
+        db,
+        tenant_id,
+        run,
+        actor,
+        completed_at_ms,
+    ) {
+        Ok(_) => Ok(true),
+        Err(_) => {
+            // The run is already durable. Leave the pending row so a later
+            // tick can meter it; do not fail the caller for usage persist.
+            Ok(false)
+        }
+    }
+}
+
+fn ack_transform_usage_pending(
+    db: &crate::db::runtime_db::RuntimeDb,
+    run_id: &str,
+) -> Result<(), Status> {
+    db.take_transform_usage_pending(run_id)
+        .map(|_| ())
+        .map_err(Status::internal)
+}
+
 fn transform_work_status(error: String) -> Status {
     if error == crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM
         || error == crate::sekai::governed_transform::STALE_TRANSFORM_ADMISSION
@@ -1913,6 +2607,7 @@ fn to_proto_transform_work(
         claim_expires_at_ms: work.claim_expires_at_ms,
         lease_expiries: work.lease_expiries,
         created_at_ms: work.created_at_ms,
+        tenant_id: work.tenant_id.clone(),
     }
 }
 
@@ -2182,6 +2877,7 @@ pub(super) async fn tick_governed_transforms(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
+    let actor = principals.first().cloned().unwrap_or_default();
     let now_ms = {
         let requested = req.into_inner().now_ms;
         if requested > 0 {
@@ -2190,11 +2886,90 @@ pub(super) async fn tick_governed_transforms(
             now_millis()
         }
     };
-    let runs = service
-        .db
-        .runtime()
+    let runtime = service.db.runtime();
+    let quota = service.quota_runtime();
+    let mut runs = runtime
         .tick_governed_transforms(now_ms)
+        .map_err(Status::internal)?;
+    let gate = crate::sekai::transform_run_admission::quota_gate(quota.clone());
+    for (run_id, _, _, generation) in runtime
+        .list_retryable_quota_holds()
         .map_err(Status::internal)?
+    {
+        if let Err(_status) =
+            release_retryable_transform_quota(runtime, quota.clone(), &run_id, generation)
+        {
+            continue;
+        }
+    }
+    for (run_id, tenant_id, completed_at_ms) in runtime
+        .list_transform_usage_pending()
+        .map_err(Status::internal)?
+    {
+        let Some(run) = runtime
+            .get_governed_transform_run(&run_id)
+            .map_err(Status::internal)?
+        else {
+            let _ = runtime.take_transform_usage_pending(&run_id);
+            continue;
+        };
+        if record_tenant_transform_usage(
+            quota.as_ref(),
+            Some(tenant_id.as_str()),
+            &run,
+            &actor,
+            completed_at_ms,
+        )? {
+            ack_transform_usage_pending(runtime, &run_id)?;
+        }
+    }
+    for item in runtime
+        .list_due_owned_in_process_transforms(now_ms)
+        .map_err(Status::internal)?
+    {
+        let owner = crate::provider_credentials::tenant_context(&item.tenant_id, "local");
+        let held = match admit_tenant_transform(
+            quota.as_ref(),
+            &gate,
+            Some(&owner),
+            &format!(
+                "transform-tick:{}:{}:{}:{}",
+                item.namespace, item.transform_id, item.cause, item.cause_ref
+            ),
+            false,
+        ) {
+            Ok(held) => held,
+            Err(status) if status.code() == tonic::Code::ResourceExhausted => continue,
+            Err(status) => return Err(status),
+        };
+        match runtime.commit_due_owned_in_process_transform(
+            &item.namespace,
+            &item.transform_id,
+            now_ms,
+            &item.tenant_id,
+        ) {
+            Ok(Some(run)) => {
+                let recorded = record_tenant_transform_usage(
+                    quota.as_ref(),
+                    Some(item.tenant_id.as_str()),
+                    &run,
+                    &actor,
+                    now_ms,
+                );
+                release_tenant_transform(runtime, &gate, &run.run_id, held.as_ref())?;
+                if recorded? {
+                    ack_transform_usage_pending(runtime, &run.run_id)?;
+                }
+                runs.push(run);
+            }
+            Ok(None) => abandon_tenant_transform(runtime, &gate, held.as_ref())?,
+            Err(error) => {
+                abandon_tenant_transform(runtime, &gate, held.as_ref())?;
+                return Err(Status::internal(error));
+            }
+        }
+    }
+    let runs = runs
         .iter()
         .map(|run| {
             let reveal = caller_can_read_run_datasets(service, &principals, run);
@@ -2237,7 +3012,22 @@ pub(super) async fn cancel_governed_transform_run(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let run_id = req.into_inner().run_id;
+    let prior = service
+        .db
+        .runtime()
+        .get_governed_transform_run(&run_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("governed transform run not found"))?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &prior.namespace,
+            true,
+        )?;
+    }
     let run = service
         .db
         .runtime()
@@ -2249,6 +3039,13 @@ pub(super) async fn cancel_governed_transform_run(
                 Status::internal(error)
             }
         })?;
+    release_claimed_transform_quota(
+        service.db.runtime(),
+        service.quota_runtime(),
+        &run.run_id,
+        None,
+        false,
+    )?;
     Ok(Response::new(CancelGovernedTransformRunResponse {
         run: Some(to_proto_transform_run(
             &run,

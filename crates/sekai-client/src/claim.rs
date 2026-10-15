@@ -12,6 +12,9 @@
 //! `Claim*` `FailedPrecondition` stays contention. Empty-queue
 //! `ClaimTransformWork` is `NotFound` (idle); a targeted run_id that is gone
 //! or held is contention. Fence loss is never mapped to idle.
+//! Isolated `TransformWork.tenant_id` is the submitting quota owner. A
+//! JobSource keys kako quotas on that value and must not substitute
+//! `namespace`.
 
 use std::fmt;
 use std::time::Duration;
@@ -674,6 +677,12 @@ impl ActionFence {
     }
 }
 
+/// Submitting tenant on claimed isolated work. Empty on community runs.
+/// A JobSource keys quotas on this value and must not substitute `namespace`.
+pub fn transform_quota_tenant_id(work: &crate::protocol::sekai::TransformWork) -> &str {
+    work.tenant_id.trim()
+}
+
 impl TransformFence {
     pub fn from_work(
         work: &crate::protocol::sekai::TransformWork,
@@ -691,6 +700,21 @@ impl TransformFence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transform_quota_tenant_id_is_the_work_owner_not_the_namespace() {
+        let owned = crate::protocol::sekai::TransformWork {
+            tenant_id: " tenant-a ".into(),
+            namespace: "ops".into(),
+            ..Default::default()
+        };
+        assert_eq!(transform_quota_tenant_id(&owned), "tenant-a");
+        let community = crate::protocol::sekai::TransformWork {
+            namespace: "ops".into(),
+            ..Default::default()
+        };
+        assert_eq!(transform_quota_tenant_id(&community), "");
+    }
 
     #[test]
     fn owned_failed_precondition_is_fence_lost_not_idle_or_contention() {

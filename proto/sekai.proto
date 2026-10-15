@@ -648,6 +648,7 @@ message TransformWork {
   int64 claim_expires_at_ms = 11;
   int64 lease_expiries = 12;
   int64 created_at_ms = 13;
+  string tenant_id = 14;
 }
 message ListClaimableTransformWorkRequest {
   string namespace = 1;

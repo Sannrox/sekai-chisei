@@ -402,8 +402,7 @@ reconciliation. Known community Postgres fail-closed exceptions include query-ti
 entailment,
 governed documents and renditions,
 and (on the Chisei side)
-online permit redeem and
-`GetEffectivePolicySummary` budget-limit projection — see the parity guides.
+online permit redeem — see the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
 RPC to shared backend evidence or an explicit computed/query implementation

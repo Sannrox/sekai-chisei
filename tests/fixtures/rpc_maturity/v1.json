@@ -1656,7 +1656,7 @@
       "service": "ChiseiService",
       "rpc": "GetEffectivePolicySummary",
       "storage_path": "chisei.policy",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"

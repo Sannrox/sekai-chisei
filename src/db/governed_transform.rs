@@ -2,26 +2,30 @@ use crate::db::sekai::SekaiDb;
 use crate::sekai::classification_lattice::ClassificationLattice;
 use crate::sekai::dataset::DatasetRowRecord;
 use crate::sekai::governed_transform::{
-    DEFAULT_TRANSFORM_TENANT_CONCURRENCY, GovernedTransform, InputLoadBudget,
-    MAX_TRANSFORM_LEASE_EXPIRIES, STALE_TRANSFORM_CLAIM, TRANSFORM_DEFINITION_CHANGED,
-    TRANSFORM_DIGEST_MISMATCH, TRANSFORM_OUTPUT_BLOCKED, TRANSFORM_OUTPUT_FRESH,
-    TRANSFORM_OUTPUT_STALE, TRANSFORM_TRIGGER_CANCELLED, TRANSFORM_TRIGGER_MANUAL,
-    TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED,
-    TRANSFORM_WORK_CLAIMED, TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED,
-    TRANSFORM_WORK_PENDING, TransformInputRows, TransformOutputState, TransformRun,
-    TransformRunInputRow, TransformWork, WriteTransformRunCommand, admit_isolated_run,
-    bind_checkpoint, bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
-    checkpoint_after_id, compute_run_tables_until, dataset_digest, derive_transform_markings,
-    evaluate_quality, fold_live_output_marking, fold_output_digest, input_partition_receipts,
-    normalize_transform_claim_ttl_ms, partition_records, partition_value, prepare_partition_commit,
-    receipts_for_touched_partitions, redact_run_partition_receipts, refuse_dependency_cycle,
-    require_bound_output_for_markings, rows_digest, schedule_due_bucket,
-    transform_claim_fence_matches, transform_work_is_claimable, trigger_is_due, trim_page_to_bytes,
+    ClaimTransformWorkOutcome, DEFAULT_TRANSFORM_TENANT_CONCURRENCY, DueOwnedInProcessTransform,
+    GovernedTransform, InputLoadBudget, MAX_TRANSFORM_LEASE_EXPIRIES, STALE_TRANSFORM_CLAIM,
+    TRANSFORM_DEFINITION_CHANGED, TRANSFORM_DIGEST_MISMATCH, TRANSFORM_OUTPUT_BLOCKED,
+    TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE, TRANSFORM_TRIGGER_CANCELLED,
+    TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_UPSTREAM,
+    TRANSFORM_WORK_CANCELLED, TRANSFORM_WORK_CLAIMED, TRANSFORM_WORK_COMPLETED,
+    TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows, TransformOutputState,
+    TransformRun, TransformRunInputRow, TransformWork, WriteTransformRunCommand,
+    admit_isolated_run, bind_checkpoint, bind_isolated_write_lineage, bind_receipts_to_dataset,
+    budget_quarantined_run, checkpoint_after_id, compute_run_tables_until, dataset_digest,
+    derive_transform_markings, evaluate_quality, fold_live_output_marking, fold_output_digest,
+    input_partition_receipts, normalize_transform_claim_ttl_ms, partition_records, partition_value,
+    prepare_partition_commit, receipts_for_touched_partitions, redact_run_partition_receipts,
+    refuse_dependency_cycle, require_bound_output_for_markings, rows_digest, schedule_due_bucket,
+    transform_claim_fence_matches, transform_claim_is_current, transform_completed_write_matches,
+    transform_quota_hold_status_allows, transform_work_is_claimable, trigger_is_due,
+    trim_page_to_bytes,
 };
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
+
+pub(crate) type TakenTransformQuotaHold = (String, bool, i64, bool, i32);
 
 impl SekaiDb {
     pub(crate) fn migrate_governed_transforms(&self) -> Result<(), String> {
@@ -74,7 +78,8 @@ impl SekaiDb {
                     fencing_token TEXT NOT NULL DEFAULT '',
                     claim_expires_at_ms INTEGER NOT NULL DEFAULT 0,
                     lease_expiries INTEGER NOT NULL DEFAULT 0,
-                    created_at_ms INTEGER NOT NULL
+                    created_at_ms INTEGER NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS sekai_transform_run_input (
                     run_id TEXT NOT NULL,
@@ -137,6 +142,11 @@ impl SekaiDb {
             [],
         );
         let _ = self.conn().execute(
+            "ALTER TABLE sekai_transform_work
+             ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
             "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN trigger_cause TEXT NOT NULL DEFAULT ''",
             [],
@@ -196,6 +206,26 @@ impl SekaiDb {
                     namespace TEXT PRIMARY KEY,
                     max_concurrent INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS sekai_transform_quota_hold (
+                    run_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    reserved_concurrency INTEGER NOT NULL,
+                    claim_generation INTEGER NOT NULL,
+                    refund_request INTEGER NOT NULL DEFAULT 0,
+                    refund_tokens INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (run_id, claim_generation)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_transform_quota_owner (
+                    namespace TEXT NOT NULL,
+                    transform_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    PRIMARY KEY (namespace, transform_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_transform_usage_pending (
+                    run_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    completed_at_ms INTEGER NOT NULL
+                );
                 ",
             )
             .map_err(|error| error.to_string())?;
@@ -206,6 +236,15 @@ impl SekaiDb {
         &self,
         transform: &GovernedTransform,
         created_at_ms: i64,
+    ) -> Result<(), String> {
+        self.put_governed_transform_owned(transform, created_at_ms, "")
+    }
+
+    pub fn put_governed_transform_owned(
+        &self,
+        transform: &GovernedTransform,
+        created_at_ms: i64,
+        tenant_id: &str,
     ) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn
@@ -229,6 +268,12 @@ impl SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
+        persist_transform_quota_owner_tx(
+            &tx,
+            &transform.namespace,
+            &transform.transform_id,
+            tenant_id,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -281,6 +326,18 @@ impl SekaiDb {
         incremental: bool,
         now_ms: i64,
     ) -> Result<TransformRun, String> {
+        self.run_governed_transform_owned(namespace, transform_id, incremental, now_ms, "", "")
+    }
+
+    pub fn run_governed_transform_owned(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        incremental: bool,
+        now_ms: i64,
+        tenant_id: &str,
+        expected_definition_digest: &str,
+    ) -> Result<TransformRun, String> {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -293,11 +350,18 @@ impl SekaiDb {
             TRANSFORM_TRIGGER_MANUAL,
             "",
             now_ms,
+            tenant_id,
+            expected_definition_digest,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
 
+    /// Admits unowned in-process work inside this transform transaction.
+    ///
+    /// Transforms with a Put quota owner stay queued:
+    /// [`list_due_owned_in_process_transforms`]. Admission for those runs
+    /// belongs on `quota_runtime()`, which may be a different store.
     pub fn tick_governed_transforms(&self, now_ms: i64) -> Result<Vec<TransformRun>, String> {
         let mut conn = self.conn();
         let tx = conn
@@ -306,6 +370,41 @@ impl SekaiDb {
         let runs = tick_governed_transforms_tx(&tx, now_ms)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(runs)
+    }
+
+    pub fn list_due_owned_in_process_transforms(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<DueOwnedInProcessTransform>, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let due = list_due_owned_in_process_tx(&tx, now_ms)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(due)
+    }
+
+    pub fn commit_due_owned_in_process_transform(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        now_ms: i64,
+        expected_tenant_id: &str,
+    ) -> Result<Option<TransformRun>, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let run = commit_due_owned_in_process_tx(
+            &tx,
+            namespace,
+            transform_id,
+            now_ms,
+            expected_tenant_id,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(run)
     }
 
     pub fn get_transform_output_state(
@@ -460,7 +559,7 @@ impl SekaiDb {
             .prepare(
                 "SELECT run_id, namespace, transform_id, definition_digest, engine, runtime_image,
                         status, claim_owner, claim_generation, fencing_token, claim_expires_at_ms,
-                        lease_expiries, created_at_ms
+                        lease_expiries, created_at_ms, tenant_id
                  FROM sekai_transform_work
                  WHERE namespace = ?1
                  ORDER BY created_at_ms, run_id",
@@ -491,6 +590,19 @@ impl SekaiDb {
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<Option<(TransformWork, GovernedTransform)>, String> {
+        self.claim_transform_work_outcome(namespace, runtime_id, run_id, ttl_ms, now_ms, &[])
+            .map(|outcome| outcome.claimed)
+    }
+
+    pub fn claim_transform_work_outcome(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        run_id: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+        skip_run_ids: &[String],
+    ) -> Result<ClaimTransformWorkOutcome, String> {
         if runtime_id.trim().is_empty() {
             return Err("runtime_id required".into());
         }
@@ -498,9 +610,17 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let claimed = claim_transform_work_tx(&tx, namespace, runtime_id, run_id, ttl_ms, now_ms)?;
+        let outcome = claim_transform_work_tx(
+            &tx,
+            namespace,
+            runtime_id,
+            run_id,
+            ttl_ms,
+            now_ms,
+            skip_run_ids,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(claimed)
+        Ok(outcome)
     }
 
     pub fn heartbeat_transform_work(
@@ -530,6 +650,530 @@ impl SekaiDb {
         persist_transform_work(&tx, &work)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(work)
+    }
+
+    pub fn release_transform_claim(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        _now_ms: i64,
+        restore_lease_expiry: bool,
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut work = load_transform_work(&tx, run_id)?.ok_or("transform work not found")?;
+        if !transform_claim_is_current(&work, runtime_id, claim_generation, fencing_token) {
+            return Err(STALE_TRANSFORM_CLAIM.into());
+        }
+        work.status = TRANSFORM_WORK_PENDING.into();
+        work.claim_owner = String::new();
+        if work.claim_generation <= 1 {
+            work.claim_generation = 0;
+        }
+        if restore_lease_expiry {
+            work.lease_expiries = work.lease_expiries.saturating_sub(1);
+        }
+        work.fencing_token = String::new();
+        work.claim_expires_at_ms = 0;
+        persist_transform_work(&tx, &work)?;
+        stamp_run_dispatch(&tx, &work.run_id, TRANSFORM_WORK_PENDING)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn put_transform_quota_hold(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        reserved_concurrency: bool,
+        claim_generation: i64,
+        fencing_token: &str,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current = tx
+            .query_row(
+                "SELECT claim_generation, fencing_token, status FROM sekai_transform_work
+                 WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((generation, token, status)) = current else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        };
+        if !transform_quota_hold_status_allows(&status, false)
+            || generation != claim_generation
+            || token != fencing_token
+        {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        let changed = tx
+            .execute(
+                "INSERT INTO sekai_transform_quota_hold
+                    (run_id, tenant_id, reserved_concurrency, claim_generation)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(run_id, claim_generation) DO UPDATE SET
+                    tenant_id = excluded.tenant_id,
+                    reserved_concurrency = excluded.reserved_concurrency,
+                    claim_generation = excluded.claim_generation
+                 WHERE excluded.claim_generation >= sekai_transform_quota_hold.claim_generation",
+                params![
+                    run_id,
+                    tenant_id,
+                    i64::from(reserved_concurrency),
+                    claim_generation
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed > 0)
+    }
+
+    pub fn restore_transform_quota_hold(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        reserved_concurrency: bool,
+        claim_generation: i64,
+    ) -> Result<bool, String> {
+        let changed = self
+            .conn()
+            .execute(
+                "INSERT INTO sekai_transform_quota_hold
+                    (run_id, tenant_id, reserved_concurrency, claim_generation)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(run_id, claim_generation) DO UPDATE SET
+                    tenant_id = excluded.tenant_id,
+                    reserved_concurrency = excluded.reserved_concurrency",
+                params![
+                    run_id,
+                    tenant_id,
+                    i64::from(reserved_concurrency),
+                    claim_generation
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(changed > 0)
+    }
+
+    pub fn restore_abandoned_quota_hold(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        reserved_concurrency: bool,
+        refund_request: bool,
+        refund_tokens: i32,
+    ) -> Result<bool, String> {
+        let changed = self
+            .conn()
+            .execute(
+                "INSERT INTO sekai_transform_quota_hold
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5)
+                 ON CONFLICT(run_id, claim_generation) DO UPDATE SET
+                    tenant_id = excluded.tenant_id,
+                    reserved_concurrency = excluded.reserved_concurrency,
+                    refund_request = excluded.refund_request,
+                    refund_tokens = excluded.refund_tokens",
+                params![
+                    run_id,
+                    tenant_id,
+                    i64::from(reserved_concurrency),
+                    i64::from(refund_request),
+                    refund_tokens
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(changed > 0)
+    }
+
+    pub fn reclaim_transform_quota_hold(
+        &self,
+        run_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+    ) -> Result<Option<(String, bool, i64)>, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let held = tx
+            .query_row(
+                "DELETE FROM sekai_transform_quota_hold
+                 WHERE rowid IN (
+                    SELECT rowid FROM sekai_transform_quota_hold
+                    WHERE run_id = ?1 AND claim_generation < ?2
+                    ORDER BY reserved_concurrency DESC, claim_generation ASC
+                    LIMIT 1
+                 )
+                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                params![run_id, claim_generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((tenant_id, reserved_concurrency, held_generation)) = held else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        let still_claimed = tx
+            .query_row(
+                "SELECT 1 FROM sekai_transform_work
+                 WHERE run_id = ?1 AND claim_generation = ?2 AND fencing_token = ?3 AND status = ?4",
+                params![
+                    run_id,
+                    claim_generation,
+                    fencing_token,
+                    TRANSFORM_WORK_CLAIMED
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if still_claimed {
+            tx.execute(
+                "INSERT INTO sekai_transform_quota_hold
+                    (run_id, tenant_id, reserved_concurrency, claim_generation)
+                 VALUES (?1, ?2, 0, ?3)
+                 ON CONFLICT(run_id, claim_generation) DO UPDATE SET
+                    tenant_id = excluded.tenant_id,
+                    reserved_concurrency = 0,
+                    claim_generation = excluded.claim_generation
+                 WHERE excluded.claim_generation >= sekai_transform_quota_hold.claim_generation",
+                params![run_id, tenant_id, claim_generation],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(Some((tenant_id, reserved_concurrency, held_generation)))
+    }
+
+    pub fn take_transform_quota_hold(
+        &self,
+        run_id: &str,
+        claim_generation: Option<i64>,
+        older_than: bool,
+    ) -> Result<Option<(String, bool, i64)>, String> {
+        let held = match (claim_generation, older_than) {
+            (Some(generation), true) => self.conn().query_row(
+                "DELETE FROM sekai_transform_quota_hold
+                 WHERE rowid IN (
+                    SELECT rowid FROM sekai_transform_quota_hold
+                    WHERE run_id = ?1 AND claim_generation < ?2
+                    ORDER BY reserved_concurrency DESC, claim_generation ASC
+                    LIMIT 1
+                 )
+                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                params![run_id, generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            ),
+            (Some(generation), false) => self.conn().query_row(
+                "DELETE FROM sekai_transform_quota_hold
+                 WHERE run_id = ?1 AND claim_generation = ?2
+                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                params![run_id, generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            ),
+            (None, _) => self.conn().query_row(
+                "DELETE FROM sekai_transform_quota_hold
+                 WHERE rowid IN (
+                    SELECT rowid FROM sekai_transform_quota_hold WHERE run_id = ?1 LIMIT 1
+                 )
+                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            ),
+        };
+        held.optional().map_err(|error| error.to_string())
+    }
+
+    pub fn take_retryable_quota_hold(
+        &self,
+        run_id: &str,
+        claim_generation: i64,
+    ) -> Result<Option<TakenTransformQuotaHold>, String> {
+        self.conn()
+            .query_row(
+                "DELETE FROM sekai_transform_quota_hold
+                 WHERE rowid IN (
+                    SELECT h.rowid
+                    FROM sekai_transform_quota_hold h
+                    LEFT JOIN sekai_transform_work w ON w.run_id = h.run_id
+                    WHERE h.run_id = ?1 AND h.claim_generation = ?2
+                      AND (
+                        w.run_id IS NULL
+                        OR w.status IN (?3, ?4, ?5)
+                        OR h.claim_generation != w.claim_generation
+                      )
+                    LIMIT 1
+                 )
+                 RETURNING tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens",
+                params![
+                    run_id,
+                    claim_generation,
+                    TRANSFORM_WORK_COMPLETED,
+                    TRANSFORM_WORK_CANCELLED,
+                    TRANSFORM_WORK_FAILED
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                        i32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_retryable_quota_holds(&self) -> Result<Vec<(String, String, bool, i64)>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT h.run_id, h.tenant_id, h.reserved_concurrency, h.claim_generation
+                 FROM sekai_transform_quota_hold h
+                 LEFT JOIN sekai_transform_work w ON w.run_id = h.run_id
+                 WHERE w.run_id IS NULL
+                    OR w.status IN (?1, ?2, ?3)
+                    OR h.claim_generation != w.claim_generation",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![
+                    TRANSFORM_WORK_COMPLETED,
+                    TRANSFORM_WORK_CANCELLED,
+                    TRANSFORM_WORK_FAILED
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    pub fn peek_transform_quota_hold(
+        &self,
+        run_id: &str,
+        claim_generation: i64,
+    ) -> Result<Option<(String, bool, i64)>, String> {
+        self.conn()
+            .query_row(
+                "SELECT tenant_id, reserved_concurrency, claim_generation
+                 FROM sekai_transform_quota_hold
+                 WHERE run_id = ?1 AND claim_generation = ?2",
+                params![run_id, claim_generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn defer_transform_work(&self, run_id: &str, now_ms: i64) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "UPDATE sekai_transform_work SET created_at_ms = ?1
+                 WHERE run_id = ?2 AND status = ?3",
+                params![now_ms, run_id, TRANSFORM_WORK_PENDING],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn bind_transform_work_tenant(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+    ) -> Result<Option<String>, String> {
+        let tenant_id = tenant_id.trim();
+        if tenant_id.is_empty() {
+            return Ok(None);
+        }
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current = tx
+            .query_row(
+                "SELECT status, claim_generation, fencing_token, tenant_id
+                 FROM sekai_transform_work WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((status, generation, token, existing)) = current else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        };
+        if status != TRANSFORM_WORK_CLAIMED
+            || generation != claim_generation
+            || token != fencing_token
+        {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
+        if !existing.trim().is_empty() {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(Some(existing));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE sekai_transform_work SET tenant_id = ?1
+                 WHERE run_id = ?2 AND claim_generation = ?3 AND fencing_token = ?4
+                   AND status = ?5 AND tenant_id = ''",
+                params![
+                    tenant_id,
+                    run_id,
+                    claim_generation,
+                    fencing_token,
+                    TRANSFORM_WORK_CLAIMED
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(Some(tenant_id.to_string()))
+    }
+
+    pub fn list_transform_usage_pending(&self) -> Result<Vec<(String, String, i64)>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT run_id, tenant_id, completed_at_ms FROM sekai_transform_usage_pending")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn transform_usage_pending(&self, run_id: &str) -> Result<Option<(String, i64)>, String> {
+        self.conn()
+            .query_row(
+                "SELECT tenant_id, completed_at_ms FROM sekai_transform_usage_pending
+                 WHERE run_id = ?1",
+                params![run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn take_transform_usage_pending(&self, run_id: &str) -> Result<Option<String>, String> {
+        self.conn()
+            .query_row(
+                "DELETE FROM sekai_transform_usage_pending WHERE run_id = ?1
+                 RETURNING tenant_id",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn transform_work_tenant(&self, run_id: &str) -> Result<Option<String>, String> {
+        self.conn()
+            .query_row(
+                "SELECT tenant_id FROM sekai_transform_work WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|value| value.filter(|tenant_id| !tenant_id.is_empty()))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn transform_quota_owner(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.conn()
+            .query_row(
+                "SELECT tenant_id FROM sekai_transform_quota_owner
+                 WHERE namespace = ?1 AND transform_id = ?2",
+                params![namespace, transform_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|value| value.filter(|tenant_id| !tenant_id.is_empty()))
+            .map_err(|error| error.to_string())
     }
 
     pub fn read_transform_run_input(
@@ -581,6 +1225,7 @@ impl SekaiDb {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_governed_transform_tx(
     tx: &Transaction<'_>,
     namespace: &str,
@@ -589,13 +1234,20 @@ fn run_governed_transform_tx(
     trigger_cause: &str,
     trigger_ref: &str,
     now_ms: i64,
+    tenant_id: &str,
+    expected_definition_digest: &str,
 ) -> Result<TransformRun, String> {
     let transform =
         load_transform(tx, namespace, transform_id)?.ok_or("governed transform not found")?;
+    if !expected_definition_digest.is_empty()
+        && transform.definition_digest != expected_definition_digest
+    {
+        return Err(TRANSFORM_DEFINITION_CHANGED.into());
+    }
     if transform.is_isolated_process() {
         // Operator RunGovernedTransform is not the scheduler cap; ticks and
         // change triggers consult can_admit_namespace.
-        let mut run = admit_isolated_process_tx(tx, &transform, now_ms)?;
+        let mut run = admit_isolated_process_tx(tx, &transform, now_ms, tenant_id)?;
         run.stamp_trigger(trigger_cause, trigger_ref);
         persist_transform_run(tx, &run)?;
         clear_pending_for_transform(tx, &transform.namespace, &transform.transform_id)?;
@@ -706,6 +1358,7 @@ fn run_governed_transform_tx(
         }
         insert_transform_run(tx, &run)?;
         after_run_committed_tx(tx, &transform, &run, now_ms)?;
+        persist_transform_usage_pending_tx(tx, &run.run_id, tenant_id, now_ms)?;
         return Ok(run);
     }
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
@@ -736,13 +1389,35 @@ fn run_governed_transform_tx(
     )
     .map_err(|error| error.to_string())?;
     after_run_committed_tx(tx, &transform, &run, now_ms)?;
+    persist_transform_usage_pending_tx(tx, &run.run_id, tenant_id, now_ms)?;
     Ok(run)
+}
+
+fn persist_transform_usage_pending_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    tenant_id: &str,
+    completed_at_ms: i64,
+) -> Result<(), String> {
+    let tenant_id = tenant_id.trim();
+    if tenant_id.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO sekai_transform_usage_pending
+            (run_id, tenant_id, completed_at_ms)
+         VALUES (?1, ?2, ?3)",
+        params![run_id, tenant_id, completed_at_ms],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn admit_isolated_process_tx(
     tx: &Transaction<'_>,
     transform: &GovernedTransform,
     now_ms: i64,
+    tenant_id: &str,
 ) -> Result<TransformRun, String> {
     let bindings = transform.input_bindings();
     for (_, dataset_id) in &bindings {
@@ -812,6 +1487,7 @@ fn admit_isolated_process_tx(
             claim_expires_at_ms: 0,
             lease_expiries: 0,
             created_at_ms: now_ms,
+            tenant_id: tenant_id.trim().to_string(),
         },
         transform,
     )?;
@@ -825,13 +1501,14 @@ fn claim_transform_work_tx(
     run_id: &str,
     ttl_ms: i64,
     now_ms: i64,
-) -> Result<Option<(TransformWork, GovernedTransform)>, String> {
+    skip_run_ids: &[String],
+) -> Result<ClaimTransformWorkOutcome, String> {
     let candidates: Vec<TransformWork> = {
         let mut stmt = tx
             .prepare(
                 "SELECT run_id, namespace, transform_id, definition_digest, engine, runtime_image,
                         status, claim_owner, claim_generation, fencing_token, claim_expires_at_ms,
-                        lease_expiries, created_at_ms
+                        lease_expiries, created_at_ms, tenant_id
                  FROM sekai_transform_work
                  WHERE namespace = ?1
                  ORDER BY created_at_ms, run_id",
@@ -844,18 +1521,25 @@ fn claim_transform_work_tx(
             .collect::<Result<Vec<_>, _>>()?
     };
     let wanted = run_id.trim();
-    let mut chosen: Option<(TransformWork, GovernedTransform)> = None;
+    let mut chosen: Option<(TransformWork, GovernedTransform, bool)> = None;
+    let mut failed_run_ids = Vec::new();
     for mut work in candidates {
         if !wanted.is_empty() && work.run_id != wanted {
             continue;
         }
-        if work.status == TRANSFORM_WORK_CLAIMED && work.claim_expires_at_ms <= now_ms {
+        if skip_run_ids.iter().any(|skipped| skipped == &work.run_id) {
+            continue;
+        }
+        let counted_lease_expiry =
+            work.status == TRANSFORM_WORK_CLAIMED && work.claim_expires_at_ms <= now_ms;
+        if counted_lease_expiry {
             work.lease_expiries = work.lease_expiries.saturating_add(1);
             if work.lease_expiries >= MAX_TRANSFORM_LEASE_EXPIRIES {
                 work.status = TRANSFORM_WORK_FAILED.into();
                 persist_transform_work(tx, &work)?;
                 stamp_run_dispatch(tx, &work.run_id, TRANSFORM_WORK_FAILED)?;
                 delete_run_input_snapshot(tx, &work.run_id)?;
+                failed_run_ids.push(work.run_id);
                 continue;
             }
             persist_transform_work(tx, &work)?;
@@ -870,16 +1554,20 @@ fn claim_transform_work_tx(
                 persist_transform_work(tx, &work)?;
                 stamp_run_dispatch(tx, &work.run_id, TRANSFORM_WORK_FAILED)?;
                 delete_run_input_snapshot(tx, &work.run_id)?;
+                failed_run_ids.push(work.run_id);
                 continue;
             }
             Err(error) => return Err(error),
         };
-        chosen = Some((work, transform));
+        chosen = Some((work, transform, counted_lease_expiry));
         break;
     }
-    let (mut work, transform) = match chosen {
-        Some(chosen) => chosen,
-        None => return Ok(None),
+    let Some((mut work, transform, counted_lease_expiry)) = chosen else {
+        return Ok(ClaimTransformWorkOutcome {
+            claimed: None,
+            failed_run_ids,
+            counted_lease_expiry: false,
+        });
     };
     work.status = TRANSFORM_WORK_CLAIMED.into();
     work.claim_owner = runtime_id.to_string();
@@ -887,8 +1575,13 @@ fn claim_transform_work_tx(
     work.fencing_token = Uuid::new_v4().to_string();
     work.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
     persist_transform_work(tx, &work)?;
+    carry_transform_quota_request_admission(tx, &work.run_id, work.claim_generation)?;
     stamp_run_dispatch(tx, &work.run_id, TRANSFORM_WORK_CLAIMED)?;
-    Ok(Some((work, transform)))
+    Ok(ClaimTransformWorkOutcome {
+        claimed: Some((work, transform)),
+        failed_run_ids,
+        counted_lease_expiry,
+    })
 }
 
 fn write_transform_run_tx(
@@ -897,6 +1590,18 @@ fn write_transform_run_tx(
     now_ms: i64,
 ) -> Result<TransformRun, String> {
     let work = load_transform_work(tx, &command.run_id)?.ok_or("transform work not found")?;
+    if work.status == TRANSFORM_WORK_COMPLETED {
+        if !transform_completed_write_matches(
+            &work,
+            &command.runtime_id,
+            command.claim_generation,
+            &command.fencing_token,
+        ) {
+            return Err(STALE_TRANSFORM_CLAIM.into());
+        }
+        return load_transform_run(tx, &command.run_id)?
+            .ok_or_else(|| "transform run not found".into());
+    }
     if !transform_claim_fence_matches(
         &work,
         &command.runtime_id,
@@ -957,6 +1662,7 @@ fn write_transform_run_tx(
         let mut done = work;
         done.status = TRANSFORM_WORK_COMPLETED.into();
         persist_transform_work(tx, &done)?;
+        persist_transform_usage_pending_tx(tx, &run.run_id, &done.tenant_id, now_ms)?;
         delete_run_input_snapshot(tx, &run.run_id)?;
         after_run_committed_tx(tx, &transform, &run, now_ms)?;
         return Ok(run);
@@ -1017,6 +1723,7 @@ fn write_transform_run_tx(
     let mut done = work;
     done.status = TRANSFORM_WORK_COMPLETED.into();
     persist_transform_work(tx, &done)?;
+    persist_transform_usage_pending_tx(tx, &run.run_id, &done.tenant_id, now_ms)?;
     delete_run_input_snapshot(tx, &run.run_id)?;
     after_run_committed_tx(tx, &transform, &run, now_ms)?;
     Ok(run)
@@ -1037,6 +1744,7 @@ fn map_transform_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformWork
         claim_expires_at_ms: row.get(10)?,
         lease_expiries: row.get(11)?,
         created_at_ms: row.get(12)?,
+        tenant_id: row.get(13)?,
     })
 }
 
@@ -1047,7 +1755,7 @@ fn load_transform_work(
     tx.query_row(
         "SELECT run_id, namespace, transform_id, definition_digest, engine, runtime_image,
                 status, claim_owner, claim_generation, fencing_token, claim_expires_at_ms,
-                lease_expiries, created_at_ms
+                lease_expiries, created_at_ms, tenant_id
          FROM sekai_transform_work WHERE run_id = ?1",
         params![run_id],
         map_transform_work,
@@ -1084,6 +1792,26 @@ fn persist_transform_work(tx: &Transaction<'_>, work: &TransformWork) -> Result<
     upsert_transform_work(tx, work, "")
 }
 
+fn carry_transform_quota_request_admission(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    claim_generation: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO sekai_transform_quota_hold
+            (run_id, tenant_id, reserved_concurrency, claim_generation)
+         SELECT run_id, tenant_id, 0, ?2
+         FROM sekai_transform_quota_hold
+         WHERE run_id = ?1 AND claim_generation < ?2
+         ORDER BY reserved_concurrency DESC, claim_generation DESC
+         LIMIT 1
+         ON CONFLICT(run_id, claim_generation) DO NOTHING",
+        params![run_id, claim_generation],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 fn upsert_transform_work(
     tx: &Transaction<'_>,
     work: &TransformWork,
@@ -1092,8 +1820,8 @@ fn upsert_transform_work(
     tx.execute(
         "INSERT INTO sekai_transform_work
          (run_id, namespace, transform_id, definition_digest, definition_json, engine, runtime_image, status,
-          claim_owner, claim_generation, fencing_token, claim_expires_at_ms, lease_expiries, created_at_ms)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+          claim_owner, claim_generation, fencing_token, claim_expires_at_ms, lease_expiries, created_at_ms, tenant_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
          ON CONFLICT(run_id) DO UPDATE SET
             status = excluded.status,
             claim_owner = excluded.claim_owner,
@@ -1115,10 +1843,49 @@ fn upsert_transform_work(
             work.fencing_token,
             work.claim_expires_at_ms,
             work.lease_expiries,
-            work.created_at_ms
+            work.created_at_ms,
+            work.tenant_id
         ],
     )
     .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn persist_transform_quota_owner_tx(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+    tenant_id: &str,
+) -> Result<(), String> {
+    let tenant_id = tenant_id.trim();
+    // Community/admin Put has no tenant. Keep the submitting owner so later
+    // ticks, runs, and isolated enqueue still meter that tenant.
+    if tenant_id.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO sekai_transform_quota_owner (namespace, transform_id, tenant_id)
+         VALUES (?1,?2,?3)
+         ON CONFLICT(namespace, transform_id) DO UPDATE SET tenant_id = excluded.tenant_id",
+        params![namespace, transform_id, tenant_id],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn load_transform_quota_owner_tx(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+) -> Result<String, String> {
+    tx.query_row(
+        "SELECT tenant_id FROM sekai_transform_quota_owner
+         WHERE namespace = ?1 AND transform_id = ?2",
+        params![namespace, transform_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or_default())
     .map_err(|error| error.to_string())
 }
 
@@ -2154,10 +2921,11 @@ fn enqueue_change_triggers_tx(
         )
         .map_err(|error| error.to_string())?;
         // Source-batch bursts pass admit_now=false and wait for debounce.
-        // A committed upstream DAG hop admits in this transaction so the
-        // pipeline advances without a later tick.
+        // Unowned DAG hops admit here. Owned in-process work stays pending
+        // until Tick admits on quota_runtime(), which may be another store.
         if (admit_now || trigger_is_due(first_seen, trigger.debounce_ms, now_ms))
             && can_admit_namespace(tx, &transform.namespace)?
+            && !has_owned_in_process_quota(tx, &transform)?
             && let Some(run) = admit_pending_transform_tx(tx, &transform, cause, cause_ref, now_ms)?
         {
             admitted.push(run);
@@ -2312,6 +3080,10 @@ fn tick_governed_transforms_tx(
                     break;
                 }
                 let (transform, cause, cause_ref) = items.remove(0);
+                // Quota/usage may live on another store; do not admit here.
+                if has_owned_in_process_quota(tx, &transform)? {
+                    continue;
+                }
                 if let Some(run) =
                     admit_pending_transform_tx(tx, &transform, &cause, &cause_ref, now_ms)?
                 {
@@ -2336,6 +3108,117 @@ fn tick_governed_transforms_tx(
         }
     }
     Ok(admitted)
+}
+
+fn list_due_owned_in_process_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+) -> Result<Vec<DueOwnedInProcessTransform>, String> {
+    let mut due = Vec::new();
+    for transform in list_all_transforms_tx(tx)? {
+        if let Some(item) = due_owned_in_process_tx(tx, &transform, now_ms)?
+            && can_admit_namespace(tx, &item.namespace)?
+        {
+            due.push(item);
+        }
+    }
+    Ok(due)
+}
+
+fn commit_due_owned_in_process_tx(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    transform_id: &str,
+    now_ms: i64,
+    expected_tenant_id: &str,
+) -> Result<Option<TransformRun>, String> {
+    let Some(transform) = load_transform(tx, namespace, transform_id)? else {
+        return Ok(None);
+    };
+    let Some(item) = due_owned_in_process_tx(tx, &transform, now_ms)? else {
+        return Ok(None);
+    };
+    if !expected_tenant_id.is_empty() && item.tenant_id != expected_tenant_id {
+        return Ok(None);
+    }
+    if !can_admit_namespace(tx, namespace)? {
+        return Ok(None);
+    }
+    let Some(run) =
+        admit_pending_transform_tx(tx, &transform, &item.cause, &item.cause_ref, now_ms)?
+    else {
+        return Ok(None);
+    };
+    if item.cause == TRANSFORM_TRIGGER_SCHEDULE
+        && let Ok(bucket) = item.cause_ref.parse::<i64>()
+    {
+        store_schedule_bucket(tx, namespace, transform_id, bucket)?;
+    }
+    persist_transform_usage_pending_tx(tx, &run.run_id, &item.tenant_id, now_ms)?;
+    Ok(Some(run))
+}
+
+fn has_owned_in_process_quota(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+) -> Result<bool, String> {
+    if transform.is_isolated_process() {
+        return Ok(false);
+    }
+    Ok(
+        !load_transform_quota_owner_tx(tx, &transform.namespace, &transform.transform_id)?
+            .is_empty(),
+    )
+}
+
+fn due_owned_in_process_tx(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    now_ms: i64,
+) -> Result<Option<DueOwnedInProcessTransform>, String> {
+    if !has_owned_in_process_quota(tx, transform)? {
+        return Ok(None);
+    }
+    let owner = load_transform_quota_owner_tx(tx, &transform.namespace, &transform.transform_id)?;
+    let Some((cause, cause_ref)) = due_transform_cause_tx(tx, transform, now_ms)? else {
+        return Ok(None);
+    };
+    Ok(Some(DueOwnedInProcessTransform {
+        namespace: transform.namespace.clone(),
+        transform_id: transform.transform_id.clone(),
+        tenant_id: owner,
+        cause,
+        cause_ref,
+    }))
+}
+
+fn due_transform_cause_tx(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    now_ms: i64,
+) -> Result<Option<(String, String)>, String> {
+    if output_blocked_by_upstream(tx, transform)? {
+        return Ok(None);
+    }
+    if let Some(schedule) = &transform.schedule {
+        let last = load_schedule_bucket(tx, &transform.namespace, &transform.transform_id)?;
+        if let Some(bucket) = schedule_due_bucket(last, schedule.every_ms, now_ms) {
+            return Ok(Some((
+                TRANSFORM_TRIGGER_SCHEDULE.into(),
+                bucket.to_string(),
+            )));
+        }
+    }
+    if let Some(pending) = load_pending(tx, &transform.namespace, &transform.transform_id)? {
+        let debounce = transform
+            .change_trigger()
+            .map(|trigger| trigger.debounce_ms)
+            .unwrap_or(0);
+        if trigger_is_due(pending.0, debounce, now_ms) {
+            return Ok(Some((pending.1, pending.2)));
+        }
+    }
+    Ok(None)
 }
 
 fn load_schedule_bucket(
@@ -2395,6 +3278,7 @@ fn admit_pending_transform_tx(
     {
         return Ok(None);
     }
+    let owner = load_transform_quota_owner_tx(tx, &transform.namespace, &transform.transform_id)?;
     let run = run_governed_transform_tx(
         tx,
         &transform.namespace,
@@ -2403,6 +3287,8 @@ fn admit_pending_transform_tx(
         cause,
         cause_ref,
         now_ms,
+        &owner,
+        "",
     )?;
     Ok(Some(run))
 }
@@ -4669,6 +5555,183 @@ mod tests {
     }
 
     #[test]
+    fn isolated_process_completed_write_retry_requires_completing_fence() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let output = vec![HashMap::from([("id".into(), "1".into())])];
+        let command = WriteTransformRunCommand {
+            run_id: work.run_id.clone(),
+            runtime_id: work.claim_owner.clone(),
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token.clone(),
+            rows: output.clone(),
+            output_digest: rows_digest(&output),
+            quarantined: false,
+            quality_rule: String::new(),
+            ..WriteTransformRunCommand::default()
+        };
+        db.write_transform_run(command.clone(), 40).unwrap();
+        let retried = db
+            .write_transform_run(command.clone(), work.claim_expires_at_ms + 1)
+            .unwrap();
+        assert_eq!(retried.dispatch_status, TRANSFORM_WORK_COMPLETED);
+        assert_eq!(retried.output_digest, rows_digest(&output));
+        for stale in [
+            WriteTransformRunCommand {
+                fencing_token: String::new(),
+                ..command.clone()
+            },
+            WriteTransformRunCommand {
+                fencing_token: "not-the-token".into(),
+                ..command.clone()
+            },
+            WriteTransformRunCommand {
+                runtime_id: "runner-b".into(),
+                ..command.clone()
+            },
+            WriteTransformRunCommand {
+                claim_generation: work.claim_generation.saturating_sub(1),
+                ..command
+            },
+        ] {
+            assert_eq!(
+                db.write_transform_run(stale, work.claim_expires_at_ms + 1)
+                    .unwrap_err(),
+                STALE_TRANSFORM_CLAIM
+            );
+        }
+        assert_eq!(db.query_rows("out", &Default::default()).unwrap(), output);
+    }
+
+    #[test]
+    fn bind_transform_work_tenant_requires_current_fence() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (first, _) = db
+            .claim_transform_work("ops", "runner-a", "", 5, 30)
+            .unwrap()
+            .expect("first claim");
+        let (second, _) = db
+            .claim_transform_work("ops", "runner-b", "", 5, first.claim_expires_at_ms + 1)
+            .unwrap()
+            .expect("expired lease returns to queue");
+        assert!(
+            db.bind_transform_work_tenant(
+                &first.run_id,
+                "tenant-a",
+                first.claim_generation,
+                &first.fencing_token,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            db.bind_transform_work_tenant(
+                &second.run_id,
+                "tenant-b",
+                second.claim_generation,
+                &second.fencing_token,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("tenant-b")
+        );
+        assert_eq!(
+            db.transform_work_tenant(&second.run_id).unwrap().as_deref(),
+            Some("tenant-b")
+        );
+    }
+
+    #[test]
+    fn isolated_process_stale_claim_cannot_retry_after_newer_complete() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (first, _) = db
+            .claim_transform_work("ops", "runner-a", "", 5, 30)
+            .unwrap()
+            .expect("first claim");
+        let (second, _) = db
+            .claim_transform_work("ops", "runner-b", "", 5, first.claim_expires_at_ms + 1)
+            .unwrap()
+            .expect("expired lease returns to queue");
+        let newer = vec![HashMap::from([("id".into(), "2".into())])];
+        db.write_transform_run(
+            WriteTransformRunCommand {
+                run_id: second.run_id.clone(),
+                runtime_id: second.claim_owner.clone(),
+                claim_generation: second.claim_generation,
+                fencing_token: second.fencing_token.clone(),
+                rows: newer.clone(),
+                output_digest: rows_digest(&newer),
+                quarantined: false,
+                quality_rule: String::new(),
+                ..WriteTransformRunCommand::default()
+            },
+            first.claim_expires_at_ms + 2,
+        )
+        .unwrap();
+        let older = vec![HashMap::from([("id".into(), "1".into())])];
+        let error = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: first.run_id,
+                    runtime_id: first.claim_owner,
+                    claim_generation: first.claim_generation,
+                    fencing_token: first.fencing_token,
+                    rows: older,
+                    output_digest: "ignored".into(),
+                    quarantined: false,
+                    quality_rule: String::new(),
+                    ..WriteTransformRunCommand::default()
+                },
+                first.claim_expires_at_ms + 3,
+            )
+            .unwrap_err();
+        assert_eq!(error, STALE_TRANSFORM_CLAIM);
+        assert_eq!(db.query_rows("out", &Default::default()).unwrap(), newer);
+    }
+
+    #[test]
     fn isolated_process_digest_mismatch_commits_nothing() {
         let db = db();
         db.create_dataset(&dataset("in")).unwrap();
@@ -4740,6 +5803,541 @@ mod tests {
         assert_eq!(second.claim_generation, first.claim_generation + 1);
         assert_eq!(second.lease_expiries, 1);
         assert_ne!(second.fencing_token, first.fencing_token);
+    }
+
+    #[test]
+    fn isolated_process_release_returns_expired_own_claim_to_the_queue() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (first, _) = db
+            .claim_transform_work("ops", "runner-a", "", 5, 30)
+            .unwrap()
+            .expect("first claim");
+        db.release_transform_claim(
+            &first.run_id,
+            &first.claim_owner,
+            first.claim_generation,
+            &first.fencing_token,
+            first.claim_expires_at_ms + 1,
+            false,
+        )
+        .unwrap();
+        let (second, _) = db
+            .claim_transform_work("ops", "runner-b", "", 5, first.claim_expires_at_ms + 1)
+            .unwrap()
+            .expect("quota rollback leaves work claimable");
+        assert_eq!(second.claim_owner, "runner-b");
+        assert_eq!(second.lease_expiries, 0);
+        assert_eq!(second.claim_generation, 1);
+    }
+
+    #[test]
+    fn put_without_tenant_keeps_the_quota_owner() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        let transform = isolated_transform();
+        db.put_governed_transform_owned(&transform, 10, "tenant-a")
+            .unwrap();
+        db.put_governed_transform(&transform, 20).unwrap();
+        assert_eq!(
+            db.transform_quota_owner("ops", "iso1").unwrap().as_deref(),
+            Some("tenant-a")
+        );
+        db.put_governed_transform_owned(&transform, 30, "tenant-b")
+            .unwrap();
+        assert_eq!(
+            db.transform_quota_owner("ops", "iso1").unwrap().as_deref(),
+            Some("tenant-b")
+        );
+    }
+
+    #[test]
+    fn put_quota_hold_restores_after_isolated_write() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        assert!(
+            db.put_transform_quota_hold(
+                &work.run_id,
+                "tenant-a",
+                true,
+                work.claim_generation,
+                &work.fencing_token,
+            )
+            .unwrap()
+        );
+        let output = vec![HashMap::from([("id".into(), "1".into())])];
+        db.write_transform_run(
+            WriteTransformRunCommand {
+                run_id: work.run_id.clone(),
+                runtime_id: work.claim_owner.clone(),
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token.clone(),
+                rows: output.clone(),
+                output_digest: rows_digest(&output),
+                quarantined: false,
+                quality_rule: String::new(),
+                ..WriteTransformRunCommand::default()
+            },
+            40,
+        )
+        .unwrap();
+        assert!(
+            db.take_transform_quota_hold(&work.run_id, Some(work.claim_generation), false)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !db.put_transform_quota_hold(
+                &work.run_id,
+                "tenant-a",
+                true,
+                work.claim_generation,
+                &work.fencing_token,
+            )
+            .unwrap()
+        );
+        assert!(
+            db.restore_transform_quota_hold(&work.run_id, "tenant-a", true, work.claim_generation)
+                .unwrap()
+        );
+        assert_eq!(
+            db.take_transform_quota_hold(&work.run_id, Some(work.claim_generation), false)
+                .unwrap(),
+            Some(("tenant-a".into(), true, work.claim_generation))
+        );
+    }
+
+    #[test]
+    fn restore_quota_hold_after_isolated_cancel() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        assert!(
+            db.put_transform_quota_hold(
+                &work.run_id,
+                "tenant-a",
+                true,
+                work.claim_generation,
+                &work.fencing_token,
+            )
+            .unwrap()
+        );
+        db.cancel_governed_transform_run(&work.run_id, 40).unwrap();
+        assert!(
+            db.take_transform_quota_hold(&work.run_id, None, false)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !db.put_transform_quota_hold(
+                &work.run_id,
+                "tenant-a",
+                true,
+                work.claim_generation,
+                &work.fencing_token,
+            )
+            .unwrap()
+        );
+        assert!(
+            db.restore_transform_quota_hold(&work.run_id, "tenant-a", true, work.claim_generation)
+                .unwrap()
+        );
+        assert_eq!(
+            db.list_retryable_quota_holds().unwrap(),
+            vec![(
+                work.run_id.clone(),
+                "tenant-a".into(),
+                true,
+                work.claim_generation
+            )]
+        );
+        assert_eq!(
+            db.take_transform_quota_hold(&work.run_id, None, false)
+                .unwrap(),
+            Some(("tenant-a".into(), true, work.claim_generation))
+        );
+    }
+
+    #[test]
+    fn restore_quota_hold_without_work_is_retryable_in_process() {
+        let db = db();
+        assert!(
+            db.restore_transform_quota_hold("run-in-process", "tenant-a", true, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            db.list_retryable_quota_holds().unwrap(),
+            vec![("run-in-process".into(), "tenant-a".into(), true, 0)]
+        );
+        assert_eq!(
+            db.take_transform_quota_hold("run-in-process", Some(0), false)
+                .unwrap(),
+            Some(("tenant-a".into(), true, 0))
+        );
+        assert!(db.list_retryable_quota_holds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_older_hold_keeps_the_current_claim_hold() {
+        let db = db();
+        assert!(
+            db.restore_transform_quota_hold("run-overlap", "tenant-a", true, 1)
+                .unwrap()
+        );
+        assert!(
+            db.restore_transform_quota_hold("run-overlap", "tenant-a", true, 2)
+                .unwrap()
+        );
+        assert_eq!(
+            db.take_transform_quota_hold("run-overlap", Some(1), false)
+                .unwrap(),
+            Some(("tenant-a".into(), true, 1))
+        );
+        assert_eq!(
+            db.take_transform_quota_hold("run-overlap", Some(2), false)
+                .unwrap(),
+            Some(("tenant-a".into(), true, 2))
+        );
+    }
+
+    #[test]
+    fn retryable_quota_holds_exclude_the_current_claim() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (first, _) = db
+            .claim_transform_work("ops", "runner-a", "", 5, 30)
+            .unwrap()
+            .expect("first claim");
+        assert_eq!(first.claim_generation, 1);
+        assert!(
+            db.put_transform_quota_hold(
+                &first.run_id,
+                "tenant-a",
+                true,
+                first.claim_generation,
+                &first.fencing_token,
+            )
+            .unwrap()
+        );
+        let (second, _) = db
+            .claim_transform_work("ops", "runner-b", "", 5, first.claim_expires_at_ms + 1)
+            .unwrap()
+            .expect("reclaim after lease expiry");
+        assert_eq!(second.claim_generation, 2);
+        assert_eq!(
+            db.peek_transform_quota_hold(&second.run_id, 2).unwrap(),
+            Some(("tenant-a".into(), false, 2))
+        );
+        assert!(
+            db.put_transform_quota_hold(
+                &second.run_id,
+                "tenant-a",
+                true,
+                second.claim_generation,
+                &second.fencing_token,
+            )
+            .unwrap()
+        );
+        assert!(
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", true, 1)
+                .unwrap()
+        );
+        assert_eq!(
+            db.list_retryable_quota_holds().unwrap(),
+            vec![(second.run_id.clone(), "tenant-a".into(), true, 1)]
+        );
+        assert_eq!(
+            db.take_retryable_quota_hold(&second.run_id, 1).unwrap(),
+            Some(("tenant-a".into(), true, 1, false, 0))
+        );
+        assert!(
+            db.take_retryable_quota_hold(&second.run_id, 2)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.take_transform_quota_hold(&second.run_id, Some(2), false)
+                .unwrap(),
+            Some(("tenant-a".into(), true, 2))
+        );
+    }
+
+    #[test]
+    fn reclaim_quota_hold_deletes_one_older_generation() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (first, _) = db
+            .claim_transform_work("ops", "runner-a", "", 5, 30)
+            .unwrap()
+            .expect("first claim");
+        let (second, _) = db
+            .claim_transform_work("ops", "runner-b", "", 5, first.claim_expires_at_ms + 1)
+            .unwrap()
+            .expect("reclaim after lease expiry");
+        assert_eq!(second.claim_generation, 2);
+        assert!(
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", true, 0)
+                .unwrap()
+        );
+        assert!(
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", true, 1)
+                .unwrap()
+        );
+        assert_eq!(
+            db.reclaim_transform_quota_hold(
+                &second.run_id,
+                second.claim_generation,
+                &second.fencing_token,
+            )
+            .unwrap(),
+            Some(("tenant-a".into(), true, 0))
+        );
+        assert_eq!(
+            db.list_retryable_quota_holds().unwrap(),
+            vec![(second.run_id.clone(), "tenant-a".into(), true, 1)]
+        );
+        assert_eq!(
+            db.take_transform_quota_hold(&second.run_id, Some(2), false)
+                .unwrap(),
+            Some(("tenant-a".into(), false, 2))
+        );
+    }
+
+    #[test]
+    fn claim_keeps_request_admission_after_retryable_older_hold_release() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (first, _) = db
+            .claim_transform_work("ops", "runner-a", "", 5, 30)
+            .unwrap()
+            .expect("first claim");
+        assert!(
+            db.put_transform_quota_hold(
+                &first.run_id,
+                "tenant-a",
+                true,
+                first.claim_generation,
+                &first.fencing_token,
+            )
+            .unwrap()
+        );
+        let (second, _) = db
+            .claim_transform_work("ops", "runner-b", "", 5, first.claim_expires_at_ms + 1)
+            .unwrap()
+            .expect("reclaim after lease expiry");
+        assert_eq!(second.claim_generation, 2);
+        assert_eq!(
+            db.peek_transform_quota_hold(&second.run_id, 2).unwrap(),
+            Some(("tenant-a".into(), false, 2))
+        );
+        assert_eq!(
+            db.take_retryable_quota_hold(&second.run_id, 1).unwrap(),
+            Some(("tenant-a".into(), true, 1, false, 0))
+        );
+        assert!(
+            db.reclaim_transform_quota_hold(
+                &second.run_id,
+                second.claim_generation,
+                &second.fencing_token,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            db.peek_transform_quota_hold(&second.run_id, 2).unwrap(),
+            Some(("tenant-a".into(), false, 2))
+        );
+    }
+
+    #[test]
+    fn owned_in_process_schedule_stays_due_until_committed_outside_tick() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = projection("t-owned", "in", "out");
+        transform.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform_owned(&transform, 10, "tenant-a")
+            .unwrap();
+        assert!(db.tick_governed_transforms(1_500).unwrap().is_empty());
+        let due = db.list_due_owned_in_process_transforms(1_500).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].tenant_id, "tenant-a");
+        assert_eq!(due[0].transform_id, "t-owned");
+        let run = db
+            .commit_due_owned_in_process_transform("ops", "t-owned", 1_500, "tenant-a")
+            .unwrap();
+        assert!(run.is_some());
+        assert!(
+            db.list_due_owned_in_process_transforms(1_500)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scheduled_isolated_tick_copies_put_owner_onto_work() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let mut transform = isolated_transform();
+        transform.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform_owned(&transform, 10, "tenant-a")
+            .unwrap();
+        let admitted = db.tick_governed_transforms(1_500).unwrap();
+        assert_eq!(admitted.len(), 1);
+        let claimable = db.list_claimable_transform_work("ops", 1_500, 10).unwrap();
+        assert_eq!(claimable.len(), 1);
+        assert_eq!(claimable[0].transform_id, "iso1");
+        assert_eq!(claimable[0].tenant_id, "tenant-a");
+    }
+
+    #[test]
+    fn triggered_isolated_enqueue_copies_put_owner_onto_work() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("mid")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform_owned(&projection("t-up", "in", "mid"), 10, "tenant-a")
+            .unwrap();
+        let down = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t-iso-down".into(),
+            input_dataset_id: "mid".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                inputs: Vec::new(),
+            }),
+            schedule: None,
+            trigger: Some(TransformTrigger {
+                on_input_commit: true,
+                debounce_ms: 0,
+            }),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform_owned(&down, 11, "tenant-a")
+            .unwrap();
+        db.run_governed_transform_owned("ops", "t-up", false, 20, "tenant-a", "")
+            .unwrap();
+        let claimable = db.list_claimable_transform_work("ops", 30, 10).unwrap();
+        assert_eq!(claimable.len(), 1);
+        assert_eq!(claimable[0].transform_id, "t-iso-down");
+        assert_eq!(claimable[0].tenant_id, "tenant-a");
     }
 
     #[test]

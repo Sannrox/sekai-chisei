@@ -4,6 +4,35 @@ use crate::db::chisei_budget::{
 use crate::db::postgres::PostgresDb;
 
 impl PostgresDb {
+    pub fn budget_limits_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<(String, String, i64, String)>, String> {
+        let scopes = scope_chain(scope_id);
+        let mut connection = self.connection()?;
+        let mut limits = Vec::new();
+        for scope in scopes {
+            let rows = connection
+                .query(
+                    "SELECT metric, max_amount, period_type FROM chisei_budget_limits
+                     WHERE scope_id = $1 ORDER BY metric",
+                    &[&scope],
+                )
+                .map_err(|error| {
+                    crate::db::postgres::missing_relation_or(error, "chisei_budget_limits")
+                })?;
+            for row in rows {
+                limits.push((
+                    scope.clone(),
+                    row.get::<_, String>(0),
+                    row.get::<_, i64>(1),
+                    row.get::<_, String>(2),
+                ));
+            }
+        }
+        Ok(limits)
+    }
+
     pub fn budget_set_limit(
         &self,
         scope_id: &str,
@@ -937,5 +966,36 @@ mod tests {
         assert_ne!(first, second);
         assert!(!first.as_bytes().contains(&0));
         assert!(!second.as_bytes().contains(&0));
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_budget_limits_for_scope_returns_configured_metrics() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = scratch.connect();
+        db.budget_set_limit("tenant:a", "requests", 1, "daily")
+            .unwrap();
+        let rows = db.budget_limits_for_scope("tenant:a").unwrap();
+        assert!(
+            rows.iter()
+                .any(|(scope, metric, max_amount, period)| scope == "tenant:a"
+                    && metric == "requests"
+                    && *max_amount == 1
+                    && period == "daily")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_budget_limits_for_scope_names_a_missing_sekai_plane_table() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = scratch
+            .connect_for_plane(crate::db::schema_plane::SchemaPlane::Sekai)
+            .unwrap();
+        let error = db.budget_limits_for_scope("tenant:a").unwrap_err();
+        assert!(
+            error.contains("chisei_budget_limits") && error.contains("does not exist"),
+            "{error}"
+        );
     }
 }

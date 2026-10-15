@@ -77,6 +77,10 @@ impl CrossStoreAdmission {
         self.distinct_stores
     }
 
+    pub(crate) fn chisei_runtime_arc(&self) -> Arc<crate::db::runtime_db::RuntimeDb> {
+        self.chisei.runtime_arc()
+    }
+
     pub(crate) fn budget_port(&self) -> Option<&dyn ActionBudgetPort> {
         self.budget
             .as_ref()
