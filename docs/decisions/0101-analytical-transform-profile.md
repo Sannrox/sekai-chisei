@@ -9,7 +9,8 @@
 - Superseded by: none
 - Related: [ADR 0097](0097-in-process-transform-host.md),
   [ADR 0074](0074-plane-owned-transforms.md),
-  [ADR 0102](0102-isolated-process-transform-profile.md)
+  [ADR 0102](0102-isolated-process-transform-profile.md),
+  [ADR 0110](0110-governed-transform-preview.md)
 
 ## Context
 

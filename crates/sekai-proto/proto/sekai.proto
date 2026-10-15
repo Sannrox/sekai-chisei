@@ -554,6 +554,26 @@ message PutGovernedTransformRequest {
 message PutGovernedTransformResponse {
   GovernedTransform transform = 1;
 }
+message PreviewGovernedTransformRequest {
+  GovernedTransform transform = 1;
+  uint32 row_cap = 2;
+  string preview_id = 3;
+}
+message PreviewGovernedTransformInputStat {
+  string alias = 1;
+  string dataset_id = 2;
+  int32 rows_read = 3;
+}
+message PreviewGovernedTransformRow {
+  map<string, string> values = 1;
+}
+message PreviewGovernedTransformResponse {
+  string preview_id = 1;
+  string output_schema_json = 2;
+  repeated PreviewGovernedTransformRow rows = 3;
+  repeated PreviewGovernedTransformInputStat inputs = 4;
+  string error = 5;
+}
 message RunGovernedTransformRequest {
   string namespace = 1;
   string transform_id = 2;
@@ -2870,6 +2890,7 @@ service SekaiService {
   rpc PutObjectTypeIndexEdit(PutObjectTypeIndexEditRequest) returns (PutObjectTypeIndexEditResponse);
   rpc PutGovernedTransform(PutGovernedTransformRequest) returns (PutGovernedTransformResponse);
   rpc RunGovernedTransform(RunGovernedTransformRequest) returns (RunGovernedTransformResponse);
+  rpc PreviewGovernedTransform(PreviewGovernedTransformRequest) returns (PreviewGovernedTransformResponse);
   rpc GetGovernedTransformRun(GetGovernedTransformRunRequest) returns (GetGovernedTransformRunResponse);
   rpc ListGovernedTransforms(ListGovernedTransformsRequest) returns (ListGovernedTransformsResponse);
   rpc ListGovernedTransformRuns(ListGovernedTransformRunsRequest) returns (ListGovernedTransformRunsResponse);

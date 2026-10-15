@@ -19860,6 +19860,660 @@ async fn isolated_cancel_releases_concurrency_for_next_claim() {
     assert_eq!(next.claim_owner, "runner-b");
 }
 
+#[tokio::test]
+async fn preview_governed_transform_returns_rows_without_committing() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        ANALYTICAL_CLASS, CONTRACT_VERSION, DEFAULT_PREVIEW_ROW_CAP, PREVIEW_ID_PREFIX,
+        PREVIEW_ROW_CAP,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            },
+            ColumnDef {
+                name: "keep".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            },
+        ],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows(
+            "in",
+            &[
+                HashMap::from([("id".into(), "1".into()), ("keep".into(), "yes".into())]),
+                HashMap::from([("id".into(), "2".into()), ("keep".into(), "no".into())]),
+            ],
+        )
+        .unwrap();
+    let versions_before = runtime.list_dataset_versions("out").unwrap();
+    let proto = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ops".into(),
+        transform_id: "preview-t1".into(),
+        input_dataset_id: "in".into(),
+        output_dataset_id: "out".into(),
+        steps: vec![TransformStep {
+            kind: "filter".into(),
+            column: "keep".into(),
+            op: "eq".into(),
+            value: "yes".into(),
+            columns: Vec::new(),
+        }],
+        profile: ANALYTICAL_CLASS.into(),
+        ..GovernedTransform::default()
+    };
+    let preview = svc
+        .preview_governed_transform(with_principal(PreviewGovernedTransformRequest {
+            transform: Some(proto.clone()),
+            row_cap: 0,
+            preview_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(preview.preview_id.starts_with(PREVIEW_ID_PREFIX));
+    assert_eq!(preview.rows.len(), 1);
+    assert_eq!(
+        preview.rows[0].values.get("id").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(preview.inputs[0].rows_read, 2);
+    assert!(preview.error.is_empty());
+    assert_eq!(
+        runtime.list_dataset_versions("out").unwrap(),
+        versions_before
+    );
+    assert!(
+        runtime
+            .list_governed_transform_runs("ops", 10)
+            .unwrap()
+            .is_empty()
+    );
+    let missing = svc
+        .get_governed_transform_run(with_principal(GetGovernedTransformRunRequest {
+            run_id: preview.preview_id,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    let over_cap = svc
+        .preview_governed_transform(with_principal(PreviewGovernedTransformRequest {
+            transform: Some(proto),
+            row_cap: (DEFAULT_PREVIEW_ROW_CAP as u32) + 2000,
+            preview_id: String::new(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(over_cap.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(over_cap.message(), PREVIEW_ROW_CAP);
+}
+
+#[tokio::test]
+async fn preview_governed_transform_denies_unreadable_input() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    runtime
+        .create_object(&domain::Object {
+            id: "secret-in".into(),
+            kind: "artifact".into(),
+            name: "in".into(),
+            namespace: "ops".into(),
+            external_id: "artifact:secret-in".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    runtime
+        .create_dataset(&Dataset {
+            id: "in".into(),
+            name: "in".into(),
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: "secret-in".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    runtime
+        .create_dataset(&Dataset {
+            id: "out".into(),
+            name: "out".into(),
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    let owner = security::Grant {
+        id: "owner-in".into(),
+        object_id: "secret-in".into(),
+        principal: "bob".into(),
+        role: security::Role::Admin,
+        created: 0,
+    };
+    runtime.create_grant(&owner).unwrap();
+    svc.security.add_grant(&owner);
+    let denied = svc
+        .preview_governed_transform(with_named_principal(
+            PreviewGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    transform_id: "preview-acl".into(),
+                    input_dataset_id: "in".into(),
+                    output_dataset_id: "out".into(),
+                    steps: vec![TransformStep {
+                        kind: "project".into(),
+                        column: String::new(),
+                        op: String::new(),
+                        value: String::new(),
+                        columns: vec!["id".into()],
+                    }],
+                    ..GovernedTransform::default()
+                }),
+                row_cap: 0,
+                preview_id: String::new(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let query = svc
+        .query_rows(with_named_principal(
+            QueryRowsRequest {
+                dataset_id: "in".into(),
+                query: None,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(query.code(), denied.code());
+}
+
+#[tokio::test]
+async fn preview_governed_transform_omits_ungranted_columns() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+    use std::collections::BTreeMap;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    runtime
+        .create_object(&domain::Object {
+            id: "bound-in".into(),
+            kind: "artifact".into(),
+            name: "in".into(),
+            namespace: "ops".into(),
+            external_id: "artifact:bound-in".into(),
+            properties: HashMap::from([("id".into(), "1".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    runtime
+        .create_dataset(&Dataset {
+            id: "in".into(),
+            name: "in".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                ColumnDef {
+                    name: "note".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+            ],
+            object_id: "bound-in".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    runtime
+        .create_dataset(&Dataset {
+            id: "out".into(),
+            name: "out".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                ColumnDef {
+                    name: "note".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+            ],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    runtime
+        .append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("note".into(), "hidden".into()),
+            ])],
+        )
+        .unwrap();
+    let owner = security::Grant {
+        id: "owner-in".into(),
+        object_id: "bound-in".into(),
+        principal: "alice".into(),
+        role: security::Role::Viewer,
+        created: 0,
+    };
+    runtime.create_grant(&owner).unwrap();
+    svc.security.add_grant(&owner);
+    let grants = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "ops".into(),
+        kind: "artifact".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+            property: "id".into(),
+            access: crate::sekai::object_security::PropertyGrantAccess::Read,
+        }]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = runtime
+        .put_object_security_policy(&grants, "root", "put-preview-cols", 1)
+        .unwrap();
+    runtime
+        .activate_object_security_policies(
+            "ops",
+            &BTreeMap::from([("artifact".into(), revision.revision_digest)]),
+            "root",
+            "activate-preview-cols",
+            2,
+        )
+        .unwrap();
+    let preview = svc
+        .preview_governed_transform(with_named_principal(
+            PreviewGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    transform_id: "preview-cols".into(),
+                    input_dataset_id: "in".into(),
+                    output_dataset_id: "out".into(),
+                    steps: vec![TransformStep {
+                        kind: "project".into(),
+                        column: String::new(),
+                        op: String::new(),
+                        value: String::new(),
+                        columns: vec!["id".into(), "note".into()],
+                    }],
+                    ..GovernedTransform::default()
+                }),
+                row_cap: 0,
+                preview_id: String::new(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(preview.rows.len(), 1);
+    assert_eq!(
+        preview.rows[0].values.get("id").map(String::as_str),
+        Some("1")
+    );
+    assert!(!preview.rows[0].values.contains_key("note"));
+}
+
+#[tokio::test]
+async fn preview_isolated_process_is_claimed_without_commit() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, ISOLATED_CLASS, PREVIEW_ID_PREFIX, rows_digest,
+    };
+    use futures_util::StreamExt;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let preview = svc
+        .preview_governed_transform(with_named_principal(
+            PreviewGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    transform_id: "iso-preview".into(),
+                    input_dataset_id: "in".into(),
+                    output_dataset_id: "out".into(),
+                    profile: ISOLATED_CLASS.into(),
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    ..GovernedTransform::default()
+                }),
+                row_cap: 256,
+                preview_id: String::new(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(preview.preview_id.starts_with(PREVIEW_ID_PREFIX));
+    assert!(preview.rows.is_empty());
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: preview.preview_id.clone(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let mut stream = svc
+        .read_transform_run_inputs(with_named_principal(
+            ReadTransformRunInputsRequest {
+                run_id: work.run_id.clone(),
+                runtime_id: work.claim_owner.clone(),
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token.clone(),
+                alias: String::new(),
+                after_row_id: 0,
+                limit: 100,
+                after_alias: String::new(),
+                ..Default::default()
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.unwrap().row.unwrap());
+    }
+    assert_eq!(rows.len(), 1);
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    let written = svc
+        .write_transform_run_result(with_named_principal(
+            WriteTransformRunResultRequest {
+                run_id: work.run_id.clone(),
+                runtime_id: work.claim_owner.clone(),
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token.clone(),
+                rows: output
+                    .iter()
+                    .map(|values| TransformRunInputRow {
+                        alias: String::new(),
+                        dataset_id: "out".into(),
+                        row_id: 0,
+                        values: values.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                output_digest: rows_digest(&output),
+                quarantined: false,
+                quality_rule: String::new(),
+                ..Default::default()
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(written.dispatch_status, "completed");
+    let retrieved = svc
+        .preview_governed_transform(with_named_principal(
+            PreviewGovernedTransformRequest {
+                preview_id: preview.preview_id.clone(),
+                ..Default::default()
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retrieved.preview_id, preview.preview_id);
+    assert_eq!(retrieved.rows.len(), 1);
+    assert_eq!(
+        retrieved.rows[0].values.get("id").map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        runtime
+            .query_rows("out", &crate::sekai::dataset::RowQuery::default())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        runtime
+            .list_governed_transform_runs("ops", 10)
+            .unwrap()
+            .is_empty()
+    );
+    let stale = svc
+        .write_transform_run_result(with_named_principal(
+            WriteTransformRunResultRequest {
+                run_id: work.run_id,
+                runtime_id: "other".into(),
+                claim_generation: work.claim_generation,
+                fencing_token: "stale".into(),
+                rows: output
+                    .iter()
+                    .map(|values| TransformRunInputRow {
+                        alias: String::new(),
+                        dataset_id: "out".into(),
+                        row_id: 0,
+                        values: values.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                output_digest: rows_digest(&output),
+                ..Default::default()
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        runtime
+            .query_rows("out", &crate::sekai::dataset::RowQuery::default())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn preview_retrieve_denies_unreadable_input() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, ISOLATED_CLASS, rows_digest};
+    use crate::sekai::security;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    runtime
+        .create_object(&domain::Object {
+            id: "secret-in".into(),
+            kind: "artifact".into(),
+            name: "in".into(),
+            namespace: "ops".into(),
+            external_id: "artifact:secret-in".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    runtime
+        .create_dataset(&Dataset {
+            id: "in".into(),
+            name: "in".into(),
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: "secret-in".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    runtime
+        .create_dataset(&Dataset {
+            id: "out".into(),
+            name: "out".into(),
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let owner = security::Grant {
+        id: "owner-in".into(),
+        object_id: "secret-in".into(),
+        principal: "local".into(),
+        role: security::Role::Admin,
+        created: 0,
+    };
+    runtime.create_grant(&owner).unwrap();
+    svc.security.add_grant(&owner);
+    let preview = svc
+        .preview_governed_transform(with_named_principal(
+            PreviewGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    transform_id: "iso-preview-acl".into(),
+                    input_dataset_id: "in".into(),
+                    output_dataset_id: "out".into(),
+                    profile: ISOLATED_CLASS.into(),
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    ..GovernedTransform::default()
+                }),
+                row_cap: 256,
+                preview_id: String::new(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: preview.preview_id.clone(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    svc.write_transform_run_result(with_named_principal(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id.clone(),
+            runtime_id: work.claim_owner.clone(),
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token.clone(),
+            rows: output
+                .iter()
+                .map(|values| TransformRunInputRow {
+                    alias: String::new(),
+                    dataset_id: "out".into(),
+                    row_id: 0,
+                    values: values.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output_digest: rows_digest(&output),
+            ..Default::default()
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let denied = svc
+        .preview_governed_transform(with_named_principal(
+            PreviewGovernedTransformRequest {
+                preview_id: preview.preview_id.clone(),
+                ..Default::default()
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+}
+
 fn seed_inspect_action_type(svc: &SekaiServiceImpl, namespace: &str) {
     svc.db
         .runtime()

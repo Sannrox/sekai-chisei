@@ -3,19 +3,23 @@ use crate::sekai::classification_lattice::ClassificationLattice;
 use crate::sekai::dataset::DatasetRowRecord;
 use crate::sekai::governed_transform::{
     ClaimTransformWorkOutcome, DEFAULT_TRANSFORM_TENANT_CONCURRENCY, DueOwnedInProcessTransform,
-    GovernedTransform, InputLoadBudget, MAX_TRANSFORM_LEASE_EXPIRIES, STALE_TRANSFORM_CLAIM,
+    GovernedTransform, InputLoadBudget, MAX_TRANSFORM_LEASE_EXPIRIES, PREVIEW_AUTH_ALIAS,
+    PREVIEW_RESULT_ALIAS, PreviewGovernedTransformResult, PreviewInputStat, STALE_TRANSFORM_CLAIM,
     TRANSFORM_DEFINITION_CHANGED, TRANSFORM_DIGEST_MISMATCH, TRANSFORM_OUTPUT_BLOCKED,
     TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE, TRANSFORM_TRIGGER_CANCELLED,
     TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_UPSTREAM,
     TRANSFORM_WORK_CANCELLED, TRANSFORM_WORK_CLAIMED, TRANSFORM_WORK_COMPLETED,
     TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows, TransformOutputState,
     TransformRun, TransformRunInputRow, TransformWork, WriteTransformRunCommand,
-    admit_isolated_run, bind_checkpoint, bind_isolated_write_lineage, bind_receipts_to_dataset,
-    budget_quarantined_run, checkpoint_after_id, compute_run_tables_until, dataset_digest,
+    admit_isolated_run, apply_preview_column_allowlist, bind_checkpoint,
+    bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
+    checkpoint_after_id, compute_preview_tables, compute_run_tables_until, dataset_digest,
     derive_transform_markings, evaluate_quality, fold_live_output_marking, fold_output_digest,
-    input_partition_receipts, normalize_transform_claim_ttl_ms, partition_records, partition_value,
-    prepare_partition_commit, receipts_for_touched_partitions, redact_run_partition_receipts,
-    refuse_dependency_cycle, require_bound_output_for_markings, rows_digest, schedule_due_bucket,
+    input_partition_receipts, is_preview_id, new_preview_id, normalize_transform_claim_ttl_ms,
+    partition_records, partition_value, prepare_partition_commit, preview_output_schema_json,
+    preview_result_from_writeback, preview_schema_from_rows, preview_writeback_run,
+    receipts_for_touched_partitions, redact_run_partition_receipts, refuse_dependency_cycle,
+    require_bound_output_for_markings, rows_digest, schedule_due_bucket,
     transform_claim_fence_matches, transform_claim_is_current, transform_completed_write_matches,
     transform_quota_hold_status_allows, transform_work_is_claimable, trigger_is_due,
     trim_page_to_bytes,
@@ -1210,6 +1214,44 @@ impl SekaiDb {
         )
     }
 
+    pub fn preview_governed_transform(
+        &self,
+        transform: &GovernedTransform,
+        row_cap: usize,
+        now_ms: i64,
+        tenant_id: &str,
+        column_allowlists: &HashMap<String, Vec<String>>,
+    ) -> Result<PreviewGovernedTransformResult, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let result = preview_governed_transform_tx(
+            &tx,
+            transform,
+            row_cap,
+            now_ms,
+            tenant_id,
+            column_allowlists,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    pub fn get_preview_governed_transform(
+        &self,
+        preview_id: &str,
+    ) -> Result<Option<PreviewGovernedTransformResult>, String> {
+        load_preview_result(&self.conn(), preview_id)
+    }
+
+    pub fn get_preview_column_allowlists(
+        &self,
+        preview_id: &str,
+    ) -> Result<HashMap<String, Vec<String>>, String> {
+        load_preview_auth(&self.conn(), preview_id)
+    }
+
     pub fn write_transform_run(
         &self,
         command: WriteTransformRunCommand,
@@ -1584,6 +1626,127 @@ fn claim_transform_work_tx(
     })
 }
 
+fn preview_governed_transform_tx(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    row_cap: usize,
+    now_ms: i64,
+    tenant_id: &str,
+    column_allowlists: &HashMap<String, Vec<String>>,
+) -> Result<PreviewGovernedTransformResult, String> {
+    let bindings = transform.input_bindings();
+    let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
+    let mut inputs = Vec::new();
+    let mut load_budget = InputLoadBudget::for_preview(transform);
+    for (alias, dataset_id) in &bindings {
+        if !dataset_exists(tx, dataset_id)? {
+            return Err("dataset not found".into());
+        }
+        let columns = load_dataset_column_names(tx, dataset_id)?;
+        let mut records =
+            list_preview_row_records(tx, dataset_id, row_cap, Some(&mut load_budget))?;
+        apply_preview_column_allowlist(
+            records.as_mut_slice(),
+            column_allowlists.get(dataset_id).map(Vec::as_slice),
+        );
+        inputs.push(PreviewInputStat {
+            alias: alias.clone(),
+            dataset_id: dataset_id.clone(),
+            rows_read: i32::try_from(records.len()).unwrap_or(i32::MAX),
+        });
+        loaded.push((alias.clone(), columns, records));
+        if load_budget.exceeded.is_some() {
+            break;
+        }
+    }
+    load_budget.expire_if_past();
+    if let Some(reason) = load_budget.exceeded {
+        return Err(reason.into());
+    }
+    if transform.is_isolated_process() {
+        let spec = transform
+            .isolated_process
+            .as_ref()
+            .ok_or_else(|| "isolated_process required".to_string())?;
+        let preview_id = new_preview_id();
+        // Isolated preview reuses the existing claim queue. Pending-work
+        // bounds stay with that queue's claim, lease, and quota path.
+        persist_admitted_transform_work(
+            tx,
+            &TransformWork {
+                run_id: preview_id.clone(),
+                namespace: transform.namespace.clone(),
+                transform_id: transform.transform_id.clone(),
+                definition_digest: transform.definition_digest.clone(),
+                engine: spec.engine.clone(),
+                runtime_image: spec.runtime_image.clone(),
+                status: TRANSFORM_WORK_PENDING.into(),
+                claim_owner: String::new(),
+                claim_generation: 0,
+                fencing_token: String::new(),
+                claim_expires_at_ms: 0,
+                lease_expiries: 0,
+                created_at_ms: now_ms,
+                tenant_id: tenant_id.trim().to_string(),
+            },
+            transform,
+        )?;
+        persist_run_input_snapshot(tx, &preview_id, &bindings, &loaded)?;
+        persist_preview_auth(tx, &preview_id, column_allowlists)?;
+        return Ok(PreviewGovernedTransformResult {
+            preview_id,
+            output_schema_json: preview_output_schema_json(&[]),
+            rows: Vec::new(),
+            inputs,
+            error: String::new(),
+        });
+    }
+    let preview_id = new_preview_id();
+    let engine_inputs: Vec<TransformInputRows<'_>> = loaded
+        .iter()
+        .map(|(alias, columns, records)| TransformInputRows {
+            alias: alias.as_str(),
+            records: records.as_slice(),
+            columns: columns.as_slice(),
+        })
+        .collect();
+    let (rows, error) =
+        compute_preview_tables(transform, &engine_inputs, now_ms, preview_id.clone())?;
+    Ok(PreviewGovernedTransformResult {
+        preview_id,
+        output_schema_json: preview_schema_from_rows(&rows),
+        rows,
+        inputs,
+        error,
+    })
+}
+
+fn write_preview_transform_run_tx(
+    tx: &Transaction<'_>,
+    command: &WriteTransformRunCommand,
+    work: TransformWork,
+    now_ms: i64,
+) -> Result<TransformRun, String> {
+    let mut done = work;
+    done.status = TRANSFORM_WORK_COMPLETED.into();
+    persist_transform_work(tx, &done)?;
+    let inputs = snapshot_input_stats(tx, &command.run_id)?;
+    let admitted_auth = load_preview_auth(tx, &command.run_id)?;
+    let transform = load_admitted_transform(tx, &done)?;
+    let quality_error = evaluate_quality(&command.rows, &transform.quality_rule)
+        .err()
+        .map(|error| error.message())
+        .unwrap_or_default();
+    delete_run_input_snapshot(tx, &command.run_id)?;
+    let mut result = preview_result_from_writeback(&command.run_id, command, inputs);
+    if result.error.is_empty() {
+        result.error = quality_error;
+    }
+    persist_preview_result(tx, &result)?;
+    persist_preview_auth(tx, &command.run_id, &admitted_auth)?;
+    Ok(preview_writeback_run(&done, command, now_ms))
+}
+
 fn write_transform_run_tx(
     tx: &Transaction<'_>,
     command: &WriteTransformRunCommand,
@@ -1599,6 +1762,9 @@ fn write_transform_run_tx(
         ) {
             return Err(STALE_TRANSFORM_CLAIM.into());
         }
+        if is_preview_id(&command.run_id) {
+            return Ok(preview_writeback_run(&work, command, now_ms));
+        }
         return load_transform_run(tx, &command.run_id)?
             .ok_or_else(|| "transform run not found".into());
     }
@@ -1610,6 +1776,9 @@ fn write_transform_run_tx(
         now_ms,
     ) {
         return Err(STALE_TRANSFORM_CLAIM.into());
+    }
+    if is_preview_id(&command.run_id) {
+        return write_preview_transform_run_tx(tx, command, work, now_ms);
     }
     let transform = load_admitted_transform(tx, &work)?;
     let mut run = load_transform_run(tx, &command.run_id)?.ok_or("transform run not found")?;
@@ -1889,6 +2058,173 @@ fn load_transform_quota_owner_tx(
     .map_err(|error| error.to_string())
 }
 
+fn snapshot_input_stats(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> Result<Vec<PreviewInputStat>, String> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT alias, dataset_id, COUNT(*)
+             FROM sekai_transform_run_input
+             WHERE run_id = ?1
+               AND alias != ?2
+               AND alias != ?3
+             GROUP BY alias, dataset_id
+             ORDER BY alias",
+        )
+        .map_err(|error| error.to_string())?;
+    let mapped = stmt
+        .query_map(
+            params![run_id, PREVIEW_RESULT_ALIAS, PREVIEW_AUTH_ALIAS],
+            |row| {
+                Ok(PreviewInputStat {
+                    alias: row.get(0)?,
+                    dataset_id: row.get(1)?,
+                    rows_read: row.get(2)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    mapped
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn persist_preview_auth(
+    tx: &Transaction<'_>,
+    preview_id: &str,
+    column_allowlists: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let values_json =
+        serde_json::to_string(column_allowlists).map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO sekai_transform_run_input
+         (run_id, alias, dataset_id, row_id, values_json, partition_key)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![preview_id, PREVIEW_AUTH_ALIAS, "", 0i64, values_json, ""],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn load_preview_auth(
+    conn: &rusqlite::Connection,
+    preview_id: &str,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let json: Result<String, rusqlite::Error> = conn.query_row(
+        "SELECT values_json FROM sekai_transform_run_input
+         WHERE run_id = ?1 AND alias = ?2 AND row_id = 0",
+        params![preview_id, PREVIEW_AUTH_ALIAS],
+        |row| row.get(0),
+    );
+    match json {
+        Ok(values_json) => serde_json::from_str(&values_json).map_err(|error| error.to_string()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(HashMap::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn persist_preview_result(
+    tx: &Transaction<'_>,
+    result: &PreviewGovernedTransformResult,
+) -> Result<(), String> {
+    let meta = serde_json::json!({
+        "output_schema_json": result.output_schema_json,
+        "error": result.error,
+        "inputs": result.inputs,
+    });
+    let meta_json = serde_json::to_string(&meta).map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO sekai_transform_run_input
+         (run_id, alias, dataset_id, row_id, values_json, partition_key)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            result.preview_id,
+            PREVIEW_RESULT_ALIAS,
+            "",
+            0i64,
+            meta_json,
+            ""
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    for (idx, row) in result.rows.iter().enumerate() {
+        let values_json = serde_json::to_string(row).map_err(|error| error.to_string())?;
+        let row_id = i64::try_from(idx + 1).unwrap_or(i64::MAX);
+        tx.execute(
+            "INSERT INTO sekai_transform_run_input
+             (run_id, alias, dataset_id, row_id, values_json, partition_key)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                result.preview_id,
+                PREVIEW_RESULT_ALIAS,
+                "",
+                row_id,
+                values_json,
+                ""
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn load_preview_result(
+    conn: &rusqlite::Connection,
+    preview_id: &str,
+) -> Result<Option<PreviewGovernedTransformResult>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT row_id, values_json FROM sekai_transform_run_input
+             WHERE run_id = ?1 AND alias = ?2
+             ORDER BY row_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let mapped = stmt
+        .query_map(params![preview_id, PREVIEW_RESULT_ALIAS], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let collected = mapped
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if collected.is_empty() {
+        return Ok(None);
+    }
+    let mut output_schema_json = String::new();
+    let mut error = String::new();
+    let mut inputs = Vec::new();
+    let mut rows = Vec::new();
+    for (row_id, values_json) in collected {
+        if row_id == 0 {
+            let meta: serde_json::Value =
+                serde_json::from_str(&values_json).map_err(|error| error.to_string())?;
+            output_schema_json = meta
+                .get("output_schema_json")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            error = meta
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(value) = meta.get("inputs") {
+                inputs = serde_json::from_value(value.clone()).unwrap_or_default();
+            }
+        } else {
+            rows.push(serde_json::from_str(&values_json).map_err(|error| error.to_string())?);
+        }
+    }
+    Ok(Some(PreviewGovernedTransformResult {
+        preview_id: preview_id.to_string(),
+        output_schema_json,
+        rows,
+        inputs,
+        error,
+    }))
+}
+
 fn persist_run_input_snapshot(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -1962,6 +2298,9 @@ fn load_run_input_snapshot(
 ) -> Result<Vec<TransformRunInputRow>, String> {
     let cap = if limit <= 0 { 1_000 } else { limit.min(5_000) };
     let wanted = alias.trim();
+    if wanted == PREVIEW_RESULT_ALIAS || wanted == PREVIEW_AUTH_ALIAS {
+        return Ok(Vec::new());
+    }
     let (wanted_partition, has_selector) = match partition_key {
         Some(key) => (key, 1i64),
         None => ("", 0i64),
@@ -1974,6 +2313,8 @@ fn load_run_input_snapshot(
             "SELECT alias, dataset_id, row_id, values_json, partition_key
              FROM sekai_transform_run_input
              WHERE run_id = ?1
+               AND alias != ?7
+               AND alias != ?8
                AND (?6 = 0 OR partition_key = ?5)
                AND (alias > ?2 OR (alias = ?2 AND row_id > ?3))
              ORDER BY alias, row_id
@@ -1999,7 +2340,9 @@ fn load_run_input_snapshot(
                 after_row_id,
                 cap,
                 wanted_partition,
-                has_selector
+                has_selector,
+                PREVIEW_RESULT_ALIAS,
+                PREVIEW_AUTH_ALIAS
             ],
             map_snapshot_row,
         )
@@ -2155,6 +2498,53 @@ pub(crate) fn load_checkpoint(
     )
     .optional()
     .map_err(|error| error.to_string())
+}
+
+fn list_preview_row_records(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    cap: usize,
+    mut budget: Option<&mut InputLoadBudget>,
+) -> Result<Vec<DatasetRowRecord>, String> {
+    let limit = i64::try_from(cap).unwrap_or(i64::MAX);
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, data FROM sekai_dataset_rows
+             WHERE dataset_id = ?1
+             ORDER BY id
+             LIMIT ?2",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows_iter = stmt
+        .query(params![dataset_id, limit])
+        .map_err(|error| error.to_string())?;
+    let mut results = Vec::new();
+    while let Some(row) = rows_iter.next().map_err(|error| error.to_string())? {
+        let id: i64 = row.get(0).map_err(|error| error.to_string())?;
+        let data = match row.get_ref(1).map_err(|error| error.to_string())? {
+            rusqlite::types::ValueRef::Text(bytes) | rusqlite::types::ValueRef::Blob(bytes) => {
+                bytes
+            }
+            rusqlite::types::ValueRef::Null => b"{}",
+            other => {
+                return Err(format!("corrupt dataset row for {dataset_id:?}: {other:?}"));
+            }
+        };
+        if let Some(budget) = budget.as_mut()
+            && !budget.allow_encoded(data.len() as u64)
+        {
+            break;
+        }
+        let map: HashMap<String, String> = serde_json::from_slice(data)
+            .map_err(|error| format!("corrupt dataset row for {dataset_id:?}: {error}"))?;
+        if let Some(budget) = budget.as_mut()
+            && !budget.charge(&map)
+        {
+            break;
+        }
+        results.push((id, map));
+    }
+    Ok(results)
 }
 
 pub(crate) fn list_row_records_after(
@@ -8201,6 +8591,245 @@ mod tests {
                 .iter()
                 .all(|partition| partition.partition_key == "[redacted]"
                     && partition.digest == "[redacted]")
+        );
+    }
+
+    #[test]
+    fn preview_analytical_returns_rows_without_committing() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[
+                HashMap::from([("id".into(), "1".into()), ("keep".into(), "yes".into())]),
+                HashMap::from([("id".into(), "2".into()), ("keep".into(), "no".into())]),
+            ],
+        )
+        .unwrap();
+        let transform = analytical_filter();
+        let preview = db
+            .preview_governed_transform(&transform, 256, 20, "", &HashMap::new())
+            .unwrap();
+        assert!(
+            preview
+                .preview_id
+                .starts_with(crate::sekai::governed_transform::PREVIEW_ID_PREFIX)
+        );
+        assert_eq!(preview.rows.len(), 1);
+        assert_eq!(preview.rows[0].get("id").map(String::as_str), Some("1"));
+        assert_eq!(preview.inputs[0].rows_read, 2);
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.get_governed_transform_run(&preview.preview_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn preview_over_budget_fails_without_committing() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let hog = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "preview-hog".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: Some(AnalyticalSpec {
+                inputs: vec![TransformInput {
+                    alias: "input".into(),
+                    dataset_id: "in".into(),
+                }],
+                sql: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT n FROM t"
+                    .into(),
+                memory_limit_bytes: 0,
+                time_limit_ms: 1,
+            }),
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        let failed = db.preview_governed_transform(&hog, 256, 20, "", &HashMap::new());
+        assert_eq!(
+            failed.unwrap_err(),
+            crate::sekai::transform_engine::BUDGET_TIME
+        );
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn preview_row_cap_limits_sample() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &(0..10)
+                .map(|i| {
+                    HashMap::from([("id".into(), i.to_string()), ("keep".into(), "yes".into())])
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let preview = db
+            .preview_governed_transform(&analytical_filter(), 3, 20, "", &HashMap::new())
+            .unwrap();
+        assert_eq!(preview.inputs[0].rows_read, 3);
+        assert_eq!(preview.rows.len(), 3);
+    }
+
+    #[test]
+    fn preview_isolated_claim_write_does_not_commit() {
+        use crate::sekai::governed_transform::{
+            IsolatedProcessSpec, WriteTransformRunCommand, rows_digest,
+        };
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[
+                HashMap::from([("id".into(), "1".into()), ("keep".into(), "yes".into())]),
+                HashMap::from([("id".into(), "2".into()), ("keep".into(), "yes".into())]),
+            ],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "iso-preview".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                inputs: Vec::new(),
+            }),
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        let preview = db
+            .preview_governed_transform(&transform, 1, 20, "", &HashMap::new())
+            .unwrap();
+        assert!(preview.rows.is_empty());
+        let claimed = db
+            .claim_transform_work("ops", "runner-a", &preview.preview_id, 60_000, 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.0.run_id, preview.preview_id);
+        let rows = db
+            .read_transform_run_input(
+                &WriteTransformRunCommand {
+                    run_id: claimed.0.run_id.clone(),
+                    runtime_id: claimed.0.claim_owner.clone(),
+                    claim_generation: claimed.0.claim_generation,
+                    fencing_token: claimed.0.fencing_token.clone(),
+                    ..WriteTransformRunCommand::default()
+                },
+                "",
+                "",
+                0,
+                100,
+                30,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let output = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("keep".into(), "yes".into()),
+        ])];
+        let written = db
+            .write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: claimed.0.run_id.clone(),
+                    runtime_id: claimed.0.claim_owner.clone(),
+                    claim_generation: claimed.0.claim_generation,
+                    fencing_token: claimed.0.fencing_token.clone(),
+                    rows: output.clone(),
+                    output_digest: rows_digest(&output),
+                    ..WriteTransformRunCommand::default()
+                },
+                40,
+            )
+            .unwrap();
+        assert_eq!(written.dispatch_status, TRANSFORM_WORK_COMPLETED);
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.get_governed_transform_run(&preview.preview_id)
+                .unwrap()
+                .is_none()
+        );
+        let stored = db
+            .get_preview_governed_transform(&preview.preview_id)
+            .unwrap()
+            .expect("isolated preview write-back stores rows");
+        assert_eq!(stored.rows, output);
+        let stale = db.write_transform_run(
+            WriteTransformRunCommand {
+                run_id: claimed.0.run_id,
+                runtime_id: "other".into(),
+                claim_generation: claimed.0.claim_generation,
+                fencing_token: "stale".into(),
+                rows: output.clone(),
+                output_digest: rows_digest(&output),
+                ..WriteTransformRunCommand::default()
+            },
+            50,
+        );
+        assert_eq!(stale.unwrap_err(), STALE_TRANSFORM_CLAIM);
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
         );
     }
 }

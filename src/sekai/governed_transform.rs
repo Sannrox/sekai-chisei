@@ -24,6 +24,18 @@ pub const HOSTED_COMPUTE_CAPABILITY: &str = "sekai.transforms.projection";
 pub const ANALYTICAL_COMPUTE_CAPABILITY: &str = "sekai.transforms.analytical";
 /// DiscoverCapabilities name for the isolated-process JobSpec profile.
 pub const ISOLATED_COMPUTE_CAPABILITY: &str = "sekai.transforms.isolated_process";
+/// DiscoverCapabilities name for unsaved preview runs (ADR 0110).
+pub const PREVIEW_COMPUTE_CAPABILITY: &str = "sekai.transforms.preview";
+/// Preview identities are never governed run ids.
+pub const PREVIEW_ID_PREFIX: &str = "preview:";
+/// Default sample rows per input when PreviewGovernedTransform omits row_cap.
+pub const DEFAULT_PREVIEW_ROW_CAP: usize = 256;
+/// Plane maximum sample rows per input.
+pub const MAX_PREVIEW_ROW_CAP: usize = 1024;
+/// Requested row_cap exceeded the plane maximum.
+pub const PREVIEW_ROW_CAP: &str = "transform_preview_row_cap";
+pub const PREVIEW_RESULT_ALIAS: &str = "__preview_result";
+pub const PREVIEW_AUTH_ALIAS: &str = "__preview_auth";
 /// DiscoverCapabilities name for scheduled and change-triggered admission.
 pub const SCHEDULER_COMPUTE_CAPABILITY: &str = "sekai.transforms.scheduler";
 pub const TRANSFORM_WORK_PENDING: &str = "pending";
@@ -220,6 +232,24 @@ pub struct TransformRun {
     /// Partitions written for this run. Empty on unpartitioned historical rows.
     #[serde(default)]
     pub output_partitions: Vec<TransformPartition>,
+}
+
+/// Rows read from one preview input after policy and the sample cap.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PreviewInputStat {
+    pub alias: String,
+    pub dataset_id: String,
+    pub rows_read: i32,
+}
+
+/// Non-committing preview result. `preview_id` is not a governed run id.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreviewGovernedTransformResult {
+    pub preview_id: String,
+    pub output_schema_json: String,
+    pub rows: Vec<HashMap<String, String>>,
+    pub inputs: Vec<PreviewInputStat>,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1280,6 +1310,16 @@ impl InputLoadBudget {
         })
     }
 
+    pub(crate) fn for_preview(transform: &GovernedTransform) -> Self {
+        Self::for_transform(transform).unwrap_or(Self {
+            used: 0,
+            limit: crate::sekai::transform_engine::DEFAULT_MEMORY_LIMIT_BYTES,
+            deadline: Instant::now()
+                + Duration::from_millis(crate::sekai::transform_engine::DEFAULT_TIME_LIMIT_MS),
+            exceeded: None,
+        })
+    }
+
     pub(crate) fn allow_encoded(&mut self, encoded_len: u64) -> bool {
         if self.exceeded.is_some() {
             return false;
@@ -1806,6 +1846,140 @@ fn require_token(field: &str, value: &str) -> Result<(), TransformError> {
         return Err(TransformError::InvalidArgument(format!("{field} required")));
     }
     Ok(())
+}
+
+pub fn new_preview_id() -> String {
+    format!("{PREVIEW_ID_PREFIX}{}", uuid::Uuid::new_v4())
+}
+
+pub fn is_preview_id(id: &str) -> bool {
+    id.starts_with(PREVIEW_ID_PREFIX)
+}
+
+pub fn resolve_preview_row_cap(requested: u32) -> Result<usize, String> {
+    if requested == 0 {
+        return Ok(DEFAULT_PREVIEW_ROW_CAP);
+    }
+    if (requested as usize) > MAX_PREVIEW_ROW_CAP {
+        return Err(PREVIEW_ROW_CAP.into());
+    }
+    Ok(requested as usize)
+}
+
+pub fn preview_output_schema_json(columns: &[String]) -> String {
+    serde_json::json!({ "columns": columns }).to_string()
+}
+
+pub fn preview_schema_from_rows(rows: &[HashMap<String, String>]) -> String {
+    let mut columns: Vec<String> = rows.iter().flat_map(|row| row.keys().cloned()).collect();
+    columns.sort();
+    columns.dedup();
+    preview_output_schema_json(&columns)
+}
+
+pub fn apply_preview_column_allowlist(
+    records: &mut [(i64, HashMap<String, String>)],
+    allowed: Option<&[String]>,
+) {
+    let Some(allowed) = allowed else {
+        return;
+    };
+    let allowed: std::collections::HashSet<&str> = allowed.iter().map(String::as_str).collect();
+    for (_, row) in records {
+        row.retain(|key, _| allowed.contains(key.as_str()));
+    }
+}
+
+pub fn preview_writeback_run(
+    work: &TransformWork,
+    command: &WriteTransformRunCommand,
+    now_ms: i64,
+) -> TransformRun {
+    TransformRun {
+        run_id: command.run_id.clone(),
+        namespace: work.namespace.clone(),
+        transform_id: work.transform_id.clone(),
+        definition_digest: work.definition_digest.clone(),
+        input_digest: String::new(),
+        output_digest: command.output_digest.clone(),
+        last_input_row_id: 0,
+        incremental: false,
+        quarantined: command.quarantined,
+        quality_rule: command.quality_rule.clone(),
+        rows_in: 0,
+        rows_out: i32::try_from(command.rows.len()).unwrap_or(i32::MAX),
+        lineage_parent: String::new(),
+        created_at_ms: now_ms,
+        markings_in: String::new(),
+        markings_out: String::new(),
+        profile: ISOLATED_CLASS.into(),
+        engine: work.engine.clone(),
+        runtime_image: work.runtime_image.clone(),
+        dispatch_status: TRANSFORM_WORK_COMPLETED.into(),
+        trigger_cause: String::new(),
+        trigger_ref: String::new(),
+        input_partitions: Vec::new(),
+        output_partitions: Vec::new(),
+    }
+}
+
+pub fn current_preview_auth_covers_admitted(
+    admitted: &HashMap<String, Vec<String>>,
+    current: &HashMap<String, Vec<String>>,
+) -> bool {
+    current.iter().all(|(dataset, current_cols)| {
+        admitted.get(dataset).is_some_and(|admitted_cols| {
+            admitted_cols
+                .iter()
+                .all(|column| current_cols.iter().any(|current| current == column))
+        })
+    })
+}
+
+pub fn preview_result_from_writeback(
+    preview_id: &str,
+    command: &WriteTransformRunCommand,
+    inputs: Vec<PreviewInputStat>,
+) -> PreviewGovernedTransformResult {
+    PreviewGovernedTransformResult {
+        preview_id: preview_id.to_string(),
+        output_schema_json: preview_schema_from_rows(&command.rows),
+        rows: command.rows.clone(),
+        inputs,
+        error: if command.quarantined {
+            command.quality_rule.clone()
+        } else {
+            String::new()
+        },
+    }
+}
+
+/// Sampled in-process preview. Budget codes fail; other quarantine is `error`.
+pub fn compute_preview_tables(
+    transform: &GovernedTransform,
+    inputs: &[TransformInputRows<'_>],
+    now_ms: i64,
+    preview_id: String,
+) -> Result<(Vec<HashMap<String, String>>, String), String> {
+    let deadline = transform.analytical.as_ref().and_then(|spec| {
+        if spec.time_limit_ms == 0 {
+            None
+        } else {
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(spec.time_limit_ms))
+        }
+    });
+    let (run, rows) =
+        compute_run_tables_until(transform, None, inputs, false, now_ms, preview_id, deadline);
+    if run.quarantined {
+        let code = run.quality_rule;
+        if code == crate::sekai::transform_engine::BUDGET_TIME
+            || code == crate::sekai::transform_engine::BUDGET_MEMORY
+        {
+            return Err(code);
+        }
+        return Ok((rows, code));
+    }
+    Ok((rows, String::new()))
 }
 
 #[cfg(test)]
@@ -2834,5 +3008,34 @@ mod tests {
             ),
             "east"
         );
+    }
+
+    #[test]
+    fn preview_id_is_not_a_run_id_prefix_collision() {
+        let id = new_preview_id();
+        assert!(is_preview_id(&id));
+        assert!(!is_preview_id("run-1"));
+        assert!(id.starts_with(PREVIEW_ID_PREFIX));
+    }
+
+    #[test]
+    fn preview_row_cap_defaults_and_rejects_plane_maximum() {
+        assert_eq!(resolve_preview_row_cap(0).unwrap(), DEFAULT_PREVIEW_ROW_CAP);
+        assert_eq!(resolve_preview_row_cap(512).unwrap(), 512);
+        assert_eq!(resolve_preview_row_cap(1024).unwrap(), 1024);
+        assert_eq!(resolve_preview_row_cap(1025).unwrap_err(), PREVIEW_ROW_CAP);
+    }
+
+    #[test]
+    fn preview_column_allowlist_drops_ungranted_keys() {
+        let mut records = vec![(
+            1,
+            HashMap::from([
+                ("keep".into(), "yes".into()),
+                ("secret".into(), "no".into()),
+            ]),
+        )];
+        apply_preview_column_allowlist(&mut records, Some(&["keep".into()]));
+        assert_eq!(records[0].1, HashMap::from([("keep".into(), "yes".into())]));
     }
 }
