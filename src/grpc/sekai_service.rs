@@ -523,6 +523,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_definitions::list_published_definition_revisions(self, req).await
     }
 
+    async fn propose_definition_rollback(
+        &self,
+        req: Request<ProposeDefinitionRollbackRequest>,
+    ) -> Result<Response<ProposeDefinitionRollbackResponse>, Status> {
+        rpc_definitions::propose_definition_rollback(self, req).await
+    }
+
     async fn compare_definition_revisions(
         &self,
         req: Request<CompareDefinitionRevisionsRequest>,

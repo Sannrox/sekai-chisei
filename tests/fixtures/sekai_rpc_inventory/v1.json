@@ -298,6 +298,19 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ProposeDefinitionRollback",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/definition_branch_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "CompareDefinitionRevisions",
       "kind": "persistent",
       "surfaces": [
