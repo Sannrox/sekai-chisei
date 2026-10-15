@@ -67,17 +67,17 @@ pub fn run_named_with_quota(
         .ok_or_else(|| "governed transform not found".to_string())?;
     let isolated = transform.is_isolated_process();
     let runtime = Arc::new(quota.clone());
-    let gate = crate::sekai::transform_run_admission::quota_gate(runtime);
+    let gate = crate::composition::transform_run_admission::quota_gate(runtime);
     let ctx =
         (!owner.is_empty()).then(|| crate::provider_credentials::tenant_context(&owner, "local"));
     let held = if isolated || owner.is_empty() {
         None
     } else if let (Some(limits), Some(context)) = (
-        crate::sekai::transform_run_admission::configured_limits(quota, &owner)?,
+        crate::composition::transform_run_admission::configured_limits(quota, &owner)?,
         ctx.as_ref(),
     ) {
         Some(
-            crate::sekai::transform_run_admission::admit_transform_run(
+            crate::composition::transform_run_admission::admit_transform_run(
                 &gate,
                 context,
                 &limits,
@@ -99,11 +99,11 @@ pub fn run_named_with_quota(
     ) {
         Ok(run) => {
             if !isolated && !owner.is_empty() {
-                let usage = crate::sekai::transform_run_admission::record_transform_usage(
+                let usage = crate::composition::transform_run_admission::record_transform_usage(
                     quota, &owner, &run, "local", now_ms,
                 );
                 if let Some(admission) = held.as_ref()
-                    && crate::sekai::transform_run_admission::complete_transform_run(
+                    && crate::composition::transform_run_admission::complete_transform_run(
                         &gate, admission,
                     )
                     .is_err()
@@ -418,7 +418,7 @@ mod tests {
             "tenant-a",
         )
         .unwrap();
-        crate::sekai::transform_run_admission::quota_gate(Arc::new(db.clone()))
+        crate::composition::transform_run_admission::quota_gate(Arc::new(db.clone()))
             .configure(
                 "tenant-a",
                 &TenantQuotaLimits {
@@ -485,7 +485,7 @@ mod tests {
             "tenant-a",
         )
         .unwrap();
-        crate::sekai::transform_run_admission::quota_gate(chisei.runtime_arc())
+        crate::composition::transform_run_admission::quota_gate(chisei.runtime_arc())
             .configure(
                 "tenant-a",
                 &TenantQuotaLimits {

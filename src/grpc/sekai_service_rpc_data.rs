@@ -1612,7 +1612,7 @@ pub(super) async fn run_governed_transform(
         tenant_context.clone()
     };
     let quota = service.quota_runtime();
-    let gate = crate::sekai::transform_run_admission::quota_gate(quota.clone());
+    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
     let held = if isolated {
         None
     } else {
@@ -1845,13 +1845,14 @@ pub(super) async fn claim_transform_work(
                 };
                 match admit_tenant_transform(
                     quota.as_ref(),
-                    &crate::sekai::transform_run_admission::quota_gate(quota.clone()),
+                    &crate::composition::transform_run_admission::quota_gate(quota.clone()),
                     owner.as_ref(),
                     &format!("transform-claim:{}", work.run_id),
                     prior_admission,
                 ) {
                     Ok(held) => {
-                        let gate = crate::sekai::transform_run_admission::quota_gate(quota.clone());
+                        let gate =
+                            crate::composition::transform_run_admission::quota_gate(quota.clone());
                         let bind_tenant = held
                             .as_ref()
                             .map(|admission| admission.tenant_id.as_str())
@@ -1874,7 +1875,7 @@ pub(super) async fn claim_transform_work(
                                 Ok(None) => {
                                     if let Some(admission) = held.as_ref() {
                                         if prior_admission {
-                                            let _ = crate::sekai::transform_run_admission::complete_transform_run(
+                                            let _ = crate::composition::transform_run_admission::complete_transform_run(
                                             &gate, admission,
                                         );
                                             restore_request_admission_hold(
@@ -1909,7 +1910,7 @@ pub(super) async fn claim_transform_work(
                                 Err(error) => {
                                     if let Some(admission) = held.as_ref() {
                                         if prior_admission {
-                                            let _ = crate::sekai::transform_run_admission::complete_transform_run(
+                                            let _ = crate::composition::transform_run_admission::complete_transform_run(
                                             &gate, admission,
                                         );
                                             restore_request_admission_hold(
@@ -1952,7 +1953,7 @@ pub(super) async fn claim_transform_work(
                                 Ok(true) => {}
                                 Ok(false) => {
                                     if prior_admission {
-                                        crate::sekai::transform_run_admission::complete_transform_run(
+                                        crate::composition::transform_run_admission::complete_transform_run(
                                         &gate, &admission,
                                     )
                                     .map_err(map_quota_error)?;
@@ -1986,7 +1987,7 @@ pub(super) async fn claim_transform_work(
                                 }
                                 Err(error) => {
                                     if prior_admission {
-                                        let _ = crate::sekai::transform_run_admission::complete_transform_run(
+                                        let _ = crate::composition::transform_run_admission::complete_transform_run(
                                         &gate,
                                         &admission,
                                     );
@@ -2338,12 +2339,13 @@ fn admit_tenant_transform(
     else {
         return Ok(None);
     };
-    let Some(limits) = crate::sekai::transform_run_admission::configured_limits(db, tenant_id)
-        .map_err(Status::internal)?
+    let Some(limits) =
+        crate::composition::transform_run_admission::configured_limits(db, tenant_id)
+            .map_err(Status::internal)?
     else {
         return Ok(None);
     };
-    crate::sekai::transform_run_admission::admit_transform_run(
+    crate::composition::transform_run_admission::admit_transform_run(
         gate, context, &limits, run_key, reclaim,
     )
     .map(Some)
@@ -2359,7 +2361,7 @@ fn release_tenant_transform(
     let Some(admission) = held else {
         return Ok(());
     };
-    match crate::sekai::transform_run_admission::complete_transform_run(gate, admission) {
+    match crate::composition::transform_run_admission::complete_transform_run(gate, admission) {
         Ok(()) => Ok(()),
         Err(_) if admission.reserved_concurrency => {
             db.restore_transform_quota_hold(run_id, &admission.tenant_id, true, 0)
@@ -2467,7 +2469,8 @@ fn release_retryable_transform_quota(
             reserved_concurrency,
             idempotency_key: run_id.to_string(),
         };
-        match crate::sekai::transform_run_admission::quota_gate(runtime.clone()).abandon(&admission)
+        match crate::composition::transform_run_admission::quota_gate(runtime.clone())
+            .abandon(&admission)
         {
             Ok(()) => return Ok(true),
             Err(failed) => {
@@ -2531,8 +2534,8 @@ fn complete_reserved_transform_quota(
         reserved_concurrency: true,
         idempotency_key: format!("transform-claim:{run_id}"),
     };
-    crate::sekai::transform_run_admission::complete_transform_run(
-        &crate::sekai::transform_run_admission::quota_gate(runtime),
+    crate::composition::transform_run_admission::complete_transform_run(
+        &crate::composition::transform_run_admission::quota_gate(runtime),
         &admission,
     )
     .map_err(map_quota_error)
@@ -2548,7 +2551,7 @@ fn record_tenant_transform_usage(
     let Some(tenant_id) = tenant_id else {
         return Ok(true);
     };
-    match crate::sekai::transform_run_admission::record_transform_usage(
+    match crate::composition::transform_run_admission::record_transform_usage(
         db,
         tenant_id,
         run,
@@ -2891,7 +2894,7 @@ pub(super) async fn tick_governed_transforms(
     let mut runs = runtime
         .tick_governed_transforms(now_ms)
         .map_err(Status::internal)?;
-    let gate = crate::sekai::transform_run_admission::quota_gate(quota.clone());
+    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
     for (run_id, _, _, generation) in runtime
         .list_retryable_quota_holds()
         .map_err(Status::internal)?
