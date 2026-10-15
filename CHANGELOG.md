@@ -356,6 +356,13 @@
   Extensions implementing the hook must return the grant (`GATE:break`,
   #1433).
 
+- Administrator-approved discovery rules name which tenants, principals,
+  spaces, and namespaces another tenant may find. Without a rule,
+  cross-tenant list and lookup look missing. A rule never grants read or
+  write. Rule changes apply on the next request. Every decision is audited
+  as `tenant.discovery`. Extensions implementing `authorize_discovery` must
+  return the current rule (`GATE:break`, #1435).
+
 - Derived transform outputs inherit the union of input object and row
   `access_marking` values. Unknown input markings fail closed with no output
   write. Marked runs require a bound output dataset object. Receipts record

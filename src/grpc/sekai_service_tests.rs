@@ -15096,6 +15096,7 @@ fn guest_credentials_reach_only_namespace_checked_rpcs() {
         "CreateObject",
         "UpdateObject",
         "DeleteObject",
+        "DiscoverCapabilities",
     ];
     for (service, protocol) in [
         (
@@ -15444,6 +15445,333 @@ async fn guest_ceiling_follows_activated_lattice() {
         3,
         "{decisions:?}"
     );
+}
+
+struct DiscoveryRuleExtension(std::sync::Mutex<Option<crate::enterprise::DiscoveryRule>>);
+
+impl DiscoveryRuleExtension {
+    fn naming(namespaces: &[&str]) -> Self {
+        Self(std::sync::Mutex::new(Some(
+            crate::enterprise::DiscoveryRule {
+                owner_tenant: "tenant-test".into(),
+                tenants: vec!["tenant-test".into()],
+                principals: vec!["subject-a".into()],
+                spaces: vec!["collab".into()],
+                namespaces: namespaces
+                    .iter()
+                    .map(|namespace| (*namespace).into())
+                    .collect(),
+            },
+        )))
+    }
+
+    fn none() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+}
+
+impl crate::enterprise::EnterpriseExtension for DiscoveryRuleExtension {
+    fn authenticate_bearer(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authenticate_bearer(bearer_token)
+    }
+
+    fn authenticate_context(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError> {
+        let issued = TestEnterpriseExtension.authenticate_context(bearer_token)?;
+        Ok(crate::enterprise::AuthenticatedContext {
+            expires_at: i64::MAX,
+            issuer: issued.issuer,
+            resource: issued.resource,
+            ..guest_context()
+        })
+    }
+
+    fn tenant_context(
+        &self,
+        principal: &crate::enterprise::AuthenticatedPrincipal,
+    ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.tenant_context(principal)
+    }
+
+    fn authorize_namespace(
+        &self,
+        context: &crate::enterprise::TenantContext,
+        namespace: &str,
+        action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authorize_namespace(context, namespace, action)
+    }
+
+    fn authorize_discovery(
+        &self,
+        _context: &crate::enterprise::AuthenticatedContext,
+        owner_tenant: &str,
+    ) -> Result<Option<crate::enterprise::DiscoveryRule>, crate::enterprise::ExtensionError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|rule| rule.owner_tenant == owner_tenant))
+    }
+
+    fn authorize_unscoped_namespace(
+        &self,
+        principal: &crate::enterprise::AuthenticatedPrincipal,
+        namespace: &str,
+        action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        TestEnterpriseExtension.authorize_unscoped_namespace(principal, namespace, action)
+    }
+}
+
+fn discovery_service(extension: Arc<DiscoveryRuleExtension>) -> SekaiServiceImpl {
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension)).unwrap(),
+    )));
+    SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
+}
+
+fn discovery_decisions(db: &RuntimeDb) -> Vec<crate::sekai::audit::Decision> {
+    db.list_decisions(&crate::sekai::decision_ledger::DecisionFilter {
+        action: Some("tenant.discovery".into()),
+        limit: 100,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+fn guest_discover(namespace: &str) -> Request<DiscoverCapabilitiesRequest> {
+    let mut req = with_named_principal(
+        DiscoverCapabilitiesRequest {
+            namespace: namespace.into(),
+            ..Default::default()
+        },
+        "subject-a",
+    );
+    req.extensions_mut().insert(guest_context());
+    req
+}
+
+#[tokio::test]
+async fn discovery_without_a_rule_looks_missing() {
+    let svc = discovery_service(Arc::new(DiscoveryRuleExtension::none()));
+    seed_lineage_object(&svc, "shared-object", "shared");
+    let hidden = svc
+        .discover_capabilities(guest_discover("shared"))
+        .await
+        .unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::NotFound);
+    assert_eq!(hidden.message(), "not found");
+    let existing = svc
+        .get_object(guest_get("shared-object"))
+        .await
+        .unwrap_err();
+    let missing = svc
+        .get_object(guest_get("no-such-object"))
+        .await
+        .unwrap_err();
+    assert_eq!(existing.code(), missing.code());
+    assert_eq!(existing.code(), tonic::Code::NotFound);
+    let mut list = with_named_principal(
+        ListObjectsRequest {
+            filter: Some(ListFilter {
+                namespace: "shared".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "subject-a",
+    );
+    list.extensions_mut().insert(guest_context());
+    let listed = svc.list_objects(list).await.unwrap();
+    assert!(listed.get_ref().objects.is_empty());
+    assert_eq!(listed.get_ref().total, 0);
+}
+
+#[test]
+fn discovery_is_off_until_a_rule_names_the_namespace() {
+    let extension = Arc::new(DiscoveryRuleExtension::none());
+    let svc = discovery_service(extension);
+    let db = svc.db.runtime();
+    for action in [
+        crate::enterprise::NamespaceAction::Discover,
+        crate::enterprise::NamespaceAction::Read,
+        crate::enterprise::NamespaceAction::Write,
+    ] {
+        assert!(
+            enforce_namespace_tenant_context_for(db, Some(&guest_context()), "shared", action)
+                .is_err()
+        );
+    }
+    let decisions = discovery_decisions(db);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].outcome, "denied");
+    assert_eq!(decisions[0].target_id, "shared");
+    assert_eq!(decisions[0].evidence["home_tenant"], "tenant-home");
+    assert_eq!(decisions[0].evidence["owner_tenant"], "tenant-test");
+    assert_eq!(decisions[0].evidence["operation"], "namespace");
+}
+
+#[test]
+fn guest_grant_discover_is_still_audited_as_discovery() {
+    let db = RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(GuestSharedExtension::granting(
+                crate::enterprise::SpaceRole::Discoverer,
+                "restricted",
+            ))),
+        )
+        .unwrap(),
+    ));
+    assert!(
+        enforce_namespace_tenant_context_for(
+            &db,
+            Some(&guest_context()),
+            "shared",
+            crate::enterprise::NamespaceAction::Discover,
+        )
+        .is_ok()
+    );
+    let decisions = discovery_decisions(&db);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].outcome, "allowed");
+    assert_eq!(decisions[0].target_id, "shared");
+    assert_eq!(decisions[0].evidence["owner_tenant"], "tenant-test");
+    assert_eq!(decisions[0].evidence["home_tenant"], "tenant-home");
+}
+
+#[tokio::test]
+async fn discovery_rule_names_exact_targets_at_discover_only() {
+    let extension = Arc::new(DiscoveryRuleExtension::naming(&["shared"]));
+    let svc = discovery_service(extension);
+    seed_lineage_object(&svc, "shared-object", "shared");
+    let db = svc.db.runtime();
+    assert!(
+        enforce_namespace_tenant_context_for(
+            db,
+            Some(&guest_context()),
+            "shared",
+            crate::enterprise::NamespaceAction::Discover,
+        )
+        .is_ok()
+    );
+    assert!(
+        enforce_namespace_tenant_context_for(
+            db,
+            Some(&guest_context()),
+            "allowed",
+            crate::enterprise::NamespaceAction::Discover,
+        )
+        .is_err()
+    );
+    assert!(
+        enforce_namespace_tenant_context_for(
+            db,
+            Some(&guest_context()),
+            "shared",
+            crate::enterprise::NamespaceAction::Read,
+        )
+        .is_err()
+    );
+    assert!(
+        enforce_namespace_tenant_context_for(
+            db,
+            Some(&guest_context()),
+            "shared",
+            crate::enterprise::NamespaceAction::Write,
+        )
+        .is_err()
+    );
+
+    let found = svc
+        .discover_capabilities(guest_discover("shared"))
+        .await
+        .unwrap();
+    assert_eq!(found.get_ref().cache_scope, "authorization_context");
+    let hidden = svc
+        .discover_capabilities(guest_discover("allowed"))
+        .await
+        .unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::NotFound);
+    assert_eq!(hidden.message(), "not found");
+
+    let existing = svc
+        .get_object(guest_get("shared-object"))
+        .await
+        .unwrap_err();
+    let missing = svc
+        .get_object(guest_get("no-such-object"))
+        .await
+        .unwrap_err();
+    assert_eq!(existing.code(), missing.code());
+    assert_eq!(existing.code(), tonic::Code::NotFound);
+    let mut list = with_named_principal(
+        ListObjectsRequest {
+            filter: Some(ListFilter {
+                namespace: "shared".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "subject-a",
+    );
+    list.extensions_mut().insert(guest_context());
+    let listed = svc.list_objects(list).await.unwrap();
+    assert!(listed.get_ref().objects.is_empty());
+    assert_eq!(listed.get_ref().total, 0);
+
+    let decisions = discovery_decisions(db);
+    assert!(decisions.iter().any(|decision| {
+        decision.target_id == "shared"
+            && decision.outcome == "allowed"
+            && decision.evidence["owner_tenant"] == "tenant-test"
+            && decision.evidence["home_tenant"] == "tenant-home"
+            && decision.evidence["operation"] == "namespace"
+    }));
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| { decision.target_id == "allowed" && decision.outcome == "denied" })
+    );
+}
+
+#[test]
+fn discovery_withdrawal_is_next_request_and_audited() {
+    let extension = Arc::new(DiscoveryRuleExtension::naming(&["shared"]));
+    let db = RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension.clone())).unwrap(),
+    ));
+    assert!(
+        enforce_namespace_tenant_context_for(
+            &db,
+            Some(&guest_context()),
+            "shared",
+            crate::enterprise::NamespaceAction::Discover,
+        )
+        .is_ok()
+    );
+    *extension.0.lock().unwrap() = None;
+    assert!(
+        enforce_namespace_tenant_context_for(
+            &db,
+            Some(&guest_context()),
+            "shared",
+            crate::enterprise::NamespaceAction::Discover,
+        )
+        .is_err()
+    );
+    let outcomes: Vec<_> = discovery_decisions(&db)
+        .into_iter()
+        .map(|decision| decision.outcome)
+        .collect();
+    assert_eq!(outcomes, ["denied", "allowed"]);
 }
 
 #[tokio::test]

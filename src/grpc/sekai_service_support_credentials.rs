@@ -522,6 +522,7 @@ pub(super) fn enforce_namespace_tenant_context_for(
     action: crate::enterprise::NamespaceAction,
 ) -> Result<(), Status> {
     let write = action == crate::enterprise::NamespaceAction::Write;
+    let mut guest_grant_ok = None;
     let result = (|| {
         if service_principal_scope(db, tenant_context)?
             .is_some_and(|scope| !scope.namespaces.iter().any(|allowed| allowed == namespace))
@@ -550,7 +551,23 @@ pub(super) fn enforce_namespace_tenant_context_for(
         if let Some(context) = tenant_context
             && context.guest_home_tenant().is_some()
         {
-            return authorize_guest(db, context, namespace, action);
+            let guest = authorize_guest(db, context, namespace, action);
+            guest_grant_ok = Some(guest.is_ok());
+            return match guest {
+                Ok(()) => {
+                    if action == crate::enterprise::NamespaceAction::Discover {
+                        record_namespace_discovery(db, context, namespace, true)?;
+                    }
+                    Ok(())
+                }
+                Err(status)
+                    if status.code() == tonic::Code::PermissionDenied
+                        && action == crate::enterprise::NamespaceAction::Discover =>
+                {
+                    authorize_discovery_namespace(db, context, namespace)
+                }
+                Err(status) => Err(status),
+            };
         }
         let Some(extension) = db.enterprise_extension() else {
             return Ok(());
@@ -564,7 +581,7 @@ pub(super) fn enforce_namespace_tenant_context_for(
             .authorize_authenticated_context(context, namespace, action)
             .map_err(extension_status)
     })();
-    // The final outcome, including denials from the checks before the hook.
+    // Guest-grant audit stays independent of a later discovery admit (#1435).
     if let Some(context) = tenant_context
         && context.guest_home_tenant().is_some()
     {
@@ -573,7 +590,7 @@ pub(super) fn enforce_namespace_tenant_context_for(
             context,
             namespace,
             &format!("{action:?}").to_lowercase(),
-            result.is_ok(),
+            guest_grant_ok.unwrap_or(result.is_ok()),
         )
         .map_err(Status::internal)?;
     }
@@ -601,6 +618,69 @@ fn authorize_guest(
     action: crate::enterprise::NamespaceAction,
 ) -> Result<(), Status> {
     guest_grant(db, context, namespace, action).map(|_| ())
+}
+
+fn acting_owner_tenant(context: &RequestEnterpriseContext) -> &str {
+    context
+        .tenant
+        .as_ref()
+        .map(|tenant| tenant.tenant_id.as_str())
+        .filter(|tenant| !tenant.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn record_namespace_discovery(
+    db: &RuntimeDb,
+    context: &RequestEnterpriseContext,
+    namespace: &str,
+    allowed: bool,
+) -> Result<(), Status> {
+    crate::grpc::record_discovery(
+        db,
+        context,
+        acting_owner_tenant(context),
+        namespace,
+        "namespace",
+        allowed,
+    )
+    .map_err(Status::internal)
+}
+
+fn discovery_rule(
+    db: &RuntimeDb,
+    context: &RequestEnterpriseContext,
+) -> Result<Option<crate::enterprise::DiscoveryRule>, Status> {
+    let owner = acting_owner_tenant(context);
+    if owner.is_empty() {
+        return Err(Status::permission_denied("enterprise authorization denied"));
+    }
+    let Some(extension) = db.enterprise_extension() else {
+        return Ok(None);
+    };
+    extension
+        .authorize_discovery(context, owner)
+        .map_err(extension_status)
+}
+
+fn authorize_discovery_namespace(
+    db: &RuntimeDb,
+    context: &RequestEnterpriseContext,
+    namespace: &str,
+) -> Result<(), Status> {
+    let denied = || Status::permission_denied("enterprise authorization denied");
+    let rule = match discovery_rule(db, context) {
+        Ok(rule) => rule,
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            record_namespace_discovery(db, context, namespace, false)?;
+            return Err(status);
+        }
+        Err(status) => return Err(status),
+    };
+    let allowed = rule
+        .as_ref()
+        .is_some_and(|rule| rule.exposes_namespace(namespace));
+    record_namespace_discovery(db, context, namespace, allowed)?;
+    allowed.then_some(()).ok_or_else(denied)
 }
 
 fn guest_grant(
