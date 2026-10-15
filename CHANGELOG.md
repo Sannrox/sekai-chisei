@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `PutDefinitionCertification` copies suite identity and pass/fail from a
+  stored eval run, refuses a bind by authors of agent-member changes since
+  the published base, treats revocation as one-way, and caps expiry at 90
+  days from bind time. A later unrelated edit cannot restore the author's
+  ability to self-certify or to clear `revoked_at_ms` (#1513).
+
 - Experimental `ProposeDefinitionRollback` opens an append-only proposal whose
   candidate restores a prior published revision as a new descendant of the live
   head. Merge records `restored_from_digest` on the receipt and refuses when
