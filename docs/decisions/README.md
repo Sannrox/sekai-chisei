@@ -129,3 +129,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0105: Partitioned streaming I/O for governed transforms](0105-partitioned-transform-io.md)
 - [ADR 0106: Namespace-scoped model review state and family enablement](0106-namespace-model-review-state.md)
 - [ADR 0107: Two-way model-release evidence for opt-in hosted routes](0107-model-release-evidence.md)
+- [ADR 0108: Search is a derived index, selected and decided under the read policy](0108-permission-aware-search-index.md)
