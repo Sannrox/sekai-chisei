@@ -103,6 +103,22 @@ impl PostgresDb {
             request.timestamp,
         )?;
         erase_supported_subject_data(&mut tx, request, &subject_hash, &mut result)?;
+        if result.llm_calls_deleted > 0 {
+            match crate::db::postgres_dataset::snapshot_dataset_version_pg(
+                &mut tx,
+                "llm_calls",
+                "",
+                "",
+                "subject-erasure",
+                "",
+                request.timestamp,
+            ) {
+                Err(error) if error == crate::sekai::dataset_version::DATASET_NOT_FOUND => {}
+                other => {
+                    other.map_err(err)?;
+                }
+            }
+        }
         if let Some(location) =
             unsupported_subject_location(&mut tx, &request.subject_kind, &request.subject)?
         {
@@ -528,6 +544,37 @@ fn erase_supported_subject_data(
                 .map_err(err)? as i32;
         }
     }
+    let version_rows = client
+        .query(
+            "SELECT version_id, row_id, data FROM sekai_dataset_version_rows
+             WHERE dataset_id = 'llm_calls'",
+            &[],
+        )
+        .map_err(err)?;
+    for row in version_rows {
+        let version_id: String = row.get(0);
+        let row_id: i64 = row.get(1);
+        let data: String = row.get(2);
+        if value_mentions_subject(&data, &request.subject_kind, subject) {
+            client
+                .execute(
+                    "DELETE FROM sekai_dataset_version_rows
+                     WHERE dataset_id = 'llm_calls' AND version_id = $1 AND row_id = $2",
+                    &[&version_id, &row_id],
+                )
+                .map_err(err)?;
+        }
+    }
+    client
+        .execute(
+            "UPDATE sekai_dataset_versions SET row_count = (
+                SELECT COUNT(*) FROM sekai_dataset_version_rows
+                WHERE dataset_id = sekai_dataset_versions.dataset_id
+                  AND version_id = sekai_dataset_versions.version_id
+             ) WHERE dataset_id = 'llm_calls'",
+            &[],
+        )
+        .map_err(err)?;
 
     for row in client
         .query(

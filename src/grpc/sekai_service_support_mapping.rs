@@ -800,6 +800,39 @@ pub(super) fn from_proto_dataset(d: &Dataset) -> dataset::Dataset {
         partition_keys: d.partition_keys.clone(),
     }
 }
+pub(super) fn to_proto_dataset_version(
+    version: &crate::sekai::dataset_version::DatasetVersion,
+) -> DatasetVersion {
+    DatasetVersion {
+        dataset_id: version.dataset_id.clone(),
+        version_id: version.version_id.clone(),
+        seq: version.seq,
+        created_at_ms: version.created_at_ms,
+        actor: version.actor.clone(),
+        tenant: version.tenant.clone(),
+        reason: version.reason.clone(),
+        restored_from_version_id: version.restored_from_version_id.clone(),
+        row_count: version.row_count,
+        purged: version.purged,
+    }
+}
+
+pub(super) fn map_dataset_version_error(error: String) -> Status {
+    if error == crate::sekai::dataset_version::DATASET_VERSION_PAST_RETENTION {
+        Status::failed_precondition(error)
+    } else if error == crate::sekai::dataset_version::DATASET_VERSION_NOT_FOUND
+        || error == crate::sekai::dataset_version::DATASET_NOT_FOUND
+    {
+        Status::not_found(error)
+    } else if error == crate::sekai::dataset_version::DATASET_ROLLBACK_REQUIRES_RESTORE
+        || error.contains("must be >=")
+    {
+        Status::invalid_argument(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
 pub(super) fn from_proto_row_filters(filters: &[RowFilter]) -> Vec<dataset::RowFilter> {
     filters
         .iter()

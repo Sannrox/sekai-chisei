@@ -77,7 +77,7 @@ mod postgres_chisei_reservation;
 mod postgres_client_package;
 mod postgres_connector_certification;
 mod postgres_coordination;
-mod postgres_dataset;
+pub(crate) mod postgres_dataset;
 pub(crate) mod postgres_decision;
 mod postgres_deduplication;
 mod postgres_definition_branch;

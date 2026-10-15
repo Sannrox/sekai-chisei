@@ -5,6 +5,7 @@ use sekai_chisei::db::ontology::OntologyBackend;
 use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::sekai::dataset::{ColumnDef, Dataset, RowFilter, RowQuery, VirtualTable};
+use sekai_chisei::sekai::dataset_version::DatasetRollback;
 use sekai_chisei::sekai::ontology::{
     Cardinality, OntologyClass, OntologyProperty, OntologyRelation,
 };
@@ -79,6 +80,74 @@ fn exercise_datasets(db: &dyn DatasetBackend, prefix: &str) {
     assert_eq!(
         db.query_rows(&dataset_id, &query).unwrap()[0]["secret"],
         "[redacted]"
+    );
+
+    let versioned_id = format!("{prefix}-versions");
+    db.create_dataset(&Dataset {
+        id: versioned_id.clone(),
+        name: "versions".into(),
+        columns: vec![ColumnDef {
+            name: "kind".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 20,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    db.append_rows(
+        &versioned_id,
+        &[HashMap::from([("kind".into(), "v1".into())])],
+    )
+    .unwrap();
+    db.append_rows(
+        &versioned_id,
+        &[HashMap::from([("kind".into(), "v2".into())])],
+    )
+    .unwrap();
+    db.append_rows(
+        &versioned_id,
+        &[HashMap::from([("kind".into(), "v3".into())])],
+    )
+    .unwrap();
+    let versions = db.list_dataset_versions(&versioned_id).unwrap();
+    assert_eq!(versions.len(), 3);
+    let first = versions[0].clone();
+    let rolled = db
+        .rollback_dataset(&DatasetRollback {
+            dataset_id: versioned_id.clone(),
+            restore_from_version_id: first.version_id.clone(),
+            reason: "bad sync".into(),
+            actor: "tester".into(),
+            tenant: "tenant-a".into(),
+        })
+        .unwrap();
+    assert_eq!(rolled.seq, 4);
+    assert_eq!(rolled.restored_from_version_id, first.version_id);
+    assert_eq!(rolled.actor, "tester");
+    assert_eq!(rolled.reason, "bad sync");
+    let live = db.query_rows(&versioned_id, &RowQuery::default()).unwrap();
+    let restored_rows = db
+        .query_dataset_version_rows(&versioned_id, &first.version_id, 0)
+        .unwrap();
+    assert_eq!(live, restored_rows);
+    let as_of = db
+        .get_dataset_version(&versioned_id, "", first.created_at_ms)
+        .unwrap();
+    assert_eq!(as_of.version_id, first.version_id);
+    db.set_dataset_version_retention(&versioned_id, 2).unwrap();
+    db.append_rows(
+        &versioned_id,
+        &[HashMap::from([("kind".into(), "v5".into())])],
+    )
+    .unwrap();
+    let err = db
+        .get_dataset_version(&versioned_id, &first.version_id, 0)
+        .unwrap_err();
+    assert!(
+        err.contains("past retention"),
+        "expected past-retention error, got {err}"
     );
 
     db.create_virtual_table(&VirtualTable {

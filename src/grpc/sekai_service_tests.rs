@@ -5398,6 +5398,209 @@ async fn query_rows_reports_corrupt_storage_as_internal() {
 }
 
 #[tokio::test]
+async fn rollback_dataset_restores_prior_snapshot_as_new_version() {
+    let svc = service();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "versioned".into(),
+            name: "versioned".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    for kind in ["v1", "v2", "v3"] {
+        svc.append_rows(with_principal(AppendRowsRequest {
+            dataset_id: "versioned".into(),
+            rows: vec![Row {
+                values: [("kind".into(), kind.into())].into(),
+            }],
+        }))
+        .await
+        .unwrap();
+    }
+    let listed = svc
+        .list_dataset_versions(with_principal(ListDatasetVersionsRequest {
+            dataset_id: "versioned".into(),
+            as_of_ms: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.versions.len(), 3);
+    let first = listed.versions[0].clone();
+    let rolled = svc
+        .rollback_dataset(with_principal(RollbackDatasetRequest {
+            dataset_id: "versioned".into(),
+            restore_from_version_id: first.version_id.clone(),
+            reason: "bad sync".into(),
+            tenant: "tenant-a".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let version = rolled.version.unwrap();
+    assert_eq!(version.seq, 4);
+    assert_eq!(version.restored_from_version_id, first.version_id);
+    assert_eq!(version.actor, "tester");
+    let live = svc
+        .query_rows(with_principal(QueryRowsRequest {
+            dataset_id: "versioned".into(),
+            query: None,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .rows;
+    assert_eq!(live, rolled.rows);
+    svc.db
+        .runtime()
+        .set_dataset_version_retention("versioned", 2)
+        .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "versioned".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v5".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let error = svc
+        .get_dataset_version(with_principal(GetDatasetVersionRequest {
+            dataset_id: "versioned".into(),
+            version_id: first.version_id,
+            as_of_ms: 0,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("past retention"));
+}
+
+#[tokio::test]
+async fn rollback_dataset_requires_write_access() {
+    let svc = service();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "protected-versions".into(),
+            name: "protected".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: "protected-version-object".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    let grant = security::Grant {
+        id: "dataset-version-owner".into(),
+        object_id: "protected-version-object".into(),
+        principal: "tester".into(),
+        role: security::Role::Admin,
+        created: 0,
+    };
+    svc.db.runtime().create_grant(&grant).unwrap();
+    svc.security.add_grant(&grant);
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "protected-versions".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v1".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let listed = svc
+        .list_dataset_versions(with_principal(ListDatasetVersionsRequest {
+            dataset_id: "protected-versions".into(),
+            as_of_ms: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let error = svc
+        .rollback_dataset(with_named_principal(
+            RollbackDatasetRequest {
+                dataset_id: "protected-versions".into(),
+                restore_from_version_id: listed.versions[0].version_id.clone(),
+                reason: "intruder".into(),
+                tenant: String::new(),
+            },
+            "intruder",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn rollback_dataset_rejects_tenant_mismatch() {
+    let svc = enterprise_service();
+    svc.db
+        .runtime()
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "mismatch-versions".into(),
+            name: "mismatch".into(),
+            columns: vec![crate::sekai::dataset::ColumnDef {
+                name: "kind".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .append_rows(
+            "mismatch-versions",
+            &[std::collections::HashMap::from([(
+                "kind".into(),
+                "v1".into(),
+            )])],
+        )
+        .unwrap();
+    let versions = svc
+        .db
+        .runtime()
+        .list_dataset_versions("mismatch-versions")
+        .unwrap();
+    let restore = versions[0].version_id.clone();
+    let error = svc
+        .rollback_dataset(with_tenant_context(RollbackDatasetRequest {
+            dataset_id: "mismatch-versions".into(),
+            restore_from_version_id: restore.clone(),
+            reason: "spoof".into(),
+            tenant: "other-tenant".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    let rolled = svc
+        .rollback_dataset(with_tenant_context(RollbackDatasetRequest {
+            dataset_id: "mismatch-versions".into(),
+            restore_from_version_id: restore,
+            reason: "restore".into(),
+            tenant: "tenant-test".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rolled.version.unwrap().tenant, "tenant-test");
+}
+
+#[tokio::test]
 async fn update_dataset_requires_write_access_to_existing_binding() {
     let svc = service();
     svc.create_dataset(with_principal(CreateDatasetRequest {

@@ -1241,6 +1241,47 @@ message AppendRowsResponse { int32 count = 1; }
 message QueryRowsRequest { string dataset_id = 1; RowQuery query = 2; }
 message QueryRowsResponse { repeated Row rows = 1; }
 
+message ListDatasetVersionsRequest {
+  string dataset_id = 1;
+  int64 as_of_ms = 2;
+}
+message DatasetVersion {
+  string dataset_id = 1;
+  string version_id = 2;
+  int64 seq = 3;
+  int64 created_at_ms = 4;
+  string actor = 5;
+  string tenant = 6;
+  string reason = 7;
+  string restored_from_version_id = 8;
+  int32 row_count = 9;
+  bool purged = 10;
+}
+message ListDatasetVersionsResponse {
+  repeated DatasetVersion versions = 1;
+  int32 version_retention_count = 2;
+}
+message GetDatasetVersionRequest {
+  string dataset_id = 1;
+  string version_id = 2;
+  int64 as_of_ms = 3;
+}
+message GetDatasetVersionResponse {
+  DatasetVersion version = 1;
+  repeated Row rows = 2;
+  int32 version_retention_count = 3;
+}
+message RollbackDatasetRequest {
+  string dataset_id = 1;
+  string restore_from_version_id = 2;
+  string reason = 3;
+  string tenant = 4;
+}
+message RollbackDatasetResponse {
+  DatasetVersion version = 1;
+  repeated Row rows = 2;
+}
+
 message CreateVirtualTableRequest { VirtualTable table = 1; }
 message CreateVirtualTableResponse { VirtualTable table = 1; }
 message ListVirtualTablesRequest {}
@@ -2864,6 +2905,9 @@ service SekaiService {
   rpc ListDatasets(ListDatasetsRequest) returns (ListDatasetsResponse);
   rpc AppendRows(AppendRowsRequest) returns (AppendRowsResponse);
   rpc QueryRows(QueryRowsRequest) returns (QueryRowsResponse);
+  rpc ListDatasetVersions(ListDatasetVersionsRequest) returns (ListDatasetVersionsResponse);
+  rpc GetDatasetVersion(GetDatasetVersionRequest) returns (GetDatasetVersionResponse);
+  rpc RollbackDataset(RollbackDatasetRequest) returns (RollbackDatasetResponse);
   rpc CreateVirtualTable(CreateVirtualTableRequest) returns (CreateVirtualTableResponse);
   rpc ListVirtualTables(ListVirtualTablesRequest) returns (ListVirtualTablesResponse);
 

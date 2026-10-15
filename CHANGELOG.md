@@ -8,6 +8,14 @@
   days from bind time. A later unrelated edit cannot restore the author's
   ability to self-certify or to clear `revoked_at_ms` (#1513).
 
+- Dataset writes snapshot a retained version id. `ListDatasetVersions` and
+  `GetDatasetVersion` read a prior snapshot by id or timestamp; `RollbackDataset`
+  restores that snapshot as a new audited version and marks consuming transform
+  outputs stale. Retention `0` keeps every version; a positive limit purges
+  older snapshots. Additive experimental RPCs and PostgreSQL migration
+  `0073_dataset_versions` (`GATE:mig`, #1412). Enable `SEKAI_EXPERIMENTAL_RPCS=1`
+  or the `experimental-rpcs` feature to invoke.
+
 - Experimental `ProposeDefinitionRollback` opens an append-only proposal whose
   candidate restores a prior published revision as a new descendant of the live
   head. Merge records `restored_from_digest` on the receipt and refuses when
