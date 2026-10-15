@@ -164,12 +164,25 @@ impl SekaiServiceImpl {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("tenant context requires an explicit namespace filter")
             })?;
-            enforce_namespace_tenant_context(
+            if let Err(status) = enforce_namespace_tenant_context(
                 self.db.runtime(),
                 tenant_context.as_ref(),
                 namespace,
                 false,
-            )?;
+            ) {
+                if status.code() == tonic::Code::PermissionDenied
+                    && tenant_context
+                        .as_ref()
+                        .is_some_and(|context| context.guest_home_tenant().is_some())
+                {
+                    return Ok(Response::new(ListObjectsResponse {
+                        objects: Vec::new(),
+                        total: 0,
+                        next_page_token: String::new(),
+                    }));
+                }
+                return Err(status);
+            }
         }
         let operation_id = invoked_capability.as_ref().map(|_| {
             requested_operation_id

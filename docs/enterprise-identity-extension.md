@@ -127,6 +127,23 @@ tenant, space, the namespace (or the RPC, when the interceptor rejects it
 first), and the operation. Ceiling denials use operation `ceiling` and the
 object id. A denied guest read looks like a missing object.
 
+## Discovery
+
+An administrator-approved discovery rule names which tenants, principals,
+spaces, and namespaces another tenant may find (#1435). Finding a name is
+not a read. Without a rule, cross-tenant list and lookup look the same as a
+missing target. The extension returns `authorize_discovery`: `Ok(None)` is
+no rule, `Ok(Some(rule))` names the exposed targets at discover level only,
+and `Err` is a withdrawn or one-sided rule. Core asks on every discover
+request and caches nothing, so a withdrawn or narrowed rule applies to the
+next request.
+
+A rule never grants read or write. Guests still need a host `GuestGrant` for
+those actions. `DiscoverCapabilities` is a discover RPC: a denied guest
+lookup is `not found`. Every discovery decision is audited as
+`tenant.discovery` with the principal, home tenant, owner tenant, space, the
+namespace, and the operation.
+
 ## Compatibility
 
 GATE:mig: before adopting tenant-required authentication, bind each service
@@ -147,6 +164,12 @@ Extensions that build `AuthenticatedContext` must set it (`None` keeps
 same-tenant behavior). No existing field changes meaning, the default guest
 hook fails closed, and no protocol field numbers change, so the contract
 version stays `v2`.
+
+GATE:break: `authorize_discovery` (#1435) is a new optional `v2` method.
+The default is no rule (`Ok(None)`). Extensions that implement it return
+the current `DiscoveryRule` or `Err` when the rule is withdrawn. No
+existing field changes meaning and no protocol field numbers change, so
+the contract version stays `v2`.
 
 Adopting the context contract requires an implementation to provide `authenticate_context`;
 there is no compatibility adapter that guesses scopes or expiry from the older

@@ -301,11 +301,25 @@ pub(super) async fn discover_capabilities(
 ) -> Result<Response<DiscoverCapabilitiesResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let namespace = inner.namespace.trim();
     if namespace.is_empty() || namespace != inner.namespace {
         return Err(Status::invalid_argument("canonical namespace required"));
     }
+    enforce_namespace_tenant_context_for(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        namespace,
+        crate::enterprise::NamespaceAction::Discover,
+    )
+    .map_err(|status| {
+        if status.code() == tonic::Code::PermissionDenied {
+            Status::not_found("not found")
+        } else {
+            status
+        }
+    })?;
     let requested_tier = inner.product_tier_filter.trim();
     if !requested_tier.is_empty()
         && !matches!(requested_tier, "all" | "core" | "advanced" | "experimental")
