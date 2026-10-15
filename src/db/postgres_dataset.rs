@@ -2,6 +2,7 @@ use crate::db::postgres::{PostgresDb, lock_dataset_rows};
 use crate::sekai::dataset::{
     ColumnDef, Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable,
 };
+use crate::sekai::dataset_version::{self, DatasetRollback, DatasetVersion};
 use std::collections::HashMap;
 
 impl PostgresDb {
@@ -133,6 +134,15 @@ impl PostgresDb {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        snapshot_dataset_version_pg(
+            &mut transaction,
+            dataset_id,
+            "",
+            "",
+            "",
+            "",
+            dataset_version::now_ms(),
+        )?;
         transaction.commit().map_err(|error| error.to_string())?;
         i32::try_from(rows.len()).map_err(|_| "too many dataset rows".into())
     }
@@ -269,6 +279,18 @@ impl PostgresDb {
             result.rows_updated += 1;
             result.fields_redacted += changed;
         }
+        redact_dataset_version_rows_pg(&mut transaction, dataset_id, filters, &fields, &keys)?;
+        if result.rows_updated > 0 {
+            snapshot_dataset_version_pg(
+                &mut transaction,
+                dataset_id,
+                "",
+                "",
+                "redaction",
+                "",
+                crate::sekai::dataset_version::now_ms(),
+            )?;
+        }
         crate::db::postgres_governed_transform::redact_transform_partition_receipts_pg(
             &mut transaction,
             dataset_id,
@@ -335,6 +357,223 @@ impl PostgresDb {
                 })
             })
             .collect()
+    }
+    pub fn list_dataset_versions(&self, dataset_id: &str) -> Result<Vec<DatasetVersion>, String> {
+        self.connection()?
+            .query(
+                "SELECT dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+                        restored_from_version_id, row_count, purged
+                 FROM sekai_dataset_versions WHERE dataset_id = $1 ORDER BY seq",
+                &[&dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(row_to_dataset_version)
+            .collect()
+    }
+
+    pub fn dataset_version_retention(&self, dataset_id: &str) -> Result<i32, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT retain_count FROM sekai_dataset_version_policy WHERE dataset_id = $1",
+                &[&dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0))
+            .unwrap_or(0))
+    }
+
+    pub fn set_dataset_version_retention(
+        &self,
+        dataset_id: &str,
+        retain_count: i32,
+    ) -> Result<(), String> {
+        if retain_count < 0 {
+            return Err("version_retention_count must be >= 0".into());
+        }
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        crate::db::postgres::lock_dataset_rows(&mut tx, dataset_id)?;
+        let found: Option<i32> = tx
+            .query_opt("SELECT 1 FROM sekai_datasets WHERE id = $1", &[&dataset_id])
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        if found.is_none() {
+            return Err(dataset_version::DATASET_NOT_FOUND.into());
+        }
+        tx.execute(
+            "INSERT INTO sekai_dataset_version_policy (dataset_id, retain_count)
+             VALUES ($1, $2)
+             ON CONFLICT (dataset_id) DO UPDATE SET retain_count = EXCLUDED.retain_count",
+            &[&dataset_id, &retain_count],
+        )
+        .map_err(|error| error.to_string())?;
+        prune_dataset_versions_pg(&mut tx, dataset_id)?;
+        tx.commit().map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    pub fn get_dataset_version(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<DatasetVersion, String> {
+        let mut connection = self.connection()?;
+        let row = if !version_id.is_empty() {
+            connection.query_opt(
+                "SELECT dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+                        restored_from_version_id, row_count, purged
+                 FROM sekai_dataset_versions WHERE dataset_id = $1 AND version_id = $2",
+                &[&dataset_id, &version_id],
+            )
+        } else if as_of_ms > 0 {
+            connection.query_opt(
+                "SELECT dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+                        restored_from_version_id, row_count, purged
+                 FROM sekai_dataset_versions
+                 WHERE dataset_id = $1 AND created_at_ms <= $2
+                 ORDER BY seq DESC LIMIT 1",
+                &[&dataset_id, &as_of_ms],
+            )
+        } else {
+            connection.query_opt(
+                "SELECT dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+                        restored_from_version_id, row_count, purged
+                 FROM sekai_dataset_versions WHERE dataset_id = $1
+                 ORDER BY seq DESC LIMIT 1",
+                &[&dataset_id],
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        let version = row
+            .map(row_to_dataset_version)
+            .transpose()?
+            .ok_or_else(|| dataset_version::DATASET_VERSION_NOT_FOUND.to_string())?;
+        if version.purged {
+            return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+        }
+        Ok(version)
+    }
+
+    pub fn query_dataset_version_rows(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<Vec<HashMap<String, String>>, String> {
+        Ok(self
+            .load_dataset_version(dataset_id, version_id, as_of_ms)?
+            .1)
+    }
+
+    pub fn load_dataset_version(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<(DatasetVersion, Vec<HashMap<String, String>>), String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        crate::db::postgres::lock_dataset_rows(&mut tx, dataset_id)?;
+        let version = get_dataset_version_pg(&mut tx, dataset_id, version_id, as_of_ms)?;
+        if version.purged {
+            return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+        }
+        let rows = tx
+            .query(
+                "SELECT data FROM sekai_dataset_version_rows
+                 WHERE dataset_id = $1 AND version_id = $2 ORDER BY row_id",
+                &[&dataset_id, &version.version_id],
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let data: String = row.get(0);
+                serde_json::from_str(&data).map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((version, rows))
+    }
+
+    pub fn rollback_dataset(&self, request: &DatasetRollback) -> Result<DatasetVersion, String> {
+        if request.restore_from_version_id.trim().is_empty() {
+            return Err(dataset_version::DATASET_ROLLBACK_REQUIRES_RESTORE.into());
+        }
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        crate::db::postgres::lock_dataset_rows(&mut tx, &request.dataset_id)?;
+        let restored = get_dataset_version_pg(
+            &mut tx,
+            &request.dataset_id,
+            &request.restore_from_version_id,
+            0,
+        )?;
+        if restored.purged {
+            return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+        }
+        tx.execute(
+            "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
+            &[&request.dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_dataset_rows (dataset_id, data)
+             SELECT dataset_id, data FROM sekai_dataset_version_rows
+             WHERE dataset_id = $1 AND version_id = $2
+             ORDER BY row_id",
+            &[&request.dataset_id, &restored.version_id],
+        )
+        .map_err(|error| error.to_string())?;
+        let keys_json: String = tx
+            .query_one(
+                "SELECT partition_keys FROM sekai_datasets WHERE id = $1",
+                &[&request.dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        let keys = crate::sekai::dataset::parse_partition_keys(&keys_json)?;
+        let live = tx
+            .query(
+                "SELECT id, data FROM sekai_dataset_rows WHERE dataset_id = $1",
+                &[&request.dataset_id],
+            )
+            .map_err(|error| error.to_string())?;
+        for row in live {
+            let id: i64 = row.get(0);
+            let data: String = row.get(1);
+            let partition_key = crate::sekai::dataset::partition_key_for_row_json(&keys, &data)?;
+            tx.execute(
+                "UPDATE sekai_dataset_rows SET partition_key = $1 WHERE id = $2",
+                &[&partition_key, &id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        mark_consuming_transform_outputs_stale_pg(
+            &mut tx,
+            &request.dataset_id,
+            &restored.version_id,
+            dataset_version::now_ms(),
+        )?;
+        let version = snapshot_dataset_version_pg(
+            &mut tx,
+            &request.dataset_id,
+            &request.actor,
+            &request.tenant,
+            &request.reason,
+            &restored.version_id,
+            dataset_version::now_ms(),
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(version)
     }
 }
 
@@ -434,4 +673,278 @@ fn compare_numeric(left: &str, right: &str, op: &str) -> bool {
         "lte" => left <= right,
         _ => false,
     }
+}
+
+fn row_to_dataset_version(row: postgres::Row) -> Result<DatasetVersion, String> {
+    let purged: i32 = row.get(9);
+    Ok(DatasetVersion {
+        dataset_id: row.get(0),
+        version_id: row.get(1),
+        seq: row.get(2),
+        created_at_ms: row.get(3),
+        actor: row.get(4),
+        tenant: row.get(5),
+        reason: row.get(6),
+        restored_from_version_id: row.get(7),
+        row_count: row.get(8),
+        purged: purged != 0,
+    })
+}
+
+fn get_dataset_version_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    version_id: &str,
+    as_of_ms: i64,
+) -> Result<DatasetVersion, String> {
+    let row = if !version_id.is_empty() {
+        tx.query_opt(
+            "SELECT dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+                    restored_from_version_id, row_count, purged
+             FROM sekai_dataset_versions WHERE dataset_id = $1 AND version_id = $2",
+            &[&dataset_id, &version_id],
+        )
+    } else if as_of_ms > 0 {
+        tx.query_opt(
+            "SELECT dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+                    restored_from_version_id, row_count, purged
+             FROM sekai_dataset_versions
+             WHERE dataset_id = $1 AND created_at_ms <= $2
+             ORDER BY seq DESC LIMIT 1",
+            &[&dataset_id, &as_of_ms],
+        )
+    } else {
+        tx.query_opt(
+            "SELECT dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+                    restored_from_version_id, row_count, purged
+             FROM sekai_dataset_versions WHERE dataset_id = $1
+             ORDER BY seq DESC LIMIT 1",
+            &[&dataset_id],
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    row.map(row_to_dataset_version)
+        .transpose()?
+        .ok_or_else(|| dataset_version::DATASET_VERSION_NOT_FOUND.to_string())
+}
+
+pub(crate) fn snapshot_dataset_version_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    actor: &str,
+    tenant: &str,
+    reason: &str,
+    restored_from_version_id: &str,
+    created_at_ms: i64,
+) -> Result<DatasetVersion, String> {
+    let exists: Option<i32> = tx
+        .query_opt("SELECT 1 FROM sekai_datasets WHERE id = $1", &[&dataset_id])
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get(0));
+    if exists.is_none() {
+        return Err(dataset_version::DATASET_NOT_FOUND.into());
+    }
+    let seq: i64 = tx
+        .query_one(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM sekai_dataset_versions WHERE dataset_id = $1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    let prev_ms: i64 = tx
+        .query_one(
+            "SELECT COALESCE(MAX(created_at_ms), 0) FROM sekai_dataset_versions WHERE dataset_id = $1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    let created_at_ms = created_at_ms.max(prev_ms.saturating_add(1));
+    let live = tx
+        .query(
+            "SELECT id, data, COALESCE(partition_key, '') FROM sekai_dataset_rows
+             WHERE dataset_id = $1 ORDER BY id",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    let row_jsons: Vec<(i64, String, String)> = live
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    let jsons: Vec<String> = row_jsons.iter().map(|(_, data, _)| data.clone()).collect();
+    let version_id = dataset_version::version_id(dataset_id, seq, created_at_ms, &jsons);
+    let row_count =
+        i32::try_from(row_jsons.len()).map_err(|_| "too many dataset rows".to_string())?;
+    tx.execute(
+        "INSERT INTO sekai_dataset_versions
+         (dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+          restored_from_version_id, row_count, purged)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0)",
+        &[
+            &dataset_id,
+            &version_id,
+            &seq,
+            &created_at_ms,
+            &actor,
+            &tenant,
+            &reason,
+            &restored_from_version_id,
+            &row_count,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    for (row_id, data, partition_key) in &row_jsons {
+        tx.execute(
+            "INSERT INTO sekai_dataset_version_rows
+             (dataset_id, version_id, row_id, data, partition_key)
+             VALUES ($1,$2,$3,$4,$5)",
+            &[&dataset_id, &version_id, row_id, data, partition_key],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    prune_dataset_versions_pg(tx, dataset_id)?;
+    Ok(DatasetVersion {
+        dataset_id: dataset_id.into(),
+        version_id,
+        seq,
+        created_at_ms,
+        actor: actor.into(),
+        tenant: tenant.into(),
+        reason: reason.into(),
+        restored_from_version_id: restored_from_version_id.into(),
+        row_count,
+        purged: false,
+    })
+}
+
+fn prune_dataset_versions_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+) -> Result<(), String> {
+    let retain: i32 = tx
+        .query_opt(
+            "SELECT retain_count FROM sekai_dataset_version_policy WHERE dataset_id = $1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get(0))
+        .unwrap_or(0);
+    if retain <= 0 {
+        return Ok(());
+    }
+    let max_seq: i64 = tx
+        .query_one(
+            "SELECT COALESCE(MAX(seq), 0) FROM sekai_dataset_versions WHERE dataset_id = $1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    let cutoff = max_seq - i64::from(retain);
+    if cutoff < 1 {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM sekai_dataset_version_rows
+         WHERE dataset_id = $1 AND version_id IN (
+            SELECT version_id FROM sekai_dataset_versions
+            WHERE dataset_id = $1 AND seq <= $2
+         )",
+        &[&dataset_id, &cutoff],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE sekai_dataset_versions SET purged = 1
+         WHERE dataset_id = $1 AND seq <= $2",
+        &[&dataset_id, &cutoff],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn mark_consuming_transform_outputs_stale_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    cause_ref: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let rows = tx
+        .query("SELECT definition_json FROM sekai_governed_transform", &[])
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let json: String = row.get(0);
+        let transform: crate::sekai::governed_transform::GovernedTransform =
+            serde_json::from_str(&json).map_err(|error| error.to_string())?;
+        if !transform.consumes_dataset(dataset_id) && transform.output_dataset_id != dataset_id {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO sekai_transform_output_state
+             (namespace, dataset_id, freshness, upstream_version, blocked_run_id, updated_at_ms)
+             VALUES ($1, $2, 'stale', $3, '', $4)
+             ON CONFLICT (namespace, dataset_id) DO UPDATE SET
+                freshness = 'stale',
+                upstream_version = EXCLUDED.upstream_version,
+                blocked_run_id = '',
+                updated_at_ms = EXCLUDED.updated_at_ms",
+            &[
+                &transform.namespace,
+                &transform.output_dataset_id,
+                &cause_ref,
+                &now_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_governed_transform_checkpoint
+             WHERE namespace = $1 AND transform_id = $2",
+            &[&transform.namespace, &transform.transform_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn redact_dataset_version_rows_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    filters: &[RowFilter],
+    fields: &[&str],
+    keys: &[String],
+) -> Result<(), String> {
+    let rows = tx
+        .query(
+            "SELECT version_id, row_id, data FROM sekai_dataset_version_rows WHERE dataset_id = $1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let version_id: String = row.get(0);
+        let row_id: i64 = row.get(1);
+        let data: String = row.get(2);
+        let mut values: HashMap<String, String> =
+            serde_json::from_str(&data).map_err(|error| error.to_string())?;
+        if !matches_filters(&values, filters) {
+            continue;
+        }
+        let mut changed = false;
+        for field in fields {
+            if let Some(value) = values.get_mut(*field)
+                && value != "[redacted]"
+            {
+                *value = "[redacted]".into();
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let data = serde_json::to_string(&values).map_err(|error| error.to_string())?;
+        let partition_key = crate::sekai::governed_transform::partition_value(keys, &values);
+        tx.execute(
+            "UPDATE sekai_dataset_version_rows SET data = $1, partition_key = $2
+             WHERE dataset_id = $3 AND version_id = $4 AND row_id = $5",
+            &[&data, &partition_key, &dataset_id, &version_id, &row_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }

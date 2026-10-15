@@ -3,6 +3,7 @@
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
+use crate::sekai::dataset_version::{DatasetRollback, DatasetVersion};
 use std::collections::HashMap;
 
 pub trait DatasetBackend: Send + Sync {
@@ -28,6 +29,26 @@ pub trait DatasetBackend: Send + Sync {
     ) -> Result<DatasetRedaction, String>;
     fn create_virtual_table(&self, table: &VirtualTable) -> Result<(), String>;
     fn list_virtual_tables(&self) -> Result<Vec<VirtualTable>, String>;
+    fn list_dataset_versions(&self, dataset_id: &str) -> Result<Vec<DatasetVersion>, String>;
+    fn get_dataset_version(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<DatasetVersion, String>;
+    fn query_dataset_version_rows(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<Vec<HashMap<String, String>>, String>;
+    fn rollback_dataset(&self, request: &DatasetRollback) -> Result<DatasetVersion, String>;
+    fn dataset_version_retention(&self, dataset_id: &str) -> Result<i32, String>;
+    fn set_dataset_version_retention(
+        &self,
+        dataset_id: &str,
+        retain_count: i32,
+    ) -> Result<(), String>;
 }
 
 macro_rules! sqlite_forward {
@@ -48,6 +69,12 @@ impl DatasetBackend for SekaiDb {
     sqlite_forward!(redact_dataset_fields(dataset_id: &str, classification: &str, filters: &[RowFilter]) -> Result<DatasetRedaction, String>);
     sqlite_forward!(create_virtual_table(table: &VirtualTable) -> Result<(), String>);
     sqlite_forward!(list_virtual_tables() -> Result<Vec<VirtualTable>, String>);
+    sqlite_forward!(list_dataset_versions(dataset_id: &str) -> Result<Vec<DatasetVersion>, String>);
+    sqlite_forward!(get_dataset_version(dataset_id: &str, version_id: &str, as_of_ms: i64) -> Result<DatasetVersion, String>);
+    sqlite_forward!(query_dataset_version_rows(dataset_id: &str, version_id: &str, as_of_ms: i64) -> Result<Vec<HashMap<String, String>>, String>);
+    sqlite_forward!(rollback_dataset(request: &DatasetRollback) -> Result<DatasetVersion, String>);
+    sqlite_forward!(dataset_version_retention(dataset_id: &str) -> Result<i32, String>);
+    sqlite_forward!(set_dataset_version_retention(dataset_id: &str, retain_count: i32) -> Result<(), String>);
 }
 
 impl DatasetBackend for PostgresDb {
@@ -90,5 +117,37 @@ impl DatasetBackend for PostgresDb {
     }
     fn list_virtual_tables(&self) -> Result<Vec<VirtualTable>, String> {
         self.list_virtual_tables()
+    }
+    fn list_dataset_versions(&self, dataset_id: &str) -> Result<Vec<DatasetVersion>, String> {
+        self.list_dataset_versions(dataset_id)
+    }
+    fn get_dataset_version(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<DatasetVersion, String> {
+        self.get_dataset_version(dataset_id, version_id, as_of_ms)
+    }
+    fn query_dataset_version_rows(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<Vec<HashMap<String, String>>, String> {
+        self.query_dataset_version_rows(dataset_id, version_id, as_of_ms)
+    }
+    fn rollback_dataset(&self, request: &DatasetRollback) -> Result<DatasetVersion, String> {
+        self.rollback_dataset(request)
+    }
+    fn dataset_version_retention(&self, dataset_id: &str) -> Result<i32, String> {
+        self.dataset_version_retention(dataset_id)
+    }
+    fn set_dataset_version_retention(
+        &self,
+        dataset_id: &str,
+        retain_count: i32,
+    ) -> Result<(), String> {
+        self.set_dataset_version_retention(dataset_id, retain_count)
     }
 }

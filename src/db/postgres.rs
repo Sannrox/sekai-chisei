@@ -135,6 +135,7 @@ const CLIENT_PACKAGES_SCHEMA: &str = include_str!("postgres/0070_client_packages
 const CAPABILITY_PACKAGES_SCHEMA: &str = include_str!("postgres/0071_capability_packages.sql");
 const GOVERNED_IMAGES_AND_OPEN_TABLES_SCHEMA: &str =
     include_str!("postgres/0072_governed_images_and_open_tables.sql");
+const DATASET_VERSIONS_SCHEMA: &str = include_str!("postgres/0073_dataset_versions.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -602,6 +603,12 @@ const MIGRATIONS: &[Migration] = &[
         71,
         "governed_images_and_open_tables",
         GOVERNED_IMAGES_AND_OPEN_TABLES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        72,
+        "dataset_versions",
+        DATASET_VERSIONS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

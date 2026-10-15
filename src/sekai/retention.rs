@@ -1109,6 +1109,41 @@ impl SekaiDb {
                     .map_err(|e| e.to_string())? as i32;
             }
         }
+        crate::sekai::dataset::erase_matching_dataset_version_rows_tx(
+            &tx,
+            "llm_calls",
+            &|values: &std::collections::HashMap<String, String>| {
+                map_matches_subject(values, &request.subject_kind, &request.subject)
+                    || values.iter().any(|(key, value)| {
+                        key_matches_subject(key, &request.subject_kind, &request.subject)
+                            || contains_subject_reference(
+                                value,
+                                &request.subject_kind,
+                                &request.subject,
+                            )
+                            || subject_object_ids.iter().any(|object_id| {
+                                contains_identifier(value, object_id)
+                                    || contains_key_identifier(key, object_id)
+                            })
+                    })
+            },
+        )?;
+        if result.llm_calls_deleted > 0 {
+            match crate::sekai::dataset::snapshot_dataset_version_tx(
+                &tx,
+                "llm_calls",
+                "",
+                "",
+                "subject-erasure",
+                "",
+                request.timestamp,
+            ) {
+                Err(error) if error == crate::sekai::dataset_version::DATASET_NOT_FOUND => {}
+                other => {
+                    other?;
+                }
+            }
+        }
 
         let matching_virtual_tables = {
             let mut stmt = tx
@@ -2900,9 +2935,44 @@ impl SekaiDb {
             )
             .map_err(|e| e.to_string())?;
         }
-        for id in llm_ids {
+        for id in &llm_ids {
             tx.execute("DELETE FROM sekai_dataset_rows WHERE id=?1", params![id])
                 .map_err(|e| e.to_string())?;
+        }
+        crate::sekai::dataset::erase_matching_dataset_version_rows_tx(
+            &tx,
+            LLM_CALLS_DATASET,
+            &|row: &std::collections::HashMap<String, String>| {
+                let namespace = row.get("project").map(String::as_str).unwrap_or_default();
+                let data_class = row
+                    .get("data_class")
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let timestamp = row
+                    .get("timestamp_ms")
+                    .and_then(|value| value.parse::<i64>().ok());
+                matches!(
+                    (timestamp, effective_policy(&policies, LLM_CALLS_DATASET, namespace, data_class)),
+                    (Some(timestamp), Some(policy))
+                        if timestamp < now - i64::from(policy.retention_days) * DAY_MS
+                )
+            },
+        )?;
+        if !llm_ids.is_empty() {
+            match crate::sekai::dataset::snapshot_dataset_version_tx(
+                &tx,
+                LLM_CALLS_DATASET,
+                "",
+                "",
+                "archive",
+                "",
+                now,
+            ) {
+                Err(error) if error == crate::sekai::dataset_version::DATASET_NOT_FOUND => {}
+                other => {
+                    other?;
+                }
+            }
         }
         for (component_id, (namespace, rows)) in expired_observations {
             let baseline = tx
@@ -3014,6 +3084,41 @@ impl SekaiDb {
                 run.llm_calls_deleted += tx
                     .execute("DELETE FROM sekai_dataset_rows WHERE id = ?1", params![id])
                     .map_err(|e| e.to_string())? as i32;
+            }
+        }
+        crate::sekai::dataset::erase_matching_dataset_version_rows_tx(
+            &tx,
+            LLM_CALLS_DATASET,
+            &|row: &std::collections::HashMap<String, String>| {
+                let namespace = row.get("project").map(String::as_str).unwrap_or_default();
+                let data_class = row
+                    .get("data_class")
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let timestamp = row
+                    .get("timestamp_ms")
+                    .and_then(|value| value.parse::<i64>().ok());
+                matches!(
+                    (timestamp, effective_policy(&policies, LLM_CALLS_DATASET, namespace, data_class)),
+                    (Some(timestamp), Some(policy))
+                        if timestamp < now - i64::from(policy.retention_days) * DAY_MS
+                )
+            },
+        )?;
+        if run.llm_calls_deleted > 0 {
+            match crate::sekai::dataset::snapshot_dataset_version_tx(
+                &tx,
+                LLM_CALLS_DATASET,
+                "",
+                "",
+                "retention",
+                "",
+                now,
+            ) {
+                Err(error) if error == crate::sekai::dataset_version::DATASET_NOT_FOUND => {}
+                other => {
+                    other?;
+                }
             }
         }
 
@@ -5191,6 +5296,20 @@ mod tests {
         let object = db.get_object("literal-object").unwrap().unwrap();
         assert_eq!(object.properties["status"], "done");
         assert_eq!(object.properties["owner"], "[erased]");
+        for version in db.list_dataset_versions(LLM_CALLS_DATASET).unwrap() {
+            if version.purged {
+                continue;
+            }
+            let rows = db
+                .query_dataset_version_rows(LLM_CALLS_DATASET, &version.version_id, 0)
+                .unwrap();
+            assert!(
+                rows.iter()
+                    .all(|row| row.get("agent").map(String::as_str) != Some("done")),
+                "snapshot {} still contains erased subject: {rows:?}",
+                version.version_id
+            );
+        }
     }
 
     #[test]

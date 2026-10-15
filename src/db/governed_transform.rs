@@ -1516,6 +1516,15 @@ pub(crate) fn append_output_rows(
     rows: &[HashMap<String, String>],
 ) -> Result<(), String> {
     if rows.is_empty() {
+        crate::sekai::dataset::snapshot_dataset_version_tx(
+            tx,
+            dataset_id,
+            "",
+            "",
+            "",
+            "",
+            crate::sekai::dataset_version::now_ms(),
+        )?;
         return Ok(());
     }
     let keys = load_dataset_partition_keys(tx, dataset_id)?;
@@ -1531,8 +1540,17 @@ pub(crate) fn append_output_rows(
          SELECT ?1, value FROM json_each(?2)",
             params![dataset_id, json],
         )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        crate::sekai::dataset::snapshot_dataset_version_tx(
+            tx,
+            dataset_id,
+            "",
+            "",
+            "",
+            "",
+            crate::sekai::dataset_version::now_ms(),
+        )?;
+        Ok(())
     } else {
         for row in rows {
             let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
@@ -1543,6 +1561,15 @@ pub(crate) fn append_output_rows(
             )
             .map_err(|error| error.to_string())?;
         }
+        crate::sekai::dataset::snapshot_dataset_version_tx(
+            tx,
+            dataset_id,
+            "",
+            "",
+            "",
+            "",
+            crate::sekai::dataset_version::now_ms(),
+        )?;
         Ok(())
     }
 }
@@ -1594,6 +1621,15 @@ fn replace_output_partitions(
             .map_err(|error| error.to_string())?;
         }
     }
+    crate::sekai::dataset::snapshot_dataset_version_tx(
+        tx,
+        dataset_id,
+        "",
+        "",
+        "",
+        "",
+        crate::sekai::dataset_version::now_ms(),
+    )?;
     Ok(())
 }
 
@@ -2644,6 +2680,86 @@ mod tests {
             .list_dataset_row_records_after("in", first.last_input_row_id)
             .unwrap();
         assert_eq!(after_first.len(), 1);
+    }
+
+    #[test]
+    fn dataset_rollback_invalidates_incremental_checkpoints() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert_eq!(first.rows_in, 1);
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "2".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let second = db.run_governed_transform("ops", "t1", true, 30).unwrap();
+        assert_eq!(second.rows_in, 1);
+        assert_eq!(db.query_rows("out", &Default::default()).unwrap().len(), 2);
+        let first_version = db.list_dataset_versions("in").unwrap()[0].clone();
+        db.rollback_dataset(&crate::sekai::dataset_version::DatasetRollback {
+            dataset_id: "in".into(),
+            restore_from_version_id: first_version.version_id,
+            reason: "restore v1".into(),
+            actor: "tester".into(),
+            tenant: String::new(),
+        })
+        .unwrap();
+        let checkpoints: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_governed_transform_checkpoint
+                 WHERE namespace = 'ops' AND transform_id = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoints, 0);
+        let freshness: String = db
+            .conn()
+            .query_row(
+                "SELECT freshness FROM sekai_transform_output_state
+                 WHERE namespace = 'ops' AND dataset_id = 'out'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(freshness, TRANSFORM_OUTPUT_STALE);
+        let rebuilt = db.run_governed_transform("ops", "t1", true, 40).unwrap();
+        assert!(!rebuilt.incremental);
+        assert_eq!(rebuilt.rows_in, 1);
+        let live = db.query_rows("out", &Default::default()).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].get("id").map(String::as_str), Some("1"));
     }
 
     #[test]

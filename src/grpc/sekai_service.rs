@@ -1316,6 +1316,24 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<QueryRowsResponse>, Status> {
         rpc_data::query_rows(self, req).await
     }
+    async fn list_dataset_versions(
+        &self,
+        req: Request<ListDatasetVersionsRequest>,
+    ) -> Result<Response<ListDatasetVersionsResponse>, Status> {
+        rpc_data::list_dataset_versions(self, req).await
+    }
+    async fn get_dataset_version(
+        &self,
+        req: Request<GetDatasetVersionRequest>,
+    ) -> Result<Response<GetDatasetVersionResponse>, Status> {
+        rpc_data::get_dataset_version(self, req).await
+    }
+    async fn rollback_dataset(
+        &self,
+        req: Request<RollbackDatasetRequest>,
+    ) -> Result<Response<RollbackDatasetResponse>, Status> {
+        rpc_data::rollback_dataset(self, req).await
+    }
     async fn create_virtual_table(
         &self,
         req: Request<CreateVirtualTableRequest>,

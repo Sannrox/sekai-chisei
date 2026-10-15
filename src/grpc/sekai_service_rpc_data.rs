@@ -337,6 +337,150 @@ pub(super) async fn query_rows(
         rows: rows.into_iter().map(|values| Row { values }).collect(),
     }))
 }
+pub(super) async fn list_dataset_versions(
+    service: &SekaiServiceImpl,
+    req: Request<ListDatasetVersionsRequest>,
+) -> Result<Response<ListDatasetVersionsResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(&inner.dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        false,
+    )?;
+    let versions = service
+        .db
+        .runtime()
+        .list_dataset_versions(&inner.dataset_id)
+        .map_err(map_dataset_version_error)?;
+    let versions = if inner.as_of_ms > 0 {
+        versions
+            .into_iter()
+            .filter(|version| version.created_at_ms <= inner.as_of_ms)
+            .collect::<Vec<_>>()
+    } else {
+        versions
+    };
+    let version_retention_count = service
+        .db
+        .runtime()
+        .dataset_version_retention(&inner.dataset_id)
+        .map_err(Status::internal)?;
+    Ok(Response::new(ListDatasetVersionsResponse {
+        versions: versions.iter().map(to_proto_dataset_version).collect(),
+        version_retention_count,
+    }))
+}
+pub(super) async fn get_dataset_version(
+    service: &SekaiServiceImpl,
+    req: Request<GetDatasetVersionRequest>,
+) -> Result<Response<GetDatasetVersionResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(&inner.dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        false,
+    )?;
+    let (version, rows) = service
+        .db
+        .runtime()
+        .load_dataset_version(&inner.dataset_id, &inner.version_id, inner.as_of_ms)
+        .map_err(map_dataset_version_error)?;
+    let version_retention_count = service
+        .db
+        .runtime()
+        .dataset_version_retention(&inner.dataset_id)
+        .map_err(Status::internal)?;
+    Ok(Response::new(GetDatasetVersionResponse {
+        version: Some(to_proto_dataset_version(&version)),
+        rows: rows.into_iter().map(|values| Row { values }).collect(),
+        version_retention_count,
+    }))
+}
+pub(super) async fn rollback_dataset(
+    service: &SekaiServiceImpl,
+    req: Request<RollbackDatasetRequest>,
+) -> Result<Response<RollbackDatasetResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(&inner.dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        true,
+    )?;
+    let actor = principals
+        .first()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    let context_tenant = tenant_context
+        .as_ref()
+        .and_then(|context| {
+            context
+                .tenant
+                .as_ref()
+                .map(|tenant| tenant.tenant_id.clone())
+        })
+        .unwrap_or_default();
+    let tenant = if !inner.tenant.is_empty() {
+        if !context_tenant.is_empty() && inner.tenant != context_tenant {
+            return Err(Status::permission_denied(
+                "rollback tenant does not match authenticated tenant",
+            ));
+        }
+        inner.tenant
+    } else {
+        context_tenant
+    };
+    let version = service
+        .db
+        .runtime()
+        .rollback_dataset(&crate::sekai::dataset_version::DatasetRollback {
+            dataset_id: inner.dataset_id.clone(),
+            restore_from_version_id: inner.restore_from_version_id,
+            reason: inner.reason,
+            actor,
+            tenant,
+        })
+        .map_err(map_dataset_version_error)?;
+    let rows = service
+        .db
+        .runtime()
+        .query_dataset_version_rows(&inner.dataset_id, &version.version_id, 0)
+        .map_err(map_dataset_version_error)?;
+    Ok(Response::new(RollbackDatasetResponse {
+        version: Some(to_proto_dataset_version(&version)),
+        rows: rows.into_iter().map(|values| Row { values }).collect(),
+    }))
+}
 pub(super) async fn create_virtual_table(
     service: &SekaiServiceImpl,
     req: Request<CreateVirtualTableRequest>,

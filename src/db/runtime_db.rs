@@ -31,6 +31,7 @@ use crate::sekai::attestation::{AttestationVerification, PolicyAttestation};
 use crate::sekai::audit::{Decision, DecisionFilter, ObjectChange};
 use crate::sekai::coordination::*;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
+use crate::sekai::dataset_version::{DatasetRollback, DatasetVersion};
 use crate::sekai::deduplication::*;
 use crate::sekai::definition_branch::*;
 use crate::sekai::definition_proposal::*;
@@ -5731,6 +5732,83 @@ impl RuntimeDb {
             Self::Postgres(_) => {
                 Err("query_rows is unavailable on the PostgreSQL community runtime".into())
             }
+        }
+    }
+
+    pub fn list_dataset_versions(&self, dataset_id: &str) -> Result<Vec<DatasetVersion>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_dataset_versions(dataset_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_dataset_versions(dataset_id))
+            }
+        }
+    }
+
+    pub fn get_dataset_version(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<DatasetVersion, String> {
+        match self {
+            Self::Sqlite(db) => db.get_dataset_version(dataset_id, version_id, as_of_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_dataset_version(dataset_id, version_id, as_of_ms)
+            }),
+        }
+    }
+
+    pub fn query_dataset_version_rows(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<Vec<HashMap<String, String>>, String> {
+        Ok(self
+            .load_dataset_version(dataset_id, version_id, as_of_ms)?
+            .1)
+    }
+
+    pub fn load_dataset_version(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+    ) -> Result<(DatasetVersion, Vec<HashMap<String, String>>), String> {
+        match self {
+            Self::Sqlite(db) => db.load_dataset_version(dataset_id, version_id, as_of_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.load_dataset_version(dataset_id, version_id, as_of_ms)
+            }),
+        }
+    }
+
+    pub fn rollback_dataset(&self, request: &DatasetRollback) -> Result<DatasetVersion, String> {
+        match self {
+            Self::Sqlite(db) => db.rollback_dataset(request),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.rollback_dataset(request)),
+        }
+    }
+
+    pub fn dataset_version_retention(&self, dataset_id: &str) -> Result<i32, String> {
+        match self {
+            Self::Sqlite(db) => db.dataset_version_retention(dataset_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.dataset_version_retention(dataset_id))
+            }
+        }
+    }
+
+    pub fn set_dataset_version_retention(
+        &self,
+        dataset_id: &str,
+        retain_count: i32,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_dataset_version_retention(dataset_id, retain_count),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.set_dataset_version_retention(dataset_id, retain_count)
+            }),
         }
     }
 

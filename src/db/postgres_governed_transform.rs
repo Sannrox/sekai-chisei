@@ -676,34 +676,41 @@ fn insert_output_rows(
     dataset_id: &str,
     rows: &[HashMap<String, String>],
 ) -> Result<(), String> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let keys = load_dataset_partition_keys_pg(tx, dataset_id)?;
-    if keys.is_empty() {
-        let payloads: Vec<String> = rows
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<_, _>>()
-            .map_err(|error| error.to_string())?;
-        return tx
-            .execute(
+    if !rows.is_empty() {
+        let keys = load_dataset_partition_keys_pg(tx, dataset_id)?;
+        if keys.is_empty() {
+            let payloads: Vec<String> = rows
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<_, _>>()
+                .map_err(|error| error.to_string())?;
+            tx.execute(
                 "INSERT INTO sekai_dataset_rows (dataset_id, data)
          SELECT $1, unnest($2::text[])",
                 &[&dataset_id, &payloads],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string());
-    }
-    for row in rows {
-        let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
-        tx.execute(
-            "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
+            .map_err(|error| error.to_string())?;
+        } else {
+            for row in rows {
+                let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+                tx.execute(
+                    "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
              VALUES ($1, $2, $3)",
-            &[&dataset_id, &data, &partition_value(&keys, row)],
-        )
-        .map_err(|error| error.to_string())?;
+                    &[&dataset_id, &data, &partition_value(&keys, row)],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
     }
+    crate::db::postgres_dataset::snapshot_dataset_version_pg(
+        tx,
+        dataset_id,
+        "",
+        "",
+        "",
+        "",
+        crate::sekai::dataset_version::now_ms(),
+    )?;
     Ok(())
 }
 
@@ -1629,6 +1636,15 @@ fn replace_output_partitions_pg(
             .map_err(|error| error.to_string())?;
         }
     }
+    crate::db::postgres_dataset::snapshot_dataset_version_pg(
+        tx,
+        dataset_id,
+        "",
+        "",
+        "",
+        "",
+        crate::sekai::dataset_version::now_ms(),
+    )?;
     Ok(())
 }
 

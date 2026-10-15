@@ -168,7 +168,7 @@ fn is_discover_rpc(method: &str) -> bool {
     let name = method.rsplit('/').next().unwrap_or(method);
     matches!(
         name,
-        "ListSchemaTypes" | "ListDatasets" | "DescribeObjectAction"
+        "ListSchemaTypes" | "ListDatasets" | "ListDatasetVersions" | "DescribeObjectAction"
     )
 }
 
@@ -627,6 +627,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExecuteContentPlanStream"
             | "ListSchemaTypes"
             | "ListDatasets"
+            | "ListDatasetVersions"
+            | "GetDatasetVersion"
+            | "RollbackDataset"
             | "DescribeObjectAction"
     )
 }
@@ -1671,6 +1674,18 @@ mod tests {
             NamespaceAction::Discover
         );
         assert_eq!(
+            rpc_namespace_action("ListDatasetVersions"),
+            NamespaceAction::Discover
+        );
+        assert_eq!(
+            rpc_namespace_action("GetDatasetVersion"),
+            NamespaceAction::Read
+        );
+        assert_eq!(
+            rpc_namespace_action("RollbackDataset"),
+            NamespaceAction::Write
+        );
+        assert_eq!(
             rpc_namespace_action("DescribeObjectAction"),
             NamespaceAction::Discover
         );
@@ -1689,6 +1704,12 @@ mod tests {
         for (role, method, allowed) in [
             (SpaceRole::Discoverer, "ListSchemaTypes", true),
             (SpaceRole::Discoverer, "ListDatasets", true),
+            (SpaceRole::Discoverer, "ListDatasetVersions", true),
+            (SpaceRole::Discoverer, "GetDatasetVersion", false),
+            (SpaceRole::Discoverer, "RollbackDataset", false),
+            (SpaceRole::Viewer, "GetDatasetVersion", true),
+            (SpaceRole::Viewer, "RollbackDataset", false),
+            (SpaceRole::Editor, "RollbackDataset", true),
             (SpaceRole::Discoverer, "DescribeObjectAction", true),
             (SpaceRole::Discoverer, "GetObject", false),
             (SpaceRole::Discoverer, "QueryRows", false),
