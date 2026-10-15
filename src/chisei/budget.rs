@@ -452,16 +452,26 @@ impl BudgetTracker {
         self.adjust_with_metric(scope_id, reserved, actual, METRIC_TOKENS)
     }
 
-    pub fn adjust_with_metric(&self, scope_id: &str, reserved: i32, actual: i32, metric: &str) {
+    pub fn try_adjust_with_metric(
+        &self,
+        scope_id: &str,
+        reserved: i32,
+        actual: i32,
+        metric: &str,
+    ) -> Result<(), String> {
         let delta = actual as i64 - reserved as i64;
-        if let Err(err) = self.db.budget_adjust_chain_for_site(
+        self.db.budget_adjust_chain_for_site(
             scope_id,
             metric,
             delta,
             now_ms(),
             self.require_home_pin(),
             self.local_site_id(),
-        ) {
+        )
+    }
+
+    pub fn adjust_with_metric(&self, scope_id: &str, reserved: i32, actual: i32, metric: &str) {
+        if let Err(err) = self.try_adjust_with_metric(scope_id, reserved, actual, metric) {
             tracing::error!(error = %err, scope_id, "failed to adjust budget usage");
         }
     }

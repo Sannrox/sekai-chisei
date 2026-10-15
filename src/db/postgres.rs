@@ -136,6 +136,12 @@ const CAPABILITY_PACKAGES_SCHEMA: &str = include_str!("postgres/0071_capability_
 const GOVERNED_IMAGES_AND_OPEN_TABLES_SCHEMA: &str =
     include_str!("postgres/0072_governed_images_and_open_tables.sql");
 const DATASET_VERSIONS_SCHEMA: &str = include_str!("postgres/0073_dataset_versions.sql");
+const TRANSFORM_QUOTA_HOLD_SCHEMA: &str = include_str!("postgres/0074_transform_quota_hold.sql");
+const TRANSFORM_WORK_TENANT_SCHEMA: &str = include_str!("postgres/0075_transform_work_tenant.sql");
+const TRANSFORM_QUOTA_OWNER_SCHEMA: &str = include_str!("postgres/0076_transform_quota_owner.sql");
+const CHISEI_USAGE_EVENTS_SCHEMA: &str = include_str!("postgres/0077_chisei_usage_events.sql");
+const TRANSFORM_USAGE_PENDING_SCHEMA: &str =
+    include_str!("postgres/0078_transform_usage_pending.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -611,6 +617,36 @@ const MIGRATIONS: &[Migration] = &[
         DATASET_VERSIONS_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        73,
+        "transform_quota_hold",
+        TRANSFORM_QUOTA_HOLD_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        74,
+        "transform_work_tenant",
+        TRANSFORM_WORK_TENANT_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        75,
+        "transform_quota_owner",
+        TRANSFORM_QUOTA_OWNER_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        76,
+        "chisei_usage_events",
+        CHISEI_USAGE_EVENTS_SCHEMA,
+        MigrationOwner::Chisei,
+    ),
+    mig(
+        77,
+        "transform_usage_pending",
+        TRANSFORM_USAGE_PENDING_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -628,6 +664,16 @@ pub(crate) fn off_runtime<T>(work: impl FnOnce() -> T) -> T {
             tokio::task::block_in_place(work)
         }
         _ => work(),
+    }
+}
+
+/// Stable missing-table display for callers that skip Chisei relations on a
+/// Sekai-only plane. `postgres::Error` otherwise displays as `db error`.
+pub(crate) fn missing_relation_or(error: postgres::Error, relation: &str) -> String {
+    if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) {
+        format!("{relation} does not exist")
+    } else {
+        error.to_string()
     }
 }
 
@@ -1478,6 +1524,33 @@ mod tests {
             "missing PostgreSQL isolated transform input snapshot table"
         );
         assert!(
+            TRANSFORM_QUOTA_HOLD_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_transform_quota_hold"),
+            "missing PostgreSQL transform quota hold table"
+        );
+        assert!(
+            TRANSFORM_WORK_TENANT_SCHEMA.contains("tenant_id TEXT NOT NULL DEFAULT ''"),
+            "missing PostgreSQL transform work tenant_id"
+        );
+        assert!(
+            TRANSFORM_QUOTA_OWNER_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_transform_quota_owner"),
+            "missing PostgreSQL transform quota owner table"
+        );
+        assert!(
+            CHISEI_USAGE_EVENTS_SCHEMA.contains("CREATE TABLE IF NOT EXISTS chisei_usage_events"),
+            "missing PostgreSQL usage ledger table"
+        );
+        assert!(
+            TRANSFORM_USAGE_PENDING_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_transform_usage_pending"),
+            "missing PostgreSQL transform usage pending table"
+        );
+        assert!(
+            TRANSFORM_USAGE_PENDING_SCHEMA.contains("completed_at_ms BIGINT NOT NULL"),
+            "missing PostgreSQL transform usage pending completion time"
+        );
+        assert!(
             PARTITIONED_TRANSFORM_IO_SCHEMA.contains("partition_keys TEXT NOT NULL DEFAULT '[]'"),
             "missing PostgreSQL dataset partition_keys"
         );
@@ -1863,6 +1936,10 @@ mod tests {
             "{tables:?}"
         );
         assert!(
+            tables.iter().any(|table| table == "chisei_usage_events"),
+            "{tables:?}"
+        );
+        assert!(
             !tables.iter().any(|table| table == "sekai_objects"),
             "{tables:?}"
         );
@@ -2023,6 +2100,25 @@ mod tests {
             .unwrap();
         drop(db);
         scratch.connect_for_plane(SchemaPlane::Sekai).unwrap();
+    }
+
+    #[test]
+    fn usage_events_migration_is_chisei_owned() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "chisei_usage_events")
+            .expect("chisei_usage_events");
+        assert!(matches!(migration.owner, MigrationOwner::Chisei));
+        assert!(migration.statements(SchemaPlane::Sekai).is_empty());
+        assert_eq!(
+            migration.statements(SchemaPlane::Chisei),
+            vec![CHISEI_USAGE_EVENTS_SCHEMA]
+        );
+        assert_eq!(
+            migration.statements(SchemaPlane::Shared),
+            vec![CHISEI_USAGE_EVENTS_SCHEMA]
+        );
     }
 
     #[test]

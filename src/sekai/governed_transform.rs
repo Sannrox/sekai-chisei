@@ -43,6 +43,7 @@ pub const TRANSFORM_DEPENDENCY_CYCLE: &str = "transform dependency cycle";
 pub const DEFAULT_TRANSFORM_TENANT_CONCURRENCY: i64 = 4;
 pub const DEFAULT_TRANSFORM_CLAIM_TTL_MS: i64 = 60_000;
 pub const MAX_TRANSFORM_LEASE_EXPIRIES: i64 = 3;
+pub const MAX_TRANSFORM_CLAIM_QUOTA_SKIPS: usize = 16;
 pub const STALE_TRANSFORM_CLAIM: &str = "stale transform claim";
 pub const STALE_TRANSFORM_ADMISSION: &str = "stale isolated transform admission";
 pub const TRANSFORM_DIGEST_MISMATCH: &str = "transform output digest mismatch";
@@ -236,6 +237,29 @@ pub struct TransformWork {
     pub claim_expires_at_ms: i64,
     pub lease_expiries: i64,
     pub created_at_ms: i64,
+    /// Submitting tenant captured at enqueue. Empty on community runs.
+    /// Claim and list responses carry this so a runner keys quotas on the
+    /// owner, not the namespace.
+    #[serde(default)]
+    pub tenant_id: String,
+}
+
+#[derive(Debug, Default)]
+pub struct ClaimTransformWorkOutcome {
+    pub claimed: Option<(TransformWork, GovernedTransform)>,
+    pub failed_run_ids: Vec<String>,
+    pub counted_lease_expiry: bool,
+}
+
+/// In-process scheduled or triggered work that has a Put quota owner.
+/// Tick skips these so the RPC can admit tenant quota before the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueOwnedInProcessTransform {
+    pub namespace: String,
+    pub transform_id: String,
+    pub tenant_id: String,
+    pub cause: String,
+    pub cause_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1039,6 +1063,52 @@ pub fn transform_work_is_claimable(work: &TransformWork, now_ms: i64) -> bool {
     }
 }
 
+/// Claim-time puts stay on CLAIMED so a delayed insert cannot land after
+/// cancel. Restore after a taken hold may rewrite the row on the completing
+/// fence, including terminal work.
+pub fn transform_quota_hold_status_allows(status: &str, restore: bool) -> bool {
+    if status == TRANSFORM_WORK_CLAIMED {
+        return true;
+    }
+    restore
+        && matches!(
+            status,
+            TRANSFORM_WORK_COMPLETED | TRANSFORM_WORK_CANCELLED | TRANSFORM_WORK_FAILED
+        )
+}
+
+fn transform_claim_identity_matches(
+    work: &TransformWork,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+) -> bool {
+    work.claim_owner == runtime_id
+        && work.claim_generation == claim_generation
+        && work.fencing_token == fencing_token
+        && !fencing_token.trim().is_empty()
+}
+
+pub fn transform_claim_is_current(
+    work: &TransformWork,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+) -> bool {
+    work.status == TRANSFORM_WORK_CLAIMED
+        && transform_claim_identity_matches(work, runtime_id, claim_generation, fencing_token)
+}
+
+pub fn transform_completed_write_matches(
+    work: &TransformWork,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+) -> bool {
+    work.status == TRANSFORM_WORK_COMPLETED
+        && transform_claim_identity_matches(work, runtime_id, claim_generation, fencing_token)
+}
+
 pub fn transform_claim_fence_matches(
     work: &TransformWork,
     runtime_id: &str,
@@ -1046,11 +1116,7 @@ pub fn transform_claim_fence_matches(
     fencing_token: &str,
     now_ms: i64,
 ) -> bool {
-    work.status == TRANSFORM_WORK_CLAIMED
-        && work.claim_owner == runtime_id
-        && work.claim_generation == claim_generation
-        && work.fencing_token == fencing_token
-        && !fencing_token.trim().is_empty()
+    transform_claim_is_current(work, runtime_id, claim_generation, fencing_token)
         && work.claim_expires_at_ms > now_ms
 }
 
@@ -1915,6 +1981,30 @@ mod tests {
         ));
         assert!(!transform_claim_fence_matches(
             &work, "runner-a", 2, "fence", 50
+        ));
+        assert!(transform_claim_is_current(&work, "runner-a", 2, "fence"));
+        let completed = TransformWork {
+            status: TRANSFORM_WORK_COMPLETED.into(),
+            claim_expires_at_ms: 10,
+            ..work
+        };
+        assert!(transform_completed_write_matches(
+            &completed, "runner-a", 2, "fence"
+        ));
+        assert!(!transform_completed_write_matches(
+            &completed, "runner-b", 2, "fence"
+        ));
+        assert!(!transform_completed_write_matches(
+            &completed, "runner-a", 1, "fence"
+        ));
+        assert!(!transform_completed_write_matches(
+            &completed, "runner-a", 2, "other"
+        ));
+        assert!(!transform_completed_write_matches(
+            &completed, "runner-a", 2, ""
+        ));
+        assert!(!transform_claim_is_current(
+            &completed, "runner-a", 2, "fence"
         ));
     }
 

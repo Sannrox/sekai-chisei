@@ -12,7 +12,7 @@ pub const SQLITE_ONLY_SURFACES_CONTRACT: &str = "sekai.sqlite-only-surfaces/v1";
 pub const SQLITE_ONLY_SURFACES_JSON: &str =
     include_str!("../tests/fixtures/sqlite_only_surfaces/v1.json");
 pub const RUNTIME_DB_SRC: &str = include_str!("db/runtime_db.rs");
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 21;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -263,11 +263,6 @@ pub const RPC_HANDLER_EVIDENCE_METHODS: &[(&str, &str, &[&str])] = &[
         "ChiseiService",
         "RedeemExternalActionPermit",
         &["redeem_permit"],
-    ),
-    (
-        "ChiseiService",
-        "GetEffectivePolicySummary",
-        &["budget_limits_for_scope"],
     ),
     (
         "ChiseiService",

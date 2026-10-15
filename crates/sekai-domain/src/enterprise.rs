@@ -96,6 +96,36 @@ impl GuestGrant {
     }
 }
 
+/// What one tenant currently allows another to find (#1435). Listing a
+/// tenant, principal, space, or namespace is not a read. Default: nothing
+/// is discoverable across tenants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryRule {
+    pub owner_tenant: String,
+    pub tenants: Vec<String>,
+    pub principals: Vec<String>,
+    pub spaces: Vec<String>,
+    pub namespaces: Vec<String>,
+}
+
+impl DiscoveryRule {
+    pub fn exposes_tenant(&self, tenant: &str) -> bool {
+        self.tenants.iter().any(|exposed| exposed == tenant)
+    }
+
+    pub fn exposes_principal(&self, principal: &str) -> bool {
+        self.principals.iter().any(|exposed| exposed == principal)
+    }
+
+    pub fn exposes_space(&self, space: &str) -> bool {
+        self.spaces.iter().any(|exposed| exposed == space)
+    }
+
+    pub fn exposes_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.iter().any(|exposed| exposed == namespace)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedPrincipal {
     pub subject: String,
@@ -619,6 +649,21 @@ pub trait EnterpriseExtension: Send + Sync {
         Err(ExtensionError::PermissionDenied)
     }
 
+    /// Current discovery rule for a caller looking at `owner_tenant` (#1435).
+    /// `Ok(None)` means no rule: cross-tenant listing and lookup look the
+    /// same as a missing target. `Ok(Some(rule))` names the tenants,
+    /// principals, spaces, and namespaces that may be found, at discover
+    /// level only. `Err` denies a withdrawn or one-sided rule. Default: no
+    /// rule. Core calls this on every discover request and caches nothing.
+    fn authorize_discovery(
+        &self,
+        context: &AuthenticatedContext,
+        owner_tenant: &str,
+    ) -> Result<Option<DiscoveryRule>, ExtensionError> {
+        let _ = (context, owner_tenant);
+        Ok(None)
+    }
+
     /// Decide whether a credential authenticated by the community store may
     /// access an enterprise-governed namespace.
     fn authorize_unscoped_namespace(
@@ -853,6 +898,32 @@ mod tests {
                 Err(ExtensionError::PermissionDenied)
             );
         }
+    }
+
+    #[test]
+    fn discovery_is_off_until_a_rule_names_the_target() {
+        let extension = FakeExtension;
+        let guest = AuthenticatedContext {
+            home_tenant: Some("tenant-home".into()),
+            ..extension.authenticate_context("test-token").unwrap()
+        };
+        assert_eq!(
+            extension.authorize_discovery(&guest, "tenant-test"),
+            Ok(None)
+        );
+        let rule = DiscoveryRule {
+            owner_tenant: "tenant-test".into(),
+            tenants: vec!["tenant-test".into()],
+            principals: vec!["subject-a".into()],
+            spaces: vec!["collab".into()],
+            namespaces: vec!["ops".into()],
+        };
+        assert!(rule.exposes_namespace("ops"));
+        assert!(!rule.exposes_namespace("secrets"));
+        assert!(rule.exposes_tenant("tenant-test"));
+        assert!(rule.exposes_principal("subject-a"));
+        assert!(rule.exposes_space("collab"));
+        assert!(!rule.exposes_space("other"));
     }
 
     #[test]

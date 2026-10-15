@@ -3513,6 +3513,7 @@ mod tests {
         let tables = user_tables(&db);
         assert!(tables.iter().any(|table| table == "sekai_decisions"));
         assert!(tables.iter().any(|table| table == "chisei_budget_limits"));
+        assert!(tables.iter().any(|table| table == "chisei_usage_events"));
         assert!(
             !tables.iter().any(|table| table == "sekai_objects"),
             "{tables:?}"

@@ -16,7 +16,7 @@ projections are the shrink-only list
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| `chisei.budget` | Proven for reserve/usage; limit projection SQLite-only | `tests/chisei_budget_backend_conformance.rs`; list entry `ChiseiService.GetEffectivePolicySummary` |
+| `chisei.budget` | Proven for reserve/usage and limit projection | `tests/chisei_budget_backend_conformance.rs` |
 | `chisei.execution` | Proven | `tests/chisei_execution_backend_conformance.rs` |
 | `chisei.evaluation` / samples | Proven | `tests/chisei_eval_backend_conformance.rs` |
 | `chisei.portfolio` | Proven | `tests/chisei_portfolio_backend_conformance.rs` |
@@ -56,14 +56,12 @@ named in
 - Tenant state, OIDC, and OAuth
 - Host-local permit verification crypto (`verify_for_executor`) — never a
   control-plane dual-backend claim
-- Control-plane online redeem and `GetEffectivePolicySummary` budget-limit
-  projection (see the shrink-only list)
+- Control-plane online redeem (see the shrink-only list)
 
 ## Operator posture
 
 SQLite remains the default community backend. Combined PostgreSQL opens
 `SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
 A single `DATABASE_URL` is retired and refuses boot. Use that dest-pair for dual-backend budget
-reserve/usage, policy, execution, Kioku, and gateway governance. Prefer SQLite
-when hosts must redeem online permits or read `GetEffectivePolicySummary` budget
-limits (see [configuration.md](configuration.md) and #238).
+reserve/usage, limit projection, policy, execution, Kioku, and gateway governance. Prefer SQLite
+when hosts must redeem online permits (see [configuration.md](configuration.md) and #238).

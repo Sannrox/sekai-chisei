@@ -168,7 +168,11 @@ fn is_discover_rpc(method: &str) -> bool {
     let name = method.rsplit('/').next().unwrap_or(method);
     matches!(
         name,
-        "ListSchemaTypes" | "ListDatasets" | "ListDatasetVersions" | "DescribeObjectAction"
+        "ListSchemaTypes"
+            | "ListDatasets"
+            | "ListDatasetVersions"
+            | "DescribeObjectAction"
+            | "DiscoverCapabilities"
     )
 }
 
@@ -245,6 +249,33 @@ pub(crate) fn record_guest_access(
                         .map(|tenant| tenant.tenant_id.as_str()),
                 ),
             ),
+            ("space".into(), context.space.clone().unwrap_or_default()),
+            ("operation".into(), operation.into()),
+        ]),
+    })
+}
+
+/// One `tenant.discovery` audit record for a cross-tenant find (#1435).
+pub(crate) fn record_discovery(
+    db: &crate::db::runtime_db::RuntimeDb,
+    context: &crate::enterprise::AuthenticatedContext,
+    owner_tenant: &str,
+    target_id: &str,
+    operation: &str,
+    allowed: bool,
+) -> Result<(), String> {
+    let tenant_id = |tenant: Option<&str>| tenant.unwrap_or_default().to_string();
+    db.record_decision(&crate::sekai::audit::Decision {
+        id: format!("discovery:{}", uuid::Uuid::new_v4().as_simple()),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: context.principal.subject.clone(),
+        action: "tenant.discovery".into(),
+        reason: "cross-tenant discovery".into(),
+        target_id: target_id.into(),
+        outcome: if allowed { "allowed" } else { "denied" }.into(),
+        evidence: std::collections::HashMap::from([
+            ("home_tenant".into(), tenant_id(context.guest_home_tenant())),
+            ("owner_tenant".into(), owner_tenant.into()),
             ("space".into(), context.space.clone().unwrap_or_default()),
             ("operation".into(), operation.into()),
         ]),
@@ -558,7 +589,12 @@ fn guest_namespace_rpc(service: &str, method: &str) -> bool {
     service == "sekai.SekaiService"
         && matches!(
             method,
-            "GetObject" | "ListObjects" | "CreateObject" | "UpdateObject" | "DeleteObject"
+            "GetObject"
+                | "ListObjects"
+                | "CreateObject"
+                | "UpdateObject"
+                | "DeleteObject"
+                | "DiscoverCapabilities"
         )
 }
 
@@ -631,6 +667,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetDatasetVersion"
             | "RollbackDataset"
             | "DescribeObjectAction"
+            | "DiscoverCapabilities"
     )
 }
 
@@ -1689,6 +1726,10 @@ mod tests {
             rpc_namespace_action("DescribeObjectAction"),
             NamespaceAction::Discover
         );
+        assert_eq!(
+            rpc_namespace_action("DiscoverCapabilities"),
+            NamespaceAction::Discover
+        );
         assert_eq!(rpc_namespace_action("GetObject"), NamespaceAction::Read);
         assert_eq!(rpc_namespace_action("QueryRows"), NamespaceAction::Read);
         assert_eq!(
@@ -1711,6 +1752,7 @@ mod tests {
             (SpaceRole::Viewer, "RollbackDataset", false),
             (SpaceRole::Editor, "RollbackDataset", true),
             (SpaceRole::Discoverer, "DescribeObjectAction", true),
+            (SpaceRole::Discoverer, "DiscoverCapabilities", true),
             (SpaceRole::Discoverer, "GetObject", false),
             (SpaceRole::Discoverer, "QueryRows", false),
             (SpaceRole::Discoverer, "EvaluateObjectSet", false),
@@ -1761,6 +1803,7 @@ mod tests {
         use crate::enterprise::SpaceRole;
         for (method, allowed) in [
             ("ListSchemaTypes", true),
+            ("DiscoverCapabilities", true),
             ("GetObject", false),
             ("QueryRows", false),
         ] {
@@ -2076,6 +2119,7 @@ mod tests {
             "ListSchemaTypes",
             "ListDatasets",
             "DescribeObjectAction",
+            "DiscoverCapabilities",
         ] {
             assert!(enterprise_namespace_method(method));
         }

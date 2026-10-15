@@ -201,7 +201,6 @@ impl ChiseiStore {
         &self.inner
     }
 
-    #[cfg(test)]
     pub(crate) fn runtime_arc(&self) -> Arc<RuntimeDb> {
         self.inner.clone()
     }
