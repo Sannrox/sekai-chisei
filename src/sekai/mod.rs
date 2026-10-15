@@ -10,6 +10,7 @@ pub mod action_ports;
 pub mod action_type_criteria;
 pub(crate) mod action_work_lifecycle;
 pub mod agent_definition;
+pub mod agent_dry_run;
 pub mod agent_promotion;
 pub mod attestation;
 pub mod audit;

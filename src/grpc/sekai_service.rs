@@ -169,6 +169,7 @@ pub struct SekaiServiceImpl {
         Option<std::sync::Arc<crate::composition::cross_store_admission::CrossStoreAdmission>>,
     /// Signs runtime tokens for granted Action work claims; none issues none.
     pub(super) runtime_token_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+    pub(super) dry_run_host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
 }
 
 impl SekaiServiceImpl {
@@ -202,6 +203,7 @@ impl SekaiServiceImpl {
             object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
             cross_store: None,
             runtime_token_authority: None,
+            dry_run_host: None,
         }
     }
 
@@ -223,6 +225,7 @@ impl SekaiServiceImpl {
             object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
             cross_store: None,
             runtime_token_authority: None,
+            dry_run_host: None,
         }
     }
 
@@ -233,6 +236,14 @@ impl SekaiServiceImpl {
         authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     ) -> Self {
         self.runtime_token_authority = authority;
+        self
+    }
+
+    pub fn with_dry_run_host(
+        mut self,
+        host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
+    ) -> Self {
+        self.dry_run_host = host;
         self
     }
 
@@ -466,6 +477,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetDefinitionCertificationGateRequest>,
     ) -> Result<Response<GetDefinitionCertificationGateResponse>, Status> {
         rpc_definitions::get_definition_certification_gate(self, req).await
+    }
+
+    async fn dry_run_agent(
+        &self,
+        req: Request<DryRunAgentRequest>,
+    ) -> Result<Response<DryRunAgentResponse>, Status> {
+        rpc_definitions::dry_run_agent(self, req).await
     }
 
     async fn get_definition_branch(

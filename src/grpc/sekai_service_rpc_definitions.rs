@@ -137,6 +137,11 @@ fn stored_suite_result(
         .ok_or_else(|| {
             Status::failed_precondition(crate::sekai::agent_promotion::REFUSAL_SUITE_MISSING)
         })?;
+    if crate::sekai::agent_dry_run::run_is_dry_run(&run.config_ref, &run.suite_id) {
+        return Err(Status::failed_precondition(
+            crate::sekai::agent_dry_run::REFUSAL_DRY_RUN,
+        ));
+    }
     if run.suite_id != suite_id {
         return Err(Status::failed_precondition(
             crate::sekai::agent_promotion::REFUSAL_SUITE_MISSING,
@@ -1269,4 +1274,249 @@ fn seed_definition_genesis(service: &SekaiServiceImpl, namespace: &str) -> Resul
             }
         })?;
     Ok(())
+}
+
+pub(super) async fn dry_run_agent(
+    service: &SekaiServiceImpl,
+    req: Request<DryRunAgentRequest>,
+) -> Result<Response<DryRunAgentResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    definition_branch_domain::validate_digest("revision_digest", &input.revision_digest)
+        .map_err(Status::invalid_argument)?;
+    definition_branch_domain::DefinitionMemberRef {
+        member_kind: crate::sekai::agent_promotion::MEMBER_KIND_AGENT.into(),
+        member_id: input.member_id.clone(),
+    }
+    .validate()
+    .map_err(Status::invalid_argument)?;
+    authorize_definition_revision(
+        service,
+        &principals,
+        &input.namespace,
+        &input.revision_digest,
+        false,
+    )
+    .map_err(|status| match status.code() {
+        tonic::Code::NotFound => Status::not_found("definition member unavailable"),
+        tonic::Code::Internal => Status::internal("definition member unavailable"),
+        _ => status,
+    })?;
+    let member = service
+        .db
+        .runtime()
+        .get_definition_member(
+            &input.namespace,
+            &input.revision_digest,
+            crate::sekai::agent_promotion::MEMBER_KIND_AGENT,
+            &input.member_id,
+        )
+        .map_err(|_| Status::internal("definition member unavailable"))?
+        .ok_or_else(|| Status::not_found("definition member unavailable"))?;
+    let definition: crate::sekai::agent_definition::AgentDefinition =
+        serde_json::from_str(&member.definition_json)
+            .map_err(|_| Status::not_found("definition member unavailable"))?;
+    definition
+        .validate()
+        .map_err(|_| Status::not_found("definition member unavailable"))?;
+    let request = crate::sekai::agent_dry_run::DryRunModelRequest {
+        namespace: input.namespace.clone(),
+        revision_digest: input.revision_digest.clone(),
+        member_id: input.member_id.clone(),
+        input: input.input,
+        instructions: definition.instructions.clone(),
+    };
+    let reply = match service.dry_run_host.as_ref() {
+        Some(host) => host.admit_and_complete(&request),
+        None => default_dry_run(service.db.runtime(), &request),
+    }
+    .map_err(map_dry_run_failure)?;
+    let namespace = input.namespace.clone();
+    let runtime = service.db.runtime();
+    let trace = crate::sekai::agent_dry_run::classify_actions(
+        &definition,
+        reply,
+        |action_type, parameters_json| {
+            crate::sekai::agent_dry_run::validate_dry_run_proposed_action(
+                runtime,
+                &namespace,
+                action_type,
+                parameters_json,
+            )
+        },
+    );
+    let record_id = format!("dry-run-{}", uuid::Uuid::new_v4().simple());
+    let record = dry_run_eval_record(
+        &input.namespace,
+        &input.member_id,
+        &input.revision_digest,
+        &record_id,
+        now_millis(),
+        &trace,
+    );
+    service
+        .db
+        .runtime()
+        .put_eval_run(&record)
+        .map_err(Status::internal)?;
+    Ok(Response::new(DryRunAgentResponse {
+        record_id,
+        model_steps: trace
+            .model_steps
+            .into_iter()
+            .map(|(route, output)| DryRunAgentModelStep { route, output })
+            .collect(),
+        tool_calls: trace
+            .tool_calls
+            .into_iter()
+            .map(|call| DryRunAgentToolCall {
+                name: call.name,
+                arguments_json: call.arguments_json,
+            })
+            .collect(),
+        actions: trace
+            .actions
+            .into_iter()
+            .map(|action| DryRunAgentAction {
+                action_type: action.action_type,
+                parameters_json: action.parameters_json,
+                disposition: action.disposition,
+                reason: action.reason,
+            })
+            .collect(),
+    }))
+}
+
+fn map_dry_run_failure(error: crate::sekai::agent_dry_run::DryRunFailure) -> Status {
+    match error {
+        crate::sekai::agent_dry_run::DryRunFailure::RouteAdmission(reason)
+        | crate::sekai::agent_dry_run::DryRunFailure::Budget(reason)
+        | crate::sekai::agent_dry_run::DryRunFailure::Model(reason) => {
+            Status::failed_precondition(reason)
+        }
+    }
+}
+
+fn dry_run_eval_record(
+    namespace: &str,
+    member_id: &str,
+    revision_digest: &str,
+    record_id: &str,
+    timestamp: i64,
+    trace: &crate::sekai::agent_dry_run::DryRunTrace,
+) -> crate::chisei::eval::Run {
+    use crate::chisei::eval::{CaseResult, Run};
+    use crate::sekai::agent_dry_run::{
+        DISPOSITION_WOULD_SUBMIT, DRY_RUN_CONFIG_REF, DRY_RUN_SUITE_PREFIX,
+    };
+    let passed = trace
+        .actions
+        .iter()
+        .all(|action| action.disposition == DISPOSITION_WOULD_SUBMIT);
+    Run {
+        id: record_id.into(),
+        suite_id: format!("{DRY_RUN_SUITE_PREFIX}{namespace}:{member_id}"),
+        config_ref: DRY_RUN_CONFIG_REF.into(),
+        results: vec![CaseResult {
+            case_id: revision_digest.into(),
+            passed,
+            status: "dry_run".into(),
+            result: serde_json::to_string(
+                &trace
+                    .actions
+                    .iter()
+                    .map(|action| {
+                        serde_json::json!({
+                            "action_type": action.action_type,
+                            "disposition": action.disposition,
+                            "reason": action.reason,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".into()),
+            score: i32::from(passed),
+            reason: String::new(),
+            elapsed: 0,
+        }],
+        timestamp,
+    }
+}
+fn default_dry_run(
+    runtime: &crate::db::runtime_db::RuntimeDb,
+    request: &crate::sekai::agent_dry_run::DryRunModelRequest,
+) -> Result<crate::sekai::agent_dry_run::DryRunModelReply, crate::sekai::agent_dry_run::DryRunFailure>
+{
+    use crate::db::chisei_budget::METRIC_TOKENS;
+    use crate::sekai::agent_dry_run::DryRunFailure;
+    admit_dry_run_route(runtime, &request.namespace)?;
+    runtime
+        .budget_check_chain(&request.namespace, METRIC_TOKENS, 1, now_millis())
+        .map_err(DryRunFailure::Budget)?;
+    // Same fail-closed default as Function `RejectLlmHost`: admission and
+    // budget run once, then the plane refuses unless a completion host was
+    // injected. Do not echo the input or invent Actions as a successful step.
+    Err(DryRunFailure::Model(
+        crate::sekai::agent_dry_run::REFUSAL_MODEL_UNAVAILABLE.into(),
+    ))
+}
+
+fn admit_dry_run_route(
+    runtime: &crate::db::runtime_db::RuntimeDb,
+    namespace: &str,
+) -> Result<String, crate::sekai::agent_dry_run::DryRunFailure> {
+    use crate::chisei::model_review::{
+        ModelReviewStatus, REFUSAL_NOT_ENABLED, effective_review_status,
+    };
+    use crate::enterprise::ModelIdentity;
+    use crate::sekai::agent_dry_run::DryRunFailure;
+    let mut families = runtime
+        .list_family_enablement_records(namespace)
+        .map_err(DryRunFailure::RouteAdmission)?;
+    let mut models = runtime
+        .list_model_review_records(namespace)
+        .map_err(DryRunFailure::RouteAdmission)?;
+    if !namespace.is_empty() {
+        families.extend(
+            runtime
+                .list_family_enablement_records("")
+                .map_err(DryRunFailure::RouteAdmission)?,
+        );
+        models.extend(
+            runtime
+                .list_model_review_records("")
+                .map_err(DryRunFailure::RouteAdmission)?,
+        );
+    }
+    let mut families_ids: Vec<String> = families
+        .iter()
+        .map(|record| record.family_id.clone())
+        .collect();
+    families_ids.sort();
+    families_ids.dedup();
+    for family_id in families_ids {
+        let identity = ModelIdentity {
+            provider: family_id.clone(),
+            model: family_id.clone(),
+            upstream_model: family_id.clone(),
+            profile_version: String::new(),
+            artifact_digest: None,
+            endpoint: String::new(),
+        };
+        if effective_review_status(&models, &families, namespace, &identity, "")
+            == ModelReviewStatus::Enabled
+        {
+            return Ok(format!("{family_id}/enabled"));
+        }
+    }
+    Err(DryRunFailure::RouteAdmission(REFUSAL_NOT_ENABLED.into()))
 }

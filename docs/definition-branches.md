@@ -270,6 +270,16 @@ cannot clear `revoked_at_ms`; expiry cannot exceed 90 days from
 the merge uses. Proposals that do not change agent members are unchanged.
 See [ADR 0093](decisions/0093-agent-drafts-use-definition-members.md).
 
+`DryRunAgent` runs one caller-supplied input against an Agent member at an
+exact revision. Auth matches `GetDefinitionMember`, including the same
+unavailable answer for a missing or unreadable member. The response is a
+step trace: model steps, tool calls, and proposed Actions marked
+`would_submit` or `refused`. No Action instance is created. The attempt is
+stored as an eval run marked `dry_run` and cannot bind
+`PutDefinitionCertification` ([ADR 0109](decisions/0109-agent-dry-run.md)).
+Route admission and budget are checked once; a failure is returned, not
+retried. The RPC is experimental.
+
 ### Scoped draft authoring
 
 Scoped authenticated contexts can call qualified `sekai.SekaiService`

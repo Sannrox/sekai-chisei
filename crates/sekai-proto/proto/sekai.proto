@@ -2428,6 +2428,34 @@ message GetDefinitionCertificationGateRequest {
 message GetDefinitionCertificationGateResponse {
   DefinitionCertificationGate gate = 1;
 }
+
+// ADR 0109 Agent dry run: one input, a step trace, no Action submitted (#1533).
+message DryRunAgentRequest {
+  string namespace = 1;
+  string revision_digest = 2;
+  string member_id = 3;
+  string input = 4;
+}
+message DryRunAgentAction {
+  string action_type = 1;
+  string parameters_json = 2;
+  string disposition = 3;
+  string reason = 4;
+}
+message DryRunAgentModelStep {
+  string route = 1;
+  string output = 2;
+}
+message DryRunAgentToolCall {
+  string name = 1;
+  string arguments_json = 2;
+}
+message DryRunAgentResponse {
+  string record_id = 1;
+  repeated DryRunAgentModelStep model_steps = 2;
+  repeated DryRunAgentToolCall tool_calls = 3;
+  repeated DryRunAgentAction actions = 4;
+}
 message DefinitionCertificationGate {
   string namespace = 1;
   string revision_digest = 2;
@@ -2820,6 +2848,7 @@ service SekaiService {
   rpc MergeDefinitionProposal(MergeDefinitionProposalRequest) returns (MergeDefinitionProposalResponse);
   rpc PutDefinitionCertification(PutDefinitionCertificationRequest) returns (PutDefinitionCertificationResponse);
   rpc GetDefinitionCertificationGate(GetDefinitionCertificationGateRequest) returns (GetDefinitionCertificationGateResponse);
+  rpc DryRunAgent(DryRunAgentRequest) returns (DryRunAgentResponse);
   rpc CloseDefinitionProposal(CloseDefinitionProposalRequest) returns (CloseDefinitionProposalResponse);
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc ListPublishedDefinitionRevisions(ListPublishedDefinitionRevisionsRequest) returns (ListPublishedDefinitionRevisionsResponse);
