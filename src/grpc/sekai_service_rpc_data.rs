@@ -927,13 +927,21 @@ pub(super) async fn list_object_changes(
         .map_err(Status::internal)?;
     match object.as_ref() {
         Some(object) => {
-            enforce_namespace_tenant_context(
+            enforce_collaboration_namespace(
                 service.db.runtime(),
                 tenant_context.as_ref(),
                 &object.namespace,
                 false,
             )
             .map_err(|_| Status::not_found("not found"))?;
+            if !collaboration_object_permitted(
+                service.db.runtime(),
+                tenant_context.as_ref(),
+                object,
+                crate::enterprise::NamespaceAction::Read,
+            )? {
+                return Err(Status::not_found("not found"));
+            }
             if evaluate_active_object_policy(
                 service.db.runtime(),
                 object,
@@ -1009,39 +1017,48 @@ pub(super) async fn list_object_changes(
     .map_err(Status::internal)?
     .remove(&inner.object_id)
     .unwrap_or_default();
-    let changes = service
-        .db
-        .runtime()
-        .list_visible_object_changes(&inner.object_id, inner.limit, inner.offset)
-        .map_err(map_runtime_store_error)?
-        .into_iter()
-        .map(|change| {
-            let mut mapped = if let Some(kind) = object_kind.as_deref() {
-                redact_object_change_values(
-                    change,
-                    &inner.object_id,
-                    kind,
-                    &schema,
-                    &service.security,
-                    &principal_policy_context_from(&principals, tenant_context.as_ref()),
-                    property_policy.as_ref(),
-                )
-            } else {
-                ObjectChange {
-                    id: change.id,
-                    object_id: change.object_id,
-                    field: change.field,
-                    old_value: change.old_value,
-                    new_value: change.new_value,
-                    changed_by: change.changed_by,
-                    timestamp: change.timestamp,
-                    operation_id: String::new(),
-                }
-            };
-            mapped.operation_id = operation_id.clone();
-            mapped
-        })
-        .collect();
+    let changes = match visible_collaboration_history_page(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        object.as_ref(),
+        inner.limit,
+        inner.offset,
+    )? {
+        Some(changes) => changes,
+        None => service
+            .db
+            .runtime()
+            .list_visible_object_changes(&inner.object_id, inner.limit, inner.offset)
+            .map_err(map_runtime_store_error)?,
+    }
+    .into_iter()
+    .map(|change| {
+        let mut mapped = if let Some(kind) = object_kind.as_deref() {
+            redact_object_change_values(
+                change,
+                &inner.object_id,
+                kind,
+                &schema,
+                &service.security,
+                &principal_policy_context_from(&principals, tenant_context.as_ref()),
+                property_policy.as_ref(),
+            )
+        } else {
+            ObjectChange {
+                id: change.id,
+                object_id: change.object_id,
+                field: change.field,
+                old_value: change.old_value,
+                new_value: change.new_value,
+                changed_by: change.changed_by,
+                timestamp: change.timestamp,
+                operation_id: String::new(),
+            }
+        };
+        mapped.operation_id = operation_id.clone();
+        mapped
+    })
+    .collect();
     Ok(Response::new(ListObjectChangesResponse { changes }))
 }
 pub(super) async fn get_attestation(

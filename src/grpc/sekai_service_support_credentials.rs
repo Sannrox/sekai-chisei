@@ -466,7 +466,7 @@ pub(super) fn enforce_namespace_tenant_context(
     namespace: &str,
     write: bool,
 ) -> Result<(), Status> {
-    enforce_namespace_tenant_context_for(
+    enforce_namespace_tenant_context_gated(
         db,
         tenant_context,
         namespace,
@@ -475,6 +475,30 @@ pub(super) fn enforce_namespace_tenant_context(
         } else {
             crate::enterprise::NamespaceAction::Read
         },
+        false,
+    )
+}
+
+/// Namespace check for object get/list/mutate/history paths that also apply
+/// [`collaboration_object_permitted`]. Other RPCs stay on
+/// [`enforce_namespace_tenant_context`] so a shared-space grant cannot admit
+/// an endpoint that does not enforce exposed kinds and markings.
+pub(super) fn enforce_collaboration_namespace(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    write: bool,
+) -> Result<(), Status> {
+    enforce_namespace_tenant_context_gated(
+        db,
+        tenant_context,
+        namespace,
+        if write {
+            crate::enterprise::NamespaceAction::Write
+        } else {
+            crate::enterprise::NamespaceAction::Read
+        },
+        true,
     )
 }
 
@@ -521,7 +545,27 @@ pub(super) fn enforce_namespace_tenant_context_for(
     namespace: &str,
     action: crate::enterprise::NamespaceAction,
 ) -> Result<(), Status> {
+    enforce_namespace_tenant_context_gated(db, tenant_context, namespace, action, false)
+}
+
+pub(super) fn enforce_collaboration_namespace_for(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<(), Status> {
+    enforce_namespace_tenant_context_gated(db, tenant_context, namespace, action, true)
+}
+
+fn enforce_namespace_tenant_context_gated(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    action: crate::enterprise::NamespaceAction,
+    admit_shared_space: bool,
+) -> Result<(), Status> {
     let write = action == crate::enterprise::NamespaceAction::Write;
+    let mut shared_audit = None;
     let mut guest_grant_ok = None;
     let result = (|| {
         if service_principal_scope(db, tenant_context)?
@@ -531,6 +575,17 @@ pub(super) fn enforce_namespace_tenant_context_for(
                 "namespace outside the service principal scope",
             ));
         }
+        let shared_decision = if let Some(context) =
+            tenant_context.filter(|context| context.named_space().is_some())
+        {
+            let decision = shared_space_authorization(db, context, namespace, action)?;
+            if let Some(owner_tenant) = decision.owner_tenant() {
+                shared_audit = Some(owner_tenant.to_string());
+            }
+            Some(decision)
+        } else {
+            None
+        };
         if let Some(context) = tenant_context {
             context.authorize_space(action).map_err(extension_status)?;
             context
@@ -569,6 +624,17 @@ pub(super) fn enforce_namespace_tenant_context_for(
                 Err(status) => Err(status),
             };
         }
+        match shared_decision {
+            Some(crate::enterprise::SharedSpaceAuthorization::Granted(grant)) => {
+                return (admit_shared_space && grant.exposes_namespace(namespace))
+                    .then_some(())
+                    .ok_or_else(|| Status::permission_denied("enterprise authorization denied"));
+            }
+            Some(crate::enterprise::SharedSpaceAuthorization::Denied { .. }) => {
+                return Err(Status::permission_denied("enterprise authorization denied"));
+            }
+            Some(crate::enterprise::SharedSpaceAuthorization::Unshared) | None => {}
+        }
         let Some(extension) = db.enterprise_extension() else {
             return Ok(());
         };
@@ -593,6 +659,20 @@ pub(super) fn enforce_namespace_tenant_context_for(
             guest_grant_ok.unwrap_or(result.is_ok()),
         )
         .map_err(Status::internal)?;
+    } else if let Some(context) = tenant_context
+        && context.named_space().is_some()
+    {
+        if let Some(resource_tenant) = shared_audit {
+            crate::grpc::record_shared_space_access(
+                db,
+                context,
+                &resource_tenant,
+                namespace,
+                &format!("{action:?}").to_lowercase(),
+                result.is_ok(),
+            )
+            .map_err(Status::internal)?;
+        }
     }
     if result.is_err() {
         record_delegated_policy_decision(
@@ -717,7 +797,7 @@ pub(super) fn guest_object_permitted(
         Err(status) if status.code() == tonic::Code::PermissionDenied => return Ok(false),
         Err(status) => return Err(status),
     };
-    let permitted = guest_ceiling_covers(db, object, &grant.marking_ceiling)?;
+    let permitted = marking_ceiling_covers(db, object, &grant.marking_ceiling)?;
     if !permitted {
         crate::grpc::record_guest_access(db, context, &object.id, "ceiling", false)
             .map_err(Status::internal)?;
@@ -725,7 +805,381 @@ pub(super) fn guest_object_permitted(
     Ok(permitted)
 }
 
-fn guest_ceiling_covers(
+/// Guest ceiling plus shared-space kind and marking exposure (#1434).
+pub(super) fn collaboration_object_permitted(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: &domain::Object,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<bool, Status> {
+    Ok(guest_object_permitted(db, tenant_context, object, action)?
+        && shared_space_object_permitted(db, tenant_context, object, action)?)
+}
+
+fn shared_space_authorization(
+    db: &RuntimeDb,
+    context: &RequestEnterpriseContext,
+    namespace: &str,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<crate::enterprise::SharedSpaceAuthorization, Status> {
+    let Some(extension) = db.enterprise_extension() else {
+        return Ok(crate::enterprise::SharedSpaceAuthorization::Unshared);
+    };
+    extension
+        .authorize_shared_space(context, namespace, action)
+        .map_err(extension_status)
+}
+
+/// Whether a shared-space member may see or write this object (#1434): the
+/// space must expose its kind and the marking ceiling must cover its
+/// `access_marking`. Non-members and unshared spaces always pass here.
+pub(super) fn shared_space_object_permitted(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: &domain::Object,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<bool, Status> {
+    let Some(context) = tenant_context.filter(|context| context.named_space().is_some()) else {
+        return Ok(true);
+    };
+    let grant = match shared_space_authorization(db, context, &object.namespace, action) {
+        Ok(crate::enterprise::SharedSpaceAuthorization::Granted(grant)) => grant,
+        Ok(crate::enterprise::SharedSpaceAuthorization::Unshared) => return Ok(true),
+        Ok(crate::enterprise::SharedSpaceAuthorization::Denied { owner_tenant }) => {
+            crate::grpc::record_shared_space_access(
+                db,
+                context,
+                &owner_tenant,
+                &object.id,
+                &format!("{action:?}").to_lowercase(),
+                false,
+            )
+            .map_err(Status::internal)?;
+            return Ok(false);
+        }
+        Err(status) => return Err(status),
+    };
+    if !grant.exposes_namespace(&object.namespace) || !grant.exposes_kind(&object.kind) {
+        crate::grpc::record_shared_space_access(
+            db,
+            context,
+            &grant.owner_tenant,
+            &object.id,
+            "kind",
+            false,
+        )
+        .map_err(Status::internal)?;
+        return Ok(false);
+    }
+    let permitted = marking_ceiling_covers(db, object, &grant.marking_ceiling)?;
+    let operation = if permitted {
+        format!("{action:?}").to_lowercase()
+    } else {
+        "ceiling".into()
+    };
+    crate::grpc::record_shared_space_access(
+        db,
+        context,
+        &grant.owner_tenant,
+        &object.id,
+        &operation,
+        permitted,
+    )
+    .map_err(Status::internal)?;
+    Ok(permitted)
+}
+
+/// History page for a guest or shared-space caller: hide values written
+/// above the ceiling, then apply `limit`/`offset` to the remaining rows so
+/// hidden changes do not consume the page. `None` leaves same-tenant
+/// callers on the store's own pagination.
+pub(super) fn visible_collaboration_history_page(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: Option<&domain::Object>,
+    limit: i32,
+    offset: i32,
+) -> Result<Option<Vec<crate::sekai::audit::ObjectChange>>, Status> {
+    let Some(object) = object else {
+        return Ok(None);
+    };
+    let Some(context) = tenant_context else {
+        return Ok(None);
+    };
+    if context.guest_home_tenant().is_some() {
+        // Guests always reconstruct history against the host ceiling.
+    } else if context.named_space().is_some() {
+        match shared_space_authorization(
+            db,
+            context,
+            &object.namespace,
+            crate::enterprise::NamespaceAction::Read,
+        ) {
+            Ok(crate::enterprise::SharedSpaceAuthorization::Granted(_)) => {}
+            Ok(crate::enterprise::SharedSpaceAuthorization::Unshared) => return Ok(None),
+            Ok(crate::enterprise::SharedSpaceAuthorization::Denied { owner_tenant }) => {
+                crate::grpc::record_shared_space_access(
+                    db,
+                    context,
+                    &owner_tenant,
+                    &object.id,
+                    "history",
+                    false,
+                )
+                .map_err(Status::internal)?;
+                return Ok(Some(Vec::new()));
+            }
+            Err(status) => return Err(status),
+        }
+    } else {
+        return Ok(None);
+    }
+    let marking_fallback = object
+        .properties
+        .get(markings::OBJECT_CLASSIFICATION_PROPERTY)
+        .cloned()
+        .unwrap_or_default();
+    let (timeline, truncated) = collaboration_history_timeline(db, &object.id)?;
+    if truncated {
+        return Ok(Some(Vec::new()));
+    }
+    let mut visible = Vec::new();
+    for change in timeline
+        .iter()
+        .filter(|change| is_visible_history_field(&change.field))
+    {
+        if !collaboration_covers_history_at(
+            db,
+            tenant_context,
+            object,
+            &timeline,
+            change.timestamp,
+            &marking_fallback,
+        )? {
+            continue;
+        }
+        let mut change = change.clone();
+        let origin_ok = match previous_field_write_timestamp(&timeline, &change) {
+            Some(timestamp) => collaboration_covers_history_at(
+                db,
+                tenant_context,
+                object,
+                &timeline,
+                timestamp,
+                &marking_fallback,
+            )?,
+            // No retained prior write means origin exposure cannot be
+            // attested. Later marking events are not creation evidence.
+            None => false,
+        };
+        if !origin_ok {
+            change.old_value.clear();
+        }
+        visible.push(change);
+    }
+    let offset = usize::try_from(offset.max(0)).unwrap_or(0);
+    let limit = if limit > 0 {
+        usize::try_from(limit).unwrap_or(100)
+    } else {
+        100
+    };
+    Ok(Some(visible.into_iter().skip(offset).take(limit).collect()))
+}
+
+fn is_visible_history_field(field: &str) -> bool {
+    field != "_namespace"
+        && field != "_security_snapshot"
+        && field != "_security_kind"
+        && !field.starts_with("_security_property.")
+}
+
+fn collaboration_history_timeline(
+    db: &RuntimeDb,
+    object_id: &str,
+) -> Result<(Vec<crate::sekai::audit::ObjectChange>, bool), Status> {
+    const PAGE: i32 = 500;
+    const CAP: i32 = 10_000;
+    let mut timeline = Vec::new();
+    let mut offset = 0i32;
+    loop {
+        let page = db
+            .list_object_changes(object_id, PAGE, offset)
+            .map_err(Status::internal)?;
+        let n = i32::try_from(page.len()).unwrap_or(PAGE);
+        if n == 0 {
+            return Ok((timeline, false));
+        }
+        timeline.extend(page);
+        offset = offset.saturating_add(n);
+        if n < PAGE {
+            return Ok((timeline, false));
+        }
+        if offset >= CAP {
+            return Ok((timeline, true));
+        }
+    }
+}
+
+fn values_touching_timestamp(
+    changes: &[crate::sekai::audit::ObjectChange],
+    field: &str,
+    timestamp: i64,
+    fallback: &str,
+) -> Vec<String> {
+    // `changes` is newest-first (`timestamp DESC`, then store row order).
+    let events: Vec<&crate::sekai::audit::ObjectChange> = changes
+        .iter()
+        .filter(|change| change.field == field)
+        .collect();
+    if events.is_empty() {
+        return vec![fallback.to_string()];
+    }
+    let mut tokens = Vec::new();
+    if let Some(previous) = events.iter().find(|event| event.timestamp < timestamp) {
+        tokens.push(previous.new_value.clone());
+    } else if let Some(oldest_at) = events
+        .iter()
+        .rev()
+        .find(|event| event.timestamp == timestamp)
+    {
+        tokens.push(oldest_at.old_value.clone());
+    } else if let Some(oldest) = events.last() {
+        tokens.push(oldest.old_value.clone());
+    } else {
+        tokens.push(fallback.to_string());
+    }
+    for event in events.iter().filter(|event| event.timestamp == timestamp) {
+        tokens.push(event.old_value.clone());
+        tokens.push(event.new_value.clone());
+    }
+    tokens
+}
+
+fn previous_field_write_timestamp(
+    changes: &[crate::sekai::audit::ObjectChange],
+    change: &crate::sekai::audit::ObjectChange,
+) -> Option<i64> {
+    let position = changes.iter().position(|other| other.id == change.id)?;
+    changes[position + 1..]
+        .iter()
+        .find(|other| other.field == change.field)
+        .map(|other| other.timestamp)
+}
+
+fn collaboration_covers_history_at(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: &domain::Object,
+    timeline: &[crate::sekai::audit::ObjectChange],
+    timestamp: i64,
+    marking_fallback: &str,
+) -> Result<bool, Status> {
+    let marking_field = format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY);
+    collaboration_covers_exposures(
+        db,
+        tenant_context,
+        object,
+        &values_touching_timestamp(timeline, "namespace", timestamp, &object.namespace),
+        &values_touching_timestamp(timeline, "kind", timestamp, &object.kind),
+        &values_touching_timestamp(timeline, &marking_field, timestamp, marking_fallback),
+    )
+}
+
+fn collaboration_covers_exposures(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: &domain::Object,
+    namespaces: &[String],
+    kinds: &[String],
+    markings: &[String],
+) -> Result<bool, Status> {
+    for namespace in namespaces {
+        for kind in kinds {
+            for marking in markings {
+                if !collaboration_grant_covers_exposure(
+                    db,
+                    tenant_context,
+                    object,
+                    namespace,
+                    kind,
+                    marking,
+                )? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn collaboration_grant_covers_exposure(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: &domain::Object,
+    namespace: &str,
+    kind: &str,
+    marking: &str,
+) -> Result<bool, Status> {
+    let historical = object_with_historical_exposure(object, namespace, kind, marking);
+    let Some(context) = tenant_context else {
+        return Ok(true);
+    };
+    if context.guest_home_tenant().is_some() {
+        let grant = match guest_grant(
+            db,
+            context,
+            &historical.namespace,
+            crate::enterprise::NamespaceAction::Read,
+        ) {
+            Ok(grant) => grant,
+            Err(status) if status.code() == tonic::Code::PermissionDenied => return Ok(false),
+            Err(status) => return Err(status),
+        };
+        return marking_ceiling_covers(db, &historical, &grant.marking_ceiling);
+    }
+    if context.named_space().is_none() {
+        return Ok(true);
+    }
+    let grant = match shared_space_authorization(
+        db,
+        context,
+        &historical.namespace,
+        crate::enterprise::NamespaceAction::Read,
+    ) {
+        Ok(crate::enterprise::SharedSpaceAuthorization::Granted(grant)) => grant,
+        Ok(crate::enterprise::SharedSpaceAuthorization::Unshared) => return Ok(true),
+        Ok(crate::enterprise::SharedSpaceAuthorization::Denied { .. }) => return Ok(false),
+        Err(status) => return Err(status),
+    };
+    if !grant.exposes_namespace(&historical.namespace) || !grant.exposes_kind(&historical.kind) {
+        return Ok(false);
+    }
+    marking_ceiling_covers(db, &historical, &grant.marking_ceiling)
+}
+
+fn object_with_historical_exposure(
+    object: &domain::Object,
+    namespace: &str,
+    kind: &str,
+    marking: &str,
+) -> domain::Object {
+    let mut object = object.clone();
+    object.namespace = namespace.to_string();
+    object.kind = kind.to_string();
+    if marking.trim().is_empty() {
+        object
+            .properties
+            .remove(markings::OBJECT_CLASSIFICATION_PROPERTY);
+    } else {
+        object.properties.insert(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+            marking.to_string(),
+        );
+    }
+    object
+}
+
+fn marking_ceiling_covers(
     db: &RuntimeDb,
     object: &domain::Object,
     ceiling: &str,

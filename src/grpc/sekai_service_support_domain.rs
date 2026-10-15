@@ -281,7 +281,7 @@ pub(super) fn governed_object_for_read(
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("governed fact not found"))?;
     if object.kind != expected_kind
-        || enforce_namespace_tenant_context(
+        || enforce_collaboration_namespace(
             service.db.runtime(),
             tenant_context,
             &object.namespace,
@@ -290,6 +290,13 @@ pub(super) fn governed_object_for_read(
         .is_err()
         || check_team_namespace(service.db.runtime(), principals, &object.namespace, false).is_err()
         || check_read(&service.security, object_id, principals).is_err()
+        || !collaboration_object_permitted(
+            service.db.runtime(),
+            tenant_context,
+            &object,
+            crate::enterprise::NamespaceAction::Read,
+        )
+        .unwrap_or(false)
         || !object_passes_marking(service.db.runtime(), &object, principals).unwrap_or(false)
     {
         return Err(Status::not_found("governed fact not found"));

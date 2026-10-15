@@ -42,7 +42,7 @@ impl SekaiServiceImpl {
             purpose.as_ref(),
             &format!("get_object:{id}"),
         )?;
-        let visibility = require_visible_read_root(
+        let visibility = require_visible_collaboration_read_root(
             self.db.runtime(),
             &self.security,
             obj,
@@ -164,7 +164,7 @@ impl SekaiServiceImpl {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("tenant context requires an explicit namespace filter")
             })?;
-            if let Err(status) = enforce_namespace_tenant_context(
+            if let Err(status) = enforce_collaboration_namespace(
                 self.db.runtime(),
                 tenant_context.as_ref(),
                 namespace,
@@ -426,7 +426,7 @@ impl SekaiServiceImpl {
             )? {
                 continue;
             }
-            let visibility = require_visible_read_root(
+            let visibility = require_visible_collaboration_read_root(
                 self.db.runtime(),
                 &self.security,
                 obj,

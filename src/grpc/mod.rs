@@ -255,6 +255,35 @@ pub(crate) fn record_guest_access(
     })
 }
 
+/// One `tenant.shared_space_access` audit record for a cross-tenant space
+/// decision (#1434), with the principal, home tenant, resource tenant, space,
+/// target, and operation.
+pub(crate) fn record_shared_space_access(
+    db: &crate::db::runtime_db::RuntimeDb,
+    context: &crate::enterprise::AuthenticatedContext,
+    resource_tenant: &str,
+    target_id: &str,
+    operation: &str,
+    allowed: bool,
+) -> Result<(), String> {
+    let tenant_id = |tenant: Option<&str>| tenant.unwrap_or_default().to_string();
+    db.record_decision(&crate::sekai::audit::Decision {
+        id: format!("shared-space-access:{}", uuid::Uuid::new_v4().as_simple()),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: context.principal.subject.clone(),
+        action: "tenant.shared_space_access".into(),
+        reason: "cross-tenant shared space".into(),
+        target_id: target_id.into(),
+        outcome: if allowed { "allowed" } else { "denied" }.into(),
+        evidence: std::collections::HashMap::from([
+            ("home_tenant".into(), tenant_id(context.home_tenant_id())),
+            ("resource_tenant".into(), resource_tenant.into()),
+            ("space".into(), context.space.clone().unwrap_or_default()),
+            ("operation".into(), operation.into()),
+        ]),
+    })
+}
+
 /// One `tenant.discovery` audit record for a cross-tenant find (#1435).
 pub(crate) fn record_discovery(
     db: &crate::db::runtime_db::RuntimeDb,

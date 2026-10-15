@@ -604,8 +604,8 @@ pub(super) fn object_is_visible_for(
 ) -> bool {
     !is_reserved_governance_kind(&object.kind)
         && check_team_namespace(db, principals, &object.namespace, false).is_ok()
-        && enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
-        && guest_object_permitted(
+        && enforce_collaboration_namespace(db, tenant_context, &object.namespace, false).is_ok()
+        && collaboration_object_permitted(
             db,
             tenant_context,
             object,
@@ -684,7 +684,7 @@ pub(super) fn enforce_object_operation_access(
     } else {
         crate::enterprise::NamespaceAction::Write
     };
-    if !guest_object_permitted(db, tenant_context, object, action)? {
+    if !collaboration_object_permitted(db, tenant_context, object, action)? {
         return Err(Status::permission_denied("access denied"));
     }
     let decision =
@@ -932,7 +932,9 @@ pub(super) fn hide_read_root_as_missing(status: Status) -> Status {
 }
 /// Single-object read root: reserved kinds are observationally missing, tenant
 /// mismatches are missing, ACL/team/marking denials stay fail-closed, and
-/// authorization outages stay Unavailable/Internal.
+/// authorization outages stay Unavailable/Internal. Graph and lineage
+/// callers stay on ordinary namespace authorization so a shared-space
+/// grant cannot admit link metadata.
 pub(super) fn require_visible_read_root(
     db: &RuntimeDb,
     security: &SecurityChecker,
@@ -960,6 +962,34 @@ pub(super) fn require_visible_read_root(
     )
 }
 
+/// Object get/find paths that also apply [`collaboration_object_permitted`].
+pub(super) fn require_visible_collaboration_read_root(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation_id: &str,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
+    enforce_collaboration_namespace_for(
+        db,
+        tenant_context,
+        &object.namespace,
+        crate::enterprise::NamespaceAction::Read,
+    )
+    .map_err(hide_read_root_as_missing)?;
+    require_visible_object_contents(
+        db,
+        security,
+        object,
+        principals,
+        tenant_context,
+        operation_id,
+        purpose,
+    )
+}
+
 pub(super) fn require_visible_object_contents(
     db: &RuntimeDb,
     security: &SecurityChecker,
@@ -970,7 +1000,7 @@ pub(super) fn require_visible_object_contents(
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
     if is_reserved_governance_kind(&object.kind)
-        || !guest_object_permitted(
+        || !collaboration_object_permitted(
             db,
             tenant_context,
             &object,
@@ -1140,7 +1170,7 @@ where
         let page_len = page.len() as i32;
         for object in page {
             if !object_passes_marking(db, &object, principals)?
-                || !guest_object_permitted(
+                || !collaboration_object_permitted(
                     db,
                     tenant_context,
                     &object,
