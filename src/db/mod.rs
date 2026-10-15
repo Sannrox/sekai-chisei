@@ -117,6 +117,7 @@ mod postgres_schema;
 mod postgres_service_principal;
 mod postgres_source_registry;
 mod postgres_team_namespace;
+mod postgres_usage_ledger;
 mod postgres_workflow_action;
 pub(crate) mod schema_plane;
 pub use schema_plane::SchemaPlane;

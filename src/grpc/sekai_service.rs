@@ -244,6 +244,14 @@ impl SekaiServiceImpl {
         self
     }
 
+    /// Budget and usage live on the Chisei store in a split layout.
+    pub(crate) fn quota_runtime(&self) -> std::sync::Arc<crate::db::runtime_db::RuntimeDb> {
+        self.cross_store
+            .as_ref()
+            .map(|clerk| clerk.chisei_runtime_arc())
+            .unwrap_or_else(|| self.db.runtime_arc())
+    }
+
     pub fn with_site_id(mut self, site_id: impl Into<String>) -> Self {
         self.site_id = site_id.into();
         self

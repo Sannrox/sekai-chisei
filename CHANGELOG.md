@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+- Isolated transform claims persist a per-run tenant concurrency hold and
+  release it once on write, cancel, reclaim, or terminal lease failure
+  (`0074_transform_quota_hold`, GATE:mig). The submitting tenant is stored on
+  the work row (`0075_transform_work_tenant`, GATE:mig) so a runner without
+  tenant context still admits and records usage against that owner. Put
+  records the submitting tenant as the quota owner
+  (`0076_transform_quota_owner`, GATE:mig) so scheduled and triggered
+  isolated enqueue copies that owner onto the work row. In-process
+  scheduled and triggered ticks admit and record usage against that owner
+  before the run; quota exhaustion skips the slot without advancing the
+  schedule cursor. RunGovernedTransform uses that Put owner when the caller
+  has no tenant context, so an admin or runner still meters the submitting
+  tenant. Isolated claims bind that owner onto empty work even when no
+  quota limits are configured. CLI `admin transform run` admits and records
+  in-process Put-owner quota the same way.   PostgreSQL discovers persisted
+  tenant quota limits for that admission instead of skipping the gate,
+  including `GetEffectivePolicySummary` limit projection.
+  Quota-denied claims return to the queue even if admission outlasted the
+  lease, so a deny does not consume lease expiries. PostgreSQL records
+  measured request usage onto `chisei_usage_events`
+  (`0077_chisei_usage_events`, GATE:mig) so isolated write-back and
+  in-process runs are metered on that runtime too.   Combined Split
+  admits and records that usage on the Chisei dest, not the Sekai
+  plane that omits budget and usage tables.   Claim and list work
+  include that submitting `tenant_id` so a runner can key quotas on
+  the owner instead of the namespace. CLI `admin transform run` admits
+  and records usage on the Chisei dest in a Combined Split layout.
+  PostgreSQL persist of a claim hold locks the work namespace and
+  rechecks the live fence so a concurrent cancel cannot leave reserved
+  concurrency on cancelled work.   The runtime-claim client exposes
+  `transform_quota_tenant_id` so a JobSource keys quotas on that owner
+  instead of the namespace.   A fenced write-back that already completed
+  records usage on retry instead of returning a lost fence, so a
+  failed usage persist after commit can still meter that run once.
+  That retry still requires the completing owner, generation, and
+  token, including after the completing lease expires. Binding a
+  claim tenant requires the current generation and token, so an
+  expired first claimant cannot stamp a different owner after a
+  later claim. In-process scheduled and triggered commits persist a
+  pending usage row (`0078_transform_usage_pending`, GATE:mig) so a
+  later tick can meter that run if usage persist failed after the
+  run and cursor committed. That pending row stores the original
+  completion time so a retry after a period boundary still meters
+  the earlier period.   Isolated write-back records the same original
+  completion time on retry. An untargeted claim that is quota-denied
+  skips that run and continues through later work in the same
+  namespace so another tenant's eligible run is not stuck behind
+  exhausted work. A Sekai-only plane that omits budget and usage
+  tables skips admission and usage instead of failing after the run
+  is already durable. PostgreSQL missing-table errors keep the relation
+  name so a Sekai-only plane is not treated as Internal. Usage persist
+  failures after commit leave the pending row for a later tick instead
+  of failing the caller.
+  Isolated write-back, cancel, lease-fail, and reclaim restore a taken
+  concurrency hold if releasing that reservation fails, so a quota-store
+  error after commit does not leave the tenant permanently exhausted.
+  Claim-time hold inserts still require CLAIMED work so a delayed insert
+  cannot land after cancel. Releasing a reserved concurrency unit reports
+  a storage error instead of swallowing it, so the restored hold can retry.
+  An in-process run that cannot release concurrency persists a hold without
+  work, and Tick retries restored holds on missing or terminal work so the
+  tenant is not left exhausted.   An untargeted claim that skips quota-denied
+  work defers that run so a later claim can reach another tenant.
+  Quota holds are keyed by run and claim generation so restoring an
+  older reservation cannot overwrite a live claimant's hold. Tick
+  releases only a retryable generation after rechecking current work
+  status, so an older restored hold cannot drain a live claimant's
+  reservation. Reclaim and older-hold deletes take one generation at
+  a time so multiple outstanding holds do not fail PostgreSQL or drop
+  extra reservations. A replacement claim copies request-admission onto
+  the new generation in the same transaction, so Tick releasing an older
+  concurrency hold cannot make that run pay a second request. Abandoning
+  an unused admission reports a storage error and persists a retryable
+  hold for only the metrics that still need refunding, so a quota-store
+  failure cannot leave the tenant permanently exhausted or double-refund
+  a metric that already committed.
+
 - `PutDefinitionCertification` copies suite identity and pass/fail from a
   stored eval run, refuses a bind by authors of agent-member changes since
   the published base, treats revocation as one-way, and caps expiry at 90

@@ -85,6 +85,14 @@ impl std::fmt::Display for TenantQuotaError {
     }
 }
 
+/// Storage failure while abandoning an unused admission, plus the metrics
+/// that still need refunding so a retry does not double-apply a committed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaAbandonError {
+    pub error: TenantQuotaError,
+    pub remaining: TenantQuotaAdmission,
+}
+
 impl std::error::Error for TenantQuotaError {}
 
 /// Canonical budget scope id for a tenant.
@@ -191,7 +199,7 @@ impl TenantQuotaGate {
                 self.tracker
                     .check_and_reserve_idempotent(&scope, estimated_tokens, idempotency_key)
             {
-                self.rollback_partial(&reserved);
+                let _ = self.rollback_partial(&reserved);
                 let _ = err;
                 return Err(exhausted(METRIC_TOKENS));
             }
@@ -202,13 +210,61 @@ impl TenantQuotaGate {
                 self.tracker
                     .check_and_reserve_with_metric(&scope, 1, METRIC_CONCURRENCY)
             {
-                self.rollback_partial(&reserved);
+                let _ = self.rollback_partial(&reserved);
                 let _ = err;
                 return Err(exhausted(METRIC_CONCURRENCY));
             }
             reserved.reserved_concurrency = true;
         }
         Ok(reserved)
+    }
+
+    /// Drop a reservation when the admitted work did not run.
+    ///
+    /// Refunds request, tokens, then concurrency. On a storage error the
+    /// returned admission still includes the metric that failed and any that
+    /// were not attempted, so a retry does not refund a metric twice.
+    pub fn abandon(&self, admission: &TenantQuotaAdmission) -> Result<(), Box<QuotaAbandonError>> {
+        let mut remaining = admission.clone();
+        if remaining.reserved_request {
+            if let Err(error) =
+                self.tracker
+                    .try_adjust_with_metric(&remaining.scope_id, 1, 0, METRIC_REQUESTS)
+            {
+                return Err(Box::new(QuotaAbandonError {
+                    error: TenantQuotaError::Storage(error),
+                    remaining,
+                }));
+            }
+            remaining.reserved_request = false;
+        }
+        if remaining.reserved_tokens > 0 {
+            if let Err(error) = self.tracker.try_adjust_with_metric(
+                &remaining.scope_id,
+                remaining.reserved_tokens,
+                0,
+                METRIC_TOKENS,
+            ) {
+                return Err(Box::new(QuotaAbandonError {
+                    error: TenantQuotaError::Storage(error),
+                    remaining,
+                }));
+            }
+            remaining.reserved_tokens = 0;
+        }
+        if remaining.reserved_concurrency {
+            if let Err(error) =
+                self.tracker
+                    .try_adjust_with_metric(&remaining.scope_id, 1, 0, METRIC_CONCURRENCY)
+            {
+                return Err(Box::new(QuotaAbandonError {
+                    error: TenantQuotaError::Storage(error),
+                    remaining,
+                }));
+            }
+            remaining.reserved_concurrency = false;
+        }
+        Ok(())
     }
 
     /// Release concurrency and reconcile token reservation to actual usage.
@@ -218,16 +274,21 @@ impl TenantQuotaGate {
         actual_tokens: i32,
     ) -> Result<TenantQuotaReceiptNote, TenantQuotaError> {
         if admission.reserved_tokens > 0 {
-            self.tracker.adjust(
-                &admission.scope_id,
-                admission.reserved_tokens,
-                actual_tokens.max(0),
-            );
+            self.tracker
+                .try_adjust_with_metric(
+                    &admission.scope_id,
+                    admission.reserved_tokens,
+                    actual_tokens.max(0),
+                    METRIC_TOKENS,
+                )
+                .map_err(TenantQuotaError::Storage)?;
         }
         if admission.reserved_concurrency {
-            // Return the in-flight unit.
+            // Return the in-flight unit. Storage errors must surface so an
+            // isolated write can restore the taken hold and retry release.
             self.tracker
-                .adjust_with_metric(&admission.scope_id, 1, 0, METRIC_CONCURRENCY);
+                .try_adjust_with_metric(&admission.scope_id, 1, 0, METRIC_CONCURRENCY)
+                .map_err(TenantQuotaError::Storage)?;
         }
         Ok(TenantQuotaReceiptNote {
             tenant_id: admission.tenant_id.clone(),
@@ -253,15 +314,23 @@ impl TenantQuotaGate {
             .map_err(|_| exhausted(METRIC_STORAGE_BYTES))
     }
 
-    fn rollback_partial(&self, admission: &TenantQuotaAdmission) {
+    fn rollback_partial(&self, admission: &TenantQuotaAdmission) -> Result<(), TenantQuotaError> {
         if admission.reserved_request {
             self.tracker
-                .adjust_with_metric(&admission.scope_id, 1, 0, METRIC_REQUESTS);
+                .try_adjust_with_metric(&admission.scope_id, 1, 0, METRIC_REQUESTS)
+                .map_err(TenantQuotaError::Storage)?;
         }
         if admission.reserved_tokens > 0 {
             self.tracker
-                .adjust(&admission.scope_id, admission.reserved_tokens, 0);
+                .try_adjust_with_metric(
+                    &admission.scope_id,
+                    admission.reserved_tokens,
+                    0,
+                    METRIC_TOKENS,
+                )
+                .map_err(TenantQuotaError::Storage)?;
         }
+        Ok(())
     }
 }
 
@@ -379,6 +448,26 @@ mod tests {
     }
 
     #[test]
+    fn abandon_refunds_a_request_that_did_not_run() {
+        let gate = gate();
+        let lim = TenantQuotaLimits {
+            max_requests_per_period: Some(1),
+            max_tokens_per_period: None,
+            max_concurrency: None,
+            max_storage_bytes: None,
+            ..limits(1)
+        };
+        gate.configure("tenant-a", &lim).unwrap();
+        let a = tenant_context("tenant-a", "alice");
+        let held = gate.admit(&a, &lim, 1, 0, "tick-1").unwrap();
+        gate.abandon(&held).unwrap();
+        assert!(
+            gate.admit(&a, &lim, 1, 0, "tick-2").is_ok(),
+            "abandoned request reservation must free the period slot"
+        );
+    }
+
+    #[test]
     fn stale_assignment_fails_closed() {
         let gate = gate();
         let lim = limits(1);
@@ -421,6 +510,98 @@ mod tests {
             err,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_STORAGE_BYTES
         ));
+    }
+
+    fn gate_on_file(path: &str) -> TenantQuotaGate {
+        TenantQuotaGate::new(ChiseiStore::open_sqlite(path))
+    }
+
+    fn drop_budget_usage(path: &str) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("DROP TABLE chisei_budget_usage")
+            .unwrap();
+    }
+
+    #[test]
+    fn complete_reports_storage_when_concurrency_release_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.db");
+        let path = path.to_str().unwrap();
+        let gate = gate_on_file(path);
+        let lim = TenantQuotaLimits {
+            max_requests_per_period: None,
+            max_tokens_per_period: None,
+            max_concurrency: Some(1),
+            max_storage_bytes: None,
+            ..limits(1)
+        };
+        gate.configure("tenant-a", &lim).unwrap();
+        let admission = gate
+            .admit(&tenant_context("tenant-a", "alice"), &lim, 1, 0, "run-1")
+            .unwrap();
+        drop_budget_usage(path);
+        let err = gate.complete(&admission, 0).unwrap_err();
+        assert!(
+            matches!(err, TenantQuotaError::Storage(ref message) if message.contains("chisei_budget_usage")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn abandon_reports_storage_when_concurrency_release_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.db");
+        let path = path.to_str().unwrap();
+        let gate = gate_on_file(path);
+        let lim = TenantQuotaLimits {
+            max_requests_per_period: None,
+            max_tokens_per_period: None,
+            max_concurrency: Some(1),
+            max_storage_bytes: None,
+            ..limits(1)
+        };
+        gate.configure("tenant-a", &lim).unwrap();
+        let admission = gate
+            .admit(&tenant_context("tenant-a", "alice"), &lim, 1, 0, "run-1")
+            .unwrap();
+        drop_budget_usage(path);
+        let err = gate.abandon(&admission).unwrap_err();
+        assert!(
+            matches!(err.error, TenantQuotaError::Storage(ref message) if message.contains("chisei_budget_usage")),
+            "{}",
+            err.error
+        );
+        assert!(err.remaining.reserved_concurrency);
+        assert!(!err.remaining.reserved_request);
+    }
+
+    #[test]
+    fn abandon_reports_storage_when_request_refund_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.db");
+        let path = path.to_str().unwrap();
+        let gate = gate_on_file(path);
+        let lim = TenantQuotaLimits {
+            max_requests_per_period: Some(1),
+            max_tokens_per_period: None,
+            max_concurrency: None,
+            max_storage_bytes: None,
+            ..limits(1)
+        };
+        gate.configure("tenant-a", &lim).unwrap();
+        let admission = gate
+            .admit(&tenant_context("tenant-a", "alice"), &lim, 1, 0, "run-1")
+            .unwrap();
+        drop_budget_usage(path);
+        let err = gate.abandon(&admission).unwrap_err();
+        assert!(
+            matches!(err.error, TenantQuotaError::Storage(ref message) if message.contains("chisei_budget_usage")),
+            "{}",
+            err.error
+        );
+        assert!(err.remaining.reserved_request);
+        assert!(!err.remaining.reserved_concurrency);
     }
 
     #[test]

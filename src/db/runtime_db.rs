@@ -437,10 +437,21 @@ impl RuntimeDb {
         transform: &crate::sekai::governed_transform::GovernedTransform,
         created_at_ms: i64,
     ) -> Result<(), String> {
+        self.put_governed_transform_owned(transform, created_at_ms, "")
+    }
+
+    pub fn put_governed_transform_owned(
+        &self,
+        transform: &crate::sekai::governed_transform::GovernedTransform,
+        created_at_ms: i64,
+        tenant_id: &str,
+    ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.put_governed_transform(transform, created_at_ms),
+            Self::Sqlite(db) => {
+                db.put_governed_transform_owned(transform, created_at_ms, tenant_id)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.put_governed_transform(transform, created_at_ms)
+                db.put_governed_transform_owned(transform, created_at_ms, tenant_id)
             }),
         }
     }
@@ -477,12 +488,36 @@ impl RuntimeDb {
         incremental: bool,
         now_ms: i64,
     ) -> Result<crate::sekai::governed_transform::TransformRun, String> {
+        self.run_governed_transform_owned(namespace, transform_id, incremental, now_ms, "", "")
+    }
+
+    pub fn run_governed_transform_owned(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        incremental: bool,
+        now_ms: i64,
+        tenant_id: &str,
+        expected_definition_digest: &str,
+    ) -> Result<crate::sekai::governed_transform::TransformRun, String> {
         match self {
-            Self::Sqlite(db) => {
-                db.run_governed_transform(namespace, transform_id, incremental, now_ms)
-            }
+            Self::Sqlite(db) => db.run_governed_transform_owned(
+                namespace,
+                transform_id,
+                incremental,
+                now_ms,
+                tenant_id,
+                expected_definition_digest,
+            ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.run_governed_transform(namespace, transform_id, incremental, now_ms)
+                db.run_governed_transform_owned(
+                    namespace,
+                    transform_id,
+                    incremental,
+                    now_ms,
+                    tenant_id,
+                    expected_definition_digest,
+                )
             }),
         }
     }
@@ -524,6 +559,9 @@ impl RuntimeDb {
         }
     }
 
+    /// Admits unowned in-process work. Owned Put-tenant in-process work is
+    /// listed by [`Self::list_due_owned_in_process_transforms`] and committed
+    /// after Tick admits on `quota_runtime()`.
     pub fn tick_governed_transforms(
         &self,
         now_ms: i64,
@@ -533,6 +571,43 @@ impl RuntimeDb {
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.tick_governed_transforms(now_ms))
             }
+        }
+    }
+
+    pub fn list_due_owned_in_process_transforms(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::DueOwnedInProcessTransform>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_due_owned_in_process_transforms(now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_due_owned_in_process_transforms(now_ms))
+            }
+        }
+    }
+
+    pub fn commit_due_owned_in_process_transform(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        now_ms: i64,
+        expected_tenant_id: &str,
+    ) -> Result<Option<crate::sekai::governed_transform::TransformRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.commit_due_owned_in_process_transform(
+                namespace,
+                transform_id,
+                now_ms,
+                expected_tenant_id,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.commit_due_owned_in_process_transform(
+                    namespace,
+                    transform_id,
+                    now_ms,
+                    expected_tenant_id,
+                )
+            }),
         }
     }
 
@@ -627,6 +702,289 @@ impl RuntimeDb {
             }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.claim_transform_work(namespace, runtime_id, run_id, ttl_ms, now_ms)
+            }),
+        }
+    }
+
+    pub fn claim_transform_work_outcome(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        run_id: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+        skip_run_ids: &[String],
+    ) -> Result<crate::sekai::governed_transform::ClaimTransformWorkOutcome, String> {
+        match self {
+            Self::Sqlite(db) => db.claim_transform_work_outcome(
+                namespace,
+                runtime_id,
+                run_id,
+                ttl_ms,
+                now_ms,
+                skip_run_ids,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.claim_transform_work_outcome(
+                    namespace,
+                    runtime_id,
+                    run_id,
+                    ttl_ms,
+                    now_ms,
+                    skip_run_ids,
+                )
+            }),
+        }
+    }
+
+    pub fn release_transform_claim(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        now_ms: i64,
+        restore_lease_expiry: bool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.release_transform_claim(
+                run_id,
+                runtime_id,
+                claim_generation,
+                fencing_token,
+                now_ms,
+                restore_lease_expiry,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.release_transform_claim(
+                    run_id,
+                    runtime_id,
+                    claim_generation,
+                    fencing_token,
+                    now_ms,
+                    restore_lease_expiry,
+                )
+            }),
+        }
+    }
+
+    pub fn put_transform_quota_hold(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        reserved_concurrency: bool,
+        claim_generation: i64,
+        fencing_token: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.put_transform_quota_hold(
+                run_id,
+                tenant_id,
+                reserved_concurrency,
+                claim_generation,
+                fencing_token,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_transform_quota_hold(
+                    run_id,
+                    tenant_id,
+                    reserved_concurrency,
+                    claim_generation,
+                    fencing_token,
+                )
+            }),
+        }
+    }
+
+    pub fn restore_transform_quota_hold(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        reserved_concurrency: bool,
+        claim_generation: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.restore_transform_quota_hold(
+                run_id,
+                tenant_id,
+                reserved_concurrency,
+                claim_generation,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.restore_transform_quota_hold(
+                    run_id,
+                    tenant_id,
+                    reserved_concurrency,
+                    claim_generation,
+                )
+            }),
+        }
+    }
+
+    pub fn restore_abandoned_quota_hold(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        reserved_concurrency: bool,
+        refund_request: bool,
+        refund_tokens: i32,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.restore_abandoned_quota_hold(
+                run_id,
+                tenant_id,
+                reserved_concurrency,
+                refund_request,
+                refund_tokens,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.restore_abandoned_quota_hold(
+                    run_id,
+                    tenant_id,
+                    reserved_concurrency,
+                    refund_request,
+                    refund_tokens,
+                )
+            }),
+        }
+    }
+
+    pub fn reclaim_transform_quota_hold(
+        &self,
+        run_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+    ) -> Result<Option<(String, bool, i64)>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.reclaim_transform_quota_hold(run_id, claim_generation, fencing_token)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.reclaim_transform_quota_hold(run_id, claim_generation, fencing_token)
+            }),
+        }
+    }
+
+    pub fn take_transform_quota_hold(
+        &self,
+        run_id: &str,
+        claim_generation: Option<i64>,
+        older_than: bool,
+    ) -> Result<Option<(String, bool, i64)>, String> {
+        match self {
+            Self::Sqlite(db) => db.take_transform_quota_hold(run_id, claim_generation, older_than),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.take_transform_quota_hold(run_id, claim_generation, older_than)
+            }),
+        }
+    }
+
+    pub fn take_retryable_quota_hold(
+        &self,
+        run_id: &str,
+        claim_generation: i64,
+    ) -> Result<Option<crate::db::governed_transform::TakenTransformQuotaHold>, String> {
+        match self {
+            Self::Sqlite(db) => db.take_retryable_quota_hold(run_id, claim_generation),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.take_retryable_quota_hold(run_id, claim_generation)
+            }),
+        }
+    }
+
+    pub fn list_retryable_quota_holds(&self) -> Result<Vec<(String, String, bool, i64)>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_retryable_quota_holds(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_retryable_quota_holds())
+            }
+        }
+    }
+
+    pub fn peek_transform_quota_hold(
+        &self,
+        run_id: &str,
+        claim_generation: i64,
+    ) -> Result<Option<(String, bool, i64)>, String> {
+        match self {
+            Self::Sqlite(db) => db.peek_transform_quota_hold(run_id, claim_generation),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.peek_transform_quota_hold(run_id, claim_generation)
+            }),
+        }
+    }
+
+    pub fn defer_transform_work(&self, run_id: &str, now_ms: i64) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.defer_transform_work(run_id, now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.defer_transform_work(run_id, now_ms))
+            }
+        }
+    }
+
+    pub fn bind_transform_work_tenant(
+        &self,
+        run_id: &str,
+        tenant_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.bind_transform_work_tenant(run_id, tenant_id, claim_generation, fencing_token)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.bind_transform_work_tenant(run_id, tenant_id, claim_generation, fencing_token)
+            }),
+        }
+    }
+
+    pub fn list_transform_usage_pending(&self) -> Result<Vec<(String, String, i64)>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_transform_usage_pending(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_transform_usage_pending())
+            }
+        }
+    }
+
+    pub fn transform_usage_pending(&self, run_id: &str) -> Result<Option<(String, i64)>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_usage_pending(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_usage_pending(run_id))
+            }
+        }
+    }
+
+    pub fn take_transform_usage_pending(&self, run_id: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.take_transform_usage_pending(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.take_transform_usage_pending(run_id))
+            }
+        }
+    }
+
+    pub fn transform_work_tenant(&self, run_id: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_work_tenant(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_work_tenant(run_id))
+            }
+        }
+    }
+
+    pub fn transform_quota_owner(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_quota_owner(namespace, transform_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.transform_quota_owner(namespace, transform_id)
             }),
         }
     }
@@ -2437,9 +2795,9 @@ impl RuntimeDb {
     ) -> Result<Vec<(String, String, i64, String)>, String> {
         match self {
             Self::Sqlite(db) => db.budget_limits_for_scope(scope_id),
-            Self::Postgres(_) => Err(
-                "budget_limits_for_scope is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.budget_limits_for_scope(scope_id))
+            }
         }
     }
 

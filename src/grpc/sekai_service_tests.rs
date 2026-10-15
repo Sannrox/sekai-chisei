@@ -16069,3 +16069,2613 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         .unwrap();
     assert_eq!(written.dispatch_status, "completed");
 }
+
+fn with_tenant_admin<T>(payload: T, tenant_id: &str) -> Request<T> {
+    let mut req = with_named_principal(payload, "local");
+    req.extensions_mut()
+        .insert(crate::provider_credentials::tenant_context(
+            tenant_id, "local",
+        ));
+    req
+}
+
+#[tokio::test]
+async fn run_governed_transform_applies_tenant_quota_and_records_usage() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform, TransformStep};
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-meter".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: vec![TransformStep {
+                    kind: "project".into(),
+                    column: String::new(),
+                    op: String::new(),
+                    value: String::new(),
+                    columns: vec!["id".into()],
+                }],
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: None,
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    let limits = TenantQuotaLimits {
+        version: 1,
+        max_requests_per_period: Some(1),
+        max_tokens_per_period: None,
+        max_concurrency: None,
+        max_storage_bytes: None,
+        period: PeriodType::Daily,
+    };
+    gate.configure("tenant-a", &limits).unwrap();
+
+    let missing = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "missing".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    let first = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-meter".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert!(!first.run_id.is_empty());
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+
+    let denied = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-meter".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn split_plane_run_records_usage_on_the_chisei_dest() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::composition::cross_store_admission::CrossStoreAdmission;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform, TransformStep};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sekai =
+        crate::db::store::SekaiStore::open_sqlite(dir.path().join("sekai.db").to_str().unwrap());
+    let chisei =
+        crate::db::store::ChiseiStore::open_sqlite(dir.path().join("chisei.db").to_str().unwrap());
+    let svc = SekaiServiceImpl::new(sekai.clone()).with_cross_store_admission(Arc::new(
+        CrossStoreAdmission::new(chisei.clone(), sekai.clone(), None),
+    ));
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-split".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: vec![TransformStep {
+                    kind: "project".into(),
+                    column: String::new(),
+                    op: String::new(),
+                    value: String::new(),
+                    columns: vec!["id".into()],
+                }],
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: None,
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    let gate = crate::composition::transform_run_admission::quota_gate(chisei.runtime_arc());
+    let limits = TenantQuotaLimits {
+        version: 1,
+        max_requests_per_period: Some(1),
+        max_tokens_per_period: None,
+        max_concurrency: None,
+        max_storage_bytes: None,
+        period: PeriodType::Daily,
+    };
+    gate.configure("tenant-a", &limits).unwrap();
+
+    let first = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-split".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert!(!first.run_id.is_empty());
+
+    let quota = svc.quota_runtime();
+    let RuntimeDb::Sqlite(chisei_sqlite) = quota.as_ref() else {
+        panic!("sqlite");
+    };
+    let usage = chisei_sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+
+    let RuntimeDb::Sqlite(sekai_sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    assert!(
+        sekai_sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .is_err(),
+        "Sekai plane must not host usage events"
+    );
+
+    let denied = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-split".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn in_process_run_without_tenant_meters_the_put_owner() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(1),
+                max_tokens_per_period: None,
+                max_concurrency: None,
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-meter-owner".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: vec![TransformStep {
+                    kind: "project".into(),
+                    columns: vec!["id".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    svc.run_governed_transform(with_named_principal(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-meter-owner".into(),
+            incremental: false,
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+    let denied = svc
+        .run_governed_transform(with_named_principal(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-meter-owner".into(),
+                incremental: false,
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn in_process_run_with_tenant_meters_the_caller_not_the_put_owner() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let limits = TenantQuotaLimits {
+        version: 1,
+        max_requests_per_period: Some(1),
+        max_tokens_per_period: None,
+        max_concurrency: None,
+        max_storage_bytes: None,
+        period: PeriodType::Daily,
+    };
+    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    gate.configure("tenant-a", &limits).unwrap();
+    gate.configure("tenant-b", &limits).unwrap();
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-meter-caller".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: vec![TransformStep {
+                    kind: "project".into(),
+                    columns: vec!["id".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-meter-caller".into(),
+            incremental: false,
+        },
+        "tenant-b",
+    ))
+    .await
+    .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        0
+    );
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-b", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        1
+    );
+    let denied = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-meter-caller".into(),
+                incremental: false,
+            },
+            "tenant-b",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-meter-caller".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        1
+    );
+}
+
+#[tokio::test]
+async fn isolated_run_without_tenant_stamps_the_put_owner() {
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, ISOLATED_CLASS, rows_digest};
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-put-owner".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                profile: ISOLATED_CLASS.into(),
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                ..Default::default()
+            }),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let run = svc
+        .run_governed_transform(with_named_principal(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-iso-put-owner".into(),
+                incremental: false,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: run.run_id,
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    assert_eq!(work.tenant_id, "tenant-a");
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    svc.write_transform_run_result(with_named_principal(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            rows: output
+                .iter()
+                .map(|values| TransformRunInputRow {
+                    alias: String::new(),
+                    dataset_id: "out".into(),
+                    row_id: 0,
+                    values: values.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output_digest: rows_digest(&output),
+            quarantined: false,
+            quality_rule: String::new(),
+            ..Default::default()
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+}
+
+#[tokio::test]
+async fn isolated_write_retry_after_complete_records_usage_once() {
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, ISOLATED_CLASS, rows_digest};
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-usage-retry".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                profile: ISOLATED_CLASS.into(),
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                ..Default::default()
+            }),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let run = svc
+        .run_governed_transform(with_named_principal(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-iso-usage-retry".into(),
+                incremental: false,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: run.run_id,
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    let write = WriteTransformRunResultRequest {
+        run_id: work.run_id.clone(),
+        runtime_id: work.claim_owner.clone(),
+        claim_generation: work.claim_generation,
+        fencing_token: work.fencing_token.clone(),
+        rows: output
+            .iter()
+            .map(|values| TransformRunInputRow {
+                alias: String::new(),
+                dataset_id: "out".into(),
+                row_id: 0,
+                values: values.clone(),
+                ..Default::default()
+            })
+            .collect(),
+        output_digest: rows_digest(&output),
+        quarantined: false,
+        quality_rule: String::new(),
+        ..Default::default()
+    };
+    runtime
+        .write_transform_run(
+            crate::sekai::governed_transform::WriteTransformRunCommand {
+                run_id: write.run_id.clone(),
+                runtime_id: write.runtime_id.clone(),
+                claim_generation: write.claim_generation,
+                fencing_token: write.fencing_token.clone(),
+                rows: output.clone(),
+                output_digest: write.output_digest.clone(),
+                quarantined: false,
+                quality_rule: String::new(),
+                ..crate::sekai::governed_transform::WriteTransformRunCommand::default()
+            },
+            40,
+        )
+        .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        0
+    );
+    svc.write_transform_run_result(with_named_principal(write.clone(), "local"))
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        1
+    );
+    svc.write_transform_run_result(with_named_principal(write, "local"))
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        1
+    );
+}
+
+#[tokio::test]
+async fn isolated_claim_admits_quota_and_write_records_usage() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, rows_digest,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-meter".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    gate.configure(
+        "tenant-a",
+        &TenantQuotaLimits {
+            version: 1,
+            max_requests_per_period: Some(1),
+            max_tokens_per_period: None,
+            max_concurrency: None,
+            max_storage_bytes: None,
+            period: PeriodType::Daily,
+        },
+    )
+    .unwrap();
+
+    let queued = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-iso-meter".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let before_claim = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(before_claim.measured, 0);
+
+    let claimed = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: queued.run_id.clone(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    let written = svc
+        .write_transform_run_result(with_tenant_admin(
+            WriteTransformRunResultRequest {
+                run_id: work.run_id,
+                runtime_id: work.claim_owner,
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token,
+                rows: output
+                    .iter()
+                    .map(|values| TransformRunInputRow {
+                        alias: String::new(),
+                        dataset_id: "out".into(),
+                        row_id: 0,
+                        values: values.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                output_digest: rows_digest(&output),
+                quarantined: false,
+                quality_rule: String::new(),
+                ..Default::default()
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(written.dispatch_status, "completed");
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-iso-meter".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let denied = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn isolated_write_records_usage_for_the_claiming_tenant() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, rows_digest,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-owner".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(1),
+                max_tokens_per_period: None,
+                max_concurrency: None,
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    let queued = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-iso-owner".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    let claimed = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: queued.run_id,
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    svc.write_transform_run_result(with_tenant_admin(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            rows: output
+                .iter()
+                .map(|values| TransformRunInputRow {
+                    alias: String::new(),
+                    dataset_id: "out".into(),
+                    row_id: 0,
+                    values: values.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output_digest: rows_digest(&output),
+            quarantined: false,
+            quality_rule: String::new(),
+            ..Default::default()
+        },
+        "tenant-b",
+    ))
+    .await
+    .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let owner = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    let writer = sqlite
+        .aggregate_usage_for_tenant("tenant-b", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(owner.measured, 1);
+    assert_eq!(writer.measured, 0);
+}
+
+#[tokio::test]
+async fn isolated_claim_without_tenant_context_meters_the_owner() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, rows_digest,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-runner".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(1),
+                max_tokens_per_period: None,
+                max_concurrency: None,
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    let queued = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-iso-runner".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: queued.run_id,
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    svc.write_transform_run_result(with_named_principal(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            rows: output
+                .iter()
+                .map(|values| TransformRunInputRow {
+                    alias: String::new(),
+                    dataset_id: "out".into(),
+                    row_id: 0,
+                    values: values.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output_digest: rows_digest(&output),
+            quarantined: false,
+            quality_rule: String::new(),
+            ..Default::default()
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-iso-runner".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let denied = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn isolated_write_records_owner_usage_without_quota_limits() {
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, rows_digest,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-noleak".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    let queued = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-iso-noleak".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: queued.run_id,
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    svc.write_transform_run_result(with_named_principal(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            rows: output
+                .iter()
+                .map(|values| TransformRunInputRow {
+                    alias: String::new(),
+                    dataset_id: "out".into(),
+                    row_id: 0,
+                    values: values.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output_digest: rows_digest(&output),
+            quarantined: false,
+            quality_rule: String::new(),
+            ..Default::default()
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+}
+
+#[tokio::test]
+async fn scheduled_isolated_tick_meters_the_put_owner() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, ISOLATED_CLASS, rows_digest};
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(1),
+                max_tokens_per_period: None,
+                max_concurrency: None,
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-sched".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                profile: ISOLATED_CLASS.into(),
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                schedule_every_ms: 1_000,
+                ..Default::default()
+            }),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let ticked = svc
+        .tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms: 1_500 },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(ticked.len(), 1);
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: ticked[0].run_id.clone(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let work = claimed.work.unwrap();
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    svc.write_transform_run_result(with_named_principal(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            rows: output
+                .iter()
+                .map(|values| TransformRunInputRow {
+                    alias: String::new(),
+                    dataset_id: "out".into(),
+                    row_id: 0,
+                    values: values.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output_digest: rows_digest(&output),
+            quarantined: false,
+            quality_rule: String::new(),
+            ..Default::default()
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+}
+
+#[tokio::test]
+async fn scheduled_in_process_tick_admits_owner_quota_before_run() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(1),
+                max_tokens_per_period: None,
+                max_concurrency: None,
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-inproc-sched".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: vec![TransformStep {
+                    kind: "project".into(),
+                    columns: vec!["id".into()],
+                    ..Default::default()
+                }],
+                schedule_every_ms: 1_000,
+                ..Default::default()
+            }),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let first = svc
+        .tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms: 1_500 },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(first.len(), 1);
+    let second = svc
+        .tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms: 2_500 },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert!(second.is_empty());
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+}
+
+#[tokio::test]
+async fn in_process_tick_retries_usage_after_commit() {
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-inproc-usage-retry".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: vec![TransformStep {
+                    kind: "project".into(),
+                    columns: vec!["id".into()],
+                    ..Default::default()
+                }],
+                schedule_every_ms: 1_000,
+                ..Default::default()
+            }),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let committed = runtime
+        .commit_due_owned_in_process_transform("ops", "t-inproc-usage-retry", 1_500, "tenant-a")
+        .unwrap()
+        .expect("due owned in-process run");
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        0
+    );
+    assert_eq!(
+        runtime.list_transform_usage_pending().unwrap(),
+        vec![(committed.run_id.clone(), "tenant-a".into(), 1_500)]
+    );
+    let ran = svc
+        .tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms: 1_600 },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert!(ran.is_empty());
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        1
+    );
+    let events = sqlite
+        .list_usage_events_for_tenant("tenant-a", 0, i64::MAX, 10)
+        .unwrap();
+    assert_eq!(events[0].event_time_ms, 1_500);
+    assert!(runtime.list_transform_usage_pending().unwrap().is_empty());
+    svc.tick_governed_transforms(with_named_principal(
+        TickGovernedTransformsRequest { now_ms: 1_700 },
+        "local",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlite
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap()
+            .measured,
+        1
+    );
+}
+
+#[tokio::test]
+async fn triggered_in_process_defers_until_quota_tick() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("mid")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(1),
+                max_tokens_per_period: None,
+                max_concurrency: None,
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    let project = |id: &str, input: &str, output: &str, trigger: bool| GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ops".into(),
+        transform_id: id.into(),
+        input_dataset_id: input.into(),
+        output_dataset_id: output.into(),
+        steps: vec![TransformStep {
+            kind: "project".into(),
+            columns: vec!["id".into()],
+            ..Default::default()
+        }],
+        trigger_on_input_commit: trigger,
+        ..Default::default()
+    };
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(project("t-up", "in", "mid", false)),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    svc.put_governed_transform(with_tenant_admin(
+        PutGovernedTransformRequest {
+            transform: Some(project("t-down", "mid", "out", true)),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-up".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let listed = svc
+        .list_governed_transform_runs(with_principal(ListGovernedTransformRunsRequest {
+            namespace: "ops".into(),
+            limit: 10,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].transform_id, "t-up");
+    let ticked = svc
+        .tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms: 1_500 },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    assert!(ticked.is_empty());
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let usage = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(usage.measured, 1);
+}
+
+#[tokio::test]
+async fn isolated_claim_without_limits_binds_the_claiming_tenant() {
+    use crate::chisei::usage_ledger::UsageUnit;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, rows_digest,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-bind".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    let queued = runtime
+        .run_governed_transform("ops", "t-iso-bind", false, 20)
+        .unwrap();
+    let claimed = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: queued.run_id.clone(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        runtime
+            .transform_work_tenant(&queued.run_id)
+            .unwrap()
+            .as_deref(),
+        Some("tenant-a")
+    );
+    let work = claimed.work.unwrap();
+    assert_eq!(work.tenant_id, "tenant-a");
+    let output = vec![HashMap::from([("id".into(), "1".into())])];
+    svc.write_transform_run_result(with_named_principal(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            rows: output
+                .iter()
+                .map(|values| TransformRunInputRow {
+                    alias: String::new(),
+                    dataset_id: "out".into(),
+                    row_id: 0,
+                    values: values.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output_digest: rows_digest(&output),
+            quarantined: false,
+            quality_rule: String::new(),
+            ..Default::default()
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = runtime else {
+        panic!("sqlite");
+    };
+    let owner = sqlite
+        .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(owner.measured, 1);
+}
+
+#[tokio::test]
+async fn isolated_quota_exhaustion_leaves_work_claimable() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-deny".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(0),
+                max_tokens_per_period: None,
+                max_concurrency: None,
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-iso-deny".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let denied = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+    let listed = svc
+        .list_claimable_transform_work(with_named_principal(
+            ListClaimableTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                limit: 10,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].tenant_id, "tenant-a");
+}
+
+#[tokio::test]
+async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out-a")).unwrap();
+    runtime.create_dataset(&dataset("out-b")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let isolated = |id: &str, output: &str| {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: id.into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: output.into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "runner:1".into(),
+                inputs: Vec::new(),
+            }),
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    };
+    runtime
+        .put_governed_transform_owned(&isolated("t-iso-a", "out-a"), 10, "tenant-a")
+        .unwrap();
+    runtime
+        .put_governed_transform_owned(&isolated("t-iso-b", "out-b"), 11, "tenant-b")
+        .unwrap();
+    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    gate.configure(
+        "tenant-a",
+        &TenantQuotaLimits {
+            version: 1,
+            max_requests_per_period: Some(0),
+            max_tokens_per_period: None,
+            max_concurrency: None,
+            max_storage_bytes: None,
+            period: PeriodType::Daily,
+        },
+    )
+    .unwrap();
+    gate.configure(
+        "tenant-b",
+        &TenantQuotaLimits {
+            version: 1,
+            max_requests_per_period: Some(1),
+            max_tokens_per_period: None,
+            max_concurrency: None,
+            max_storage_bytes: None,
+            period: PeriodType::Daily,
+        },
+    )
+    .unwrap();
+    runtime
+        .run_governed_transform_owned("ops", "t-iso-a", false, 20, "tenant-a", "")
+        .unwrap();
+    runtime
+        .run_governed_transform_owned("ops", "t-iso-b", false, 21, "tenant-b", "")
+        .unwrap();
+    let claimed = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(claimed.transform_id, "t-iso-b");
+    assert_eq!(claimed.tenant_id, "tenant-b");
+}
+
+#[tokio::test]
+async fn scheduled_isolated_tick_claims_against_the_put_owner() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, TransformSchedule,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform_owned(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-sched".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: Some(TransformSchedule { every_ms: 1_000 }),
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+            "tenant-a",
+        )
+        .unwrap();
+    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    gate.configure(
+        "tenant-a",
+        &TenantQuotaLimits {
+            version: 1,
+            max_requests_per_period: Some(0),
+            max_tokens_per_period: None,
+            max_concurrency: None,
+            max_storage_bytes: None,
+            period: PeriodType::Daily,
+        },
+    )
+    .unwrap();
+    svc.tick_governed_transforms(with_named_principal(
+        TickGovernedTransformsRequest { now_ms: 1_500 },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let listed = svc
+        .list_claimable_transform_work(with_named_principal(
+            ListClaimableTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                limit: 10,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].tenant_id, "tenant-a");
+    let denied = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn triggered_isolated_claim_uses_the_put_owner() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, TransformTrigger,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("mid")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform_owned(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-up".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "mid".into(),
+                steps: vec![crate::sekai::governed_transform::TransformStep {
+                    kind: "project".into(),
+                    columns: vec!["id".into()],
+                    ..Default::default()
+                }],
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: None,
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+            "tenant-a",
+        )
+        .unwrap();
+    runtime
+        .put_governed_transform_owned(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-down".into(),
+                input_dataset_id: "mid".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: Some(TransformTrigger {
+                    on_input_commit: true,
+                    debounce_ms: 0,
+                }),
+            }
+            .prepare()
+            .unwrap(),
+            11,
+            "tenant-a",
+        )
+        .unwrap();
+    runtime
+        .run_governed_transform_owned("ops", "t-up", false, 20, "tenant-a", "")
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(0),
+                max_tokens_per_period: None,
+                max_concurrency: None,
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    let listed = svc
+        .list_claimable_transform_work(with_named_principal(
+            ListClaimableTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                limit: 10,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].transform_id, "t-iso-down");
+    assert_eq!(listed[0].tenant_id, "tenant-a");
+    let denied = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn isolated_expired_claim_releases_concurrency_for_reclaim() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-conc".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: None,
+                max_tokens_per_period: None,
+                max_concurrency: Some(1),
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-iso-conc".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    svc.claim_transform_work(with_tenant_admin(
+        ClaimTransformWorkRequest {
+            namespace: "ops".into(),
+            runtime_id: "runner-a".into(),
+            run_id: String::new(),
+            ttl_ms: 1,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let reclaimed = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-b".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(reclaimed.claim_owner, "runner-b");
+}
+
+#[tokio::test]
+async fn isolated_terminal_lease_failure_releases_concurrency() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, MAX_TRANSFORM_LEASE_EXPIRIES,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-term".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: None,
+                max_tokens_per_period: None,
+                max_concurrency: Some(1),
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-iso-term".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    for attempt in 0..MAX_TRANSFORM_LEASE_EXPIRIES {
+        svc.claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: format!("runner-{attempt}"),
+                run_id: String::new(),
+                ttl_ms: 1,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let terminal = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-final".into(),
+                run_id: String::new(),
+                ttl_ms: 1,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(terminal.code(), tonic::Code::NotFound);
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-iso-term".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let next = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-next".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(next.claim_owner, "runner-next");
+}
+
+#[tokio::test]
+async fn isolated_cancel_releases_concurrency_for_next_claim() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
+    };
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "t-iso-cancel".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: None,
+                max_tokens_per_period: None,
+                max_concurrency: Some(1),
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    let queued = svc
+        .run_governed_transform(with_tenant_admin(
+            RunGovernedTransformRequest {
+                namespace: "ops".into(),
+                transform_id: "t-iso-cancel".into(),
+                incremental: false,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    svc.claim_transform_work(with_tenant_admin(
+        ClaimTransformWorkRequest {
+            namespace: "ops".into(),
+            runtime_id: "runner-a".into(),
+            run_id: queued.run_id.clone(),
+            ttl_ms: 60_000,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    svc.cancel_governed_transform_run(with_tenant_admin(
+        CancelGovernedTransformRunRequest {
+            run_id: queued.run_id,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-iso-cancel".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let next = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-b".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(next.claim_owner, "runner-b");
+}

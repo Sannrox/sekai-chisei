@@ -226,54 +226,11 @@ impl SekaiDb {
         tenant_id: &str,
         receipt: &OperationReceipt,
     ) -> Result<Vec<UsageEvent>, String> {
-        if tenant_id.trim().is_empty() {
-            return Err("tenant_id required from authenticated context".into());
+        let events = measured_usage_events(tenant_id, receipt)?;
+        for event in &events {
+            self.append_usage_event(event)?;
         }
-        let tokens = measured_tokens_from_receipt(receipt);
-        let event_time = receipt.completed_at_ms.unwrap_or(receipt.started_at_ms);
-        let mut out = Vec::new();
-
-        // One request unit per completed operation.
-        let request_event = UsageEvent {
-            version: USAGE_EVENT_VERSION.into(),
-            event_id: stable_event_id(tenant_id, &receipt.operation_id, "requests", "measured"),
-            tenant_id: tenant_id.into(),
-            namespace: receipt.namespace.clone(),
-            unit: UsageUnit::Requests,
-            quantity: 1,
-            source: UsageSource::Measured,
-            receipt_operation_id: receipt.operation_id.clone(),
-            dedupe_key: format!(
-                "usage:v1:{tenant_id}:{}:requests:measured",
-                receipt.operation_id
-            ),
-            event_time_ms: event_time,
-            corrects_event_id: None,
-        };
-        self.append_usage_event(&request_event)?;
-        out.push(request_event);
-
-        if tokens != 0 {
-            let token_event = UsageEvent {
-                version: USAGE_EVENT_VERSION.into(),
-                event_id: stable_event_id(tenant_id, &receipt.operation_id, "tokens", "measured"),
-                tenant_id: tenant_id.into(),
-                namespace: receipt.namespace.clone(),
-                unit: UsageUnit::Tokens,
-                quantity: tokens,
-                source: UsageSource::Measured,
-                receipt_operation_id: receipt.operation_id.clone(),
-                dedupe_key: format!(
-                    "usage:v1:{tenant_id}:{}:tokens:measured",
-                    receipt.operation_id
-                ),
-                event_time_ms: event_time,
-                corrects_event_id: None,
-            };
-            self.append_usage_event(&token_event)?;
-            out.push(token_event);
-        }
-        Ok(out)
+        Ok(events)
     }
 
     /// Append-only correction (never mutates prior rows).
@@ -320,7 +277,54 @@ impl SekaiDb {
     }
 }
 
-fn validate_event(event: &UsageEvent) -> Result<(), String> {
+pub(crate) fn measured_usage_events(
+    tenant_id: &str,
+    receipt: &OperationReceipt,
+) -> Result<Vec<UsageEvent>, String> {
+    if tenant_id.trim().is_empty() {
+        return Err("tenant_id required from authenticated context".into());
+    }
+    let tokens = measured_tokens_from_receipt(receipt);
+    let event_time = receipt.completed_at_ms.unwrap_or(receipt.started_at_ms);
+    let mut out = Vec::new();
+    out.push(UsageEvent {
+        version: USAGE_EVENT_VERSION.into(),
+        event_id: stable_event_id(tenant_id, &receipt.operation_id, "requests", "measured"),
+        tenant_id: tenant_id.into(),
+        namespace: receipt.namespace.clone(),
+        unit: UsageUnit::Requests,
+        quantity: 1,
+        source: UsageSource::Measured,
+        receipt_operation_id: receipt.operation_id.clone(),
+        dedupe_key: format!(
+            "usage:v1:{tenant_id}:{}:requests:measured",
+            receipt.operation_id
+        ),
+        event_time_ms: event_time,
+        corrects_event_id: None,
+    });
+    if tokens != 0 {
+        out.push(UsageEvent {
+            version: USAGE_EVENT_VERSION.into(),
+            event_id: stable_event_id(tenant_id, &receipt.operation_id, "tokens", "measured"),
+            tenant_id: tenant_id.into(),
+            namespace: receipt.namespace.clone(),
+            unit: UsageUnit::Tokens,
+            quantity: tokens,
+            source: UsageSource::Measured,
+            receipt_operation_id: receipt.operation_id.clone(),
+            dedupe_key: format!(
+                "usage:v1:{tenant_id}:{}:tokens:measured",
+                receipt.operation_id
+            ),
+            event_time_ms: event_time,
+            corrects_event_id: None,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) fn validate_event(event: &UsageEvent) -> Result<(), String> {
     if event.version != USAGE_EVENT_VERSION {
         return Err(format!("unsupported usage event version {}", event.version));
     }
