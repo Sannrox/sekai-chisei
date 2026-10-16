@@ -25,6 +25,7 @@ pub mod connector_certification;
 pub mod coordination;
 pub mod credentials;
 pub mod dataset;
+pub mod dataset_health;
 pub mod dataset_version;
 pub mod decision_ledger;
 pub mod deduplication;

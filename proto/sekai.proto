@@ -1303,6 +1303,60 @@ message RollbackDatasetResponse {
   repeated Row rows = 2;
 }
 
+message DatasetHealthCheck {
+  string dataset_id = 1;
+  string check_id = 2;
+  string kind = 3;
+  int64 max_age_ms = 4;
+  int32 min_rows = 5;
+  int32 max_rows = 6;
+  repeated string columns = 7;
+  repeated RowFilter predicate = 8;
+  bool blocking = 9;
+  int64 every_ms = 10;
+  string tenant = 11;
+  string space = 12;
+}
+message PutDatasetHealthCheckRequest { DatasetHealthCheck check = 1; }
+message PutDatasetHealthCheckResponse { DatasetHealthCheck check = 1; }
+message ListDatasetHealthChecksRequest { string dataset_id = 1; }
+message ListDatasetHealthChecksResponse { repeated DatasetHealthCheck checks = 1; }
+message DatasetHealthResult {
+  string dataset_id = 1;
+  string version_id = 2;
+  string check_id = 3;
+  bool passed = 4;
+  string detail = 5;
+  int64 judged_at_ms = 6;
+  bool quarantined = 7;
+}
+message ListDatasetHealthResultsRequest {
+  string dataset_id = 1;
+  string version_id = 2;
+}
+message ListDatasetHealthResultsResponse {
+  repeated DatasetHealthResult results = 1;
+  string last_healthy_version_id = 2;
+  bool quarantined = 3;
+}
+message RunDatasetHealthChecksRequest {
+  string dataset_id = 1;
+  int64 now_ms = 2;
+}
+message RunDatasetHealthChecksResponse { repeated DatasetHealthResult results = 1; }
+message DatasetAlert {
+  string kind = 1;
+  string ref_id = 2;
+  string dataset_id = 3;
+  string tenant = 4;
+  string space = 5;
+  string reason = 6;
+  string state = 7;
+  int64 emitted_at_ms = 8;
+}
+message ListDatasetAlertsRequest { string dataset_id = 1; }
+message ListDatasetAlertsResponse { repeated DatasetAlert alerts = 1; }
+
 message CreateVirtualTableRequest { VirtualTable table = 1; }
 message CreateVirtualTableResponse { VirtualTable table = 1; }
 message ListVirtualTablesRequest {}
@@ -2959,6 +3013,11 @@ service SekaiService {
   rpc ListDatasetVersions(ListDatasetVersionsRequest) returns (ListDatasetVersionsResponse);
   rpc GetDatasetVersion(GetDatasetVersionRequest) returns (GetDatasetVersionResponse);
   rpc RollbackDataset(RollbackDatasetRequest) returns (RollbackDatasetResponse);
+  rpc PutDatasetHealthCheck(PutDatasetHealthCheckRequest) returns (PutDatasetHealthCheckResponse);
+  rpc ListDatasetHealthChecks(ListDatasetHealthChecksRequest) returns (ListDatasetHealthChecksResponse);
+  rpc ListDatasetHealthResults(ListDatasetHealthResultsRequest) returns (ListDatasetHealthResultsResponse);
+  rpc RunDatasetHealthChecks(RunDatasetHealthChecksRequest) returns (RunDatasetHealthChecksResponse);
+  rpc ListDatasetAlerts(ListDatasetAlertsRequest) returns (ListDatasetAlertsResponse);
   rpc CreateVirtualTable(CreateVirtualTableRequest) returns (CreateVirtualTableResponse);
   rpc ListVirtualTables(ListVirtualTablesRequest) returns (ListVirtualTablesResponse);
 

@@ -3,6 +3,7 @@ use crate::sekai::dataset::{
     ColumnDef, Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable,
 };
 use crate::sekai::dataset_version::{self, DatasetRollback, DatasetVersion};
+use postgres::IsolationLevel;
 use std::collections::HashMap;
 
 impl PostgresDb {
@@ -173,13 +174,30 @@ impl PostgresDb {
         dataset_id: &str,
         query: &RowQuery,
     ) -> Result<Vec<HashMap<String, String>>, String> {
-        let rows = self
-            .connection()?
-            .query(
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(|error| error.to_string())?;
+        let state = crate::db::postgres_dataset_health::load_state_pg(&mut tx, dataset_id)?;
+        let rows = if state.quarantined && !state.last_healthy_version_id.is_empty() {
+            tx.query(
+                "SELECT data FROM sekai_dataset_version_rows
+                 WHERE dataset_id=$1 AND version_id=$2 ORDER BY row_id",
+                &[&dataset_id, &state.last_healthy_version_id],
+            )
+            .map_err(|error| error.to_string())?
+        } else if state.quarantined {
+            Vec::new()
+        } else {
+            tx.query(
                 "SELECT data FROM sekai_dataset_rows WHERE dataset_id=$1 ORDER BY id",
                 &[&dataset_id],
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+        };
         let mut result = Vec::new();
         let mut skipped = 0;
         for row in rows {
@@ -801,8 +819,7 @@ pub(crate) fn snapshot_dataset_version_pg(
         )
         .map_err(|error| error.to_string())?;
     }
-    prune_dataset_versions_pg(tx, dataset_id)?;
-    Ok(DatasetVersion {
+    let version = DatasetVersion {
         dataset_id: dataset_id.into(),
         version_id,
         seq,
@@ -813,7 +830,15 @@ pub(crate) fn snapshot_dataset_version_pg(
         restored_from_version_id: restored_from_version_id.into(),
         row_count,
         purged: false,
-    })
+    };
+    crate::db::postgres_dataset_health::judge_after_write_pg(
+        tx,
+        dataset_id,
+        &version,
+        created_at_ms,
+    )?;
+    prune_dataset_versions_pg(tx, dataset_id)?;
+    Ok(version)
 }
 
 fn prune_dataset_versions_pg(
@@ -847,13 +872,21 @@ fn prune_dataset_versions_pg(
          WHERE dataset_id = $1 AND version_id IN (
             SELECT version_id FROM sekai_dataset_versions
             WHERE dataset_id = $1 AND seq <= $2
+              AND version_id != COALESCE((
+                SELECT last_healthy_version_id FROM sekai_dataset_health_state
+                WHERE dataset_id = $1
+              ), '')
          )",
         &[&dataset_id, &cutoff],
     )
     .map_err(|error| error.to_string())?;
     tx.execute(
         "UPDATE sekai_dataset_versions SET purged = 1
-         WHERE dataset_id = $1 AND seq <= $2",
+         WHERE dataset_id = $1 AND seq <= $2
+           AND version_id != COALESCE((
+             SELECT last_healthy_version_id FROM sekai_dataset_health_state
+             WHERE dataset_id = $1
+           ), '')",
         &[&dataset_id, &cutoff],
     )
     .map(|_| ())

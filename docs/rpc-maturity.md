@@ -179,6 +179,11 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.ListDatasetVersions` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetDatasetVersion` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RollbackDataset` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.PutDatasetHealthCheck` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListDatasetHealthChecks` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListDatasetHealthResults` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.RunDatasetHealthChecks` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListDatasetAlerts` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.CreateVirtualTable` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListVirtualTables` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.CreateGrant` | `sekai.authorization` | yes | host | `stable` |

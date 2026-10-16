@@ -171,6 +171,7 @@ fn is_discover_rpc(method: &str) -> bool {
         "ListSchemaTypes"
             | "ListDatasets"
             | "ListDatasetVersions"
+            | "ListDatasetHealthChecks"
             | "DescribeObjectAction"
             | "DiscoverCapabilities"
     )
@@ -704,6 +705,11 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListDatasetVersions"
             | "GetDatasetVersion"
             | "RollbackDataset"
+            | "PutDatasetHealthCheck"
+            | "ListDatasetHealthChecks"
+            | "ListDatasetHealthResults"
+            | "RunDatasetHealthChecks"
+            | "ListDatasetAlerts"
             | "DescribeObjectAction"
             | "DiscoverCapabilities"
     )

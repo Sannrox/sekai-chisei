@@ -5601,6 +5601,164 @@ async fn rollback_dataset_rejects_tenant_mismatch() {
 }
 
 #[tokio::test]
+async fn dataset_health_checks_quarantine_and_schedule_alerts() {
+    let svc = service();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "health".into(),
+            name: "health".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.put_dataset_health_check(with_principal(PutDatasetHealthCheckRequest {
+        check: Some(DatasetHealthCheck {
+            dataset_id: "health".into(),
+            check_id: "count".into(),
+            kind: "row_count".into(),
+            max_age_ms: 0,
+            min_rows: 1,
+            max_rows: 1,
+            columns: Vec::new(),
+            predicate: Vec::new(),
+            blocking: true,
+            every_ms: 0,
+            tenant: "acme".into(),
+            space: "ops".into(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "health".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v1".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "health".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v2".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let live = svc
+        .query_rows(with_principal(QueryRowsRequest {
+            dataset_id: "health".into(),
+            query: None,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .rows;
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].values["kind"], "v1");
+    let status = svc
+        .list_dataset_health_results(with_principal(ListDatasetHealthResultsRequest {
+            dataset_id: "health".into(),
+            version_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(status.quarantined);
+
+    svc.put_dataset_health_check(with_principal(PutDatasetHealthCheckRequest {
+        check: Some(DatasetHealthCheck {
+            dataset_id: "health".into(),
+            check_id: "fresh".into(),
+            kind: "freshness".into(),
+            max_age_ms: 10_000,
+            min_rows: 0,
+            max_rows: 0,
+            columns: Vec::new(),
+            predicate: Vec::new(),
+            blocking: false,
+            every_ms: 1_000,
+            tenant: "acme".into(),
+            space: "ops".into(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
+        dataset_id: "health".into(),
+        now_ms: 5_000,
+    }))
+    .await
+    .unwrap();
+    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
+        dataset_id: "health".into(),
+        now_ms: 7_000,
+    }))
+    .await
+    .unwrap();
+    let alerts = svc
+        .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
+            dataset_id: "health".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .alerts;
+    let late: Vec<_> = alerts
+        .iter()
+        .filter(|alert| alert.reason == "late")
+        .collect();
+    assert_eq!(late.len(), 1);
+    assert_eq!(late[0].state, "firing");
+    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
+        dataset_id: "health".into(),
+        now_ms: 7_500,
+    }))
+    .await
+    .unwrap();
+    let alerts = svc
+        .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
+            dataset_id: "health".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .alerts;
+    assert_eq!(
+        alerts.iter().filter(|alert| alert.reason == "late").count(),
+        1
+    );
+    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
+        dataset_id: "health".into(),
+        now_ms: 8_000,
+    }))
+    .await
+    .unwrap();
+    let alerts = svc
+        .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
+            dataset_id: "health".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .alerts;
+    let late: Vec<_> = alerts
+        .iter()
+        .filter(|alert| alert.reason == "late")
+        .collect();
+    assert_eq!(late.len(), 2);
+    assert_eq!(late[1].state, "resolved");
+}
+
+#[tokio::test]
 async fn update_dataset_requires_write_access_to_existing_binding() {
     let svc = service();
     svc.create_dataset(with_principal(CreateDatasetRequest {

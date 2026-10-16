@@ -31,6 +31,9 @@ use crate::sekai::attestation::{AttestationVerification, PolicyAttestation};
 use crate::sekai::audit::{Decision, DecisionFilter, ObjectChange};
 use crate::sekai::coordination::*;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
+use crate::sekai::dataset_health::{
+    DatasetAlert, DatasetHealthCheck, DatasetHealthResult, DatasetHealthState,
+};
 use crate::sekai::dataset_version::{DatasetRollback, DatasetVersion};
 use crate::sekai::deduplication::*;
 use crate::sekai::definition_branch::*;
@@ -6219,6 +6222,71 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.set_dataset_version_retention(dataset_id, retain_count),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.set_dataset_version_retention(dataset_id, retain_count)
+            }),
+        }
+    }
+
+    pub fn put_dataset_health_check(&self, check: &DatasetHealthCheck) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_dataset_health_check(check),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_dataset_health_check(check))
+            }
+        }
+    }
+
+    pub fn list_dataset_health_checks(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Vec<DatasetHealthCheck>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_dataset_health_checks(dataset_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_dataset_health_checks(dataset_id))
+            }
+        }
+    }
+
+    pub fn list_dataset_health_results(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+    ) -> Result<Vec<DatasetHealthResult>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_dataset_health_results(dataset_id, version_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_dataset_health_results(dataset_id, version_id)
+            }),
+        }
+    }
+
+    pub fn dataset_health_state(&self, dataset_id: &str) -> Result<DatasetHealthState, String> {
+        match self {
+            Self::Sqlite(db) => db.dataset_health_state(dataset_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.dataset_health_state(dataset_id))
+            }
+        }
+    }
+
+    pub fn list_dataset_alerts(&self, dataset_id: &str) -> Result<Vec<DatasetAlert>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_dataset_alerts(dataset_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_dataset_alerts(dataset_id))
+            }
+        }
+    }
+
+    pub fn run_dataset_health_checks(
+        &self,
+        dataset_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<DatasetHealthResult>, String> {
+        match self {
+            Self::Sqlite(db) => db.run_dataset_health_checks(dataset_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.run_dataset_health_checks(dataset_id, now_ms)
             }),
         }
     }

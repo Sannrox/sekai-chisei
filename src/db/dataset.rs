@@ -3,6 +3,9 @@
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
+use crate::sekai::dataset_health::{
+    DatasetAlert, DatasetHealthCheck, DatasetHealthResult, DatasetHealthState,
+};
 use crate::sekai::dataset_version::{DatasetRollback, DatasetVersion};
 use std::collections::HashMap;
 
@@ -49,6 +52,23 @@ pub trait DatasetBackend: Send + Sync {
         dataset_id: &str,
         retain_count: i32,
     ) -> Result<(), String>;
+    fn put_dataset_health_check(&self, check: &DatasetHealthCheck) -> Result<(), String>;
+    fn list_dataset_health_checks(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Vec<DatasetHealthCheck>, String>;
+    fn list_dataset_health_results(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+    ) -> Result<Vec<DatasetHealthResult>, String>;
+    fn dataset_health_state(&self, dataset_id: &str) -> Result<DatasetHealthState, String>;
+    fn list_dataset_alerts(&self, dataset_id: &str) -> Result<Vec<DatasetAlert>, String>;
+    fn run_dataset_health_checks(
+        &self,
+        dataset_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<DatasetHealthResult>, String>;
 }
 
 macro_rules! sqlite_forward {
@@ -75,6 +95,12 @@ impl DatasetBackend for SekaiDb {
     sqlite_forward!(rollback_dataset(request: &DatasetRollback) -> Result<DatasetVersion, String>);
     sqlite_forward!(dataset_version_retention(dataset_id: &str) -> Result<i32, String>);
     sqlite_forward!(set_dataset_version_retention(dataset_id: &str, retain_count: i32) -> Result<(), String>);
+    sqlite_forward!(put_dataset_health_check(check: &DatasetHealthCheck) -> Result<(), String>);
+    sqlite_forward!(list_dataset_health_checks(dataset_id: &str) -> Result<Vec<DatasetHealthCheck>, String>);
+    sqlite_forward!(list_dataset_health_results(dataset_id: &str, version_id: &str) -> Result<Vec<DatasetHealthResult>, String>);
+    sqlite_forward!(dataset_health_state(dataset_id: &str) -> Result<DatasetHealthState, String>);
+    sqlite_forward!(list_dataset_alerts(dataset_id: &str) -> Result<Vec<DatasetAlert>, String>);
+    sqlite_forward!(run_dataset_health_checks(dataset_id: &str, now_ms: i64) -> Result<Vec<DatasetHealthResult>, String>);
 }
 
 impl DatasetBackend for PostgresDb {
@@ -149,5 +175,34 @@ impl DatasetBackend for PostgresDb {
         retain_count: i32,
     ) -> Result<(), String> {
         self.set_dataset_version_retention(dataset_id, retain_count)
+    }
+    fn put_dataset_health_check(&self, check: &DatasetHealthCheck) -> Result<(), String> {
+        self.put_dataset_health_check(check)
+    }
+    fn list_dataset_health_checks(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Vec<DatasetHealthCheck>, String> {
+        self.list_dataset_health_checks(dataset_id)
+    }
+    fn list_dataset_health_results(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+    ) -> Result<Vec<DatasetHealthResult>, String> {
+        self.list_dataset_health_results(dataset_id, version_id)
+    }
+    fn dataset_health_state(&self, dataset_id: &str) -> Result<DatasetHealthState, String> {
+        self.dataset_health_state(dataset_id)
+    }
+    fn list_dataset_alerts(&self, dataset_id: &str) -> Result<Vec<DatasetAlert>, String> {
+        self.list_dataset_alerts(dataset_id)
+    }
+    fn run_dataset_health_checks(
+        &self,
+        dataset_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<DatasetHealthResult>, String> {
+        self.run_dataset_health_checks(dataset_id, now_ms)
     }
 }

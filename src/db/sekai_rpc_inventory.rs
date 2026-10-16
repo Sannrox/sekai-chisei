@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 173);
+        assert_eq!(inventory.entries.len(), 178);
         assert!(inventory.entry("PutGovernedTransform").is_some());
         assert!(inventory.entry("ListGovernedTransforms").is_some());
         assert!(inventory.entry("ListGovernedTransformRuns").is_some());
@@ -412,6 +412,11 @@ mod tests {
         assert!(inventory.entry("ListDatasetVersions").is_some());
         assert!(inventory.entry("GetDatasetVersion").is_some());
         assert!(inventory.entry("RollbackDataset").is_some());
+        assert!(inventory.entry("PutDatasetHealthCheck").is_some());
+        assert!(inventory.entry("ListDatasetHealthChecks").is_some());
+        assert!(inventory.entry("ListDatasetHealthResults").is_some());
+        assert!(inventory.entry("RunDatasetHealthChecks").is_some());
+        assert!(inventory.entry("ListDatasetAlerts").is_some());
         assert!(inventory.entry("CompareDefinitionRevisions").is_some());
         assert!(inventory.entry("ReportDefinitionConsumerImpact").is_some());
         assert!(
