@@ -11,8 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ANALYZER_VERSION: &str = "search.text/v1";
-pub const SEARCH_INDEX_UNAVAILABLE: &str =
-    "search index is unavailable on the PostgreSQL community runtime";
+pub const SEARCH_INDEX_UNAVAILABLE: &str = "search index is unavailable on this runtime";
 
 pub const POLICY_ATTRIBUTE_KEYS: &[&str] = &["owner", "acl", "access_marking", "purpose"];
 
@@ -431,6 +430,33 @@ mod tests {
     use crate::domain::{ListFilter, Object};
     use crate::sekai::dataset::{ColumnDef, Dataset};
 
+    fn postgres_runtime() -> (crate::db::postgres::ScratchDatabase, RuntimeDb) {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        (scratch, db)
+    }
+
+    fn seed_team_principal(db: &RuntimeDb, principal: &str) {
+        if db
+            .create_managed_team_credential(principal, "hash", 10)
+            .is_ok()
+        {
+            return;
+        }
+        let RuntimeDb::Postgres(postgres) = db else {
+            panic!("could not seed team principal");
+        };
+        postgres
+            .connection()
+            .expect("postgres connection")
+            .execute(
+                "INSERT INTO sekai_team_principals (principal, created) VALUES ($1, $2)
+                 ON CONFLICT (principal) DO NOTHING",
+                &[&principal, &10i64],
+            )
+            .expect("seed team principal");
+    }
+
     fn object(id: &str, namespace: &str, name: &str, properties: &[(&str, &str)]) -> Object {
         Object {
             id: id.into(),
@@ -505,9 +531,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unicode_object_text_is_searchable() {
-        let db = RuntimeDb::memory();
+    fn exercise_unicode_object_text_is_searchable(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object(
                 "note-munich",
@@ -554,8 +578,18 @@ mod tests {
     }
 
     #[test]
-    fn folded_letters_match_the_same_object_text() {
-        let db = RuntimeDb::memory();
+    fn unicode_object_text_is_searchable() {
+        exercise_unicode_object_text_is_searchable(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_unicode_object_text_is_searchable() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_unicode_object_text_is_searchable(&db);
+    }
+
+    fn exercise_folded_letters_match_the_same_object_text(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object("note-lodz", "acme", "city", &[("body", "office in Łódź")]),
             "editor",
@@ -583,6 +617,18 @@ mod tests {
     }
 
     #[test]
+    fn folded_letters_match_the_same_object_text() {
+        exercise_folded_letters_match_the_same_object_text(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_folded_letters_match_the_same_object_text() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_folded_letters_match_the_same_object_text(&db);
+    }
+
+    #[test]
     fn object_name_field_is_not_overwritten_by_a_name_property() {
         let note = object(
             "note-name",
@@ -598,9 +644,7 @@ mod tests {
         assert!(!properties.values().any(|value| value == "secret-property"));
     }
 
-    #[test]
-    fn deny_unmarked_hides_unmarked_search_candidates() {
-        let db = RuntimeDb::memory();
+    fn exercise_deny_unmarked_hides_unmarked_search_candidates(db: &RuntimeDb) {
         let mut namespace = object("ns-acme", "acme", "acme", &[("deny_unmarked", "true")]);
         namespace.kind = "namespace".into();
         namespace.external_id = "namespace:acme".into();
@@ -642,6 +686,18 @@ mod tests {
             .unwrap();
         assert_eq!(trusted.len(), 1);
         assert_eq!(trusted[0].id, "note-bare");
+    }
+
+    #[test]
+    fn deny_unmarked_hides_unmarked_search_candidates() {
+        exercise_deny_unmarked_hides_unmarked_search_candidates(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_deny_unmarked_hides_unmarked_search_candidates() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_deny_unmarked_hides_unmarked_search_candidates(&db);
     }
 
     #[test]
@@ -761,9 +817,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn object_edit_is_indexed_once_the_cursor_passes_it() {
-        let db = RuntimeDb::memory();
+    fn exercise_object_edit_is_indexed_once_the_cursor_passes_it(db: &RuntimeDb) {
         let note = object(
             "note-1",
             "acme",
@@ -800,8 +854,18 @@ mod tests {
     }
 
     #[test]
-    fn policy_attribute_edit_updates_stored_attributes() {
-        let db = RuntimeDb::memory();
+    fn object_edit_is_indexed_once_the_cursor_passes_it() {
+        exercise_object_edit_is_indexed_once_the_cursor_passes_it(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_object_edit_is_indexed_once_the_cursor_passes_it() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_object_edit_is_indexed_once_the_cursor_passes_it(&db);
+    }
+
+    fn exercise_policy_attribute_edit_updates_stored_attributes(db: &RuntimeDb) {
         let mut note = object(
             "note-2",
             "acme",
@@ -830,8 +894,18 @@ mod tests {
     }
 
     #[test]
-    fn owner_only_edit_updates_stored_policy_attributes() {
-        let db = RuntimeDb::memory();
+    fn policy_attribute_edit_updates_stored_attributes() {
+        exercise_policy_attribute_edit_updates_stored_attributes(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_policy_attribute_edit_updates_stored_attributes() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_policy_attribute_edit_updates_stored_attributes(&db);
+    }
+
+    fn exercise_owner_only_edit_updates_stored_policy_attributes(db: &RuntimeDb) {
         let mut note = object(
             "note-owner",
             "acme",
@@ -853,8 +927,18 @@ mod tests {
     }
 
     #[test]
-    fn generation_gap_rebuilds_and_matches_incremental_contents() {
-        let db = RuntimeDb::memory();
+    fn owner_only_edit_updates_stored_policy_attributes() {
+        exercise_owner_only_edit_updates_stored_policy_attributes(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_owner_only_edit_updates_stored_policy_attributes() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_owner_only_edit_updates_stored_policy_attributes(&db);
+    }
+
+    fn exercise_generation_gap_rebuilds_and_matches_incremental_contents(db: &RuntimeDb) {
         let first = object("note-3", "acme", "gamma", &[("body", "left join")]);
         db.create_object_with_audit(&first, "editor").unwrap();
         db.catch_up_search_namespace("acme", 10).unwrap();
@@ -877,8 +961,18 @@ mod tests {
     }
 
     #[test]
-    fn generation_gap_rebuilds_even_when_newer_changes_remain() {
-        let db = RuntimeDb::memory();
+    fn generation_gap_rebuilds_and_matches_incremental_contents() {
+        exercise_generation_gap_rebuilds_and_matches_incremental_contents(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_generation_gap_rebuilds_and_matches_incremental_contents() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_generation_gap_rebuilds_and_matches_incremental_contents(&db);
+    }
+
+    fn exercise_generation_gap_rebuilds_even_when_newer_changes_remain(db: &RuntimeDb) {
         let mut first = object("note-stale", "acme", "alpha", &[("body", "old token")]);
         db.create_object_with_audit(&first, "editor").unwrap();
         db.catch_up_search_namespace("acme", 10).unwrap();
@@ -918,8 +1012,18 @@ mod tests {
     }
 
     #[test]
-    fn repeated_edits_to_one_object_stay_incremental() {
-        let db = RuntimeDb::memory();
+    fn generation_gap_rebuilds_even_when_newer_changes_remain() {
+        exercise_generation_gap_rebuilds_even_when_newer_changes_remain(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_generation_gap_rebuilds_even_when_newer_changes_remain() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_generation_gap_rebuilds_even_when_newer_changes_remain(&db);
+    }
+
+    fn exercise_repeated_edits_to_one_object_stay_incremental(db: &RuntimeDb) {
         let mut note = object("note-repeat", "acme", "alpha", &[("body", "first")]);
         db.create_object_with_audit(&note, "editor").unwrap();
         db.catch_up_search_namespace("acme", 10).unwrap();
@@ -950,8 +1054,18 @@ mod tests {
     }
 
     #[test]
-    fn property_names_are_not_full_text_matches() {
-        let db = RuntimeDb::memory();
+    fn repeated_edits_to_one_object_stay_incremental() {
+        exercise_repeated_edits_to_one_object_stay_incremental(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_repeated_edits_to_one_object_stay_incremental() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_repeated_edits_to_one_object_stay_incremental(&db);
+    }
+
+    fn exercise_property_names_are_not_full_text_matches(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object("note-meta", "acme", "alpha", &[("body", "visible token")]),
             "editor",
@@ -976,8 +1090,18 @@ mod tests {
     }
 
     #[test]
-    fn dataset_catalog_change_updates_metadata_entries() {
-        let db = RuntimeDb::memory();
+    fn property_names_are_not_full_text_matches() {
+        exercise_property_names_are_not_full_text_matches(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_property_names_are_not_full_text_matches() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_property_names_are_not_full_text_matches(&db);
+    }
+
+    fn exercise_dataset_catalog_change_updates_metadata_entries(db: &RuntimeDb) {
         let bound = object("dataset-owner", "acme", "owner", &[]);
         db.create_object_with_audit(&bound, "editor").unwrap();
         let mut sales = dataset(
@@ -1019,8 +1143,18 @@ mod tests {
     }
 
     #[test]
-    fn restricted_bound_object_hides_dataset_candidates() {
-        let db = RuntimeDb::memory();
+    fn dataset_catalog_change_updates_metadata_entries() {
+        exercise_dataset_catalog_change_updates_metadata_entries(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_dataset_catalog_change_updates_metadata_entries() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_dataset_catalog_change_updates_metadata_entries(&db);
+    }
+
+    fn exercise_restricted_bound_object_hides_dataset_candidates(db: &RuntimeDb) {
         let bound = object(
             "secret-owner",
             "acme",
@@ -1070,8 +1204,18 @@ mod tests {
     }
 
     #[test]
-    fn dataset_purpose_filter_hides_mismatched_bound_objects() {
-        let db = RuntimeDb::memory();
+    fn restricted_bound_object_hides_dataset_candidates() {
+        exercise_restricted_bound_object_hides_dataset_candidates(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_restricted_bound_object_hides_dataset_candidates() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_restricted_bound_object_hides_dataset_candidates(&db);
+    }
+
+    fn exercise_dataset_purpose_filter_hides_mismatched_bound_objects(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object("finance-owner", "acme", "owner", &[("purpose", "finance")]),
             "editor",
@@ -1121,8 +1265,18 @@ mod tests {
     }
 
     #[test]
-    fn object_grants_filter_search_candidates() {
-        let db = RuntimeDb::memory();
+    fn dataset_purpose_filter_hides_mismatched_bound_objects() {
+        exercise_dataset_purpose_filter_hides_mismatched_bound_objects(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_dataset_purpose_filter_hides_mismatched_bound_objects() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_dataset_purpose_filter_hides_mismatched_bound_objects(&db);
+    }
+
+    fn exercise_object_grants_filter_search_candidates(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object("note-grant", "acme", "shared", &[("body", "visible token")]),
             "editor",
@@ -1171,8 +1325,18 @@ mod tests {
     }
 
     #[test]
-    fn compiled_object_security_policy_filters_candidates() {
-        let db = RuntimeDb::memory();
+    fn object_grants_filter_search_candidates() {
+        exercise_object_grants_filter_search_candidates(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_object_grants_filter_search_candidates() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_object_grants_filter_search_candidates(&db);
+    }
+
+    fn exercise_compiled_object_security_policy_filters_candidates(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object(
                 "note-owned",
@@ -1245,8 +1409,18 @@ mod tests {
     }
 
     #[test]
-    fn live_object_permissions_override_stale_index_attributes() {
-        let db = RuntimeDb::memory();
+    fn compiled_object_security_policy_filters_candidates() {
+        exercise_compiled_object_security_policy_filters_candidates(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_compiled_object_security_policy_filters_candidates() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_compiled_object_security_policy_filters_candidates(&db);
+    }
+
+    fn exercise_live_object_permissions_override_stale_index_attributes(db: &RuntimeDb) {
         let mut note = object(
             "note-live",
             "acme",
@@ -1278,8 +1452,18 @@ mod tests {
     }
 
     #[test]
-    fn value_instance_grants_hide_denied_search_matches() {
-        let db = RuntimeDb::memory();
+    fn live_object_permissions_override_stale_index_attributes() {
+        exercise_live_object_permissions_override_stale_index_attributes(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_live_object_permissions_override_stale_index_attributes() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_live_object_permissions_override_stale_index_attributes(&db);
+    }
+
+    fn exercise_value_instance_grants_hide_denied_search_matches(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object("note-value", "acme", "alpha", &[("body", "secret token")]),
             "editor",
@@ -1336,8 +1520,18 @@ mod tests {
     }
 
     #[test]
-    fn dataset_candidates_honor_kind_filter() {
-        let db = RuntimeDb::memory();
+    fn value_instance_grants_hide_denied_search_matches() {
+        exercise_value_instance_grants_hide_denied_search_matches(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_value_instance_grants_hide_denied_search_matches() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_value_instance_grants_hide_denied_search_matches(&db);
+    }
+
+    fn exercise_dataset_candidates_honor_kind_filter(db: &RuntimeDb) {
         db.create_object_with_audit(&object("owner", "acme", "owner", &[]), "editor")
             .unwrap();
         db.create_dataset(&dataset("ds-kind", "ledger", "owner", &[("id", "public")]))
@@ -1377,8 +1571,18 @@ mod tests {
     }
 
     #[test]
-    fn unbound_dataset_is_searchable_after_catalog_catch_up() {
-        let db = RuntimeDb::memory();
+    fn dataset_candidates_honor_kind_filter() {
+        exercise_dataset_candidates_honor_kind_filter(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_dataset_candidates_honor_kind_filter() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_dataset_candidates_honor_kind_filter(&db);
+    }
+
+    fn exercise_unbound_dataset_is_searchable_after_catalog_catch_up(db: &RuntimeDb) {
         db.create_dataset(&dataset(
             "ds-global",
             "shared-catalog",
@@ -1405,10 +1609,19 @@ mod tests {
     }
 
     #[test]
-    fn team_principals_cannot_search_unbound_global_datasets() {
-        let db = RuntimeDb::memory();
-        db.create_managed_team_credential("team-agent", "hash", 10)
-            .unwrap();
+    fn unbound_dataset_is_searchable_after_catalog_catch_up() {
+        exercise_unbound_dataset_is_searchable_after_catalog_catch_up(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_unbound_dataset_is_searchable_after_catalog_catch_up() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_unbound_dataset_is_searchable_after_catalog_catch_up(&db);
+    }
+
+    fn exercise_team_principals_cannot_search_unbound_global_datasets(db: &RuntimeDb) {
+        seed_team_principal(db, "team-agent");
         db.create_dataset(&dataset(
             "ds-global",
             "world catalog",
@@ -1451,8 +1664,18 @@ mod tests {
     }
 
     #[test]
-    fn required_purpose_needs_a_verified_authorization_decision() {
-        let db = RuntimeDb::memory();
+    fn team_principals_cannot_search_unbound_global_datasets() {
+        exercise_team_principals_cannot_search_unbound_global_datasets(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_team_principals_cannot_search_unbound_global_datasets() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_team_principals_cannot_search_unbound_global_datasets(&db);
+    }
+
+    fn exercise_required_purpose_needs_a_verified_authorization_decision(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object(
                 "note-purpose",
@@ -1525,8 +1748,18 @@ mod tests {
     }
 
     #[test]
-    fn live_dataset_binding_overrides_stale_index() {
-        let db = RuntimeDb::memory();
+    fn required_purpose_needs_a_verified_authorization_decision() {
+        exercise_required_purpose_needs_a_verified_authorization_decision(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_required_purpose_needs_a_verified_authorization_decision() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_required_purpose_needs_a_verified_authorization_decision(&db);
+    }
+
+    fn exercise_live_dataset_binding_overrides_stale_index(db: &RuntimeDb) {
         let mut owner = object(
             "open-owner",
             "acme",
@@ -1565,8 +1798,18 @@ mod tests {
     }
 
     #[test]
-    fn hidden_property_does_not_produce_a_candidate() {
-        let db = RuntimeDb::memory();
+    fn live_dataset_binding_overrides_stale_index() {
+        exercise_live_dataset_binding_overrides_stale_index(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_live_dataset_binding_overrides_stale_index() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_live_dataset_binding_overrides_stale_index(&db);
+    }
+
+    fn exercise_hidden_property_does_not_produce_a_candidate(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object(
                 "note-hidden",
@@ -1611,8 +1854,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_compiled_property_projection_fails_closed() {
-        let db = RuntimeDb::memory();
+    fn hidden_property_does_not_produce_a_candidate() {
+        exercise_hidden_property_does_not_produce_a_candidate(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_hidden_property_does_not_produce_a_candidate() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_hidden_property_does_not_produce_a_candidate(&db);
+    }
+
+    fn exercise_empty_compiled_property_projection_fails_closed(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object(
                 "note-proj",
@@ -1656,8 +1909,18 @@ mod tests {
     }
 
     #[test]
-    fn lag_gauge_moves_with_unindexed_backlog() {
-        let db = RuntimeDb::memory();
+    fn empty_compiled_property_projection_fails_closed() {
+        exercise_empty_compiled_property_projection_fails_closed(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_empty_compiled_property_projection_fails_closed() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_empty_compiled_property_projection_fails_closed(&db);
+    }
+
+    fn exercise_lag_gauge_moves_with_unindexed_backlog(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object("note-lag", "acme", "lag", &[("body", "pending")]),
             "editor",
@@ -1679,8 +1942,18 @@ mod tests {
     }
 
     #[test]
-    fn list_filter_keeps_namespace_isolation() {
-        let db = RuntimeDb::memory();
+    fn lag_gauge_moves_with_unindexed_backlog() {
+        exercise_lag_gauge_moves_with_unindexed_backlog(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_lag_gauge_moves_with_unindexed_backlog() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_lag_gauge_moves_with_unindexed_backlog(&db);
+    }
+
+    fn exercise_list_filter_keeps_namespace_isolation(db: &RuntimeDb) {
         db.create_object_with_audit(
             &object("note-a", "acme", "alpha", &[("body", "shared token")]),
             "editor",
@@ -1733,5 +2006,17 @@ mod tests {
             })
             .unwrap();
         assert!(listed.iter().all(|object| object.namespace == "acme"));
+    }
+
+    #[test]
+    fn list_filter_keeps_namespace_isolation() {
+        exercise_list_filter_keeps_namespace_isolation(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_list_filter_keeps_namespace_isolation() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_list_filter_keeps_namespace_isolation(&db);
     }
 }

@@ -115,6 +115,7 @@ mod postgres_portfolio;
 mod postgres_retention;
 mod postgres_routing_profile;
 mod postgres_schema;
+mod postgres_search_index;
 mod postgres_service_principal;
 mod postgres_source_registry;
 mod postgres_team_namespace;

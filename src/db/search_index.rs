@@ -10,13 +10,13 @@ use crate::sekai::markings::{
     unmarked_access_decision,
 };
 use crate::sekai::search_index::{
-    ANALYZER_VERSION, SEARCH_INDEX_UNAVAILABLE, SearchCandidate, SearchCandidateQuery,
-    SearchCatchUpReport, SearchDatasetDump, SearchDocument, SearchDocumentKey, SearchIndex,
-    SearchIndexDump, SearchIndexError, SearchIndexStatus, SearchObjectDump, SearchQueryMode,
-    SearchRebuildReport, SearchSourceKind, acl_allows, dataset_catalog_digest,
-    dataset_classification_allows, dataset_content_digest, fts_query, indexed_search_text,
-    live_object_match_fields, object_content_digest, object_text_properties, policy_attributes,
-    purpose_allows, text_matches_query,
+    ANALYZER_VERSION, SearchCandidate, SearchCandidateQuery, SearchCatchUpReport,
+    SearchDatasetDump, SearchDocument, SearchDocumentKey, SearchIndex, SearchIndexDump,
+    SearchIndexError, SearchIndexStatus, SearchObjectDump, SearchQueryMode, SearchRebuildReport,
+    SearchSourceKind, acl_allows, dataset_catalog_digest, dataset_classification_allows,
+    dataset_content_digest, fts_query, indexed_search_text, live_object_match_fields,
+    object_content_digest, object_text_properties, policy_attributes, purpose_allows,
+    text_matches_query,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1451,24 +1451,18 @@ impl SearchIndex for SekaiDb {
     }
 }
 
-fn unavailable<T>() -> Result<T, SearchIndexError> {
-    Err(SearchIndexError::Unavailable(
-        SEARCH_INDEX_UNAVAILABLE.into(),
-    ))
-}
-
 impl SearchIndex for RuntimeDb {
     fn index(&self, document: &SearchDocument, now_ms: i64) -> Result<(), SearchIndexError> {
         match self {
             Self::Sqlite(db) => db.index(document, now_ms),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.index(document, now_ms)),
         }
     }
 
     fn delete(&self, key: &SearchDocumentKey) -> Result<(), SearchIndexError> {
         match self {
             Self::Sqlite(db) => db.delete(key),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.delete(key)),
         }
     }
 
@@ -1478,7 +1472,7 @@ impl SearchIndex for RuntimeDb {
     ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
         match self {
             Self::Sqlite(db) => db.query_candidates(query),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.query_candidates(query)),
         }
     }
 
@@ -1489,14 +1483,16 @@ impl SearchIndex for RuntimeDb {
     ) -> Result<SearchRebuildReport, SearchIndexError> {
         match self {
             Self::Sqlite(db) => db.rebuild_namespace(namespace, now_ms),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.rebuild_namespace(namespace, now_ms))
+            }
         }
     }
 
     fn status(&self, namespace: &str, now_ms: i64) -> Result<SearchIndexStatus, SearchIndexError> {
         match self {
             Self::Sqlite(db) => db.status(namespace, now_ms),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.status(namespace, now_ms)),
         }
     }
 }
@@ -1525,7 +1521,9 @@ impl SearchIndexStore for RuntimeDb {
     ) -> Result<SearchCatchUpReport, SearchIndexError> {
         match self {
             Self::Sqlite(db) => db.catch_up_search_namespace(namespace, now_ms),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.catch_up_search_namespace(namespace, now_ms))
+            }
         }
     }
 
@@ -1534,7 +1532,10 @@ impl SearchIndexStore for RuntimeDb {
             Self::Sqlite(db) => db
                 .search_index_dump(namespace)
                 .map_err(SearchIndexError::from),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.search_index_dump(namespace)
+                    .map_err(SearchIndexError::from)
+            }),
         }
     }
 
@@ -1544,7 +1545,10 @@ impl SearchIndexStore for RuntimeDb {
             Self::Sqlite(db) => db
                 .purge_object_changes_for_test()
                 .map_err(SearchIndexError::from),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.purge_object_changes_for_test()
+                    .map_err(SearchIndexError::from)
+            }),
         }
     }
 
@@ -1557,7 +1561,10 @@ impl SearchIndexStore for RuntimeDb {
             Self::Sqlite(db) => db
                 .purge_object_changes_for_object_for_test(object_id)
                 .map_err(SearchIndexError::from),
-            Self::Postgres(_) => unavailable(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.purge_object_changes_for_object_for_test(object_id)
+                    .map_err(SearchIndexError::from)
+            }),
         }
     }
 }
