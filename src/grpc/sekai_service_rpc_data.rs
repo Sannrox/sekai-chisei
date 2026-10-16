@@ -1909,12 +1909,23 @@ pub(super) async fn get_governed_transform_run(
 ) -> Result<Response<GetGovernedTransformRunResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let run = service
         .db
         .runtime()
         .get_governed_transform_run(&req.into_inner().run_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("not found"))?;
+    // Another tenant's run reads as missing, not as denied.
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &run.namespace,
+            false,
+        )
+        .map_err(|_| Status::not_found("not found"))?;
+    }
     check_team_namespace(service.db.runtime(), &principals, &run.namespace, false)?;
     let reveal = caller_can_read_run_datasets(service, &principals, &run);
     Ok(Response::new(GetGovernedTransformRunResponse {
@@ -1927,7 +1938,11 @@ pub(super) async fn list_governed_transforms(
 ) -> Result<Response<ListGovernedTransformsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let namespace = req.into_inner().namespace;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(service.db.runtime(), Some(context), &namespace, false)?;
+    }
     check_team_namespace(service.db.runtime(), &principals, &namespace, false)?;
     let transforms = service
         .db
@@ -1945,7 +1960,16 @@ pub(super) async fn list_governed_transform_runs(
 ) -> Result<Response<ListGovernedTransformRunsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &input.namespace,
+            false,
+        )?;
+    }
     check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
     let limit = if input.limit <= 0 {
         50

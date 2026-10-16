@@ -14515,6 +14515,271 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
 }
 
 #[tokio::test]
+async fn scoped_transform_preview_and_reads_cross_server_transport() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{ANALYTICAL_CLASS, CONTRACT_VERSION};
+    use tower::Layer;
+    let sqlite = Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    );
+    let runtime = Arc::new(RuntimeDb::Sqlite(sqlite));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(runtime.clone());
+    for id in ["scoped-in", "scoped-out"] {
+        runtime
+            .create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+    }
+    runtime
+        .append_rows("scoped-in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    // A run in a namespace the tenant cannot read.
+    let foreign_transform = crate::sekai::governed_transform::GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "foreign".into(),
+        transform_id: "foreign-t".into(),
+        input_dataset_id: "scoped-in".into(),
+        output_dataset_id: "scoped-out".into(),
+        steps: vec![crate::sekai::governed_transform::TransformStep {
+            kind: "project".into(),
+            column: String::new(),
+            op: String::new(),
+            value: String::new(),
+            columns: vec!["id".into()],
+        }],
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: None,
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .unwrap();
+    runtime
+        .put_governed_transform(&foreign_transform, 10)
+        .unwrap();
+    let foreign_run = runtime
+        .run_governed_transform("foreign", "foreign-t", false, 20)
+        .unwrap()
+        .run_id;
+    let authority = Arc::new(AssertionAuthority::new(
+        "https://issuer.test",
+        "https://sekai.test",
+        b"synthetic-transform-test-key",
+    ));
+    let interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store.clone(),
+        Some(authority.clone()),
+    );
+    let service = crate::grpc::rpc_identity::RpcIdentityService::new(
+        tonic::service::interceptor::InterceptedService::new(
+            crate::rpc_maturity::RpcMaturityLayer::new(true).layer(
+                crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer::new(
+                    SekaiServiceImpl::new(store),
+                ),
+            ),
+            interceptor,
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let mut client =
+        crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    /// A tenant session with `scopes`.
+    fn scoped<T>(authority: &AssertionAuthority, scopes: &[&str], body: T) -> Request<T> {
+        let claims = IdentityAssertion {
+            contract_version: IDENTITY_ASSERTION_VERSION.into(),
+            issuer: "https://issuer.test".into(),
+            audience: "https://sekai.test".into(),
+            subject: "subject-a".into(),
+            credential_id: "credential-a".into(),
+            credential_kind: "human_session".into(),
+            space: None,
+            space_role: None,
+            act: None,
+            tenant_id: Some("tenant-test".into()),
+            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            expires_at: chrono::Utc::now().timestamp() + 30,
+            nonce: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut request = Request::new(body);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", authority.sign(&claims).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        request
+    }
+    // Every admitted RPC here is a read; a read-only session suffices.
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "allowed".into(),
+        transform_id: "scoped-preview".into(),
+        input_dataset_id: "scoped-in".into(),
+        output_dataset_id: "scoped-out".into(),
+        profile: ANALYTICAL_CLASS.into(),
+        sql: "SELECT id FROM input".into(),
+        ..GovernedTransform::default()
+    };
+    let preview = client
+        .preview_governed_transform(scoped(
+            &authority,
+            &["sekai.read"],
+            PreviewGovernedTransformRequest {
+                transform: Some(transform.clone()),
+                row_cap: 0,
+                preview_id: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(preview.inputs[0].rows_read, 1, "{}", preview.error);
+    assert_eq!(preview.rows.len(), 1);
+    let listed = client
+        .list_governed_transforms(scoped(
+            &authority,
+            &["sekai.read"],
+            ListGovernedTransformsRequest {
+                namespace: "allowed".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        listed.transforms.is_empty(),
+        "preview never puts a definition"
+    );
+    let runs = client
+        .list_governed_transform_runs(scoped(
+            &authority,
+            &["sekai.read"],
+            ListGovernedTransformRunsRequest {
+                namespace: "allowed".into(),
+                limit: 10,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(runs.runs.is_empty(), "preview never records a run");
+    // Admitted past the interceptor; a preview identity is not a run.
+    let run = client
+        .get_governed_transform_run(scoped(
+            &authority,
+            &["sekai.read"],
+            GetGovernedTransformRunRequest {
+                run_id: preview.preview_id,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(run.code(), tonic::Code::NotFound);
+    // Another tenant's namespace is refused for every admitted read.
+    let foreign_list = client
+        .list_governed_transforms(scoped(
+            &authority,
+            &["sekai.read"],
+            ListGovernedTransformsRequest {
+                namespace: "foreign".into(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign_list.code(), tonic::Code::PermissionDenied);
+    let foreign_runs = client
+        .list_governed_transform_runs(scoped(
+            &authority,
+            &["sekai.read"],
+            ListGovernedTransformRunsRequest {
+                namespace: "foreign".into(),
+                limit: 10,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign_runs.code(), tonic::Code::PermissionDenied);
+    let hidden_run = client
+        .get_governed_transform_run(scoped(
+            &authority,
+            &["sekai.read"],
+            GetGovernedTransformRunRequest {
+                run_id: foreign_run,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(hidden_run.code(), tonic::Code::NotFound, "{hidden_run:?}");
+    let mut foreign = transform.clone();
+    foreign.namespace = "foreign".into();
+    let foreign = client
+        .preview_governed_transform(scoped(
+            &authority,
+            &["sekai.read"],
+            PreviewGovernedTransformRequest {
+                transform: Some(foreign),
+                row_cap: 0,
+                preview_id: String::new(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    let put = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(transform),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (put.code(), put.message()),
+        (
+            tonic::Code::PermissionDenied,
+            "RPC is not available to enterprise-scoped credentials"
+        )
+    );
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn legacy_pipeline_round_trips_through_create_and_list() {
     use prost::Message;
     let svc = service();
