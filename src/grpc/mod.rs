@@ -670,6 +670,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetDefinitionBranch"
             | "CreateDefinitionBranch"
             | "ApplyDefinitionBranchEdit"
+            | "GetDefinitionProposal"
+            | "CreateDefinitionProposal"
+            | "ApproveDefinitionProposal"
+            | "MergeDefinitionProposal"
             | "GetGovernedFactVersion"
             | "ResolveInvariantSet"
             | "SubmitActionInstance"
@@ -2165,13 +2169,21 @@ mod tests {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
         }
+        // ADR 0111: proposals publish drafts under the same grants and the
+        // ADR 0079 certification gate; close stays unadmitted.
         for method in [
+            "GetDefinitionProposal",
             "CreateDefinitionProposal",
             "ApproveDefinitionProposal",
             "MergeDefinitionProposal",
         ] {
-            assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
+            assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
+            assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
         }
+        assert!(!enterprise_namespace_rpc(
+            "sekai.SekaiService",
+            "CloseDefinitionProposal"
+        ));
     }
 
     #[test]

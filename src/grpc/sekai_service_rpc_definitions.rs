@@ -591,6 +591,19 @@ pub(super) async fn get_definition_proposal(
         proposal: Some(to_proto_definition_proposal(&proposal)),
     }))
 }
+/// Approving, merging, or closing discloses both revisions, so the caller
+/// must read them as creation and retrieval require (ADR 0111).
+fn authorize_proposal_revision_reads(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    proposal: &definition_proposal_domain::DefinitionProposal,
+) -> Result<(), Status> {
+    for digest in [&proposal.base_digest, &proposal.candidate_digest] {
+        authorize_definition_revision(service, principals, &proposal.namespace, digest, false)?;
+    }
+    Ok(())
+}
+
 pub(super) async fn approve_definition_proposal(
     service: &SekaiServiceImpl,
     req: Request<ApproveDefinitionProposalRequest>,
@@ -618,6 +631,7 @@ pub(super) async fn approve_definition_proposal(
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    authorize_proposal_revision_reads(service, &principals, &proposal)?;
     authorize_proposal_member_writes(
         service,
         &principals,
@@ -669,6 +683,7 @@ pub(super) async fn merge_definition_proposal(
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    authorize_proposal_revision_reads(service, &principals, &proposal)?;
     authorize_proposal_member_writes(
         service,
         &principals,
@@ -747,6 +762,7 @@ pub(super) async fn close_definition_proposal(
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    authorize_proposal_revision_reads(service, &principals, &proposal)?;
     authorize_proposal_member_writes(
         service,
         &principals,
