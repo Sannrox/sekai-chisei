@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use native_tls::Certificate;
@@ -143,6 +144,7 @@ const CHISEI_USAGE_EVENTS_SCHEMA: &str = include_str!("postgres/0077_chisei_usag
 const TRANSFORM_USAGE_PENDING_SCHEMA: &str =
     include_str!("postgres/0078_transform_usage_pending.sql");
 const DATASET_HEALTH_CHECKS_SCHEMA: &str = include_str!("postgres/0079_dataset_health_checks.sql");
+const SEARCH_INDEX_SCHEMA: &str = include_str!("postgres/0080_search_index.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -654,6 +656,12 @@ const MIGRATIONS: &[Migration] = &[
         DATASET_HEALTH_CHECKS_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        79,
+        "search_index",
+        SEARCH_INDEX_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -719,6 +727,7 @@ pub struct PostgresDb {
     pool: Pool<Manager>,
     plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
     schema_plane: SchemaPlane,
+    pub(crate) search_maintenance: Mutex<()>,
 }
 
 impl std::fmt::Debug for PostgresDb {
@@ -820,6 +829,7 @@ impl PostgresDb {
             pool,
             plane: std::sync::OnceLock::new(),
             schema_plane,
+            search_maintenance: Mutex::new(()),
         };
         db.migrate()?;
         crate::db::schema_plane::reject_populated_foreign_postgres(&db, schema_plane)?;
