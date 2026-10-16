@@ -99,6 +99,7 @@ pub mod retention;
 pub mod retrieval;
 pub mod risk_class;
 pub mod schema;
+pub mod search_index;
 pub mod security;
 pub mod semantic;
 pub mod sentinel;

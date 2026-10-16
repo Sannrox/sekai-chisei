@@ -6,6 +6,7 @@ use std::time::Duration;
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 static DB_LOCK_POISONED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SEARCH_INDEX_LAG_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Install the Prometheus recorder using the running binary's package version.
 pub fn handle(pkg_version: &'static str) -> &'static PrometheusHandle {
@@ -22,6 +23,10 @@ pub fn handle(pkg_version: &'static str) -> &'static PrometheusHandle {
         describe_counter!(
             "db_lock_poisoned_total",
             "Database connection mutex poison recoveries"
+        );
+        describe_gauge!(
+            "sekai_search_index_lag_ms",
+            "Maximum search index lag across namespaces"
         );
         crate::signals::describe_all();
         gauge!(
@@ -42,6 +47,15 @@ pub fn record_db_lock_poisoned() {
 
 pub fn db_lock_poisoned_total() -> u64 {
     DB_LOCK_POISONED_TOTAL.load(Ordering::Relaxed)
+}
+
+pub fn set_search_index_lag_ms(lag_ms: u64) {
+    SEARCH_INDEX_LAG_MS.store(lag_ms, Ordering::Relaxed);
+    gauge!("sekai_search_index_lag_ms").set(lag_ms as f64);
+}
+
+pub fn search_index_lag_ms() -> u64 {
+    SEARCH_INDEX_LAG_MS.load(Ordering::Relaxed)
 }
 
 pub fn spawn_upkeep_task(pkg_version: &'static str) {

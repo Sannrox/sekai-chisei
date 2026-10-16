@@ -92,9 +92,25 @@ fn classify_table(name: &str) -> TableClass {
             TableClass::Shared
         }
         name if name.starts_with("chisei_") => TableClass::Chisei,
+        name if is_fts5_shadow_table(name) => TableClass::Infrastructure,
         name if name.starts_with("sekai_") => TableClass::Sekai,
         _ => TableClass::Unknown,
     }
+}
+
+/// SQLite FTS5 shadow tables (`*_fts_config` and siblings) are schema
+/// machinery. The config row is inserted by CREATE VIRTUAL TABLE, not by
+/// operator data, so a Chisei-only open of a dual-schema file must ignore them.
+fn is_fts5_shadow_table(name: &str) -> bool {
+    [
+        "_fts_config",
+        "_fts_data",
+        "_fts_idx",
+        "_fts_docsize",
+        "_fts_content",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
 }
 
 fn plane_owns(plane: SchemaPlane, class: TableClass) -> bool {
@@ -321,6 +337,14 @@ mod tests {
         );
         assert_eq!(
             classify_table("sekai_action_effect_migrations"),
+            TableClass::Infrastructure
+        );
+        assert_eq!(
+            classify_table("sekai_search_dataset_fts_config"),
+            TableClass::Infrastructure
+        );
+        assert_eq!(
+            classify_table("sekai_search_object_fts_data"),
             TableClass::Infrastructure
         );
     }
