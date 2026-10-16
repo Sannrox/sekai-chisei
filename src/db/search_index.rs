@@ -1,6 +1,6 @@
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
-use crate::domain::{ListFilter, MAX_LIST_LIMIT, Object};
+use crate::domain::Object;
 use crate::sekai::classification_lattice::{ClassificationLattice, evaluate_lattice_access};
 use crate::sekai::dataset::Dataset;
 use crate::sekai::markings::{
@@ -751,23 +751,25 @@ impl SekaiDb {
     }
 
     fn list_namespace_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
+        let ids = {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare("SELECT id FROM sekai_objects WHERE namespace = ?1 ORDER BY id")
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![namespace], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
         let mut objects = Vec::new();
-        let mut offset = 0;
-        loop {
-            let page = self.list_objects(&ListFilter {
-                namespace: Some(namespace.into()),
-                limit: MAX_LIST_LIMIT,
-                offset,
-                ..ListFilter::default()
-            })?;
-            let count = page.len() as i32;
-            objects.extend(page);
-            if count < MAX_LIST_LIMIT {
-                break;
+        for id in ids {
+            if let Some(object) = self.get_object(&id)?
+                && object.namespace == namespace
+            {
+                objects.push(object);
             }
-            offset += count;
         }
-        objects.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(objects)
     }
 
