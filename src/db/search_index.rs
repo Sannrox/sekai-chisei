@@ -14,9 +14,9 @@ use crate::sekai::search_index::{
     SearchCatchUpReport, SearchDatasetDump, SearchDocument, SearchDocumentKey, SearchIndex,
     SearchIndexDump, SearchIndexError, SearchIndexStatus, SearchObjectDump, SearchQueryMode,
     SearchRebuildReport, SearchSourceKind, acl_allows, dataset_catalog_digest,
-    dataset_classification_allows, dataset_content_digest, fts_query, live_object_match_fields,
-    object_content_digest, object_text_properties, policy_attributes, purpose_allows,
-    text_matches_query,
+    dataset_classification_allows, dataset_content_digest, fts_query, indexed_search_text,
+    live_object_match_fields, object_content_digest, object_text_properties, policy_attributes,
+    purpose_allows, text_matches_query,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -408,7 +408,7 @@ impl SekaiDb {
                 .map_err(|error| error.to_string())?;
             conn.execute(
                 "INSERT INTO sekai_search_object_fts(rowid, property, text) VALUES (?1, ?2, ?3)",
-                params![id, property, text],
+                params![id, property, indexed_search_text(text)],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -442,7 +442,7 @@ impl SekaiDb {
             conn.execute(
                 "INSERT INTO sekai_search_object_fts(sekai_search_object_fts, rowid, property, text)
                  VALUES('delete', ?1, ?2, ?3)",
-                params![id, property, text],
+                params![id, property, indexed_search_text(&text)],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -481,7 +481,7 @@ impl SekaiDb {
                 .map_err(|error| error.to_string())?;
             conn.execute(
                 "INSERT INTO sekai_search_dataset_fts(rowid, field, text) VALUES (?1, ?2, ?3)",
-                params![id, field, text],
+                params![id, field, indexed_search_text(&text)],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -515,7 +515,7 @@ impl SekaiDb {
             conn.execute(
                 "INSERT INTO sekai_search_dataset_fts(sekai_search_dataset_fts, rowid, field, text)
                  VALUES('delete', ?1, ?2, ?3)",
-                params![id, field, text],
+                params![id, field, indexed_search_text(&text)],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -1007,6 +1007,7 @@ impl SekaiDb {
                 "namespace required".into(),
             ));
         }
+        let _guard = self.lock_search_maintenance()?;
         let checkpoint = self.search_checkpoint(namespace)?;
         let after = checkpoint
             .as_ref()
@@ -1394,8 +1395,17 @@ impl SekaiDb {
     }
 }
 
+impl SekaiDb {
+    fn lock_search_maintenance(&self) -> Result<std::sync::MutexGuard<'_, ()>, SearchIndexError> {
+        self.search_maintenance.lock().map_err(|_| {
+            SearchIndexError::Unavailable("search maintenance lock was poisoned".into())
+        })
+    }
+}
+
 impl SearchIndex for SekaiDb {
     fn index(&self, document: &SearchDocument, now_ms: i64) -> Result<(), SearchIndexError> {
+        let _guard = self.lock_search_maintenance()?;
         match document {
             SearchDocument::Object(object) => self.index_object_document(object, now_ms),
             SearchDocument::Dataset { namespace, dataset } => {
@@ -1405,6 +1415,7 @@ impl SearchIndex for SekaiDb {
     }
 
     fn delete(&self, key: &SearchDocumentKey) -> Result<(), SearchIndexError> {
+        let _guard = self.lock_search_maintenance()?;
         match key {
             SearchDocumentKey::Object {
                 namespace,
@@ -1429,6 +1440,7 @@ impl SearchIndex for SekaiDb {
         namespace: &str,
         now_ms: i64,
     ) -> Result<SearchRebuildReport, SearchIndexError> {
+        let _guard = self.lock_search_maintenance()?;
         self.rebuild_search_namespace(namespace, now_ms)
     }
 

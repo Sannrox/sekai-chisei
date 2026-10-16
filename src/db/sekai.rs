@@ -7,8 +7,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -64,6 +64,7 @@ pub struct SekaiDb {
     persistent: bool,
     memory_pool_id: u64,
     plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
+    pub(crate) search_maintenance: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -210,6 +211,7 @@ impl SekaiDb {
             persistent,
             memory_pool_id,
             plane: std::sync::OnceLock::new(),
+            search_maintenance: Mutex::new(()),
         };
         db.migrate_for_plane(schema_plane)?;
         Ok(db)

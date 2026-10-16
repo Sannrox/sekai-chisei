@@ -310,6 +310,10 @@ pub fn search_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn indexed_search_text(text: &str) -> String {
+    search_tokens(text).join(" ")
+}
+
 pub fn fts_query(text: &str) -> Result<String, SearchIndexError> {
     let tokens = search_tokens(text)
         .into_iter()
@@ -547,6 +551,35 @@ mod tests {
             .unwrap();
         assert_eq!(ascii.len(), 1);
         assert_eq!(ascii[0].id, "note-munich");
+    }
+
+    #[test]
+    fn folded_letters_match_the_same_object_text() {
+        let db = RuntimeDb::memory();
+        db.create_object_with_audit(
+            &object("note-lodz", "acme", "city", &[("body", "office in Łódź")]),
+            "editor",
+        )
+        .unwrap();
+        db.catch_up_search_namespace("acme", 10).unwrap();
+        for query in ["Łódź", "Lodz", "lodz"] {
+            let hits = db
+                .query_candidates(&SearchCandidateQuery {
+                    mode: SearchQueryMode::Text,
+                    text: query.into(),
+                    source: Some(SearchSourceKind::Object),
+                    policy: SearchPolicyFilter {
+                        namespace: "acme".into(),
+                        namespace_authorized: true,
+                        subjects: vec!["editor".into()],
+                        ..SearchPolicyFilter::default()
+                    },
+                    limit: 10,
+                })
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert_eq!(hits[0].id, "note-lodz");
+        }
     }
 
     #[test]
