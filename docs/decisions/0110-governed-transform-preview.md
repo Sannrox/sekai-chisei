@@ -80,3 +80,15 @@ input gets no rows or columns they could not read. Over-budget previews fail
 with the existing budget errors; the row cap is enforced. An isolated-process
 preview is claimed, read, and returned without a committed output; a stale
 fence returns nothing.
+
+## Amendment 2026-10-16
+
+#1553 admits enterprise-scoped contexts (tenant identity assertions) to
+`PreviewGovernedTransform`, `ListGovernedTransforms`,
+`ListGovernedTransformRuns` and `GetGovernedTransformRun` on
+`sekai.SekaiService`. Each checks namespace read access and, like preview, the
+caller's tenant context; another tenant's run reads as missing. Preview reads
+its samples under the caller's policy, so a scoped session needs only
+`sekai.read`. `PutGovernedTransform` and `RunGovernedTransform` stay
+unadmitted for scoped contexts: Put requires credential administration, and
+admitting it needs its own decision.
