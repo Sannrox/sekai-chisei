@@ -1583,6 +1583,221 @@ pub(super) async fn put_governed_transform(
         transform: Some(to_proto_transform(&transform)),
     }))
 }
+
+fn preview_response(
+    result: crate::sekai::governed_transform::PreviewGovernedTransformResult,
+) -> PreviewGovernedTransformResponse {
+    PreviewGovernedTransformResponse {
+        preview_id: result.preview_id,
+        output_schema_json: result.output_schema_json,
+        rows: result
+            .rows
+            .into_iter()
+            .map(|values| PreviewGovernedTransformRow { values })
+            .collect(),
+        inputs: result
+            .inputs
+            .into_iter()
+            .map(|input| PreviewGovernedTransformInputStat {
+                alias: input.alias,
+                dataset_id: input.dataset_id,
+                rows_read: input.rows_read,
+            })
+            .collect(),
+        error: result.error,
+    }
+}
+
+fn authorize_preview_inputs(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+) -> Result<std::collections::HashMap<String, Vec<String>>, Status> {
+    let mut column_allowlists = std::collections::HashMap::new();
+    for (_, dataset_id) in transform.input_bindings() {
+        let dataset = service
+            .db
+            .runtime()
+            .get_dataset(&dataset_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("dataset not found"))?;
+        check_dataset_access(
+            service.db.runtime(),
+            &service.security,
+            principals,
+            &dataset,
+            false,
+        )?;
+        if !dataset.object_id.is_empty() {
+            if let Some(object) = service
+                .db
+                .runtime()
+                .get_object(&dataset.object_id)
+                .map_err(Status::internal)?
+            {
+                if !object_is_visible(
+                    service.db.runtime(),
+                    &service.security,
+                    &object,
+                    principals,
+                    tenant_context,
+                ) {
+                    return Err(Status::permission_denied("access denied"));
+                }
+            }
+        }
+        if let Some(allowed) = preview_column_allowlist(service, &dataset)? {
+            column_allowlists.insert(dataset_id, allowed);
+        }
+    }
+    Ok(column_allowlists)
+}
+
+fn retrieve_preview_governed_transform(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    preview_id: &str,
+) -> Result<Response<PreviewGovernedTransformResponse>, Status> {
+    if !crate::sekai::governed_transform::is_preview_id(preview_id) {
+        return Err(Status::invalid_argument(
+            "preview_id is not a preview identity",
+        ));
+    }
+    let transform = service
+        .db
+        .runtime()
+        .admitted_isolated_transform(preview_id)
+        .map_err(transform_work_status)?
+        .ok_or_else(|| Status::not_found("preview not found"))?;
+    if let Some(context) = tenant_context {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &transform.namespace,
+            false,
+        )?;
+    }
+    check_team_namespace(
+        service.db.runtime(),
+        principals,
+        &transform.namespace,
+        false,
+    )?;
+    let column_allowlists =
+        authorize_preview_inputs(service, principals, tenant_context, &transform)?;
+    let admitted = service
+        .db
+        .runtime()
+        .get_preview_column_allowlists(preview_id)
+        .map_err(Status::internal)?;
+    if !crate::sekai::governed_transform::current_preview_auth_covers_admitted(
+        &admitted,
+        &column_allowlists,
+    ) {
+        return Err(Status::permission_denied("access denied"));
+    }
+    let result = service
+        .db
+        .runtime()
+        .get_preview_governed_transform(preview_id)
+        .map_err(Status::internal)?
+        .unwrap_or(
+            crate::sekai::governed_transform::PreviewGovernedTransformResult {
+                preview_id: preview_id.to_string(),
+                ..Default::default()
+            },
+        );
+    Ok(Response::new(preview_response(result)))
+}
+
+pub(super) async fn preview_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<PreviewGovernedTransformRequest>,
+) -> Result<Response<PreviewGovernedTransformResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    if !input.preview_id.is_empty() {
+        return retrieve_preview_governed_transform(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &input.preview_id,
+        );
+    }
+    let proto = input
+        .transform
+        .ok_or_else(|| Status::invalid_argument("transform required"))?;
+    let analytical = from_proto_analytical(&proto);
+    let isolated_process = from_proto_isolated(&proto);
+    let transform = crate::sekai::governed_transform::GovernedTransform {
+        contract_version: proto.contract_version,
+        namespace: proto.namespace,
+        transform_id: proto.transform_id,
+        input_dataset_id: proto.input_dataset_id,
+        output_dataset_id: proto.output_dataset_id,
+        steps: proto
+            .steps
+            .into_iter()
+            .map(|step| crate::sekai::governed_transform::TransformStep {
+                kind: step.kind,
+                column: step.column,
+                op: step.op,
+                value: step.value,
+                columns: step.columns,
+            })
+            .collect(),
+        quality_rule: proto.quality_rule,
+        definition_digest: proto.definition_digest,
+        analytical,
+        isolated_process,
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .map_err(|error| Status::invalid_argument(error.message()))?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &transform.namespace,
+            false,
+        )?;
+    }
+    check_team_namespace(
+        service.db.runtime(),
+        &principals,
+        &transform.namespace,
+        false,
+    )?;
+    let row_cap = crate::sekai::governed_transform::resolve_preview_row_cap(input.row_cap)
+        .map_err(preview_transform_status)?;
+    let column_allowlists =
+        authorize_preview_inputs(service, &principals, tenant_context.as_ref(), &transform)?;
+    let owner_tenant = tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.as_str())
+        .unwrap_or("");
+    // Isolated previews admit claimable work and return preview_id immediately.
+    // After write-back, the same RPC with that preview_id returns stored rows.
+    // GetGovernedTransformRun stays unavailable for preview identities.
+    let result = service
+        .db
+        .runtime()
+        .preview_governed_transform(
+            &transform,
+            row_cap,
+            now_millis(),
+            owner_tenant,
+            &column_allowlists,
+        )
+        .map_err(preview_transform_status)?;
+    Ok(Response::new(preview_response(result)))
+}
 pub(super) async fn run_governed_transform(
     service: &SekaiServiceImpl,
     req: Request<RunGovernedTransformRequest>,
@@ -2096,12 +2311,7 @@ pub(super) async fn heartbeat_transform_claim(
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
     let input = req.into_inner();
-    let run = service
-        .db
-        .runtime()
-        .get_governed_transform_run(&input.run_id)
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::not_found("transform run not found"))?;
+    let run = load_transform_run_or_preview(service, &input.run_id)?;
     check_team_namespace(service.db.runtime(), &principals, &run.namespace, true)?;
     let work = service
         .db
@@ -2137,12 +2347,7 @@ pub(super) async fn read_transform_run_inputs(
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
     let input = req.into_inner();
-    let run = service
-        .db
-        .runtime()
-        .get_governed_transform_run(&input.run_id)
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::not_found("transform run not found"))?;
+    let run = load_transform_run_or_preview(service, &input.run_id)?;
     check_team_namespace(service.db.runtime(), &principals, &run.namespace, true)?;
     check_isolated_transform_datasets(service, &principals, &run, false)?;
     let command = crate::sekai::governed_transform::WriteTransformRunCommand {
@@ -2189,14 +2394,10 @@ pub(super) async fn write_transform_run_result(
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let actor = principals.first().cloned().unwrap_or_default();
     let input = req.into_inner();
-    let run = service
-        .db
-        .runtime()
-        .get_governed_transform_run(&input.run_id)
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::not_found("transform run not found"))?;
+    let preview = crate::sekai::governed_transform::is_preview_id(&input.run_id);
+    let run = load_transform_run_or_preview(service, &input.run_id)?;
     check_team_namespace(service.db.runtime(), &principals, &run.namespace, true)?;
-    check_isolated_transform_datasets(service, &principals, &run, true)?;
+    check_isolated_transform_datasets(service, &principals, &run, !preview)?;
     let command = crate::sekai::governed_transform::WriteTransformRunCommand {
         run_id: input.run_id,
         runtime_id: input.runtime_id,
@@ -2237,6 +2438,28 @@ pub(super) async fn write_transform_run_result(
         .runtime()
         .write_transform_run(command, now_millis())
         .map_err(transform_work_status)?;
+    if preview {
+        let hold = service
+            .db
+            .runtime()
+            .take_transform_quota_hold(&run.run_id, Some(claim_generation), false)
+            .map_err(Status::internal)?;
+        let quota = service.quota_runtime();
+        if let Some((tenant_id, true, held_generation)) = hold.as_ref() {
+            if let Err(status) = complete_reserved_transform_quota(quota, &run.run_id, tenant_id) {
+                let _ = service.db.runtime().restore_transform_quota_hold(
+                    &run.run_id,
+                    tenant_id,
+                    true,
+                    *held_generation,
+                );
+                return Err(status);
+            }
+        }
+        return Ok(Response::new(WriteTransformRunResultResponse {
+            run: Some(to_proto_transform_run(&run, true)),
+        }));
+    }
     // Hold consume and TenantQuotaGate.complete stay on separate stores.
     // Folding them into the write transaction is out of this slice. A crash
     // between take and complete leaves reserved concurrency until the budget
@@ -2593,10 +2816,120 @@ fn ack_transform_usage_pending(
         .map_err(Status::internal)
 }
 
+fn load_transform_run_or_preview(
+    service: &SekaiServiceImpl,
+    run_id: &str,
+) -> Result<crate::sekai::governed_transform::TransformRun, Status> {
+    if let Some(run) = service
+        .db
+        .runtime()
+        .get_governed_transform_run(run_id)
+        .map_err(Status::internal)?
+    {
+        return Ok(run);
+    }
+    if !crate::sekai::governed_transform::is_preview_id(run_id) {
+        return Err(Status::not_found("transform run not found"));
+    }
+    let transform = service
+        .db
+        .runtime()
+        .admitted_isolated_transform(run_id)
+        .map_err(transform_work_status)?
+        .ok_or_else(|| Status::not_found("admitted transform not found"))?;
+    Ok(crate::sekai::governed_transform::TransformRun {
+        run_id: run_id.to_string(),
+        namespace: transform.namespace,
+        transform_id: transform.transform_id,
+        definition_digest: transform.definition_digest,
+        input_digest: String::new(),
+        output_digest: String::new(),
+        last_input_row_id: 0,
+        incremental: false,
+        quarantined: false,
+        quality_rule: String::new(),
+        rows_in: 0,
+        rows_out: 0,
+        lineage_parent: String::new(),
+        created_at_ms: 0,
+        markings_in: String::new(),
+        markings_out: String::new(),
+        profile: crate::sekai::governed_transform::ISOLATED_CLASS.into(),
+        engine: String::new(),
+        runtime_image: String::new(),
+        dispatch_status: String::new(),
+        trigger_cause: String::new(),
+        trigger_ref: String::new(),
+        input_partitions: Vec::new(),
+        output_partitions: Vec::new(),
+    })
+}
+
+fn preview_column_allowlist(
+    service: &SekaiServiceImpl,
+    dataset: &crate::sekai::dataset::Dataset,
+) -> Result<Option<Vec<String>>, Status> {
+    if dataset.object_id.is_empty() {
+        return Ok(None);
+    }
+    let Some(object) = service
+        .db
+        .runtime()
+        .get_object(&dataset.object_id)
+        .map_err(Status::internal)?
+    else {
+        return Ok(None);
+    };
+    let Some(policy) = service
+        .db
+        .runtime()
+        .active_object_policy(&object.namespace, &object.kind)
+        .map_err(|error| {
+            if error.starts_with("object_security_denied") {
+                Status::permission_denied("access denied")
+            } else {
+                Status::unavailable("object authorization unavailable")
+            }
+        })?
+    else {
+        return Ok(None);
+    };
+    if !policy.property_grants_enforced() {
+        return Ok(None);
+    }
+    Ok(Some(
+        dataset
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .filter(|name| {
+                policy.allows_property_access(
+                    name,
+                    crate::sekai::object_security::PropertyGrantAccess::Read,
+                )
+            })
+            .collect(),
+    ))
+}
+
+fn preview_transform_status(error: String) -> Status {
+    if error == crate::sekai::governed_transform::PREVIEW_ROW_CAP
+        || error == crate::sekai::transform_engine::BUDGET_TIME
+        || error == crate::sekai::transform_engine::BUDGET_MEMORY
+    {
+        Status::failed_precondition(error)
+    } else {
+        transform_work_status(error)
+    }
+}
+
 fn transform_work_status(error: String) -> Status {
     if error == crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM
         || error == crate::sekai::governed_transform::STALE_TRANSFORM_ADMISSION
         || error == crate::sekai::governed_transform::TRANSFORM_DEFINITION_CHANGED
+        || error == crate::sekai::governed_transform::PREVIEW_ROW_CAP
+        || error == crate::sekai::transform_engine::BUDGET_TIME
+        || error == crate::sekai::transform_engine::BUDGET_MEMORY
     {
         Status::failed_precondition(error)
     } else if error == crate::sekai::governed_transform::TRANSFORM_DIGEST_MISMATCH

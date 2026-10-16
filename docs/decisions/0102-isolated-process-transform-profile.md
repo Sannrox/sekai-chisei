@@ -11,7 +11,8 @@
   [ADR 0101](0101-analytical-transform-profile.md),
   [ADR 0074](0074-plane-owned-transforms.md),
   [ADR 0103](0103-transform-schedule-and-dependency-graph.md),
-  [ADR 0105](0105-partitioned-transform-io.md)
+  [ADR 0105](0105-partitioned-transform-io.md),
+  [ADR 0110](0110-governed-transform-preview.md)
 
 ## Context
 

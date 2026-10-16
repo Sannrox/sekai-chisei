@@ -1064,6 +1064,59 @@ impl RuntimeDb {
         }
     }
 
+    pub fn preview_governed_transform(
+        &self,
+        transform: &crate::sekai::governed_transform::GovernedTransform,
+        row_cap: usize,
+        now_ms: i64,
+        tenant_id: &str,
+        column_allowlists: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<crate::sekai::governed_transform::PreviewGovernedTransformResult, String> {
+        match self {
+            Self::Sqlite(db) => db.preview_governed_transform(
+                transform,
+                row_cap,
+                now_ms,
+                tenant_id,
+                column_allowlists,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.preview_governed_transform(
+                    transform,
+                    row_cap,
+                    now_ms,
+                    tenant_id,
+                    column_allowlists,
+                )
+            }),
+        }
+    }
+
+    pub fn get_preview_governed_transform(
+        &self,
+        preview_id: &str,
+    ) -> Result<Option<crate::sekai::governed_transform::PreviewGovernedTransformResult>, String>
+    {
+        match self {
+            Self::Sqlite(db) => db.get_preview_governed_transform(preview_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_preview_governed_transform(preview_id))
+            }
+        }
+    }
+
+    pub fn get_preview_column_allowlists(
+        &self,
+        preview_id: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_preview_column_allowlists(preview_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_preview_column_allowlists(preview_id))
+            }
+        }
+    }
+
     pub fn put_purpose_authorization(
         &self,
         authorization: &crate::sekai::purpose_authorization::PurposeAuthorization,

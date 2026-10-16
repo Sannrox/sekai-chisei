@@ -551,6 +551,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PreviewGovernedTransform",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetGovernedTransformRun",
       "kind": "persistent",
       "surfaces": [
