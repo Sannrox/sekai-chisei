@@ -142,6 +142,7 @@ const TRANSFORM_QUOTA_OWNER_SCHEMA: &str = include_str!("postgres/0076_transform
 const CHISEI_USAGE_EVENTS_SCHEMA: &str = include_str!("postgres/0077_chisei_usage_events.sql");
 const TRANSFORM_USAGE_PENDING_SCHEMA: &str =
     include_str!("postgres/0078_transform_usage_pending.sql");
+const DATASET_HEALTH_CHECKS_SCHEMA: &str = include_str!("postgres/0079_dataset_health_checks.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -645,6 +646,12 @@ const MIGRATIONS: &[Migration] = &[
         77,
         "transform_usage_pending",
         TRANSFORM_USAGE_PENDING_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        78,
+        "dataset_health_checks",
+        DATASET_HEALTH_CHECKS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

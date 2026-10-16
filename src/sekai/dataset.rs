@@ -70,7 +70,7 @@ pub struct VirtualTable {
     pub created: i64,
 }
 
-fn parse_columns(value: &str) -> Result<Vec<ColumnDef>, String> {
+pub(crate) fn parse_columns(value: &str) -> Result<Vec<ColumnDef>, String> {
     if let Ok(columns) = serde_json::from_str::<Vec<(String, String, String)>>(value) {
         return Ok(columns
             .into_iter()
@@ -214,6 +214,7 @@ impl SekaiDb {
             );",
         )
         .map_err(|e| e.to_string())?;
+        crate::sekai::dataset_health::migrate_dataset_health(&conn)?;
         let _ = conn.execute(
             "ALTER TABLE sekai_datasets ADD COLUMN partition_keys TEXT NOT NULL DEFAULT '[]'",
             [],
@@ -696,11 +697,27 @@ impl SekaiDb {
         dataset_id: &str,
         q: &RowQuery,
     ) -> Result<Vec<HashMap<String, String>>, String> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT data FROM sekai_dataset_rows WHERE dataset_id = ?1")
-            .map_err(|e| e.to_string())?;
-        let mut rows_iter = stmt.query(params![dataset_id]).map_err(|e| e.to_string())?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let state = crate::sekai::dataset_health::load_state_conn(&tx, dataset_id)?;
+        let mut stmt = if state.quarantined && !state.last_healthy_version_id.is_empty() {
+            tx.prepare(
+                "SELECT data FROM sekai_dataset_version_rows
+                 WHERE dataset_id = ?1 AND version_id = ?2 ORDER BY row_id",
+            )
+            .map_err(|e| e.to_string())?
+        } else if state.quarantined {
+            return Ok(Vec::new());
+        } else {
+            tx.prepare("SELECT data FROM sekai_dataset_rows WHERE dataset_id = ?1")
+                .map_err(|e| e.to_string())?
+        };
+        let mut rows_iter = if state.quarantined && !state.last_healthy_version_id.is_empty() {
+            stmt.query(params![dataset_id, state.last_healthy_version_id])
+                .map_err(|e| e.to_string())?
+        } else {
+            stmt.query(params![dataset_id]).map_err(|e| e.to_string())?
+        };
         let mut results = Vec::new();
         let mut skipped = 0;
         while let Some(row) = rows_iter.next().map_err(|e| e.to_string())? {
@@ -1213,8 +1230,7 @@ pub(crate) fn snapshot_dataset_version_tx(
         )
         .map_err(|error| error.to_string())?;
     }
-    prune_dataset_versions_tx(tx, dataset_id)?;
-    Ok(DatasetVersion {
+    let version = DatasetVersion {
         dataset_id: dataset_id.into(),
         version_id,
         seq,
@@ -1225,7 +1241,15 @@ pub(crate) fn snapshot_dataset_version_tx(
         restored_from_version_id: restored_from_version_id.into(),
         row_count,
         purged: false,
-    })
+    };
+    crate::sekai::dataset_health::judge_after_write_sqlite(
+        tx,
+        dataset_id,
+        &version,
+        created_at_ms,
+    )?;
+    prune_dataset_versions_tx(tx, dataset_id)?;
+    Ok(version)
 }
 
 fn prune_dataset_versions_tx(tx: &Transaction<'_>, dataset_id: &str) -> Result<(), String> {
@@ -1257,13 +1281,21 @@ fn prune_dataset_versions_tx(tx: &Transaction<'_>, dataset_id: &str) -> Result<(
          WHERE dataset_id = ?1 AND version_id IN (
             SELECT version_id FROM sekai_dataset_versions
             WHERE dataset_id = ?1 AND seq <= ?2
+              AND version_id != COALESCE((
+                SELECT last_healthy_version_id FROM sekai_dataset_health_state
+                WHERE dataset_id = ?1
+              ), '')
          )",
         params![dataset_id, cutoff],
     )
     .map_err(|error| error.to_string())?;
     tx.execute(
         "UPDATE sekai_dataset_versions SET purged = 1
-         WHERE dataset_id = ?1 AND seq <= ?2",
+         WHERE dataset_id = ?1 AND seq <= ?2
+           AND version_id != COALESCE((
+             SELECT last_healthy_version_id FROM sekai_dataset_health_state
+             WHERE dataset_id = ?1
+           ), '')",
         params![dataset_id, cutoff],
     )
     .map_err(|error| error.to_string())?;

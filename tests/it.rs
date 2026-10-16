@@ -45,6 +45,7 @@ mod connector_template;
 mod coordination_backend_conformance;
 mod data_dir_store_layout;
 mod data_quality_rule_adr;
+mod dataset_health_backend_conformance;
 mod decision_backend_conformance;
 mod definition_branch_backend_conformance;
 mod definition_consumer_impact_adr;
@@ -206,6 +207,7 @@ const GROUPED_MODULES: &[&str] = &[
     "coordination_backend_conformance",
     "data_dir_store_layout",
     "data_quality_rule_adr",
+    "dataset_health_backend_conformance",
     "decision_backend_conformance",
     "definition_branch_backend_conformance",
     "definition_consumer_impact_adr",
@@ -400,6 +402,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 132);
+    assert_eq!(GROUPED_MODULES.len(), 133);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

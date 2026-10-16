@@ -833,6 +833,82 @@ pub(super) fn map_dataset_version_error(error: String) -> Status {
     }
 }
 
+pub(super) fn to_proto_health_check(
+    check: &crate::sekai::dataset_health::DatasetHealthCheck,
+) -> DatasetHealthCheck {
+    DatasetHealthCheck {
+        dataset_id: check.dataset_id.clone(),
+        check_id: check.check_id.clone(),
+        kind: check.kind.clone(),
+        max_age_ms: check.max_age_ms,
+        min_rows: check.min_rows,
+        max_rows: check.max_rows,
+        columns: check.columns.clone(),
+        predicate: check
+            .predicate
+            .iter()
+            .map(|filter| RowFilter {
+                column: filter.column.clone(),
+                op: filter.op.clone(),
+                value: filter.value.clone(),
+            })
+            .collect(),
+        blocking: check.blocking,
+        every_ms: check.every_ms,
+        tenant: check.tenant.clone(),
+        space: check.space.clone(),
+    }
+}
+
+pub(super) fn from_proto_health_check(
+    check: &DatasetHealthCheck,
+) -> crate::sekai::dataset_health::DatasetHealthCheck {
+    crate::sekai::dataset_health::DatasetHealthCheck {
+        dataset_id: check.dataset_id.clone(),
+        check_id: check.check_id.clone(),
+        kind: check.kind.clone(),
+        max_age_ms: check.max_age_ms,
+        min_rows: check.min_rows,
+        max_rows: check.max_rows,
+        columns: check.columns.clone(),
+        predicate: from_proto_row_filters(&check.predicate),
+        blocking: check.blocking,
+        every_ms: check.every_ms,
+        tenant: check.tenant.clone(),
+        space: check.space.clone(),
+        last_run_ms: 0,
+    }
+}
+
+pub(super) fn to_proto_health_result(
+    result: &crate::sekai::dataset_health::DatasetHealthResult,
+) -> DatasetHealthResult {
+    DatasetHealthResult {
+        dataset_id: result.dataset_id.clone(),
+        version_id: result.version_id.clone(),
+        check_id: result.check_id.clone(),
+        passed: result.passed,
+        detail: result.detail.clone(),
+        judged_at_ms: result.judged_at_ms,
+        quarantined: result.quarantined,
+    }
+}
+
+pub(super) fn to_proto_dataset_alert(
+    alert: &crate::sekai::dataset_health::DatasetAlert,
+) -> DatasetAlert {
+    DatasetAlert {
+        kind: alert.kind.clone(),
+        ref_id: alert.ref_id.clone(),
+        dataset_id: alert.dataset_id.clone(),
+        tenant: alert.tenant.clone(),
+        space: alert.space.clone(),
+        reason: alert.reason.clone(),
+        state: alert.state.clone(),
+        emitted_at_ms: alert.emitted_at_ms,
+    }
+}
+
 pub(super) fn from_proto_row_filters(filters: &[RowFilter]) -> Vec<dataset::RowFilter> {
     filters
         .iter()

@@ -105,6 +105,16 @@
   `0073_dataset_versions` (`GATE:mig`, #1412). Enable `SEKAI_EXPERIMENTAL_RPCS=1`
   or the `experimental-rpcs` feature to invoke.
 
+- Dataset health checks run after each committed write and on a schedule.
+  Freshness, row-count, schema, null/uniqueness, and predicate checks store
+  results with the judged version. A failing blocking check quarantines the
+  new version so `QueryRows` stays on the last healthy snapshot. Late
+  schedules emit one alert and recovery emits a resolve; check and job
+  metrics carry tenant and space labels. Additive experimental RPCs and
+  PostgreSQL migration `0079_dataset_health_checks` (`GATE:mig`, #1411).
+  Enable `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature to
+  invoke.
+
 - Experimental `ProposeDefinitionRollback` opens an append-only proposal whose
   candidate restores a prior published revision as a new descendant of the live
   head. Merge records `restored_from_digest` on the receipt and refuses when

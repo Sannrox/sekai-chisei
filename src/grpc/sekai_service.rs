@@ -1366,6 +1366,36 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<RollbackDatasetResponse>, Status> {
         rpc_data::rollback_dataset(self, req).await
     }
+    async fn put_dataset_health_check(
+        &self,
+        req: Request<PutDatasetHealthCheckRequest>,
+    ) -> Result<Response<PutDatasetHealthCheckResponse>, Status> {
+        rpc_data::put_dataset_health_check(self, req).await
+    }
+    async fn list_dataset_health_checks(
+        &self,
+        req: Request<ListDatasetHealthChecksRequest>,
+    ) -> Result<Response<ListDatasetHealthChecksResponse>, Status> {
+        rpc_data::list_dataset_health_checks(self, req).await
+    }
+    async fn list_dataset_health_results(
+        &self,
+        req: Request<ListDatasetHealthResultsRequest>,
+    ) -> Result<Response<ListDatasetHealthResultsResponse>, Status> {
+        rpc_data::list_dataset_health_results(self, req).await
+    }
+    async fn run_dataset_health_checks(
+        &self,
+        req: Request<RunDatasetHealthChecksRequest>,
+    ) -> Result<Response<RunDatasetHealthChecksResponse>, Status> {
+        rpc_data::run_dataset_health_checks(self, req).await
+    }
+    async fn list_dataset_alerts(
+        &self,
+        req: Request<ListDatasetAlertsRequest>,
+    ) -> Result<Response<ListDatasetAlertsResponse>, Status> {
+        rpc_data::list_dataset_alerts(self, req).await
+    }
     async fn create_virtual_table(
         &self,
         req: Request<CreateVirtualTableRequest>,

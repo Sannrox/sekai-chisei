@@ -481,6 +481,180 @@ pub(super) async fn rollback_dataset(
         rows: rows.into_iter().map(|values| Row { values }).collect(),
     }))
 }
+
+pub(super) async fn put_dataset_health_check(
+    service: &SekaiServiceImpl,
+    req: Request<PutDatasetHealthCheckRequest>,
+) -> Result<Response<PutDatasetHealthCheckResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let check = inner
+        .check
+        .ok_or_else(|| Status::invalid_argument("check required"))?;
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(&check.dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        true,
+    )?;
+    let parsed = from_proto_health_check(&check);
+    service
+        .db
+        .runtime()
+        .put_dataset_health_check(&parsed)
+        .map_err(Status::invalid_argument)?;
+    let stored = service
+        .db
+        .runtime()
+        .list_dataset_health_checks(&parsed.dataset_id)
+        .map_err(Status::internal)?
+        .into_iter()
+        .find(|item| item.check_id == parsed.check_id)
+        .unwrap_or(parsed);
+    Ok(Response::new(PutDatasetHealthCheckResponse {
+        check: Some(to_proto_health_check(&stored)),
+    }))
+}
+
+pub(super) async fn list_dataset_health_checks(
+    service: &SekaiServiceImpl,
+    req: Request<ListDatasetHealthChecksRequest>,
+) -> Result<Response<ListDatasetHealthChecksResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(&inner.dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        false,
+    )?;
+    let checks = service
+        .db
+        .runtime()
+        .list_dataset_health_checks(&inner.dataset_id)
+        .map_err(Status::internal)?;
+    Ok(Response::new(ListDatasetHealthChecksResponse {
+        checks: checks.iter().map(to_proto_health_check).collect(),
+    }))
+}
+
+pub(super) async fn list_dataset_health_results(
+    service: &SekaiServiceImpl,
+    req: Request<ListDatasetHealthResultsRequest>,
+) -> Result<Response<ListDatasetHealthResultsResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(&inner.dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        false,
+    )?;
+    let results = service
+        .db
+        .runtime()
+        .list_dataset_health_results(&inner.dataset_id, &inner.version_id)
+        .map_err(Status::internal)?;
+    let state = service
+        .db
+        .runtime()
+        .dataset_health_state(&inner.dataset_id)
+        .map_err(Status::internal)?;
+    Ok(Response::new(ListDatasetHealthResultsResponse {
+        results: results.iter().map(to_proto_health_result).collect(),
+        last_healthy_version_id: state.last_healthy_version_id,
+        quarantined: state.quarantined,
+    }))
+}
+
+pub(super) async fn run_dataset_health_checks(
+    service: &SekaiServiceImpl,
+    req: Request<RunDatasetHealthChecksRequest>,
+) -> Result<Response<RunDatasetHealthChecksResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(&inner.dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        true,
+    )?;
+    let now_ms = if inner.now_ms > 0 {
+        inner.now_ms
+    } else {
+        crate::sekai::dataset_version::now_ms()
+    };
+    let results = service
+        .db
+        .runtime()
+        .run_dataset_health_checks(&inner.dataset_id, now_ms)
+        .map_err(Status::internal)?;
+    Ok(Response::new(RunDatasetHealthChecksResponse {
+        results: results.iter().map(to_proto_health_result).collect(),
+    }))
+}
+
+pub(super) async fn list_dataset_alerts(
+    service: &SekaiServiceImpl,
+    req: Request<ListDatasetAlertsRequest>,
+) -> Result<Response<ListDatasetAlertsResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(&inner.dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        false,
+    )?;
+    let alerts = service
+        .db
+        .runtime()
+        .list_dataset_alerts(&inner.dataset_id)
+        .map_err(Status::internal)?;
+    Ok(Response::new(ListDatasetAlertsResponse {
+        alerts: alerts.iter().map(to_proto_dataset_alert).collect(),
+    }))
+}
 pub(super) async fn create_virtual_table(
     service: &SekaiServiceImpl,
     req: Request<CreateVirtualTableRequest>,
