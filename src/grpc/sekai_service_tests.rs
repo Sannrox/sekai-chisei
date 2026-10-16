@@ -13167,9 +13167,10 @@ async fn scoped_published_definition_read_crosses_the_server_transport() {
             );
         }
         let token = authority.sign(&claims("disallowed-rpc")).unwrap();
-        let mut request = Request::new(GetDefinitionProposalRequest {
+        let mut request = Request::new(CloseDefinitionProposalRequest {
             namespace: "allowed".into(),
             proposal_id: "fixture".into(),
+            ..Default::default()
         });
         request
             .metadata_mut()
@@ -13180,7 +13181,7 @@ async fn scoped_published_definition_read_crosses_the_server_transport() {
         );
         assert_eq!(
             client
-                .get_definition_proposal(request)
+                .close_definition_proposal(request)
                 .await
                 .unwrap_err()
                 .code(),
@@ -14270,20 +14271,233 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
             .revision_digest,
         parent.revision_digest
     );
-    let mut promotion = signed(
+    // ADR 0111: the scoped author publishes through a proposal under the
+    // same grants and the ADR 0079 certification gate.
+    let candidate = head.head_revision_digest.clone();
+    let head = client
+        .get_definition_branch(signed(
+            &authority,
+            &claims(),
+            GetDefinitionBranchRequest {
+                namespace: "allowed".into(),
+                branch_id: create.branch_id.clone(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .branch
+        .unwrap()
+        .head_revision_digest;
+    assert_ne!(head, candidate, "the second save moved the head");
+    let propose = CreateDefinitionProposalRequest {
+        namespace: "allowed".into(),
+        branch_id: create.branch_id.clone(),
+        proposal_id: "publish-triage".into(),
+        base_digest: parent.revision_digest.clone(),
+        candidate_digest: head.clone(),
+        eval_plan_digests: vec![],
+        named_foreign_digests: vec![],
+        idempotency_key: "publish-proposal".into(),
+    };
+    read_only.nonce = uuid::Uuid::new_v4().to_string();
+    let mut foreign_proposal = propose.clone();
+    foreign_proposal.namespace = "foreign".into();
+    let mut ungranted = claims();
+    ungranted.subject = "subject-b".into();
+    for (claims, request) in [
+        (read_only.clone(), propose.clone()),
+        (claims(), foreign_proposal),
+        (ungranted, propose.clone()),
+    ] {
+        let denied = client
+            .create_definition_proposal(signed(&authority, &claims, request))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                denied.code(),
+                tonic::Code::PermissionDenied | tonic::Code::NotFound
+            ),
+            "{denied}"
+        );
+    }
+    let opened = client
+        .create_definition_proposal(signed(&authority, &claims(), propose))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(
+        (opened.status.as_str(), opened.created_by.as_str()),
+        ("open", "subject-a")
+    );
+    let fetched = client
+        .get_definition_proposal(signed(
+            &authority,
+            &claims(),
+            GetDefinitionProposalRequest {
+                namespace: "allowed".into(),
+                proposal_id: "publish-triage".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(fetched, opened);
+    let approved = client
+        .approve_definition_proposal(signed(
+            &authority,
+            &claims(),
+            ApproveDefinitionProposalRequest {
+                namespace: "allowed".into(),
+                proposal_id: "publish-triage".into(),
+                idempotency_key: "publish-approve".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(approved.approvals[0].actor, "subject-a");
+    // Administering the changed member is not enough: approve and merge also
+    // need read access to every member of both revisions.
+    security.add_grant(&security::Grant {
+        id: "reader-c-agent-admin".into(),
+        object_id: "schema:agent:triage".into(),
+        principal: "subject-c".into(),
+        role: security::Role::Admin,
+        created: 1,
+    });
+    security.add_grant(&security::Grant {
+        id: "ticket-restricted".into(),
+        object_id: "schema:Ticket".into(),
+        principal: "subject-a".into(),
+        role: security::Role::Admin,
+        created: 1,
+    });
+    let mut unreadable = claims();
+    unreadable.subject = "subject-c".into();
+    let approve_denied = client
+        .approve_definition_proposal(signed(
+            &authority,
+            &unreadable,
+            ApproveDefinitionProposalRequest {
+                namespace: "allowed".into(),
+                proposal_id: "publish-triage".into(),
+                idempotency_key: "approve-unreadable".into(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            approve_denied.code(),
+            tonic::Code::PermissionDenied | tonic::Code::NotFound
+        ),
+        "{approve_denied}"
+    );
+    unreadable.nonce = uuid::Uuid::new_v4().to_string();
+    let merge_denied = client
+        .merge_definition_proposal(signed(
+            &authority,
+            &unreadable,
+            MergeDefinitionProposalRequest {
+                namespace: "allowed".into(),
+                proposal_id: "publish-triage".into(),
+                idempotency_key: "merge-unreadable".into(),
+                expected_published_digest: parent.revision_digest.clone(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            merge_denied.code(),
+            tonic::Code::PermissionDenied | tonic::Code::NotFound
+        ),
+        "{merge_denied}"
+    );
+    security.remove_grant("schema:Ticket", "subject-a");
+    security.remove_grant("schema:agent:triage", "subject-c");
+    let merge = |key: &str| MergeDefinitionProposalRequest {
+        namespace: "allowed".into(),
+        proposal_id: "publish-triage".into(),
+        idempotency_key: key.into(),
+        expected_published_digest: parent.revision_digest.clone(),
+    };
+    let refused = client
+        .merge_definition_proposal(signed(&authority, &claims(), merge("publish-uncertified")))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (
+            tonic::Code::FailedPrecondition,
+            "agent_promotion_requires_certification"
+        )
+    );
+    sqlite
+        .put_agent_definition_certification(
+            &crate::sekai::agent_promotion::AgentDefinitionCertification {
+                namespace: "allowed".into(),
+                revision_digest: head.clone(),
+                suite_id: "triage-suite".into(),
+                certification_id: "triage-cert".into(),
+                baseline_status: "pass".into(),
+                latest_status: "pass".into(),
+                expires_at_ms: chrono::Utc::now().timestamp_millis() + 30 * 86_400_000,
+                revoked_at_ms: 0,
+                bound_by: "reviewer".into(),
+                bound_at_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .unwrap();
+    let merged = client
+        .merge_definition_proposal(signed(&authority, &claims(), merge("publish-merge")))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!merged.receipt_id.is_empty());
+    assert_eq!(merged.previous_published_digest, parent.revision_digest);
+    let published = merged.published_revision.clone().unwrap();
+    assert!(published.published);
+    assert_eq!(
+        merged,
+        client
+            .merge_definition_proposal(signed(&authority, &claims(), merge("publish-merge")))
+            .await
+            .unwrap()
+            .into_inner(),
+        "a replayed merge returns the same receipt"
+    );
+    assert_eq!(
+        sqlite
+            .get_published_definition_revision("allowed")
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        published.revision_digest
+    );
+    // Close stays unadmitted, even behind a spoofed method header.
+    let mut close = signed(
         &authority,
         &claims(),
-        CreateDefinitionProposalRequest {
+        CloseDefinitionProposalRequest {
             namespace: "allowed".into(),
             ..Default::default()
         },
     );
-    promotion
+    close
         .metadata_mut()
-        .insert("x-rpc-method", "ApplyDefinitionBranchEdit".parse().unwrap());
+        .insert("x-rpc-method", "CreateDefinitionProposal".parse().unwrap());
     assert_eq!(
         client
-            .create_definition_proposal(promotion)
+            .close_definition_proposal(close)
             .await
             .unwrap_err()
             .code(),

@@ -296,6 +296,12 @@ the outcome is unknown: retry the identical operation and key with a fresh
 assertion. Identical retries return the original receipt, even after the head has
 advanced. Reload before choosing a new edit following a conflict.
 
-Draft authoring does not grant proposal, approval, merge, or publication access
-and never advances the published pointer. See
+Draft authoring never advances the published pointer. See
 [ADR 0094](decisions/0094-scoped-definition-draft-authoring.md).
+
+Scoped contexts can also call qualified `GetDefinitionProposal`,
+`CreateDefinitionProposal`, `ApproveDefinitionProposal`, and
+`MergeDefinitionProposal` to publish a draft. The same namespace write, member
+administration, approval, expected-published-digest, and ADR 0079 certification
+checks apply; `CloseDefinitionProposal` is not available to scoped contexts. See
+[ADR 0111](decisions/0111-scoped-definition-proposals.md).
