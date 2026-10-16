@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     fn exercise_team_principals_cannot_search_unbound_global_datasets(db: &RuntimeDb) {
-        seed_team_principal(&db, "team-agent");
+        seed_team_principal(db, "team-agent");
         db.create_dataset(&dataset(
             "ds-global",
             "world catalog",
