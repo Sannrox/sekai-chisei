@@ -8915,7 +8915,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn conn(&self) -> r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager> {
+    pub fn conn(&self) -> crate::db::sekai::SqliteConn {
         match self {
             Self::Sqlite(db) => db.conn(),
             Self::Postgres(_) => panic!("conn() is only available for the SQLite community store"),

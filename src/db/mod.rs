@@ -127,6 +127,7 @@ pub mod replica_safety;
 pub mod retention;
 pub mod reusable;
 pub mod runtime_db;
+pub mod search_index;
 pub mod sekai;
 pub mod sekai_rpc_inventory;
 mod service_principal;
