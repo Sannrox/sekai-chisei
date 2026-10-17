@@ -154,22 +154,36 @@ impl ObjectLogHost {
 
     /// The identity's current record, or `None` when the host has never
     /// committed it.
-    pub fn load(&self, kind: &str, key: &str) -> Result<Option<ObjectRecord>, String> {
-        let reply = self.call(json!({ "op": "load", "kind": kind, "key": key }))?;
-        // The pinned host tag reports a never-committed identity only as this
-        // error text; it has no structured not-found. The real-host test
-        // (`two_clerk_clients_share_generations_through_one_host`) pins it,
-        // so a tag bump that rewords it fails there instead of turning every
-        // first admit into an error. Any other failure stays an error.
-        if !reply.ok
-            && reply.error.as_deref() == Some(format!("unknown identity {kind}/{key}").as_str())
-        {
-            return Ok(None);
+    pub fn load(
+        &self,
+        namespace: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<ObjectRecord>, String> {
+        let reply = self.call(json!({
+            "op": "load",
+            "namespace": namespace,
+            "kind": kind,
+            "key": key
+        }))?;
+        // The pinned host reports a never-committed identity only as error
+        // text; it has no structured not-found. A namespace the host has
+        // never ingested is the same absence: first admit must ingest rather
+        // than fail closed. The real-host tests pin both strings, so a pin
+        // bump that rewords them fails there instead of turning every first
+        // admit into an error. Any other failure stays an error.
+        if !reply.ok {
+            let error = reply.error.as_deref().unwrap_or("");
+            if error == format!("unknown identity {namespace}/{kind}/{key}")
+                || error == format!("unknown namespace {namespace}")
+            {
+                return Ok(None);
+            }
         }
         let record = Self::require_ok(reply)?
             .load
             .ok_or("object-log host load returned no record")?;
-        if record.kind != kind || record.key != key {
+        if record.namespace != namespace || record.kind != kind || record.key != key {
             return Err("object-log host returned a different identity".into());
         }
         Ok(Some(record))
@@ -180,7 +194,7 @@ impl ObjectLogHost {
     /// generation read back. A committed record that does not carry the
     /// admitted properties (another writer won the race) fails closed.
     pub fn admit(&self, record: ObjectRecord) -> Result<u64, String> {
-        if let Some(existing) = self.load(&record.kind, &record.key)?
+        if let Some(existing) = self.load(&record.namespace, &record.kind, &record.key)?
             && !existing.hidden
             && existing.props == record.props
         {
@@ -188,7 +202,7 @@ impl ObjectLogHost {
         }
         self.ingest_batch(std::slice::from_ref(&record))?;
         let committed = self
-            .load(&record.kind, &record.key)?
+            .load(&record.namespace, &record.kind, &record.key)?
             .ok_or("object-log host did not commit the admitted identity")?;
         if committed.hidden || committed.props != record.props {
             return Err("object-log host generation does not carry the admitted properties".into());
@@ -239,18 +253,20 @@ mod tests {
     fn record(key: &str, region: &str) -> ObjectRecord {
         ObjectRecord {
             r#gen: 0,
+            namespace: "sales".into(),
             kind: "Customer".into(),
             key: key.into(),
             hidden: false,
             action_id: None,
             props: HashMap::from([("region".into(), region.into())]),
+            schema_version: 1,
         }
     }
 
     /// One real object-log host on loopback, serving until the test ends.
     fn spawn_host(bearer: Option<&str>) -> (SocketAddr, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let mut host = mikura_host::Host::open(&dir.path().join("objects.mikura"), 64).unwrap();
+        let host = mikura_host::Host::open(&dir.path().join("objects.mikura"), 64).unwrap();
         if let Some(bearer) = bearer {
             host.require_bearer(bearer).unwrap();
         }
@@ -271,7 +287,7 @@ mod tests {
         let second = ObjectLogHost::new(&addr.to_string(), Some("clerk-bearer".into())).unwrap();
 
         let generation = first.admit(record("c-1", "eu")).unwrap();
-        let seen = second.load("Customer", "c-1").unwrap().unwrap();
+        let seen = second.load("sales", "Customer", "c-1").unwrap().unwrap();
         assert_eq!(seen.r#gen, generation);
         assert_eq!(seen.props["region"], "eu");
         // An identical admit from the other client keeps the generation.
@@ -280,10 +296,41 @@ mod tests {
         let updated = second.admit(record("c-1", "us")).unwrap();
         assert!(updated > generation);
         assert_eq!(
-            first.load("Customer", "c-1").unwrap().unwrap().r#gen,
+            first
+                .load("sales", "Customer", "c-1")
+                .unwrap()
+                .unwrap()
+                .r#gen,
             updated
         );
-        assert_eq!(first.load("Customer", "missing").unwrap(), None);
+        assert_eq!(first.load("sales", "Customer", "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn two_namespaces_keep_separate_generations_through_the_host() {
+        let (addr, _dir) = spawn_host(None);
+        let host = ObjectLogHost::new(&addr.to_string(), None).unwrap();
+        let sales = record("shared", "eu");
+        let mut ops = record("shared", "us");
+        ops.namespace = "ops".into();
+        let sales_gen = host.admit(sales).unwrap();
+        let ops_gen = host.admit(ops).unwrap();
+        assert_eq!(sales_gen, 1);
+        assert_eq!(ops_gen, 1);
+        assert_eq!(
+            host.load("sales", "Customer", "shared")
+                .unwrap()
+                .unwrap()
+                .props["region"],
+            "eu"
+        );
+        assert_eq!(
+            host.load("ops", "Customer", "shared")
+                .unwrap()
+                .unwrap()
+                .props["region"],
+            "us"
+        );
     }
 
     #[test]
@@ -295,7 +342,11 @@ mod tests {
         let refused = forged.admit(record("c-1", "us")).unwrap_err();
         assert!(!refused.contains("guess"), "the bearer leaked: {refused}");
         assert_eq!(
-            honest.load("Customer", "c-1").unwrap().unwrap().r#gen,
+            honest
+                .load("sales", "Customer", "c-1")
+                .unwrap()
+                .unwrap()
+                .r#gen,
             generation
         );
 
@@ -342,7 +393,7 @@ mod tests {
         // Another writer won the race: the committed record differs.
         let raced = spawn_scripted(|op| {
             match op {
-            "load" => r#"{"v":1,"ok":true,"load":{"gen":7,"kind":"Customer","key":"c-1","hidden":false,"props":{"region":"other"}}}"#.to_string() + "\n",
+            "load" => r#"{"v":1,"ok":true,"load":{"gen":7,"namespace":"sales","kind":"Customer","key":"c-1","hidden":false,"props":{"region":"other"}}}"#.to_string() + "\n",
             _ => "{\"v\":1,\"ok\":true}\n".into(),
         }
         });
@@ -358,14 +409,14 @@ mod tests {
         for reply in [
             "{\"v\":2,\"ok\":true}\n",
             "not json\n",
-            "{\"v\":1,\"ok\":true,\"load\":{\"gen\":1,\"kind\":\"Other\",\"key\":\"c-1\",\"hidden\":false,\"props\":{}}}\n",
+            "{\"v\":1,\"ok\":true,\"load\":{\"gen\":1,\"namespace\":\"sales\",\"kind\":\"Other\",\"key\":\"c-1\",\"hidden\":false,\"props\":{}}}\n",
             "{\"v\":1,\"ok\":false,\"error\":\"store is poisoned\"}\n",
         ] {
             let host = spawn_scripted(move |_| reply.to_string());
             assert!(
                 ObjectLogHost::new(&host.to_string(), None)
                     .unwrap()
-                    .load("Customer", "c-1")
+                    .load("sales", "Customer", "c-1")
                     .is_err(),
                 "{reply}"
             );
@@ -392,7 +443,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             via_host,
-            host.load("Customer", "c-1")
+            host.load("sales", "Customer", "c-1")
                 .unwrap()
                 .map(|record| record.r#gen)
         );

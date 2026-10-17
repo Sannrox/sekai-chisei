@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Object-log identity is `(namespace, kind, key)`. Ingest, generation reads,
+  dual-read, and the host client pass the plane namespace. `MIKURAV1` logs
+  fail closed until an explicit projection-driven migration. The mikura pin
+  is `0d43c57` (#1552, ADR 0112).
+
 - Enterprise-scoped sessions can publish a governed transform definition with
   namespace write and read access to its datasets. A scoped Put cannot name a
   schedule or input-commit trigger. Community Put still requires credential

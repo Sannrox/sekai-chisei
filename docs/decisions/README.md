@@ -133,3 +133,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0109: Agent dry run is an evaluation-style record that cannot certify](0109-agent-dry-run.md)
 - [ADR 0110: Preview a governed transform without committing governed data](0110-governed-transform-preview.md)
 - [ADR 0111: Scoped contexts publish definition drafts through proposals](0111-scoped-definition-proposals.md)
+- [ADR 0112: Plane namespace is part of object-log identity](0112-namespaced-object-log-identity.md)

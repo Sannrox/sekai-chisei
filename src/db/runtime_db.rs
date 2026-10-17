@@ -271,6 +271,15 @@ impl RuntimeDb {
         }
     }
 
+    pub fn object_log_migration_identities(&self) -> Result<Vec<(String, String, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.object_log_migration_identities(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.object_log_migration_identities())
+            }
+        }
+    }
+
     pub fn object_type_index_status(
         &self,
         namespace: &str,
