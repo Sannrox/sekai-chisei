@@ -618,6 +618,9 @@ pub fn identity_from_hosted_profile(
     if !profile.require_runtime_evidence {
         return Ok(None);
     }
+    let Some(digest) = profile.artifact_digest.as_deref() else {
+        return Err("artifact_digest is required when require_runtime_evidence is set".into());
+    };
     let identity = ModelReleaseIdentity {
         provider: profile.evidence_provider.clone(),
         model: profile.evidence_model.clone(),
@@ -626,10 +629,13 @@ pub fn identity_from_hosted_profile(
         endpoint: profile.evidence_endpoint.clone(),
     };
     identity.validate()?;
-    if let Some(digest) = profile.artifact_digest.as_deref()
-        && digest != identity.artifact_digest
-    {
+    if digest != identity.artifact_digest {
         return Err("evidence_artifact_digest must match the profile artifact_digest".into());
+    }
+    let bound_origin = crate::chisei::routing_profiles::canonical_origin(&identity.endpoint)
+        .map_err(|_| "evidence_endpoint must match the served endpoint origin".to_string())?;
+    if bound_origin != profile.endpoint_origin {
+        return Err("evidence_endpoint must match the served endpoint origin".into());
     }
     Ok(Some(identity))
 }
@@ -1005,6 +1011,8 @@ mod tests {
     const RELEASE_DIGEST: &str =
         "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
+    const SERVED_ORIGIN: &str = "https://models.example.com";
+
     fn identity() -> ModelReleaseIdentity {
         ModelReleaseIdentity {
             provider: "huggingface".into(),
@@ -1012,6 +1020,35 @@ mod tests {
             profile_version: "v1".into(),
             artifact_digest: DIGEST.into(),
             endpoint: "served://qwen-coder".into(),
+        }
+    }
+
+    fn bound_identity() -> ModelReleaseIdentity {
+        ModelReleaseIdentity {
+            provider: "huggingface".into(),
+            model: "qwen-coder".into(),
+            profile_version: "v1".into(),
+            artifact_digest: DIGEST.into(),
+            endpoint: SERVED_ORIGIN.into(),
+        }
+    }
+
+    fn opt_in_profile(namespace: &str, origin: &str, digest: Option<&str>) -> HostedRoutingProfile {
+        HostedRoutingProfile {
+            namespace: namespace.into(),
+            profile_id: "hosted:acme".into(),
+            endpoint_origin: origin.into(),
+            model_patterns: vec!["qwen-coder".into()],
+            credential_ref: "ACME".into(),
+            artifact_digest: digest.map(str::to_string),
+            registered_by: "root".into(),
+            registered_at_ms: 1,
+            require_runtime_evidence: true,
+            evidence_provider: bound_identity().provider,
+            evidence_model: bound_identity().model,
+            evidence_profile_version: bound_identity().profile_version,
+            evidence_artifact_digest: bound_identity().artifact_digest,
+            evidence_endpoint: bound_identity().endpoint,
         }
     }
 
@@ -1029,8 +1066,12 @@ mod tests {
     }
 
     fn runtime_draft() -> RuntimeEvidenceDraft {
+        runtime_draft_for(identity())
+    }
+
+    fn runtime_draft_for(identity: ModelReleaseIdentity) -> RuntimeEvidenceDraft {
         RuntimeEvidenceDraft {
-            identity: identity(),
+            identity,
             release_id: "qwen-coder@0.1.0".into(),
             release_digest: RELEASE_DIGEST.into(),
             health: RuntimeHealth::Healthy,
@@ -1169,24 +1210,9 @@ mod tests {
         let db = ChiseiStore::memory();
         let (key, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();
-        let evidence = sign_runtime_evidence(runtime_draft(), &key).unwrap();
+        let evidence = sign_runtime_evidence(runtime_draft_for(bound_identity()), &key).unwrap();
         ingest_runtime_evidence(&db, evidence.clone(), NOW_MS).unwrap();
-        let mut profile = HostedRoutingProfile {
-            namespace: "sales".into(),
-            profile_id: "hosted:acme".into(),
-            endpoint_origin: "https://models.example".into(),
-            model_patterns: vec!["qwen-coder".into()],
-            credential_ref: "ACME".into(),
-            artifact_digest: None,
-            registered_by: "root".into(),
-            registered_at_ms: 1,
-            require_runtime_evidence: true,
-            evidence_provider: identity().provider,
-            evidence_model: identity().model,
-            evidence_profile_version: identity().profile_version,
-            evidence_artifact_digest: identity().artifact_digest,
-            evidence_endpoint: identity().endpoint,
-        };
+        let mut profile = opt_in_profile("sales", SERVED_ORIGIN, Some(DIGEST));
         admit_hosted_runtime_evidence(
             &db,
             &profile,
@@ -1195,6 +1221,14 @@ mod tests {
             Some("root"),
         )
         .unwrap();
+        profile.evidence_endpoint = format!("{SERVED_ORIGIN}/v1");
+        assert_eq!(
+            identity_from_hosted_profile(&profile)
+                .unwrap()
+                .unwrap()
+                .endpoint,
+            format!("{SERVED_ORIGIN}/v1")
+        );
         profile.require_runtime_evidence = false;
         assert!(route_runtime_evidence_allows(
             &db,
@@ -1210,22 +1244,7 @@ mod tests {
         let db = ChiseiStore::memory();
         let (_, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();
-        let profile = HostedRoutingProfile {
-            namespace: "sales".into(),
-            profile_id: "hosted:acme".into(),
-            endpoint_origin: "https://models.example".into(),
-            model_patterns: vec!["qwen-coder".into()],
-            credential_ref: "ACME".into(),
-            artifact_digest: None,
-            registered_by: "root".into(),
-            registered_at_ms: 1,
-            require_runtime_evidence: true,
-            evidence_provider: identity().provider,
-            evidence_model: identity().model,
-            evidence_profile_version: identity().profile_version,
-            evidence_artifact_digest: identity().artifact_digest,
-            evidence_endpoint: identity().endpoint,
-        };
+        let profile = opt_in_profile("sales", SERVED_ORIGIN, Some(DIGEST));
         assert_eq!(
             admit_hosted_runtime_evidence(
                 &db,
@@ -1309,17 +1328,12 @@ mod tests {
 
     #[test]
     fn opt_in_profile_without_digest_is_invalid() {
-        let profile = HostedRoutingProfile {
-            namespace: "sales".into(),
-            profile_id: "hosted:acme".into(),
-            require_runtime_evidence: true,
-            evidence_provider: identity().provider,
-            evidence_model: identity().model,
-            evidence_profile_version: identity().profile_version,
-            evidence_endpoint: identity().endpoint,
-            ..Default::default()
-        };
-        assert!(identity_from_hosted_profile(&profile).is_err());
+        let profile = opt_in_profile("sales", SERVED_ORIGIN, None);
+        assert!(
+            identity_from_hosted_profile(&profile)
+                .unwrap_err()
+                .contains("artifact_digest is required")
+        );
         assert!(ModelReleaseEvidenceFailure::matches_message(
             REFUSAL_MISSING
         ));
@@ -1331,22 +1345,61 @@ mod tests {
 
     #[test]
     fn opt_in_profile_rejects_a_mismatched_route_digest() {
-        let profile = HostedRoutingProfile {
-            namespace: "sales".into(),
-            profile_id: "hosted:acme".into(),
-            artifact_digest: Some(format!("sha256:{}", "ab".repeat(32))),
-            require_runtime_evidence: true,
-            evidence_provider: identity().provider,
-            evidence_model: identity().model,
-            evidence_profile_version: identity().profile_version,
-            evidence_artifact_digest: identity().artifact_digest,
-            evidence_endpoint: identity().endpoint,
-            ..Default::default()
-        };
+        let profile = opt_in_profile(
+            "sales",
+            SERVED_ORIGIN,
+            Some(&format!("sha256:{}", "ab".repeat(32))),
+        );
         assert!(
             identity_from_hosted_profile(&profile)
                 .unwrap_err()
                 .contains("must match the profile artifact_digest")
+        );
+    }
+
+    #[test]
+    fn opt_in_profile_refuses_a_foreign_namespace_that_omits_digest() {
+        use crate::db::store::ChiseiStore;
+        let db = ChiseiStore::memory();
+        let (key, roots) = signing_pair();
+        install_trust_roots(&db, roots, NOW_MS).unwrap();
+        let evidence = sign_runtime_evidence(runtime_draft_for(bound_identity()), &key).unwrap();
+        ingest_runtime_evidence(&db, evidence, NOW_MS).unwrap();
+        let mut foreign = opt_in_profile("other-ns", SERVED_ORIGIN, None);
+        foreign.evidence_endpoint = identity().endpoint;
+        assert!(
+            identity_from_hosted_profile(&foreign)
+                .unwrap_err()
+                .contains("artifact_digest is required")
+        );
+        assert_eq!(
+            admit_hosted_runtime_evidence(
+                &db,
+                &foreign,
+                Some("hosted.acme/qwen-coder"),
+                NOW_MS,
+                Some("root")
+            )
+            .unwrap_err(),
+            ModelReleaseEvidenceFailure::Invalid
+        );
+        let other_origin =
+            opt_in_profile("other-ns", "https://elsewhere.example.com", Some(DIGEST));
+        assert!(
+            identity_from_hosted_profile(&other_origin)
+                .unwrap_err()
+                .contains("evidence_endpoint must match the served endpoint origin")
+        );
+        assert_eq!(
+            admit_hosted_runtime_evidence(
+                &db,
+                &other_origin,
+                Some("hosted.acme/qwen-coder"),
+                NOW_MS,
+                Some("root")
+            )
+            .unwrap_err(),
+            ModelReleaseEvidenceFailure::Invalid
         );
     }
     #[test]
@@ -1355,24 +1408,10 @@ mod tests {
         let db = ChiseiStore::memory();
         let (key, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();
-        let evidence = sign_runtime_evidence(runtime_draft(), &key).unwrap();
+        let evidence = sign_runtime_evidence(runtime_draft_for(bound_identity()), &key).unwrap();
         ingest_runtime_evidence(&db, evidence, NOW_MS).unwrap();
-        let profile = HostedRoutingProfile {
-            namespace: "sales".into(),
-            profile_id: "hosted:acme".into(),
-            endpoint_origin: "https://models.example".into(),
-            model_patterns: vec!["qwen-*".into()],
-            credential_ref: "ACME".into(),
-            artifact_digest: None,
-            registered_by: "root".into(),
-            registered_at_ms: 1,
-            require_runtime_evidence: true,
-            evidence_provider: identity().provider,
-            evidence_model: identity().model,
-            evidence_profile_version: identity().profile_version,
-            evidence_artifact_digest: identity().artifact_digest,
-            evidence_endpoint: identity().endpoint,
-        };
+        let mut profile = opt_in_profile("sales", SERVED_ORIGIN, Some(DIGEST));
+        profile.model_patterns = vec!["qwen-*".into()];
         assert_eq!(
             admit_hosted_runtime_evidence(
                 &db,
