@@ -5,7 +5,9 @@
 //! gateway-shared slice in `sekai-domain`.
 
 pub mod classification_lattice;
+pub mod dataset;
 pub mod dataset_version;
+pub mod decision_ledger;
 pub mod evidence;
 pub mod evidence_vocabulary;
 pub mod evolve;
@@ -13,7 +15,10 @@ pub mod governed_subject_provenance;
 pub mod governed_transform;
 pub mod json;
 pub mod markings;
+pub mod object_schema;
 pub mod object_security;
+pub mod object_type_index;
+pub mod parked_work;
 pub mod policy_decision;
 pub mod principal;
 pub mod purpose_authorization;
