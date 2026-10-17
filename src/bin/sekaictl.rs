@@ -767,7 +767,8 @@ fn print_admin_usage() {
          \n\
          Store:\n\
            sekaictl admin store relocate ...\n\
-           sekaictl admin store restamp ..."
+           sekaictl admin store restamp ...\n\
+           sekaictl admin store migrate-object-log ..."
     );
 }
 

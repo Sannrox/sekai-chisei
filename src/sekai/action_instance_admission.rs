@@ -1990,8 +1990,13 @@ mod tests {
             assert_eq!(receipt.ontology_digest.as_deref(), Some(ONTOLOGY_DIGEST));
             let store = mikura::Store::open(&log).unwrap();
             assert_eq!(
-                crate::sekai::object_log::identity_generation(&store, "customer_record", "rec-log")
-                    .unwrap(),
+                crate::sekai::object_log::identity_generation(
+                    &store,
+                    "acme",
+                    "customer_record",
+                    "rec-log"
+                )
+                .unwrap(),
                 1
             );
             assert!(
@@ -2039,6 +2044,7 @@ mod tests {
             assert_eq!(
                 crate::sekai::object_log::identity_generation(
                     &store,
+                    "acme",
                     "customer_record",
                     "rec-retry"
                 )
@@ -2085,6 +2091,7 @@ mod tests {
             assert_eq!(
                 crate::sekai::object_log::identity_generation(
                     &store,
+                    "acme",
                     "customer_record",
                     "rec-catchup"
                 )

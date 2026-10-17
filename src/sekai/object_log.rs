@@ -2,8 +2,9 @@
 //!
 //! `SEKAI_OBJECT_INDEX_DUAL_READ` compares SQL hop engines. This gate compares
 //! the SQL projection to in-process mikura `ObjectSet::evaluate` (ADR 0081).
-//! ADR 0091: the log owns identity generations; EvaluateObjectSet keeps the
-//! SQL serving projection because the tagged log is not namespace-scoped.
+//! ADR 0091 / ADR 0112: the log owns identity generations keyed by
+//! `(namespace, kind, key)`; EvaluateObjectSet keeps the SQL serving
+//! projection.
 
 use crate::domain::Object;
 use crate::sekai::object_security::ObjectSecurityPolicy;
@@ -334,6 +335,7 @@ pub fn map_evaluate_request(
         }
     }
     Ok(EvaluateRequest {
+        namespace: descriptor.namespace.clone(),
         root_kind: descriptor.kind.clone(),
         hops: hops
             .iter()
@@ -560,9 +562,11 @@ pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Optio
         // reason to fail the admission.
         // #1127: a direct identity lookup replaces the full-kind scan.
         let existing = with_cached_object_log_store(&path, |store| {
-            Ok(visible_record(store, &object.kind, &object.id)
-                .filter(|record| record.props == object.properties)
-                .map(|record| record.r#gen))
+            Ok(
+                visible_record(store, &object.namespace, &object.kind, &object.id)
+                    .filter(|record| record.props == object.properties)
+                    .map(|record| record.r#gen),
+            )
         });
         if let Ok(Some(generation)) = existing {
             return Ok(Some(generation));
@@ -798,7 +802,11 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
         let mut seen = HashSet::new();
         let mut batch = Vec::new();
         pending.retain(|ticket| {
-            if !seen.insert((ticket.object.kind.clone(), ticket.object.id.clone())) {
+            if !seen.insert((
+                ticket.object.namespace.clone(),
+                ticket.object.kind.clone(),
+                ticket.object.id.clone(),
+            )) {
                 return true;
             }
             batch.push(ticket.clone());
@@ -813,7 +821,12 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
         return Ok(());
     }
     let generation = |store: &Store, ticket: &IngestTicket| {
-        identity_generation(store, &ticket.object.kind, &ticket.object.id)
+        identity_generation(
+            store,
+            &ticket.object.namespace,
+            &ticket.object.kind,
+            &ticket.object.id,
+        )
     };
     let pages_before = store.committed_pages();
     let records = batch
@@ -873,9 +886,56 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
     Err(error)
 }
 
+/// Resolve one V1 `(kind, key)` to a plane namespace from the SQL projection.
+/// Unknown identities and collisions fail closed (ADR 0112).
+pub fn projection_namespace_for(
+    rows: &[(String, String, String)],
+    kind: &str,
+    key: &str,
+) -> Result<String, String> {
+    let mut found = None;
+    for (namespace, row_kind, row_key) in rows {
+        if row_kind != kind || row_key != key {
+            continue;
+        }
+        match &found {
+            None => found = Some(namespace.clone()),
+            Some(existing) if existing == namespace => {}
+            Some(existing) => {
+                return Err(format!(
+                    "{kind}/{key} is in more than one namespace ({existing} and {namespace})"
+                ));
+            }
+        }
+    }
+    found.ok_or_else(|| format!("{kind}/{key} is unknown to the object projection"))
+}
+
+/// Copy a `MIKURAV1` log to a namespaced `MIKURAV2` log. `src` is only read.
+pub fn migrate_unnamespaced_object_log(
+    src: &Path,
+    dst: &Path,
+    mut namespace_for: impl FnMut(&str, &str) -> Result<String, String>,
+) -> Result<usize, String> {
+    Store::migrate_unnamespaced_with(src, dst, |kind, key| namespace_for(kind, key))
+}
+
+/// Assign each V1 identity its plane namespace from SQL projection rows
+/// `(namespace, kind, source_key)`.
+pub fn migrate_unnamespaced_object_log_from_projection(
+    src: &Path,
+    dst: &Path,
+    rows: &[(String, String, String)],
+) -> Result<usize, String> {
+    migrate_unnamespaced_object_log(src, dst, |kind, key| {
+        projection_namespace_for(rows, kind, key)
+    })
+}
+
 fn object_record(object: &Object) -> ObjectRecord {
     ObjectRecord {
         r#gen: 0,
+        namespace: object.namespace.clone(),
         kind: object.kind.clone(),
         key: object.id.clone(),
         hidden: false,
@@ -883,20 +943,26 @@ fn object_record(object: &Object) -> ObjectRecord {
         // stays the receipted clerk admission.
         action_id: None,
         props: object.properties.clone(),
+        schema_version: 1,
     }
 }
 
-pub fn identity_generation(store: &Store, kind: &str, key: &str) -> Result<u64, String> {
-    visible_record(store, kind, key)
+pub fn identity_generation(
+    store: &Store,
+    namespace: &str,
+    kind: &str,
+    key: &str,
+) -> Result<u64, String> {
+    visible_record(store, namespace, kind, key)
         .map(|record| record.r#gen)
-        .ok_or_else(|| format!("mikura identity missing for {kind}:{key}"))
+        .ok_or_else(|| format!("mikura identity missing for {namespace}/{kind}:{key}"))
 }
 
 /// The current visible record for one identity, by direct lookup. Missing or
 /// hidden identities read as absent, as the v0.1 visible-kind scan did.
-fn visible_record(store: &Store, kind: &str, key: &str) -> Option<ObjectRecord> {
+fn visible_record(store: &Store, namespace: &str, kind: &str, key: &str) -> Option<ObjectRecord> {
     store
-        .load(kind, key, &PropertyAcl::allow_all())
+        .load(namespace, kind, key, &PropertyAcl::allow_all())
         .ok()
         .filter(|record| !record.hidden)
 }
@@ -961,7 +1027,10 @@ mod tests {
         assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 1);
         assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 2);
         let store = Store::open(&log).unwrap();
-        assert_eq!(identity_generation(&store, "Customer", "c1").unwrap(), 2);
+        assert_eq!(
+            identity_generation(&store, "sales", "Customer", "c1").unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -992,7 +1061,7 @@ mod tests {
         let ingest_and_read = |cache: &Mutex<Option<CachedObjectLogStore>>, path: &Path| {
             with_object_log_store_cache(cache, path, |store| {
                 BatchIngest::run(store, vec![object_record(&object)])?;
-                identity_generation(store, &object.kind, &object.id)
+                identity_generation(store, &object.namespace, &object.kind, &object.id)
             })
         };
 
@@ -1063,10 +1132,14 @@ mod tests {
                 vec![ObjectRecord {
                     action_id: None,
                     r#gen: generation,
+
+                    namespace: "sales".into(),
                     kind: "Customer".into(),
                     key: "c1".into(),
                     hidden: false,
                     props: HashMap::from([("n".into(), generation.to_string())]),
+
+                    schema_version: 1,
                 }],
             )
             .unwrap();
@@ -1158,7 +1231,7 @@ mod tests {
         assert_eq!(store.committed_pages(), pages_before + 1);
         for (id, generation) in ["q1", "q2", "q3", "q4", "leader"].iter().zip(&generations) {
             assert_eq!(
-                identity_generation(&store, "Customer", id).unwrap(),
+                identity_generation(&store, "sales", "Customer", id).unwrap(),
                 *generation
             );
         }
@@ -1223,7 +1296,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         for (id, generation) in ["same", "new-1", "new-2"].iter().zip(&generations) {
             assert_eq!(
-                identity_generation(&store, "Customer", id).unwrap(),
+                identity_generation(&store, "sales", "Customer", id).unwrap(),
                 *generation
             );
         }
@@ -1237,7 +1310,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         for (id, generation) in ["same", "new-1", "new-2"].iter().zip(&generations) {
             assert_eq!(
-                identity_generation(&store, "Customer", id).unwrap(),
+                identity_generation(&store, "sales", "Customer", id).unwrap(),
                 *generation
             );
         }
@@ -1276,7 +1349,7 @@ mod tests {
         assert!(newer > older, "the newer admit commits after its twin");
         let store = Store::open(&path).unwrap();
         assert_eq!(
-            identity_generation(&store, "Customer", "twin").unwrap(),
+            identity_generation(&store, "sales", "Customer", "twin").unwrap(),
             newer
         );
     }
@@ -1367,7 +1440,7 @@ mod tests {
         assert_eq!(results.len(), 80);
         for (id, generation) in &results {
             assert_eq!(
-                identity_generation(&store, "Customer", id).unwrap(),
+                identity_generation(&store, "sales", "Customer", id).unwrap(),
                 *generation
             );
         }
@@ -1385,22 +1458,32 @@ mod tests {
                 ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+
+                    namespace: "sales".into(),
                     kind: "Customer".into(),
                     key: "c1".into(),
                     hidden: false,
                     props: HashMap::from([("region".into(), "eu".into())]),
+
+                    schema_version: 1,
                 },
                 ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+
+                    namespace: "sales".into(),
                     kind: "Order".into(),
                     key: "o1".into(),
                     hidden: false,
                     props: HashMap::from([("customer_id".into(), "c1".into())]),
+
+                    schema_version: 1,
                 },
                 ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+
+                    namespace: "sales".into(),
                     kind: "Shipment".into(),
                     key: "s1".into(),
                     hidden: false,
@@ -1408,10 +1491,14 @@ mod tests {
                         ("order_id".into(), "o1".into()),
                         ("amount".into(), "10".into()),
                     ]),
+
+                    schema_version: 1,
                 },
                 ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+
+                    namespace: "sales".into(),
                     kind: "Shipment".into(),
                     key: "s-hidden".into(),
                     hidden: true,
@@ -1419,11 +1506,14 @@ mod tests {
                         ("order_id".into(), "o1".into()),
                         ("amount".into(), "99".into()),
                     ]),
+
+                    schema_version: 1,
                 },
             ],
         )
         .unwrap();
         let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
@@ -1474,6 +1564,8 @@ mod tests {
             vec![ObjectRecord {
                 action_id: None,
                 r#gen: 1,
+
+                namespace: "sales".into(),
                 kind: "Shipment".into(),
                 key: "s2".into(),
                 hidden: false,
@@ -1481,6 +1573,8 @@ mod tests {
                     ("order_id".into(), "o1".into()),
                     ("amount".into(), "5".into()),
                 ]),
+
+                schema_version: 1,
             }],
         )
         .unwrap();
@@ -1524,6 +1618,7 @@ mod tests {
     #[test]
     fn incoming_hop_fails_closed_instead_of_outbound() {
         let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
@@ -1613,6 +1708,7 @@ mod tests {
             sample_n: 2,
         };
         let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
@@ -1652,6 +1748,7 @@ mod tests {
 
     fn canary_descriptor() -> ObjectSetDescriptor {
         ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         }
@@ -1798,6 +1895,8 @@ mod tests {
             &mut store,
             vec![ObjectRecord {
                 r#gen: 0,
+
+                namespace: "sales".into(),
                 kind: "Customer".into(),
                 key: "c1".into(),
                 hidden: false,
@@ -1808,10 +1907,12 @@ mod tests {
                     ("secret".into(), "s".into()),
                     ("email".into(), "e".into()),
                 ]),
+
+                schema_version: 1,
             }],
         )
         .unwrap();
-        let visible = store.load("Customer", "c1", &acl).unwrap();
+        let visible = store.load("sales", "Customer", "c1", &acl).unwrap();
         let mut keys = visible.props.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, ["region", "tier"]);
@@ -1828,6 +1929,8 @@ mod tests {
         let record = |kind: &str, key: &str, props: &[(&str, &str)]| ObjectRecord {
             action_id: None,
             r#gen: 1,
+
+            namespace: "sales".into(),
             kind: kind.into(),
             key: key.into(),
             hidden: false,
@@ -1835,6 +1938,8 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).into(), (*value).into()))
                 .collect(),
+
+            schema_version: 1,
         };
         BatchIngest::run(
             &mut store,
@@ -1864,12 +1969,13 @@ mod tests {
         .unwrap();
         assert!(
             !store
-                .load("Customer", "c1", &acl)
+                .load("sales", "Customer", "c1", &acl)
                 .unwrap()
                 .props
                 .contains_key("secret")
         );
         let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
@@ -1944,5 +2050,149 @@ mod tests {
             project_object_log_acl([customer_kind(None, None, &["anything"])]).unwrap(),
             PropertyAcl::allow_all()
         );
+    }
+
+    #[test]
+    fn projection_namespace_fails_closed_on_unknown_and_colliding_identities() {
+        let rows = vec![
+            ("sales".into(), "Customer".into(), "c1".into()),
+            ("ops".into(), "Customer".into(), "c1".into()),
+            ("sales".into(), "Order".into(), "o1".into()),
+        ];
+        assert_eq!(
+            projection_namespace_for(&rows, "Order", "o1").unwrap(),
+            "sales"
+        );
+        let unknown = projection_namespace_for(&rows, "Customer", "missing").unwrap_err();
+        assert!(unknown.contains("unknown"), "{unknown}");
+        let clash = projection_namespace_for(&rows, "Customer", "c1").unwrap_err();
+        assert!(clash.contains("more than one namespace"), "{clash}");
+    }
+
+    #[test]
+    fn two_namespaces_keep_separate_generations_for_the_same_kind_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let sales = crate::domain::Object {
+            id: "shared".into(),
+            kind: "Customer".into(),
+            name: "Sales".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        let ops = crate::domain::Object {
+            id: "shared".into(),
+            kind: "Customer".into(),
+            name: "Ops".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "us".into())]),
+            created: 1,
+            updated: 1,
+        };
+        assert_eq!(apply_admitted_object_to_log(&log, &sales).unwrap(), 1);
+        assert_eq!(apply_admitted_object_to_log(&log, &ops).unwrap(), 1);
+        assert_eq!(apply_admitted_object_to_log(&log, &sales).unwrap(), 2);
+        let store = Store::open(&log).unwrap();
+        assert_eq!(
+            identity_generation(&store, "sales", "Customer", "shared").unwrap(),
+            2
+        );
+        assert_eq!(
+            identity_generation(&store, "ops", "Customer", "shared").unwrap(),
+            1
+        );
+        drop(store);
+        let reopened = Store::open(&log).unwrap();
+        assert_eq!(
+            identity_generation(&reopened, "sales", "Customer", "shared").unwrap(),
+            2
+        );
+        assert_eq!(
+            identity_generation(&reopened, "ops", "Customer", "shared").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pre_namespace_log_fails_closed_naming_the_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("legacy.mikura");
+        std::fs::write(&log, include_bytes!("mikurav1_superblock.bin")).unwrap();
+        let error = Store::open(&log).err().expect("V1 open must fail closed");
+        assert!(error.contains("migrate_unnamespaced"), "{error}");
+    }
+
+    #[test]
+    fn projection_migration_answers_generations_and_dual_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("legacy.mikura");
+        let dst = dir.path().join("objects.mikura");
+        std::fs::write(&src, include_bytes!("mikurav1_records.bin")).unwrap();
+        let src_bytes = std::fs::read(&src).unwrap();
+        let rows = vec![
+            ("sales".into(), "Customer".into(), "c1".into()),
+            ("sales".into(), "Order".into(), "o1".into()),
+            ("sales".into(), "Shipment".into(), "s1".into()),
+        ];
+        assert_eq!(
+            migrate_unnamespaced_object_log_from_projection(&src, &dst, &rows).unwrap(),
+            3
+        );
+        assert_eq!(std::fs::read(&src).unwrap(), src_bytes);
+        let store = Store::open(&dst).unwrap();
+        assert_eq!(
+            identity_generation(&store, "sales", "Customer", "c1").unwrap(),
+            1
+        );
+        drop(store);
+
+        let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            ..ObjectSetDescriptor::default()
+        };
+        let hops = vec![
+            crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "Order".into(),
+                join_property: "customer_id".into(),
+                ..Default::default()
+            },
+            crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "Shipment".into(),
+                join_property: "order_id".into(),
+                ..Default::default()
+            },
+        ];
+        let aggregation = ObjectSetAggregation {
+            function: "sum".into(),
+            property: "amount".into(),
+            group_by: String::new(),
+        };
+        let customer = member("Customer", "c1", "region", "eu");
+        let order = member("Order", "o1", "customer_id", "c1");
+        let shipment = member("Shipment", "s1", "amount", "10");
+        let paths = vec![vec![&customer, &order, &shipment]];
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        compare_sql_to_log_with_cache(
+            &cache,
+            &dst,
+            &descriptor,
+            &hops,
+            &aggregation,
+            &paths,
+            PropertyAcl::allow_all(),
+        )
+        .unwrap();
+        let unknown = migrate_unnamespaced_object_log_from_projection(
+            &src,
+            &dir.path().join("empty.mikura"),
+            &[("sales".into(), "Customer".into(), "c1".into())],
+        )
+        .unwrap_err();
+        assert!(unknown.contains("unknown"), "{unknown}");
     }
 }

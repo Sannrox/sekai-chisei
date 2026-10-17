@@ -84,6 +84,7 @@ mod namespace_object_generation_adr;
 mod native_server_smoke;
 mod object_change_subscription_adr;
 mod object_log_host_adr;
+mod object_log_identity_adr;
 mod object_security_backend_conformance;
 mod object_security_property_grant_adr;
 mod object_security_property_read_adr;
@@ -246,6 +247,7 @@ const GROUPED_MODULES: &[&str] = &[
     "native_server_smoke",
     "object_change_subscription_adr",
     "object_log_host_adr",
+    "object_log_identity_adr",
     "object_security_backend_conformance",
     "object_security_property_grant_adr",
     "object_security_property_read_adr",
@@ -402,6 +404,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 133);
+    assert_eq!(GROUPED_MODULES.len(), 134);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

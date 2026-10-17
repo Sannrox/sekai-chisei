@@ -293,6 +293,23 @@ impl PostgresDb {
         Ok(members)
     }
 
+    pub fn object_log_migration_identities(&self) -> Result<Vec<(String, String, String)>, String> {
+        self.connection()?
+            .query(
+                "SELECT namespace, kind, source_key
+                 FROM sekai_object_type_index_member
+                 UNION
+                 SELECT namespace, kind, id
+                 FROM sekai_objects
+                 ORDER BY 1, 2, 3",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| Ok((row.get(0), row.get(1), row.get(2))))
+            .collect()
+    }
+
     pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
         self.connection()?
             .query_one(

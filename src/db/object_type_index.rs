@@ -411,6 +411,30 @@ impl SekaiDb {
         Ok(members)
     }
 
+    pub fn object_log_migration_identities(&self) -> Result<Vec<(String, String, String)>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT namespace, kind, source_key
+                 FROM sekai_object_type_index_member
+                 UNION
+                 SELECT namespace, kind, id
+                 FROM sekai_objects
+                 ORDER BY 1, 2, 3",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            out.push((
+                row.get(0).map_err(|error| error.to_string())?,
+                row.get(1).map_err(|error| error.to_string())?,
+                row.get(2).map_err(|error| error.to_string())?,
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
         self.conn()
             .query_row(
@@ -1554,6 +1578,46 @@ mod tests {
         assert_eq!(
             region_only[0].properties,
             BTreeMap::from([("region".into(), "eu".into())])
+        );
+    }
+
+    #[test]
+    fn object_log_migration_identities_lists_each_projection_row() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        db.create_object(&crate::domain::Object {
+            id: "rec-log".into(),
+            kind: "customer_record".into(),
+            name: "rec-log".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            db.object_log_migration_identities().unwrap(),
+            vec![
+                ("acme".into(), "customer_record".into(), "rec-log".into()),
+                ("sales".into(), "Customer".into(), "c1".into()),
+            ]
         );
     }
 }
