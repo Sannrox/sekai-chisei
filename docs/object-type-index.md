@@ -41,8 +41,12 @@ host. See [ADR 0088](decisions/0088-one-object-log-host-many-clerk-clients.md).
 or lagging. Hidden rows never appear in members, counts, order, errors, or
 continuation tokens. Existing `object_type_index*` tables are retained as a
 rebuildable projection: `ReindexObjectType` rematerializes them; they are
-not recovery material. The tagged object-log is `(kind, key)` identity, not
-a namespace-scoped evaluate backend ([ADR 0091](decisions/0091-object-log-owns-evaluate-identity.md)).
+not recovery material. Object-log identity is `(namespace, kind, key)`
+([ADR 0112](decisions/0112-namespaced-object-log-identity.md)). A pre-namespace
+`MIKURAV1` log fails closed on open until
+`sekaictl admin store migrate-object-log --src <legacy> --dst <namespaced>`
+assigns each `(kind, key)` its plane namespace from this projection and
+from clerk objects.
 The SQL index is the serving backend.
 `SEKAI_OBJECT_LOG_DUAL_READ=1` with `SEKAI_OBJECT_LOG` is a canary: it
 compares hop/count/sum answers to a tagged in-process object-log library on
