@@ -577,6 +577,16 @@ pub struct ModelIdentity {
     pub endpoint: String,
 }
 
+/// Isolated-process work about to be returned to a runner (#1588).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedProcessJob {
+    pub run_id: String,
+    pub namespace: String,
+    /// Seconds the runner is expected to hold. `0` means the extension should
+    /// apply its own estimate.
+    pub estimated_seconds: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionError {
     CredentialNotFound,
@@ -795,6 +805,20 @@ pub trait EnterpriseExtension: Send + Sync {
         Ok(())
     }
 
+    /// Admit or refuse an isolated-process claim before the runner receives
+    /// it (#1588). Community `TenantQuotaGate` still runs separately.
+    ///
+    /// Default: admit. Return `PermissionDenied` to skip and defer this claim,
+    /// or `Unavailable` when the admission policy cannot decide.
+    fn admit_isolated_process_job(
+        &self,
+        context: &AuthenticatedContext,
+        job: &IsolatedProcessJob,
+    ) -> Result<(), ExtensionError> {
+        let _ = (context, job);
+        Ok(())
+    }
+
     /// Resolve a tenant-scoped model-provider credential (#118).
     ///
     /// Default: unavailable. Enterprise distributions must implement this so
@@ -929,6 +953,19 @@ mod tests {
         assert_eq!(
             extension.authorize_namespace(&context, "other", NamespaceAction::Write),
             Err(ExtensionError::PermissionDenied)
+        );
+        let auth = extension.authenticate_context("test-token").unwrap();
+        assert!(
+            extension
+                .admit_isolated_process_job(
+                    &auth,
+                    &IsolatedProcessJob {
+                        run_id: "run-1".into(),
+                        namespace: "allowed".into(),
+                        estimated_seconds: 30,
+                    }
+                )
+                .is_ok()
         );
     }
 
