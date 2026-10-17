@@ -2699,6 +2699,7 @@ name = "sekai-types"
 version = "1.0.0"
 dependencies = [
  "base64 0.23.1",
+ "ed25519-dalek",
  "hmac 0.12.1",
  "sekai-domain",
  "serde",

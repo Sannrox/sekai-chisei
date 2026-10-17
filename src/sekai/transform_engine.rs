@@ -5,20 +5,24 @@
 //! envelope. This host registers only caller-supplied dataset rows, rejects
 //! statements other than SELECT/WITH, and bounds memory and wall time.
 
-use super::governed_transform::{TransformError, TransformStep};
+use super::governed_transform::TransformError;
 use rusqlite::config::DbConfig;
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, InterruptHandle, params_from_iter};
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::{c_int, c_void};
-use std::iter::Peekable;
 use std::ptr;
-use std::str::Chars;
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+pub use sekai_types::transform_sql::{
+    BUDGET_MEMORY, BUDGET_TIME, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_TIME_LIMIT_MS,
+    compile_steps_sql, host_limit, quote_column, quote_ident, sql_is_row_local,
+    validate_analytical_sql,
+};
 
 static ALLOC_INSTALL: Once = Once::new();
 static ALLOC_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -215,129 +219,6 @@ unsafe extern "C" fn engine_realloc(allocated: *mut c_void, requested: c_int) ->
     resized
 }
 
-pub const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_TIME_LIMIT_MS: u64 = 5_000;
-pub const BUDGET_TIME: &str = "transform_budget_time";
-pub const BUDGET_MEMORY: &str = "transform_budget_memory";
-
-const FORBIDDEN_SQL: &[&str] = &[
-    "attach",
-    "detach",
-    "load",
-    "pragma",
-    "insert",
-    "update",
-    "delete",
-    "drop",
-    "create",
-    "alter",
-    "vacuum",
-    "copy",
-    "import",
-    "export",
-    "install",
-    "uninstall",
-    "reindex",
-];
-
-const FULL_SCAN_SQL: &[&str] = &[
-    "join",
-    "group",
-    "union",
-    "intersect",
-    "except",
-    "distinct",
-    "having",
-    "window",
-    "over",
-    "recursive",
-    "count",
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "total",
-];
-
-/// Compile `filter` / `project` steps to a single SELECT over `alias`.
-pub fn compile_steps_sql(steps: &[TransformStep], alias: &str) -> Result<String, TransformError> {
-    let ident = quote_ident(alias)?;
-    let mut sql = format!("SELECT * FROM {ident}");
-    for step in steps {
-        match step.kind.trim().to_ascii_lowercase().as_str() {
-            "filter" => {
-                let column = quote_column(&step.column)?;
-                let value = quote_string(&step.value);
-                let predicate = match step.op.as_str() {
-                    "eq" | "" => format!("{column} = {value}"),
-                    "neq" => format!("{column} != {value}"),
-                    other => {
-                        return Err(TransformError::InvalidArgument(format!(
-                            "unsupported transform filter op {other}"
-                        )));
-                    }
-                };
-                sql = format!("SELECT * FROM ({sql}) WHERE {predicate}");
-            }
-            "project" if !step.columns.is_empty() => {
-                let mut columns = Vec::new();
-                for column in &step.columns {
-                    columns.push(quote_column(column)?);
-                }
-                sql = format!("SELECT {} FROM ({sql})", columns.join(", "));
-            }
-            "project" => {}
-            other => {
-                return Err(TransformError::InvalidArgument(format!(
-                    "unsupported transform step {other}"
-                )));
-            }
-        }
-    }
-    Ok(sql)
-}
-
-pub fn validate_analytical_sql(sql: &str) -> Result<(), TransformError> {
-    let trimmed = sql.trim();
-    if trimmed.is_empty() {
-        return Err(TransformError::InvalidArgument(
-            "transform sql required".into(),
-        ));
-    }
-    let body = trimmed.trim_end_matches(';').trim();
-    if sql_has_internal_semicolon(body) {
-        return Err(TransformError::InvalidArgument(
-            "transform sql must be a single statement".into(),
-        ));
-    }
-    let first = body
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if first != "select" && first != "with" {
-        return Err(TransformError::InvalidArgument(
-            "transform sql must be a SELECT".into(),
-        ));
-    }
-    for token in tokenize_sql(body) {
-        if FORBIDDEN_SQL.contains(&token.as_str()) {
-            return Err(TransformError::InvalidArgument(format!(
-                "transform sql must not use {token}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// True when the SQL is a row-local filter/project and can reuse the
-/// projection watermark. Joins and aggregates need a full recompute.
-pub fn sql_is_row_local(sql: &str) -> bool {
-    tokenize_sql(sql)
-        .iter()
-        .all(|token| !FULL_SCAN_SQL.contains(&token.as_str()))
-}
-
 pub struct EngineTable {
     pub alias: String,
     pub rows: Vec<HashMap<String, String>>,
@@ -524,14 +405,6 @@ fn register_table(
     Ok(())
 }
 
-pub fn host_limit(requested: u64, max: u64) -> u64 {
-    if requested == 0 {
-        max
-    } else {
-        requested.min(max)
-    }
-}
-
 struct EngineBudget {
     deadline: Instant,
     memory: u64,
@@ -626,144 +499,9 @@ fn map_engine_error(error: rusqlite::Error) -> TransformError {
     TransformError::InvalidArgument(format!("analytical query failed: {error}"))
 }
 
-fn quote_ident(name: &str) -> Result<String, TransformError> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(TransformError::InvalidArgument(
-            "identifier required".into(),
-        ));
-    }
-    let mut chars = trimmed.chars();
-    let first = chars.next().expect("non-empty");
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return Err(TransformError::InvalidArgument(
-            "identifier must start with a letter".into(),
-        ));
-    }
-    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-        return Err(TransformError::InvalidArgument(
-            "identifier must be alphanumeric".into(),
-        ));
-    }
-    Ok(format!("\"{trimmed}\""))
-}
-
-fn quote_column(name: &str) -> Result<String, TransformError> {
-    if name.is_empty() || name.contains('\0') {
-        return Err(TransformError::InvalidArgument(
-            "identifier required".into(),
-        ));
-    }
-    Ok(format!("\"{}\"", name.replace('"', "\"\"")))
-}
-
-fn quote_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn push_sql_token(current: &mut String, tokens: &mut Vec<String>) {
-    if !current.is_empty() {
-        tokens.push(std::mem::take(current).to_ascii_lowercase());
-    }
-}
-
-fn skip_quoted(chars: &mut Peekable<Chars<'_>>, quote: char) {
-    while let Some(ch) = chars.next() {
-        if ch == quote {
-            if chars.peek() == Some(&quote) {
-                chars.next();
-                continue;
-            }
-            break;
-        }
-    }
-}
-
-fn sql_has_internal_semicolon(sql: &str) -> bool {
-    let mut chars = sql.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' | '"' | '`' => skip_quoted(&mut chars, ch),
-            '[' => {
-                for next in chars.by_ref() {
-                    if next == ']' {
-                        break;
-                    }
-                }
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                chars.next();
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut prev = ' ';
-                for next in chars.by_ref() {
-                    if prev == '*' && next == '/' {
-                        break;
-                    }
-                    prev = next;
-                }
-            }
-            ';' => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-fn tokenize_sql(sql: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = sql.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' | '"' | '`' => {
-                push_sql_token(&mut current, &mut tokens);
-                skip_quoted(&mut chars, ch);
-            }
-            '[' => {
-                push_sql_token(&mut current, &mut tokens);
-                for next in chars.by_ref() {
-                    if next == ']' {
-                        break;
-                    }
-                }
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                push_sql_token(&mut current, &mut tokens);
-                chars.next();
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                push_sql_token(&mut current, &mut tokens);
-                chars.next();
-                let mut prev = ' ';
-                for next in chars.by_ref() {
-                    if prev == '*' && next == '/' {
-                        break;
-                    }
-                    prev = next;
-                }
-            }
-            ch if ch.is_ascii_alphanumeric() || ch == '_' => current.push(ch),
-            _ => push_sql_token(&mut current, &mut tokens),
-        }
-    }
-    push_sql_token(&mut current, &mut tokens);
-    tokens
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::governed_transform::TransformStep;
     use super::*;
 
     fn table(alias: &str, rows: Vec<HashMap<String, String>>, columns: Vec<String>) -> EngineTable {
