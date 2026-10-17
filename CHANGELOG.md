@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Enterprise-scoped sessions can publish a governed transform definition with
+  namespace write and read access to its datasets. A scoped Put cannot name a
+  schedule or input-commit trigger. Community Put still requires credential
+  administration. Run stays unadmitted for scoped sessions (#1557).
+
 - A space can be shared across tenants when both the owning tenant and the
   member's home tenant approve. The owning tenant names the namespaces, kinds,
   and marking ceiling the space exposes. Members act under their own home

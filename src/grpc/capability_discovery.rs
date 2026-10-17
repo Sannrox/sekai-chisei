@@ -137,7 +137,7 @@ fn hosted_transform_capability(enabled: bool) -> CapabilityEntry {
         "sekai.PutGovernedTransformRequest",
         "sekai.PutGovernedTransformResponse",
     );
-    entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
+    entry.required_scopes = vec!["namespace:write".into(), "dataset:read".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
     entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
     entry
@@ -151,7 +151,7 @@ fn analytical_transform_capability(enabled: bool) -> CapabilityEntry {
         "sekai.PutGovernedTransformRequest",
         "sekai.PutGovernedTransformResponse",
     );
-    entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
+    entry.required_scopes = vec!["namespace:write".into(), "dataset:read".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
     entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
     entry

@@ -14921,13 +14921,27 @@ async fn scoped_transform_preview_and_reads_cross_server_transport() {
             &authority,
             &["sekai.read", "sekai.write"],
             PutGovernedTransformRequest {
-                transform: Some(transform),
+                transform: Some(transform.clone()),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(put.transform.unwrap().transform_id, "scoped-preview");
+    let run = client
+        .run_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            RunGovernedTransformRequest {
+                namespace: "allowed".into(),
+                transform_id: "scoped-preview".into(),
+                incremental: false,
             },
         ))
         .await
         .unwrap_err();
     assert_eq!(
-        (put.code(), put.message()),
+        (run.code(), run.message()),
         (
             tonic::Code::PermissionDenied,
             "RPC is not available to enterprise-scoped credentials"
@@ -14935,6 +14949,326 @@ async fn scoped_transform_preview_and_reads_cross_server_transport() {
     );
     stop.send(()).unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn scoped_put_governed_transform_requires_namespace_write_and_readable_datasets() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{ANALYTICAL_CLASS, CONTRACT_VERSION};
+    use tower::Layer;
+    let sqlite = Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    );
+    let runtime = Arc::new(RuntimeDb::Sqlite(sqlite));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(runtime.clone());
+    for id in ["scoped-in", "scoped-out", "hidden-in"] {
+        runtime
+            .create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: if id == "hidden-in" {
+                    "hidden-object".into()
+                } else {
+                    String::new()
+                },
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+    }
+    runtime
+        .create_object(&crate::domain::Object {
+            id: "hidden-object".into(),
+            kind: "widget".into(),
+            name: "hidden-object".into(),
+            namespace: "foreign".into(),
+            external_id: "widget:hidden-object".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let authority = Arc::new(AssertionAuthority::new(
+        "https://issuer.test",
+        "https://sekai.test",
+        b"synthetic-transform-put-test-key",
+    ));
+    let interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store.clone(),
+        Some(authority.clone()),
+    );
+    let service = crate::grpc::rpc_identity::RpcIdentityService::new(
+        tonic::service::interceptor::InterceptedService::new(
+            crate::rpc_maturity::RpcMaturityLayer::new(true).layer(
+                crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer::new(
+                    SekaiServiceImpl::new(store),
+                ),
+            ),
+            interceptor,
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let mut client =
+        crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    fn scoped<T>(authority: &AssertionAuthority, scopes: &[&str], body: T) -> Request<T> {
+        let claims = IdentityAssertion {
+            contract_version: IDENTITY_ASSERTION_VERSION.into(),
+            issuer: "https://issuer.test".into(),
+            audience: "https://sekai.test".into(),
+            subject: "subject-a".into(),
+            credential_id: "credential-a".into(),
+            credential_kind: "human_session".into(),
+            space: None,
+            space_role: None,
+            act: None,
+            tenant_id: Some("tenant-test".into()),
+            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            expires_at: chrono::Utc::now().timestamp() + 30,
+            nonce: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut request = Request::new(body);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", authority.sign(&claims).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        request
+    }
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "allowed".into(),
+        transform_id: "scoped-put".into(),
+        input_dataset_id: "scoped-in".into(),
+        output_dataset_id: "scoped-out".into(),
+        profile: ANALYTICAL_CLASS.into(),
+        sql: "SELECT id FROM input".into(),
+        ..GovernedTransform::default()
+    };
+    let put = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(transform.clone()),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(put.transform.unwrap().transform_id, "scoped-put");
+    let listed = client
+        .list_governed_transforms(scoped(
+            &authority,
+            &["sekai.read"],
+            ListGovernedTransformsRequest {
+                namespace: "allowed".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.transforms.len(), 1);
+    let read_only = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read"],
+            PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    transform_id: "scoped-put-ro".into(),
+                    ..transform.clone()
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(read_only.code(), tonic::Code::PermissionDenied);
+    let mut foreign = transform.clone();
+    foreign.namespace = "foreign".into();
+    foreign.transform_id = "scoped-put-foreign".into();
+    let foreign = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(foreign),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    let hidden = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    transform_id: "scoped-put-hidden".into(),
+                    input_dataset_id: "hidden-in".into(),
+                    ..transform.clone()
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::PermissionDenied);
+    let scheduled = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    transform_id: "scoped-put-scheduled".into(),
+                    schedule_every_ms: 60_000,
+                    ..transform.clone()
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (scheduled.code(), scheduled.message()),
+        (
+            tonic::Code::PermissionDenied,
+            "scoped put cannot schedule or trigger execution"
+        )
+    );
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn community_put_governed_transform_still_requires_credential_admin() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    let request = PutGovernedTransformRequest {
+        transform: Some(GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "community-put".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                columns: vec!["id".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    };
+    let denied = svc
+        .put_governed_transform(with_principal(request.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (denied.code(), denied.message()),
+        (tonic::Code::PermissionDenied, "credential admin required")
+    );
+    svc.put_governed_transform(with_named_principal(request, "local"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn community_human_session_put_still_requires_credential_admin() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    let mut req = with_principal(PutGovernedTransformRequest {
+        transform: Some(GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "community-session-put".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                columns: vec!["id".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    });
+    req.extensions_mut()
+        .insert(crate::enterprise::AuthenticatedContext {
+            contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
+            principal: crate::enterprise::AuthenticatedPrincipal {
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+            },
+            credential_kind: crate::enterprise::CredentialKind::HumanSession,
+            space: None,
+            space_role: None,
+            act: None,
+            tenant: None,
+            scopes: vec!["sekai.read".into(), "sekai.write".into()],
+            issuer: "https://issuer.test".into(),
+            resource: "https://sekai.test".into(),
+            expires_at: 100,
+        });
+    let denied = svc.put_governed_transform(req).await.unwrap_err();
+    assert_eq!(
+        (denied.code(), denied.message()),
+        (tonic::Code::PermissionDenied, "credential admin required")
+    );
 }
 
 #[tokio::test]
