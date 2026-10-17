@@ -124,6 +124,8 @@ lives in the separate [research index](research/README.md).
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
   `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
   hops/aggregates, evaluated through authorized list and traverse.
+- [Permission-aware search](search.md) — experimental text search over
+  objects and dataset metadata under the live read policy.
 - [Evidence producer contract](action-evidence-producer-contract.md) —
   evidence submission with optional ActionInstance creation.
 - [Inbound object sync](object-sync.md) — authenticated source batches,

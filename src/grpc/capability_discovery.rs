@@ -48,6 +48,8 @@ impl SekaiServiceImpl {
         entries.push(explain_derivation_capability(entailment));
         entries.push(kioku_candidates_capability());
         let experimental = crate::rpc_maturity::experimental_rpcs_enabled();
+        entries.push(search_query_capability(experimental));
+        entries.push(search_status_capability(experimental));
         entries.push(experimental_rpc_capability(experimental));
         entries.push(hosted_transform_capability(experimental));
         entries.push(analytical_transform_capability(experimental));
@@ -105,6 +107,7 @@ fn capability_product_tier(name: &str) -> &'static str {
         other if other.starts_with("sekai.objects.query.") => "core",
         other if other.starts_with("sekai.actions.") => "advanced",
         other if other.contains("kioku") => "experimental",
+        "sekai.search.query" | "sekai.search.status" => "experimental",
         _ => "advanced",
     }
 }
@@ -459,6 +462,50 @@ fn kioku_candidates_capability() -> CapabilityEntry {
     entry
 }
 
+fn search_query_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        super::search_rpc::SEARCH_CAPABILITY.into(),
+        "Permission-aware full-text search over objects and dataset metadata. Discovery is not a grant.".into(),
+        "query",
+        "sekai.SearchRequest",
+        "sekai.SearchResponse",
+    );
+    entry.required_scopes = vec!["namespace:discover".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "marking".into(),
+        "object_acl".into(),
+        "property_grant".into(),
+        "row_filter".into(),
+    ];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.limits = vec![
+        CapabilityLimit {
+            name: "max_page".into(),
+            value: super::search_rpc::MAX_PAGE_SIZE as u64,
+        },
+        CapabilityLimit {
+            name: "candidate_cap".into(),
+            value: super::search_rpc::CANDIDATE_CAP as u64,
+        },
+    ];
+    entry
+}
+
+fn search_status_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        super::search_rpc::SEARCH_STATUS_CAPABILITY.into(),
+        "Per-namespace search index lag and analyzer identity. Not authority.".into(),
+        "query",
+        "sekai.GetSearchIndexStatusRequest",
+        "sekai.GetSearchIndexStatusResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into()];
+    entry.policy_decision_points = vec!["namespace_access".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry
+}
+
 fn experimental_rpc_capability(enabled: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         crate::rpc_maturity::EXPERIMENTAL_CAPABILITY.into(),
@@ -537,5 +584,18 @@ mod tests {
         );
         let on = scheduler_transform_capability(true);
         assert_eq!(on.lifecycle_state, "active");
+    }
+
+    #[test]
+    fn search_capabilities_are_disabled_when_experimental_rpcs_are_off() {
+        let off = search_query_capability(false);
+        assert_eq!(off.lifecycle_state, "disabled");
+        assert_eq!(off.name, "sekai.search.query");
+        assert_eq!(off.product_tier, "experimental");
+        let on = search_query_capability(true);
+        assert_eq!(on.lifecycle_state, "active");
+        let status = search_status_capability(false);
+        assert_eq!(status.lifecycle_state, "disabled");
+        assert_eq!(status.name, "sekai.search.status");
     }
 }

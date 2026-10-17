@@ -26,6 +26,8 @@ mod ontology_definition_lifecycle;
 mod schema_definition_lifecycle;
 #[path = "scored_knowledge_admission.rs"]
 mod scored_knowledge_admission;
+#[path = "search_rpc.rs"]
+mod search_rpc;
 #[cfg(test)]
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
@@ -662,6 +664,18 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetObjectTypeIndexStatusRequest>,
     ) -> Result<Response<GetObjectTypeIndexStatusResponse>, Status> {
         rpc_objects::get_object_type_index_status(self, req).await
+    }
+    async fn search(
+        &self,
+        req: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        search_rpc::search(self, req).await
+    }
+    async fn get_search_index_status(
+        &self,
+        req: Request<GetSearchIndexStatusRequest>,
+    ) -> Result<Response<GetSearchIndexStatusResponse>, Status> {
+        search_rpc::get_search_index_status(self, req).await
     }
     async fn put_object_type_index_edit(
         &self,

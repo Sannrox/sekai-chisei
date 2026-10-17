@@ -358,6 +358,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "Search",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetSearchIndexStatus",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "PutObjectTypeIndexEdit",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
