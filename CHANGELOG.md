@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- ApplySourceBatch authorizes a page with one namespace-scoped external-id
+  lookup and one active object-policy load per kind, instead of a lookup
+  pair per record (#1438).
+
 - Object-path gRPC workloads (GetObject, ListObjects, EvaluateObjectSet,
   Action apply, policy-checked reads, ApplySourceBatch) are measured at 10⁴/10⁵
   objects on SQLite and PostgreSQL. Scheduled runs start TLS PostgreSQL, fail

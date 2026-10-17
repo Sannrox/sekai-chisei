@@ -2636,6 +2636,60 @@ async fn source_sync_authorized_success_replay_and_state_are_exact() {
     assert_eq!(state_after_older_replay.last_result.as_ref(), Some(&second));
 }
 
+fn source_batch_domain_with_records(
+    namespace: &str,
+    producer: &str,
+    n: usize,
+    idempotency_key: &str,
+) -> crate::sekai::object_sync::SourceBatch {
+    let proto = source_batch(namespace, producer, "", "cursor:1", idempotency_key);
+    let mut domain = from_proto_source_batch(proto).unwrap();
+    let template = domain.records[0].clone();
+    domain.records = (0..n)
+        .map(|i| {
+            let mut record = template.clone();
+            record.external_id = format!("{}", 1000 + i);
+            record
+        })
+        .collect();
+    domain.batch_digest = domain.canonical_digest().unwrap();
+    domain
+}
+
+#[test]
+fn source_batch_object_policy_queries_are_constant_in_record_count() {
+    let svc = service();
+    let namespace = "sync-auth-batch";
+    let producer = "connector/github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    let principals = vec![producer.to_string()];
+    let measure = |n: usize, key: &str| {
+        crate::db::runtime_db::source_batch_auth_counters::LOOKUP_QUERIES.with(|c| c.set(0));
+        crate::db::runtime_db::source_batch_auth_counters::POLICY_LOOKUPS.with(|c| c.set(0));
+        let batch = source_batch_domain_with_records(namespace, producer, n, key);
+        authorize_source_batch_object_policy(svc.db.runtime(), &batch, &principals, None).unwrap();
+        (
+            crate::db::runtime_db::source_batch_auth_counters::LOOKUP_QUERIES.with(|c| c.get()),
+            crate::db::runtime_db::source_batch_auth_counters::POLICY_LOOKUPS.with(|c| c.get()),
+        )
+    };
+    let (lookups_25, policies_25) = measure(25, "batch-25");
+    let (lookups_80, policies_80) = measure(80, "batch-80");
+    assert_eq!(
+        lookups_25, 1,
+        "25-record authorize used {lookups_25} lookups"
+    );
+    assert_eq!(
+        lookups_80, 1,
+        "80-record authorize used {lookups_80} lookups"
+    );
+    assert_eq!(policies_25, policies_80);
+    assert!(
+        policies_25 <= 2,
+        "same-kind batch should resolve policy once, got {policies_25}"
+    );
+}
+
 #[tokio::test]
 async fn source_sync_rejects_anonymous_ambiguous_and_unauthorized_principals() {
     let svc = service();

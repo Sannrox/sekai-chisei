@@ -305,6 +305,30 @@ impl PostgresDb {
             .collect()
     }
 
+    pub fn find_all_by_external_ids_in_namespace(
+        &self,
+        namespace: &str,
+        external_ids: &[String],
+    ) -> Result<Vec<Object>, String> {
+        if external_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = external_ids.to_vec();
+        self.connection()?
+            .query(
+                &format!(
+                    "SELECT {OBJECT_COLUMNS} FROM sekai_objects
+                     WHERE namespace = $1 AND external_id = ANY($2)
+                     ORDER BY id"
+                ),
+                &[&namespace, &ids],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(row_to_object)
+            .collect()
+    }
+
     pub fn find_all_by_external_id_with_policy_context(
         &self,
         external_id: &str,
