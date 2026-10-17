@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Object-path gRPC workloads (GetObject, ListObjects, EvaluateObjectSet,
+  Action apply, policy-checked reads, ApplySourceBatch) are measured at 10⁴/10⁵
+  objects on SQLite and PostgreSQL. Scheduled runs start TLS PostgreSQL, fail
+  a missed published budget or a >20% p95 regression, and reject a matrix that
+  dropped every postgres workload. Pull requests run a wide-budget SQLite smoke
+  subset (#1437).
+
 - Object-log dual-read maps min, max, and avg against the tagged object-log
   when reconstructed hop measures agree with the mikura fixture, including
   zero-hop whole-set aggregates. `group_by`, distinct, multi-key sort, and

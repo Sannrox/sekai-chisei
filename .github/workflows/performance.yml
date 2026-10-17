@@ -1,16 +1,15 @@
 name: Performance
 
-# The full benchmark matrix runs on a schedule and on demand, not per pull
-# request. Issue #98 asks CI for a stable smoke budget and scheduled or release
-# validation for the full matrix; a smoke budget needs thresholds calibrated on
-# this runner, which is what these scheduled runs collect.
+# Adoption workloads stay on the weekly schedule. Object-path workloads also
+# run a wide-budget smoke subset on pull requests (#1437).
 on:
+  pull_request:
   schedule:
     - cron: "41 4 * * 2"
   workflow_dispatch:
     inputs:
       enforce:
-        description: "Fail the run on a significant regression"
+        description: "Fail the adoption-suite run on a significant regression"
         type: boolean
         default: false
 
@@ -18,8 +17,39 @@ permissions:
   contents: read
 
 jobs:
+  object-path-smoke:
+    name: Object-path smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build benchmarks
+        run: cargo build --release --benches --bin perf-gate
+      - name: Run object-path smoke
+        run: |
+          set -euo pipefail
+          SEKAI_BENCH_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          SEKAI_BENCH_HARDWARE="github-hosted ubuntu-latest, $(nproc) vCPU, $(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo) bytes RAM" \
+          SEKAI_BENCH_OS="$(. /etc/os-release && echo "$PRETTY_NAME")" \
+          SEKAI_BENCH_RUSTC="$(rustc --version)" \
+          SEKAI_BENCH_PROFILE="release" \
+          cargo bench --bench control_plane -- benchmarks/manifest-object-path-smoke-v1.json \
+            | sed -n '/^{/,$p' > smoke-report.json
+          python3 - <<'PY'
+          import json, sys
+          report = json.load(open("smoke-report.json"))
+          bad = [row["id"] for row in report["results"] if not row["within_budget"]]
+          if bad:
+              print("smoke budgets missed:", ", ".join(bad))
+              sys.exit(1)
+          print("object-path smoke within budget")
+          PY
+
   benchmark:
     name: Benchmark matrix
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -63,4 +93,107 @@ jobs:
         with:
           name: performance-reports
           path: perf-reports/
+          retention-days: 90
+
+  object-path:
+    name: Object-path matrix
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build benchmarks
+        run: cargo build --release --benches --bin perf-gate
+      - name: Run object-path matrix
+        run: |
+          set -euo pipefail
+          mkdir -p object-path-reports
+          bash scripts/object-path-with-postgres.sh bash -s <<'BENCH'
+          set -euo pipefail
+          for run in 1 2 3; do
+            SEKAI_BENCH_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            SEKAI_BENCH_HARDWARE="github-hosted ubuntu-latest, $(nproc) vCPU, $(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo) bytes RAM" \
+            SEKAI_BENCH_OS="$(. /etc/os-release && echo "$PRETTY_NAME")" \
+            SEKAI_BENCH_RUSTC="$(rustc --version)" \
+            SEKAI_BENCH_PROFILE="release" \
+            cargo bench --bench control_plane -- benchmarks/manifest-object-path-v1.json \
+              | sed -n '/^{/,$p' > "object-path-reports/run-${run}.json"
+          done
+          BENCH
+      - name: Enforce published object-path budgets
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, json, statistics, sys
+          reports = [
+              json.load(open(path))
+              for path in sorted(glob.glob("object-path-reports/run-*.json"))
+          ]
+          if len(reports) < 3:
+              print("need three object-path reports")
+              sys.exit(1)
+          postgres_ids = sorted({
+              row["id"]
+              for report in reports
+              for row in report["results"]
+              if "_postgres_" in row["id"]
+          })
+          if not postgres_ids:
+              print("scheduled object-path matrix dropped every postgres workload")
+              sys.exit(1)
+          missed = sorted({
+              row["id"]
+              for report in reports
+              for row in report["results"]
+              if not row["within_budget"]
+          })
+          if missed:
+              print("published budgets missed:", ", ".join(missed))
+              sys.exit(1)
+          def median_p95(workload_id):
+              values = [
+                  row["p95_latency_us"]
+                  for report in reports
+                  for row in report["results"]
+                  if row["id"] == workload_id
+              ]
+              return statistics.median(values) if values else None
+          for report in reports:
+              for row in report["results"]:
+                  workload_id = row["id"]
+                  prefix = "policy_checked_read_"
+                  if not workload_id.startswith(prefix):
+                      continue
+                  get_id = "get_object_" + workload_id[len(prefix):]
+                  policy = median_p95(workload_id)
+                  unrestricted = median_p95(get_id)
+                  if policy is None or unrestricted is None or unrestricted <= 0:
+                      print("policy overhead missing pair", workload_id, get_id)
+                      sys.exit(1)
+                  overhead = policy / unrestricted - 1.0
+                  if overhead > 0.20:
+                      print(
+                          f"{workload_id} overhead {overhead:.2%} exceeds 20%"
+                      )
+                      sys.exit(1)
+          print("object-path published budgets and policy overhead held")
+          PY
+      - name: Enforce object-path regression gate
+        run: |
+          set -euo pipefail
+          # Empty bootstrap results yield MissingFromBaseline, which is not a
+          # regression. Check in three runner-class reports before the 20%
+          # floor has a measured reference.
+          ./target/release/perf-gate --enforce --regression-threshold-percent 20 \
+            --manifest benchmarks/manifest-object-path-v1.json \
+            --baseline benchmarks/baseline-github-ubuntu-latest-object-path.json \
+            object-path-reports/run-*.json
+      - name: Upload object-path reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: object-path-reports
+          path: object-path-reports/
           retention-days: 90
