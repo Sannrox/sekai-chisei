@@ -507,6 +507,40 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "Search",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/grpc/search_rpc.rs",
+        "src/db/search_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetSearchIndexStatus",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/grpc/search_rpc.rs",
+        "src/db/search_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutObjectTypeIndexEdit",
       "kind": "persistent",
       "surfaces": [

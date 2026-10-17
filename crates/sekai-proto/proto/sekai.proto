@@ -508,6 +508,59 @@ message ObjectTypeIndexStatus {
 message GetObjectTypeIndexStatusResponse {
   ObjectTypeIndexStatus status = 1;
 }
+message SearchPropertyFilter {
+  string property = 1;
+  string value = 2;
+}
+message SearchRequest {
+  string namespace = 1;
+  string text = 2;
+  repeated string kinds = 3;
+  repeated SearchPropertyFilter property_filters = 4;
+  repeated string facets = 5;
+  string page_token = 6;
+  int32 page_size = 7;
+  string source = 8;
+}
+message SearchHighlight {
+  string field = 1;
+  string text = 2;
+}
+message SearchHit {
+  string source = 1;
+  string id = 2;
+  string kind = 3;
+  repeated SearchHighlight highlights = 4;
+  bool authority = 5;
+}
+message SearchFacetValue {
+  string value = 1;
+  int64 count = 2;
+}
+message SearchFacet {
+  string field = 1;
+  repeated SearchFacetValue values = 2;
+}
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  int64 count = 2;
+  bool count_is_lower_bound = 3;
+  repeated SearchFacet facets = 4;
+  string next_page_token = 5;
+  bool authority = 6;
+  int64 lag_ms = 7;
+}
+message GetSearchIndexStatusRequest {
+  string namespace = 1;
+}
+message GetSearchIndexStatusResponse {
+  string namespace = 1;
+  string analyzer_version = 2;
+  int64 lag_ms = 3;
+  int64 object_count = 4;
+  int64 dataset_count = 5;
+  bool authority = 6;
+}
 message PutObjectTypeIndexEditRequest {
   string namespace = 1;
   string kind = 2;
@@ -2941,6 +2994,8 @@ service SekaiService {
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
   rpc GetObjectTypeIndexStatus(GetObjectTypeIndexStatusRequest) returns (GetObjectTypeIndexStatusResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc GetSearchIndexStatus(GetSearchIndexStatusRequest) returns (GetSearchIndexStatusResponse);
   rpc PutObjectTypeIndexEdit(PutObjectTypeIndexEditRequest) returns (PutObjectTypeIndexEditResponse);
   rpc PutGovernedTransform(PutGovernedTransformRequest) returns (PutGovernedTransformResponse);
   rpc RunGovernedTransform(RunGovernedTransformRequest) returns (RunGovernedTransformResponse);

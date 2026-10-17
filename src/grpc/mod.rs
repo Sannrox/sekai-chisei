@@ -174,6 +174,7 @@ fn is_discover_rpc(method: &str) -> bool {
             | "ListDatasetHealthChecks"
             | "DescribeObjectAction"
             | "DiscoverCapabilities"
+            | "Search"
     )
 }
 
@@ -713,6 +714,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListDatasetAlerts"
             | "DescribeObjectAction"
             | "DiscoverCapabilities"
+            | "Search"
+            | "GetSearchIndexStatus"
     )
 }
 
