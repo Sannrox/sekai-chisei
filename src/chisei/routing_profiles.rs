@@ -218,7 +218,14 @@ pub fn admit_hosted_profile(
             );
         }
     };
+    let evidence_endpoint = input.evidence_endpoint.trim().to_string();
     if input.require_runtime_evidence {
+        let Some(digest) = artifact_digest.as_deref() else {
+            return Err(
+                "invalid_argument: artifact_digest is required when require_runtime_evidence is set"
+                    .into(),
+            );
+        };
         for (label, value) in [
             ("evidence_provider", input.evidence_provider.trim()),
             ("evidence_model", input.evidence_model.trim()),
@@ -238,12 +245,17 @@ pub fn admit_hosted_profile(
                 ));
             }
         }
-        if let Some(digest) = artifact_digest.as_deref()
-            && digest != input.evidence_artifact_digest.trim()
-        {
+        if digest != input.evidence_artifact_digest.trim() {
             return Err(
-                "invalid_argument: evidence_artifact_digest must match artifact_digest when both are set"
+                "invalid_argument: evidence_artifact_digest must match artifact_digest when require_runtime_evidence is set"
                     .into(),
+            );
+        }
+        let bound_origin = canonical_origin(&evidence_endpoint)
+            .map_err(|error| format!("invalid_argument: evidence_endpoint {error}"))?;
+        if bound_origin != origin {
+            return Err(
+                "invalid_argument: evidence_endpoint must match the served endpoint origin".into(),
             );
         }
     }
@@ -261,7 +273,7 @@ pub fn admit_hosted_profile(
         evidence_model: input.evidence_model.trim().into(),
         evidence_profile_version: input.evidence_profile_version.trim().into(),
         evidence_artifact_digest: input.evidence_artifact_digest.trim().into(),
-        evidence_endpoint: input.evidence_endpoint.trim().into(),
+        evidence_endpoint,
     })
 }
 
@@ -640,33 +652,63 @@ mod tests {
         );
     }
 
+    fn evidence_request(
+        digest: &str,
+        evidence_digest: &str,
+        evidence_endpoint: &str,
+    ) -> HostedRoutingProfileInput {
+        let mut request = input("https://models.example.com/v1", "ACME_KEY");
+        request.artifact_digest = digest.into();
+        request.require_runtime_evidence = true;
+        request.evidence_provider = "hosted.acme".into();
+        request.evidence_model = "qwen".into();
+        request.evidence_profile_version = "v1".into();
+        request.evidence_artifact_digest = evidence_digest.into();
+        request.evidence_endpoint = evidence_endpoint.into();
+        request
+    }
+
+    fn admit_evidence(
+        digest: &str,
+        evidence_digest: &str,
+        evidence_endpoint: &str,
+    ) -> Result<HostedRoutingProfile, String> {
+        admit_hosted_profile(
+            evidence_request(digest, evidence_digest, evidence_endpoint),
+            &["https://models.example.com".to_string()],
+            |_| true,
+            "admin",
+            1,
+        )
+    }
+
     #[test]
-    fn evidence_digest_must_match_a_pinned_artifact_digest() {
+    fn evidence_required_profiles_bind_digest_and_served_origin() {
         let pinned = format!("sha256:{}", "ab".repeat(32));
         let other = format!("sha256:{}", "cd".repeat(32));
-        let admit = |digest: &str, evidence: &str| {
-            let mut request = input("https://models.example.com/v1", "ACME_KEY");
-            request.artifact_digest = digest.into();
-            request.require_runtime_evidence = true;
-            request.evidence_provider = "hosted.acme".into();
-            request.evidence_model = "qwen".into();
-            request.evidence_profile_version = "v1".into();
-            request.evidence_artifact_digest = evidence.into();
-            request.evidence_endpoint = "served://acme".into();
-            admit_hosted_profile(
-                request,
-                &["https://models.example.com".to_string()],
-                |_| true,
-                "admin",
-                1,
-            )
-        };
-        assert!(admit(&pinned, &pinned).is_ok());
-        assert!(admit("", &pinned).is_ok());
+        let bound = admit_evidence(&pinned, &pinned, "https://models.example.com/v1").unwrap();
+        assert_eq!(bound.artifact_digest.as_deref(), Some(pinned.as_str()));
+        assert_eq!(bound.evidence_endpoint, "https://models.example.com/v1");
+        assert_eq!(bound.endpoint_origin, "https://models.example.com");
         assert!(
-            admit(&pinned, &other)
+            admit_evidence("", &pinned, "https://models.example.com")
+                .unwrap_err()
+                .contains("artifact_digest is required")
+        );
+        assert!(
+            admit_evidence(&pinned, &other, "https://models.example.com")
                 .unwrap_err()
                 .contains("evidence_artifact_digest must match artifact_digest")
+        );
+        assert!(
+            admit_evidence(&pinned, &pinned, "served://acme")
+                .unwrap_err()
+                .contains("evidence_endpoint")
+        );
+        assert!(
+            admit_evidence(&pinned, &pinned, "https://elsewhere.example.com")
+                .unwrap_err()
+                .contains("evidence_endpoint must match the served endpoint origin")
         );
     }
 }
