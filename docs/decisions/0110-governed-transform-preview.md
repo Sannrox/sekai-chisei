@@ -89,6 +89,15 @@ fence returns nothing.
 `sekai.SekaiService`. Each checks namespace read access and, like preview, the
 caller's tenant context; another tenant's run reads as missing. Preview reads
 its samples under the caller's policy, so a scoped session needs only
-`sekai.read`. `PutGovernedTransform` and `RunGovernedTransform` stay
-unadmitted for scoped contexts: Put requires credential administration, and
-admitting it needs its own decision.
+`sekai.read`. `RunGovernedTransform` stays unadmitted for scoped contexts.
+
+## Amendment 2026-10-17
+
+#1557 admits `PutGovernedTransform` for enterprise-scoped contexts on
+`sekai.SekaiService`. A scoped Put authorizes the caller's tenant context and
+namespace Write on the transform namespace instead of credential
+administration, and the caller must be able to read every input and the
+output dataset. A scoped Put that names a schedule or input-commit trigger
+is refused, so publication cannot arrange later execution. Community
+credentials still require credential administration.
+`RunGovernedTransform` stays unadmitted.

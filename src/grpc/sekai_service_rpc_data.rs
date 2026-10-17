@@ -1688,8 +1688,15 @@ pub(super) async fn put_governed_transform(
 ) -> Result<Response<PutGovernedTransformResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    require_credential_admin(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let scoped_put = service.db.runtime().enterprise_extension().is_some()
+        && tenant_context.as_ref().is_some_and(|context| {
+            context.credential_kind == crate::enterprise::CredentialKind::HumanSession
+                && context.tenant.is_some()
+        });
+    if !scoped_put {
+        require_credential_admin(&principals)?;
+    }
     let proto = req
         .into_inner()
         .transform
@@ -1743,6 +1750,25 @@ pub(super) async fn put_governed_transform(
             true,
         )?;
     }
+    if scoped_put {
+        check_team_namespace(
+            service.db.runtime(),
+            &principals,
+            &transform.namespace,
+            true,
+        )?;
+        if transform.schedule.is_some() || transform.trigger.is_some() {
+            return Err(Status::permission_denied(
+                "scoped put cannot schedule or trigger execution",
+            ));
+        }
+        authorize_transform_dataset_reads(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &transform,
+        )?;
+    }
     let owner_tenant = tenant_context
         .as_ref()
         .and_then(|context| context.tenant.as_ref())
@@ -1780,6 +1806,68 @@ fn preview_response(
             .collect(),
         error: result.error,
     }
+}
+
+fn authorize_transform_dataset_reads(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+) -> Result<(), Status> {
+    let mut dataset_ids: Vec<String> = transform
+        .input_bindings()
+        .into_iter()
+        .map(|(_, dataset_id)| dataset_id)
+        .collect();
+    if !transform.output_dataset_id.is_empty() {
+        dataset_ids.push(transform.output_dataset_id.clone());
+    }
+    dataset_ids.sort();
+    dataset_ids.dedup();
+    for dataset_id in dataset_ids {
+        authorize_transform_dataset_read(service, principals, tenant_context, &dataset_id)?;
+    }
+    Ok(())
+}
+
+fn authorize_transform_dataset_read(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    dataset_id: &str,
+) -> Result<(), Status> {
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        principals,
+        &dataset,
+        false,
+    )?;
+    if !dataset.object_id.is_empty() {
+        if let Some(object) = service
+            .db
+            .runtime()
+            .get_object(&dataset.object_id)
+            .map_err(Status::internal)?
+        {
+            if !object_is_visible(
+                service.db.runtime(),
+                &service.security,
+                &object,
+                principals,
+                tenant_context,
+            ) {
+                return Err(Status::permission_denied("access denied"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn authorize_preview_inputs(

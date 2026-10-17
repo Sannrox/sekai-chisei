@@ -702,6 +702,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListGovernedTransformRuns"
             | "GetGovernedTransformRun"
             | "PreviewGovernedTransform"
+            | "PutGovernedTransform"
             | "ListDatasets"
             | "ListDatasetVersions"
             | "GetDatasetVersion"
@@ -2200,21 +2201,23 @@ mod tests {
     }
 
     #[test]
-    fn scoped_transform_reads_and_preview_exclude_put() {
-        // Each checks namespace read; preview reads samples under the
-        // caller's policy (ADR 0110). Put needs credential administration.
+    fn scoped_transform_reads_preview_and_put_exclude_run() {
+        // Reads and preview check namespace read (ADR 0110). Put checks
+        // namespace write and dataset read (#1557). Run stays unadmitted.
         for method in [
             "ListGovernedTransforms",
             "ListGovernedTransformRuns",
             "GetGovernedTransformRun",
             "PreviewGovernedTransform",
+            "PutGovernedTransform",
         ] {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
         }
-        for method in ["PutGovernedTransform", "RunGovernedTransform"] {
-            assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
-        }
+        assert!(!enterprise_namespace_rpc(
+            "sekai.SekaiService",
+            "RunGovernedTransform"
+        ));
     }
 
     #[test]
