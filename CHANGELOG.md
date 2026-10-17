@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Object-log dual-read maps min, max, and avg against the tagged object-log
+  when reconstructed hop measures agree with the mikura fixture, including
+  zero-hop whole-set aggregates. `group_by`, distinct, multi-key sort, and
+  min/max whose checked average overflows stay named refusals: SQL still
+  requires one group key and falls back to the source key when it is absent,
+  counts only numeric distinct values, sorts on one `order_by`, and does not
+  share the object-log's checked `(sum, n)` overflow. The plane aggregation
+  contract is unchanged. The mikura pin remains `0d43c57` (#1540).
+
 - Object-log identity is `(namespace, kind, key)`. Ingest, generation reads,
   dual-read, and the host client pass the plane namespace. `MIKURAV1` logs
   fail closed until an explicit projection-driven migration. The mikura pin
