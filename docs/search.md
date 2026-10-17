@@ -7,7 +7,8 @@ current namespace lag.
 
 Capability discovery of `sekai.search.query` or `sekai.search.status` is not a
 grant. Both RPCs stay classified `experimental`
-([rpc-maturity.md](rpc-maturity.md)) and require the experimental RPC gate.
+([rpc-maturity.md](rpc-maturity.md)) and are rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
 
 ## Search
 

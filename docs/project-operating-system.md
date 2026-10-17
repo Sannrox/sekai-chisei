@@ -228,7 +228,7 @@ only when a branch needs substantial project-specific material.
 
 | Skill | Purpose and use | Required inputs | Expected output | Responsibilities and boundaries |
 | --- | --- | --- | --- | --- |
-| `shape-work-item` | Convert an idea, bug, refactor, or research question into a decision-ready Issue. | Raw request, repository evidence, known constraints. | Issue type, concise draft, acceptance evidence, labels, and routing recommendation. | Search for duplicates and expose uncertainty. It does not invent priority, assign people, or publish without authorization. |
+| `shape-work-item` | Convert an idea, bug, refactor, or research question into a decision-ready Issue. | Raw request, repository evidence, known constraints. | Issue type, concise draft, acceptance evidence, labels, and routing recommendation. | Look for duplicates and expose uncertainty. It does not invent priority, assign people, or publish without authorization. |
 | `advance-issue-frontier` | Recompute which dependency-linked Issues are blocked, ready, or active after a merge or backlog review. | Live Issues and PRs, dependency sections, trigger, active-lane limit, and mutation authority. | Newly unblocked and blocked Issues, active capacity, anomalies, ordered candidates, and authorized status updates. | Parse explicit dependencies and default to report-only. It does not prioritize, assign, implement, close, or merge work. |
 | `deliver-ready-issue` | Take one approved, dependency-ready Issue through its authorized delivery stage. | Selected Issue, live repository state, and an implement, publish, or land authority ceiling. | Bounded implementation, verification and review evidence, plus a linked PR or merge when authorized. | Preserve unrelated work and stop on blocked or competing implementation. It does not select priority or exceed the authority ceiling. |
 | `assess-change-impact` | Scope a proposed or implemented change across domain and trust boundaries. | Issue/PR/diff and affected paths. | Impact matrix, required tests, migration/docs/security obligations, open risks. | Trace SQLite/PostgreSQL, gateway/native, and policy/audit effects. It does not approve architecture or replace a security audit. |
@@ -400,7 +400,7 @@ Documentation stays maintainable when:
 
 ### Humans
 
-1. Search Issues, Discussions, and PRs.
+1. Look through Issues, Discussions, and PRs.
 2. Choose the smallest artifact using the table above.
 3. Confirm an Issue is `status:ready` or clarify the intended scope.
 4. For a delivery lane, claim `<type>/<issue>` on GitHub and check it out in
