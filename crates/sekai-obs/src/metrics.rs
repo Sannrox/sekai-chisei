@@ -1,5 +1,7 @@
 use metrics::{counter, describe_counter, describe_gauge, gauge};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusBuilder;
+
+pub use metrics_exporter_prometheus::PrometheusHandle;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
