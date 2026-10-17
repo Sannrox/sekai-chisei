@@ -2,7 +2,7 @@ use crate::db::sekai::SekaiDb;
 use crate::sekai::dataset::RowQuery;
 use crate::sekai::object_type_index::{
     HopProjectionAdmit, HopProjectionFence, ObjectTypeDatasource, ObjectTypeIndexEdit,
-    ObjectTypeIndexError, ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport,
+    ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport,
     admit_hop_projection_fence, member_from_edit, member_from_row, schema_drift,
 };
 use rusqlite::params;
@@ -888,12 +888,6 @@ impl<T> OptionalRow<T> for rusqlite::Result<T> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error),
         }
-    }
-}
-
-impl From<ObjectTypeIndexError> for String {
-    fn from(value: ObjectTypeIndexError) -> Self {
-        value.message()
     }
 }
 
