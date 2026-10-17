@@ -4,39 +4,7 @@ use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Role {
-    Viewer,
-    Editor,
-    Admin,
-}
-
-impl Role {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "viewer" => Some(Self::Viewer),
-            "editor" => Some(Self::Editor),
-            "admin" => Some(Self::Admin),
-            _ => None,
-        }
-    }
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Viewer => "viewer",
-            Self::Editor => "editor",
-            Self::Admin => "admin",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Grant {
-    pub id: String,
-    pub object_id: String,
-    pub principal: String,
-    pub role: Role,
-    pub created: i64,
-}
+pub use sekai_types::security::{Grant, Role};
 
 pub struct SecurityChecker {
     grants: RwLock<HashMap<String, HashMap<String, Role>>>, // object_id -> principal -> role

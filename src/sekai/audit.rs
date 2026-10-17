@@ -6,16 +6,7 @@ use crate::sekai::security::{Grant, Role};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeSet, HashMap};
 
-#[derive(Debug, Clone)]
-pub struct ObjectChange {
-    pub id: String,
-    pub object_id: String,
-    pub field: String,
-    pub old_value: String,
-    pub new_value: String,
-    pub changed_by: String,
-    pub timestamp: i64,
-}
+pub use sekai_types::object_change::ObjectChange;
 
 fn validate_decision(decision: &Decision) -> Result<(), String> {
     if decision.id.trim().is_empty() {
