@@ -46,7 +46,7 @@
     },
     {
       "subject": "HandoffManifest",
-      "source": "src/sekai/handoff.rs",
+      "source": "crates/sekai-types/src/handoff.rs",
       "locator": "HandoffManifest",
       "confidence": 1.0
     },
