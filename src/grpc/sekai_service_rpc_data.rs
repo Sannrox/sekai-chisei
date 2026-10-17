@@ -2361,11 +2361,11 @@ pub(super) async fn claim_transform_work(
                 } else {
                     false
                 };
-                match admit_tenant_transform(
+                match admit_claimed_isolated_process(
+                    service,
                     quota.as_ref(),
-                    &crate::composition::transform_run_admission::quota_gate(quota.clone()),
                     owner.as_ref(),
-                    &format!("transform-claim:{}", work.run_id),
+                    &work,
                     prior_admission,
                 ) {
                     Ok(held) => {
@@ -2845,6 +2845,59 @@ fn map_quota_error(error: crate::chisei::tenant_quota::TenantQuotaError) -> Stat
         TenantQuotaError::StaleAssignment { .. } => Status::failed_precondition(error.to_string()),
         TenantQuotaError::Exhausted { .. } => Status::resource_exhausted(error.to_string()),
         TenantQuotaError::Storage(message) => Status::internal(message),
+    }
+}
+
+/// Wall-clock seconds reserved when the isolated-process spec carries no
+/// time limit. Matches the runner's default wall clock.
+const DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS: i64 = 30;
+
+fn admit_claimed_isolated_process(
+    service: &SekaiServiceImpl,
+    quota: &crate::db::runtime_db::RuntimeDb,
+    owner: Option<&crate::enterprise::AuthenticatedContext>,
+    work: &crate::sekai::governed_transform::TransformWork,
+    reclaim: bool,
+) -> Result<Option<crate::chisei::tenant_quota::TenantQuotaAdmission>, Status> {
+    admit_extension_isolated_process(service, owner, work)?;
+    admit_tenant_transform(
+        quota,
+        &crate::composition::transform_run_admission::quota_gate(service.quota_runtime()),
+        owner,
+        &format!("transform-claim:{}", work.run_id),
+        reclaim,
+    )
+}
+
+fn admit_extension_isolated_process(
+    service: &SekaiServiceImpl,
+    owner: Option<&crate::enterprise::AuthenticatedContext>,
+    work: &crate::sekai::governed_transform::TransformWork,
+) -> Result<(), Status> {
+    let Some(extension) = service.db.runtime().enterprise_extension() else {
+        return Ok(());
+    };
+    let Some(context) = owner else {
+        return Ok(());
+    };
+    match extension.admit_isolated_process_job(
+        context,
+        &crate::enterprise::IsolatedProcessJob {
+            run_id: work.run_id.clone(),
+            namespace: work.namespace.clone(),
+            estimated_seconds: DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
+        },
+    ) {
+        Ok(()) => Ok(()),
+        Err(crate::enterprise::ExtensionError::PermissionDenied) => {
+            Err(Status::resource_exhausted("tenant quota exceeded"))
+        }
+        Err(crate::enterprise::ExtensionError::Unavailable(message)) => {
+            Err(Status::unavailable(message))
+        }
+        Err(_) => Err(Status::permission_denied(
+            "isolated-process job not admitted",
+        )),
     }
 }
 

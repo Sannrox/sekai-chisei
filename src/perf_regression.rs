@@ -327,6 +327,16 @@ pub fn compare_workload(
     samples: &[WorkloadSample],
     baseline: &WorkloadSample,
 ) -> BaselineComparison {
+    compare_workload_with_threshold(id, samples, baseline, MIN_DETECTABLE_REGRESSION_PERCENT)
+}
+
+/// Compare one workload against baseline using an explicit detection floor.
+pub fn compare_workload_with_threshold(
+    id: &str,
+    samples: &[WorkloadSample],
+    baseline: &WorkloadSample,
+    min_regression_percent: f64,
+) -> BaselineComparison {
     let mut p95_values: Vec<f64> = samples.iter().map(|s| s.p95_latency_us).collect();
     let current_median = if p95_values.is_empty() {
         0.0
@@ -381,7 +391,7 @@ pub fn compare_workload(
 
     let delta = comparison.delta_percent;
 
-    let threshold = (noise * SIGNIFICANCE_FACTOR).max(MIN_DETECTABLE_REGRESSION_PERCENT);
+    let threshold = (noise * SIGNIFICANCE_FACTOR).max(min_regression_percent);
     comparison.verdict = if delta > threshold {
         BaselineVerdict::Regressed {
             delta_percent: delta,
@@ -402,6 +412,15 @@ pub fn compare_to_baseline(
     runs: &[Vec<WorkloadSample>],
     baseline: &[WorkloadSample],
 ) -> BaselineReport {
+    compare_to_baseline_with_threshold(runs, baseline, MIN_DETECTABLE_REGRESSION_PERCENT)
+}
+
+/// Compare repeated runs against a recorded baseline with an explicit floor.
+pub fn compare_to_baseline_with_threshold(
+    runs: &[Vec<WorkloadSample>],
+    baseline: &[WorkloadSample],
+    min_regression_percent: f64,
+) -> BaselineReport {
     let mut by_workload: BTreeMap<String, Vec<WorkloadSample>> = BTreeMap::new();
     for run in runs {
         for sample in run {
@@ -419,7 +438,12 @@ pub fn compare_to_baseline(
     let comparisons = by_workload
         .iter()
         .map(|(id, samples)| match baseline_by_id.get(id.as_str()) {
-            Some(baseline_sample) => compare_workload(id, samples, baseline_sample),
+            Some(baseline_sample) => compare_workload_with_threshold(
+                id,
+                samples,
+                baseline_sample,
+                min_regression_percent,
+            ),
             None => {
                 let mut p95_values: Vec<f64> = samples.iter().map(|s| s.p95_latency_us).collect();
                 let current_median = if p95_values.is_empty() {
@@ -701,6 +725,27 @@ mod tests {
             BaselineVerdict::MissingFromBaseline
         );
         assert!(report.passed());
+    }
+
+    #[test]
+    fn twenty_percent_floor_ignores_a_smaller_p95_shift() {
+        let baseline = sample("get_object", 100.0, 2.0);
+        let samples = vec![
+            sample("get_object", 115.0, 2.0),
+            sample("get_object", 116.0, 2.0),
+            sample("get_object", 114.0, 2.0),
+        ];
+        let default_gate = compare_workload("get_object", &samples, &baseline);
+        assert!(default_gate.verdict.is_regression());
+        let scheduled = compare_workload_with_threshold("get_object", &samples, &baseline, 20.0);
+        assert_eq!(scheduled.verdict, BaselineVerdict::Unchanged);
+        let over = vec![
+            sample("get_object", 125.0, 2.0),
+            sample("get_object", 126.0, 2.0),
+            sample("get_object", 124.0, 2.0),
+        ];
+        let enforced = compare_workload_with_threshold("get_object", &over, &baseline, 20.0);
+        assert!(enforced.verdict.is_regression());
     }
 
     #[test]

@@ -20233,6 +20233,204 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
     assert_eq!(claimed.tenant_id, "tenant-b");
 }
 
+struct IsolatedClaimExtension {
+    deny: bool,
+}
+
+impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
+    fn authenticate_bearer(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError> {
+        (bearer_token == "enterprise-token")
+            .then(|| crate::enterprise::AuthenticatedPrincipal {
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+            })
+            .ok_or(crate::enterprise::ExtensionError::CredentialNotFound)
+    }
+
+    fn authenticate_context(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError> {
+        let principal = self.authenticate_bearer(bearer_token)?;
+        Ok(crate::enterprise::AuthenticatedContext {
+            contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
+            tenant: Some(self.tenant_context(&principal)?),
+            principal,
+            credential_kind: crate::enterprise::CredentialKind::HumanSession,
+            space: None,
+            space_role: None,
+            act: None,
+            scopes: vec!["sekai.read".into(), "sekai.write".into()],
+            issuer: "https://issuer.test".into(),
+            resource: "https://sekai.test".into(),
+            expires_at: i64::MAX,
+        })
+    }
+
+    fn tenant_context(
+        &self,
+        principal: &crate::enterprise::AuthenticatedPrincipal,
+    ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+        Ok(crate::enterprise::TenantContext {
+            tenant_id: "tenant-a".into(),
+            subject: principal.subject.clone(),
+        })
+    }
+
+    fn authorize_namespace(
+        &self,
+        _context: &crate::enterprise::TenantContext,
+        _namespace: &str,
+        _action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        Ok(())
+    }
+
+    fn authorize_unscoped_namespace(
+        &self,
+        _principal: &crate::enterprise::AuthenticatedPrincipal,
+        _namespace: &str,
+        _action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        Ok(())
+    }
+
+    fn admit_isolated_process_job(
+        &self,
+        _context: &crate::enterprise::AuthenticatedContext,
+        _job: &crate::enterprise::IsolatedProcessJob,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        if self.deny {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn isolated_claim_service(deny: bool) -> SekaiServiceImpl {
+    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(IsolatedClaimExtension { deny })),
+        )
+        .unwrap(),
+    )));
+    SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
+}
+
+async fn enqueue_isolated_claim(svc: &SekaiServiceImpl, transform_id: &str) {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
+    };
+
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ops".into(),
+        transform_id: transform_id.into(),
+        input_dataset_id: "in".into(),
+        output_dataset_id: "out".into(),
+        steps: Vec::new(),
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: Some(IsolatedProcessSpec {
+            engine: "python".into(),
+            runtime_image: "runner:1".into(),
+            inputs: Vec::new(),
+        }),
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .unwrap();
+    runtime
+        .put_governed_transform_owned(&transform, 10, "tenant-a")
+        .unwrap();
+    runtime
+        .run_governed_transform_owned("ops", transform_id, false, 20, "tenant-a", "")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn isolated_process_claim_is_admitted_by_the_enterprise_extension() {
+    let svc = isolated_claim_service(false);
+    enqueue_isolated_claim(&svc, "t-iso-admit").await;
+    let claimed = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(claimed.transform_id, "t-iso-admit");
+}
+
+#[tokio::test]
+async fn isolated_process_claim_skips_work_the_extension_denies() {
+    let svc = isolated_claim_service(true);
+    enqueue_isolated_claim(&svc, "t-iso-deny").await;
+    let denied = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+    let listed = svc
+        .list_claimable_transform_work(with_tenant_admin(
+            ListClaimableTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                limit: 10,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].transform_id, "t-iso-deny");
+}
+
 #[tokio::test]
 async fn scheduled_isolated_tick_claims_against_the_put_owner() {
     use crate::chisei::budget::PeriodType;

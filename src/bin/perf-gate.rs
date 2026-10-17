@@ -14,8 +14,8 @@
 //! unchanged on other hardware fails for reasons unrelated to a code change.
 
 use sekai_chisei::perf_regression::{
-    BaselineVerdict, GateOutcome, Ineligibility, MIN_REPETITIONS, WorkloadBudget, WorkloadSample,
-    compare_to_baseline, evaluate,
+    BaselineVerdict, GateOutcome, Ineligibility, MIN_DETECTABLE_REGRESSION_PERCENT,
+    MIN_REPETITIONS, WorkloadBudget, WorkloadSample, compare_to_baseline_with_threshold, evaluate,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -51,6 +51,7 @@ fn run() -> Result<ExitCode, String> {
     let mut manifest_path = None;
     let mut baseline_path = None;
     let mut enforce = false;
+    let mut regression_threshold_percent = MIN_DETECTABLE_REGRESSION_PERCENT;
     let mut report_paths = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -61,6 +62,18 @@ fn run() -> Result<ExitCode, String> {
             }
             "--baseline" => {
                 baseline_path = Some(args.next().ok_or("--baseline requires a path")?);
+            }
+            "--regression-threshold-percent" => {
+                let raw = args
+                    .next()
+                    .ok_or("--regression-threshold-percent requires a number")?;
+                let parsed: f64 = raw
+                    .parse()
+                    .map_err(|_| format!("invalid --regression-threshold-percent {raw}"))?;
+                if !parsed.is_finite() || parsed <= 0.0 {
+                    return Err("--regression-threshold-percent must be a positive number".into());
+                }
+                regression_threshold_percent = parsed;
             }
             "--enforce" => enforce = true,
             other if other.starts_with("--") => {
@@ -136,7 +149,11 @@ fn run() -> Result<ExitCode, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
         let baseline: Report =
             serde_json::from_slice(&bytes).map_err(|e| format!("parse {path}: {e}"))?;
-        let comparison = compare_to_baseline(&runs, &baseline.results);
+        let comparison = compare_to_baseline_with_threshold(
+            &runs,
+            &baseline.results,
+            regression_threshold_percent,
+        );
 
         println!();
         println!(

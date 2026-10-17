@@ -85,6 +85,7 @@ mod native_server_smoke;
 mod object_change_subscription_adr;
 mod object_log_host_adr;
 mod object_log_identity_adr;
+mod object_path_benchmark;
 mod object_security_backend_conformance;
 mod object_security_property_grant_adr;
 mod object_security_property_read_adr;
