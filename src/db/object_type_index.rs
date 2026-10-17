@@ -2,8 +2,8 @@ use crate::db::sekai::SekaiDb;
 use crate::sekai::dataset::RowQuery;
 use crate::sekai::object_type_index::{
     HopProjectionAdmit, HopProjectionFence, ObjectTypeDatasource, ObjectTypeIndexEdit,
-    ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport,
-    admit_hop_projection_fence, member_from_edit, member_from_row, schema_drift,
+    ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport, admit_hop_projection_fence,
+    member_from_edit, member_from_row, schema_drift,
 };
 use rusqlite::params;
 use std::collections::{BTreeMap, HashMap};
