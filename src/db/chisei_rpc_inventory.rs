@@ -193,7 +193,10 @@ impl ChiseiRpcInventory {
         }
 
         for path in self.all_evidence_paths() {
-            if (path.starts_with("tests/") || path.starts_with("src/") || path.starts_with("docs/"))
+            if (path.starts_with("tests/")
+                || path.starts_with("src/")
+                || path.starts_with("docs/")
+                || path.starts_with("crates/"))
                 && !Path::new(path).exists()
             {
                 return Err(format!("inventory evidence path does not exist: {path}"));

@@ -992,7 +992,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/policy_decision.rs",
+        "crates/sekai-types/src/policy_decision.rs",
         "src/grpc/sekai_service_rpc_objects.rs",
         "docs/object-security.md"
       ],
@@ -1006,7 +1006,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/policy_decision.rs",
+        "crates/sekai-types/src/policy_decision.rs",
         "src/grpc/sekai_service_rpc_objects.rs",
         "docs/object-security.md"
       ],

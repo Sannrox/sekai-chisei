@@ -7,7 +7,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::domain::{ListFilter, Object, is_valid_property_key};
+use sekai_domain::domain::{ListFilter, Object, is_valid_property_key};
 
 pub const OBJECT_SECURITY_POLICY_VERSION: &str = "sekai.object-security-policy/v1";
 pub const MAX_POLICY_BYTES: usize = 64 * 1024;
@@ -190,7 +190,7 @@ impl PrincipalPolicyContext {
         self
     }
 
-    pub(crate) fn sql_subjects(&self) -> String {
+    pub fn sql_subjects(&self) -> String {
         let mut groups = vec![self.subjects.clone()];
         if let Some(actor) = &self.delegated_subject {
             groups.push(vec![actor.clone()]);
@@ -198,7 +198,7 @@ impl PrincipalPolicyContext {
         serde_json::json!(groups).to_string()
     }
 
-    pub(crate) fn sql_scopes(&self) -> String {
+    pub fn sql_scopes(&self) -> String {
         let mut groups = vec![self.scopes.clone()];
         if self.delegated_subject.is_some() {
             groups.push(Vec::new());
@@ -337,7 +337,7 @@ impl ObjectSecurityPolicy {
         }
         let text = std::str::from_utf8(input)
             .map_err(|error| format!("invalid object-security policy JSON: {error}"))?;
-        if crate::sekai::json::contains_duplicate_object_keys(text)
+        if crate::json::contains_duplicate_object_keys(text)
             .map_err(|error| format!("invalid object-security policy JSON: {error}"))?
         {
             return Err(
@@ -764,7 +764,7 @@ fn reject_unknown_keys(
 }
 
 impl ObjectSecurityPredicate {
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::AllowAll => Ok(()),
             Self::SubjectEqualsProperty { property } => validate_property(property),
@@ -776,7 +776,7 @@ impl ObjectSecurityPredicate {
         }
     }
 
-    pub(crate) fn matches(&self, context: &PrincipalPolicyContext, object: &Object) -> bool {
+    pub fn matches(&self, context: &PrincipalPolicyContext, object: &Object) -> bool {
         match self {
             Self::AllowAll => true,
             Self::SubjectEqualsProperty { property } => object
