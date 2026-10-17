@@ -1,0 +1,891 @@
+{
+  "contract_version": "sekai.performance-manifest/v1",
+  "fixture_version": "sekai.object-path-workloads/v1",
+  "description": "Object-path gRPC workloads on SQLite and PostgreSQL. Scheduled runs enforce a 20% p95 baseline regression.",
+  "workloads": [
+    {
+      "id": "get_object_sqlite_10k",
+      "description": "Point GetObject through the gRPC handler.",
+      "category": "object_read",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 2000,
+        "p95_latency_us": 4000,
+        "p99_latency_us": 5000
+      }
+    },
+    {
+      "id": "get_object_postgres_10k",
+      "description": "Point GetObject through the gRPC handler.",
+      "category": "object_read",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 2000,
+        "p95_latency_us": 4000,
+        "p99_latency_us": 5000
+      }
+    },
+    {
+      "id": "get_object_sqlite_100k",
+      "description": "Point GetObject through the gRPC handler.",
+      "category": "object_read",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 2000,
+        "p95_latency_us": 4000,
+        "p99_latency_us": 5000
+      }
+    },
+    {
+      "id": "get_object_postgres_100k",
+      "description": "Point GetObject through the gRPC handler.",
+      "category": "object_read",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 2000,
+        "p95_latency_us": 4000,
+        "p99_latency_us": 5000
+      }
+    },
+    {
+      "id": "list_page_sqlite_10k",
+      "description": "ListObjects page of 50 through the gRPC handler.",
+      "category": "object_list",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 30000
+      }
+    },
+    {
+      "id": "list_page_postgres_10k",
+      "description": "ListObjects page of 50 through the gRPC handler.",
+      "category": "object_list",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 30000
+      }
+    },
+    {
+      "id": "list_page_sqlite_100k",
+      "description": "ListObjects page of 50 through the gRPC handler.",
+      "category": "object_list",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 10000,
+        "p95_latency_us": 25000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "list_page_postgres_100k",
+      "description": "ListObjects page of 50 through the gRPC handler.",
+      "category": "object_list",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 10000,
+        "p95_latency_us": 25000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "evaluate_object_set_filter_sqlite_10k",
+      "description": "EvaluateObjectSet filtered page through gRPC.",
+      "category": "object_set",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 20000,
+        "p95_latency_us": 80000,
+        "p99_latency_us": 150000
+      }
+    },
+    {
+      "id": "evaluate_object_set_filter_postgres_10k",
+      "description": "EvaluateObjectSet filtered page through gRPC.",
+      "category": "object_set",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 20000,
+        "p95_latency_us": 80000,
+        "p99_latency_us": 150000
+      }
+    },
+    {
+      "id": "evaluate_object_set_filter_sqlite_100k",
+      "description": "EvaluateObjectSet filtered page through gRPC.",
+      "category": "object_set",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 40000,
+        "p95_latency_us": 160000,
+        "p99_latency_us": 300000
+      }
+    },
+    {
+      "id": "evaluate_object_set_filter_postgres_100k",
+      "description": "EvaluateObjectSet filtered page through gRPC.",
+      "category": "object_set",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 40000,
+        "p95_latency_us": 160000,
+        "p99_latency_us": 300000
+      }
+    },
+    {
+      "id": "evaluate_object_set_sort_sqlite_10k",
+      "description": "EvaluateObjectSet property-sorted page through gRPC.",
+      "category": "object_set",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 20000,
+        "p95_latency_us": 80000,
+        "p99_latency_us": 150000
+      }
+    },
+    {
+      "id": "evaluate_object_set_sort_postgres_10k",
+      "description": "EvaluateObjectSet property-sorted page through gRPC.",
+      "category": "object_set",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 20000,
+        "p95_latency_us": 80000,
+        "p99_latency_us": 150000
+      }
+    },
+    {
+      "id": "evaluate_object_set_sort_sqlite_100k",
+      "description": "EvaluateObjectSet property-sorted page through gRPC.",
+      "category": "object_set",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 40000,
+        "p95_latency_us": 160000,
+        "p99_latency_us": 300000
+      }
+    },
+    {
+      "id": "evaluate_object_set_sort_postgres_100k",
+      "description": "EvaluateObjectSet property-sorted page through gRPC.",
+      "category": "object_set",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 40000,
+        "p95_latency_us": 160000,
+        "p99_latency_us": 300000
+      }
+    },
+    {
+      "id": "evaluate_object_set_one_hop_sqlite_10k",
+      "description": "EvaluateObjectSet one-hop traverse through gRPC.",
+      "category": "object_set",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 30000,
+        "p95_latency_us": 120000,
+        "p99_latency_us": 200000
+      }
+    },
+    {
+      "id": "evaluate_object_set_one_hop_postgres_10k",
+      "description": "EvaluateObjectSet one-hop traverse through gRPC.",
+      "category": "object_set",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 30000,
+        "p95_latency_us": 120000,
+        "p99_latency_us": 200000
+      }
+    },
+    {
+      "id": "evaluate_object_set_one_hop_sqlite_100k",
+      "description": "EvaluateObjectSet one-hop traverse through gRPC.",
+      "category": "object_set",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 60000,
+        "p95_latency_us": 240000,
+        "p99_latency_us": 400000
+      }
+    },
+    {
+      "id": "evaluate_object_set_one_hop_postgres_100k",
+      "description": "EvaluateObjectSet one-hop traverse through gRPC.",
+      "category": "object_set",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 60000,
+        "p95_latency_us": 240000,
+        "p99_latency_us": 400000
+      }
+    },
+    {
+      "id": "evaluate_object_set_two_hop_sqlite_10k",
+      "description": "EvaluateObjectSet two-hop traverse through gRPC.",
+      "category": "object_set",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 40000,
+        "p95_latency_us": 160000,
+        "p99_latency_us": 250000
+      }
+    },
+    {
+      "id": "evaluate_object_set_two_hop_postgres_10k",
+      "description": "EvaluateObjectSet two-hop traverse through gRPC.",
+      "category": "object_set",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 40000,
+        "p95_latency_us": 160000,
+        "p99_latency_us": 250000
+      }
+    },
+    {
+      "id": "evaluate_object_set_two_hop_sqlite_100k",
+      "description": "EvaluateObjectSet two-hop traverse through gRPC.",
+      "category": "object_set",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 80000,
+        "p95_latency_us": 320000,
+        "p99_latency_us": 500000
+      }
+    },
+    {
+      "id": "evaluate_object_set_two_hop_postgres_100k",
+      "description": "EvaluateObjectSet two-hop traverse through gRPC.",
+      "category": "object_set",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 80000,
+        "p95_latency_us": 320000,
+        "p99_latency_us": 500000
+      }
+    },
+    {
+      "id": "action_apply_sqlite_10k",
+      "description": "SubmitActionInstance through the gRPC handler.",
+      "category": "object_action",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 15000,
+        "p99_latency_us": 25000
+      }
+    },
+    {
+      "id": "action_apply_postgres_10k",
+      "description": "SubmitActionInstance through the gRPC handler.",
+      "category": "object_action",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 15000,
+        "p99_latency_us": 25000
+      }
+    },
+    {
+      "id": "action_apply_sqlite_100k",
+      "description": "SubmitActionInstance through the gRPC handler.",
+      "category": "object_action",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 15000,
+        "p99_latency_us": 25000
+      }
+    },
+    {
+      "id": "action_apply_postgres_100k",
+      "description": "SubmitActionInstance through the gRPC handler.",
+      "category": "object_action",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 15000,
+        "p99_latency_us": 25000
+      }
+    },
+    {
+      "id": "policy_checked_read_sqlite_10k",
+      "description": "GetObject with an active object-security policy.",
+      "category": "object_security",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 2400,
+        "p95_latency_us": 4800,
+        "p99_latency_us": 6000
+      }
+    },
+    {
+      "id": "policy_checked_read_postgres_10k",
+      "description": "GetObject with an active object-security policy.",
+      "category": "object_security",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 2400,
+        "p95_latency_us": 4800,
+        "p99_latency_us": 6000
+      }
+    },
+    {
+      "id": "policy_checked_read_sqlite_100k",
+      "description": "GetObject with an active object-security policy.",
+      "category": "object_security",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 2400,
+        "p95_latency_us": 4800,
+        "p99_latency_us": 6000
+      }
+    },
+    {
+      "id": "policy_checked_read_postgres_100k",
+      "description": "GetObject with an active object-security policy.",
+      "category": "object_security",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 2400,
+        "p95_latency_us": 4800,
+        "p99_latency_us": 6000
+      }
+    },
+    {
+      "id": "create_object_sqlite_10k",
+      "description": "CreateObject through the gRPC handler.",
+      "category": "object_write",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "create_object_postgres_10k",
+      "description": "CreateObject through the gRPC handler.",
+      "category": "object_write",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "create_object_sqlite_100k",
+      "description": "CreateObject through the gRPC handler.",
+      "category": "object_write",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "create_object_postgres_100k",
+      "description": "CreateObject through the gRPC handler.",
+      "category": "object_write",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "update_object_sqlite_10k",
+      "description": "UpdateObject through the gRPC handler.",
+      "category": "object_write",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "update_object_postgres_10k",
+      "description": "UpdateObject through the gRPC handler.",
+      "category": "object_write",
+      "dataset_size": 10000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "update_object_sqlite_100k",
+      "description": "UpdateObject through the gRPC handler.",
+      "category": "object_write",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "update_object_postgres_100k",
+      "description": "UpdateObject through the gRPC handler.",
+      "category": "object_write",
+      "dataset_size": 100000,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 8000,
+        "p95_latency_us": 20000,
+        "p99_latency_us": 40000
+      }
+    },
+    {
+      "id": "apply_source_batch_grpc_sqlite_100",
+      "description": "ApplySourceBatch through the gRPC handler.",
+      "category": "object_ingest",
+      "dataset_size": 100,
+      "concurrency": 1,
+      "operations_per_iteration": 100,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic source batch",
+      "observes": [
+        "ingestion_throughput",
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 25000,
+        "p95_latency_us": 50000,
+        "p99_latency_us": 75000
+      }
+    },
+    {
+      "id": "apply_source_batch_grpc_postgres_100",
+      "description": "ApplySourceBatch through the gRPC handler.",
+      "category": "object_ingest",
+      "dataset_size": 100,
+      "concurrency": 1,
+      "operations_per_iteration": 100,
+      "warmup_iterations": 2,
+      "sample_iterations": 20,
+      "fixture": "synthetic source batch",
+      "observes": [
+        "ingestion_throughput",
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 25000,
+        "p95_latency_us": 50000,
+        "p99_latency_us": 75000
+      }
+    },
+    {
+      "id": "apply_source_batch_grpc_sqlite_1000",
+      "description": "ApplySourceBatch through the gRPC handler.",
+      "category": "object_ingest",
+      "dataset_size": 1000,
+      "concurrency": 1,
+      "operations_per_iteration": 1000,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic source batch",
+      "observes": [
+        "ingestion_throughput",
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 250000,
+        "p95_latency_us": 500000,
+        "p99_latency_us": 750000
+      }
+    },
+    {
+      "id": "apply_source_batch_grpc_postgres_1000",
+      "description": "ApplySourceBatch through the gRPC handler.",
+      "category": "object_ingest",
+      "dataset_size": 1000,
+      "concurrency": 1,
+      "operations_per_iteration": 1000,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic source batch",
+      "observes": [
+        "ingestion_throughput",
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 250000,
+        "p95_latency_us": 500000,
+        "p99_latency_us": 750000
+      }
+    }
+  ]
+}

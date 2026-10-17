@@ -54,6 +54,7 @@ pub mod ontology_inspect;
 pub mod ontology_product_cli;
 pub mod operation_report;
 pub mod operation_statistics;
+pub mod perf_object_path;
 pub mod perf_regression;
 pub mod plane;
 pub use sekai_provider::pricing;

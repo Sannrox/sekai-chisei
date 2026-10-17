@@ -1,0 +1,187 @@
+{
+  "contract_version": "sekai.performance-manifest/v1",
+  "fixture_version": "sekai.object-path-smoke/v1",
+  "description": "PR smoke subset of object-path workloads with wide budgets.",
+  "workloads": [
+    {
+      "id": "get_object_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 32,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    },
+    {
+      "id": "list_page_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 32,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    },
+    {
+      "id": "evaluate_object_set_filter_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 32,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    },
+    {
+      "id": "evaluate_object_set_sort_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 32,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    },
+    {
+      "id": "evaluate_object_set_one_hop_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 32,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    },
+    {
+      "id": "evaluate_object_set_two_hop_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 32,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    },
+    {
+      "id": "action_apply_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 32,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    },
+    {
+      "id": "policy_checked_read_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 32,
+      "concurrency": 1,
+      "operations_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    },
+    {
+      "id": "apply_source_batch_grpc_sqlite_smoke",
+      "description": "PR smoke subset of object-path gRPC workloads.",
+      "category": "object_smoke",
+      "dataset_size": 100,
+      "concurrency": 1,
+      "operations_per_iteration": 100,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "fixture": "synthetic object graph",
+      "observes": [
+        "control_plane_latency",
+        "throughput"
+      ],
+      "budgets": {
+        "p50_latency_us": 1000000,
+        "p95_latency_us": 2000000,
+        "p99_latency_us": 5000000
+      }
+    }
+  ]
+}

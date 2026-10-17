@@ -1,0 +1,15 @@
+{
+  "contract_version": "sekai.performance-report/v1",
+  "manifest_version": "sekai.performance-manifest/v1",
+  "fixture_version": "sekai.object-path-workloads/v1",
+  "recorded_at": "2026-10-17T00:00:00Z",
+  "hardware": {
+    "description": "github-hosted ubuntu-latest runner class",
+    "operating_system": "Ubuntu",
+    "rustc": "rustc"
+  },
+  "build_profile": "release",
+  "crate_version": "1.3.0",
+  "results": [],
+  "uncertainty": "Bootstrap with no measured rows. MissingFromBaseline is not a regression. Check in three scheduled runner-class reports before the 20% p95 floor has a measured reference."
+}

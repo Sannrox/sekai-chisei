@@ -200,3 +200,44 @@ fn baseline_regression_fails_enforce_even_when_budget_passes() {
         "regression not shown in output"
     );
 }
+
+#[test]
+fn twenty_percent_threshold_passes_a_smaller_baseline_shift() {
+    let dir = temp_dir("threshold");
+    let manifest = write_manifest(&dir, 5000.0);
+    let baseline_path = write_report(&dir, "baseline.json", 100.0);
+    let reports: Vec<PathBuf> = (1..=3)
+        .map(|n| write_report(&dir, &format!("t-{n}.json"), 115.0))
+        .collect();
+
+    let default_floor = Command::new(binary())
+        .arg("--enforce")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(&reports)
+        .output()
+        .expect("run perf-gate");
+    assert!(
+        !default_floor.status.success(),
+        "15% shift should fail the 5% default floor"
+    );
+
+    let scheduled = Command::new(binary())
+        .arg("--enforce")
+        .arg("--regression-threshold-percent")
+        .arg("20")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(&reports)
+        .output()
+        .expect("run perf-gate");
+    assert!(
+        scheduled.status.success(),
+        "15% shift should pass a 20% floor: {}",
+        String::from_utf8_lossy(&scheduled.stdout)
+    );
+}
