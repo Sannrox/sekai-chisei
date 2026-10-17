@@ -2560,6 +2560,7 @@ dependencies = [
  "sekai-proto",
  "sekai-provider",
  "sekai-source-sdk",
+ "sekai-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2690,6 +2691,19 @@ dependencies = [
  "sha2 0.10.9",
  "syn 2.0.118",
  "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "sekai-types"
+version = "1.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "hmac 0.12.1",
+ "sekai-domain",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "uuid",
 ]
 

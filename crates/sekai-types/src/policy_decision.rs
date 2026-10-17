@@ -13,15 +13,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::domain::Object;
-use crate::sekai::classification_lattice::{ClassificationLattice, evaluate_lattice_access};
-use crate::sekai::markings::{MarkingDecision, PrincipalAuthority, object_marking_token};
-use crate::sekai::object_security::{
+use crate::classification_lattice::{ClassificationLattice, evaluate_lattice_access};
+use crate::markings::{MarkingDecision, PrincipalAuthority, object_marking_token};
+use crate::object_security::{
     ObjectSecurityOperation, ObjectSecurityPolicy, PrincipalPolicyContext,
 };
-use crate::sekai::purpose_authorization::{
+use crate::purpose_authorization::{
     PurposeAuthorization, PurposeEvaluation, PurposePresentation, evaluate_required_purpose,
 };
+use sekai_domain::domain::Object;
 
 pub const POLICY_DECISION_CONTRACT: &str = "sekai.policy-decision/v1";
 
@@ -521,13 +521,13 @@ pub fn audit_export_contains_hidden_value(export_json: &[u8], hidden: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sekai::evidence::EvidenceClassification;
-    use crate::sekai::markings::{OBJECT_CLASSIFICATION_PROPERTY, PrincipalAuthority};
-    use crate::sekai::object_security::{
+    use crate::evidence::EvidenceClassification;
+    use crate::markings::{OBJECT_CLASSIFICATION_PROPERTY, PrincipalAuthority};
+    use crate::object_security::{
         OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityPredicate, ObjectSecurityRule, PropertyGrant,
         PropertyGrantAccess, ValueInstanceGrant, value_instance_digest,
     };
-    use crate::sekai::purpose_authorization::PURPOSE_AUTHORIZATION_VERSION;
+    use crate::purpose_authorization::PURPOSE_AUTHORIZATION_VERSION;
     use std::collections::HashMap;
 
     fn object(id: &str, owner: &str, state: &str, marking: Option<&str>) -> Object {

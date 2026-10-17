@@ -20,6 +20,7 @@ members = [
     "crates/sekai-client",
     "crates/sekai-domain",
     "crates/sekai-obs",
+    "crates/sekai-types",
     "crates/sekai-ontology",
     "crates/sekai-proto",
     "crates/sekai-provider",
@@ -96,6 +97,7 @@ pin-project-lite = "0.2"
 tracing = "0.1"
 metrics = "0.24"
 sekai-domain = { version = "1.1.0", path = "crates/sekai-domain" }
+sekai-types = { version = "1.0.0", path = "crates/sekai-types" }
 sekai-source-sdk = { version = "1.2.0", path = "crates/sekai-source-sdk" }
 sekai-obs = { version = "1.1.0", path = "crates/sekai-obs" }
 sekai-provider = { version = "1.0.0", path = "crates/sekai-provider" }
