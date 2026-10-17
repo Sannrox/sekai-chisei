@@ -128,7 +128,7 @@
         "chisei.execution"
       ],
       "evidence": [
-        "src/chisei/governed_subject_provenance.rs",
+        "crates/sekai-types/src/governed_subject_provenance.rs",
         "src/grpc/chisei_service.rs",
         "tests/chisei_governed_subject_provenance_backend_conformance.rs",
         "src/db/governed_subject_provenance.rs",

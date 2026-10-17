@@ -292,7 +292,7 @@ pub(super) fn principal_request<T>(
 }
 
 fn inject_trace_context(metadata: &mut tonic::metadata::MetadataMap) {
-    use opentelemetry::propagation::Injector;
+    use crate::obs::otel::Injector;
     use tonic::metadata::{AsciiMetadataKey, MetadataValue};
 
     struct MetadataInjector<'a>(&'a mut tonic::metadata::MetadataMap);

@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::sekai::evidence::EvidenceClassification;
-use crate::sekai::markings::{
+use crate::evidence::EvidenceClassification;
+use crate::markings::{
     MarkingCheckResult, MarkingDecision, PrincipalAuthority, is_marking_downgrade,
     is_trusted_service_principal,
 };
@@ -182,10 +182,10 @@ pub fn evaluate_lattice_access(
         uuid::Uuid::new_v4().as_simple()
     );
     let Some(lattice) = lattice else {
-        return crate::sekai::markings::evaluate_marking_access(
+        return crate::markings::evaluate_marking_access(
             operation_id,
             object_token.and_then(|token| {
-                crate::sekai::markings::parse_optional_classification(token)
+                crate::markings::parse_optional_classification(token)
                     .ok()
                     .flatten()
             }),
@@ -274,8 +274,8 @@ pub fn join_marking_tokens(
         (_, None, None) => Ok(None),
         (_, Some(token), None) | (_, None, Some(token)) => Ok(Some(token.into())),
         (None, Some(left), Some(right)) => {
-            let parsed_left = crate::sekai::markings::parse_optional_classification(left)?;
-            let parsed_right = crate::sekai::markings::parse_optional_classification(right)?;
+            let parsed_left = crate::markings::parse_optional_classification(left)?;
+            let parsed_right = crate::markings::parse_optional_classification(right)?;
             Ok(match (parsed_left, parsed_right) {
                 (Some(left), Some(right)) => Some(left.max(right).as_str().into()),
                 (Some(token), None) | (None, Some(token)) => Some(token.as_str().into()),
@@ -304,7 +304,7 @@ pub fn union_input_marking_tokens(
         };
         match lattice {
             None => {
-                crate::sekai::markings::parse_optional_classification(token)?;
+                crate::markings::parse_optional_classification(token)?;
             }
             Some(lattice) => {
                 if !lattice.contains(token) {
@@ -339,8 +339,8 @@ pub fn is_marking_token_downgrade(
         (Some(from), Some(to)) => match lattice {
             Some(lattice) => Ok(!lattice.dominates(to, from)?),
             None => {
-                let from = crate::sekai::markings::parse_optional_classification(from)?;
-                let to = crate::sekai::markings::parse_optional_classification(to)?;
+                let from = crate::markings::parse_optional_classification(from)?;
+                let to = crate::markings::parse_optional_classification(to)?;
                 Ok(is_marking_downgrade(from, to))
             }
         },
@@ -372,7 +372,7 @@ pub fn evaluate_declassify_tokens(
         });
     }
     let from_token = from.ok_or_else(|| "marking is not a downgrade".to_string())?;
-    let from_key = match crate::sekai::markings::parse_classification(from_token) {
+    let from_key = match crate::markings::parse_classification(from_token) {
         Ok(marking) => marking.as_str().to_string(),
         Err(_) => from_token.to_string(),
     };
@@ -429,7 +429,7 @@ pub fn validate_written_marking_token(
     match lattice {
         Some(lattice) if lattice.contains(token) => Ok(()),
         Some(_) => Err("object marking is unknown to the activated lattice".into()),
-        None => crate::sekai::markings::parse_optional_classification(token).map(|_| ()),
+        None => crate::markings::parse_optional_classification(token).map(|_| ()),
     }
 }
 
@@ -544,7 +544,7 @@ mod tests {
         PrincipalAuthority {
             principal: "alice".into(),
             classification_ceiling: token.and_then(|value| {
-                crate::sekai::markings::parse_optional_classification(value)
+                crate::markings::parse_optional_classification(value)
                     .ok()
                     .flatten()
             }),

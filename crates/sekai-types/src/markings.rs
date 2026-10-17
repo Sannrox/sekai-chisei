@@ -11,8 +11,8 @@
 //! - **Marked** objects and purpose-gated actions fail closed when the
 //!   principal lacks a sufficient clearance or purpose allow-list entry.
 
-use crate::domain::Object;
-use crate::sekai::evidence::EvidenceClassification;
+use crate::evidence::EvidenceClassification;
+use sekai_domain::domain::Object;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
