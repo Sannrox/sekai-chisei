@@ -7,7 +7,7 @@ pub mod metrics {
         set_search_index_lag_ms,
     };
 
-    pub fn handle() -> &'static metrics_exporter_prometheus::PrometheusHandle {
+    pub fn handle() -> &'static sekai_obs::metrics::PrometheusHandle {
         sekai_obs::metrics::handle(env!("CARGO_PKG_VERSION"))
     }
 

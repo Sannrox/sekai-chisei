@@ -42,7 +42,18 @@ prost = "0.14"
 prost-types = "0.14"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", default-features = false, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 tokio-stream = { version = "0.1", features = ["net"] }
 axum = "0.8"
 async-stream = "0.3"
@@ -83,13 +94,7 @@ http-body = "1"
 http-body-util = "0.1"
 pin-project-lite = "0.2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
-tracing-opentelemetry = { version = "0.33", default-features = false }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.18", default-features = false }
 sekai-domain = { version = "1.1.0", path = "crates/sekai-domain" }
 sekai-source-sdk = { version = "1.2.0", path = "crates/sekai-source-sdk" }
 sekai-obs = { version = "1.1.0", path = "crates/sekai-obs" }
@@ -109,6 +114,10 @@ chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 # The object-log host the clerk adapter talks to (ADR 0088), same pinned tag.
 mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "std",
+] }
 
 [[bin]]
 name = "sekai-plane"
