@@ -134,3 +134,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0110: Preview a governed transform without committing governed data](0110-governed-transform-preview.md)
 - [ADR 0111: Scoped contexts publish definition drafts through proposals](0111-scoped-definition-proposals.md)
 - [ADR 0112: Plane namespace is part of object-log identity](0112-namespaced-object-log-identity.md)
+- [ADR 0113: Customer-managed keys use envelope encryption and one key-provider contract](0113-customer-managed-keys.md)
