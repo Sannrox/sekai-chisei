@@ -84,7 +84,9 @@ An LLM function revision is a governed evaluation subject
 fixture set, retains each structured output as evidence, and scores that
 evidence with the existing `stochastic_model/v1` rubric
 (`chisei.bounded-rubric-score/v1`). A mean score below the manifest threshold
-is a `deny` on publish.
+is a `deny` on publish. Invoice extraction uses a labelled fixture set
+(`invoice_extraction_fixtures`) with expected vendor `ACME`; a worse
+extraction is denied and an unchanged revision publishes (#1327).
 
 Publish is the only way to store a revision with an LLM step: it records an
 approval for the revision digest, then stores the revision. `CreateFunction`

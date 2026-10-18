@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Invoice extraction function revisions are scored on a labelled fixture
+  set before publish. A worse vendor extraction is denied; an unchanged
+  revision still publishes (#1327).
+
 - Operators can freeze writes or agent Actions by tenant, namespace, principal,
   or Action type. The next object write and Action admission fail closed with
   the freeze reason. In-flight claims fail at ack. Freeze and unfreeze write
