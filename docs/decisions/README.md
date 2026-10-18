@@ -136,3 +136,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0112: Plane namespace is part of object-log identity](0112-namespaced-object-log-identity.md)
 - [ADR 0113: Customer-managed keys use envelope encryption and one key-provider contract](0113-customer-managed-keys.md)
 - [ADR 0114: Signed per-namespace receipt chain, verifiable offline](0114-signed-receipt-chain.md)
+- [ADR 0115: Compliance packs map controls to export evidence as data](0115-compliance-packs.md)

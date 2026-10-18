@@ -1,0 +1,39 @@
+{
+  "pack_format": "sekai.compliance-pack/v1",
+  "id": "iso27001",
+  "version": "1",
+  "framework": "ISO/IEC 27001",
+  "framework_version": "2022",
+  "controls": [
+    {
+      "id": "A.5.15",
+      "title": "Access control",
+      "queries": ["access_reviews"]
+    },
+    {
+      "id": "A.5.18",
+      "title": "Access rights",
+      "queries": ["grant_expiry"]
+    },
+    {
+      "id": "A.5.34",
+      "title": "Privacy and protection of PII",
+      "queries": ["deletion_proofs"]
+    },
+    {
+      "id": "A.5.24",
+      "title": "Information security incident management planning",
+      "queries": ["incident_records"]
+    },
+    {
+      "id": "A.8.13",
+      "title": "Information backup",
+      "queries": ["backup_drills"]
+    },
+    {
+      "id": "A.8.24",
+      "title": "Use of cryptography",
+      "queries": ["key_rotation"]
+    }
+  ]
+}
