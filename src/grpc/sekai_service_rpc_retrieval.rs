@@ -335,7 +335,8 @@ pub(super) async fn discover_capabilities(
     };
     let contract_version = capability::negotiate_contract_version(&inner.contract_version)
         .map_err(map_capability_error)?;
-    let mut entries = service.discoverable_capabilities(namespace, &principals)?;
+    let mut entries =
+        service.discoverable_capabilities(namespace, &principals, tenant_context.as_ref())?;
     if tier_filter != "all" {
         entries.retain(|entry| {
             let tier = if entry.product_tier.trim().is_empty() {
@@ -346,11 +347,13 @@ pub(super) async fn discover_capabilities(
             tier == tier_filter
         });
     }
+    let ontology_revision = service.published_ontology_revision(namespace, &principals)?;
     let mut context = principals.clone();
     context.sort();
     context.dedup();
     context.insert(0, namespace.to_string());
     context.push(format!("product_tier:{tier_filter}"));
+    context.push(format!("ontology_revision:{ontology_revision}"));
     let canonical_entries = entries
         .iter()
         .map(Message::encode_to_vec)
@@ -371,6 +374,7 @@ pub(super) async fn discover_capabilities(
         next_page_token,
         total_size: entries.len().min(u32::MAX as usize) as u32,
         cache_scope: "authorization_context".into(),
+        ontology_revision,
     }))
 }
 pub(super) async fn get_governed_fact_version(

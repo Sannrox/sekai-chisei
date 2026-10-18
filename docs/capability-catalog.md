@@ -41,11 +41,16 @@ Catalog entries are ordered by capability name and describe:
 - bounded query or retrieval limits;
 - evidence requirements for Kioku candidate retrieval; and
 - bounded epistemic-descriptor projection limits and backend capability
-  metadata where a reusable surface differs by SQLite versus PostgreSQL; and
-- the existing `ObjectType` where a schema applies.
+  metadata where a reusable surface differs by SQLite versus PostgreSQL;
+- the existing `ObjectType` where a schema applies;
+- closed Action parameter JSON Schema and visible markings on Action entries;
+  and
+- `ontology_revision`, the published definition revision digest the caller
+  may read (empty when none is published or the caller cannot see it).
 
 `ObjectType` remains the schema source of truth. The catalog does not define
-another JSON Schema or tool-schema vocabulary.
+another JSON Schema or tool-schema vocabulary. Action entries copy
+`parameter_schema_json` from the governed Action type.
 
 ## Authorization and caching
 
@@ -93,6 +98,38 @@ entry is still visible and matches the requested object kind, action type, or
 semantic capability. A revoked credential, removed grant, changed action
 policy, or unavailable capability is therefore enforced even when the caller
 cached an older catalog.
+
+## Governed Action type capabilities
+
+Enabled governed Action types appear as `sekai.actions.{type_id}` on the
+**core** pack. Each entry copies the type's description, closed
+`parameter_schema_json`, and selected `action_version`. When several versions
+of one type are enabled, the catalog keeps the last row in type_id/version
+order. Visible markings come from the bound object kind after
+restricted-property redaction. `approval_behavior` matches submit admission
+(`submit_action_instance`). Discovery omits a type that is disabled, binds a reserved or ACL-hidden
+object kind, submit admission is Deny, or a per-type policy override is
+Deny. A per-type Allow does not restore a submit-denied type. Callers who
+cannot query restricted properties also omit a type whose parameter schema
+names those properties. Team-managed namespaces omit every Action entry
+when the caller lacks Editor or Admin, matching submit authorization. A
+service principal only sees types in its registered `action_types` scope.
+Enterprise write authorization (credential scope and space role) matches
+submit: discover-only sessions keep object queries and lose Action entries.
+
+`DiscoverCapabilitiesResponse.ontology_revision` is observational. It does
+not authorize invoke. `catalog_version` includes that digest, so a published
+revision or permission change ABORTs a pinned snapshot.
+
+Catalog-bound `SubmitActionInstance` with `x-sekai-capability` equal to
+`sekai.actions.{type_id}` rebuilds the live catalog and fails with
+`FAILED_PRECONDITION` / `capability unavailable` when the named entry is
+gone or `action_version` is not the advertised version. Direct submit
+without those headers, and MCP v1's `sekai.actions.submit` tool when that
+name is not the native type entry, keep the existing submit path. MCP v1
+keeps its fixed ten-tool allowlist; the native catalog is the Action-type
+source.
+See [ADR 0116](decisions/0116-action-type-capability-discovery.md).
 
 ## Semantic retrieval capabilities
 

@@ -270,6 +270,16 @@ message CapabilityEntry {
   // Product tier for discovery filters (#386 / research #383): core | advanced | experimental.
   // Empty means untagged (treated as advanced for filtering).
   string product_tier = 19;
+  // Closed parameter JSON Schema copied from the governed Action type. Empty
+  // for query and retrieval entries. Not a second schema language.
+  string parameter_schema_json = 20;
+  // Visible classification markings remaining after restricted-property
+  // redaction. Hidden markings are omitted.
+  repeated string markings = 21;
+  // Governed Action type version selected for this catalog entry. Empty on
+  // query and retrieval entries. When several versions of one type_id are
+  // enabled, the catalog keeps the last row in type_id/version order.
+  string action_version = 22;
 }
 
 message CapabilityLimit {
@@ -295,6 +305,10 @@ message DiscoverCapabilitiesResponse {
   string next_page_token = 4;
   uint32 total_size = 5;
   string cache_scope = 6; // always authorization_context
+  // Published definition revision digest the caller may read. Empty when the
+  // namespace has no published revision or the caller cannot see it.
+  // catalog_version still changes when this value changes.
+  string ontology_revision = 7;
 }
 
 // Fixed graph-backed profile for immutable requirement, invariant, and waiver

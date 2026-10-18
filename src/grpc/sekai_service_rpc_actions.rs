@@ -141,12 +141,39 @@ pub(super) async fn submit_action_instance(
         &req,
         crate::sekai::operation_correlation::OPERATION_METADATA,
     );
+    let catalog_capability = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-capability");
+    let catalog_namespace = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-namespace");
     let mut inner = req.into_inner();
     let namespace = inner.namespace.trim().to_string();
     if namespace.is_empty() {
         return Err(Status::invalid_argument("namespace required"));
     }
     let actor = authorize_action_instance_submit(service, &principals, &namespace)?;
+    if let Some(capability_name) = catalog_capability {
+        let expected = crate::sekai::capability::action_capability_name(&inner.type_id);
+        // MCP v1 binds SubmitActionInstance as `sekai.actions.submit`. Skip
+        // the type-specific live catalog check only when that allowlist name
+        // is not also the native entry for this type_id.
+        if capability_name != "sekai.actions.submit" || capability_name == expected {
+            let catalog_namespace = catalog_namespace.unwrap_or_else(|| namespace.clone());
+            if catalog_namespace != namespace {
+                return Err(Status::invalid_argument(
+                    "catalog namespace metadata must match request namespace",
+                ));
+            }
+            let visible = service
+                .discoverable_capabilities(&namespace, &principals, tenant_context.as_ref())?
+                .into_iter()
+                .any(|entry| {
+                    entry.name == capability_name
+                        && capability_name == expected
+                        && entry.action_version == inner.version
+                });
+            if !visible {
+                return Err(Status::failed_precondition("capability unavailable"));
+            }
+        }
+    }
     enforce_namespace_tenant_context(
         service.db.runtime(),
         tenant_context.as_ref(),

@@ -336,7 +336,7 @@ impl SekaiServiceImpl {
     /// Live discovery is rechecked; a previously observed catalog is never a grant.
     fn begin_semantic_catalog_invocation<'a>(
         &'a self,
-        req: &Request<impl prost::Message>,
+        req: &Request<impl prost::Message + 'static>,
         expected_capability: &str,
         namespace: &str,
         principals: &[String],
@@ -366,8 +366,9 @@ impl SekaiServiceImpl {
         let catalog_version = Self::catalog_metadata_value(req, "x-sekai-catalog-version");
         let actor = principals.first().cloned().unwrap_or_default();
 
+        let tenant_context = request_tenant_context(self.db.runtime(), req)?;
         let visible = self
-            .discoverable_capabilities(namespace, principals)?
+            .discoverable_capabilities(namespace, principals, tenant_context.as_ref())?
             .into_iter()
             .any(|entry| entry.name == capability_name && capability_name == expected_capability);
         if !visible {

@@ -509,6 +509,24 @@ fn with_named_principal<T>(payload: T, principal: &str) -> Request<T> {
     req
 }
 
+fn with_catalog_action<T>(
+    payload: T,
+    principal: &str,
+    capability: &str,
+    namespace: &str,
+) -> Request<T> {
+    let mut req = with_named_principal(payload, principal);
+    req.metadata_mut().insert(
+        "x-sekai-capability",
+        MetadataValue::try_from(capability).unwrap(),
+    );
+    req.metadata_mut().insert(
+        "x-sekai-namespace",
+        MetadataValue::try_from(namespace).unwrap(),
+    );
+    req
+}
+
 fn with_operation_identity<T>(payload: T, operation_id: &str) -> Request<T> {
     let mut req = with_principal(payload);
     req.metadata_mut().insert(
@@ -13536,6 +13554,649 @@ async fn capability_discovery_rejects_a_stale_pinned_snapshot_without_metadata()
     assert_eq!(stale.code(), tonic::Code::Aborted);
     assert_eq!(stale.message(), "capability catalog version unavailable");
     assert!(!stale.message().contains("widget"));
+}
+
+fn intake_action_type(object_kind: &str) -> GovernedActionType {
+    let parameter_schema_json = if object_kind.is_empty() {
+        r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#
+    } else {
+        r#"{"type":"object","properties":{"object_id":{"type":"string"},"summary":{"type":"string"}},"required":["object_id","summary"],"additionalProperties":false}"#
+    };
+    GovernedActionType {
+        approvers: Vec::new(),
+        namespace: "acme".into(),
+        type_id: "review.intake".into(),
+        version: "1.0.0".into(),
+        description: "Admit review".into(),
+        parameter_schema_json: parameter_schema_json.into(),
+        allowed_effect_kinds: vec!["runtime_dispatch".into()],
+        policy_scope: String::new(),
+        budget_scope: String::new(),
+        enabled: true,
+        created_by: String::new(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        disabled_at_ms: 0,
+        object_kind: object_kind.into(),
+        object_mutation: if object_kind.is_empty() {
+            String::new()
+        } else {
+            "create".into()
+        },
+        submission_criteria: vec![],
+        declared_effect_kinds: vec![],
+        system_one_json: String::new(),
+    }
+}
+
+async fn discover_acme(
+    svc: &SekaiServiceImpl,
+    principal: &str,
+) -> crate::grpc::pb::sekai::DiscoverCapabilitiesResponse {
+    svc.discover_capabilities(with_named_principal(
+        DiscoverCapabilitiesRequest {
+            namespace: "acme".into(),
+            page_size: 200,
+            ..Default::default()
+        },
+        principal,
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+/// #1459: a published enabled Action type is a core catalog entry for a
+/// permitted principal, with the type's schema, description, and markings.
+#[tokio::test]
+async fn capability_discovery_lists_published_action_types_for_permitted_principals() {
+    let svc = service();
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let before = discover_acme(&svc, "tester").await;
+    let action_name = capability::action_capability_name("review.intake");
+    assert!(
+        before
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("widget")),
+            request_id: "put-intake".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let discovered = discover_acme(&svc, "tester").await;
+    assert_ne!(discovered.catalog_version, before.catalog_version);
+    assert!(discovered.ontology_revision.is_empty());
+    let entry = discovered
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == action_name)
+        .expect("published action type is discoverable");
+    assert_eq!(entry.product_tier, "core");
+    assert_eq!(entry.kind, "action");
+    assert_eq!(entry.description, "Admit review");
+    assert_eq!(
+        entry.parameter_schema_json,
+        r#"{"type":"object","properties":{"object_id":{"type":"string"},"summary":{"type":"string"}},"required":["object_id","summary"],"additionalProperties":false}"#
+    );
+    assert_eq!(entry.approval_behavior, "none");
+    assert_eq!(entry.action_version, "1.0.0");
+    assert_eq!(entry.input_type, "sekai.SubmitActionInstanceRequest");
+    assert_eq!(entry.output_type, "sekai.SubmitActionInstanceResponse");
+    assert!(
+        entry
+            .required_scopes
+            .iter()
+            .any(|scope| scope == "action:submit")
+    );
+    assert!(
+        entry
+            .policy_decision_points
+            .iter()
+            .any(|point| point == "action_policy")
+    );
+    assert!(
+        entry
+            .policy_decision_points
+            .iter()
+            .any(|point| point == "schema_visibility")
+    );
+    assert!(entry.markings.iter().any(|marking| marking == "public"));
+
+    let mut later = intake_action_type("widget");
+    later.version = "2.0.0".into();
+    later.description = "Admit review v2".into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(later),
+            request_id: "put-intake-v2".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let latest = discover_acme(&svc, "tester").await;
+    let latest_entries: Vec<_> = latest
+        .capabilities
+        .iter()
+        .filter(|entry| entry.name == action_name)
+        .collect();
+    assert_eq!(latest_entries.len(), 1);
+    assert_eq!(latest_entries[0].action_version, "2.0.0");
+    assert_eq!(latest_entries[0].description, "Admit review v2");
+
+    let mut require_approval = action_policy::ActionPolicy::allow_all("agent:tester");
+    require_approval.action_overrides.insert(
+        crate::sekai::action_instance::SUBMIT_POLICY_ACTION.into(),
+        action_policy::ActionDecision::RequireApproval,
+    );
+    svc.db
+        .runtime()
+        .upsert_action_policy(&require_approval)
+        .unwrap();
+    let approved = discover_acme(&svc, "tester").await;
+    let approved_entry = approved
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == action_name)
+        .expect("approval policy still lists the action");
+    assert_eq!(approved_entry.approval_behavior, "required");
+
+    let mut deny_submit = action_policy::ActionPolicy::allow_all("agent:tester");
+    deny_submit.action_overrides.insert(
+        crate::sekai::action_instance::SUBMIT_POLICY_ACTION.into(),
+        action_policy::ActionDecision::Deny,
+    );
+    deny_submit
+        .action_overrides
+        .insert("review.intake".into(), action_policy::ActionDecision::Allow);
+    svc.db.runtime().upsert_action_policy(&deny_submit).unwrap();
+    let submit_denied = discover_acme(&svc, "tester").await;
+    assert!(
+        submit_denied
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+}
+
+/// #1459: a type-level deny drops the catalog entry; catalog-bound submit
+/// then fails closed. Direct submit without catalog headers is unchanged.
+#[tokio::test]
+async fn capability_discovery_omits_denied_action_and_catalog_submit_fails_closed() {
+    use crate::sekai::action_instance::STATUS_ADMITTED;
+
+    let svc = service();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("")),
+            request_id: "put-intake".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let action_name = capability::action_capability_name("review.intake");
+    let listed = discover_acme(&svc, "tester").await;
+    assert!(
+        listed
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == action_name)
+    );
+
+    let mut later = intake_action_type("");
+    later.version = "2.0.0".into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(later),
+            request_id: "put-intake-v2-submit".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let submit = SubmitActionInstanceRequest {
+        namespace: "acme".into(),
+        type_id: "review.intake".into(),
+        version: "2.0.0".into(),
+        parameters_json: r#"{"summary":"ship it"}"#.into(),
+        idempotency_key: "idem-catalog".into(),
+        evidence_submission_ids: vec![],
+        request_id: "req-catalog".into(),
+        ontology_digest: String::new(),
+    };
+    let stale_version = svc
+        .submit_action_instance(with_catalog_action(
+            SubmitActionInstanceRequest {
+                version: "1.0.0".into(),
+                idempotency_key: "idem-old-version".into(),
+                request_id: "req-old-version".into(),
+                ..submit.clone()
+            },
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_version.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(stale_version.message(), "capability unavailable");
+
+    let admitted = svc
+        .submit_action_instance(with_catalog_action(
+            submit.clone(),
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(admitted.status, STATUS_ADMITTED);
+
+    let mut deny = action_policy::ActionPolicy::allow_all("agent:tester");
+    deny.action_overrides
+        .insert("review.intake".into(), action_policy::ActionDecision::Deny);
+    svc.db.runtime().upsert_action_policy(&deny).unwrap();
+
+    let omitted = discover_acme(&svc, "tester").await;
+    assert!(
+        omitted
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+    assert_ne!(omitted.catalog_version, listed.catalog_version);
+
+    let stale = svc
+        .submit_action_instance(with_catalog_action(
+            SubmitActionInstanceRequest {
+                idempotency_key: "idem-stale".into(),
+                request_id: "req-stale".into(),
+                ..submit.clone()
+            },
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(stale.message(), "capability unavailable");
+    assert!(!stale.message().contains("review.intake"));
+
+    let direct = svc
+        .submit_action_instance(with_named_principal(
+            SubmitActionInstanceRequest {
+                idempotency_key: "idem-direct".into(),
+                request_id: "req-direct".into(),
+                ..submit.clone()
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(direct.status, STATUS_ADMITTED);
+
+    let mcp = svc
+        .submit_action_instance(with_catalog_action(
+            SubmitActionInstanceRequest {
+                idempotency_key: "idem-mcp".into(),
+                request_id: "req-mcp".into(),
+                ..submit
+            },
+            "tester",
+            "sekai.actions.submit",
+            "acme",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(mcp.status, STATUS_ADMITTED);
+}
+
+/// #1459: team-managed Viewers keep object queries and lose Action entries.
+#[tokio::test]
+async fn capability_discovery_omits_actions_without_namespace_write() {
+    let svc = service();
+    grant_source_namespace(&svc, "acme", "alice", security::Role::Viewer);
+    grant_source_namespace(&svc, "acme", "tester", security::Role::Editor);
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("")),
+            request_id: "put-intake".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let action_name = capability::action_capability_name("review.intake");
+    let viewer = discover_acme(&svc, "alice").await;
+    assert!(
+        viewer
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+    let editor = discover_acme(&svc, "tester").await;
+    assert!(
+        editor
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == action_name)
+    );
+    assert_ne!(viewer.catalog_version, editor.catalog_version);
+}
+
+/// #1459: discover-only enterprise sessions keep queries and lose Actions.
+#[tokio::test]
+async fn capability_discovery_omits_actions_without_enterprise_write() {
+    let svc = service();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("")),
+            request_id: "put-intake".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let action_name = capability::action_capability_name("review.intake");
+    let discoverer = svc
+        .discover_capabilities(with_discoverer(
+            DiscoverCapabilitiesRequest {
+                namespace: "acme".into(),
+                page_size: 200,
+                ..Default::default()
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        discoverer
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+    let writer = discover_acme(&svc, "tester").await;
+    assert!(
+        writer
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == action_name)
+    );
+}
+
+/// #1459: type_id `submit` publishes as `sekai.actions.submit` and still
+/// rechecks the live catalog. The MCP allowlist skip does not apply.
+#[tokio::test]
+async fn capability_discovery_rechecks_native_submit_type_id() {
+    use crate::sekai::action_instance::STATUS_ADMITTED;
+
+    let svc = service();
+    let mut native_submit = intake_action_type("");
+    native_submit.type_id = "submit".into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(native_submit),
+            request_id: "put-submit-type".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let action_name = capability::action_capability_name("submit");
+    assert_eq!(action_name, "sekai.actions.submit");
+    let listed = discover_acme(&svc, "tester").await;
+    assert!(
+        listed
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == action_name)
+    );
+
+    let submit = SubmitActionInstanceRequest {
+        namespace: "acme".into(),
+        type_id: "submit".into(),
+        version: "1.0.0".into(),
+        parameters_json: r#"{"summary":"ship it"}"#.into(),
+        idempotency_key: "idem-native-submit".into(),
+        evidence_submission_ids: vec![],
+        request_id: "req-native-submit".into(),
+        ontology_digest: String::new(),
+    };
+    let admitted = svc
+        .submit_action_instance(with_catalog_action(
+            submit.clone(),
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(admitted.status, STATUS_ADMITTED);
+
+    let mut deny = action_policy::ActionPolicy::allow_all("agent:tester");
+    deny.action_overrides
+        .insert("submit".into(), action_policy::ActionDecision::Deny);
+    svc.db.runtime().upsert_action_policy(&deny).unwrap();
+    let omitted = discover_acme(&svc, "tester").await;
+    assert!(
+        omitted
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+    let stale = svc
+        .submit_action_instance(with_catalog_action(
+            SubmitActionInstanceRequest {
+                idempotency_key: "idem-native-submit-stale".into(),
+                request_id: "req-native-submit-stale".into(),
+                ..submit
+            },
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(stale.message(), "capability unavailable");
+}
+
+/// #1459: schema ACL hides types from ungranted principals; restricted
+/// properties and markings stay off the catalog unless the caller may query
+/// them.
+#[tokio::test]
+async fn capability_discovery_hides_restricted_schema_and_markings() {
+    let svc = service();
+    let mut widget = widget_schema_type();
+    widget.properties.push(PropertyDef {
+        name: "secret_note".into(),
+        r#type: "string".into(),
+        required: false,
+        description: "".into(),
+        enum_values: vec![],
+        link_kind: "".into(),
+        compute_expr: "".into(),
+        classification: "internal".into(),
+        struct_fields: vec![],
+    });
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(widget),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let mut classified = widget_schema_type();
+    classified.kind = "classified_widget".into();
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(classified),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    grant_object_role(
+        &svc,
+        &schema_object_id("classified_widget"),
+        "tester",
+        security::Role::Viewer,
+    );
+
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("widget")),
+            request_id: "put-widget-action".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let mut secret_action = intake_action_type("widget");
+    secret_action.type_id = "review.secret".into();
+    secret_action.description = "Admit review with note".into();
+    secret_action.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"summary":{"type":"string"},"secret_note":{"type":"string"}},"required":["object_id","summary"],"additionalProperties":false}"#.into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(secret_action),
+            request_id: "put-secret-action".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let mut classified_action = intake_action_type("classified_widget");
+    classified_action.type_id = "classified.dispatch".into();
+    classified_action.description = "Classified dispatch".into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(classified_action),
+            request_id: "put-classified-action".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let widget_action = capability::action_capability_name("review.intake");
+    let secret_action_name = capability::action_capability_name("review.secret");
+    let classified_action_name = capability::action_capability_name("classified.dispatch");
+    let alice = discover_acme(&svc, "alice").await;
+    let alice_names: Vec<&str> = alice
+        .capabilities
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert!(alice_names.contains(&widget_action.as_str()));
+    assert!(!alice_names.contains(&secret_action_name.as_str()));
+    assert!(!alice_names.contains(&classified_action_name.as_str()));
+    assert!(!alice_names.contains(&"sekai.objects.query.classified_widget"));
+    let alice_widget = alice
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == widget_action)
+        .unwrap();
+    assert!(
+        !alice_widget
+            .markings
+            .iter()
+            .any(|marking| marking == "internal")
+    );
+    let alice_query = alice
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == "sekai.objects.query.widget")
+        .expect("world-readable widget query stays visible");
+    assert!(
+        alice_query
+            .object_type
+            .as_ref()
+            .unwrap()
+            .properties
+            .iter()
+            .all(|property| property.name != "secret_note")
+    );
+    assert!(!format!("{alice:?}").contains("classified_widget"));
+    assert!(!format!("{alice:?}").contains("secret_note"));
+
+    let tester = discover_acme(&svc, "tester").await;
+    assert!(
+        tester
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == classified_action_name)
+    );
+    assert!(
+        tester
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == "sekai.objects.query.classified_widget")
+    );
+
+    let local = discover_acme(&svc, "local").await;
+    let local_secret = local
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == secret_action_name)
+        .expect("restricted callers still see parameter schemas they may use");
+    assert!(local_secret.parameter_schema_json.contains("secret_note"));
+    let local_widget = local
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == widget_action)
+        .unwrap();
+    assert!(
+        local_widget
+            .markings
+            .iter()
+            .any(|marking| marking == "internal")
+    );
+    let local_query = local
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == "sekai.objects.query.widget")
+        .unwrap();
+    assert!(
+        local_query
+            .object_type
+            .as_ref()
+            .unwrap()
+            .properties
+            .iter()
+            .any(|property| property.name == "secret_note")
+    );
 }
 
 /// Real transport regression: client extensions cannot cross the wire.

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `DiscoverCapabilities` lists enabled governed Action types as
+  `sekai.actions.{type_id}` on the core pack, with parameter schema,
+  selected `action_version`, description, approval matching submit
+  admission, and visible markings from the bound object kind.
+  Catalog-bound `SubmitActionInstance` rechecks the live catalog and fails
+  closed after revoke. Hidden types, restricted properties, and markings stay
+  off the catalog. The response carries `ontology_revision` (ADR 0116, #1459).
+
 - New grants can require a purpose and an end date when a namespace opts in.
   Permanent grants need an explicit exception. Expired grants stop authorizing.
   Create and renew write Decision receipts (#1462).
