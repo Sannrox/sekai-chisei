@@ -67,6 +67,11 @@ pub struct Config {
     /// Authenticated hop target for a Chisei process (`http://127.0.0.1:50051`).
     /// Required to boot `chisei-plane` (ADR 0096 rule 4). Combined mode ignores it.
     pub sekai_endpoint: Option<String>,
+    /// Per-principal and per-agent rate limits plus the agent grant ceiling (#1563).
+    /// Off until callers send actor chains.
+    pub actor_chain_enforcement: bool,
+    pub principal_requests_per_minute: u32,
+    pub agent_requests_per_minute: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +150,14 @@ impl Config {
             assertion_audience: optional_env("SEKAI_ASSERTION_AUDIENCE"),
             assertion_hmac_key: optional_env("SEKAI_ASSERTION_HMAC_KEY"),
             sekai_endpoint: optional_env("SEKAI_ENDPOINT"),
+            actor_chain_enforcement: env::var("SEKAI_ACTOR_CHAIN_ENFORCEMENT").unwrap_or_default()
+                == "1",
+            principal_requests_per_minute: env("SEKAI_PRINCIPAL_REQUESTS_PER_MINUTE", "60")
+                .parse()
+                .unwrap_or(60),
+            agent_requests_per_minute: env("SEKAI_AGENT_REQUESTS_PER_MINUTE", "60")
+                .parse()
+                .unwrap_or(60),
         }
     }
 

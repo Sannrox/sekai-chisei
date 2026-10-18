@@ -231,6 +231,7 @@ enabled in the default build.
 - [Tenant isolation conformance](tenant-isolation-conformance.md)
 - [Tenant provider credentials](tenant-provider-credentials.md)
 - [Tenant quotas](tenant-quotas.md)
+- [Per-principal and per-agent authority](actor-authority.md)
 - [Tenant invitations](tenant-invitations.md)
 - [Tenant usage ledger](tenant-usage-ledger.md)
 - [Tenant entitlements](tenant-entitlements.md)

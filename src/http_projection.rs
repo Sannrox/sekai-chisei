@@ -133,9 +133,10 @@ where
     I: Interceptor + Clone + Send + Sync + 'static,
 {
     let path = format!("/{service}/{method}");
-    if let Err(status) = authenticate(&state.interceptor, &headers) {
-        return status_response(status);
-    }
+    let authenticated = match authenticate(&state.interceptor, &headers) {
+        Ok(request) => request,
+        Err(status) => return status_response(status),
+    };
     if crate::store_relocate::is_mutating_rpc(&method)
         && let Some(stores) = &state.stores
         && let Err(message) = crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)
@@ -151,7 +152,8 @@ where
     ) {
         return status_response(Status::unimplemented(STREAMING_MESSAGE));
     }
-    dispatch(&state, &service, &method, &headers, body).await
+    let (metadata, extensions, ()) = authenticated.into_parts();
+    dispatch(&state, &service, &method, metadata, extensions, body).await
 }
 
 async fn mcp_handler<I>(
@@ -163,7 +165,7 @@ where
     I: Interceptor + Clone + Send + Sync + 'static,
 {
     let authenticated = match authenticate(&state.interceptor, &headers) {
-        Ok(metadata) => metadata,
+        Ok(request) => request.into_parts().0,
         Err(status) => return status_response(status),
     };
     let message = match serde_json::from_slice::<Value>(&body) {
@@ -195,422 +197,419 @@ where
     }
 }
 
-fn authenticate<I>(interceptor: &I, headers: &HeaderMap) -> Result<MetadataMap, Status>
+fn authenticate<I>(interceptor: &I, headers: &HeaderMap) -> Result<Request<()>, Status>
 where
     I: Interceptor + Clone,
 {
     let mut interceptor = interceptor.clone();
-    let request = interceptor.call(Request::from_parts(
+    interceptor.call(Request::from_parts(
         headers_to_metadata(headers),
         Default::default(),
         (),
-    ))?;
-    Ok(request.into_parts().0)
+    ))
 }
 
 async fn dispatch<I>(
     state: &HttpProjectionState<I>,
     service: &str,
     method: &str,
-    headers: &HeaderMap,
+    metadata: MetadataMap,
+    extensions: http::Extensions,
     body: Bytes,
-) -> Response
-where
-    I: Interceptor + Clone,
-{
+) -> Response {
     match (service, method) {
         ("sekai.SekaiService", "ApplySourceBatch") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::apply_source_batch(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "GetSourceSyncState") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_source_sync_state(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "GetPublishedDefinitionRevision") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_published_definition_revision(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CreateObject") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_object(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "GetObject") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_object(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "UpdateObject") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::update_object(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "DeleteObject") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::delete_object(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ListObjects") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::list_objects(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "RetrieveContext") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::retrieve_context(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ExpandRelations") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::expand_relations(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ExplainDerivation") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::explain_derivation(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "EvaluateObjectSet") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::evaluate_object_set(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ReadObjectChangeSubscription") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::read_object_change_subscription(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "PutObjectSecurityPolicyRevision") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::put_object_security_policy_revision(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ActivateObjectSecurityPolicies") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::activate_object_security_policies(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "GetObjectSecurityActivation") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_object_security_activation(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "FindByExternalId") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::find_by_external_id(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "FindByProperty") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::find_by_property(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CreateLink") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_link(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "DeleteLink") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::delete_link(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "GetLinks") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_links(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "Traverse") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::traverse(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "DiscoverCapabilities") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::discover_capabilities(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ListSchemaTypes") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::list_schema_types(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CreateSchemaType") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_schema_type(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CreateOntologyClass") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_ontology_class(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CreateOntologyRelation") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_ontology_relation(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CreateDataset") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_dataset(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "UpdateDataset") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::update_dataset(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "AppendRows") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::append_rows(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "QueryRows") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::query_rows(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CreateGrant") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_grant(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "DeleteGrant") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::delete_grant(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ListGrants") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::list_grants(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CheckAccess") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::check_access(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "PutGovernedActionType") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::put_governed_action_type(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "SubmitActionInstance") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::submit_action_instance(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "DecideActionInstance") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::decide_action_instance(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "DescribeObjectAction") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::describe_object_action(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "PreviewObjectAction") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::preview_object_action(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "GetActionInstance") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_action_instance(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ListActionInstances") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::list_action_instances(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "GetActionEffect") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_action_effect(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ListActionEffects") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::list_action_effects(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "CreateCredential") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_credential(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "RotateCredential") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::rotate_credential(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "RevokeCredential") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::revoke_credential(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "ListCredentials") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::list_credentials(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "RegisterEvidenceSchema") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::register_evidence_schema(&*svc, req).await
             })
             .await
         }
         ("sekai.SekaiService", "SubmitEvidence") => {
-            invoke_sekai(state, headers, body, |svc, req| async move {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::submit_evidence(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "AuthorizeExternalAction") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::authorize_external_action(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "TransitionExternalAction") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::transition_external_action(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "RedeemExternalActionPermit") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::redeem_external_action_permit(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "RecordUsage") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::record_usage(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "SetBudgetLimit") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::set_budget_limit(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "DecideGatewayExecution") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::decide_gateway_execution(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "SetNamespacePolicy") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::set_namespace_policy(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "PlanExecution") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::plan_execution(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "PlanContentExecution") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::plan_content_execution(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "ReportOperationEvent") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::report_operation_event(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "GetOperationReceipt") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::get_operation_receipt(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "GetQualityTrend") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::get_quality_trend(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "PutEvaluationPlan") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::put_evaluation_plan(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "ResolveEvaluationPlan") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::resolve_evaluation_plan(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "ExecuteEvaluationManifest") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::execute_evaluation_manifest(&*svc, req).await
             })
             .await
         }
         ("chisei.ChiseiService", "ClaimGatewayDispatch") => {
-            invoke_chisei(state, headers, body, |svc, req| async move {
+            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::claim_gateway_dispatch(&*svc, req).await
             })
             .await
@@ -621,17 +620,17 @@ where
 
 async fn invoke_sekai<I, Req, Fut, Res>(
     state: &HttpProjectionState<I>,
-    headers: &HeaderMap,
+    metadata: MetadataMap,
+    extensions: http::Extensions,
     body: Bytes,
     handler: impl FnOnce(Arc<SekaiServiceImpl>, Request<Req>) -> Fut,
 ) -> Response
 where
-    I: Interceptor + Clone,
     Req: DeserializeOwned + Serialize + Default,
     Res: Serialize,
     Fut: Future<Output = Result<tonic::Response<Res>, Status>>,
 {
-    match decode_authenticated(&state.interceptor, headers, body) {
+    match decode_authenticated(metadata, extensions, body) {
         Ok(request) => match handler(state.sekai.clone(), request).await {
             Ok(response) => json_ok(response.into_inner()),
             Err(status) => status_response(status),
@@ -642,17 +641,17 @@ where
 
 async fn invoke_chisei<I, Req, Fut, Res>(
     state: &HttpProjectionState<I>,
-    headers: &HeaderMap,
+    metadata: MetadataMap,
+    extensions: http::Extensions,
     body: Bytes,
     handler: impl FnOnce(Arc<ChiseiServiceImpl>, Request<Req>) -> Fut,
 ) -> Response
 where
-    I: Interceptor + Clone,
     Req: DeserializeOwned + Serialize + Default,
     Res: Serialize,
     Fut: Future<Output = Result<tonic::Response<Res>, Status>>,
 {
-    match decode_authenticated(&state.interceptor, headers, body) {
+    match decode_authenticated(metadata, extensions, body) {
         Ok(request) => match handler(state.chisei.clone(), request).await {
             Ok(response) => json_ok(response.into_inner()),
             Err(status) => status_response(status),
@@ -693,23 +692,15 @@ fn merge_json(base: &mut Value, incoming: Value) {
     }
 }
 
-fn decode_authenticated<I, T>(
-    interceptor: &I,
-    headers: &HeaderMap,
+fn decode_authenticated<T>(
+    metadata: MetadataMap,
+    extensions: http::Extensions,
     body: Bytes,
 ) -> Result<Request<T>, Status>
 where
-    I: Interceptor + Clone,
     T: DeserializeOwned + Serialize + Default,
 {
     let payload = decode_proto_json::<T>(body)?;
-    let mut interceptor = interceptor.clone();
-    let request = interceptor.call(Request::from_parts(
-        headers_to_metadata(headers),
-        Default::default(),
-        (),
-    ))?;
-    let (metadata, extensions, ()) = request.into_parts();
     Ok(Request::from_parts(metadata, extensions, payload))
 }
 
@@ -777,6 +768,7 @@ fn status_response(status: Status) -> Response {
         tonic::Code::NotFound => StatusCode::NOT_FOUND,
         tonic::Code::AlreadyExists | tonic::Code::Aborted => StatusCode::CONFLICT,
         tonic::Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+        tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
         tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         tonic::Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -876,6 +868,7 @@ fn bind_identity<T>(request: &mut Request<T>, principal: &str, namespace: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::actor_limit::ActorRateGate;
     use crate::chisei::budget::BudgetTracker;
     use crate::config::Config;
     use crate::db::runtime_db::RuntimeDb;
@@ -1063,6 +1056,37 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(payload["code"], "unauthenticated");
         let _ = token;
+    }
+
+    #[tokio::test]
+    async fn http_json_charges_the_actor_rate_gate_once_per_request() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let interceptor = interceptor.with_actor_rate_gate(ActorRateGate::enabled(1, 1));
+        let app = router_for(sekai, chisei, interceptor);
+        let (status, payload) = http_json(
+            app.clone(),
+            "/sekai.SekaiService/ListSchemaTypes",
+            Some(&token),
+            json!({}),
+        )
+        .await;
+        assert_ne!(payload["code"], "resource_exhausted");
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+        let (status, payload) = http_json(
+            app,
+            "/sekai.SekaiService/ListSchemaTypes",
+            Some(&token),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(payload["code"], "resource_exhausted");
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("retry_after")
+        );
     }
 
     #[tokio::test]

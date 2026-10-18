@@ -6,13 +6,15 @@
 //! storage-error classification behind one interface.
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::enterprise::DelegatorApplyRefusal;
+use crate::enterprise::{DelegatorApplyRefusal, NamespaceAction, revalidate_agent_ceiling};
 use crate::sekai::action_effect::{
     ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, ACK_OUTCOME_PARKED, ActionEffect,
     EFFECT_STATUS_COMPLETED, EFFECT_STATUS_FAILED,
 };
 use crate::sekai::audit;
-use crate::sekai::delegating_principal::{DelegatorApplyError, revalidate_delegator_at_apply};
+use crate::sekai::delegating_principal::{
+    DelegatorApplyError, current_delegating_principal_state, revalidate_delegator_at_apply,
+};
 use crate::sekai::parked_work::{ActionWorkContinuation, ActionWorkPark};
 use sekai_provider::receipt::{
     OperationReceipt, OperationReceiptEvent, ReceiptArtifact, ReceiptEventKind,
@@ -88,11 +90,20 @@ pub(crate) struct AckedActionWork {
 
 pub(crate) struct ActionWorkLifecycle<'a> {
     db: &'a RuntimeDb,
+    enforce_agent_ceiling: bool,
 }
 
 impl<'a> ActionWorkLifecycle<'a> {
     pub(crate) fn new(db: &'a RuntimeDb) -> Self {
-        Self { db }
+        Self {
+            db,
+            enforce_agent_ceiling: false,
+        }
+    }
+
+    pub(crate) fn with_agent_ceiling(mut self, enforce: bool) -> Self {
+        self.enforce_agent_ceiling = enforce;
+        self
     }
 
     pub(crate) fn claim(
@@ -364,11 +375,40 @@ impl<'a> ActionWorkLifecycle<'a> {
             instance.delegating_actor.as_deref(),
             &instance.namespace,
         ) {
-            Ok(()) => Ok(None),
-            Err(DelegatorApplyError::Refused(reason)) => Ok(Some(reason)),
+            Ok(()) => {}
+            Err(DelegatorApplyError::Refused(reason)) => return Ok(Some(reason)),
             Err(DelegatorApplyError::Internal(error)) => {
-                Err(ActionWorkLifecycleError::Internal(error))
+                return Err(ActionWorkLifecycleError::Internal(error));
             }
+        }
+        if !self.enforce_agent_ceiling {
+            return Ok(None);
+        }
+        let agent = instance.principal.trim();
+        let Some(user) = instance
+            .delegating_actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        if agent.is_empty() || agent == user {
+            return Ok(None);
+        }
+        // Grant ceiling only. Human credential liveness is already checked
+        // on `delegating_actor`; an agent may hold a namespace grant without
+        // its own login credential.
+        let state = current_delegating_principal_state(
+            self.db,
+            agent,
+            &instance.namespace,
+            NamespaceAction::Write,
+        )
+        .map_err(ActionWorkLifecycleError::Internal)?;
+        match revalidate_agent_ceiling(Some(agent), state.holds_needed_grant) {
+            Ok(()) => Ok(None),
+            Err(reason) => Ok(Some(reason)),
         }
     }
 
@@ -875,7 +915,8 @@ mod tests {
     use super::*;
     use crate::db::runtime_db::RuntimeDb;
     use crate::enterprise::{
-        DELEGATOR_DISABLED, DELEGATOR_GRANT_MISSING, DELEGATOR_NOT_MEMBER, DELEGATOR_RECORD_MISSING,
+        AGENT_CEILING_GRANT_MISSING, DELEGATOR_DISABLED, DELEGATOR_GRANT_MISSING,
+        DELEGATOR_NOT_MEMBER, DELEGATOR_RECORD_MISSING,
     };
     use crate::sekai::action_effect::{
         ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, plan_effects_for_admit,
@@ -1774,8 +1815,13 @@ mod tests {
         assert_eq!(replayed.effect.status, EFFECT_STATUS_COMPLETED);
     }
 
-    fn claim_refused(db: &RuntimeDb, effect: &ActionEffect) -> ActionWorkLifecycleError {
+    fn claim_refused_with(
+        db: &RuntimeDb,
+        effect: &ActionEffect,
+        enforce_agent_ceiling: bool,
+    ) -> ActionWorkLifecycleError {
         ActionWorkLifecycle::new(db)
+            .with_agent_ceiling(enforce_agent_ceiling)
             .claim(
                 ClaimActionWork {
                     effect_id: &effect.effect_id,
@@ -1787,6 +1833,10 @@ mod tests {
                 100,
             )
             .expect_err("delegator refusal must fail closed at claim")
+    }
+
+    fn claim_refused(db: &RuntimeDb, effect: &ActionEffect) -> ActionWorkLifecycleError {
+        claim_refused_with(db, effect, false)
     }
 
     #[test]
@@ -1838,6 +1888,67 @@ mod tests {
         );
         let stored = db.get_action_effect(&effect.effect_id).unwrap().unwrap();
         assert_eq!(stored.status, EFFECT_STATUS_FAILED);
+    }
+
+    #[test]
+    fn claim_is_refused_when_agent_ceiling_lacks_the_grant() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let error = claim_refused_with(&db, &effect, true);
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(AGENT_CEILING_GRANT_MISSING.into())
+        );
+        let stored = db.get_action_effect(&effect.effect_id).unwrap().unwrap();
+        assert_eq!(stored.status, EFFECT_STATUS_FAILED);
+        assert_eq!(stored.failure_reason, AGENT_CEILING_GRANT_MISSING);
+        assert_eq!(
+            receipt_reason(&db, &effect.operation_id).as_deref(),
+            Some(AGENT_CEILING_GRANT_MISSING)
+        );
+    }
+
+    #[test]
+    fn claim_succeeds_when_user_and_agent_both_hold_the_grant() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        db.create_principal_credential(
+            "runtime",
+            &crate::gateway_keys::hash_gateway_key("runtime-secret"),
+            1,
+        )
+        .unwrap();
+        db.ensure_team_namespace("acme", "runtime", Role::Editor, "local")
+            .unwrap();
+        ActionWorkLifecycle::new(&db)
+            .with_agent_ceiling(true)
+            .claim(
+                ClaimActionWork {
+                    effect_id: &effect.effect_id,
+                    runtime_id: "shikigami",
+                    request_id: "claim-ok",
+                    ttl_ms: 60_000,
+                },
+                "operator",
+                100,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn apply_is_refused_when_agent_ceiling_lacks_the_grant() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        let error = ActionWorkLifecycle::new(&db)
+            .with_agent_ceiling(true)
+            .ack(
+                ack_completed(&effect.effect_id, &claimed, ""),
+                "operator",
+                200,
+            )
+            .expect_err("agent ceiling must fail closed at apply");
+        assert_eq!(
+            error,
+            ActionWorkLifecycleError::FailedPrecondition(AGENT_CEILING_GRANT_MISSING.into())
+        );
     }
 
     #[test]

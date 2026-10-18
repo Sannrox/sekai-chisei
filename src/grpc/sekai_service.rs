@@ -175,6 +175,8 @@ pub struct SekaiServiceImpl {
     /// Signs runtime tokens for granted Action work claims; none issues none.
     pub(super) runtime_token_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     pub(super) dry_run_host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
+    /// User grants intersect the agent ceiling at claim and apply (#1563).
+    pub(super) enforce_agent_ceiling: bool,
 }
 
 fn db_work_limiter(db: &crate::db::store::SekaiStore) -> Arc<tokio::sync::Semaphore> {
@@ -235,6 +237,7 @@ impl SekaiServiceImpl {
             cross_store: None,
             runtime_token_authority: None,
             dry_run_host: None,
+            enforce_agent_ceiling: false,
         }
     }
 
@@ -259,6 +262,7 @@ impl SekaiServiceImpl {
             cross_store: None,
             runtime_token_authority: None,
             dry_run_host: None,
+            enforce_agent_ceiling: false,
         }
     }
 
@@ -269,6 +273,11 @@ impl SekaiServiceImpl {
         authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     ) -> Self {
         self.runtime_token_authority = authority;
+        self
+    }
+
+    pub fn with_agent_ceiling(mut self, enforce: bool) -> Self {
+        self.enforce_agent_ceiling = enforce;
         self
     }
 

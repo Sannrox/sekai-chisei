@@ -38,6 +38,9 @@ template.
 | `SEKAI_MCP_PRINCIPAL` | unset | Authenticated principal for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_NAMESPACE` | unset | Canonical namespace for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for the `sekai-mcp` stdio host. HTTP MCP is `POST /mcp` on `SEKAI_HTTP_PORT`. MCP Preview that may fill uses `LLM_HTTP_REQUEST_TIMEOUT_SECS` (default 120s), not a hard 5s deadline; Submit stays at 5s. |
+| `SEKAI_ACTOR_CHAIN_ENFORCEMENT` | unset | Set `1` to enforce per-principal and per-agent rate limits and the agent grant ceiling (#1563). Off until callers send actor chains. |
+| `SEKAI_PRINCIPAL_REQUESTS_PER_MINUTE` | `60` | Token-bucket refill for the delegating user |
+| `SEKAI_AGENT_REQUESTS_PER_MINUTE` | `60` | Token-bucket refill for the agent when `act` is present |
 | `SEKAI_TLS_CERT` | unset | Server certificate PEM path |
 | `SEKAI_TLS_KEY` | unset | Server private-key PEM path |
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
