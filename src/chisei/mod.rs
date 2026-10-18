@@ -53,6 +53,7 @@ pub use sekai_types::principal;
 pub mod privacy;
 pub mod promotion;
 pub use sekai_provider::receipt;
+pub mod actor_limit;
 pub mod residency;
 pub mod risk_class;
 pub mod routing_profiles;

@@ -1024,6 +1024,7 @@ pub(super) async fn claim_action_work(
     let actor = principals.first().cloned().unwrap_or_default();
     let now = now_millis();
     let claimed = ActionWorkLifecycle::new(service.db.runtime())
+        .with_agent_ceiling(service.enforce_agent_ceiling)
         .claim(
             ClaimActionWorkCommand {
                 effect_id: &inner.effect_id,
@@ -1122,6 +1123,7 @@ pub(super) async fn ack_action_work(
     let now = now_millis();
     let actor = principals.first().cloned().unwrap_or_default();
     let acked = ActionWorkLifecycle::new(service.db.runtime())
+        .with_agent_ceiling(service.enforce_agent_ceiling)
         .ack(
             AckActionWorkCommand {
                 effect_id: &inner.effect_id,

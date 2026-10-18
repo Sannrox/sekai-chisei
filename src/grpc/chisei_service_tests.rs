@@ -1135,6 +1135,9 @@ fn config(db_path: &str) -> Config {
         assertion_audience: None,
         assertion_hmac_key: None,
         sekai_endpoint: None,
+        actor_chain_enforcement: false,
+        principal_requests_per_minute: 60,
+        agent_requests_per_minute: 60,
     }
 }
 
