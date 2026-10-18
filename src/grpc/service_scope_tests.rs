@@ -10,7 +10,8 @@ use crate::enterprise::{
 };
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
-    ClaimActionWorkRequest, ClaimActionWorkResponse, GetObjectRequest, HeartbeatActionClaimRequest,
+    ClaimActionWorkRequest, ClaimActionWorkResponse, DiscoverCapabilitiesRequest, GetObjectRequest,
+    GovernedActionType, HeartbeatActionClaimRequest, PutGovernedActionTypeRequest,
     SubmitActionInstanceRequest,
 };
 use crate::identity_assertion::AssertionAuthority;
@@ -171,6 +172,13 @@ fn service_token(plane: &Plane) -> String {
 }
 
 /// Authenticate `token` for `method` and attach `message`.
+fn with_named_principal<T>(payload: T, principal: &str) -> Request<T> {
+    let mut req = Request::new(payload);
+    req.metadata_mut()
+        .insert("x-principal", MetadataValue::try_from(principal).unwrap());
+    req
+}
+
 fn authenticated<T>(
     plane: &Plane,
     token: &str,
@@ -312,6 +320,62 @@ async fn action_type_outside_the_registration_is_refused_on_claim_and_submit() {
             "{status:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn capability_discovery_lists_only_registered_service_principal_action_types() {
+    let plane = plane();
+    let put = |type_id: &str| {
+        PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            namespace: IN_SCOPE.into(),
+            type_id: type_id.into(),
+            version: "1.0.0".into(),
+            description: type_id.into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["runtime_dispatch".into()],
+            enabled: true,
+            ..Default::default()
+        }),
+        request_id: format!("put-{type_id}"),
+    }
+    };
+    plane
+        .service
+        .put_governed_action_type(with_named_principal(put("dispatch"), "local"))
+        .await
+        .unwrap();
+    plane
+        .service
+        .put_governed_action_type(with_named_principal(put("other"), "local"))
+        .await
+        .unwrap();
+    let token = service_token(&plane);
+    let discovered = plane
+        .service
+        .discover_capabilities(
+            authenticated(
+                &plane,
+                &token,
+                "DiscoverCapabilities",
+                DiscoverCapabilitiesRequest {
+                    namespace: IN_SCOPE.into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    let names: Vec<&str> = discovered
+        .capabilities
+        .iter()
+        .filter(|entry| entry.name.starts_with("sekai.actions."))
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["sekai.actions.dispatch"]);
 }
 
 #[tokio::test]

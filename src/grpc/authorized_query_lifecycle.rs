@@ -227,7 +227,7 @@ impl SekaiServiceImpl {
             let expected = format!("sekai.objects.query.{kind}");
             if capability_name != &expected
                 || !self
-                    .discoverable_capabilities(namespace, &principals)?
+                    .discoverable_capabilities(namespace, &principals, tenant_context.as_ref())?
                     .iter()
                     .any(|entry| entry.name == *capability_name)
             {

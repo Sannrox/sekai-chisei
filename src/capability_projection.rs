@@ -381,6 +381,9 @@ mod tests {
             object_type: None,
             evidence_requirements: vec![],
             product_tier: "advanced".into(),
+            parameter_schema_json: String::new(),
+            markings: vec![],
+            action_version: String::new(),
         }
     }
 

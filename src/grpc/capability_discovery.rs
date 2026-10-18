@@ -10,6 +10,7 @@ impl SekaiServiceImpl {
         &self,
         namespace: &str,
         principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
     ) -> Result<Vec<CapabilityEntry>, Status> {
         check_team_namespace(self.db.runtime(), principals, namespace, false)
             .map_err(|_| Status::permission_denied("capability discovery denied"))?;
@@ -17,6 +18,7 @@ impl SekaiServiceImpl {
             .schema_definitions
             .refresh_snapshot()
             .map_err(|_| Status::internal("capability catalog unavailable"))?;
+        let include_restricted = principals_can_query_restricted_properties(principals);
         let visible_types = schema
             .all()
             .into_iter()
@@ -32,8 +34,15 @@ impl SekaiServiceImpl {
             .collect::<Vec<_>>();
         let mut entries = visible_types
             .iter()
-            .map(object_query_capability)
+            .map(|object_type| object_query_capability(object_type, include_restricted))
             .collect::<Vec<_>>();
+        entries.extend(self.discoverable_action_capabilities(
+            namespace,
+            principals,
+            tenant_context,
+            &schema,
+            include_restricted,
+        )?);
         entries.push(evaluate_object_set_capability());
         entries.push(object_change_subscription_capability());
         entries.push(traverse_capability());
@@ -58,6 +67,118 @@ impl SekaiServiceImpl {
         entries.push(preview_transform_capability(experimental));
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
+    }
+
+    fn discoverable_action_capabilities(
+        &self,
+        namespace: &str,
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+        schema: &schema::SchemaRegistry,
+        include_restricted: bool,
+    ) -> Result<Vec<CapabilityEntry>, Status> {
+        match check_team_namespace(self.db.runtime(), principals, namespace, true) {
+            Ok(()) => {}
+            Err(status) if status.code() == tonic::Code::PermissionDenied => {
+                return Ok(Vec::new());
+            }
+            Err(status) => return Err(status),
+        }
+        match enforce_namespace_tenant_context(self.db.runtime(), tenant_context, namespace, true) {
+            Ok(()) => {}
+            Err(status) if status.code() == tonic::Code::PermissionDenied => {
+                return Ok(Vec::new());
+            }
+            Err(status) => return Err(status),
+        }
+        let service_scope = service_principal_scope(self.db.runtime(), tenant_context)?;
+        let types = self
+            .db
+            .runtime()
+            .list_governed_action_types(namespace, None, true)
+            .map_err(|_| Status::internal("capability catalog unavailable"))?;
+        let actor = principals.first().map(String::as_str).unwrap_or("");
+        let mut latest = std::collections::BTreeMap::new();
+        for type_def in types {
+            if !type_def.enabled {
+                continue;
+            }
+            latest.insert(type_def.type_id.clone(), type_def);
+        }
+        let mut entries = Vec::new();
+        for type_def in latest.into_values() {
+            if !type_def.object_kind.is_empty()
+                && (is_reserved_governance_kind(&type_def.object_kind)
+                    || check_read(
+                        &self.security,
+                        &schema_object_id(&type_def.object_kind),
+                        principals,
+                    )
+                    .is_err())
+            {
+                continue;
+            }
+            if !include_restricted
+                && action_parameter_schema_discloses_restricted(&type_def, schema)
+            {
+                continue;
+            }
+            let project = if type_def.policy_scope.trim().is_empty() {
+                namespace
+            } else {
+                type_def.policy_scope.as_str()
+            };
+            let policy = self
+                .db
+                .runtime()
+                .resolve_action_policy(actor, namespace, project)
+                .map_err(|_| Status::internal("capability catalog unavailable"))?;
+            if action_discovery_decision(policy.as_ref(), &type_def.type_id)
+                == crate::sekai::action_policy::ActionDecision::Deny
+            {
+                continue;
+            }
+            if let Some(scope) = &service_scope
+                && !scope
+                    .action_types
+                    .iter()
+                    .any(|allowed| allowed == &type_def.type_id)
+            {
+                continue;
+            }
+            entries.push(action_capability(
+                &type_def,
+                action_submit_decision(policy.as_ref()),
+                schema,
+                include_restricted,
+            ));
+        }
+        Ok(entries)
+    }
+
+    pub(super) fn published_ontology_revision(
+        &self,
+        namespace: &str,
+        principals: &[String],
+    ) -> Result<String, Status> {
+        let Some(revision) = self
+            .db
+            .runtime()
+            .get_published_definition_revision(namespace)
+            .map_err(|_| Status::internal("capability catalog unavailable"))?
+        else {
+            return Ok(String::new());
+        };
+        match authorize_definition_revision(
+            self,
+            principals,
+            namespace,
+            &revision.revision_digest,
+            true,
+        ) {
+            Ok(()) => Ok(revision.revision_digest),
+            Err(_) => Ok(String::new()),
+        }
     }
 }
 
@@ -88,7 +209,123 @@ fn base_capability(
         object_type: None,
         evidence_requirements: Vec::new(),
         product_tier,
+        parameter_schema_json: String::new(),
+        markings: Vec::new(),
+        action_version: String::new(),
     }
+}
+
+fn action_submit_decision(
+    policy: Option<&crate::sekai::action_policy::ActionPolicy>,
+) -> crate::sekai::action_policy::ActionDecision {
+    use crate::sekai::action_instance::SUBMIT_POLICY_ACTION;
+    use crate::sekai::action_policy::ActionDecision;
+    use sekai_types::risk_class::RiskClass;
+    match policy {
+        Some(policy) => policy.decide(SUBMIT_POLICY_ACTION, RiskClass::Write),
+        None => ActionDecision::Allow,
+    }
+}
+
+fn action_discovery_decision(
+    policy: Option<&crate::sekai::action_policy::ActionPolicy>,
+    type_id: &str,
+) -> crate::sekai::action_policy::ActionDecision {
+    use crate::sekai::action_policy::ActionDecision;
+    let submit = action_submit_decision(policy);
+    if submit == ActionDecision::Deny {
+        return ActionDecision::Deny;
+    }
+    match policy.and_then(|policy| policy.action_overrides.get(type_id)) {
+        Some(ActionDecision::Deny) => ActionDecision::Deny,
+        _ => submit,
+    }
+}
+
+fn action_capability(
+    type_def: &crate::sekai::governed_action_type::GovernedActionType,
+    submit_decision: crate::sekai::action_policy::ActionDecision,
+    schema: &schema::SchemaRegistry,
+    include_restricted: bool,
+) -> CapabilityEntry {
+    use crate::sekai::action_policy::ActionDecision;
+    let mut entry = base_capability(
+        capability::action_capability_name(&type_def.type_id),
+        if type_def.description.trim().is_empty() {
+            format!("Submit governed Action {}.", type_def.type_id)
+        } else {
+            type_def.description.clone()
+        },
+        "action",
+        "sekai.SubmitActionInstanceRequest",
+        "sekai.SubmitActionInstanceResponse",
+    );
+    entry.product_tier = "core".into();
+    entry.required_scopes = vec!["namespace:write".into(), "action:submit".into()];
+    entry.policy_decision_points = vec!["namespace_access".into(), "action_policy".into()];
+    entry.risk_class = "write".into();
+    entry.approval_behavior = match submit_decision {
+        ActionDecision::RequireApproval => "required",
+        ActionDecision::Allow | ActionDecision::Deny => "none",
+    }
+    .into();
+    entry.parameter_schema_json = type_def.parameter_schema_json.clone();
+    entry.action_version = type_def.version.clone();
+    if let Some(object_type) = schema.get(&type_def.object_kind) {
+        entry.markings = visible_markings(object_type, include_restricted);
+        entry
+            .policy_decision_points
+            .push("schema_visibility".into());
+    }
+    entry
+}
+
+fn action_parameter_schema_discloses_restricted(
+    type_def: &crate::sekai::governed_action_type::GovernedActionType,
+    schema: &schema::SchemaRegistry,
+) -> bool {
+    let Some(object_type) = schema.get(&type_def.object_kind) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&type_def.parameter_schema_json)
+    else {
+        return true;
+    };
+    let Some(properties) = parsed.get("properties").and_then(|value| value.as_object()) else {
+        return true;
+    };
+    object_type.properties.iter().any(|property| {
+        schema::is_restricted_property_classification(&property.classification)
+            && properties.contains_key(&property.name)
+    })
+}
+
+fn visible_object_type(
+    object_type: &schema::ObjectType,
+    include_restricted: bool,
+) -> schema::ObjectType {
+    if include_restricted {
+        return object_type.clone();
+    }
+    let mut visible = object_type.clone();
+    visible.properties.retain(|property| {
+        !schema::is_restricted_property_classification(&property.classification)
+    });
+    visible
+}
+
+fn visible_markings(object_type: &schema::ObjectType, include_restricted: bool) -> Vec<String> {
+    let mut markings = visible_object_type(object_type, include_restricted)
+        .properties
+        .iter()
+        .map(|property| {
+            schema::normalize_property_classification(&property.classification).to_string()
+        })
+        .filter(|marking| !marking.is_empty())
+        .collect::<Vec<_>>();
+    markings.sort();
+    markings.dedup();
+    markings
 }
 
 /// Product tier for catalog discovery (#386 / research #383).
@@ -105,14 +342,18 @@ fn capability_product_tier(name: &str) -> &'static str {
         | semantic::CAPABILITY_EXPLAIN_DERIVATION => "core",
         "sekai.relations.traverse" | "sekai.objects.evaluate_set" => "core",
         other if other.starts_with("sekai.objects.query.") => "core",
-        other if other.starts_with("sekai.actions.") => "advanced",
+        other if other.starts_with("sekai.actions.") => "core",
         other if other.contains("kioku") => "experimental",
         "sekai.search.query" | "sekai.search.status" => "experimental",
         _ => "advanced",
     }
 }
 
-fn object_query_capability(object_type: &schema::ObjectType) -> CapabilityEntry {
+fn object_query_capability(
+    object_type: &schema::ObjectType,
+    include_restricted: bool,
+) -> CapabilityEntry {
+    let visible = visible_object_type(object_type, include_restricted);
     let mut entry = base_capability(
         format!("sekai.objects.query.{}", object_type.kind),
         format!("List authorized {} objects.", object_type.kind),
@@ -126,7 +367,8 @@ fn object_query_capability(object_type: &schema::ObjectType) -> CapabilityEntry 
         "schema_visibility".into(),
         "object_acl".into(),
     ];
-    entry.object_type = Some(to_proto_schema_type(object_type));
+    entry.object_type = Some(to_proto_schema_type(&visible));
+    entry.markings = visible_markings(&visible, true);
     entry
 }
 
