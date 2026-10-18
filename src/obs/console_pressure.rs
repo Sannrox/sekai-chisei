@@ -417,6 +417,7 @@ mod tests {
             principal: principal.into(),
             role,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
     }

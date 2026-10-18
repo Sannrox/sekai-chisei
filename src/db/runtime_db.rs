@@ -3137,6 +3137,57 @@ impl RuntimeDb {
         }
     }
 
+    pub fn create_grant_with_decision(
+        &self,
+        grant: &Grant,
+        decision: &crate::sekai::audit::Decision,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.create_grant_with_decision(grant, decision),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.create_grant_with_decision(grant, decision))
+            }
+        }
+    }
+
+    pub fn set_namespace_grant_policy(&self, policy: &NamespaceGrantPolicy) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_namespace_grant_policy(policy),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.set_namespace_grant_policy(policy))
+            }
+        }
+    }
+
+    /// Stamp namespace grant policy and refresh the in-memory access cache.
+    /// Storage updates existing open-ended grants; the cache would otherwise
+    /// keep `not_after_ms = 0` until process restart.
+    ///
+    /// There is no public policy RPC. Call this on a quiet store (tests or
+    /// operator setup). CreateGrant and this refresh are not a concurrent
+    /// production pair.
+    pub fn apply_namespace_grant_policy(
+        &self,
+        security: &SecurityChecker,
+        policy: &NamespaceGrantPolicy,
+    ) -> Result<(), String> {
+        self.set_namespace_grant_policy(policy)?;
+        security.reload(|| self.list_all_grants())?;
+        Ok(())
+    }
+
+    pub fn namespace_grant_policy(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<NamespaceGrantPolicy>, String> {
+        match self {
+            Self::Sqlite(db) => db.namespace_grant_policy(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.namespace_grant_policy(namespace))
+            }
+        }
+    }
+
     pub fn create_handoff(
         &self,
         manifest: &HandoffManifest,

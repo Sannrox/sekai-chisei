@@ -183,12 +183,15 @@ impl PostgresDb {
             principal: grant_principal.into(),
             role,
             created: now,
+            purpose: "team namespace membership".into(),
+            exception_reason: "team-managed namespace bootstrap".into(),
+            ..Default::default()
         })
         .collect::<Vec<_>>();
         for grant in &grants {
             tx.execute(
-                "INSERT INTO sekai_grants (id, object_id, principal, role, created)
-                 VALUES ($1,$2,$3,$4,$5)
+                "INSERT INTO sekai_grants (id, object_id, principal, role, created, purpose, not_after_ms, exception_reason)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                  ON CONFLICT (object_id, principal) DO UPDATE SET
                     id=EXCLUDED.id, role=EXCLUDED.role, created=EXCLUDED.created",
                 &[
@@ -197,11 +200,16 @@ impl PostgresDb {
                     &grant.principal.as_str(),
                     &grant.role.as_str(),
                     &grant.created,
+                    &grant.purpose.as_str(),
+                    &grant.not_after_ms,
+                    &grant.exception_reason.as_str(),
                 ],
             )
             .map_err(|error| error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())?;
+        drop(connection);
+        let grants = self.list_grants(&object.id)?;
         Ok((object, grants))
     }
 }

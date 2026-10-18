@@ -16,6 +16,7 @@ use crate::sekai::markings::{
     parse_classification, principal_authority_from_profile, principal_profile_external_id,
     trusted_service_authority,
 };
+#[cfg(test)]
 use crate::sekai::security::Role;
 use crate::sekai::virtual_pushdown::{self, VirtualPushdownPlan};
 use crate::shomei;
@@ -442,7 +443,7 @@ fn query_authority(
             if db
                 .list_grants(&object.id)?
                 .iter()
-                .any(|grant| matches!(grant.role, Role::Admin))
+                .any(crate::sekai::security::grant_is_live_admin)
             {
                 sealed.push(object);
             }
@@ -550,6 +551,7 @@ mod tests {
                 principal: "root".into(),
                 role: Role::Admin,
                 created: 1,
+                ..Default::default()
             })
             .unwrap();
     }

@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 
 pub use sekai_types::object_change::ObjectChange;
 
-fn validate_decision(decision: &Decision) -> Result<(), String> {
+pub(crate) fn validate_decision(decision: &Decision) -> Result<(), String> {
     if decision.id.trim().is_empty() {
         return Err("decision id required".into());
     }
@@ -35,12 +35,22 @@ fn looks_like_secret(value: &str) -> bool {
         "xoxb-",
         "xoxp-",
         "bearer ",
-        "akia",
-        "asia",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
+        || aws_access_key_id(&lower)
         || (lower.starts_with("eyj") && lower.matches('.').count() == 2)
+}
+
+fn aws_access_key_id(lower: &str) -> bool {
+    // AKIA/ASIA access key IDs are 20 characters. Bare `asia` namespaces
+    // and principals are identifiers, not keys.
+    ["akia", "asia"].iter().any(|prefix| {
+        lower.starts_with(prefix)
+            && lower.get(prefix.len()..).is_some_and(|rest| {
+                rest.len() >= 16 && rest.chars().take(16).all(|c| c.is_ascii_alphanumeric())
+            })
+    })
 }
 
 pub fn record_object_diff(
@@ -394,12 +404,15 @@ impl SekaiDb {
             principal: grant_principal.into(),
             role,
             created: now,
+            purpose: "team namespace membership".into(),
+            exception_reason: "team-managed namespace bootstrap".into(),
+            ..Default::default()
         })
         .collect::<Vec<_>>();
         for grant in &grants {
             tx.execute(
-                "INSERT INTO sekai_grants (id, object_id, principal, role, created)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO sekai_grants (id, object_id, principal, role, created, purpose, not_after_ms, exception_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(object_id, principal) DO UPDATE SET
                     id=excluded.id, role=excluded.role, created=excluded.created",
                 params![
@@ -407,12 +420,17 @@ impl SekaiDb {
                     grant.object_id,
                     grant.principal,
                     grant.role.as_str(),
-                    grant.created
+                    grant.created,
+                    grant.purpose,
+                    grant.not_after_ms,
+                    grant.exception_reason
                 ],
             )
             .map_err(|error| error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())?;
+        drop(conn);
+        let grants = self.list_grants(&object.id)?;
         Ok((object, grants))
     }
 

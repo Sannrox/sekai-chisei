@@ -157,6 +157,7 @@ impl PostgresDb {
              ) OR EXISTS (
                 SELECT 1 FROM sekai_grants g
                 WHERE g.object_id = o.id AND g.principal = ANY({principals_param})
+                  AND (g.not_after_ms = 0 OR g.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
              ))"
         ));
         if !privileged {
@@ -174,6 +175,8 @@ impl PostgresDb {
                       AND boundary.external_id = 'namespace:' || o.namespace
                       AND boundary.properties::jsonb ->> 'team_managed' = 'true'
                       AND namespace_grant.principal = ANY({principals_param})
+                      AND (namespace_grant.not_after_ms = 0
+                           OR namespace_grant.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
                 ))"
             ));
         }
@@ -441,6 +444,7 @@ impl PostgresDb {
                  ) OR EXISTS (
                     SELECT 1 FROM sekai_grants g
                     WHERE g.object_id = o.id AND g.principal = ANY({parameter})
+                      AND (g.not_after_ms = 0 OR g.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
                  ))"
             ));
             if !privileged {
@@ -458,6 +462,8 @@ impl PostgresDb {
                           AND boundary.external_id = 'namespace:' || o.namespace
                           AND boundary.properties::jsonb ->> 'team_managed' = 'true'
                           AND namespace_grant.principal = ANY({parameter})
+                          AND (namespace_grant.not_after_ms = 0
+                               OR namespace_grant.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
                     ))"
                 ));
             }

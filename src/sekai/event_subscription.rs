@@ -559,6 +559,7 @@ mod tests {
                 principal: "root".into(),
                 role: Role::Admin,
                 created: 1,
+                ..Default::default()
             })
             .unwrap();
     }

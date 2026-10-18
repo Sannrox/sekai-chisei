@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- New grants can require a purpose and an end date when a namespace opts in.
+  Permanent grants need an explicit exception. Expired grants stop authorizing.
+  Create and renew write Decision receipts (#1462).
+
 - Action, transform-run, and agent-turn receipts join a per-namespace
   Ed25519-signed hash chain when `CHISEI_RECEIPT_CHAIN_SIGNING_KEY` is set.
   Genesis and periodic checkpoints detect truncation. `sekaictl admin

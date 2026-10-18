@@ -199,6 +199,7 @@ fn sqlite_access(
     let Some(object) = db.get_object(object_id)? else {
         return Ok(false);
     };
+    let now_ms = crate::sekai::security::unix_now_ms();
     let privileged = principals
         .iter()
         .any(|principal| matches!(*principal, "root" | "local"));
@@ -208,10 +209,9 @@ fn sqlite_access(
             .properties
             .get("team_managed")
             .is_some_and(|managed| managed == "true")
-        && !db
-            .list_grants(&boundary.id)?
-            .iter()
-            .any(|grant| principals.contains(&grant.principal.as_str()))
+        && !db.list_grants(&boundary.id)?.iter().any(|grant| {
+            principals.contains(&grant.principal.as_str()) && grant.is_active(now_ms).is_ok()
+        })
     {
         return Ok(false);
     }
@@ -220,6 +220,7 @@ fn sqlite_access(
         return Ok(grants.iter().any(|grant| {
             principals.contains(&grant.principal.as_str())
                 && grant.role == crate::sekai::security::Role::Admin
+                && grant.is_active(now_ms).is_ok()
         }));
     }
     if grants.is_empty() {
@@ -227,6 +228,7 @@ fn sqlite_access(
     }
     Ok(grants.iter().any(|grant| {
         principals.contains(&grant.principal.as_str())
+            && grant.is_active(now_ms).is_ok()
             && (action == "read"
                 || matches!(
                     grant.role,

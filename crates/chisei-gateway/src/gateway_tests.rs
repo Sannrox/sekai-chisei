@@ -6113,6 +6113,7 @@ async fn explicit_context_manifest_enforces_the_authenticated_callers_acl() {
         principal: "agent:other".to_string(),
         role: crate::test_support::security::Role::Viewer,
         created: 0,
+        ..Default::default()
     })
     .unwrap();
     let (chisei_target, _) = spawn_control_plane_from_db(test_config(), db).await;

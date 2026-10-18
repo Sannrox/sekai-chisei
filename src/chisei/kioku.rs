@@ -2637,7 +2637,9 @@ fn authorize_kioku_evidence_tx(
         };
         let role: Option<String> = tx
             .query_row(
-                "SELECT role FROM sekai_grants WHERE object_id=?1 AND principal=?2",
+                "SELECT role FROM sekai_grants
+                 WHERE object_id=?1 AND principal=?2
+                   AND (not_after_ms = 0 OR not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))",
                 params![namespace_id, request.actor],
                 |row| row.get(0),
             )
@@ -2690,7 +2692,8 @@ fn authorize_kioku_evidence_tx(
             let actor_granted: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sekai_grants
-                     WHERE object_id=?1 AND principal=?2)",
+                     WHERE object_id=?1 AND principal=?2
+                       AND (not_after_ms = 0 OR not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)))",
                     params![projection_id, request.actor],
                     |row| row.get(0),
                 )

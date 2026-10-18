@@ -790,6 +790,7 @@ fn seed_namespace(db: &RuntimeDb, namespace: &str) -> Result<(), String> {
         principal: READER.into(),
         role: Role::Admin,
         created: 1,
+        ..Default::default()
     })?;
     Ok(())
 }

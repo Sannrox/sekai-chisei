@@ -1979,6 +1979,7 @@ mod tests {
                 principal: principal.into(),
                 role,
                 created: 1,
+                ..Default::default()
             };
             svc.db.runtime().create_grant(&grant).unwrap();
             svc.security.add_grant(&grant);
@@ -2026,6 +2027,7 @@ mod tests {
                 principal: "root".into(),
                 role: security::Role::Admin,
                 created: 1,
+                ..Default::default()
             };
             svc.db.runtime().create_grant(&grant).unwrap();
             svc.security.add_grant(&grant);
@@ -2185,6 +2187,7 @@ mod tests {
             principal: "service-a".into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         };
         svc.db.runtime().create_grant(&grant).unwrap();
         svc.security.add_grant(&grant);
@@ -2258,6 +2261,7 @@ mod tests {
             principal: "other-human".into(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         };
         svc.db.runtime().create_grant(&denied_grant).unwrap();
         svc.security.add_grant(&denied_grant);

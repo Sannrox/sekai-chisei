@@ -915,6 +915,7 @@ mod tests {
             principal: "alice".into(),
             role: Role::Admin,
             created: 0,
+            ..Default::default()
         })
         .unwrap();
         let token = "http-projection-token";

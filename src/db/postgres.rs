@@ -146,6 +146,7 @@ const TRANSFORM_USAGE_PENDING_SCHEMA: &str =
 const DATASET_HEALTH_CHECKS_SCHEMA: &str = include_str!("postgres/0079_dataset_health_checks.sql");
 const SEARCH_INDEX_SCHEMA: &str = include_str!("postgres/0080_search_index.sql");
 const RECEIPT_CHAIN_SCHEMA: &str = include_str!("postgres/0081_receipt_chain.sql");
+const GRANT_TERMS_SCHEMA: &str = include_str!("postgres/0082_grant_terms.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -669,6 +670,7 @@ const MIGRATIONS: &[Migration] = &[
         RECEIPT_CHAIN_SCHEMA,
         MigrationOwner::Chisei,
     ),
+    mig(81, "grant_terms", GRANT_TERMS_SCHEMA, MigrationOwner::Sekai),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;

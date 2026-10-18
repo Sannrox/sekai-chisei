@@ -90,6 +90,7 @@ fn seed_sekai(path: &Path) {
             principal: "operator".into(),
             role: sekai_chisei::sekai::security::Role::Admin,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
 }

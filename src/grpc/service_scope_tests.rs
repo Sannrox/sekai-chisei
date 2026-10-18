@@ -350,6 +350,7 @@ async fn object_above_the_profile_marking_ceiling_is_refused() {
         principal: "root".into(),
         role: Role::Admin,
         created: 0,
+        ..Default::default()
     })
     .unwrap();
     for (id, marking) in [

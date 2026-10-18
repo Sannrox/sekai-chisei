@@ -2924,6 +2924,7 @@ async fn evaluation_resource_reads_are_namespace_and_reference_authorized() {
             principal: "alice".into(),
             role: Role::Admin,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
 
@@ -2935,6 +2936,7 @@ async fn evaluation_resource_reads_are_namespace_and_reference_authorized() {
             principal: "root".into(),
             role: Role::Viewer,
             created: 2,
+            ..Default::default()
         })
         .unwrap();
     let mut alice_put = Request::new(evaluator_definition_request("acme"));
@@ -4097,6 +4099,7 @@ async fn evaluation_resolution_detects_hidden_applicable_waivers() {
             principal: "root".into(),
             role: Role::Viewer,
             created: 3,
+            ..Default::default()
         })
         .unwrap();
     svc.db
@@ -4120,6 +4123,7 @@ async fn evaluation_resolution_detects_hidden_applicable_waivers() {
             principal: "alice".into(),
             role: Role::Admin,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
 
@@ -5255,6 +5259,7 @@ fn team_execution_uses_authenticated_namespace_and_budget_scope() {
             principal: "alice".into(),
             role: crate::sekai::security::Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
 
@@ -5413,6 +5418,7 @@ async fn cached_plan_execution_rechecks_namespace_membership() {
             principal: "alice".into(),
             role: crate::sekai::security::Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
     let mut planning = Request::new(PlanExecutionRequest {
@@ -7218,6 +7224,7 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
             principal: "alice".into(),
             role: crate::sekai::security::Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
     assert_eq!(
@@ -10781,6 +10788,7 @@ async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed()
                 principal: principal.into(),
                 role,
                 created: 1,
+                ..Default::default()
             })
             .unwrap();
     }

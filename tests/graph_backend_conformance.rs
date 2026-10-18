@@ -165,6 +165,7 @@ fn exercise_graph_backend(db: &dyn GraphBackend, prefix: &str) {
         principal: viewer.clone(),
         role: Role::Viewer,
         created: 13,
+        ..Default::default()
     })
     .unwrap();
     assert!(db.can_access(&root.id, &[&viewer]).unwrap());
@@ -233,6 +234,7 @@ fn exercise_batch_object_read(db: &dyn GraphBackend, prefix: &str) {
         principal: "batch-owner".into(),
         role: Role::Viewer,
         created: 11,
+        ..Default::default()
     })
     .unwrap();
 

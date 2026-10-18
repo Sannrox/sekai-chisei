@@ -1288,6 +1288,7 @@ mod tests {
             principal: "alice".into(),
             role: crate::sekai::security::Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
         db.catch_up_search_namespace("acme", 10).unwrap();

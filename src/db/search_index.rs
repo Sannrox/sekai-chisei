@@ -316,9 +316,11 @@ impl SekaiDb {
         if grants.is_empty() {
             return Ok(true);
         }
-        Ok(grants
-            .iter()
-            .any(|grant| subjects.iter().any(|subject| subject == &grant.principal)))
+        let now_ms = crate::sekai::security::unix_now_ms();
+        Ok(grants.iter().any(|grant| {
+            grant.is_active(now_ms).is_ok()
+                && subjects.iter().any(|subject| subject == &grant.principal)
+        }))
     }
 
     fn bound_dataset_policy(&self, dataset: &Dataset) -> Result<(String, String), String> {
