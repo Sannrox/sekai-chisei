@@ -1134,6 +1134,9 @@ pub(super) fn to_proto_grant(g: &security::Grant) -> Grant {
         principal: g.principal.clone(),
         role: g.role.as_str().to_string(),
         created: g.created,
+        purpose: g.purpose.clone(),
+        not_after_ms: g.not_after_ms,
+        exception_reason: g.exception_reason.clone(),
     }
 }
 pub(super) fn to_proto_contention_scope(scope: &coordination::ContentionScope) -> ContentionScope {
@@ -1461,6 +1464,9 @@ pub(crate) fn from_proto_grant(g: &Grant) -> Result<security::Grant, Status> {
         principal: g.principal.clone(),
         role,
         created: g.created,
+        purpose: g.purpose.clone(),
+        not_after_ms: g.not_after_ms,
+        exception_reason: g.exception_reason.clone(),
     })
 }
 pub(super) fn from_proto_context_root(

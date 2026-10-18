@@ -819,14 +819,17 @@ impl SekaiDb {
             for grant in source_grants {
                 transaction
                     .execute(
-                        "INSERT INTO sekai_grants (id, object_id, principal, role, created)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        "INSERT INTO sekai_grants (id, object_id, principal, role, created, purpose, not_after_ms, exception_reason)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         params![
                             format!("ontology-projection-{}", Uuid::new_v4().simple()),
                             object_id,
                             grant.principal,
                             grant.role.as_str(),
-                            grant.created
+                            grant.created,
+                            grant.purpose,
+                            grant.not_after_ms,
+                            grant.exception_reason
                         ],
                     )
                     .map_err(|error| error.to_string())?;
@@ -1182,6 +1185,7 @@ fn select_readable_classes(
                  SELECT 1 FROM sekai_grants g
                  WHERE g.object_id = 'ontology:class:' || c.name
                    AND g.principal IN (SELECT value FROM json_each(?1))
+                   AND (g.not_after_ms = 0 OR g.not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
              ) ORDER BY c.name LIMIT ?2"
             ))
             .map_err(|error| error.to_string())?;
@@ -1301,6 +1305,7 @@ fn select_readable_relations(
                  SELECT 1 FROM sekai_grants g
                  WHERE g.object_id = 'ontology:relation:' || r.name
                    AND g.principal IN (SELECT value FROM json_each(?1))
+                   AND (g.not_after_ms = 0 OR g.not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
              ) ORDER BY r.name LIMIT ?2"
             ))
             .map_err(|error| error.to_string())?;

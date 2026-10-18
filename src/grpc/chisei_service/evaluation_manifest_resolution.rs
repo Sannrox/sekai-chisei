@@ -50,7 +50,12 @@ fn object_visible_to_actor(db: &RuntimeDb, object: &Object, actor: &str) -> Resu
         return Ok(true);
     }
     let grants = db.list_grants(&object.id)?;
-    if !grants.is_empty() && !grants.iter().any(|grant| grant.principal == actor) {
+    let now_ms = crate::sekai::security::unix_now_ms();
+    if !grants.is_empty()
+        && !grants
+            .iter()
+            .any(|grant| grant.principal == actor && grant.is_active(now_ms).is_ok())
+    {
         return Ok(false);
     }
     if markings::object_marking_token(object).is_none() {

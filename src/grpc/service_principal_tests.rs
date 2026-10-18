@@ -69,6 +69,7 @@ fn service(extension: bool) -> sekai_service::SekaiServiceImpl {
         principal: "tenant-admin".into(),
         role: Role::Admin,
         created: 0,
+        ..Default::default()
     };
     service.db.runtime().create_grant(&grant).unwrap();
     service.security.add_grant(&grant);
@@ -143,6 +144,7 @@ async fn admin_registers_reads_and_removes_with_profile_ceiling() {
         principal: "root".into(),
         role: Role::Admin,
         created: 0,
+        ..Default::default()
     };
     service.db.runtime().create_grant(&profile_grant).unwrap();
 

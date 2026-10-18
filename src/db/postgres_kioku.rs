@@ -779,7 +779,7 @@ fn authorize_kioku_evidence_tx(
         };
         let grants = tx
             .query(
-                "SELECT principal, role FROM sekai_grants
+                "SELECT principal, role, not_after_ms FROM sekai_grants
              WHERE object_id=$1 FOR SHARE",
                 &[&namespace_id],
             )
@@ -789,7 +789,10 @@ fn authorize_kioku_evidence_tx(
         } else {
             let role = grants
                 .iter()
-                .find(|row| row.get::<_, String>(0) == request.actor)
+                .find(|row| {
+                    row.get::<_, String>(0) == request.actor
+                        && crate::sekai::security::grant_live(row.get::<_, i64>(2))
+                })
                 .map(|row| row.get::<_, String>(1));
             match role.as_deref() {
                 Some("viewer") => EvidenceClassification::Internal,
@@ -817,14 +820,15 @@ fn authorize_kioku_evidence_tx(
     if !privileged {
         let grants = tx
             .query(
-                "SELECT principal FROM sekai_grants WHERE object_id=$1 FOR SHARE",
+                "SELECT principal, not_after_ms FROM sekai_grants WHERE object_id=$1 FOR SHARE",
                 &[&projection_id],
             )
             .map_err(|error| error.to_string())?;
         if !grants.is_empty()
-            && !grants
-                .iter()
-                .any(|row| row.get::<_, String>(0) == request.actor)
+            && !grants.iter().any(|row| {
+                row.get::<_, String>(0) == request.actor
+                    && crate::sekai::security::grant_live(row.get::<_, i64>(1))
+            })
         {
             return Err("actor is not authorized to read evidence projection".into());
         }

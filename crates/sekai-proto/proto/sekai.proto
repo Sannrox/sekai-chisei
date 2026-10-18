@@ -216,6 +216,9 @@ message Grant {
   string principal = 3;
   string role = 4;
   int64 created = 5;
+  string purpose = 6;
+  int64 not_after_ms = 7;
+  string exception_reason = 8;
 }
 
 message Decision {

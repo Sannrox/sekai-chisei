@@ -2124,6 +2124,7 @@ fn build_visibility_filter_internal(
                         OR json_extract(team_namespace.properties, '$.team_managed') = 'true'
                       )
                       AND team_grant.principal IN ({principal_placeholders})
+                      AND (team_grant.not_after_ms = 0 OR team_grant.not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
                 )
             )"
         )
@@ -2131,7 +2132,7 @@ fn build_visibility_filter_internal(
 
     (
         format!(
-            " AND (NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id) OR EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id AND principal IN ({principal_placeholders}))){team_namespace_filter}"
+            " AND (NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id) OR EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id AND principal IN ({principal_placeholders}) AND (not_after_ms = 0 OR not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)))){team_namespace_filter}"
         ),
         params,
     )
@@ -2980,6 +2981,7 @@ mod tests {
             principal: "alice".to_string(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
         db.create_grant(&security::Grant {
@@ -2988,6 +2990,7 @@ mod tests {
             principal: "bob".to_string(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
 

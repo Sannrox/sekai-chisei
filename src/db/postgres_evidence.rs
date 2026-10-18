@@ -935,23 +935,29 @@ impl PostgresDb {
         }
         let target_grants = tx
             .query(
-                "SELECT principal,role FROM sekai_grants WHERE object_id=$1",
+                "SELECT principal,role,purpose,not_after_ms,exception_reason FROM sekai_grants WHERE object_id=$1",
                 &[&target_id],
             )
             .map_err(|error| error.to_string())?;
         for grant in &target_grants {
             let principal: String = grant.get(0);
             let role: String = grant.get(1);
+            let purpose: String = grant.get(2);
+            let not_after_ms: i64 = grant.get(3);
+            let exception_reason: String = grant.get(4);
             let grant_hash = format!("{:x}", Sha256::digest(principal.as_bytes()));
             tx.execute(
-                "INSERT INTO sekai_grants(id,object_id,principal,role,created)
-                 VALUES($1,$2,$3,$4,$5)",
+                "INSERT INTO sekai_grants(id,object_id,principal,role,created,purpose,not_after_ms,exception_reason)
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
                 &[
                     &format!("grant-{id}-{}", &grant_hash[..16]),
                     &object_id,
                     &principal,
                     &role,
                     &now,
+                    &purpose,
+                    &not_after_ms,
+                    &exception_reason,
                 ],
             )
             .map_err(|error| error.to_string())?;

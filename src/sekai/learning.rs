@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 pub const RECORD_LEARNING_ACTION: &str = "record_learning";
 
+type CopiedGrant = (String, String, String, i64, String);
+
 const RECORD_LEARNING_PARAMS: [&str; 12] = [
     "id",
     "target_id",
@@ -278,15 +280,19 @@ pub(crate) fn record_learning(
     )
     .map_err(|error| error.to_string())?;
 
-    for (principal, role) in &expected_grants {
+    for (principal, role, purpose, not_after_ms, exception_reason) in &expected_grants {
         tx.execute(
-            "INSERT INTO sekai_grants (id, object_id, principal, role, created) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO sekai_grants (id, object_id, principal, role, created, purpose, not_after_ms, exception_reason)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 format!("grant-{}", uuid::Uuid::new_v4().simple()),
                 learning.id,
                 principal,
                 role,
                 now,
+                purpose,
+                not_after_ms,
+                exception_reason,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -307,21 +313,36 @@ fn expected_learning_grants(
     conn: &rusqlite::Connection,
     target_id: &str,
     actor: &str,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<CopiedGrant>, String> {
     let mut grants = {
         let mut stmt = conn
             .prepare(
-                "SELECT principal, role FROM sekai_grants WHERE object_id = ?1 ORDER BY principal, role, id",
+                "SELECT principal, role, purpose, not_after_ms, exception_reason
+                 FROM sekai_grants WHERE object_id = ?1 ORDER BY principal, role, id",
             )
             .map_err(|error| error.to_string())?;
         let rows = stmt
-            .query_map(params![target_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(params![target_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
     };
     if grants.is_empty() {
-        grants.push((actor.to_string(), "admin".to_string()));
+        grants.push((
+            actor.to_string(),
+            "admin".to_string(),
+            String::new(),
+            0,
+            String::new(),
+        ));
     }
     grants.sort();
     Ok(grants)
@@ -332,7 +353,7 @@ fn ensure_matching_retry(
     existing: &Object,
     expected: &Object,
     expected_link: &Link,
-    expected_grants: &[(String, String)],
+    expected_grants: &[CopiedGrant],
 ) -> Result<(), String> {
     let object_matches = existing.kind == expected.kind
         && existing.name == expected.name
@@ -372,11 +393,20 @@ fn ensure_matching_retry(
     let mut actual_grants = {
         let mut stmt = conn
             .prepare(
-                "SELECT principal, role FROM sekai_grants WHERE object_id = ?1 ORDER BY principal, role, id",
+                "SELECT principal, role, purpose, not_after_ms, exception_reason
+                 FROM sekai_grants WHERE object_id = ?1 ORDER BY principal, role, id",
             )
             .map_err(|error| error.to_string())?;
         let rows = stmt
-            .query_map(params![expected.id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(params![expected.id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
@@ -523,6 +553,7 @@ mod tests {
                 principal: principal.into(),
                 role,
                 created: 1,
+                ..Default::default()
             })
             .unwrap();
         }
@@ -625,6 +656,7 @@ mod tests {
             principal: "worker-1".into(),
             role: Role::Admin,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
 

@@ -567,7 +567,7 @@ pub(super) fn require_namespace_access(
         .list_grants(&boundary.id)
         .map_err(|error| sekai_fact_status(error, denied))?
         .into_iter()
-        .any(|grant| grant.principal == actor);
+        .any(|grant| grant.principal == actor && grant.is_live());
     if granted {
         Ok(())
     } else {
@@ -594,6 +594,7 @@ pub(super) fn require_namespace_write_access(
         .into_iter()
         .any(|grant| {
             grant.principal == actor
+                && grant.is_live()
                 && matches!(
                     grant.role,
                     crate::chisei::principal::PrincipalRole::Editor
@@ -635,6 +636,7 @@ pub(super) fn require_namespace_admin_access(
         .into_iter()
         .any(|grant| {
             grant.principal == actor
+                && grant.is_live()
                 && matches!(grant.role, crate::chisei::principal::PrincipalRole::Admin)
         });
     if granted {
@@ -667,6 +669,7 @@ pub(super) fn require_external_project_access(
         .into_iter()
         .any(|grant| {
             grant.principal == actor
+                && grant.is_live()
                 && matches!(
                     grant.role,
                     crate::chisei::principal::PrincipalRole::Editor

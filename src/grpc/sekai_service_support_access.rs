@@ -372,7 +372,7 @@ pub(super) fn resolve_principal_authority(
         let grants = db.list_grants(&object.id).map_err(Status::internal)?;
         if grants
             .iter()
-            .any(|grant| matches!(grant.role, security::Role::Admin))
+            .any(crate::sekai::security::grant_is_live_admin)
         {
             profiles.push(object);
         }

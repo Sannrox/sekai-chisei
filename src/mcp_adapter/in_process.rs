@@ -74,6 +74,7 @@ impl InProcessSurface {
                 principal: PRINCIPAL.into(),
                 role: Role::Admin,
                 created: 0,
+                ..Default::default()
             })
             .map_err(|error| error.to_string())?;
         }

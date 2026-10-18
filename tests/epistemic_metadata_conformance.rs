@@ -52,6 +52,7 @@ fn grant(id: &str, object_id: &str, principal: &str) -> Grant {
         principal: principal.into(),
         role: Role::Viewer,
         created: 1,
+        ..Default::default()
     }
 }
 

@@ -28,6 +28,7 @@ impl From<&Grant> for PrincipalGrant {
         Self {
             principal: grant.principal.clone(),
             role: PrincipalRole::from(&grant.role),
+            not_after_ms: grant.not_after_ms,
         }
     }
 }
@@ -49,6 +50,7 @@ mod tests {
             principal: principal.into(),
             role,
             created: 1,
+            ..Default::default()
         }
     }
 
@@ -62,20 +64,24 @@ mod tests {
     fn sekai_may_read(actor: &str, grants: &[Grant]) -> bool {
         matches!(actor, "root" | "local")
             || grants.is_empty()
-            || grants.iter().any(|grant| grant.principal == actor)
+            || grants
+                .iter()
+                .any(|grant| grant.principal == actor && grant.is_active(1_000).is_ok())
     }
 
     fn sekai_role(actor: &str, grants: &[Grant]) -> Option<Role> {
         grants
             .iter()
-            .find(|grant| grant.principal == actor)
+            .find(|grant| grant.principal == actor && grant.is_active(1_000).is_ok())
             .map(|grant| grant.role.clone())
     }
 
     fn sekai_is_admin(actor: &str, grants: &[Grant]) -> bool {
-        grants
-            .iter()
-            .any(|grant| grant.principal == actor && matches!(grant.role, Role::Admin))
+        grants.iter().any(|grant| {
+            grant.principal == actor
+                && matches!(grant.role, Role::Admin)
+                && grant.is_active(1_000).is_ok()
+        })
     }
 
     #[test]
@@ -90,6 +96,11 @@ mod tests {
                 sekai_grant("alice", Role::Admin),
             ],
             vec![sekai_grant("root", Role::Viewer)],
+            vec![{
+                let mut expired = sekai_grant("alice", Role::Admin);
+                expired.not_after_ms = 1;
+                expired
+            }],
         ];
         for actor in [
             "alice",

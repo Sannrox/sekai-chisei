@@ -725,12 +725,81 @@ pub(super) async fn list_virtual_tables(
         .collect();
     Ok(Response::new(ListVirtualTablesResponse { tables }))
 }
+fn persist_created_grant(
+    service: &SekaiServiceImpl,
+    mut parsed: crate::sekai::security::Grant,
+    actor: &str,
+) -> Result<crate::sekai::security::Grant, Status> {
+    let runtime = service.db.runtime();
+    let now_ms = crate::sekai::security::unix_now_ms();
+    let namespace = runtime
+        .get_object(&parsed.object_id)
+        .map_err(Status::internal)?
+        .map(|object| {
+            crate::sekai::security::policy_namespace_for_object(
+                &object.kind,
+                &object.namespace,
+                &object.external_id,
+            )
+        })
+        .filter(|namespace| !namespace.is_empty());
+    let policy = match namespace.as_deref() {
+        Some(namespace) => runtime
+            .namespace_grant_policy(namespace)
+            .map_err(Status::internal)?,
+        None => None,
+    };
+    let term = parsed
+        .term()
+        .prepare(policy.as_ref(), now_ms)
+        .map_err(|error| Status::invalid_argument(error.as_str()))?;
+    parsed = parsed.with_term(term);
+    let renew = runtime
+        .list_grants(&parsed.object_id)
+        .map_err(Status::internal)?
+        .iter()
+        .any(|grant| grant.principal == parsed.principal);
+    let action = if renew { "grant.renew" } else { "grant.create" };
+    let mut evidence = HashMap::new();
+    evidence.insert("purpose".into(), parsed.purpose.clone());
+    evidence.insert("not_after_ms".into(), parsed.not_after_ms.to_string());
+    evidence.insert("exception_reason".into(), parsed.exception_reason.clone());
+    evidence.insert("principal".into(), parsed.principal.clone());
+    evidence.insert("role".into(), parsed.role.as_str().into());
+    evidence.insert("grant_id".into(), parsed.id.clone());
+    if let Some(namespace) = namespace {
+        evidence.insert("namespace".into(), namespace);
+    }
+    let receipt_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    runtime
+        .create_grant_with_decision(
+            &parsed,
+            &crate::sekai::audit::Decision {
+                id: format!("{action}:{}:{receipt_ns}", parsed.id),
+                timestamp: now_ms,
+                actor: actor.into(),
+                action: action.into(),
+                reason: parsed.purpose.clone(),
+                evidence,
+                target_id: parsed.object_id.clone(),
+                outcome: "allowed".into(),
+            },
+        )
+        .map_err(Status::internal)?;
+    service.security.add_grant(&parsed);
+    Ok(parsed)
+}
+
 pub(super) async fn create_grant(
     service: &SekaiServiceImpl,
     req: Request<CreateGrantRequest>,
 ) -> Result<Response<CreateGrantResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let actor = principals.first().map(String::as_str).unwrap_or_default();
     let grant = req
         .into_inner()
         .grant
@@ -742,12 +811,7 @@ pub(super) async fn create_grant(
         &parsed.object_id,
         &principals,
     )? {
-        service
-            .db
-            .runtime()
-            .create_grant(&parsed)
-            .map_err(Status::invalid_argument)?;
-        service.security.add_grant(&parsed);
+        let parsed = persist_created_grant(service, parsed, actor)?;
         return Ok(Response::new(CreateGrantResponse {
             grant: Some(to_proto_grant(&parsed)),
         }));
@@ -769,12 +833,7 @@ pub(super) async fn create_grant(
         &target,
         &principals,
     )?;
-    service
-        .db
-        .runtime()
-        .create_grant(&parsed)
-        .map_err(Status::invalid_argument)?;
-    service.security.add_grant(&parsed);
+    let parsed = persist_created_grant(service, parsed, actor)?;
     Ok(Response::new(CreateGrantResponse {
         grant: Some(to_proto_grant(&parsed)),
     }))

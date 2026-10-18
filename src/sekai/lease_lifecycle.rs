@@ -403,6 +403,7 @@ mod tests {
             principal: "alice".into(),
             role: Role::Editor,
             created: 1,
+            ..Default::default()
         });
         let lifecycle = LeaseLifecycle::new(&db, &security, "local");
 

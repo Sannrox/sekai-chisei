@@ -451,6 +451,7 @@ mod tests {
             principal: principal.into(),
             role: Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
     }

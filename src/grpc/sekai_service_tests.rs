@@ -834,6 +834,7 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
             principal: "other-reader".into(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         };
         svc.security.add_grant(&grant);
         let token = authority.sign(&claims(nonce)).unwrap();
@@ -995,6 +996,7 @@ async fn definition_branch_edit_rechecks_member_admin() {
         principal: "tester".into(),
         role: security::Role::Viewer,
         created: 1,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&read_grant).unwrap();
     svc.security.add_grant(&read_grant);
@@ -1032,6 +1034,7 @@ async fn definition_branch_edit_rechecks_member_admin() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 2,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&object_admin_grant).unwrap();
     svc.security.add_grant(&object_admin_grant);
@@ -1173,6 +1176,7 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
         principal: "root".into(),
         role: security::Role::Admin,
         created: 1,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&ticket_admin).unwrap();
     svc.security.add_grant(&ticket_admin);
@@ -1445,6 +1449,7 @@ async fn definition_proposal_merge_accepts_one_live_approval() {
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         };
         svc.db.runtime().create_grant(&grant).unwrap();
         svc.security.add_grant(&grant);
@@ -2367,6 +2372,7 @@ async fn list_published_definition_revisions_chains_filters_and_paginates() {
         principal: "other-reader".into(),
         role: security::Role::Viewer,
         created: 1,
+        ..Default::default()
     };
     svc.security.add_grant(&protected);
     assert!(
@@ -3226,6 +3232,7 @@ fn grant_schema_admin(svc: &SekaiServiceImpl) {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -3238,6 +3245,7 @@ fn grant_ontology_admin(svc: &SekaiServiceImpl) {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -3250,6 +3258,7 @@ fn grant_ontology_reader(svc: &SekaiServiceImpl, object_id: &str) {
         principal: "tester".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -3275,6 +3284,7 @@ fn grant_action_admin(svc: &SekaiServiceImpl) {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -3292,6 +3302,7 @@ fn grant_object_role(
         principal: principal.into(),
         role,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -5563,6 +5574,7 @@ async fn rollback_dataset_requires_write_access() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -5837,6 +5849,7 @@ async fn update_dataset_requires_write_access_to_existing_binding() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -8055,6 +8068,7 @@ async fn ontology_list_hides_unreadable_definitions() {
         principal: "other-reader".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&hidden_grant).unwrap();
     svc.security.add_grant(&hidden_grant);
@@ -9283,6 +9297,7 @@ async fn ontology_grants_are_managed_through_public_rpcs() {
                 principal: "alice".into(),
                 role: "viewer".into(),
                 created: 1,
+                ..Default::default()
             }),
         }))
         .await
@@ -9321,6 +9336,318 @@ async fn ontology_grants_are_managed_through_public_rpcs() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn namespace_policy_requires_purpose_and_end_date() {
+    let svc = service();
+    grant_schema_admin(&svc);
+    svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+        r#type: Some(widget_schema_type()),
+    }))
+    .await
+    .unwrap();
+    svc.create_object(with_named_principal(
+        CreateObjectRequest {
+            object: Some(Object {
+                id: "term-widget".into(),
+                kind: "widget".into(),
+                name: "widget".into(),
+                namespace: "ops".into(),
+                external_id: "".into(),
+                properties: HashMap::from([("name".into(), "w".into())]),
+                created: 0,
+                updated: 0,
+            }),
+            lease_precondition: None,
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .apply_namespace_grant_policy(
+            &svc.security,
+            &security::NamespaceGrantPolicy {
+                namespace: "ops".into(),
+                max_duration_ms: 86_400_000,
+                require_terms: true,
+            },
+        )
+        .unwrap();
+    let denied = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "term-alice".into(),
+                    object_id: "term-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "audit".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::InvalidArgument);
+    assert!(denied.message().contains("end date"));
+    let created = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "term-alice".into(),
+                    object_id: "term-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "audit".into(),
+                    not_after_ms: crate::sekai::security::unix_now_ms() + 60_000,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .grant
+        .unwrap();
+    assert_eq!(created.purpose, "audit");
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("grant.create".into()),
+            target_id: Some("term-widget".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].outcome, "allowed");
+    assert_eq!(decisions[0].target_id, "term-widget");
+    assert_eq!(
+        decisions[0].evidence.get("grant_id").map(String::as_str),
+        Some("term-alice")
+    );
+    let listed = svc
+        .list_decisions(with_named_principal(
+            ListDecisionsRequest {
+                actor: String::new(),
+                action: "grant.create".into(),
+                after: 0,
+                limit: 10,
+                target_id: "term-widget".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.decisions.len(), 1);
+    let stranger = svc
+        .list_decisions(with_named_principal(
+            ListDecisionsRequest {
+                actor: String::new(),
+                action: "grant.create".into(),
+                after: 0,
+                limit: 10,
+                target_id: String::new(),
+            },
+            "stranger",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stranger.decisions.is_empty());
+    let denied_target = svc
+        .list_decisions(with_named_principal(
+            ListDecisionsRequest {
+                actor: String::new(),
+                action: "grant.create".into(),
+                after: 0,
+                limit: 10,
+                target_id: "term-widget".into(),
+            },
+            "stranger",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_target.code(), tonic::Code::PermissionDenied);
+    let renewed = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "term-alice".into(),
+                    object_id: "term-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 2,
+                    purpose: "audit".into(),
+                    not_after_ms: crate::sekai::security::unix_now_ms() + 120_000,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .grant
+        .unwrap();
+    let again = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "term-alice".into(),
+                    object_id: "term-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 3,
+                    purpose: "audit".into(),
+                    not_after_ms: crate::sekai::security::unix_now_ms() + 180_000,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .grant
+        .unwrap();
+    assert!(again.not_after_ms >= renewed.not_after_ms);
+    let renewals = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("grant.renew".into()),
+            target_id: Some("term-widget".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(renewals.len(), 2);
+    assert!(renewals.iter().all(|decision| {
+        decision.target_id == "term-widget"
+            && decision.evidence.get("grant_id").map(String::as_str) == Some("term-alice")
+    }));
+}
+
+#[tokio::test]
+async fn grant_receipt_accepts_asia_shaped_identifiers() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "asia-widget".into(),
+            kind: "note".into(),
+            name: "asia".into(),
+            namespace: "asia-ops".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let created = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "asia-grant".into(),
+                    object_id: "asia-widget".into(),
+                    principal: "asia".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "regional review".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .grant
+        .unwrap();
+    assert_eq!(created.principal, "asia");
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("grant.create".into()),
+            target_id: Some("asia-widget".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(
+        decisions[0].evidence.get("namespace").map(String::as_str),
+        Some("asia-ops")
+    );
+    assert_eq!(
+        decisions[0].evidence.get("principal").map(String::as_str),
+        Some("asia")
+    );
+}
+
+#[tokio::test]
+async fn grant_receipt_rejects_secret_shaped_exception_reason() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "secret-widget".into(),
+            kind: "note".into(),
+            name: "secret".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let denied = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "secret-grant".into(),
+                    object_id: "secret-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "audit".into(),
+                    exception_reason: "sk-live-secret".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::Internal);
+    assert!(denied.message().contains("secret material"));
+    let denied_aws = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "aws-grant".into(),
+                    object_id: "secret-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "ASIAIOSFODNN7EXAMPLE".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_aws.code(), tonic::Code::Internal);
+    assert!(denied_aws.message().contains("secret material"));
 }
 
 #[tokio::test]
@@ -9653,6 +9980,7 @@ async fn grant_and_audit_rpcs_round_trip() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&admin_grant).unwrap();
     svc.security.add_grant(&admin_grant);
@@ -9690,6 +10018,7 @@ async fn grant_and_audit_rpcs_round_trip() {
                 principal: "alice".into(),
                 role: "viewer".into(),
                 created: 1,
+                ..Default::default()
             }),
         }))
         .await
@@ -9739,7 +10068,13 @@ async fn grant_and_audit_rpcs_round_trip() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(listed.decisions.len(), 2);
+    assert_eq!(listed.decisions.len(), 3);
+    assert!(
+        listed
+            .decisions
+            .iter()
+            .any(|decision| decision.action == "grant.create")
+    );
 
     let changes = svc
         .list_object_changes(with_principal(ListObjectChangesRequest {
@@ -9775,6 +10110,7 @@ async fn control_plane_admin_can_recover_managed_acl() {
         principal: "alice".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&member_grant).unwrap();
     svc.security.add_grant(&member_grant);
@@ -9787,6 +10123,7 @@ async fn control_plane_admin_can_recover_managed_acl() {
                 principal: "root".into(),
                 role: "admin".into(),
                 created: 1,
+                ..Default::default()
             }),
         },
         "local",
@@ -10000,6 +10337,7 @@ async fn grants_cannot_preclaim_future_namespace_boundaries() {
                     principal: "mallory".into(),
                     role: "admin".into(),
                     created: 1,
+                    ..Default::default()
                 }),
             },
             "mallory",
@@ -10016,6 +10354,7 @@ async fn grants_cannot_preclaim_future_namespace_boundaries() {
             principal: "mallory".into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
     let bootstrap = svc
@@ -11352,6 +11691,7 @@ async fn list_attestations_paginates_over_visible_rows_only() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -11845,6 +12185,7 @@ async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
         principal: "bob".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&denied_grant).unwrap();
     svc.security.add_grant(&denied_grant);
@@ -12417,6 +12758,7 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
         principal: "bob".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&denied_grant).unwrap();
     svc.security.add_grant(&denied_grant);
@@ -13605,6 +13947,7 @@ async fn agent_definition_member_read_crosses_server_transport() {
             principal: "other-reader".into(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         };
         security.add_grant(&grant);
         let denied = client
@@ -13744,6 +14087,7 @@ async fn definition_certification_gate_rpc_reports_bound_states() {
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         });
     }
     seed_agent_eval_run(&svc, "agent-cert", "agent-suite", true);
@@ -13843,6 +14187,7 @@ async fn definition_certification_refuses_self_certify_revoke_undo_and_caller_st
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         });
     }
     svc.create_definition_branch(with_named_principal(
@@ -13994,6 +14339,7 @@ async fn definition_certification_refuses_author_after_unrelated_edit() {
                 principal: principal.into(),
                 role: security::Role::Admin,
                 created: 1,
+                ..Default::default()
             });
         }
     }
@@ -14101,6 +14447,7 @@ async fn definition_certification_revokes_when_the_suite_run_is_gone() {
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         });
     }
     svc.create_definition_branch(with_named_principal(
@@ -14366,6 +14713,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
             principal: "other-author".into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         };
         security.add_grant(&grant);
         let denied = client
@@ -14387,6 +14735,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         principal: "subject-a".into(),
         role: security::Role::Admin,
         created: 1,
+        ..Default::default()
     });
     let saved = client
         .apply_definition_branch_edit(signed(&authority, &claims(), edit.clone()))
@@ -14584,6 +14933,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         principal: "subject-c".into(),
         role: security::Role::Admin,
         created: 1,
+        ..Default::default()
     });
     security.add_grant(&security::Grant {
         id: "ticket-restricted".into(),
@@ -14591,6 +14941,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         principal: "subject-a".into(),
         role: security::Role::Admin,
         created: 1,
+        ..Default::default()
     });
     let mut unreadable = claims();
     unreadable.subject = "subject-c".into();
@@ -17844,6 +18195,7 @@ async fn get_transform_run_redacts_partition_keys_without_dataset_read() {
         principal: "alice".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     let owner_out = security::Grant {
         id: "owner-out".into(),
@@ -17851,6 +18203,7 @@ async fn get_transform_run_redacts_partition_keys_without_dataset_read() {
         principal: "alice".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner_in).unwrap();
     runtime.create_grant(&owner_out).unwrap();
@@ -18139,6 +18492,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         principal: "alice".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     let owner_out = security::Grant {
         id: "owner-out".into(),
@@ -18146,6 +18500,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         principal: "alice".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner_in).unwrap();
     runtime.create_grant(&owner_out).unwrap();
@@ -18215,6 +18570,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         principal: "local".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&reader).unwrap();
     svc.security.add_grant(&reader);
@@ -18262,6 +18618,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         principal: "local".into(),
         role: security::Role::Editor,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&writer).unwrap();
     svc.security.add_grant(&writer);
@@ -21240,6 +21597,7 @@ async fn preview_governed_transform_denies_unreadable_input() {
         principal: "bob".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner).unwrap();
     svc.security.add_grant(&owner);
@@ -21359,6 +21717,7 @@ async fn preview_governed_transform_omits_ungranted_columns() {
         principal: "alice".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner).unwrap();
     svc.security.add_grant(&owner);
@@ -21661,6 +22020,7 @@ async fn preview_retrieve_denies_unreadable_input() {
         principal: "local".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner).unwrap();
     svc.security.add_grant(&owner);
@@ -21770,6 +22130,7 @@ async fn seed_agent_draft(svc: &SekaiServiceImpl, namespace: &str) -> String {
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         });
     }
     svc.create_definition_branch(with_named_principal(

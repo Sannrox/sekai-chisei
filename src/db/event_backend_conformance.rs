@@ -71,6 +71,7 @@ fn pin_ceiling(runtime: &RuntimeDb, case: &Case, ceiling: &str) {
             principal: "root".into(),
             role: Role::Admin,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
 }

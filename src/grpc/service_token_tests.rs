@@ -95,6 +95,7 @@ fn plane(with_extension: bool) -> Plane {
         principal: "tenant-admin".into(),
         role: Role::Admin,
         created: 0,
+        ..Default::default()
     };
     store.runtime().create_grant(&grant).unwrap();
     let authority = Arc::new(AssertionAuthority::new(

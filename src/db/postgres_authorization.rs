@@ -43,6 +43,7 @@ impl PostgresDb {
                         WHERE object_id = $1
                           AND principal = ANY($2)
                           AND role = ANY($3)
+                          AND (not_after_ms = 0 OR not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
                     ),
                     EXISTS(
                         SELECT 1
@@ -64,6 +65,8 @@ impl PostgresDb {
                         WHERE target.id = $1
                           AND boundary.properties::jsonb ->> 'team_managed' = 'true'
                           AND namespace_grant.principal = ANY($2)
+                          AND (namespace_grant.not_after_ms = 0
+                               OR namespace_grant.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
                     )",
                 &[&object_id, &principals, &roles],
             )

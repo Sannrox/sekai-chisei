@@ -1879,6 +1879,7 @@ mod tests {
             principal: grant.principal,
             role: Role::Viewer,
             created: grant.created,
+            ..Default::default()
         })
         .unwrap();
         let error = claim_refused(&db, &effect);
@@ -2060,6 +2061,7 @@ mod tests {
             principal: grant.principal,
             role: Role::Viewer,
             created: grant.created,
+            ..Default::default()
         })
         .unwrap();
         let error = apply_completed(&db, &effect, &claimed).unwrap_err();
