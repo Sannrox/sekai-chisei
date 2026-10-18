@@ -10,7 +10,11 @@ use crate::db::postgres::PostgresDb;
 
 impl PostgresDb {
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
-        self.upsert_operation_receipt(receipt)
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+        self.upsert_operation_receipt_on(&mut tx, receipt)?;
+        self.append_operation_receipt_chain(&mut tx, receipt)?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
@@ -18,33 +22,39 @@ impl PostgresDb {
         let request_id = intent_attr(receipt, "request_id");
         let lookup_request_id = intent_attr(receipt, "lookup_request_id");
         let caller_scope = intent_attr(receipt, "caller_scope");
-        self.connection()?
-            .execute(
-                "INSERT INTO chisei_operation_receipts(
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO chisei_operation_receipts(
                     operation_id, request_id, lookup_request_id, initiating_actor,
                     caller_scope, namespace, receipt_json, updated_at
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[
-                    &receipt.operation_id,
-                    &request_id,
-                    &lookup_request_id,
-                    &receipt.initiating_actor,
-                    &caller_scope,
-                    &receipt.namespace,
-                    &receipt_json,
-                    &chrono::Utc::now().timestamp_millis(),
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            &[
+                &receipt.operation_id,
+                &request_id,
+                &lookup_request_id,
+                &receipt.initiating_actor,
+                &caller_scope,
+                &receipt.namespace,
+                &receipt_json,
+                &chrono::Utc::now().timestamp_millis(),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&mut tx, receipt)?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
-    fn upsert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
+    fn upsert_operation_receipt_on<C: postgres::GenericClient>(
+        &self,
+        client: &mut C,
+        receipt: &OperationReceipt,
+    ) -> Result<(), String> {
         let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
         let request_id = intent_attr(receipt, "request_id");
         let lookup_request_id = intent_attr(receipt, "lookup_request_id");
         let caller_scope = intent_attr(receipt, "caller_scope");
-        self.connection()?
+        client
             .execute(
                 "INSERT INTO chisei_operation_receipts(
                     operation_id, request_id, lookup_request_id, initiating_actor,
@@ -534,6 +544,7 @@ impl PostgresDb {
                 &[&updated_json, &durable_at_ms, &operation_id],
             )
             .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&mut transaction, &receipt)?;
         transaction.commit().map_err(|error| error.to_string())?;
         record_durability_lag(produced_at_ms, durable_at_ms);
         Ok((receipt, true))
@@ -586,6 +597,7 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&mut transaction, &receipt)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(receipt)
     }
@@ -651,6 +663,7 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&mut transaction, &receipt)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }

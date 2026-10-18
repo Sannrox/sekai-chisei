@@ -1545,8 +1545,8 @@ fn insert_transform_run(
             &output_partitions,
         ],
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    crate::db::postgres_receipt_chain::append_transform_run_chain(tx, run)
 }
 
 fn row_to_run(row: Row) -> Result<TransformRun, String> {
@@ -2790,7 +2790,7 @@ pub(crate) fn redact_transform_partition_receipts_pg(
         )
         .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    crate::db::postgres_receipt_chain::redact_transform_run_chain(tx, dataset_id)
 }
 
 fn persist_transform_run_pg(
@@ -2830,8 +2830,8 @@ fn persist_transform_run_pg(
             &output_partitions,
         ],
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    crate::db::postgres_receipt_chain::append_transform_run_chain(tx, run)
 }
 
 fn stamp_run_dispatch_pg(
@@ -2843,8 +2843,11 @@ fn stamp_run_dispatch_pg(
         "UPDATE sekai_governed_transform_run SET dispatch_status = $2 WHERE run_id = $1",
         &[&run_id, &status],
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    let Some(run) = load_transform_run_pg(tx, run_id)? else {
+        return Ok(());
+    };
+    crate::db::postgres_receipt_chain::append_transform_run_chain(tx, &run)
 }
 
 fn list_all_transforms_pg(

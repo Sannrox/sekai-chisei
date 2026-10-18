@@ -81,6 +81,7 @@ pub mod model_platform_cli;
 pub mod model_release_evidence_cli;
 pub mod model_review_cli;
 pub mod open_table_cli;
+pub mod receipt_chain_cli;
 pub mod receipt_cli;
 pub mod replay_cli;
 pub mod report_cli;

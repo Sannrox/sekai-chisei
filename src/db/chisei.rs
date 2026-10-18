@@ -497,8 +497,13 @@ impl SekaiDb {
             stage = crate::obs::correlation::Stage::Persistence.as_str(),
         )
         .entered();
-        let conn = self.conn();
-        upsert_operation_receipt(&conn, receipt)
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        upsert_operation_receipt(&tx, receipt)?;
+        self.append_operation_receipt_chain(&tx, receipt)?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
@@ -506,8 +511,11 @@ impl SekaiDb {
         let request_id = receipt_intent_attr(receipt, "request_id");
         let lookup_request_id = receipt_intent_attr(receipt, "lookup_request_id");
         let caller_scope = receipt_intent_attr(receipt, "caller_scope");
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        tx.execute(
             "INSERT INTO chisei_operation_receipts(
                 operation_id, request_id, lookup_request_id, initiating_actor,
                 caller_scope, namespace, receipt_json, updated_at
@@ -523,8 +531,9 @@ impl SekaiDb {
                 chrono::Utc::now().timestamp_millis(),
             ],
         )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&tx, receipt)?;
+        tx.commit().map_err(|error| error.to_string())
     }
 }
 
@@ -972,8 +981,11 @@ impl SekaiDb {
         // this guard remains live through the read, mutation, and update below.
         // Concurrent reporters therefore serialize across this whole JSON
         // read-modify-write sequence rather than overwriting one another.
-        let conn = self.conn();
-        let receipt_json = conn
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let receipt_json = tx
             .query_row(
                 "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id=?1",
                 params![operation_id],
@@ -992,6 +1004,7 @@ impl SekaiDb {
             let mut replay = event.clone();
             replay.timestamp_ms = existing.timestamp_ms;
             if existing == &replay {
+                tx.commit().map_err(|error| error.to_string())?;
                 return Ok((receipt, false));
             }
             return Err(format!(
@@ -1040,11 +1053,13 @@ impl SekaiDb {
         receipt.events.push(event);
         let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
         let durable_at_ms = chrono::Utc::now().timestamp_millis();
-        conn.execute(
+        tx.execute(
             "UPDATE chisei_operation_receipts SET receipt_json=?1, updated_at=?2 WHERE operation_id=?3",
             params![updated_json, durable_at_ms, operation_id],
         )
         .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&tx, &receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
         record_durability_lag(
             crate::obs::labels::LagSurface::Receipt,
             produced_at_ms,
@@ -1064,8 +1079,11 @@ impl SekaiDb {
         // Hold the same sole connection guard used by reporter appends across
         // this entire read-modify-write operation so completion cannot erase
         // evidence reported concurrently.
-        let conn = self.conn();
-        let receipt_json = conn
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let receipt_json = tx
             .query_row(
                 "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id=?1",
                 params![operation_id],
@@ -1079,14 +1097,17 @@ impl SekaiDb {
         let original = receipt.clone();
         update(&mut receipt)?;
         if receipt == original {
+            tx.commit().map_err(|error| error.to_string())?;
             return Ok(receipt);
         }
         let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
-        conn.execute(
+        tx.execute(
             "UPDATE chisei_operation_receipts SET receipt_json=?1, updated_at=?2 WHERE operation_id=?3",
             params![updated_json, chrono::Utc::now().timestamp_millis(), operation_id],
         )
         .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&tx, &receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(receipt)
     }
 
@@ -1096,8 +1117,11 @@ impl SekaiDb {
         principal: &str,
         event_kinds: Vec<ReceiptEventKind>,
     ) -> Result<bool, String> {
-        let conn = self.conn();
-        let receipt_json = conn
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let receipt_json = tx
             .query_row(
                 "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id=?1",
                 params![operation_id],
@@ -1120,6 +1144,7 @@ impl SekaiDb {
             existing.sort_by_key(|kind| kind.as_str());
             existing.dedup();
             if existing == normalized {
+                tx.commit().map_err(|error| error.to_string())?;
                 return Ok(false);
             }
             grant.event_kinds = normalized;
@@ -1130,11 +1155,13 @@ impl SekaiDb {
             });
         }
         let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
-        conn.execute(
+        tx.execute(
             "UPDATE chisei_operation_receipts SET receipt_json=?1, updated_at=?2 WHERE operation_id=?3",
             params![updated_json, chrono::Utc::now().timestamp_millis(), operation_id],
         )
         .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&tx, &receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }
 

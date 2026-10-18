@@ -61,6 +61,8 @@ mod peer_import_store;
 #[cfg(test)]
 mod portfolio_route_test_cases;
 pub mod postgres;
+pub(crate) mod postgres_receipt_chain;
+pub(crate) mod receipt_chain;
 #[cfg(test)]
 pub(crate) use postgres::ScratchDatabase;
 pub(crate) use postgres::off_runtime;

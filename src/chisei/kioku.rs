@@ -2720,7 +2720,9 @@ impl SekaiDb {
             return Err("holdout actor is required".into());
         }
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         for (memory_id, memory_version) in holdouts {
             let state = tx
                 .query_row(
@@ -2736,6 +2738,7 @@ impl SekaiDb {
             }
         }
         crate::db::chisei::upsert_operation_receipt(&tx, receipt)?;
+        self.append_operation_receipt_chain(&tx, receipt)?;
         for (memory_id, memory_version) in holdouts {
             insert_lifecycle_event(
                 &tx,
