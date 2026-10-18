@@ -2088,12 +2088,26 @@ mod tests {
         let mut interceptor = interceptor_with_authority(authority.clone())
             .with_actor_rate_gate(crate::chisei::actor_limit::ActorRateGate::enabled(1, 1));
         let expires_at = chrono::Utc::now().timestamp() + 60;
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
         let first = authority
-            .sign(&test_assertion_claims("n-limit-1", expires_at))
+            .sign(&test_assertion_claims(
+                &format!("n-limit-a-{unique}"),
+                expires_at,
+            ))
             .unwrap();
         interceptor.call(bearer_request(&first)).unwrap();
         let second = authority
-            .sign(&test_assertion_claims("n-limit-2", expires_at))
+            .sign(&test_assertion_claims(
+                &format!("n-limit-b-{unique}"),
+                expires_at,
+            ))
             .unwrap();
         let error = interceptor.call(bearer_request(&second)).unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
