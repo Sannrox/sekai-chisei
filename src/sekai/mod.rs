@@ -91,6 +91,7 @@ pub mod operation_correlation;
 pub(crate) mod parameter_schema;
 pub mod parked_work;
 pub mod peer_import;
+pub mod review_queue;
 pub use sekai_types::policy_decision;
 pub mod propagation;
 pub use sekai_types::purpose_authorization;

@@ -148,6 +148,13 @@ Describe and preview still never grant. `ListActionInstances` with
   type declares none, a namespace administrator. The submitter never decides
   their own instance. Every refusal, including an unknown instance, answers
   `PERMISSION_DENIED` with `access denied`.
+- **Review queues (#1455).** A type may set `review_queue_id`, an optional
+  numeric `review_threshold` on a parameter, an SLA, a pool, and escalation
+  (`auto_deny` or `reassign`). Matching parked instances record the queue and
+  assignee on the instance. Only the assignee may decide. Past-SLA items
+  escalate as configured. Agent reviewers listed on the type are marked
+  `agent_decision=true` on the approval receipt. Listing or deciding the
+  parked inbox applies due SLAs; there is no separate background worker.
 - **Grant** resumes the same instance against current state. It re-checks
   the type, parameters, submission criteria, and policy (the approval
   satisfies only `require_approval`), and the target object: if it changed

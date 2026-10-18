@@ -4623,6 +4623,27 @@ impl RuntimeDb {
         }
     }
 
+    pub fn update_parked_action_instance(
+        &self,
+        instance: &crate::sekai::action_instance::ActionInstance,
+        expected_assignee: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.transition_action_instance(
+                crate::sekai::action_instance::STATUS_PARKED,
+                instance,
+                expected_assignee,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.transition_action_instance(
+                    crate::sekai::action_instance::STATUS_PARKED,
+                    instance,
+                    expected_assignee,
+                )
+            }),
+        }
+    }
+
     pub fn grant_parked_action_instance(
         &self,
         granted: &crate::sekai::action_instance::ActionInstance,
@@ -4658,12 +4679,16 @@ impl RuntimeDb {
         parked: &crate::sekai::action_instance::ActionInstance,
     ) -> Result<bool, String> {
         match self {
-            Self::Sqlite(db) => db
-                .transition_action_instance(crate::sekai::action_instance::STATUS_ADMITTED, parked),
+            Self::Sqlite(db) => db.transition_action_instance(
+                crate::sekai::action_instance::STATUS_ADMITTED,
+                parked,
+                &parked.review.assignee,
+            ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.transition_action_instance(
                     crate::sekai::action_instance::STATUS_ADMITTED,
                     parked,
+                    &parked.review.assignee,
                 )
             }),
         }

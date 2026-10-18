@@ -375,7 +375,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             version: request.version,
             principal: actor.to_string(),
             delegating_actor: request.delegating_actor,
-            parameters_json: request.parameters_json,
+            parameters_json: request.parameters_json.clone(),
             request_digest,
             idempotency_key: request.idempotency_key,
             operation_id: operation_id.clone(),
@@ -391,6 +391,17 @@ impl<'a> ActionInstanceAdmission<'a> {
             decided_by: String::new(),
             approval_decision: String::new(),
             autonomous_envelope_id: envelope_id.clone(),
+            review: if status == STATUS_PARKED {
+                crate::sekai::review_queue::place(
+                    &type_def.review_queue,
+                    &request.parameters_json,
+                    now,
+                    actor,
+                    &type_def.approvers,
+                )
+            } else {
+                Default::default()
+            },
             agent_action,
             admission_tenant: tenant.as_ref().to_string(),
             resource_tenant: request.resource_tenant.clone(),
@@ -524,6 +535,12 @@ impl<'a> ActionInstanceAdmission<'a> {
         require_value("instance_id", request.instance_id.trim())?;
         let access_denied =
             || ActionInstanceAdmissionError::PermissionDenied(DECISION_ACCESS_DENIED.into());
+        let loaded = self
+            .db
+            .get_action_instance(request.instance_id.trim())
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .ok_or_else(access_denied)?;
+        let _ = self.escalate_due(&loaded.namespace, now)?;
         let instance = self
             .db
             .get_action_instance(request.instance_id.trim())
@@ -551,6 +568,29 @@ impl<'a> ActionInstanceAdmission<'a> {
         if is_submitter || !entitled {
             return Err(access_denied());
         }
+        if !crate::sekai::review_queue::reviewer_may_decide(
+            &type_def.review_queue,
+            &instance.review,
+            decider,
+        ) {
+            return Err(access_denied());
+        }
+        let latest = self
+            .db
+            .get_action_instance(&instance.instance_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .ok_or_else(access_denied)?;
+        if latest.review.assignee != instance.review.assignee
+            || latest.review.queue_id != instance.review.queue_id
+        {
+            return Err(access_denied());
+        }
+        let mut instance = instance;
+        instance.review = crate::sekai::review_queue::mark_decision(
+            &type_def.review_queue,
+            &instance.review,
+            decider,
+        );
 
         if instance.status != STATUS_PARKED {
             // A repeated decision replays and finishes any post-write
@@ -900,6 +940,94 @@ impl<'a> ActionInstanceAdmission<'a> {
         })
     }
 
+    /// Applies due review-queue SLA actions: reassign or auto-deny (#1455).
+    pub(crate) fn escalate_due(
+        &self,
+        namespace: &str,
+        now: i64,
+    ) -> Result<(usize, usize), ActionInstanceAdmissionError> {
+        let mut reassigned = 0;
+        let mut denied = 0;
+        loop {
+            let mut progressed = false;
+            let mut offset = 0;
+            loop {
+                let parked = self
+                    .db
+                    .list_action_instances_page(namespace, None, Some(STATUS_PARKED), 100, offset)
+                    .map_err(ActionInstanceAdmissionError::Internal)?;
+                let exhausted = parked.len() < 100;
+                offset += parked.len();
+                for instance in parked {
+                    let Some(type_def) = self
+                        .db
+                        .get_governed_action_type(
+                            &instance.namespace,
+                            &instance.type_id,
+                            &instance.version,
+                        )
+                        .map_err(ActionInstanceAdmissionError::Internal)?
+                    else {
+                        continue;
+                    };
+                    match crate::sekai::review_queue::escalate(
+                        &type_def.review_queue,
+                        &instance.review,
+                        now,
+                    ) {
+                        crate::sekai::review_queue::Escalation::None => {}
+                        crate::sekai::review_queue::Escalation::Reassign { assignee } => {
+                            if assignee == instance.principal {
+                                let mut next = instance;
+                                next.review.escalated = true;
+                                let approval = ApprovalRecord {
+                                    decider: "review.queue",
+                                    decision: DECISION_DENY,
+                                    reason: "sla",
+                                };
+                                self.finish_denied(next, "review_sla_expired", &approval, now)?;
+                                denied += 1;
+                                progressed = true;
+                                continue;
+                            }
+                            let expected_assignee = instance.review.assignee.clone();
+                            let mut next = instance;
+                            next.review =
+                                crate::sekai::review_queue::apply_reassign(&next.review, &assignee);
+                            if self
+                                .db
+                                .update_parked_action_instance(&next, &expected_assignee)
+                                .map_err(ActionInstanceAdmissionError::Internal)?
+                            {
+                                reassigned += 1;
+                                progressed = true;
+                            }
+                        }
+                        crate::sekai::review_queue::Escalation::AutoDeny => {
+                            let mut next = instance;
+                            next.review.escalated = true;
+                            let approval = ApprovalRecord {
+                                decider: "review.queue",
+                                decision: DECISION_DENY,
+                                reason: "sla",
+                            };
+                            self.finish_denied(next, "review_sla_expired", &approval, now)?;
+                            denied += 1;
+                            progressed = true;
+                        }
+                    }
+                }
+                if exhausted {
+                    break;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok((reassigned, denied))
+    }
+
     fn replay_decided(
         &self,
         instance_id: &str,
@@ -1081,6 +1209,12 @@ impl<'a> ActionInstanceAdmission<'a> {
             ]);
             if !approval.reason.trim().is_empty() {
                 attributes.insert("reason".into(), approval.reason.trim().to_string());
+            }
+            if !stored.review.queue_id.is_empty() {
+                attributes.insert("queue_id".into(), stored.review.queue_id.clone());
+            }
+            if stored.review.agent_decision {
+                attributes.insert("agent_decision".into(), "true".into());
             }
             let mut decided = event(
                 "approval",
@@ -2929,6 +3063,135 @@ mod tests {
     }
 
     #[test]
+    fn review_queue_routes_over_threshold_and_refuses_outsiders() {
+        let db = setup();
+        ensure_record_kind(&db);
+        let mut type_def = record_type("create");
+        type_def.approvers = vec!["bob".into(), "carol".into()];
+        type_def.review_queue = crate::sekai::review_queue::ReviewQueueSpec {
+            queue_id: "spend".into(),
+            sla_ms: 1_000,
+            escalate: crate::sekai::review_queue::ESCALATE_AUTO_DENY.into(),
+            threshold_param: String::new(),
+            threshold: 0,
+            pool: vec!["bob".into()],
+            agent_reviewers: vec![],
+            escalate_to: String::new(),
+        };
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let parked = admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-q"}"#),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        assert_eq!(parked.review.queue_id, "spend");
+        assert_eq!(parked.review.assignee, "bob");
+        let denied = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "carol"),
+                "carol",
+                20,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            denied,
+            ActionInstanceAdmissionError::PermissionDenied(_)
+        ));
+        let granted = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(granted.status, STATUS_ADMITTED);
+        let receipt = db
+            .get_operation_receipt(&granted.operation_id)
+            .unwrap()
+            .unwrap();
+        let approval = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::ApprovalDecided)
+            .expect("approval receipt");
+        assert_eq!(
+            approval.attributes.get("queue_id").map(String::as_str),
+            Some("spend")
+        );
+        assert_eq!(
+            approval.attributes.get("approver").map(String::as_str),
+            Some("bob")
+        );
+        assert_eq!(
+            approval.attributes.get("reason").map(String::as_str),
+            Some("reviewed")
+        );
+    }
+
+    #[test]
+    fn review_queue_auto_denies_past_sla() {
+        let db = setup();
+        ensure_record_kind(&db);
+        let mut type_def = record_type("create");
+        type_def.approvers = vec!["bob".into()];
+        type_def.review_queue = crate::sekai::review_queue::ReviewQueueSpec {
+            queue_id: "spend".into(),
+            sla_ms: 5,
+            escalate: crate::sekai::review_queue::ESCALATE_AUTO_DENY.into(),
+            threshold_param: String::new(),
+            threshold: 0,
+            pool: vec!["bob".into()],
+            agent_reviewers: vec![],
+            escalate_to: String::new(),
+        };
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let parked = admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-sla"}"#),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        let (reassigned, denied) = admission.escalate_due("acme", 16).unwrap();
+        assert_eq!(reassigned, 0);
+        assert_eq!(denied, 1);
+        let stored = db
+            .get_action_instance(&parked.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, STATUS_DENIED);
+        assert_eq!(stored.deny_reason, "review_sla_expired");
+        let late = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            late,
+            ActionInstanceAdmissionError::FailedPrecondition(_)
+                | ActionInstanceAdmissionError::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
     fn require_approval_parks_and_an_approver_grant_resumes_the_same_instance() {
         let db = approval_setup("create", &["bob"]);
         let admission = ActionInstanceAdmission::new(&db, None);
@@ -3527,6 +3790,7 @@ mod tests {
             parked_object_digest: String::new(),
             decided_by: String::new(),
             approval_decision: String::new(),
+            review: Default::default(),
             instance_id: "gai-incomplete".into(),
             namespace: "acme".into(),
             type_id: "customer.record.create".into(),

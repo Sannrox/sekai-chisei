@@ -1537,6 +1537,16 @@ message GovernedActionType {
   // Principals who may grant or deny a parked instance. Empty means namespace
   // administrators. A submitter never decides their own instance (#1084).
   repeated string approvers = 19;
+  // Review queue for parked instances (#1455). Empty queue_id means no queue.
+  string review_queue_id = 20;
+  int64 review_sla_ms = 21;
+  // auto_deny | reassign | empty
+  string review_escalate = 22;
+  string review_escalate_to = 23;
+  string review_threshold_param = 24;
+  int64 review_threshold = 25;
+  repeated string review_pool = 26;
+  repeated string review_agent_reviewers = 27;
 }
 message PutGovernedActionTypeRequest { GovernedActionType type = 1; string request_id = 2; }
 message PutGovernedActionTypeResponse { GovernedActionType type = 1; }
@@ -1583,6 +1593,12 @@ message ActionInstance {
   // Approver who decided a parked instance, and their decision (grant | deny).
   string decided_by = 18;
   string approval_decision = 19;
+  // Review-queue placement when the type routed this park (#1455).
+  string review_queue_id = 20;
+  string review_assignee = 21;
+  int64 review_sla_deadline_ms = 22;
+  bool review_escalated = 23;
+  bool agent_decision = 24;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;
