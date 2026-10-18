@@ -61,6 +61,19 @@ pub struct ActionInstance {
     /// require it to still be live.
     #[serde(default)]
     pub autonomous_envelope_id: String,
+    /// Admission classified the submitter as an agent Action. Persisted so
+    /// parked grant and in-flight ack keep that classification after the
+    /// submitting credential is gone.
+    #[serde(default)]
+    pub agent_action: bool,
+    /// Tenant used at admission for freeze matching. Empty when the submit
+    /// had no tenant context and no registered owning tenant.
+    #[serde(default)]
+    pub admission_tenant: String,
+    /// Shared-space owner tenant at admission, when it differed from the
+    /// acting tenant. Parked grant and ack keep checking it.
+    #[serde(default)]
+    pub resource_tenant: String,
 }
 
 impl ActionInstance {
@@ -634,6 +647,9 @@ mod tests {
             parked_object_digest: String::new(),
             decided_by: String::new(),
             approval_decision: String::new(),
+            agent_action: false,
+            admission_tenant: String::new(),
+            resource_tenant: String::new(),
             instance_id: "ai-1".into(),
             namespace: "acme".into(),
             type_id: "review.intake".into(),

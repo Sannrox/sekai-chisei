@@ -343,6 +343,7 @@ impl SekaiDb {
     fn migrate_sekai_families(&self) -> Result<(), String> {
         self.migrate()?;
         self.migrate_grants()?;
+        self.migrate_write_freeze()?;
         self.migrate_principal_credentials()?;
         self.migrate_audit()?;
         self.migrate_object_sync()?;

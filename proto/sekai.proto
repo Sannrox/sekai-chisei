@@ -221,6 +221,16 @@ message Grant {
   string exception_reason = 8;
 }
 
+// Control-plane write freeze (#1458). scope_kind is namespace, tenant, principal, or action.
+message WriteFreeze {
+  string scope_kind = 1;
+  string scope_value = 2;
+  string mode = 3;
+  string reason = 4;
+  bool enabled = 5;
+  int64 updated_ms = 6;
+}
+
 message Decision {
   string id = 1;
   int64 timestamp = 2;
@@ -1440,6 +1450,10 @@ message ListGrantsRequest { string object_id = 1; }
 message ListGrantsResponse { repeated Grant grants = 1; }
 message CheckAccessRequest { string object_id = 1; repeated string principals = 2; }
 message CheckAccessResponse { bool allowed = 1; }
+message SetWriteFreezeRequest { WriteFreeze freeze = 1; }
+message SetWriteFreezeResponse { WriteFreeze freeze = 1; }
+message ListWriteFreezesRequest {}
+message ListWriteFreezesResponse { repeated WriteFreeze freezes = 1; }
 message EnsureTeamNamespaceRequest {
   string namespace = 1;
   string principal = 2;
@@ -3097,6 +3111,8 @@ service SekaiService {
   rpc DeleteGrant(DeleteGrantRequest) returns (DeleteGrantResponse);
   rpc ListGrants(ListGrantsRequest) returns (ListGrantsResponse);
   rpc CheckAccess(CheckAccessRequest) returns (CheckAccessResponse);
+  rpc SetWriteFreeze(SetWriteFreezeRequest) returns (SetWriteFreezeResponse);
+  rpc ListWriteFreezes(ListWriteFreezesRequest) returns (ListWriteFreezesResponse);
   rpc EnsureTeamNamespace(EnsureTeamNamespaceRequest) returns (EnsureTeamNamespaceResponse);
 
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);

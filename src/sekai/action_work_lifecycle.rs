@@ -170,6 +170,95 @@ impl<'a> ActionWorkLifecycle<'a> {
         now_ms: i64,
     ) -> Result<AckedActionWork, ActionWorkLifecycleError> {
         let artifact = parse_ack_artifact(command.artifact_json)?;
+        if let Some(stored) = self
+            .db
+            .get_action_effect(command.effect_id)
+            .map_err(ActionWorkLifecycleError::Internal)?
+            && stored.status != EFFECT_STATUS_COMPLETED
+            && stored.status != EFFECT_STATUS_FAILED
+        {
+            let instance = self
+                .db
+                .get_action_instance(&stored.instance_id)
+                .map_err(ActionWorkLifecycleError::Internal)?;
+            let action_type = instance
+                .as_ref()
+                .map(|instance| instance.type_id.as_str())
+                .unwrap_or("");
+            let origin = instance
+                .as_ref()
+                .map(|instance| instance.principal.as_str())
+                .unwrap_or("");
+            let delegating = instance
+                .as_ref()
+                .and_then(|instance| instance.delegating_actor.as_deref());
+            let stored_agent = instance
+                .as_ref()
+                .is_some_and(|instance| instance.agent_action);
+            let actor_agent =
+                crate::sekai::write_freeze::actor_is_agent(self.db, actor, None, false)
+                    .map_err(ActionWorkLifecycleError::Internal)?;
+            let origin_agent = stored_agent
+                || crate::sekai::write_freeze::actor_is_agent(self.db, origin, delegating, false)
+                    .map_err(ActionWorkLifecycleError::Internal)?;
+            let actor_tenant =
+                crate::sekai::write_freeze::acting_or_registered_tenant(self.db, "", actor)
+                    .map_err(ActionWorkLifecycleError::Internal)?;
+            let origin_tenant =
+                crate::sekai::write_freeze::acting_or_registered_tenant(self.db, "", origin)
+                    .map_err(ActionWorkLifecycleError::Internal)?;
+            let mut checks = crate::sekai::write_freeze::write_checks_for_actors(
+                &stored.namespace,
+                actor_tenant.as_ref(),
+                actor,
+                None,
+                action_type,
+                actor_agent,
+            );
+            checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                &stored.namespace,
+                origin_tenant.as_ref(),
+                origin,
+                delegating,
+                action_type,
+                origin_agent,
+            ));
+            let stored_tenant = instance
+                .as_ref()
+                .map(|instance| instance.admission_tenant.as_str())
+                .unwrap_or("");
+            if !stored_tenant.is_empty() {
+                checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                    &stored.namespace,
+                    stored_tenant,
+                    origin,
+                    delegating,
+                    action_type,
+                    origin_agent,
+                ));
+            }
+            let resource_tenant = instance
+                .as_ref()
+                .map(|instance| instance.resource_tenant.as_str())
+                .unwrap_or("");
+            if !resource_tenant.is_empty() && resource_tenant != stored_tenant {
+                checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                    &stored.namespace,
+                    resource_tenant,
+                    origin,
+                    delegating,
+                    action_type,
+                    origin_agent,
+                ));
+            }
+            match crate::sekai::write_freeze::freeze_reason_any(self.db, &checks) {
+                Ok(Some(reason)) => {
+                    return Err(ActionWorkLifecycleError::FailedPrecondition(reason));
+                }
+                Ok(None) => {}
+                Err(error) => return Err(ActionWorkLifecycleError::Internal(error)),
+            }
+        }
         if command.outcome == ACK_OUTCOME_PARKED {
             if artifact.is_some() {
                 return Err(ActionWorkLifecycleError::InvalidArgument(
@@ -957,6 +1046,9 @@ mod tests {
             decided_by: String::new(),
             approval_decision: String::new(),
             autonomous_envelope_id: String::new(),
+            agent_action: false,
+            admission_tenant: String::new(),
+            resource_tenant: String::new(),
         })
         .unwrap();
     }
@@ -1004,6 +1096,436 @@ mod tests {
         assert_eq!(claimed.effect.status, "claimed");
         assert!(claimed.continuation.is_none());
         assert!(claimed.park.is_none());
+    }
+
+    #[test]
+    fn freeze_blocks_in_flight_agent_ack() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect(&db);
+        let claimed = ActionWorkLifecycle::new(&db)
+            .claim(
+                ClaimActionWork {
+                    effect_id: &effect.effect_id,
+                    runtime_id: "shikigami",
+                    request_id: "claim-freeze",
+                    ttl_ms: 60_000,
+                },
+                "operator",
+                100,
+            )
+            .unwrap();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "acme".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_AGENT_ACTIONS.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let ack = AckActionWork {
+            effect_id: &effect.effect_id,
+            runtime_id: "shikigami",
+            claim_generation: claimed.effect.claim_generation,
+            fencing_token: &claimed.effect.claim_fencing_token,
+            outcome: ACK_OUTCOME_COMPLETED,
+            reason: "done",
+            request_id: "",
+            checkpoint_store_id: "",
+            checkpoint_ref: "",
+            checkpoint_digest: "",
+            artifact_json: "",
+        };
+        let blocked = ActionWorkLifecycle::new(&db)
+            .ack(ack.clone(), "agent:bot", 200)
+            .unwrap_err();
+        match blocked {
+            ActionWorkLifecycleError::FailedPrecondition(reason) => {
+                assert!(reason.contains("write freeze"));
+            }
+            other => panic!("expected freeze, got {other:?}"),
+        }
+        ActionWorkLifecycle::new(&db)
+            .ack(ack.clone(), "operator", 200)
+            .unwrap();
+        ActionWorkLifecycle::new(&db)
+            .ack(ack, "agent:bot", 300)
+            .unwrap();
+    }
+
+    #[test]
+    fn freeze_blocks_persisted_agent_ack() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect_row(&db);
+        db.put_action_instance(&ActionInstance {
+            instance_id: effect.instance_id.clone(),
+            namespace: effect.namespace.clone(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            principal: "runtime".into(),
+            delegating_actor: None,
+            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+            request_digest: "digest-1".into(),
+            idempotency_key: format!("idem-{}", effect.effect_id),
+            operation_id: effect.operation_id.clone(),
+            status: STATUS_ADMITTED.into(),
+            deny_reason: String::new(),
+            evidence_submission_ids: Vec::new(),
+            policy_decision: "allow".into(),
+            budget_decision: "allow".into(),
+            created_at_ms: 10,
+            decided_at_ms: 10,
+            system_one_fill_json: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
+            autonomous_envelope_id: String::new(),
+            agent_action: true,
+            admission_tenant: String::new(),
+            resource_tenant: String::new(),
+        })
+        .unwrap();
+        let claimed = ActionWorkLifecycle::new(&db)
+            .claim(
+                ClaimActionWork {
+                    effect_id: &effect.effect_id,
+                    runtime_id: "shikigami",
+                    request_id: "claim-persisted-agent",
+                    ttl_ms: 60_000,
+                },
+                "operator",
+                100,
+            )
+            .unwrap();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "acme".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_AGENT_ACTIONS.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionWorkLifecycle::new(&db)
+            .ack(
+                AckActionWork {
+                    effect_id: &effect.effect_id,
+                    runtime_id: "shikigami",
+                    claim_generation: claimed.effect.claim_generation,
+                    fencing_token: &claimed.effect.claim_fencing_token,
+                    outcome: ACK_OUTCOME_COMPLETED,
+                    reason: "done",
+                    request_id: "",
+                    checkpoint_store_id: "",
+                    checkpoint_ref: "",
+                    checkpoint_digest: "",
+                    artifact_json: "",
+                },
+                "operator",
+                200,
+            )
+            .unwrap_err();
+        match blocked {
+            ActionWorkLifecycleError::FailedPrecondition(reason) => {
+                assert!(reason.contains("write freeze"));
+            }
+            other => panic!("expected freeze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn principal_agent_freeze_on_human_origin_does_not_block_machine_ack() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect_row(&db);
+        db.put_action_instance(&ActionInstance {
+            instance_id: effect.instance_id.clone(),
+            namespace: effect.namespace.clone(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            principal: "alice".into(),
+            delegating_actor: None,
+            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+            request_digest: "digest-1".into(),
+            idempotency_key: format!("idem-{}", effect.effect_id),
+            operation_id: effect.operation_id.clone(),
+            status: STATUS_ADMITTED.into(),
+            deny_reason: String::new(),
+            evidence_submission_ids: Vec::new(),
+            policy_decision: "allow".into(),
+            budget_decision: "allow".into(),
+            created_at_ms: 10,
+            decided_at_ms: 10,
+            system_one_fill_json: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
+            autonomous_envelope_id: String::new(),
+            agent_action: false,
+            admission_tenant: String::new(),
+            resource_tenant: String::new(),
+        })
+        .unwrap();
+        let claimed = claim_effect(&db, &effect);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_PRINCIPAL.into(),
+            scope_value: "alice".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_AGENT_ACTIONS.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let result = ActionWorkLifecycle::new(&db).ack(
+            ack_completed(&effect.effect_id, &claimed, ""),
+            "agent:bot",
+            200,
+        );
+        if let Err(ActionWorkLifecycleError::FailedPrecondition(reason)) = result {
+            assert!(
+                !reason.contains("write freeze"),
+                "machine ack must not inherit the human origin's agent freeze: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn freeze_blocks_origin_principal_ack() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect(&db);
+        let claimed = ActionWorkLifecycle::new(&db)
+            .claim(
+                ClaimActionWork {
+                    effect_id: &effect.effect_id,
+                    runtime_id: "shikigami",
+                    request_id: "claim-origin-freeze",
+                    ttl_ms: 60_000,
+                },
+                "operator",
+                100,
+            )
+            .unwrap();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_PRINCIPAL.into(),
+            scope_value: "runtime".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionWorkLifecycle::new(&db)
+            .ack(
+                AckActionWork {
+                    effect_id: &effect.effect_id,
+                    runtime_id: "shikigami",
+                    claim_generation: claimed.effect.claim_generation,
+                    fencing_token: &claimed.effect.claim_fencing_token,
+                    outcome: ACK_OUTCOME_COMPLETED,
+                    reason: "done",
+                    request_id: "",
+                    checkpoint_store_id: "",
+                    checkpoint_ref: "",
+                    checkpoint_digest: "",
+                    artifact_json: "",
+                },
+                "operator",
+                200,
+            )
+            .unwrap_err();
+        match blocked {
+            ActionWorkLifecycleError::FailedPrecondition(reason) => {
+                assert!(reason.contains("write freeze"));
+            }
+            other => panic!("expected freeze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeze_blocks_delegating_principal_ack() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_PRINCIPAL.into(),
+            scope_value: DELEGATOR.into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionWorkLifecycle::new(&db)
+            .ack(
+                ack_completed(&effect.effect_id, &claimed, ""),
+                "operator",
+                200,
+            )
+            .unwrap_err();
+        match blocked {
+            ActionWorkLifecycleError::FailedPrecondition(reason) => {
+                assert!(reason.contains("write freeze"));
+                assert!(reason.contains("principal/origin-user"));
+            }
+            other => panic!("expected freeze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeze_blocks_persisted_resource_tenant_ack() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect_row(&db);
+        db.put_action_instance(&ActionInstance {
+            instance_id: effect.instance_id.clone(),
+            namespace: effect.namespace.clone(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            principal: "runtime".into(),
+            delegating_actor: None,
+            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+            request_digest: "digest-1".into(),
+            idempotency_key: format!("idem-{}", effect.effect_id),
+            operation_id: effect.operation_id.clone(),
+            status: STATUS_ADMITTED.into(),
+            deny_reason: String::new(),
+            evidence_submission_ids: Vec::new(),
+            policy_decision: "allow".into(),
+            budget_decision: "allow".into(),
+            created_at_ms: 10,
+            decided_at_ms: 10,
+            system_one_fill_json: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
+            autonomous_envelope_id: String::new(),
+            agent_action: false,
+            admission_tenant: String::new(),
+            resource_tenant: "tenant-test".into(),
+        })
+        .unwrap();
+        let claimed = claim_effect(&db, &effect);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+            scope_value: "tenant-test".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionWorkLifecycle::new(&db)
+            .ack(
+                ack_completed(&effect.effect_id, &claimed, ""),
+                "operator",
+                200,
+            )
+            .unwrap_err();
+        match blocked {
+            ActionWorkLifecycleError::FailedPrecondition(reason) => {
+                assert!(reason.contains("write freeze"));
+                assert!(reason.contains("tenant/tenant-test"));
+            }
+            other => panic!("expected freeze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeze_blocks_persisted_admission_tenant_ack() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect_row(&db);
+        db.put_action_instance(&ActionInstance {
+            instance_id: effect.instance_id.clone(),
+            namespace: effect.namespace.clone(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            principal: "runtime".into(),
+            delegating_actor: None,
+            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+            request_digest: "digest-1".into(),
+            idempotency_key: format!("idem-{}", effect.effect_id),
+            operation_id: effect.operation_id.clone(),
+            status: STATUS_ADMITTED.into(),
+            deny_reason: String::new(),
+            evidence_submission_ids: Vec::new(),
+            policy_decision: "allow".into(),
+            budget_decision: "allow".into(),
+            created_at_ms: 10,
+            decided_at_ms: 10,
+            system_one_fill_json: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
+            autonomous_envelope_id: String::new(),
+            agent_action: false,
+            admission_tenant: "acme-tenant".into(),
+            resource_tenant: String::new(),
+        })
+        .unwrap();
+        let claimed = claim_effect(&db, &effect);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+            scope_value: "acme-tenant".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionWorkLifecycle::new(&db)
+            .ack(
+                ack_completed(&effect.effect_id, &claimed, ""),
+                "operator",
+                200,
+            )
+            .unwrap_err();
+        match blocked {
+            ActionWorkLifecycleError::FailedPrecondition(reason) => {
+                assert!(reason.contains("write freeze"));
+                assert!(reason.contains("tenant/acme-tenant"));
+            }
+            other => panic!("expected freeze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeze_blocks_registered_tenant_ack() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect_row(&db);
+        seed_admitted_instance(&db, &effect, None);
+        db.put_service_principal(
+            &crate::sekai::service_principal::ServicePrincipalRegistration {
+                principal: "runtime".into(),
+                tenant_id: "acme-tenant".into(),
+                namespaces: vec!["acme".into()],
+                action_types: vec!["dispatch".into()],
+                registered_by: "local".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+        let claimed = claim_effect(&db, &effect);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+            scope_value: "acme-tenant".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionWorkLifecycle::new(&db)
+            .ack(
+                ack_completed(&effect.effect_id, &claimed, ""),
+                "operator",
+                200,
+            )
+            .unwrap_err();
+        match blocked {
+            ActionWorkLifecycleError::FailedPrecondition(reason) => {
+                assert!(reason.contains("write freeze"));
+                assert!(reason.contains("tenant/acme-tenant"));
+            }
+            other => panic!("expected freeze, got {other:?}"),
+        }
     }
 
     #[test]

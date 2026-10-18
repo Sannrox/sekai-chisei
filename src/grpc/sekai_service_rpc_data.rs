@@ -965,6 +965,75 @@ pub(super) async fn check_access(
         allowed: service.security.can_access(&inner.object_id, &refs),
     }))
 }
+pub(super) async fn set_write_freeze(
+    service: &SekaiServiceImpl,
+    req: Request<SetWriteFreezeRequest>,
+) -> Result<Response<SetWriteFreezeResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let actor = principals.first().map(String::as_str).unwrap_or_default();
+    let proto = req
+        .into_inner()
+        .freeze
+        .ok_or_else(|| Status::invalid_argument("freeze required"))?;
+    let mut freeze = from_proto_write_freeze(proto);
+    if freeze.updated_ms <= 0 {
+        freeze.updated_ms = now_millis();
+    }
+    freeze.validate().map_err(Status::invalid_argument)?;
+    let runtime = service.db.runtime();
+    let mut evidence = HashMap::new();
+    evidence.insert("scope_kind".into(), freeze.scope_kind.clone());
+    evidence.insert("scope_value".into(), freeze.scope_value.clone());
+    evidence.insert("mode".into(), freeze.mode.clone());
+    evidence.insert("enabled".into(), freeze.enabled.to_string());
+    runtime
+        .set_write_freeze_with_decision(
+            &freeze,
+            &audit::Decision {
+                id: format!(
+                    "write_freeze:{}:{}:{}",
+                    freeze.scope_kind,
+                    freeze.scope_value,
+                    uuid::Uuid::new_v4().simple()
+                ),
+                timestamp: freeze.updated_ms,
+                actor: actor.into(),
+                action: "write_freeze".into(),
+                reason: freeze.reason.clone(),
+                evidence,
+                target_id: String::new(),
+                outcome: if freeze.enabled {
+                    "enabled".into()
+                } else {
+                    "disabled".into()
+                },
+            },
+        )
+        .map_err(Status::internal)?;
+    Ok(Response::new(SetWriteFreezeResponse {
+        freeze: Some(to_proto_write_freeze(&freeze)),
+    }))
+}
+pub(super) async fn list_write_freezes(
+    service: &SekaiServiceImpl,
+    req: Request<ListWriteFreezesRequest>,
+) -> Result<Response<ListWriteFreezesResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let _ = req.into_inner();
+    let freezes = service
+        .db
+        .runtime()
+        .list_write_freezes()
+        .map_err(Status::internal)?
+        .iter()
+        .map(to_proto_write_freeze)
+        .collect();
+    Ok(Response::new(ListWriteFreezesResponse { freezes }))
+}
 pub(super) async fn ensure_team_namespace(
     service: &SekaiServiceImpl,
     req: Request<EnsureTeamNamespaceRequest>,

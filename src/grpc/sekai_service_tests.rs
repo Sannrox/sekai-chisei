@@ -16463,6 +16463,9 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         decided_by: String::new(),
         approval_decision: String::new(),
         autonomous_envelope_id: String::new(),
+        agent_action: false,
+        admission_tenant: String::new(),
+        resource_tenant: String::new(),
     }
 }
 
@@ -23196,5 +23199,442 @@ async fn agent_dry_run_refuses_allowed_actions_that_fail_the_type_schema() {
     assert_eq!(
         response.actions[0].reason,
         crate::sekai::agent_dry_run::REFUSAL_INVALID_PARAMETERS
+    );
+}
+
+#[tokio::test]
+async fn write_freeze_refuses_in_scope_writes_and_records_receipts() {
+    let svc = service();
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: "ops".into(),
+                mode: "block_writes".into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let listed = svc
+        .list_write_freezes(with_named_principal(ListWriteFreezesRequest {}, "local"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.freezes.len(), 1);
+    assert!(listed.freezes[0].enabled);
+
+    let mut frozen = widget_object(
+        "frozen-widget",
+        HashMap::from([("name".into(), "frozen".into())]),
+    );
+    frozen.namespace = "ops".into();
+    let refused = svc
+        .create_object(with_principal(CreateObjectRequest {
+            object: Some(frozen),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (namespace/ops/block_writes)")
+    );
+
+    let mut outside = widget_object(
+        "live-widget",
+        HashMap::from([("name".into(), "live".into())]),
+    );
+    outside.namespace = "other".into();
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(outside),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: "ops".into(),
+                mode: "block_writes".into(),
+                reason: "lifted".into(),
+                enabled: false,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let mut thawed = widget_object(
+        "thawed-widget",
+        HashMap::from([("name".into(), "thawed".into())]),
+    );
+    thawed.namespace = "ops".into();
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(thawed),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+
+    let receipts = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("write_freeze".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    let outcomes: Vec<&str> = receipts
+        .iter()
+        .map(|decision| decision.outcome.as_str())
+        .collect();
+    assert!(outcomes.contains(&"enabled"), "{outcomes:?}");
+    assert!(outcomes.contains(&"disabled"), "{outcomes:?}");
+}
+
+#[tokio::test]
+async fn write_freeze_refuses_source_batch_in_scope() {
+    let svc = service();
+    let namespace = "sync-frozen";
+    let producer = "connector/github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: namespace.into(),
+                mode: "block_writes".into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let refused = svc
+        .apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest {
+                batch: Some(source_batch(
+                    namespace,
+                    producer,
+                    "",
+                    "cursor:1",
+                    "batch-frozen",
+                )),
+            },
+            producer,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (namespace/sync-frozen/block_writes)")
+    );
+
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: namespace.into(),
+                mode: "block_writes".into(),
+                reason: "lifted".into(),
+                enabled: false,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let admitted = svc
+        .apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest {
+                batch: Some(source_batch(
+                    namespace,
+                    producer,
+                    "",
+                    "cursor:1",
+                    "batch-frozen",
+                )),
+            },
+            producer,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .unwrap();
+    assert_eq!(admitted.transaction.as_ref().unwrap().status, "COMMITTED");
+}
+
+#[tokio::test]
+async fn write_freeze_blocks_source_batch_when_registered_tenant_is_frozen() {
+    let svc = service();
+    let namespace = "sync-tenant-frozen";
+    let producer = "github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    svc.db
+        .runtime()
+        .put_service_principal(
+            &crate::sekai::service_principal::ServicePrincipalRegistration {
+                principal: producer.into(),
+                tenant_id: "acme-tenant".into(),
+                namespaces: vec![namespace.into()],
+                action_types: vec!["dispatch".into()],
+                registered_by: "local".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "tenant".into(),
+                scope_value: "acme-tenant".into(),
+                mode: "block_writes".into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let refused = svc
+        .apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest {
+                batch: Some(source_batch(
+                    namespace,
+                    producer,
+                    "",
+                    "cursor:1",
+                    "batch-tenant-frozen",
+                )),
+            },
+            producer,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (tenant/acme-tenant/block_writes)")
+    );
+}
+
+#[tokio::test]
+async fn write_freeze_blocks_machine_action_submit() {
+    let svc = service();
+    grant_action_admin(&svc);
+    svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
+            namespace: "acme".into(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            description: "dispatch work".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["runtime_dispatch".into()],
+            policy_scope: String::new(),
+            budget_scope: String::new(),
+            enabled: true,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+            object_kind: String::new(),
+            object_mutation: String::new(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
+            system_one_json: String::new(),
+        }),
+        request_id: "put-freeze-dispatch".into(),
+    }))
+    .await
+    .unwrap();
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: "acme".into(),
+                mode: "block_agent_actions".into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    svc.submit_action_instance(with_principal(SubmitActionInstanceRequest {
+        namespace: "acme".into(),
+        type_id: "dispatch".into(),
+        version: "1".into(),
+        parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+        idempotency_key: "freeze-human".into(),
+        evidence_submission_ids: Vec::new(),
+        request_id: "req-freeze-human".into(),
+        ontology_digest: String::new(),
+    }))
+    .await
+    .unwrap();
+
+    let mut machine = with_named_principal(
+        SubmitActionInstanceRequest {
+            namespace: "acme".into(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+            idempotency_key: "freeze-machine".into(),
+            evidence_submission_ids: Vec::new(),
+            request_id: "req-freeze-machine".into(),
+            ontology_digest: String::new(),
+        },
+        "tester",
+    );
+    machine
+        .extensions_mut()
+        .insert(crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "tester".into(),
+                credential_id: "community-credential".into(),
+            },
+        ));
+    let refused = svc.submit_action_instance(machine).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (namespace/acme/block_agent_actions)")
+    );
+}
+
+#[test]
+fn write_freeze_blocks_shared_space_write_when_owner_tenant_is_frozen() {
+    let extension = Arc::new(SharedSpaceExtension::granting());
+    let db = RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension)).unwrap(),
+    ));
+    db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+        scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+        scope_value: "tenant-test".into(),
+        mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+        reason: "incident".into(),
+        enabled: true,
+        updated_ms: 1,
+    })
+    .unwrap();
+    let object = domain::Object {
+        id: "w-owner-freeze".into(),
+        kind: "widget".into(),
+        name: "w-owner-freeze".into(),
+        namespace: "ops".into(),
+        external_id: String::new(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "internal".into(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    let member = crate::enterprise::AuthenticatedContext {
+        space_role: Some(crate::enterprise::SpaceRole::Editor),
+        ..shared_space_member()
+    };
+    let refused = enforce_object_operation_access(
+        &db,
+        &object,
+        &["subject-a".into()],
+        Some(&member),
+        crate::sekai::object_security::ObjectSecurityOperation::Update,
+        "op-owner-freeze",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (tenant/tenant-test/block_writes)")
+    );
+}
+
+#[test]
+fn write_freeze_blocks_object_write_when_registered_tenant_is_frozen() {
+    let db = RuntimeDb::memory();
+    db.put_service_principal(
+        &crate::sekai::service_principal::ServicePrincipalRegistration {
+            principal: "worker-a".into(),
+            tenant_id: "acme-tenant".into(),
+            namespaces: vec!["ops".into()],
+            action_types: vec!["dispatch".into()],
+            registered_by: "local".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+    )
+    .unwrap();
+    db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+        scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+        scope_value: "acme-tenant".into(),
+        mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+        reason: "incident".into(),
+        enabled: true,
+        updated_ms: 1,
+    })
+    .unwrap();
+    let object = domain::Object {
+        id: "w-registered-tenant-freeze".into(),
+        kind: "widget".into(),
+        name: "w-registered-tenant-freeze".into(),
+        namespace: "ops".into(),
+        external_id: String::new(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "internal".into(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    let refused = enforce_object_operation_access(
+        &db,
+        &object,
+        &["worker-a".into()],
+        None,
+        crate::sekai::object_security::ObjectSecurityOperation::Update,
+        "op-registered-tenant-freeze",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (tenant/acme-tenant/block_writes)")
     );
 }

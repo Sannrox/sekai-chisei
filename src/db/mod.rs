@@ -123,6 +123,7 @@ mod postgres_source_registry;
 mod postgres_team_namespace;
 mod postgres_usage_ledger;
 mod postgres_workflow_action;
+mod postgres_write_freeze;
 pub(crate) mod schema_plane;
 pub use schema_plane::SchemaPlane;
 pub mod replica_conformance;

@@ -54,6 +54,9 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     pub policy_context: PrincipalPolicyContext,
     pub delegating_actor: Option<String>,
     pub budget_already_reserved: bool,
+    /// Shared-space owner tenant for freeze matching. Empty when the write
+    /// is not through a named space.
+    pub resource_tenant: String,
 }
 
 /// Grant or deny of a parked instance (#1084). The transport adapter
@@ -66,6 +69,7 @@ pub(crate) struct ActionInstanceDecisionRequest {
     pub reason: String,
     pub decider_principals: Vec<String>,
     pub decider_is_namespace_admin: bool,
+    pub delegating_actor: Option<String>,
 }
 
 /// One bounded answer for every refused or unknown decision target, so a
@@ -98,6 +102,8 @@ pub(crate) struct ActionInstanceAdmission<'a> {
     db: &'a RuntimeDb,
     budget: Option<&'a dyn ActionBudgetPort>,
     proposal: Option<&'a dyn ActionProposalPort>,
+    tenant: &'a str,
+    machine_credential: bool,
 }
 
 impl<'a> ActionInstanceAdmission<'a> {
@@ -106,11 +112,23 @@ impl<'a> ActionInstanceAdmission<'a> {
             db,
             budget,
             proposal: None,
+            tenant: "",
+            machine_credential: false,
         }
     }
 
     pub(crate) fn with_proposal(mut self, proposal: Option<&'a dyn ActionProposalPort>) -> Self {
         self.proposal = proposal;
+        self
+    }
+
+    pub(crate) fn with_tenant(mut self, tenant: &'a str) -> Self {
+        self.tenant = tenant;
+        self
+    }
+
+    pub(crate) fn with_machine_credential(mut self, machine_credential: bool) -> Self {
+        self.machine_credential = machine_credential;
         self
     }
 
@@ -166,6 +184,41 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ));
             }
             return self.completed_replay(existing, now);
+        }
+
+        let agent_action = crate::sekai::write_freeze::actor_is_agent(
+            self.db,
+            actor,
+            request.delegating_actor.as_deref(),
+            self.machine_credential,
+        )
+        .map_err(ActionInstanceAdmissionError::Internal)?;
+        let tenant =
+            crate::sekai::write_freeze::acting_or_registered_tenant(self.db, self.tenant, actor)
+                .map_err(ActionInstanceAdmissionError::Internal)?;
+        refuse_frozen(
+            self.db,
+            &crate::sekai::write_freeze::write_checks_for_actors(
+                &namespace,
+                tenant.as_ref(),
+                actor,
+                request.delegating_actor.as_deref(),
+                request.type_id.trim(),
+                agent_action,
+            ),
+        )?;
+        if !request.resource_tenant.is_empty() && request.resource_tenant != tenant.as_ref() {
+            refuse_frozen(
+                self.db,
+                &crate::sekai::write_freeze::write_checks_for_actors(
+                    &namespace,
+                    &request.resource_tenant,
+                    actor,
+                    request.delegating_actor.as_deref(),
+                    request.type_id.trim(),
+                    agent_action,
+                ),
+            )?;
         }
 
         // New admissions consume a live signed envelope. Replay of an already
@@ -338,6 +391,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             decided_by: String::new(),
             approval_decision: String::new(),
             autonomous_envelope_id: envelope_id.clone(),
+            agent_action,
+            admission_tenant: tenant.as_ref().to_string(),
+            resource_tenant: request.resource_tenant.clone(),
         };
         let planned_effects = if status == STATUS_ADMITTED {
             let force_notify_fail =
@@ -592,6 +648,85 @@ impl<'a> ActionInstanceAdmission<'a> {
         }) {
             return self.finish_denied(instance, "policy_denied_on_resume", &approval, now);
         }
+        let submitter_tenant = crate::sekai::write_freeze::acting_or_registered_tenant(
+            self.db,
+            self.tenant,
+            &instance.principal,
+        )
+        .map_err(ActionInstanceAdmissionError::Internal)?;
+        let submitter_agent = instance.agent_action
+            || crate::sekai::write_freeze::actor_is_agent(
+                self.db,
+                &instance.principal,
+                instance.delegating_actor.as_deref(),
+                false,
+            )
+            .map_err(ActionInstanceAdmissionError::Internal)?;
+        let mut submitter_checks = crate::sekai::write_freeze::write_checks_for_actors(
+            &instance.namespace,
+            submitter_tenant.as_ref(),
+            &instance.principal,
+            instance.delegating_actor.as_deref(),
+            instance.type_id.trim(),
+            submitter_agent,
+        );
+        if !instance.admission_tenant.is_empty()
+            && instance.admission_tenant != submitter_tenant.as_ref()
+        {
+            submitter_checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                &instance.namespace,
+                &instance.admission_tenant,
+                &instance.principal,
+                instance.delegating_actor.as_deref(),
+                instance.type_id.trim(),
+                submitter_agent,
+            ));
+        }
+        if !instance.resource_tenant.is_empty()
+            && instance.resource_tenant != submitter_tenant.as_ref()
+            && instance.resource_tenant != instance.admission_tenant
+        {
+            submitter_checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                &instance.namespace,
+                &instance.resource_tenant,
+                &instance.principal,
+                instance.delegating_actor.as_deref(),
+                instance.type_id.trim(),
+                submitter_agent,
+            ));
+        }
+        refuse_frozen(self.db, &submitter_checks)?;
+        let decider_tenant =
+            crate::sekai::write_freeze::acting_or_registered_tenant(self.db, self.tenant, decider)
+                .map_err(ActionInstanceAdmissionError::Internal)?;
+        let decider_agent = crate::sekai::write_freeze::actor_is_agent(
+            self.db,
+            decider,
+            request.delegating_actor.as_deref(),
+            self.machine_credential,
+        )
+        .map_err(ActionInstanceAdmissionError::Internal)?;
+        let mut decider_checks = crate::sekai::write_freeze::write_checks_for_actors(
+            &instance.namespace,
+            decider_tenant.as_ref(),
+            decider,
+            request.delegating_actor.as_deref(),
+            instance.type_id.trim(),
+            decider_agent,
+        );
+        if !instance.resource_tenant.is_empty()
+            && instance.resource_tenant != decider_tenant.as_ref()
+        {
+            decider_checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                &instance.namespace,
+                &instance.resource_tenant,
+                decider,
+                request.delegating_actor.as_deref(),
+                instance.type_id.trim(),
+                decider_agent,
+            ));
+        }
+        refuse_frozen(self.db, &decider_checks)?;
         let budget_subject = submit_budget_subject(
             &instance.namespace,
             &instance.principal,
@@ -1209,6 +1344,17 @@ fn map_object_mutation_error(error: ActionObjectMutationError) -> ActionInstance
     }
 }
 
+fn refuse_frozen(
+    db: &RuntimeDb,
+    checks: &[crate::sekai::write_freeze::WriteFreezeCheck<'_>],
+) -> Result<(), ActionInstanceAdmissionError> {
+    match crate::sekai::write_freeze::freeze_reason_any(db, checks) {
+        Ok(Some(reason)) => Err(ActionInstanceAdmissionError::FailedPrecondition(reason)),
+        Ok(None) => Ok(()),
+        Err(error) => Err(ActionInstanceAdmissionError::Internal(error)),
+    }
+}
+
 fn require_value(name: &str, value: &str) -> Result<(), ActionInstanceAdmissionError> {
     if value.is_empty() {
         Err(ActionInstanceAdmissionError::InvalidArgument(format!(
@@ -1356,6 +1502,7 @@ mod tests {
             policy_context: PrincipalPolicyContext::default(),
             delegating_actor: Some("origin-user".into()),
             budget_already_reserved: false,
+            resource_tenant: String::new(),
         }
     }
 
@@ -1425,6 +1572,487 @@ mod tests {
             |decision| decision.evidence.get("act").map(String::as_str) == Some("origin-user")
         ));
         assert_eq!(admitted.instance.budget_decision, "not_configured");
+    }
+
+    #[test]
+    fn tenant_freeze_blocks_admit_when_tenant_is_supplied() {
+        let db = setup();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+            scope_value: "acme-tenant".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .with_tenant("acme-tenant")
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze"))
+        );
+        ActionInstanceAdmission::new(&db, None)
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+    }
+
+    #[test]
+    fn resource_tenant_freeze_blocks_admit() {
+        let db = setup();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+            scope_value: "tenant-test".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let mut request = request(r#"{"runtime":"shikigami"}"#);
+        request.delegating_actor = None;
+        request.resource_tenant = "tenant-test".into();
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .admit(request, "alice", 10)
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze") && reason.contains("tenant/tenant-test"))
+        );
+    }
+
+    #[test]
+    fn persisted_resource_tenant_blocks_later_grant_without_tenant() {
+        let db = approval_setup("create", &["bob"]);
+        let mut parked_request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-resource-tenant","title":"t"}"#,
+        );
+        parked_request.resource_tenant = "tenant-test".into();
+        let parked = ActionInstanceAdmission::new(&db, None)
+            .admit(parked_request, "alice", 10)
+            .unwrap()
+            .instance;
+        assert_eq!(parked.resource_tenant, "tenant-test");
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+            scope_value: "tenant-test".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze") && reason.contains("tenant/tenant-test"))
+        );
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+    }
+
+    #[test]
+    fn persisted_admission_tenant_blocks_later_grant_without_tenant() {
+        let db = approval_setup("create", &["bob"]);
+        let parked = ActionInstanceAdmission::new(&db, None)
+            .with_tenant("acme-tenant")
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-stored-tenant","title":"t"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(parked.admission_tenant, "acme-tenant");
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+            scope_value: "acme-tenant".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze") && reason.contains("tenant/acme-tenant"))
+        );
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+    }
+
+    #[test]
+    fn principal_freeze_on_delegating_actor_blocks_admit() {
+        let db = setup();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_PRINCIPAL.into(),
+            scope_value: "alice".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let mut delegated = request(r#"{"runtime":"shikigami"}"#);
+        delegated.delegating_actor = Some("alice".into());
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .admit(delegated, "agent:bot", 10)
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze") && reason.contains("principal/alice"))
+        );
+        let mut other = request(r#"{"runtime":"shikigami"}"#);
+        other.delegating_actor = Some("bob".into());
+        other.idempotency_key = "idem-2".into();
+        ActionInstanceAdmission::new(&db, None)
+            .admit(other, "agent:bot", 10)
+            .unwrap();
+    }
+
+    #[test]
+    fn registered_principal_tenant_freeze_blocks_admit_without_with_tenant() {
+        let db = setup();
+        db.put_service_principal(
+            &crate::sekai::service_principal::ServicePrincipalRegistration {
+                principal: "worker-a".into(),
+                tenant_id: "acme-tenant".into(),
+                namespaces: vec!["acme".into()],
+                action_types: vec!["dispatch".into()],
+                registered_by: "local".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+            scope_value: "acme-tenant".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let mut request = request(r#"{"runtime":"shikigami"}"#);
+        request.delegating_actor = None;
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .admit(request, "worker-a", 10)
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze") && reason.contains("tenant/acme-tenant"))
+        );
+    }
+
+    #[test]
+    fn freeze_blocks_parked_grant() {
+        let db = approval_setup("create", &["bob"]);
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let parked = admission
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-freeze","title":"t"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "acme".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze"))
+        );
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+        assert!(db.get_object("rec-freeze").unwrap().is_none());
+    }
+
+    #[test]
+    fn machine_credential_blocks_agent_action_admit() {
+        let db = setup();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "acme".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_AGENT_ACTIONS.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let mut human = request(r#"{"runtime":"shikigami"}"#);
+        human.delegating_actor = None;
+        ActionInstanceAdmission::new(&db, None)
+            .admit(human.clone(), "alice", 10)
+            .unwrap();
+        human.idempotency_key = "idem-2".into();
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .with_machine_credential(true)
+            .admit(human, "alice", 10)
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze"))
+        );
+    }
+
+    #[test]
+    fn machine_credential_blocks_parked_grant() {
+        let db = approval_setup("create", &["bob"]);
+        let parked = ActionInstanceAdmission::new(&db, None)
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-machine","title":"t"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "acme".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_AGENT_ACTIONS.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .with_machine_credential(true)
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze"))
+        );
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+        ActionInstanceAdmission::new(&db, None)
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                30,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn principal_agent_freeze_on_human_submitter_does_not_block_machine_grant() {
+        let db = approval_setup("create", &["bob"]);
+        let parked = ActionInstanceAdmission::new(&db, None)
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-human-submitter-machine-grant","title":"t"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        assert!(!parked.agent_action);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_PRINCIPAL.into(),
+            scope_value: "alice".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_AGENT_ACTIONS.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let granted = ActionInstanceAdmission::new(&db, None)
+            .with_machine_credential(true)
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap();
+        assert_eq!(granted.instance.status, STATUS_ADMITTED);
+    }
+
+    #[test]
+    fn persisted_agent_action_blocks_human_grant() {
+        let db = approval_setup("create", &["bob"]);
+        let parked = ActionInstanceAdmission::new(&db, None)
+            .with_machine_credential(true)
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-persisted-agent","title":"t"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        assert!(parked.agent_action);
+        assert_eq!(parked.status, STATUS_PARKED);
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "acme".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_AGENT_ACTIONS.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze"))
+        );
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+    }
+
+    #[test]
+    fn principal_freeze_on_approver_blocks_grant() {
+        let db = approval_setup("create", &["bob"]);
+        let parked = ActionInstanceAdmission::new(&db, None)
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-approver-freeze","title":"t"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_PRINCIPAL.into(),
+            scope_value: "bob".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze"))
+        );
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+        assert!(db.get_object("rec-approver-freeze").unwrap().is_none());
+    }
+
+    #[test]
+    fn principal_freeze_on_approver_delegating_actor_blocks_grant() {
+        let db = approval_setup("create", &["bob"]);
+        let parked = ActionInstanceAdmission::new(&db, None)
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-approver-act-freeze","title":"t"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_PRINCIPAL.into(),
+            scope_value: "carol".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let mut grant = decision(&parked.instance_id, DECISION_GRANT, "bob");
+        grant.delegating_actor = Some("carol".into());
+        let blocked = ActionInstanceAdmission::new(&db, None)
+            .decide(grant, "bob", 20)
+            .unwrap_err();
+        assert!(
+            matches!(blocked, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze") && reason.contains("principal/carol"))
+        );
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+        assert!(db.get_object("rec-approver-act-freeze").unwrap().is_none());
     }
 
     #[test]
@@ -1653,6 +2281,7 @@ mod tests {
                     reason: String::new(),
                     decider_principals: vec!["ops-admin".into()],
                     decider_is_namespace_admin: true,
+                    delegating_actor: None,
                 },
                 "ops-admin",
                 45,
@@ -1714,6 +2343,7 @@ mod tests {
                     policy_context: PrincipalPolicyContext::default(),
                     delegating_actor: None,
                     budget_already_reserved: false,
+            resource_tenant: String::new(),
                 },
                 "alice",
                 10,
@@ -1884,6 +2514,7 @@ mod tests {
             policy_context: PrincipalPolicyContext::default(),
             delegating_actor: None,
             budget_already_reserved: false,
+            resource_tenant: String::new(),
         }
     }
 
@@ -2293,6 +2924,7 @@ mod tests {
             reason: "reviewed".into(),
             decider_principals: vec![principal.into()],
             decider_is_namespace_admin: false,
+            delegating_actor: None,
         }
     }
 
@@ -2920,6 +3552,9 @@ mod tests {
             created_at_ms: 10,
             decided_at_ms: 10,
             system_one_fill_json: String::new(),
+            agent_action: false,
+            admission_tenant: String::new(),
+            resource_tenant: String::new(),
         };
         db.put_action_instance(&reserved).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);

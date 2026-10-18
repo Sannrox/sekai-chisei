@@ -137,6 +137,38 @@ impl SekaiServiceImpl {
         // it may submit, checked before any page is consumed.
         check_team_namespace(self.db.runtime(), &run_as, &binding.namespace, true)
             .map_err(|_| Status::failed_precondition("run_as lacks namespace write"))?;
+        let tenant = crate::sekai::write_freeze::acting_or_registered_tenant(
+            self.db.runtime(),
+            acting_tenant(tenant_context.as_ref()),
+            &binding.run_as,
+        )
+        .map_err(Status::internal)?;
+        let resource_tenant = shared_space_resource_tenant(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &binding.namespace,
+            crate::enterprise::NamespaceAction::Write,
+        )
+        .unwrap_or_default();
+        let mut freeze_checks = crate::sekai::write_freeze::write_checks_for_actors(
+            &binding.namespace,
+            tenant.as_ref(),
+            &binding.run_as,
+            None,
+            binding.type_id.trim(),
+            true,
+        );
+        if !resource_tenant.is_empty() && resource_tenant != tenant.as_ref() {
+            freeze_checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                &binding.namespace,
+                &resource_tenant,
+                &binding.run_as,
+                None,
+                binding.type_id.trim(),
+                true,
+            ));
+        }
+        crate::sekai::write_freeze::refuse_if_frozen_any(self.db.runtime(), &freeze_checks)?;
 
         let scope = ObjectChangeScope {
             namespace: binding.namespace.clone(),
@@ -328,13 +360,24 @@ impl SekaiServiceImpl {
             .map(|object| (object.id.clone(), object))
             .collect::<HashMap<_, _>>();
 
-        for event in std::mem::take(&mut cursor.pending_events) {
-            response.submissions.push(self.submit_bound_event(
+        for event in &cursor.pending_events {
+            let submission = self.submit_bound_event(
                 &binding,
-                &event,
+                event,
                 visible_by_id.get(&event.object_id),
-            ));
+                tenant.as_ref(),
+                &resource_tenant,
+            );
+            if let Some(reason) = submission
+                .skipped_reason
+                .strip_prefix("failed_precondition: ")
+                .filter(|reason| reason.contains("write freeze"))
+            {
+                return Err(Status::failed_precondition(reason.to_string()));
+            }
+            response.submissions.push(submission);
         }
+        cursor.pending_events.clear();
         self.db
             .runtime()
             .advance_action_binding_cursor(&binding, &cursor, now_millis())
@@ -347,6 +390,8 @@ impl SekaiServiceImpl {
         binding: &ActionBinding,
         event: &crate::sekai::object_change_subscription::ObjectChangeEvent,
         object: Option<&domain::Object>,
+        tenant: &str,
+        resource_tenant: &str,
     ) -> ActionBindingSubmission {
         let mut submission = ActionBindingSubmission {
             event_id: event.event_id.clone(),
@@ -385,12 +430,15 @@ impl SekaiServiceImpl {
             policy_context: crate::sekai::object_security::PrincipalPolicyContext::default(),
             delegating_actor: None,
             budget_already_reserved: false,
+            resource_tenant: resource_tenant.to_string(),
         };
         let result = if let Some(clerk) = &self.cross_store {
-            clerk.admit(request, &binding.run_as, now_millis())
+            clerk.admit(request, &binding.run_as, now_millis(), tenant, true)
         } else {
             ActionInstanceAdmission::new(self.db.runtime(), None)
                 .with_proposal(Some(&crate::chisei::system_one_action::SystemOneProposal))
+                .with_tenant(tenant)
+                .with_machine_credential(true)
                 .admit(request, &binding.run_as, now_millis())
         };
         match result {
@@ -621,5 +669,158 @@ mod tests {
                 .read_marker
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn write_freeze_refuses_binding_run_before_consuming_pending_events() {
+        let db = Arc::new(RuntimeDb::memory());
+        let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+            db.clone(),
+        ));
+        let (_, grants) = db
+            .ensure_team_namespace("demo", "svc-escalator", security::Role::Editor, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        db.put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: "demo".into(),
+                type_id: "component.escalate".into(),
+                version: "1".into(),
+                description: "Escalate a degraded component".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"component":{"type":"string"},"severity":{"type":"string"}},"required":["component","severity"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                enabled: true,
+                ..Default::default()
+            },
+            "local",
+            1,
+        )
+        .unwrap();
+        db.upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
+            "demo",
+        ))
+        .unwrap();
+        let binding = db
+            .put_action_binding(
+                &ActionBinding {
+                    contract_version: ACTION_BINDING_CONTRACT.into(),
+                    binding_id: "escalate".into(),
+                    namespace: "demo".into(),
+                    kind: "component".into(),
+                    property_filters: Vec::new(),
+                    ops: vec!["update".into()],
+                    type_id: "component.escalate".into(),
+                    version: "1".into(),
+                    run_as: "svc-escalator".into(),
+                    parameters: BTreeMap::from([
+                        ("component".into(), ParameterSource::ObjectId),
+                        (
+                            "severity".into(),
+                            ParameterSource::Property("severity".into()),
+                        ),
+                    ]),
+                    enabled: true,
+                    revision: 0,
+                    created_by: String::new(),
+                    updated_at_ms: 0,
+                },
+                "local",
+                2,
+            )
+            .unwrap();
+        db.advance_action_binding_cursor(
+            &binding,
+            &ActionBindingCursor {
+                snapshot_revision: "pin".into(),
+                pending_events: vec![
+                    crate::sekai::object_change_subscription::ObjectChangeEvent {
+                        offset: 1,
+                        event_id: "evt-frozen".into(),
+                        object_id: "billing-api".into(),
+                        kind: "component".into(),
+                        op: "update".into(),
+                        field: "severity".into(),
+                        committed_at_ms: 3,
+                        operation_id: "op-frozen".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            now_millis(),
+        )
+        .unwrap();
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "demo".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 1,
+        })
+        .unwrap();
+        let refused = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(refused.message().contains("write freeze"));
+        let pending = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .1
+            .pending_events;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_id, "evt-frozen");
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "demo".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+            reason: "lifted".into(),
+            enabled: false,
+            updated_ms: 2,
+        })
+        .unwrap();
+        let after = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .1
+            .pending_events;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].event_id, "evt-frozen");
+        db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+            scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+            scope_value: "demo".into(),
+            mode: crate::sekai::write_freeze::MODE_BLOCK_AGENT_ACTIONS.into(),
+            reason: "incident".into(),
+            enabled: true,
+            updated_ms: 3,
+        })
+        .unwrap();
+        let refused_agent = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused_agent.code(), tonic::Code::FailedPrecondition);
+        assert!(refused_agent.message().contains("write freeze"));
+        let still_pending = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .1
+            .pending_events;
+        assert_eq!(still_pending.len(), 1);
+        assert_eq!(still_pending[0].event_id, "evt-frozen");
     }
 }

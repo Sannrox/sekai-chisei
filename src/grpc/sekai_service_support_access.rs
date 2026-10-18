@@ -304,6 +304,33 @@ pub(super) fn now_millis() -> i64 {
         .as_millis()
         .min(i64::MAX as u128) as i64
 }
+
+pub(super) fn acting_tenant(tenant_context: Option<&RequestEnterpriseContext>) -> &str {
+    tenant_context
+        .and_then(|context| context.tenant.as_ref())
+        .map_or("", |tenant| tenant.tenant_id.as_str())
+}
+
+pub(super) fn freeze_machine_credential(tenant_context: Option<&RequestEnterpriseContext>) -> bool {
+    tenant_context.is_some_and(|context| {
+        context.credential_kind == crate::enterprise::CredentialKind::Machine
+            || crate::service_token::is_service_principal_context(context)
+    })
+}
+
+pub(super) fn freeze_actor_is_agent(
+    db: &RuntimeDb,
+    principal: &str,
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Result<bool, Status> {
+    crate::sekai::write_freeze::actor_is_agent(
+        db,
+        principal,
+        tenant_context.and_then(|context| context.act.as_deref()),
+        freeze_machine_credential(tenant_context),
+    )
+    .map_err(Status::internal)
+}
 pub(super) fn check_read(
     security: &SecurityChecker,
     object_id: &str,
@@ -686,6 +713,43 @@ pub(super) fn enforce_object_operation_access(
     };
     if !collaboration_object_permitted(db, tenant_context, object, action)? {
         return Err(Status::permission_denied("access denied"));
+    }
+    if !matches!(
+        operation,
+        crate::sekai::object_security::ObjectSecurityOperation::Read
+            | crate::sekai::object_security::ObjectSecurityOperation::Traverse
+            | crate::sekai::object_security::ObjectSecurityOperation::Query
+            | crate::sekai::object_security::ObjectSecurityOperation::Export
+    ) {
+        let principal = principals.first().map(String::as_str).unwrap_or_default();
+        let act = tenant_context.and_then(|context| context.act.as_deref());
+        let acting = crate::sekai::write_freeze::acting_or_registered_tenant(
+            db,
+            acting_tenant(tenant_context),
+            principal,
+        )
+        .map_err(Status::internal)?;
+        let owner = shared_space_resource_tenant(db, tenant_context, &object.namespace, action);
+        let agent = freeze_actor_is_agent(db, principal, tenant_context)?;
+        let mut checks = crate::sekai::write_freeze::write_checks_for_actors(
+            &object.namespace,
+            acting.as_ref(),
+            principal,
+            act,
+            "",
+            agent,
+        );
+        if let Some(owner) = owner.as_deref().filter(|owner| *owner != acting.as_ref()) {
+            checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                &object.namespace,
+                owner,
+                principal,
+                act,
+                "",
+                agent,
+            ));
+        }
+        crate::sekai::write_freeze::refuse_if_frozen_any(db, &checks)?;
     }
     let decision =
         decide_object_access(db, object, principals, tenant_context, operation, purpose)?;
