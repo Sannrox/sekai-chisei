@@ -1446,6 +1446,32 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn find_all_by_external_ids_in_namespace(
+        &self,
+        namespace: &str,
+        external_ids: &[String],
+    ) -> Result<Vec<Object>, String> {
+        if external_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json = serde_json::to_string(external_ids).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE namespace = ?1
+                   AND external_id IN (SELECT value FROM json_each(?2))
+                 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![namespace, ids_json], row_to_object)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn find_all_by_external_id_with_policy_context(
         &self,
         external_id: &str,

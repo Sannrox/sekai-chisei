@@ -6,6 +6,16 @@ use crate::db::sekai::{PrincipalCredential, SekaiDb};
 use postgres::GenericClient;
 use std::sync::Arc;
 
+#[cfg(test)]
+pub(crate) mod source_batch_auth_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static LOOKUP_QUERIES: Cell<usize> = const { Cell::new(0) };
+        pub static POLICY_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
 use crate::chisei::eval;
 use crate::chisei::evaluation_execution::EvaluationExecutionIndex;
 use crate::chisei::evolve;
@@ -1215,6 +1225,8 @@ impl RuntimeDb {
         namespace: &str,
         kind: &str,
     ) -> Result<Option<ObjectSecurityPolicy>, String> {
+        #[cfg(test)]
+        source_batch_auth_counters::POLICY_LOOKUPS.with(|c| c.set(c.get() + 1));
         let Some(activation) = self.get_object_security_activation(namespace)? else {
             return Ok(None);
         };
@@ -3466,6 +3478,23 @@ impl RuntimeDb {
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.find_all_by_external_id(external_id))
             }
+        }
+    }
+
+    pub fn find_all_by_external_ids_in_namespace(
+        &self,
+        namespace: &str,
+        external_ids: &[String],
+    ) -> Result<Vec<Object>, String> {
+        #[cfg(test)]
+        if !external_ids.is_empty() {
+            source_batch_auth_counters::LOOKUP_QUERIES.with(|c| c.set(c.get() + 1));
+        }
+        match self {
+            Self::Sqlite(db) => db.find_all_by_external_ids_in_namespace(namespace, external_ids),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.find_all_by_external_ids_in_namespace(namespace, external_ids)
+            }),
         }
     }
 
