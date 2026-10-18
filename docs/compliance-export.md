@@ -80,6 +80,12 @@ prompts, PII, or free-form error text under unexpected field names.
   other offline `sekaictl` report tools. A future gRPC export will enforce
   namespace authorization for networked multi-tenant access.
 
+## Compliance packs (#1468)
+
+Versioned JSON packs map framework controls onto named evidence queries over
+this export. See [compliance-packs.md](compliance-packs.md). Report generation
+and verification stay offline; they do not open the control-plane database.
+
 ## Non-goals (this version)
 
 - Console download UI

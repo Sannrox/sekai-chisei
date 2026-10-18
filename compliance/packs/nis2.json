@@ -1,0 +1,34 @@
+{
+  "pack_format": "sekai.compliance-pack/v1",
+  "id": "nis2",
+  "version": "1",
+  "framework": "NIS2",
+  "framework_version": "2022/2555",
+  "controls": [
+    {
+      "id": "Art.21(2)(b)",
+      "title": "Incident handling",
+      "queries": ["incident_records"]
+    },
+    {
+      "id": "Art.21(2)(c)",
+      "title": "Business continuity, backup management and disaster recovery",
+      "queries": ["backup_drills"]
+    },
+    {
+      "id": "Art.21(2)(h)",
+      "title": "Policies and procedures regarding the use of cryptography",
+      "queries": ["key_rotation"]
+    },
+    {
+      "id": "Art.21(2)(i)",
+      "title": "Human resources security, access control policies and asset management",
+      "queries": ["access_reviews"]
+    },
+    {
+      "id": "Art.23",
+      "title": "Reporting of significant incidents",
+      "queries": ["incident_records"]
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "pack_format": "sekai.compliance-pack/v1",
+  "id": "fixture",
+  "version": "1",
+  "framework": "fixture",
+  "framework_version": "1",
+  "controls": [
+    {
+      "id": "FIX.access",
+      "title": "Access review evidence",
+      "queries": ["access_reviews"]
+    },
+    {
+      "id": "FIX.grant",
+      "title": "Grant expiry evidence",
+      "queries": ["grant_expiry"]
+    },
+    {
+      "id": "FIX.purpose",
+      "title": "Purpose-record evidence",
+      "queries": ["purpose_records"]
+    },
+    {
+      "id": "FIX.deletion",
+      "title": "Deletion-proof evidence",
+      "queries": ["deletion_proofs"]
+    },
+    {
+      "id": "FIX.incident",
+      "title": "Incident-handling evidence",
+      "queries": ["incident_records"]
+    },
+    {
+      "id": "FIX.keys",
+      "title": "Key-rotation evidence",
+      "queries": ["key_rotation"]
+    },
+    {
+      "id": "FIX.backup",
+      "title": "Backup-drill evidence",
+      "queries": ["backup_drills"]
+    },
+    {
+      "id": "FIX.partial",
+      "title": "Two-source control used to show partial evidence",
+      "queries": ["backup_drills", "incident_records"]
+    }
+  ]
+}
