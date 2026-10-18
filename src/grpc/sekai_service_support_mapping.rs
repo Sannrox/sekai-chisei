@@ -1139,6 +1139,30 @@ pub(super) fn to_proto_grant(g: &security::Grant) -> Grant {
         exception_reason: g.exception_reason.clone(),
     }
 }
+pub(super) fn to_proto_write_freeze(
+    freeze: &crate::sekai::write_freeze::WriteFreeze,
+) -> WriteFreeze {
+    WriteFreeze {
+        scope_kind: freeze.scope_kind.clone(),
+        scope_value: freeze.scope_value.clone(),
+        mode: freeze.mode.clone(),
+        reason: freeze.reason.clone(),
+        enabled: freeze.enabled,
+        updated_ms: freeze.updated_ms,
+    }
+}
+pub(super) fn from_proto_write_freeze(
+    freeze: WriteFreeze,
+) -> crate::sekai::write_freeze::WriteFreeze {
+    crate::sekai::write_freeze::WriteFreeze {
+        scope_kind: freeze.scope_kind,
+        scope_value: freeze.scope_value,
+        mode: freeze.mode,
+        reason: freeze.reason,
+        enabled: freeze.enabled,
+        updated_ms: freeze.updated_ms,
+    }
+}
 pub(super) fn to_proto_contention_scope(scope: &coordination::ContentionScope) -> ContentionScope {
     ContentionScope {
         id: scope.id.clone(),

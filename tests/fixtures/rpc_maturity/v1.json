@@ -1078,6 +1078,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "SetWriteFreeze",
+      "storage_path": "sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListWriteFreezes",
+      "storage_path": "sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "EnsureTeamNamespace",
       "storage_path": "sekai.team-namespaces, sekai.authorization, sekai.graph, sekai.audit",
       "real_backend": "yes",

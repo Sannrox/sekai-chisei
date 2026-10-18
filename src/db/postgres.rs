@@ -147,6 +147,7 @@ const DATASET_HEALTH_CHECKS_SCHEMA: &str = include_str!("postgres/0079_dataset_h
 const SEARCH_INDEX_SCHEMA: &str = include_str!("postgres/0080_search_index.sql");
 const RECEIPT_CHAIN_SCHEMA: &str = include_str!("postgres/0081_receipt_chain.sql");
 const GRANT_TERMS_SCHEMA: &str = include_str!("postgres/0082_grant_terms.sql");
+const WRITE_FREEZE_SCHEMA: &str = include_str!("postgres/0083_write_freeze.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -671,6 +672,12 @@ const MIGRATIONS: &[Migration] = &[
         MigrationOwner::Chisei,
     ),
     mig(81, "grant_terms", GRANT_TERMS_SCHEMA, MigrationOwner::Sekai),
+    mig(
+        82,
+        "write_freeze",
+        WRITE_FREEZE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;

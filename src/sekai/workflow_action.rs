@@ -266,6 +266,7 @@ pub fn submit_step(
                 policy_context: crate::sekai::object_security::PrincipalPolicyContext::default(),
                 delegating_actor: None,
                 budget_already_reserved: false,
+                resource_tenant: String::new(),
             },
             actor,
             now_ms,

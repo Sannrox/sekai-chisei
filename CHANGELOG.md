@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Operators can freeze writes or agent Actions by tenant, namespace, principal,
+  or Action type. The next object write and Action admission fail closed with
+  the freeze reason. In-flight claims fail at ack. Freeze and unfreeze write
+  Decision receipts. `SetWriteFreeze` / `ListWriteFreezes` stay behind
+  `SEKAI_EXPERIMENTAL_RPCS` (`0083_write_freeze`, GATE:mig, #1458).
+
 - `DiscoverCapabilities` lists enabled governed Action types as
   `sekai.actions.{type_id}` on the core pack, with parameter schema,
   selected `action_version`, description, approval matching submit

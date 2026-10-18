@@ -115,3 +115,4 @@ pub mod virtual_pushdown;
 pub mod warehouse_projection;
 pub(crate) mod work_unit_lifecycle;
 pub mod workflow_action;
+pub mod write_freeze;

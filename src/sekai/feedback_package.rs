@@ -541,6 +541,7 @@ mod tests {
             policy_context: PrincipalPolicyContext::default(),
             delegating_actor: None,
             budget_already_reserved: false,
+            resource_tenant: String::new(),
         }
     }
 

@@ -206,6 +206,41 @@ fn apply_source_batch_blocking(
     if proto.producer_identity != principal {
         return Err(Status::permission_denied("source producer identity denied"));
     }
+    let tenant = crate::sekai::write_freeze::acting_or_registered_tenant(
+        service.db.runtime(),
+        acting_tenant(tenant_context.as_ref()),
+        &principal,
+    )
+    .map_err(Status::internal)?;
+    let act = tenant_context
+        .as_ref()
+        .and_then(|context| context.act.as_deref());
+    let agent = freeze_actor_is_agent(service.db.runtime(), &principal, tenant_context.as_ref())?;
+    let mut checks = crate::sekai::write_freeze::write_checks_for_actors(
+        &proto.namespace,
+        tenant.as_ref(),
+        &principal,
+        act,
+        "",
+        agent,
+    );
+    let owner = shared_space_resource_tenant(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &proto.namespace,
+        crate::enterprise::NamespaceAction::Write,
+    );
+    if let Some(owner) = owner.as_deref().filter(|owner| *owner != tenant.as_ref()) {
+        checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+            &proto.namespace,
+            owner,
+            &principal,
+            act,
+            "",
+            agent,
+        ));
+    }
+    crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)?;
     let mut batch = from_proto_source_batch(proto)?;
     batch.producer_identity = principal.clone();
     let authorized_objects = authorize_source_batch_object_policy(

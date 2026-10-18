@@ -1487,6 +1487,18 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<CheckAccessResponse>, Status> {
         rpc_data::check_access(self, req).await
     }
+    async fn set_write_freeze(
+        &self,
+        req: Request<SetWriteFreezeRequest>,
+    ) -> Result<Response<SetWriteFreezeResponse>, Status> {
+        rpc_data::set_write_freeze(self, req).await
+    }
+    async fn list_write_freezes(
+        &self,
+        req: Request<ListWriteFreezesRequest>,
+    ) -> Result<Response<ListWriteFreezesResponse>, Status> {
+        rpc_data::list_write_freezes(self, req).await
+    }
     async fn ensure_team_namespace(
         &self,
         req: Request<EnsureTeamNamespaceRequest>,

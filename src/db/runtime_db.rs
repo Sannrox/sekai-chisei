@@ -3130,6 +3130,38 @@ impl RuntimeDb {
         }
     }
 
+    pub fn set_write_freeze(
+        &self,
+        freeze: &crate::sekai::write_freeze::WriteFreeze,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_write_freeze(freeze),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.set_write_freeze(freeze)),
+        }
+    }
+
+    pub fn set_write_freeze_with_decision(
+        &self,
+        freeze: &crate::sekai::write_freeze::WriteFreeze,
+        decision: &crate::sekai::audit::Decision,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_write_freeze_with_decision(freeze, decision),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.set_write_freeze_with_decision(freeze, decision)
+            }),
+        }
+    }
+
+    pub fn list_write_freezes(
+        &self,
+    ) -> Result<Vec<crate::sekai::write_freeze::WriteFreeze>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_write_freezes(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.list_write_freezes()),
+        }
+    }
+
     pub fn create_grant(&self, grant: &Grant) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.create_grant(grant),

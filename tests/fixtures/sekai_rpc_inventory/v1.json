@@ -1574,6 +1574,30 @@
       "product_tier": "core"
     },
     {
+      "rpc": "SetWriteFreeze",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.authorization"
+      ],
+      "evidence": [
+        "src/sekai/write_freeze.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ListWriteFreezes",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.authorization"
+      ],
+      "evidence": [
+        "src/sekai/write_freeze.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "EnsureTeamNamespace",
       "kind": "persistent",
       "surfaces": [

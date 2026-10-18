@@ -830,6 +830,25 @@ fn shared_space_authorization(
         .map_err(extension_status)
 }
 
+/// Owning tenant of a shared-space resource, when the caller is acting
+/// through a named space. Callers keep their home tenant in context.
+pub(super) fn shared_space_resource_tenant(
+    db: &RuntimeDb,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    action: crate::enterprise::NamespaceAction,
+) -> Option<String> {
+    let context = tenant_context.filter(|context| context.named_space().is_some())?;
+    match shared_space_authorization(db, context, namespace, action) {
+        Ok(auth) => auth
+            .owner_tenant()
+            .map(str::trim)
+            .filter(|tenant| !tenant.is_empty())
+            .map(str::to_string),
+        Err(_) => None,
+    }
+}
+
 /// Whether a shared-space member may see or write this object (#1434): the
 /// space must expose its kind and the marking ceiling must cover its
 /// `access_marking`. Non-members and unshared spaces always pass here.

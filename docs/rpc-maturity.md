@@ -192,6 +192,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.DeleteGrant` | `sekai.authorization` | yes | host | `stable` |
 | `SekaiService.ListGrants` | `sekai.authorization` | yes | host | `stable` |
 | `SekaiService.CheckAccess` | `sekai.authorization` | yes | host | `stable` |
+| `SekaiService.SetWriteFreeze` | `sekai.authorization` | yes | none | `experimental` |
+| `SekaiService.ListWriteFreezes` | `sekai.authorization` | yes | none | `experimental` |
 | `SekaiService.EnsureTeamNamespace` | `sekai.team-namespaces, sekai.authorization, sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RecordDecision` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListDecisions` | `sekai.audit` | yes | none | `experimental` |
