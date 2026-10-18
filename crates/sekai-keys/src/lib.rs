@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -341,14 +341,12 @@ fn wrap_dek(
     dek_id: &KeyId,
 ) -> Result<Vec<u8>, KeyError> {
     let cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| KeyError::WrapFailed)?;
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Aes256Gcm::generate_nonce(&mut rand::thread_rng());
     let aad = envelope_aad(tenant_id, purpose, dek_id)?;
-    let mut out = nonce_bytes.to_vec();
+    let mut out = nonce.to_vec();
     let ct = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: dek.as_bytes().as_ref(),
                 aad: &aad,
