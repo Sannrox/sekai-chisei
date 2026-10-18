@@ -19,6 +19,7 @@ members = [
     "crates/sekai-connector-template",
     "crates/sekai-client",
     "crates/sekai-domain",
+    "crates/sekai-keys",
     "crates/sekai-obs",
     "crates/sekai-types",
     "crates/sekai-ontology",
