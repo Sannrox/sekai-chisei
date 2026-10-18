@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Action, transform-run, and agent-turn receipts join a per-namespace
+  Ed25519-signed hash chain when `CHISEI_RECEIPT_CHAIN_SIGNING_KEY` is set.
+  Genesis and periodic checkpoints detect truncation. `sekaictl admin
+  assurance receipts export|verify` checks a bundle offline and names the
+  first bad position when `--trusted-key` matches the operator key.
+  Isolated-process `TransformRun` JSON verifies with the same tool.
+  Dataset field redaction rewrites chained transform-run bodies and re-signs
+  the namespace (`0081_receipt_chain`, GATE:mig, ADR 0114, #1449).
+
 - gRPC GetObject, ListObjects, ApplySourceBatch, and object-change reads run
   store work on `spawn_blocking`, bounded by the connection pool, so a slow
   batch does not pin a Tokio worker (#1439).
