@@ -156,9 +156,12 @@ fn map_schema_definition_lifecycle_error(error: SchemaDefinitionLifecycleError) 
     }
 }
 
+#[derive(Clone)]
 pub struct SekaiServiceImpl {
     pub(super) db: crate::db::store::SekaiStore,
     pub(super) security: Arc<SecurityChecker>,
+    /// Bounds DB `spawn_blocking` work to the store connection pool.
+    db_work: Arc<tokio::sync::Semaphore>,
     pub(super) schema_definitions: SchemaDefinitionLifecycle,
     pub(super) gateway_schema_principals: Vec<String>,
     /// Region/site pin from `SEKAI_SITE_ID` (default `"local"`).
@@ -174,7 +177,31 @@ pub struct SekaiServiceImpl {
     pub(super) dry_run_host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
 }
 
+fn db_work_limiter(db: &crate::db::store::SekaiStore) -> Arc<tokio::sync::Semaphore> {
+    let permits = db.runtime().connection_pool_max().max(1) as usize;
+    Arc::new(tokio::sync::Semaphore::new(permits))
+}
+
 impl SekaiServiceImpl {
+    /// Run store work on the blocking pool, bounded by the connection pool.
+    pub(super) async fn spawn_db<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T, Status> + Send + 'static,
+    ) -> Result<T, Status> {
+        let permit = self
+            .db_work
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("database worker closed"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .unwrap_or_else(|_| Err(Status::unavailable("database worker cancelled")))
+    }
+
     pub fn new(db: crate::db::store::SekaiStore) -> Self {
         Self::new_with_gateway_schema_principals(db, Vec::new())
     }
@@ -191,9 +218,11 @@ impl SekaiServiceImpl {
             .runtime()
             .object_query_cursor_key()
             .expect("initialize durable object query cursor key");
+        let db_work = db_work_limiter(&db);
         Self {
             db,
             security,
+            db_work,
             schema_definitions,
             gateway_schema_principals,
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
@@ -213,9 +242,11 @@ impl SekaiServiceImpl {
     /// without requiring Sekai tables on a Chisei-only dest.
     pub fn wrong_plane_placeholder(db: crate::db::store::SekaiStore) -> Self {
         let schema_definitions = SchemaDefinitionLifecycle::empty(db.runtime_arc());
+        let db_work = db_work_limiter(&db);
         Self {
             db,
             security: Arc::new(SecurityChecker::new()),
+            db_work,
             schema_definitions,
             gateway_schema_principals: Vec::new(),
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
@@ -1572,6 +1603,39 @@ impl KnowledgeWriter for SekaiServiceImpl {
         request: &KnowledgeWriteRequest,
     ) -> Result<KnowledgeWriteOutcome, String> {
         scored_knowledge_admission::admit(self, request).await
+    }
+}
+
+#[cfg(test)]
+mod spawn_db_tests {
+    use super::*;
+    use crate::db::store::SekaiStore;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_db_does_not_block_the_tokio_worker() {
+        let service = SekaiServiceImpl::new(SekaiStore::memory());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = service.spawn_db(move || {
+            let _ = started_tx.send(());
+            release_rx
+                .recv()
+                .map_err(|_| Status::internal("release signal closed"))?;
+            Ok(())
+        });
+        let probe = async {
+            started_rx.await.expect("blocking work started");
+            tokio::task::yield_now().await;
+            let _ = release_tx.send(());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(blocking, probe);
+            result
+        })
+        .await
+        .expect("spawn_db blocked the Tokio worker")
+        .unwrap();
     }
 }
 

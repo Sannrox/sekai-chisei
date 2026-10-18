@@ -179,6 +179,16 @@ pub(super) async fn apply_source_batch(
     service: &SekaiServiceImpl,
     req: Request<ApplySourceBatchRequest>,
 ) -> Result<Response<ApplySourceBatchResponse>, Status> {
+    let cloned = service.clone();
+    service
+        .spawn_db(move || apply_source_batch_blocking(&cloned, req))
+        .await
+}
+
+fn apply_source_batch_blocking(
+    service: &SekaiServiceImpl,
+    req: Request<ApplySourceBatchRequest>,
+) -> Result<Response<ApplySourceBatchResponse>, Status> {
     let principals = caller_principals(&req);
     let principal = require_single_source_principal(&principals)?.to_string();
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;

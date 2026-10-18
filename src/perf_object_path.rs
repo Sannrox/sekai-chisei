@@ -423,12 +423,21 @@ impl ObjectPathHarness {
     }
 
     fn fetch_target(&self) -> Result<crate::grpc::pb::sekai::Object, String> {
-        let response = self.block_on(self.inner.service.get_object(with_principal(
-            GetObjectRequest {
-                id: self.inner.target_id.clone(),
-            },
-            READER,
-        )))?;
+        self.inner.runtime.block_on(self.fetch_target_async())
+    }
+
+    async fn fetch_target_async(&self) -> Result<crate::grpc::pb::sekai::Object, String> {
+        let response = self
+            .inner
+            .service
+            .get_object(with_principal(
+                GetObjectRequest {
+                    id: self.inner.target_id.clone(),
+                },
+                READER,
+            ))
+            .await
+            .map_err(|status| format!("{status}"))?;
         let object = response
             .into_inner()
             .object
@@ -439,9 +448,49 @@ impl ObjectPathHarness {
         Ok(object)
     }
 
+    fn sample_get_object_p99(&self, samples: usize) -> Result<f64, String> {
+        if samples == 0 {
+            return Err("GetObject sample count must be positive".into());
+        }
+        let mut values = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let started = Instant::now();
+            self.get_object()?;
+            values.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        Ok(percentile_us(&mut values, 0.99))
+    }
+
     /// Point-read the seeded target object.
     pub fn get_object(&self) -> Result<(), String> {
         self.fetch_target().map(|_| ())
+    }
+
+    /// GetObject p99 idle vs while two max-size source pages (1000 records) apply.
+    pub fn mixed_get_object_p99_during_batch(
+        &self,
+        get_samples: usize,
+    ) -> Result<(f64, f64), String> {
+        let idle = self.sample_get_object_p99(get_samples)?;
+        let busy = self.inner.runtime.block_on(async {
+            let batch = async {
+                self.apply_source_batch_async().await?;
+                self.apply_source_batch_async().await
+            };
+            let gets = async {
+                let mut samples = Vec::with_capacity(get_samples);
+                for _ in 0..get_samples {
+                    let started = Instant::now();
+                    self.fetch_target_async().await?;
+                    samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+                }
+                Ok::<_, String>(percentile_us(&mut samples, 0.99))
+            };
+            let (batch, gets) = tokio::join!(batch, gets);
+            batch?;
+            gets
+        })?;
+        Ok((idle, busy))
     }
 
     /// List one page of 50 items in the seeded namespace.
@@ -624,6 +673,10 @@ impl ObjectPathHarness {
 
     /// Apply one source batch through the gRPC handler.
     pub fn apply_source_batch(&self) -> Result<(), String> {
+        self.inner.runtime.block_on(self.apply_source_batch_async())
+    }
+
+    async fn apply_source_batch_async(&self) -> Result<(), String> {
         let step = self.sequence.fetch_add(1, Ordering::Relaxed);
         let current = if step <= 1 {
             String::new()
@@ -638,10 +691,15 @@ impl ObjectPathHarness {
             self.batch_records.max(1),
             step,
         )?;
-        let response = self.block_on(self.inner.service.apply_source_batch(with_principal(
-            ApplySourceBatchRequest { batch: Some(batch) },
-            PRODUCER,
-        )))?;
+        let response = self
+            .inner
+            .service
+            .apply_source_batch(with_principal(
+                ApplySourceBatchRequest { batch: Some(batch) },
+                PRODUCER,
+            ))
+            .await
+            .map_err(|status| format!("{status}"))?;
         let result = response
             .into_inner()
             .result
@@ -679,6 +737,12 @@ enum EvaluateMode {
     Sort,
     OneHop,
     TwoHop,
+}
+
+fn percentile_us(samples: &mut [f64], q: f64) -> f64 {
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let index = ((samples.len() as f64 - 1.0) * q).round() as usize;
+    samples[index.min(samples.len().saturating_sub(1))]
 }
 
 fn scan_limit(dataset_size: usize) -> ObjectSetCostLimit {

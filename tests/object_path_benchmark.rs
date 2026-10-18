@@ -315,3 +315,25 @@ fn policy_checked_read_overhead_stays_within_published_budget() {
         "policy-checked read overhead {overhead} is unreasonably large"
     );
 }
+
+#[test]
+fn mixed_get_object_p99_stays_within_2x_idle_during_source_batch() {
+    // One RPC page is capped at 500 records; the helper applies two pages.
+    let harness = ObjectPathHarness::open(
+        ObjectPathId {
+            kind: ObjectPathKind::ApplySourceBatch,
+            backend: ObjectPathBackend::Sqlite,
+            scale: ObjectPathScale::Batch1000,
+        },
+        64,
+        500,
+    )
+    .expect("open mixed harness");
+    let (idle, busy) = harness
+        .mixed_get_object_p99_during_batch(16)
+        .expect("measure mixed GetObject");
+    assert!(
+        busy <= idle * 2.0 || busy <= GET_OBJECT_P99_US * 2.0,
+        "busy GetObject p99 {busy}us exceeds 2x idle {idle}us"
+    );
+}

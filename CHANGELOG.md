@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- gRPC GetObject, ListObjects, ApplySourceBatch, and object-change reads run
+  store work on `spawn_blocking`, bounded by the connection pool, so a slow
+  batch does not pin a Tokio worker (#1439).
+
 - ApplySourceBatch authorizes a page with one namespace-scoped external-id
   lookup and one active object-policy load per kind, instead of a lookup
   pair per record (#1438).
