@@ -117,6 +117,14 @@ pub(crate) const ACTION_BINDINGS_UNAVAILABLE: &str =
     "action bindings are unavailable on the PostgreSQL community runtime";
 
 impl RuntimeDb {
+    /// Connection-pool ceiling used as the gRPC `spawn_blocking` bound.
+    pub(crate) fn connection_pool_max(&self) -> u32 {
+        match self {
+            Self::Sqlite(db) => db.as_ref().pool_max_size(),
+            Self::Postgres(db) => db.as_ref().max_connections(),
+        }
+    }
+
     /// Labels this store's connection-pool signals with the plane it serves.
     pub(crate) fn set_pool_plane(&self, plane: crate::obs::labels::PoolPlane) {
         match self {

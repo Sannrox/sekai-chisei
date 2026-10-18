@@ -11,6 +11,15 @@ impl SekaiServiceImpl {
         &self,
         req: Request<ReadObjectChangeSubscriptionRequest>,
     ) -> Result<Response<ReadObjectChangeSubscriptionResponse>, Status> {
+        let service = self.clone();
+        self.spawn_db(move || service.read_visible_object_change_subscription_blocking(req))
+            .await
+    }
+
+    fn read_visible_object_change_subscription_blocking(
+        &self,
+        req: Request<ReadObjectChangeSubscriptionRequest>,
+    ) -> Result<Response<ReadObjectChangeSubscriptionResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let policy_context = principal_policy_context(&req);

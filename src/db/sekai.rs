@@ -217,7 +217,6 @@ impl SekaiDb {
         Ok(db)
     }
 
-    #[cfg(test)]
     pub(crate) fn pool_max_size(&self) -> u32 {
         self.pool.max_size()
     }
