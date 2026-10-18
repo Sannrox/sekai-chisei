@@ -374,6 +374,7 @@ impl SekaiDb {
 
     fn migrate_chisei_families(&self) -> Result<(), String> {
         self.migrate_chisei()?;
+        self.migrate_receipt_chain()?;
         self.migrate_evaluation_plans()?;
         self.migrate_evaluation_manifests()?;
         self.migrate_evaluation_executions()?;

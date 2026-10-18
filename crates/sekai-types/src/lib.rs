@@ -27,6 +27,7 @@ pub mod parked_work;
 pub mod policy_decision;
 pub mod principal;
 pub mod purpose_authorization;
+pub mod receipt_chain;
 pub mod risk_class;
 pub mod security;
 pub mod sekai_principal;

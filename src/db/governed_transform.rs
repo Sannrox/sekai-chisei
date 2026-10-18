@@ -2437,17 +2437,24 @@ fn persist_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(),
             output_partitions
         ],
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    crate::db::receipt_chain::append_transform_run_chain(tx, run)
 }
 
-fn stamp_run_dispatch(tx: &Transaction<'_>, run_id: &str, status: &str) -> Result<(), String> {
+pub(crate) fn stamp_run_dispatch(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    status: &str,
+) -> Result<(), String> {
     tx.execute(
         "UPDATE sekai_governed_transform_run SET dispatch_status = ?2 WHERE run_id = ?1",
         params![run_id, status],
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    let Some(run) = load_transform_run(tx, run_id)? else {
+        return Ok(());
+    };
+    crate::db::receipt_chain::append_transform_run_chain(tx, &run)
 }
 
 pub(crate) fn load_transform(
@@ -2879,7 +2886,7 @@ pub(crate) fn redact_transform_partition_receipts(
         )
         .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    crate::db::receipt_chain::redact_transform_run_chain(tx, dataset_id)
 }
 
 pub(crate) fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> Result<(), String> {
@@ -2919,8 +2926,8 @@ pub(crate) fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> 
             output_partitions
         ],
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    crate::db::receipt_chain::append_transform_run_chain(tx, run)
 }
 
 pub(crate) fn load_lattice(

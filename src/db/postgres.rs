@@ -145,6 +145,7 @@ const TRANSFORM_USAGE_PENDING_SCHEMA: &str =
     include_str!("postgres/0078_transform_usage_pending.sql");
 const DATASET_HEALTH_CHECKS_SCHEMA: &str = include_str!("postgres/0079_dataset_health_checks.sql");
 const SEARCH_INDEX_SCHEMA: &str = include_str!("postgres/0080_search_index.sql");
+const RECEIPT_CHAIN_SCHEMA: &str = include_str!("postgres/0081_receipt_chain.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -661,6 +662,12 @@ const MIGRATIONS: &[Migration] = &[
         "search_index",
         SEARCH_INDEX_SCHEMA,
         MigrationOwner::Sekai,
+    ),
+    mig(
+        80,
+        "receipt_chain",
+        RECEIPT_CHAIN_SCHEMA,
+        MigrationOwner::Chisei,
     ),
 ];
 

@@ -51,6 +51,8 @@ template.
 | `SEKAI_OBJECT_LOG_HOST` | unset | `host:port` of a mikura object-log host (ADR 0088). Admits append and read generations through it instead of a local log. Mutually exclusive with `SEKAI_OBJECT_LOG`: setting both fails every ingest closed, and the dual-read canary never opens the local log behind a host |
 | `SEKAI_OBJECT_LOG_HOST_BEARER` | unset | Bearer the object-log host requires. Required for a non-loopback host |
 | `CHISEI_PERMIT_SIGNING_KEY` | unset | Ed25519 seed (64 lowercase hex chars) for external-action permit signing; required to issue permits |
+| `CHISEI_RECEIPT_CHAIN_SIGNING_KEY` | unset | Ed25519 seed (64 lowercase hex chars) that signs the per-namespace receipt chain; unset leaves receipts unchained. Offline verify takes `--trusted-key` with the matching public key hex ([ADR 0114](decisions/0114-signed-receipt-chain.md)) |
+| `CHISEI_RECEIPT_CHAIN_PREVIOUS_PUBLIC_KEYS` | unset | Comma-separated historical Ed25519 public keys (64 hex chars each). Required after the signing seed rotates so genesis, historical entries, and the latest checkpoint still authenticate, including during dataset redaction. |
 | `CHISEI_PERMIT_ISSUER` | `chisei.local` | Issuer id embedded in signed permits |
 | `CHISEI_PERMIT_KEY_ID` | `permit-key-1` | Key id embedded in signed permits for rotation |
 | `CHISEI_GOVERNED_SUBJECT_PROVENANCE_SIGNING_KEY` | unset | Separate Ed25519 seed (64 hexadecimal chars) for authenticated Tenkai-compatible governed-subject provenance; never returned by an API |
