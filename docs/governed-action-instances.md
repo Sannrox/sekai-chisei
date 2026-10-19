@@ -161,6 +161,13 @@ Describe and preview still never grant. `ListActionInstances` with
   since the park, the instance ends `denied` with `stale_on_resume` and
   nothing is written. Otherwise the object write, effects, and receipt
   match a direct admit.
+- **Decision memory (#1465).** Each grant or deny stores outcome, reason, and
+  the facts that mattered. `GetActionInstance` lists similar past decisions of
+  the same type (shared parameter keys; matching `object_id` when both have
+  one) that the caller may read, newest first, at most twenty, from the newest
+  256 stored decisions of that type. Empty parameters skip the lookup.
+  Superseded rows stay visible and labelled.
+  Precedent never auto-decides.
 - **Deny** is terminal (`denied_by_approver`).
 - **Idempotency.** Repeating a decision returns the recorded outcome
   (`replay=true`); a conflicting decision fails `FAILED_PRECONDITION`.

@@ -313,4 +313,95 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(ParkedGrantOutcome::Granted { previous })
     }
+
+    pub fn put_decision_memory(
+        &self,
+        memory: &crate::sekai::decision_memory::DecisionMemory,
+    ) -> Result<(), String> {
+        let body = serde_json::to_string(memory).map_err(|error| error.to_string())?;
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_action_decision_memory
+                 (memory_id, namespace, type_id, instance_id, decided_at_ms, body_json)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (memory_id) DO UPDATE SET
+                    namespace = EXCLUDED.namespace,
+                    type_id = EXCLUDED.type_id,
+                    instance_id = EXCLUDED.instance_id,
+                    decided_at_ms = EXCLUDED.decided_at_ms,
+                    body_json = EXCLUDED.body_json",
+                &[
+                    &memory.memory_id,
+                    &memory.namespace,
+                    &memory.type_id,
+                    &memory.instance_id,
+                    &memory.decided_at_ms,
+                    &body,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_decision_memory(
+        &self,
+        namespace: &str,
+        type_id: &str,
+    ) -> Result<Vec<crate::sekai::decision_memory::DecisionMemory>, String> {
+        self.list_decision_memory_page(namespace, type_id, 0, i64::MAX)
+    }
+
+    pub fn list_decision_memory_page(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::sekai::decision_memory::DecisionMemory>, String> {
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT body_json FROM sekai_action_decision_memory
+                 WHERE namespace = $1 AND type_id = $2
+                 ORDER BY decided_at_ms DESC
+                 LIMIT $3 OFFSET $4",
+                &[&namespace, &type_id, &limit, &offset],
+            )
+            .map_err(|error| error.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let body: String = row.get(0);
+            out.push(
+                serde_json::from_str(&body)
+                    .map_err(|error| format!("corrupt decision memory: {error}"))?,
+            );
+        }
+        Ok(out)
+    }
+
+    pub fn get_decision_memory(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<crate::sekai::decision_memory::DecisionMemory>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT body_json FROM sekai_action_decision_memory WHERE memory_id = $1",
+                &[&memory_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let body: String = row.get(0);
+                serde_json::from_str(&body).map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    pub fn mark_decision_memory_superseded(&self, memory_id: &str) -> Result<bool, String> {
+        let Some(mut memory) = self.get_decision_memory(memory_id)? else {
+            return Ok(false);
+        };
+        memory.superseded = true;
+        self.put_decision_memory(&memory)?;
+        Ok(true)
+    }
 }

@@ -1730,7 +1730,21 @@ message GetActionInstanceRequest {
   // Optional hop lookup when instance_id and idempotency_key are empty.
   string operation_id = 4;
 }
-message GetActionInstanceResponse { ActionInstance instance = 1; }
+message ActionDecisionPrecedent {
+  string instance_id = 1;
+  string outcome = 2;
+  string reason = 3;
+  string conditions_json = 4;
+  string facts_json = 5;
+  string decided_by = 6;
+  int64 decided_at_ms = 7;
+  bool superseded = 8;
+}
+message GetActionInstanceResponse {
+  ActionInstance instance = 1;
+  // Past similar decisions the caller may read (#1465).
+  repeated ActionDecisionPrecedent decision_precedents = 2;
+}
 message ListActionInstancesRequest {
   string namespace = 1;
   string type_id = 2;

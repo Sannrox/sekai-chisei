@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Grant and deny on parked Actions store structured decision memory. A later
+  similar Action of the same type surfaces those precedents on
+  `GetActionInstance`, omitting decisions the caller cannot read and labelling
+  superseded rows (`0084_decision_memory`, #1465).
+
 - Agents start propose-only. After enough unchanged approvals and no
   incidents, an admin can grant auto-apply for that Action type against a
   live bounded envelope. Matching submits skip review; other types still

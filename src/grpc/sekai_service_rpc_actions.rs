@@ -595,8 +595,80 @@ pub(super) async fn get_action_instance(
         &policy_context,
         &stored,
     )?;
+    let mut decision_precedents = Vec::new();
+    let mut offset = 0_i64;
+    const PAGE: i64 = 64;
+    if crate::sekai::decision_memory::similar_parameters(
+        &stored.parameters_json,
+        &stored.parameters_json,
+    ) {
+        loop {
+            let page = service
+                .db
+                .runtime()
+                .list_decision_memory_page(&stored.namespace, &stored.type_id, offset, PAGE)
+                .map_err(Status::internal)?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            for memory in page {
+                if memory.instance_id == stored.instance_id {
+                    continue;
+                }
+                if !crate::sekai::decision_memory::similar_parameters(
+                    &memory.parameters_json,
+                    &stored.parameters_json,
+                ) {
+                    continue;
+                }
+                let Some(past) = service
+                    .db
+                    .runtime()
+                    .get_action_instance(&memory.instance_id)
+                    .map_err(Status::internal)?
+                else {
+                    continue;
+                };
+                if authorize_action_instance_visibility(
+                    service,
+                    &principals,
+                    tenant_context.as_ref(),
+                    &policy_context,
+                    &past,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                decision_precedents.push(ActionDecisionPrecedent {
+                    instance_id: memory.instance_id,
+                    outcome: memory.outcome,
+                    reason: memory.reason,
+                    conditions_json: memory.conditions_json,
+                    facts_json: memory.facts_json,
+                    decided_by: memory.decided_by,
+                    decided_at_ms: memory.decided_at_ms,
+                    superseded: memory.superseded,
+                });
+                if decision_precedents.len() >= crate::sekai::decision_memory::MAX_PRECEDENTS {
+                    break;
+                }
+            }
+            if decision_precedents.len() >= crate::sekai::decision_memory::MAX_PRECEDENTS
+                || page_len < PAGE as usize
+            {
+                break;
+            }
+            offset += PAGE;
+            if offset >= crate::sekai::decision_memory::MAX_SCAN_ROWS {
+                break;
+            }
+        }
+    }
     Ok(Response::new(GetActionInstanceResponse {
         instance: Some(to_proto_action_instance(&stored)),
+        decision_precedents,
     }))
 }
 pub(super) async fn list_action_instances(
