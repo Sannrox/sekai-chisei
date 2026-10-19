@@ -1,7 +1,8 @@
-//! sekaictl admin autonomy commands (#715).
+//! sekaictl admin autonomy commands (#715, #1469).
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
+use crate::sekai::agent_autonomy::{self, AutonomyThreshold};
 use crate::sekai::autonomous_envelope::{self, AutonomousEnvelope};
 use chrono::Utc;
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin autonomy admit --envelope <file> [--actor <principal>]\n  sekaictl admin autonomy get --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy stop --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy rollback --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy note-lease-loss --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy invalidate-receipt --namespace <ns> --envelope-id <id> [--actor <principal>]"
+    "sekaictl admin autonomy admit --envelope <file> [--actor <principal>]\n  sekaictl admin autonomy get --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy stop --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy rollback --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy note-lease-loss --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy invalidate-receipt --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy offer --namespace <ns> --principal <agent> --type <type_id> [--actor <principal>]\n  sekaictl admin autonomy grant-auto-apply --namespace <ns> --principal <agent> --type <type_id> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy revoke-auto-apply --namespace <ns> --principal <agent> --type <type_id> --reason <reason> [--actor <principal>]"
 }
 
 pub async fn run_autonomy_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -20,6 +21,9 @@ pub async fn run_autonomy_command(args: Vec<String>) -> Result<(), BoxErr> {
         Some("rollback") => rollback(parse_identity(&args[1..])?).await,
         Some("note-lease-loss") => lease_loss(parse_identity(&args[1..])?).await,
         Some("invalidate-receipt") => invalidate(parse_identity(&args[1..])?).await,
+        Some("offer") => offer(parse_grant(&args[1..], false, false)?).await,
+        Some("grant-auto-apply") => grant_auto_apply(parse_grant(&args[1..], true, false)?).await,
+        Some("revoke-auto-apply") => revoke_auto_apply(parse_grant(&args[1..], false, true)?).await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -130,6 +134,123 @@ async fn mutate(config: Identity, op: Mutate) -> Result<(), BoxErr> {
     Ok(())
 }
 
+struct GrantArgs {
+    namespace: String,
+    principal: String,
+    type_id: String,
+    envelope_id: String,
+    reason: String,
+    actor: String,
+}
+
+async fn offer(config: GrantArgs) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let snapshot = agent_autonomy::offer(
+        db.as_ref(),
+        &config.namespace,
+        &config.principal,
+        &config.type_id,
+        AutonomyThreshold::production(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    Ok(())
+}
+
+async fn grant_auto_apply(config: GrantArgs) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let grant = agent_autonomy::grant_auto_apply(
+        db.as_ref(),
+        agent_autonomy::GrantAutoApplyRequest {
+            actor: &config.actor,
+            namespace: &config.namespace,
+            principal: &config.principal,
+            type_id: &config.type_id,
+            envelope_id: &config.envelope_id,
+            now_ms: Utc::now().timestamp_millis(),
+            threshold: AutonomyThreshold::production(),
+        },
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&grant)?);
+    Ok(())
+}
+
+async fn revoke_auto_apply(config: GrantArgs) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let revoked = agent_autonomy::revoke_auto_apply(
+        db.as_ref(),
+        &config.actor,
+        &config.namespace,
+        &config.principal,
+        &config.type_id,
+        &config.reason,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&revoked)?);
+    Ok(())
+}
+
+fn parse_grant(
+    args: &[String],
+    need_envelope: bool,
+    need_reason: bool,
+) -> Result<GrantArgs, String> {
+    let mut namespace = None;
+    let mut principal = None;
+    let mut type_id = None;
+    let mut envelope_id = None;
+    let mut reason = None;
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            "--principal" => {
+                principal = Some(require_value(args, i, "--principal")?);
+                i += 2;
+            }
+            "--type" => {
+                type_id = Some(require_value(args, i, "--type")?);
+                i += 2;
+            }
+            "--envelope-id" => {
+                envelope_id = Some(require_value(args, i, "--envelope-id")?);
+                i += 2;
+            }
+            "--reason" => {
+                reason = Some(require_value(args, i, "--reason")?);
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    Ok(GrantArgs {
+        namespace: namespace.ok_or("--namespace is required")?,
+        principal: principal.ok_or("--principal is required")?,
+        type_id: type_id.ok_or("--type is required")?,
+        envelope_id: if need_envelope {
+            envelope_id.ok_or("--envelope-id is required")?
+        } else {
+            envelope_id.unwrap_or_default()
+        },
+        reason: if need_reason {
+            reason.ok_or("--reason is required")?
+        } else {
+            reason.unwrap_or_default()
+        },
+        actor,
+    })
+}
+
 fn parse_file(args: &[String]) -> Result<FileActor, String> {
     let mut path = None;
     let mut actor = "operator".to_string();
@@ -200,5 +321,8 @@ mod tests {
         assert!(usage.contains("stop"));
         assert!(usage.contains("rollback"));
         assert!(usage.contains("invalidate-receipt"));
+        assert!(usage.contains("grant-auto-apply"));
+        assert!(usage.contains("revoke-auto-apply"));
+        assert!(usage.contains("offer"));
     }
 }

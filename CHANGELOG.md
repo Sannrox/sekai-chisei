@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Agents start propose-only. After enough unchanged approvals and no
+  incidents, an admin can grant auto-apply for that Action type against a
+  live bounded envelope. Matching submits skip review; other types still
+  park. A rejected Action, a dead envelope, or a model pin change revokes
+  the grant. Grant and revoke write Decision receipts
+  (`sekaictl admin autonomy offer|grant-auto-apply|revoke-auto-apply`,
+  #1469).
+
 - Parked Actions can route to a review queue on the type: SLA, assignee pool,
   threshold, and auto-deny or reassign escalation. `DecideActionInstance`
   refuses a reviewer who is not the assignee. The approval receipt names the

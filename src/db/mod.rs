@@ -1,4 +1,5 @@
 pub mod action_governance;
+mod agent_autonomy_store;
 pub mod attestation;
 mod autonomous_envelope_store;
 mod capability_package_store;
