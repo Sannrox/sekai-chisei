@@ -1,0 +1,51 @@
+# Model a domain on a definition branch and open a proposal through sekai-mcp.
+#
+# Local recipe, not a CI fixture. Needs a reachable sekai-chisei with
+# SEKAI_EXPERIMENTAL_RPCS enabled, a `sekai-mcp` binary on PATH, and
+# SEKAI_MCP_PRINCIPAL / SEKAI_MCP_NAMESPACE / SEKAI_CREDENTIAL in the
+# environment of the shell that starts shikigami. Approve and merge stay with
+# a human over gRPC.
+version = 1
+
+[profile]
+name = "local"
+
+[governance]
+adapter = "local"
+principal = "tester"
+namespace = "acme"
+
+[workspace]
+adapter = "directory"
+root = "."
+
+[context]
+skills_root = "examples/shikigami-definition-branch"
+skills = ["model-domain-proposal"]
+
+[tools]
+enabled = [
+  "report",
+  "mcp.sekai.sekai.definitions.branch.create",
+  "mcp.sekai.sekai.definitions.branch.edit",
+  "mcp.sekai.sekai.definitions.diff",
+  "mcp.sekai.sekai.definitions.impact",
+  "mcp.sekai.sekai.definitions.proposal.create",
+]
+
+[[tools.mcp_servers]]
+name = "sekai"
+command = "sekai-mcp"
+framing = "newline"
+timeout_secs = 30
+
+[events]
+adapter = "jsonl"
+
+[model]
+adapter = "scripted"
+script_json = '''
+[
+  {"content":"Model this domain on a branch and open a proposal."}
+]
+'''

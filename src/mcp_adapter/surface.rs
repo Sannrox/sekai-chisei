@@ -43,6 +43,11 @@ pub enum NativeRpc {
     CreateLink,
     ResolveEvaluationPlan,
     ExecuteEvaluationManifest,
+    CreateDefinitionBranch,
+    ApplyDefinitionBranchEdit,
+    CompareDefinitionRevisions,
+    ReportDefinitionConsumerImpact,
+    CreateDefinitionProposal,
 }
 
 #[derive(Debug, Clone)]
@@ -260,7 +265,49 @@ pub async fn dispatch_native(
                 .into_inner();
             Ok(receipt_output(response))
         }
+        NativeRpc::CreateDefinitionBranch => dispatch_sekai_json(
+            sekai
+                .create_definition_branch(bind_json(&invocation)?)
+                .await,
+        ),
+        NativeRpc::ApplyDefinitionBranchEdit => dispatch_sekai_json(
+            sekai
+                .apply_definition_branch_edit(bind_json(&invocation)?)
+                .await,
+        ),
+        NativeRpc::CompareDefinitionRevisions => dispatch_sekai_json(
+            sekai
+                .compare_definition_revisions(bind_json(&invocation)?)
+                .await,
+        ),
+        NativeRpc::ReportDefinitionConsumerImpact => dispatch_sekai_json(
+            sekai
+                .report_definition_consumer_impact(bind_json(&invocation)?)
+                .await,
+        ),
+        NativeRpc::CreateDefinitionProposal => dispatch_sekai_json(
+            sekai
+                .create_definition_proposal(bind_json(&invocation)?)
+                .await,
+        ),
     }
+}
+
+fn bind_json<T: serde::de::DeserializeOwned + prost::Message + Default>(
+    invocation: &SdkInvocation,
+) -> Result<tonic::Request<T>, AdapterError> {
+    let payload = serde_json::from_value::<T>(invocation.input.clone())
+        .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+    invocation
+        .bind(payload)
+        .map_err(|error| AdapterError::Protocol(error.to_string()))
+}
+
+fn dispatch_sekai_json<T: serde::Serialize>(
+    result: Result<tonic::Response<T>, tonic::Status>,
+) -> Result<Value, AdapterError> {
+    let response = result.map_err(status_error)?.into_inner();
+    serde_json::to_value(response).map_err(|error| AdapterError::Protocol(error.to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -477,6 +524,34 @@ impl NativeSurface for FixtureSurface {
             NativeRpc::PreviewObjectAction => Ok(json!({
                 "outcome": "ready",
                 "reasonCode": "preview"
+            })),
+            NativeRpc::CreateDefinitionBranch => Ok(json!({
+                "branch": {
+                    "namespace": self.namespace,
+                    "branch_id": required_string(&invocation.input, "branch_id")?,
+                    "head_revision_digest": required_string(
+                        &invocation.input,
+                        "parent_revision_digest",
+                    )?,
+                }
+            })),
+            NativeRpc::ApplyDefinitionBranchEdit => Ok(json!({
+                "previous_head_digest": required_string(&invocation.input, "expected_head_digest")?,
+                "changed_member_digests": ["sha256:fixture-edit"]
+            })),
+            NativeRpc::CompareDefinitionRevisions => Ok(json!({
+                "diff": {"added": [], "removed": [], "changed": []}
+            })),
+            NativeRpc::ReportDefinitionConsumerImpact => Ok(json!({
+                "completeness": "complete",
+                "impacts": []
+            })),
+            NativeRpc::CreateDefinitionProposal => Ok(json!({
+                "proposal": {
+                    "namespace": self.namespace,
+                    "proposal_id": required_string(&invocation.input, "proposal_id")?,
+                    "status": "open"
+                }
             })),
         }
     }
@@ -724,6 +799,61 @@ impl NativeSurface for SdkSurface {
                 let response = with_timeout(
                     preview_deadline(self.config.timeout),
                     client.preview_object_action(request),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::CreateDefinitionBranch => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.create_definition_branch(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::ApplyDefinitionBranchEdit => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.apply_definition_branch_edit(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::CompareDefinitionRevisions => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.compare_definition_revisions(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::ReportDefinitionConsumerImpact => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.report_definition_consumer_impact(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::CreateDefinitionProposal => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.create_definition_proposal(bind_json(&invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)

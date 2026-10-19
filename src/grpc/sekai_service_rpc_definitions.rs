@@ -591,6 +591,24 @@ pub(super) async fn get_definition_proposal(
         proposal: Some(to_proto_definition_proposal(&proposal)),
     }))
 }
+fn refuse_proposal_creator(
+    proposal: &definition_proposal_domain::DefinitionProposal,
+    actor: &str,
+    action: &str,
+) -> Result<(), Status> {
+    // `root` / `local` are the unix-socket operator identity. One operator
+    // creates, approves, and merges on that path. Agent principals cannot.
+    if matches!(actor, "root" | "local") {
+        return Ok(());
+    }
+    if proposal.created_by == actor {
+        return Err(Status::permission_denied(format!(
+            "proposal creator cannot {action}"
+        )));
+    }
+    Ok(())
+}
+
 /// Approving, merging, or closing discloses both revisions, so the caller
 /// must read them as creation and retrieval require (ADR 0111).
 fn authorize_proposal_revision_reads(
@@ -631,6 +649,10 @@ pub(super) async fn approve_definition_proposal(
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    let actor = principals
+        .first()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    refuse_proposal_creator(&proposal, actor, "approve")?;
     authorize_proposal_revision_reads(service, &principals, &proposal)?;
     authorize_proposal_member_writes(
         service,
@@ -639,9 +661,6 @@ pub(super) async fn approve_definition_proposal(
         &proposal.base_digest,
         &proposal.candidate_digest,
     )?;
-    let actor = principals
-        .first()
-        .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let result = service
         .db
         .runtime()
@@ -683,6 +702,10 @@ pub(super) async fn merge_definition_proposal(
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    let actor = principals
+        .first()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    refuse_proposal_creator(&proposal, actor, "merge")?;
     authorize_proposal_revision_reads(service, &principals, &proposal)?;
     authorize_proposal_member_writes(
         service,
@@ -716,9 +739,6 @@ pub(super) async fn merge_definition_proposal(
             "definition write is not current",
         ));
     }
-    let actor = principals
-        .first()
-        .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let result = service
         .db
         .runtime()

@@ -67,7 +67,9 @@ enter the published member map. Creating a proposal does not move the
 published head.
 
 `ApproveDefinitionProposal` records a live approval on an open proposal.
-`MergeDefinitionProposal` requires `expected_published_digest` and rechecks
+An agent principal that created the proposal cannot approve or merge it,
+including when that principal still holds namespace write and changed-member
+admin (#1311). `MergeDefinitionProposal` requires `expected_published_digest` and rechecks
 that the live published head equals both that digest and the pinned base, the
 branch head still equals the candidate, the candidate descends from the pinned
 base, at least one recorded approver still holds namespace write and

@@ -144,7 +144,20 @@ fn mcp_allowlist_paragraph(catalog: &str) -> &str {
     let start = section
         .find("returns only the v1 allowlist:")
         .expect("MCP v1 allowlist sentence");
-    &section[start..]
+    section[start..]
+        .split("\n### Definition-branch tools")
+        .next()
+        .expect("stable MCP allowlist before definition-branch tools")
+}
+
+fn definition_branch_tools_paragraph(catalog: &str) -> &str {
+    catalog
+        .split("### Definition-branch tools")
+        .nth(1)
+        .expect("definition-branch tools heading")
+        .split("\nThe SDK bindings")
+        .next()
+        .expect("definition-branch tools before SDK bindings")
 }
 
 #[test]
@@ -195,10 +208,50 @@ fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
         "capability catalog must not call stable evaluation RPCs experimental: {allowlist}"
     );
 
+    let definition_tools = [
+        "sekai.definitions.branch.create",
+        "sekai.definitions.branch.edit",
+        "sekai.definitions.diff",
+        "sekai.definitions.impact",
+        "sekai.definitions.proposal.create",
+    ];
     for tool in &projected {
+        if definition_tools.contains(tool) {
+            continue;
+        }
         assert!(
             allowlist.contains(tool),
             "capability catalog MCP allowlist must list projected tool {tool}"
         );
     }
+
+    let definition = definition_branch_tools_paragraph(&catalog);
+    for tool in definition_tools {
+        assert!(
+            projected.contains(&tool),
+            "{tool} must stay on the shipped MCP allowlist"
+        );
+        assert!(
+            !capability_is_stable(tool),
+            "{tool} backing RPC must stay experimental"
+        );
+        assert!(
+            definition.contains(tool),
+            "definition-branch catalog paragraph must list {tool}"
+        );
+        let rpc = capability_backing_rpc(tool).expect("definition tool maps to an RPC");
+        assert!(
+            definition.contains(rpc),
+            "definition-branch catalog paragraph must list {rpc}"
+        );
+    }
+    assert!(
+        definition.contains("SEKAI_EXPERIMENTAL_RPCS"),
+        "definition-branch catalog paragraph must name SEKAI_EXPERIMENTAL_RPCS: {definition}"
+    );
+    assert!(
+        !definition.contains("sekai.definitions.proposal.approve")
+            && !definition.contains("sekai.definitions.proposal.merge"),
+        "approve and merge stay off MCP: {definition}"
+    );
 }
