@@ -7,6 +7,12 @@
   `GetActionInstance`, omitting decisions the caller cannot read and labelling
   superseded rows (`0084_decision_memory`, #1465).
 
+- MCP lists definition-branch tools so an agent can create a branch, edit it,
+  diff, report impact, and open a proposal. Approve and merge stay off MCP.
+  The creating agent principal cannot approve or merge, including when it
+  holds changed-member admin. Backing RPCs stay behind
+  `SEKAI_EXPERIMENTAL_RPCS` (#1311).
+
 - Agents start propose-only. After enough unchanged approvals and no
   incidents, an admin can grant auto-apply for that Action type against a
   live bounded envelope. Matching submits skip review; other types still

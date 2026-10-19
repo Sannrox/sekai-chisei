@@ -443,6 +443,21 @@ mappings, forged reserved metadata, oversized frames, and revoked catalog
 access fail closed. The adapter never invents success; timeouts and unknown
 effects reconcile through `GetOperationReceipt`.
 
+### Definition-branch tools
+
+`tools/list` also returns definition-branch tools whose backing RPCs stay
+`experimental` and remain gated by `SEKAI_EXPERIMENTAL_RPCS` (#1311):
+`sekai.definitions.branch.create` → `CreateDefinitionBranch`,
+`sekai.definitions.branch.edit` → `ApplyDefinitionBranchEdit`,
+`sekai.definitions.diff` → `CompareDefinitionRevisions`,
+`sekai.definitions.impact` → `ReportDefinitionConsumerImpact`, and
+`sekai.definitions.proposal.create` → `CreateDefinitionProposal`.
+Each call binds `input.namespace` to the session namespace and refuses a
+different one. Approve and merge stay off MCP. The server still refuses
+`ApproveDefinitionProposal` and `MergeDefinitionProposal` from the agent
+principal that created the proposal, including when that principal holds
+changed-member admin.
+
 The SDK bindings under `sdk/` consume the same serialized projection. TypeScript
 `getQualityTrend` and Python `get_quality_trend` send `chisei.quality.read` and
 call `GetQualityTrend`; they do not reimplement the reducer. Every binding fails

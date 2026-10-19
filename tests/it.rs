@@ -77,6 +77,7 @@ mod integration_contract;
 mod lakehouse_snapshot_adr;
 mod managed_shikigami_routing_fixture;
 mod mcp_adapter;
+mod mcp_definition_branch;
 mod model_platform_adr;
 mod model_release_evidence_adr;
 mod namespace_model_review_adr;
@@ -241,6 +242,7 @@ const GROUPED_MODULES: &[&str] = &[
     "lakehouse_snapshot_adr",
     "managed_shikigami_routing_fixture",
     "mcp_adapter",
+    "mcp_definition_branch",
     "model_platform_adr",
     "model_release_evidence_adr",
     "namespace_model_review_adr",
@@ -406,6 +408,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 135);
+    assert_eq!(GROUPED_MODULES.len(), 136);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

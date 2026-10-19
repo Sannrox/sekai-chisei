@@ -25,7 +25,12 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.links.get",
             "sekai.links.create",
             "chisei.evaluation.resolve",
-            "chisei.evaluation.execute"
+            "chisei.evaluation.execute",
+            "sekai.definitions.branch.create",
+            "sekai.definitions.branch.edit",
+            "sekai.definitions.diff",
+            "sekai.definitions.impact",
+            "sekai.definitions.proposal.create"
         ]
     );
     assert_eq!(report.object_id, "widget-1");
