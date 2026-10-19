@@ -230,6 +230,15 @@ impl SekaiDb {
                     tenant_id TEXT NOT NULL,
                     completed_at_ms INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS sekai_streaming_transform_apply (
+                    run_id TEXT NOT NULL,
+                    checkpoint TEXT NOT NULL,
+                    claim_generation INTEGER NOT NULL,
+                    transform_version TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (run_id, checkpoint)
+                );
                 ",
             )
             .map_err(|error| error.to_string())?;
@@ -1265,6 +1274,67 @@ impl SekaiDb {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
+
+    pub fn peek_streaming_transform_apply(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        checkpoint: &str,
+        now_ms: i64,
+    ) -> Result<
+        Option<crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt>,
+        crate::sekai::streaming_transform_apply::StreamingApplyError,
+    > {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(
+                error.to_string(),
+            )
+        })?;
+        let receipt = load_streaming_apply_receipt_tx(
+            &tx,
+            run_id,
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            checkpoint,
+            now_ms,
+        )?;
+        tx.commit().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(
+                error.to_string(),
+            )
+        })?;
+        Ok(receipt)
+    }
+
+    pub fn apply_streaming_transform_batch(
+        &self,
+        batch: crate::sekai::streaming_transform_apply::StreamingTransformApplyBatch,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<
+        crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt,
+        crate::sekai::streaming_transform_apply::StreamingApplyError,
+    > {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(
+                    error.to_string(),
+                )
+            })?;
+        let receipt = apply_streaming_transform_batch_tx(&tx, &batch, actor, now_ms)?;
+        tx.commit().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(
+                error.to_string(),
+            )
+        })?;
+        Ok(receipt)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1745,6 +1815,127 @@ fn write_preview_transform_run_tx(
     persist_preview_result(tx, &result)?;
     persist_preview_auth(tx, &command.run_id, &admitted_auth)?;
     Ok(preview_writeback_run(&done, command, now_ms))
+}
+
+fn apply_streaming_transform_batch_tx(
+    tx: &Transaction<'_>,
+    batch: &crate::sekai::streaming_transform_apply::StreamingTransformApplyBatch,
+    actor: &str,
+    now_ms: i64,
+) -> Result<
+    crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt,
+    crate::sekai::streaming_transform_apply::StreamingApplyError,
+> {
+    use crate::sekai::streaming_transform_apply::{
+        StreamingApplyError, decode_receipt, encode_receipt, map_persist_error, receipt_from_batch,
+    };
+    if let Some(receipt) = load_streaming_apply_receipt_tx(
+        tx,
+        &batch.run_id,
+        &batch.runtime_id,
+        batch.claim_generation,
+        &batch.fencing_token,
+        &batch.checkpoint,
+        now_ms,
+    )? {
+        return Ok(receipt);
+    }
+    let receipt = receipt_from_batch(batch, false);
+    let receipt_json = encode_receipt(&receipt).map_err(StreamingApplyError::Internal)?;
+    match tx.execute(
+        "INSERT INTO sekai_streaming_transform_apply
+         (run_id, checkpoint, claim_generation, transform_version, receipt_json, created_at_ms)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            batch.run_id,
+            batch.checkpoint,
+            batch.claim_generation,
+            batch.transform_version,
+            receipt_json,
+            now_ms
+        ],
+    ) {
+        Ok(_) => {}
+        Err(error) if error.to_string().contains("UNIQUE constraint failed") => {
+            let raw: String = tx
+                .query_row(
+                    "SELECT receipt_json FROM sekai_streaming_transform_apply
+                     WHERE run_id = ?1 AND checkpoint = ?2",
+                    params![batch.run_id, batch.checkpoint],
+                    |row| row.get(0),
+                )
+                .map_err(|error| StreamingApplyError::Internal(error.to_string()))?;
+            let mut stored = decode_receipt(&raw).map_err(StreamingApplyError::Internal)?;
+            stored.replay = true;
+            return Ok(stored);
+        }
+        Err(error) => return Err(StreamingApplyError::Internal(error.to_string())),
+    }
+    let policy_generation = Some(batch.policy_generation.as_str());
+    for edit in &batch.edits {
+        if edit.create {
+            crate::sekai::audit::insert_created_object_in(
+                tx,
+                &edit.object,
+                actor,
+                policy_generation,
+            )
+            .map_err(map_persist_error)?;
+        } else {
+            let previous = crate::sekai::audit::update_object_in(
+                tx,
+                &edit.object,
+                edit.expected.as_ref(),
+                actor,
+                policy_generation,
+            )
+            .map_err(map_persist_error)?;
+            if previous.is_none() {
+                return Err(StreamingApplyError::FailedPrecondition(format!(
+                    "object {} not found",
+                    edit.object.id
+                )));
+            }
+        }
+    }
+    Ok(receipt)
+}
+
+fn load_streaming_apply_receipt_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+    checkpoint: &str,
+    now_ms: i64,
+) -> Result<
+    Option<crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt>,
+    crate::sekai::streaming_transform_apply::StreamingApplyError,
+> {
+    use crate::sekai::streaming_transform_apply::{StreamingApplyError, decode_receipt};
+    let work = load_transform_work(tx, run_id)
+        .map_err(StreamingApplyError::Internal)?
+        .ok_or_else(|| StreamingApplyError::NotFound("transform work not found".into()))?;
+    if !transform_claim_fence_matches(&work, runtime_id, claim_generation, fencing_token, now_ms) {
+        return Err(StreamingApplyError::FailedPrecondition(
+            STALE_TRANSFORM_CLAIM.into(),
+        ));
+    }
+    tx.query_row(
+        "SELECT receipt_json FROM sekai_streaming_transform_apply
+         WHERE run_id = ?1 AND checkpoint = ?2",
+        params![run_id, checkpoint],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|error| StreamingApplyError::Internal(error.to_string()))?
+    .map(|raw| {
+        let mut receipt = decode_receipt(&raw).map_err(StreamingApplyError::Internal)?;
+        receipt.replay = true;
+        Ok(receipt)
+    })
+    .transpose()
 }
 
 fn write_transform_run_tx(

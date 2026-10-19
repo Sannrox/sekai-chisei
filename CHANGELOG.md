@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Isolated-process streaming workers can apply a batch of Action-written
+  object edits together with an input checkpoint in one transaction.
+  Replay of the same `(run_id, checkpoint)` returns the original receipt.
+  An older claim generation is fenced. Action policy Deny and
+  RequireApproval fail closed. `ApplyStreamingTransformBatch` stays behind
+  `SEKAI_EXPERIMENTAL_RPCS` (`0085_streaming_transform_apply`, GATE:mig,
+  #1583).
+
 - Grant and deny on parked Actions store structured decision memory. A later
   similar Action of the same type surfaces those precedents on
   `GetActionInstance`, omitting decisions the caller cannot read and labelling

@@ -705,6 +705,23 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ApplyStreamingTransformBatch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/sekai/streaming_transform_apply.rs",
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "TickGovernedTransforms",
       "kind": "persistent",
       "surfaces": [

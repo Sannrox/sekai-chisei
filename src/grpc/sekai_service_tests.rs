@@ -23763,3 +23763,391 @@ fn write_freeze_blocks_object_write_when_registered_tenant_is_frozen() {
             .contains("write freeze (tenant/acme-tenant/block_writes)")
     );
 }
+
+#[tokio::test]
+async fn apply_streaming_transform_batch_is_fenced_and_idempotent() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_action_type::{EFFECT_KIND_NOTIFY, GovernedActionType};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
+    };
+    use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    runtime
+        .upsert_object_type(&ObjectType {
+            kind: "stream_record".into(),
+            description: "fixture".into(),
+            properties: vec![PropertyDef {
+                name: "n".into(),
+                prop_type: PropertyType::String,
+                required: false,
+                description: String::new(),
+                enum_values: vec![],
+                link_kind: String::new(),
+                compute_expr: String::new(),
+                classification: "public".into(),
+                struct_fields: vec![],
+            }],
+            is_builtin: false,
+            implements: vec![],
+        })
+        .unwrap();
+    runtime
+        .put_governed_action_type(
+            GovernedActionType {
+                namespace: "ops".into(),
+                type_id: "stream.record.create".into(),
+                version: "1".into(),
+                description: "create".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"},"n":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                object_kind: "stream_record".into(),
+                object_mutation: crate::sekai::governed_action_type::OBJECT_MUTATION_CREATE.into(),
+                enabled: true,
+                created_by: "alice".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                ..Default::default()
+            },
+            "alice",
+            5,
+        )
+        .unwrap();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "iso-stream".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    runtime
+        .run_governed_transform("ops", "iso-stream", false, 20)
+        .unwrap();
+    let work = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    let apply_req = || ApplyStreamingTransformBatchRequest {
+        run_id: work.run_id.clone(),
+        runtime_id: work.claim_owner.clone(),
+        claim_generation: work.claim_generation,
+        fencing_token: work.fencing_token.clone(),
+        checkpoint: "c0".into(),
+        action_type_id: "stream.record.create".into(),
+        action_type_version: "1".into(),
+        edits: vec![StreamingTransformObjectEdit {
+            object_id: "rec-0".into(),
+            name: "rec-0".into(),
+            properties: HashMap::from([("n".into(), "0".into())]),
+        }],
+        input_positions: vec![StreamingTransformInputPosition {
+            source: "src".into(),
+            position: "c0".into(),
+        }],
+    };
+    let first = svc
+        .apply_streaming_transform_batch(with_named_principal(apply_req(), "local"))
+        .await
+        .unwrap()
+        .into_inner()
+        .receipt
+        .unwrap();
+    assert!(!first.replay);
+    assert_eq!(first.objects[0].object_id, "rec-0");
+    let replay = svc
+        .apply_streaming_transform_batch(with_named_principal(apply_req(), "local"))
+        .await
+        .unwrap()
+        .into_inner()
+        .receipt
+        .unwrap();
+    assert!(replay.replay);
+    assert_eq!(replay.objects, first.objects);
+    let mut stale = apply_req();
+    stale.checkpoint = "c1".into();
+    stale.claim_generation = work.claim_generation.saturating_sub(1);
+    stale.edits[0].object_id = "rec-1".into();
+    let fenced = svc
+        .apply_streaming_transform_batch(with_named_principal(stale, "local"))
+        .await
+        .unwrap_err();
+    assert_eq!(fenced.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        fenced.message(),
+        crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM
+    );
+    assert!(runtime.get_object("rec-1").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn apply_streaming_transform_batch_stamps_markings_and_refuses_declassify() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_action_type::{EFFECT_KIND_NOTIFY, GovernedActionType};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
+    };
+    use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
+    use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
+
+    let svc = service();
+    let runtime = svc.db.runtime();
+    runtime
+        .upsert_object_type(&ObjectType {
+            kind: "stream_record".into(),
+            description: "fixture".into(),
+            properties: vec![PropertyDef {
+                name: "n".into(),
+                prop_type: PropertyType::String,
+                required: false,
+                description: String::new(),
+                enum_values: vec![],
+                link_kind: String::new(),
+                compute_expr: String::new(),
+                classification: "public".into(),
+                struct_fields: vec![],
+            }],
+            is_builtin: false,
+            implements: vec![],
+        })
+        .unwrap();
+    let marked_schema = r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"},"n":{"type":"string"},"access_marking":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#;
+    runtime
+        .put_governed_action_type(
+            GovernedActionType {
+                namespace: "ops".into(),
+                type_id: "stream.record.create".into(),
+                version: "1".into(),
+                description: "create".into(),
+                parameter_schema_json: marked_schema.into(),
+                allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                object_kind: "stream_record".into(),
+                object_mutation: crate::sekai::governed_action_type::OBJECT_MUTATION_CREATE.into(),
+                enabled: true,
+                created_by: "alice".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                ..Default::default()
+            },
+            "alice",
+            5,
+        )
+        .unwrap();
+    runtime
+        .put_governed_action_type(
+            GovernedActionType {
+                namespace: "ops".into(),
+                type_id: "stream.record.update".into(),
+                version: "1".into(),
+                description: "update".into(),
+                parameter_schema_json: marked_schema.into(),
+                allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                object_kind: "stream_record".into(),
+                object_mutation: crate::sekai::governed_action_type::OBJECT_MUTATION_UPDATE.into(),
+                enabled: true,
+                created_by: "alice".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                ..Default::default()
+            },
+            "alice",
+            6,
+        )
+        .unwrap();
+    runtime
+        .create_object(&crate::domain::Object {
+            id: "in-obj".into(),
+            kind: "stream_record".into(),
+            name: "in-obj".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([(
+                OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let dataset = |id: &str, object_id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: object_id.into(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in", "in-obj")).unwrap();
+    runtime.create_dataset(&dataset("out", "")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    runtime
+        .put_governed_transform(
+            &GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "iso-stream".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap(),
+            10,
+        )
+        .unwrap();
+    runtime
+        .run_governed_transform("ops", "iso-stream", false, 20)
+        .unwrap();
+    let work = svc
+        .claim_transform_work(with_named_principal(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    let created = svc
+        .apply_streaming_transform_batch(with_named_principal(
+            ApplyStreamingTransformBatchRequest {
+                run_id: work.run_id.clone(),
+                runtime_id: work.claim_owner.clone(),
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token.clone(),
+                checkpoint: "c0".into(),
+                action_type_id: "stream.record.create".into(),
+                action_type_version: "1".into(),
+                edits: vec![StreamingTransformObjectEdit {
+                    object_id: "rec-0".into(),
+                    name: "rec-0".into(),
+                    properties: HashMap::from([
+                        ("n".into(), "0".into()),
+                        (OBJECT_CLASSIFICATION_PROPERTY.into(), "public".into()),
+                    ]),
+                }],
+                input_positions: vec![StreamingTransformInputPosition {
+                    source: "src".into(),
+                    position: "c0".into(),
+                }],
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .receipt
+        .unwrap();
+    assert!(!created.replay);
+    let stored = runtime.get_object("rec-0").unwrap().expect("created");
+    assert_eq!(
+        stored
+            .properties
+            .get(OBJECT_CLASSIFICATION_PROPERTY)
+            .map(String::as_str),
+        Some("confidential")
+    );
+    svc.apply_streaming_transform_batch(with_named_principal(
+        ApplyStreamingTransformBatchRequest {
+            run_id: work.run_id.clone(),
+            runtime_id: work.claim_owner.clone(),
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token.clone(),
+            checkpoint: "c1".into(),
+            action_type_id: "stream.record.update".into(),
+            action_type_version: "1".into(),
+            edits: vec![StreamingTransformObjectEdit {
+                object_id: "rec-0".into(),
+                name: "rec-0".into(),
+                properties: HashMap::from([
+                    ("n".into(), "1".into()),
+                    (OBJECT_CLASSIFICATION_PROPERTY.into(), "public".into()),
+                ]),
+            }],
+            input_positions: vec![StreamingTransformInputPosition {
+                source: "src".into(),
+                position: "c1".into(),
+            }],
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let stored = runtime.get_object("rec-0").unwrap().expect("updated");
+    assert_eq!(stored.properties.get("n").map(String::as_str), Some("1"));
+    assert_eq!(
+        stored
+            .properties
+            .get(OBJECT_CLASSIFICATION_PROPERTY)
+            .map(String::as_str),
+        Some("confidential")
+    );
+}

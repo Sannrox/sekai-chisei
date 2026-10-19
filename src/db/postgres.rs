@@ -149,6 +149,8 @@ const RECEIPT_CHAIN_SCHEMA: &str = include_str!("postgres/0081_receipt_chain.sql
 const GRANT_TERMS_SCHEMA: &str = include_str!("postgres/0082_grant_terms.sql");
 const WRITE_FREEZE_SCHEMA: &str = include_str!("postgres/0083_write_freeze.sql");
 const DECISION_MEMORY_SCHEMA: &str = include_str!("postgres/0084_decision_memory.sql");
+const STREAMING_TRANSFORM_APPLY_SCHEMA: &str =
+    include_str!("postgres/0085_streaming_transform_apply.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -683,6 +685,12 @@ const MIGRATIONS: &[Migration] = &[
         83,
         "decision_memory",
         DECISION_MEMORY_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        84,
+        "streaming_transform_apply",
+        STREAMING_TRANSFORM_APPLY_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -1543,6 +1551,11 @@ mod tests {
             CONNECTOR_CERTIFICATIONS_SCHEMA
                 .contains("sekai_connector_certifications_live_identity"),
             "missing PostgreSQL live-certification unique index"
+        );
+        assert!(
+            STREAMING_TRANSFORM_APPLY_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_streaming_transform_apply"),
+            "missing PostgreSQL streaming transform apply table"
         );
         assert!(
             FUNCTION_GATE_APPROVALS_SCHEMA

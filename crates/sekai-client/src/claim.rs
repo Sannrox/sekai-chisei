@@ -22,14 +22,15 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::protocol::sekai::{
-    AckActionWorkRequest, AckActionWorkResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
+    AckActionWorkRequest, AckActionWorkResponse, ApplyStreamingTransformBatchRequest,
+    ApplyStreamingTransformBatchResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
     ClaimTransformWorkRequest, ClaimTransformWorkResponse, HeartbeatActionClaimRequest,
     HeartbeatActionClaimResponse, HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse,
     ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
     ListClaimableTransformWorkRequest, ListClaimableTransformWorkResponse,
     ReadTransformRunInputsRequest, ReadTransformRunInputsResponse, ReportActionClaimEventRequest,
-    ReportActionClaimEventResponse, TransformRunInputRow, WriteTransformRunResultRequest,
-    WriteTransformRunResultResponse,
+    ReportActionClaimEventResponse, StreamingTransformInputPosition, StreamingTransformObjectEdit,
+    TransformRunInputRow, WriteTransformRunResultRequest, WriteTransformRunResultResponse,
 };
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -56,6 +57,7 @@ const CLAIM_TRANSFORM: &str = "/sekai.SekaiService/ClaimTransformWork";
 const HEARTBEAT_TRANSFORM: &str = "/sekai.SekaiService/HeartbeatTransformClaim";
 const READ_TRANSFORM: &str = "/sekai.SekaiService/ReadTransformRunInputs";
 const WRITE_TRANSFORM: &str = "/sekai.SekaiService/WriteTransformRunResult";
+const APPLY_STREAMING_TRANSFORM: &str = "/sekai.SekaiService/ApplyStreamingTransformBatch";
 
 /// Dispatch kind a worker lists or claims. Transform work uses the isolated
 /// JobSpec profile; Action work uses `runtime_dispatch`.
@@ -234,6 +236,16 @@ pub struct TransformRead {
     /// Unset reads every partition. `Some("")` selects the empty identity.
     pub partition_key: Option<String>,
     pub max_bytes: i64,
+}
+
+/// Fenced streaming object-apply payload for an isolated-process run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamingTransformApply {
+    pub checkpoint: String,
+    pub action_type_id: String,
+    pub action_type_version: String,
+    pub edits: Vec<StreamingTransformObjectEdit>,
+    pub input_positions: Vec<StreamingTransformInputPosition>,
 }
 
 /// Fenced write-back payload for an isolated-process run.
@@ -646,6 +658,30 @@ impl<'a> RuntimeClaimClient<'a> {
                 quarantined: write.quarantined,
                 quality_rule: write.quality_rule,
                 partitions: write.partitions,
+            },
+            false,
+            true,
+        )
+        .await
+    }
+
+    pub async fn apply_streaming_transform_batch(
+        &self,
+        fence: &TransformFence,
+        apply: StreamingTransformApply,
+    ) -> Result<ApplyStreamingTransformBatchResponse, RuntimeClaimError> {
+        self.unary(
+            APPLY_STREAMING_TRANSFORM,
+            ApplyStreamingTransformBatchRequest {
+                run_id: fence.run_id.clone(),
+                runtime_id: fence.runtime_id.clone(),
+                claim_generation: fence.generation,
+                fencing_token: fence.fencing_token.clone(),
+                checkpoint: apply.checkpoint,
+                action_type_id: apply.action_type_id,
+                action_type_version: apply.action_type_version,
+                edits: apply.edits,
+                input_positions: apply.input_positions,
             },
             false,
             true,
