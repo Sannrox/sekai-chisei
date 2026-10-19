@@ -4570,6 +4570,62 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_decision_memory(
+        &self,
+        memory: &crate::sekai::decision_memory::DecisionMemory,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_decision_memory(memory),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_decision_memory(memory))
+            }
+        }
+    }
+
+    pub fn list_decision_memory(
+        &self,
+        namespace: &str,
+        type_id: &str,
+    ) -> Result<Vec<crate::sekai::decision_memory::DecisionMemory>, String> {
+        self.list_decision_memory_page(namespace, type_id, 0, i64::MAX)
+    }
+
+    pub fn list_decision_memory_page(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::sekai::decision_memory::DecisionMemory>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_decision_memory_page(namespace, type_id, offset, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_decision_memory_page(namespace, type_id, offset, limit)
+            }),
+        }
+    }
+
+    pub fn get_decision_memory(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<crate::sekai::decision_memory::DecisionMemory>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_decision_memory(memory_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_decision_memory(memory_id))
+            }
+        }
+    }
+
+    pub fn mark_decision_memory_superseded(&self, memory_id: &str) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.mark_decision_memory_superseded(memory_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.mark_decision_memory_superseded(memory_id))
+            }
+        }
+    }
+
     pub fn put_action_binding(
         &self,
         binding: &crate::sekai::action_binding::ActionBinding,

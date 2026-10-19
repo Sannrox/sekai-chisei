@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Grant and deny on parked Actions store structured decision memory. A later
+  similar Action of the same type surfaces those precedents on
+  `GetActionInstance`, omitting decisions the caller cannot read and labelling
+  superseded rows (`0084_decision_memory`, #1465).
+
 - MCP lists definition-branch tools so an agent can create a branch, edit it,
   diff, report impact, and open a proposal. Approve and merge stay off MCP.
   The creating agent principal cannot approve or merge, including when it

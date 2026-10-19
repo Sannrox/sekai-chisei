@@ -148,6 +148,7 @@ const SEARCH_INDEX_SCHEMA: &str = include_str!("postgres/0080_search_index.sql")
 const RECEIPT_CHAIN_SCHEMA: &str = include_str!("postgres/0081_receipt_chain.sql");
 const GRANT_TERMS_SCHEMA: &str = include_str!("postgres/0082_grant_terms.sql");
 const WRITE_FREEZE_SCHEMA: &str = include_str!("postgres/0083_write_freeze.sql");
+const DECISION_MEMORY_SCHEMA: &str = include_str!("postgres/0084_decision_memory.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -676,6 +677,12 @@ const MIGRATIONS: &[Migration] = &[
         82,
         "write_freeze",
         WRITE_FREEZE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        83,
+        "decision_memory",
+        DECISION_MEMORY_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
