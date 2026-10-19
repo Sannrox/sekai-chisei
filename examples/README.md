@@ -198,3 +198,14 @@ plane. The live `sekai-mcp` binary uses the same framing over stdio.
 cargo run --locked --example mcp_adapter
 cargo test --locked --test it mcp_adapter
 ```
+
+## shikigami-definition-branch
+
+[shikigami-definition-branch/](shikigami-definition-branch/) is a shikigami
+host config pointed at `sekai-mcp` plus a skill that models a domain on a
+branch and opens a proposal. Approve and merge stay off MCP.
+
+```bash
+cargo test --locked --test it mcp_definition_branch
+```
+

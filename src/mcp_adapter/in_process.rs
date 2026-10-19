@@ -46,7 +46,7 @@ pub struct InProcessSurface {
     pub foreign_peer_object_id: String,
     pub action_type: String,
     pub action_version: String,
-    sekai: SekaiServiceImpl,
+    pub sekai: SekaiServiceImpl,
     chisei: ChiseiServiceImpl,
     catalog: Mutex<Option<CatalogSnapshot>>,
 }

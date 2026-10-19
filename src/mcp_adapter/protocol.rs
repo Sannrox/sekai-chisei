@@ -20,6 +20,12 @@ pub const CREATE_LINK_TOOL: &str = "sekai.links.create";
 /// (#1090). Compare is a CLI projection with no wire RPC, so it has no tool.
 pub const RESOLVE_EVALUATION_TOOL: &str = "chisei.evaluation.resolve";
 pub const EXECUTE_EVALUATION_TOOL: &str = "chisei.evaluation.execute";
+/// Definition-branch tools (#1311). Backing RPCs stay experimental.
+pub const CREATE_DEFINITION_BRANCH_TOOL: &str = "sekai.definitions.branch.create";
+pub const EDIT_DEFINITION_BRANCH_TOOL: &str = "sekai.definitions.branch.edit";
+pub const DIFF_DEFINITIONS_TOOL: &str = "sekai.definitions.diff";
+pub const IMPACT_DEFINITIONS_TOOL: &str = "sekai.definitions.impact";
+pub const CREATE_DEFINITION_PROPOSAL_TOOL: &str = "sekai.definitions.proposal.create";
 
 const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "authorization",
@@ -33,7 +39,7 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 10] {
+pub fn well_known_tools() -> [&'static str; 15] {
     [
         GET_OBJECT_TOOL,
         EVALUATE_SET_TOOL,
@@ -45,6 +51,11 @@ pub fn well_known_tools() -> [&'static str; 10] {
         CREATE_LINK_TOOL,
         RESOLVE_EVALUATION_TOOL,
         EXECUTE_EVALUATION_TOOL,
+        CREATE_DEFINITION_BRANCH_TOOL,
+        EDIT_DEFINITION_BRANCH_TOOL,
+        DIFF_DEFINITIONS_TOOL,
+        IMPACT_DEFINITIONS_TOOL,
+        CREATE_DEFINITION_PROPOSAL_TOOL,
     ]
 }
 
@@ -60,6 +71,11 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         CREATE_LINK_TOOL => Some(NativeRpc::CreateLink),
         RESOLVE_EVALUATION_TOOL => Some(NativeRpc::ResolveEvaluationPlan),
         EXECUTE_EVALUATION_TOOL => Some(NativeRpc::ExecuteEvaluationManifest),
+        CREATE_DEFINITION_BRANCH_TOOL => Some(NativeRpc::CreateDefinitionBranch),
+        EDIT_DEFINITION_BRANCH_TOOL => Some(NativeRpc::ApplyDefinitionBranchEdit),
+        DIFF_DEFINITIONS_TOOL => Some(NativeRpc::CompareDefinitionRevisions),
+        IMPACT_DEFINITIONS_TOOL => Some(NativeRpc::ReportDefinitionConsumerImpact),
+        CREATE_DEFINITION_PROPOSAL_TOOL => Some(NativeRpc::CreateDefinitionProposal),
         _ => None,
     }
 }
@@ -111,7 +127,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, ResolveEvaluationPlan, and ExecuteEvaluationManifest. Discovery is not a grant."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, ResolveEvaluationPlan, ExecuteEvaluationManifest, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
     }))
 }
 
@@ -308,6 +324,21 @@ fn bind_session_input(
             }
             object.insert("namespace".into(), json!(context.namespace));
         }
+        NativeRpc::CreateDefinitionBranch
+        | NativeRpc::ApplyDefinitionBranchEdit
+        | NativeRpc::CompareDefinitionRevisions
+        | NativeRpc::ReportDefinitionConsumerImpact
+        | NativeRpc::CreateDefinitionProposal => {
+            if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
+                && namespace != context.namespace
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"definition namespace must match the authenticated adapter session"
+                }));
+            }
+            object.insert("namespace".into(), json!(context.namespace));
+        }
     }
     Ok(input)
 }
@@ -444,6 +475,46 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "action",
             "chisei.ExecuteEvaluationManifestRequest",
             "chisei.ExecuteEvaluationManifestResponse",
+            "write",
+        ),
+        capability_entry(
+            CREATE_DEFINITION_BRANCH_TOOL,
+            "Create one definition branch from a published parent.",
+            "action",
+            "sekai.CreateDefinitionBranchRequest",
+            "sekai.CreateDefinitionBranchResponse",
+            "write",
+        ),
+        capability_entry(
+            EDIT_DEFINITION_BRANCH_TOOL,
+            "Apply one definition-branch edit.",
+            "action",
+            "sekai.ApplyDefinitionBranchEditRequest",
+            "sekai.ApplyDefinitionBranchEditResponse",
+            "write",
+        ),
+        capability_entry(
+            DIFF_DEFINITIONS_TOOL,
+            "Compare two definition revisions.",
+            "query",
+            "sekai.CompareDefinitionRevisionsRequest",
+            "sekai.CompareDefinitionRevisionsResponse",
+            "read",
+        ),
+        capability_entry(
+            IMPACT_DEFINITIONS_TOOL,
+            "Report visible consumers of a definition revision pair.",
+            "query",
+            "sekai.ReportDefinitionConsumerImpactRequest",
+            "sekai.ReportDefinitionConsumerImpactResponse",
+            "read",
+        ),
+        capability_entry(
+            CREATE_DEFINITION_PROPOSAL_TOOL,
+            "Open one definition proposal from a branch head.",
+            "action",
+            "sekai.CreateDefinitionProposalRequest",
+            "sekai.CreateDefinitionProposalResponse",
             "write",
         ),
     ]
@@ -612,6 +683,11 @@ mod tests {
                 CREATE_LINK_TOOL,
                 RESOLVE_EVALUATION_TOOL,
                 EXECUTE_EVALUATION_TOOL,
+                CREATE_DEFINITION_BRANCH_TOOL,
+                EDIT_DEFINITION_BRANCH_TOOL,
+                DIFF_DEFINITIONS_TOOL,
+                IMPACT_DEFINITIONS_TOOL,
+                CREATE_DEFINITION_PROPOSAL_TOOL,
             ]
         );
         assert_eq!(

@@ -15347,11 +15347,11 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient::connect(endpoint)
             .await
             .unwrap();
-    let claims = || IdentityAssertion {
+    let assertion = |subject: &str| IdentityAssertion {
         contract_version: IDENTITY_ASSERTION_VERSION.into(),
         issuer: "https://issuer.test".into(),
         audience: "https://sekai.test".into(),
-        subject: "subject-a".into(),
+        subject: subject.into(),
         credential_id: "credential-a".into(),
         credential_kind: "human_session".into(),
         space: None,
@@ -15362,6 +15362,8 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         expires_at: chrono::Utc::now().timestamp() + 30,
         nonce: uuid::Uuid::new_v4().to_string(),
     };
+    let claims = || assertion("subject-a");
+    let reviewer = || assertion("reviewer");
     let create = CreateDefinitionBranchRequest {
         namespace: "allowed".into(),
         branch_id: "agent-save".into(),
@@ -15658,10 +15660,32 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         .proposal
         .unwrap();
     assert_eq!(fetched, opened);
-    let approved = client
+    let self_approve = client
         .approve_definition_proposal(signed(
             &authority,
             &claims(),
+            ApproveDefinitionProposalRequest {
+                namespace: "allowed".into(),
+                proposal_id: "publish-triage".into(),
+                idempotency_key: "publish-approve-self".into(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(self_approve.code(), tonic::Code::PermissionDenied);
+    assert_eq!(self_approve.message(), "proposal creator cannot approve");
+    security.add_grant(&security::Grant {
+        id: "reviewer-agent-admin".into(),
+        object_id: "schema:agent:triage".into(),
+        principal: "reviewer".into(),
+        role: security::Role::Admin,
+        created: 1,
+        ..Default::default()
+    });
+    let approved = client
+        .approve_definition_proposal(signed(
+            &authority,
+            &reviewer(),
             ApproveDefinitionProposalRequest {
                 namespace: "allowed".into(),
                 proposal_id: "publish-triage".into(),
@@ -15673,7 +15697,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         .into_inner()
         .proposal
         .unwrap();
-    assert_eq!(approved.approvals[0].actor, "subject-a");
+    assert_eq!(approved.approvals[0].actor, "reviewer");
     // Administering the changed member is not enough: approve and merge also
     // need read access to every member of both revisions.
     security.add_grant(&security::Grant {
@@ -15743,7 +15767,11 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         expected_published_digest: parent.revision_digest.clone(),
     };
     let refused = client
-        .merge_definition_proposal(signed(&authority, &claims(), merge("publish-uncertified")))
+        .merge_definition_proposal(signed(
+            &authority,
+            &reviewer(),
+            merge("publish-uncertified"),
+        ))
         .await
         .unwrap_err();
     assert_eq!(
@@ -15770,7 +15798,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         )
         .unwrap();
     let merged = client
-        .merge_definition_proposal(signed(&authority, &claims(), merge("publish-merge")))
+        .merge_definition_proposal(signed(&authority, &reviewer(), merge("publish-merge")))
         .await
         .unwrap()
         .into_inner();
@@ -15781,7 +15809,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
     assert_eq!(
         merged,
         client
-            .merge_definition_proposal(signed(&authority, &claims(), merge("publish-merge")))
+            .merge_definition_proposal(signed(&authority, &reviewer(), merge("publish-merge")))
             .await
             .unwrap()
             .into_inner(),

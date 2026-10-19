@@ -302,6 +302,11 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "sekai.links.create" => Some("CreateLink"),
         "chisei.evaluation.resolve" => Some("ResolveEvaluationPlan"),
         "chisei.evaluation.execute" => Some("ExecuteEvaluationManifest"),
+        "sekai.definitions.branch.create" => Some("CreateDefinitionBranch"),
+        "sekai.definitions.branch.edit" => Some("ApplyDefinitionBranchEdit"),
+        "sekai.definitions.diff" => Some("CompareDefinitionRevisions"),
+        "sekai.definitions.impact" => Some("ReportDefinitionConsumerImpact"),
+        "sekai.definitions.proposal.create" => Some("CreateDefinitionProposal"),
         other if other.starts_with("sekai.objects.query.") => Some("ListObjects"),
         other if other.starts_with("sekai.actions.") || other.starts_with("sekai.action.") => {
             Some("SubmitActionInstance")
