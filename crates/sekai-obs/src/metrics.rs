@@ -56,6 +56,11 @@ pub fn set_search_index_lag_ms(lag_ms: u64) {
     gauge!("sekai_search_index_lag_ms").set(lag_ms as f64);
 }
 
+/// Embedding index lag: age of the oldest object change a catch-up consumed.
+pub fn set_embedding_index_lag_ms(lag_ms: u64) {
+    gauge!("sekai_embedding_index_lag_ms").set(lag_ms as f64);
+}
+
 pub fn search_index_lag_ms() -> u64 {
     SEARCH_INDEX_LAG_MS.load(Ordering::Relaxed)
 }
