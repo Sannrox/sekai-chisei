@@ -7801,6 +7801,39 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_agent_autonomy(
+        &self,
+        namespace: &str,
+        principal: &str,
+        type_id: &str,
+    ) -> Result<Option<crate::sekai::agent_autonomy::AgentAutonomyGrant>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_agent_autonomy(namespace, principal, type_id),
+            Self::Postgres(_) => Err(crate::sekai::agent_autonomy::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_agent_autonomy(
+        &self,
+        grant: &crate::sekai::agent_autonomy::AgentAutonomyGrant,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_agent_autonomy(grant),
+            Self::Postgres(_) => Err(crate::sekai::agent_autonomy::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_agent_autonomy_with_receipt(
+        &self,
+        grant: &crate::sekai::agent_autonomy::AgentAutonomyGrant,
+        decision: &crate::sekai::audit::Decision,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_agent_autonomy_with_receipt(grant, decision),
+            Self::Postgres(_) => Err(crate::sekai::agent_autonomy::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn get_federation_revocation(
         &self,
         revocation_id: &str,

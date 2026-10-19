@@ -221,15 +221,45 @@ impl<'a> ActionInstanceAdmission<'a> {
             )?;
         }
 
+        // Propose-only keys off the actor principal. Freeze's agent_action also
+        // matches machine credentials and delegating actors; those humans keep
+        // Allow until the principal itself is an agent.
+        let autonomy = if crate::sekai::agent_autonomy::actor_is_agent(self.db, actor) {
+            Some(
+                crate::sekai::agent_autonomy::evaluate_admission(
+                    self.db,
+                    actor,
+                    &namespace,
+                    &request.type_id,
+                    &envelope_id,
+                    now,
+                )
+                .map_err(ActionInstanceAdmissionError::Internal)?,
+            )
+        } else {
+            None
+        };
+        let auto_apply_envelope = match &autonomy {
+            Some(crate::sekai::agent_autonomy::AdmissionAutonomy::AutoApply { envelope_id }) => {
+                envelope_id.clone()
+            }
+            _ => String::new(),
+        };
+        let consume_envelope = if envelope_id.is_empty() {
+            auto_apply_envelope.as_str()
+        } else {
+            envelope_id.as_str()
+        };
         // New admissions consume a live signed envelope. Replay of an already
         // admitted request stays idempotent after stop, rollback, lease loss,
-        // or receipt invalidation. The envelope is not a runtime grant.
-        if request.type_id.starts_with("autonomous.") || !envelope_id.is_empty() {
+        // or receipt invalidation. The envelope is not a runtime grant. An
+        // auto-apply grant may supply the envelope for autonomous.* submits.
+        if request.type_id.starts_with("autonomous.") || !consume_envelope.is_empty() {
             crate::sekai::autonomous_envelope::require_live_envelope(
                 self.db,
                 actor,
                 &namespace,
-                &envelope_id,
+                consume_envelope,
             )
             .map_err(ActionInstanceAdmissionError::FailedPrecondition)?;
         }
@@ -356,6 +386,46 @@ impl<'a> ActionInstanceAdmission<'a> {
             deny_reason = format!("action budget exhausted for {budget_subject}");
             budget_decision = "budget_exceeded".into();
         }
+        match &autonomy {
+            Some(crate::sekai::agent_autonomy::AdmissionAutonomy::AutoApply { .. })
+                if status != STATUS_DENIED =>
+            {
+                if status == STATUS_PARKED {
+                    status = STATUS_ADMITTED.into();
+                    policy_decision_text = "auto_apply".into();
+                    budget_decision = if self.budget.is_some() {
+                        "allow".into()
+                    } else {
+                        "not_configured".into()
+                    };
+                } else if status == STATUS_ADMITTED {
+                    policy_decision_text = "auto_apply".into();
+                }
+            }
+            Some(crate::sekai::agent_autonomy::AdmissionAutonomy::ProposeOnly)
+                if status == STATUS_ADMITTED =>
+            {
+                status = STATUS_PARKED.into();
+                policy_decision_text = "require_approval".into();
+                if !budget_already_reserved {
+                    budget_decision = if self.budget.is_some() {
+                        "allow".into()
+                    } else {
+                        "deferred".into()
+                    };
+                }
+            }
+            _ => {}
+        }
+        if status == STATUS_ADMITTED
+            && let Some(budget) = self.budget
+            && !budget_already_reserved
+            && budget.check(&budget_subject, 1).is_err()
+        {
+            status = STATUS_DENIED.into();
+            deny_reason = format!("action budget exhausted for {budget_subject}");
+            budget_decision = "budget_exceeded".into();
+        }
 
         let system_one_fill_json = match self.proposal {
             Some(proposal) => proposal
@@ -390,7 +460,11 @@ impl<'a> ActionInstanceAdmission<'a> {
             parked_object_digest,
             decided_by: String::new(),
             approval_decision: String::new(),
-            autonomous_envelope_id: envelope_id.clone(),
+            autonomous_envelope_id: if envelope_id.is_empty() {
+                auto_apply_envelope
+            } else {
+                envelope_id.clone()
+            },
             review: if status == STATUS_PARKED {
                 crate::sekai::review_queue::place(
                     &type_def.review_queue,
@@ -508,6 +582,17 @@ impl<'a> ActionInstanceAdmission<'a> {
         }
         if let Some(applied) = &applied_object {
             action_object_mutation::complete_object_write(self.db, &applied.object, actor, now);
+        }
+        if stored.status == STATUS_DENIED {
+            crate::sekai::agent_autonomy::revoke_if_granted(
+                self.db,
+                actor,
+                &stored.namespace,
+                &stored.principal,
+                &stored.type_id,
+                now,
+            )
+            .map_err(ActionInstanceAdmissionError::Internal)?;
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: stored,
@@ -772,8 +857,6 @@ impl<'a> ActionInstanceAdmission<'a> {
             &instance.principal,
             &type_def.budget_scope,
         );
-        // A decision never charges budget: the submit already accounted for
-        // this instance (Combined Split reserves one unit at submit).
 
         let force_notify_fail =
             serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
@@ -815,6 +898,9 @@ impl<'a> ActionInstanceAdmission<'a> {
         granted.decided_at_ms = now;
         granted.decided_by = decider.to_string();
         granted.approval_decision = DECISION_GRANT.into();
+        // Do not re-check deferred budget here. Combined Split already reserved
+        // before admit; production decide passes no budget port. A second check
+        // would double-charge or deny reserved RequireApproval parks.
         // The object write and the parked-to-admitted transition commit
         // together, with the target re-digested under the same lock (#1139).
         let applied_object = match action_object_mutation::grant_parked(
@@ -852,7 +938,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             Some(&planned_effects),
             applied_object.as_ref(),
             ontology_digest,
-            false,
+            instance.budget_decision != "deferred",
             Some(&approval),
             now,
         ) {
@@ -934,6 +1020,15 @@ impl<'a> ActionInstanceAdmission<'a> {
             Some(approval),
             now,
         )?;
+        crate::sekai::agent_autonomy::revoke_if_granted(
+            self.db,
+            approval.decider,
+            &denied.namespace,
+            &denied.principal,
+            &denied.type_id,
+            now,
+        )
+        .map_err(ActionInstanceAdmissionError::Internal)?;
         Ok(ActionInstanceAdmissionOutcome {
             instance: denied,
             replay: false,
@@ -1051,6 +1146,17 @@ impl<'a> ActionInstanceAdmission<'a> {
                     &current.principal,
                     now,
                 );
+            }
+            if current.status == STATUS_DENIED {
+                crate::sekai::agent_autonomy::revoke_if_granted(
+                    self.db,
+                    &current.decided_by,
+                    &current.namespace,
+                    &current.principal,
+                    &current.type_id,
+                    now,
+                )
+                .map_err(ActionInstanceAdmissionError::Internal)?;
             }
             Ok(ActionInstanceAdmissionOutcome {
                 instance: current,
@@ -1320,12 +1426,14 @@ impl<'a> ActionInstanceAdmission<'a> {
             })
             .map_err(ActionInstanceAdmissionError::Internal)?;
 
+        if !budget_already_reserved
+            && let Some(budget) = self.budget
+            && (stored.status == STATUS_ADMITTED
+                || (stored.status == STATUS_PARKED && stored.budget_decision == "allow"))
+        {
+            budget.record(budget_subject, 1);
+        }
         if stored.status == STATUS_ADMITTED {
-            if let Some(budget) = self.budget
-                && !budget_already_reserved
-            {
-                budget.record(budget_subject, 1);
-            }
             let effects = planned_effects.ok_or_else(|| {
                 ActionInstanceAdmissionError::Internal("admitted instance effects missing".into())
             })?;
@@ -2233,6 +2341,59 @@ mod tests {
         assert_eq!(denied.instance.status, STATUS_DENIED);
         assert_eq!(denied.instance.budget_decision, "budget_exceeded");
         assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn agent_propose_only_denies_when_budget_is_exhausted() {
+        let db = setup();
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(0),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+        };
+        let denied = ActionInstanceAdmission::new(&db, Some(&budget))
+            .admit(request(r#"{"runtime":"shikigami"}"#), "agent:bot", 10)
+            .unwrap();
+        assert_eq!(denied.instance.status, STATUS_DENIED);
+        assert_eq!(denied.instance.budget_decision, "budget_exceeded");
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn agent_parked_grant_rechecks_deferred_budget() {
+        let db = setup();
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(1),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+        };
+        let admission = ActionInstanceAdmission::new(&db, Some(&budget));
+        let mut first = request(r#"{"runtime":"shikigami"}"#);
+        first.idempotency_key = "agent-a".into();
+        let parked_a = admission.admit(first, "agent:bot", 10).unwrap().instance;
+        assert_eq!(parked_a.status, STATUS_PARKED);
+        assert_eq!(parked_a.budget_decision, "allow");
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut second = request(r#"{"runtime":"shikigami"}"#);
+        second.idempotency_key = "agent-b".into();
+        let denied = admission.admit(second, "agent:bot", 11).unwrap().instance;
+        assert_eq!(denied.status, STATUS_DENIED);
+        assert_eq!(denied.budget_decision, "budget_exceeded");
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let granted = admission
+            .decide(
+                ActionInstanceDecisionRequest {
+                    instance_id: parked_a.instance_id.clone(),
+                    decision: DECISION_GRANT.into(),
+                    reason: "reviewed".into(),
+                    decider_principals: vec!["ops".into()],
+                    decider_is_namespace_admin: true,
+                    delegating_actor: None,
+                },
+                "ops",
+                20,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(granted.status, STATUS_ADMITTED);
     }
 
     #[test]

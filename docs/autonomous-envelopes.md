@@ -23,6 +23,21 @@ ActionInstance admission consumes a live envelope when `type_id`
 starts with `autonomous.` or `autonomous_envelope_id` is set on the
 request or in `parameters_json`.
 
+## Gradual auto-apply
+
+Agents (`agent:` principals and registered service principals) start
+propose-only: submits park for review even when Action policy would
+allow. Per agent and Action type, Chisei counts parked grant/deny
+history. The production threshold is 50 reviews, 98% approved
+unchanged, and zero incidents. `sekaictl admin autonomy offer` reports
+whether that threshold is met. `grant-auto-apply` binds a live envelope
+and writes a Decision receipt. Matching submits then admit without
+review and bind that envelope. A different submitted envelope stays
+parked. Other types still park. A later deny, a stopped envelope, or a
+changed model pin revokes the grant and returns the agent to
+propose-only. Amount, scope, and time-of-day limits are not in this
+slice. PostgreSQL surfaces stay unavailable.
+
 ## Operator workflow
 
 ```text

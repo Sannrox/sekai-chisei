@@ -280,7 +280,9 @@ pub fn submit_step(
     }
     let status = if admitted.instance.status == STATUS_DENIED {
         STATUS_DENIED
-    } else if admitted.instance.status == STATUS_ADMITTED {
+    } else if admitted.instance.status == STATUS_ADMITTED
+        || admitted.instance.status == crate::sekai::action_instance::STATUS_PARKED
+    {
         STATUS_SUBMITTED
     } else {
         return Err(WORKFLOW_UNAVAILABLE.into());
@@ -490,8 +492,7 @@ pub fn reconcile_receipt(
         }) => {
             let matched = operation_id == binding.operation_id
                 && namespace == binding.namespace
-                && initiating_actor == binding.owner
-                && instance.status == binding.instance_status;
+                && initiating_actor == binding.owner;
             (true, operation_id, matched)
         }
         None => (false, String::new(), false),
@@ -501,7 +502,7 @@ pub fn reconcile_receipt(
         binding_id: binding.binding_id,
         instance_id: binding.instance_id,
         operation_id: binding.operation_id,
-        instance_status: binding.instance_status,
+        instance_status: instance.status,
         receipt_present,
         receipt_operation_id,
         matched,
@@ -1128,6 +1129,20 @@ mod tests {
             ADMISSION_RETAINED,
             "workflow adapters cannot assume admission authority"
         );
+    }
+
+    #[test]
+    fn agent_submit_parks_the_action_and_keeps_the_binding() {
+        let runtime = setup();
+        let mut envelope = job_envelope();
+        envelope.owner = "agent:bot".into();
+        let submitted = submit_step(&runtime, "agent:bot", &envelope, 1_000, None, None).unwrap();
+        assert_eq!(submitted.status, STATUS_SUBMITTED);
+        assert_eq!(
+            submitted.instance_status,
+            crate::sekai::action_instance::STATUS_PARKED
+        );
+        assert!(!submitted.instance_id.is_empty());
     }
 
     struct CountingBudget {
