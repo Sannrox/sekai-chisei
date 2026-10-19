@@ -396,6 +396,16 @@ pub(super) fn from_proto_governed_action_type(
         declared_effect_kinds: proto.declared_effect_kinds,
         system_one: parse_system_one_json(&proto.system_one_json)?,
         approvers: proto.approvers,
+        review_queue: crate::sekai::review_queue::ReviewQueueSpec {
+            queue_id: proto.review_queue_id,
+            sla_ms: proto.review_sla_ms,
+            escalate: proto.review_escalate,
+            escalate_to: proto.review_escalate_to,
+            threshold_param: proto.review_threshold_param,
+            threshold: proto.review_threshold,
+            pool: proto.review_pool,
+            agent_reviewers: proto.review_agent_reviewers,
+        },
         enabled: proto.enabled,
         created_by: proto.created_by,
         created_at_ms: proto.created_at_ms,
@@ -431,6 +441,14 @@ pub(super) fn to_proto_governed_action_type(
             .map(|bind| serde_json::to_string(bind).unwrap_or_default())
             .unwrap_or_default(),
         approvers: domain.approvers.clone(),
+        review_queue_id: domain.review_queue.queue_id.clone(),
+        review_sla_ms: domain.review_queue.sla_ms,
+        review_escalate: domain.review_queue.escalate.clone(),
+        review_escalate_to: domain.review_queue.escalate_to.clone(),
+        review_threshold_param: domain.review_queue.threshold_param.clone(),
+        review_threshold: domain.review_queue.threshold,
+        review_pool: domain.review_queue.pool.clone(),
+        review_agent_reviewers: domain.review_queue.agent_reviewers.clone(),
         enabled: domain.enabled,
         created_by: domain.created_by.clone(),
         created_at_ms: domain.created_at_ms,
@@ -481,6 +499,11 @@ pub(super) fn to_proto_action_instance(
         system_one_fill_json: domain.system_one_fill_json.clone(),
         decided_by: domain.decided_by.clone(),
         approval_decision: domain.approval_decision.clone(),
+        review_queue_id: domain.review.queue_id.clone(),
+        review_assignee: domain.review.assignee.clone(),
+        review_sla_deadline_ms: domain.review.sla_deadline_ms,
+        review_escalated: domain.review.escalated,
+        agent_decision: domain.review.agent_decision,
     }
 }
 pub(super) fn to_proto_action_effect(

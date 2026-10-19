@@ -622,6 +622,11 @@ pub(super) async fn list_action_instances(
         &inner.namespace,
         false,
     )?;
+    let _ = crate::sekai::action_instance_admission::ActionInstanceAdmission::new(
+        service.db.runtime(),
+        None,
+    )
+    .escalate_due(&inner.namespace, now_millis());
     let type_id = if inner.type_id.trim().is_empty() {
         None
     } else {

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Parked Actions can route to a review queue on the type: SLA, assignee pool,
+  threshold, and auto-deny or reassign escalation. `DecideActionInstance`
+  refuses a reviewer who is not the assignee. The approval receipt names the
+  queue, reviewer, and reason (#1455).
+
 - Invoice extraction function revisions are scored on a labelled fixture
   set before publish. A worse vendor extraction is denied; an unchanged
   revision still publishes (#1327).

@@ -199,7 +199,7 @@ impl PostgresDb {
     /// Moves a parked instance to its decided state. Returns false when the
     /// instance is no longer parked, so the first decision wins.
     pub fn decide_parked_action_instance(&self, decided: &ActionInstance) -> Result<bool, String> {
-        self.transition_action_instance(STATUS_PARKED, decided)
+        self.transition_action_instance(STATUS_PARKED, decided, &decided.review.assignee)
     }
 
     /// Replaces an instance only while it still has `expected_status`.
@@ -207,6 +207,7 @@ impl PostgresDb {
         &self,
         expected_status: &str,
         decided: &ActionInstance,
+        expected_assignee: &str,
     ) -> Result<bool, String> {
         decided.validate_fields()?;
         let body_json = serde_json::to_string(decided).map_err(|e| e.to_string())?;
@@ -215,7 +216,8 @@ impl PostgresDb {
                 "UPDATE sekai_action_instances
                  SET status = $2, deny_reason = $3, policy_decision = $4, budget_decision = $5,
                      decided_at_ms = $6, body_json = $7
-                 WHERE instance_id = $1 AND status = $8",
+                 WHERE instance_id = $1 AND status = $8
+                   AND coalesce(body_json::jsonb #>> '{review,assignee}', '') = $9",
                 &[
                     &decided.instance_id,
                     &decided.status,
@@ -225,6 +227,7 @@ impl PostgresDb {
                     &decided.decided_at_ms,
                     &body_json,
                     &expected_status,
+                    &expected_assignee,
                 ],
             )
             .map(|updated| updated == 1)
@@ -284,12 +287,13 @@ impl PostgresDb {
             ),
             None => None,
         };
-        transaction
+        let updated = transaction
             .execute(
                 "UPDATE sekai_action_instances
                  SET status = $2, deny_reason = $3, policy_decision = $4, budget_decision = $5,
                      decided_at_ms = $6, body_json = $7
-                 WHERE instance_id = $1 AND status = $8",
+                 WHERE instance_id = $1 AND status = $8
+                   AND coalesce(body_json::jsonb #>> '{review,assignee}', '') = $9",
                 &[
                     &granted.instance_id,
                     &granted.status,
@@ -299,9 +303,13 @@ impl PostgresDb {
                     &granted.decided_at_ms,
                     &body_json,
                     &STATUS_PARKED,
+                    &granted.review.assignee,
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Ok(ParkedGrantOutcome::NotParked);
+        }
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(ParkedGrantOutcome::Granted { previous })
     }

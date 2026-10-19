@@ -99,6 +99,22 @@ struct TypeFile {
     #[serde(default)]
     approvers: Vec<String>,
     #[serde(default)]
+    review_queue_id: String,
+    #[serde(default)]
+    review_sla_ms: i64,
+    #[serde(default)]
+    review_escalate: String,
+    #[serde(default)]
+    review_escalate_to: String,
+    #[serde(default)]
+    review_threshold_param: String,
+    #[serde(default)]
+    review_threshold: i64,
+    #[serde(default)]
+    review_pool: Vec<String>,
+    #[serde(default)]
+    review_agent_reviewers: Vec<String>,
+    #[serde(default)]
     system_one: Option<Value>,
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -200,6 +216,14 @@ fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxE
                 .transpose()?
                 .unwrap_or_default(),
             approvers: parsed.approvers,
+            review_queue_id: parsed.review_queue_id,
+            review_sla_ms: parsed.review_sla_ms,
+            review_escalate: parsed.review_escalate,
+            review_escalate_to: parsed.review_escalate_to,
+            review_threshold_param: parsed.review_threshold_param,
+            review_threshold: parsed.review_threshold,
+            review_pool: parsed.review_pool,
+            review_agent_reviewers: parsed.review_agent_reviewers,
             enabled: parsed.enabled,
             created_by: String::new(),
             created_at_ms: 0,

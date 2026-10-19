@@ -2491,6 +2491,7 @@ mod tests {
                 parked_object_digest: String::new(),
                 decided_by: String::new(),
                 approval_decision: String::new(),
+                review: Default::default(),
                 agent_action: false,
                 admission_tenant: String::new(),
                 resource_tenant: String::new(),
