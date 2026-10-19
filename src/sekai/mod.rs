@@ -82,6 +82,7 @@ pub mod object_log_host;
 pub mod object_mutation;
 pub mod object_schema;
 pub use sekai_types::object_security;
+pub mod decision_memory;
 pub mod object_set;
 pub mod object_sync;
 pub mod object_type_index;

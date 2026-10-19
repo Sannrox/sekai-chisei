@@ -964,6 +964,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             }
             return Err(error);
         }
+        self.remember_decision(&granted, approval.reason)?;
         if let Some(applied) = &applied_object {
             action_object_mutation::complete_object_write(
                 self.db,
@@ -1020,6 +1021,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             Some(approval),
             now,
         )?;
+        self.remember_decision(&denied, approval.reason)?;
         crate::sekai::agent_autonomy::revoke_if_granted(
             self.db,
             approval.decider,
@@ -1033,6 +1035,40 @@ impl<'a> ActionInstanceAdmission<'a> {
             instance: denied,
             replay: false,
         })
+    }
+
+    fn remember_decision(
+        &self,
+        instance: &ActionInstance,
+        reason: &str,
+    ) -> Result<(), ActionInstanceAdmissionError> {
+        let denied = instance.status == STATUS_DENIED;
+        let memory = crate::sekai::decision_memory::DecisionMemory {
+            memory_id: instance.instance_id.clone(),
+            namespace: instance.namespace.clone(),
+            type_id: instance.type_id.clone(),
+            version: instance.version.clone(),
+            instance_id: instance.instance_id.clone(),
+            outcome: if denied {
+                DECISION_DENY.into()
+            } else {
+                DECISION_GRANT.into()
+            },
+            reason: if denied && instance.deny_reason != "denied_by_approver" {
+                instance.deny_reason.clone()
+            } else {
+                reason.to_string()
+            },
+            conditions_json: String::new(),
+            facts_json: instance.parameters_json.clone(),
+            decided_by: instance.decided_by.clone(),
+            decided_at_ms: instance.decided_at_ms,
+            superseded: false,
+            parameters_json: instance.parameters_json.clone(),
+        };
+        self.db
+            .put_decision_memory(&memory)
+            .map_err(ActionInstanceAdmissionError::Internal)
     }
 
     /// Applies due review-queue SLA actions: reassign or auto-deny (#1455).
@@ -1146,6 +1182,25 @@ impl<'a> ActionInstanceAdmission<'a> {
                     &current.principal,
                     now,
                 );
+            }
+            let remembered = self
+                .db
+                .get_decision_memory(&current.instance_id)
+                .map_err(ActionInstanceAdmissionError::Internal)?;
+            if remembered.is_none() {
+                let reason = self
+                    .db
+                    .get_operation_receipt(&current.operation_id)
+                    .map_err(ActionInstanceAdmissionError::Internal)?
+                    .and_then(|receipt| {
+                        receipt.events.iter().rev().find_map(|event| {
+                            (event.kind == ReceiptEventKind::ApprovalDecided)
+                                .then(|| event.attributes.get("reason").cloned())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or_default();
+                self.remember_decision(&current, &reason)?;
             }
             if current.status == STATUS_DENIED {
                 crate::sekai::agent_autonomy::revoke_if_granted(
@@ -3296,6 +3351,86 @@ mod tests {
         assert_eq!(
             approval.attributes.get("reason").map(String::as_str),
             Some("reviewed")
+        );
+    }
+
+    #[test]
+    fn decision_memory_surfaces_similar_readable_precedents() {
+        let db = setup();
+        ensure_record_kind(&db);
+        let mut type_def = record_type("create");
+        type_def.approvers = vec!["bob".into()];
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let submit = |key: &str, object_id: &str, now: i64| {
+            let mut request = record_request(
+                "customer.record.create",
+                &format!(r#"{{"object_id":"{object_id}"}}"#),
+            );
+            request.idempotency_key = key.into();
+            request.request_id = format!("op-{key}");
+            admission.admit(request, "alice", now).unwrap().instance
+        };
+        let first = submit("mem-1", "rec-1", 10);
+        admission
+            .decide(
+                decision(&first.instance_id, DECISION_DENY, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap();
+        let second = submit("mem-2", "rec-1", 30);
+        admission
+            .decide(
+                decision(&second.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                40,
+            )
+            .unwrap();
+        let unrelated = submit("mem-9", "rec-9", 50);
+        admission
+            .decide(
+                decision(&unrelated.instance_id, DECISION_DENY, "bob"),
+                "bob",
+                60,
+            )
+            .unwrap();
+        let third = submit("mem-3", "rec-1", 70);
+        let memories = db
+            .list_decision_memory(&third.namespace, &third.type_id)
+            .unwrap();
+        let shown = crate::sekai::decision_memory::precedents_for(
+            &memories,
+            &third.namespace,
+            &third.type_id,
+            &third.parameters_json,
+            &[first.instance_id.clone(), second.instance_id.clone()],
+        );
+        assert_eq!(shown.len(), 2);
+        assert!(shown.iter().any(|row| row.instance_id == first.instance_id));
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.instance_id == second.instance_id)
+        );
+        assert!(
+            !shown
+                .iter()
+                .any(|row| row.instance_id == unrelated.instance_id)
+        );
+        db.mark_decision_memory_superseded(&first.instance_id)
+            .unwrap();
+        let labelled = db
+            .list_decision_memory(&third.namespace, &third.type_id)
+            .unwrap();
+        assert!(
+            labelled
+                .iter()
+                .any(|row| row.instance_id == first.instance_id && row.superseded)
         );
     }
 

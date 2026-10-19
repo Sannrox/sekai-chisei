@@ -369,6 +369,7 @@ impl SekaiDb {
         self.drop_legacy_action_types()?;
         self.migrate_governed_action_types()?;
         self.migrate_action_instances()?;
+        self.migrate_decision_memory()?;
         self.migrate_action_effects()?;
         Ok(())
     }
