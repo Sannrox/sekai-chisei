@@ -970,6 +970,7 @@ impl SekaiDb {
                         OR json_extract(team_namespace.properties, '$.team_managed')='true'
                       )
                       AND team_grant.principal IN ({principal_placeholders})
+                      AND (team_grant.not_after_ms = 0 OR team_grant.not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
                  ))"
             )
         };
@@ -999,6 +1000,7 @@ impl SekaiDb {
                         SELECT 1 FROM sekai_grants grant_row
                         WHERE grant_row.object_id=evidence_object.id
                           AND grant_row.principal IN ({principal_placeholders})
+                          AND (grant_row.not_after_ms = 0 OR grant_row.not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
                     )
                ){team_filter}{marking_filter}
              ORDER BY s.received_at_ms DESC, s.id DESC

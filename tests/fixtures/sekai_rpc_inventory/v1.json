@@ -507,6 +507,40 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "Search",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/grpc/search_rpc.rs",
+        "src/db/search_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetSearchIndexStatus",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/grpc/search_rpc.rs",
+        "src/db/search_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutObjectTypeIndexEdit",
       "kind": "persistent",
       "surfaces": [
@@ -958,7 +992,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/policy_decision.rs",
+        "crates/sekai-types/src/policy_decision.rs",
         "src/grpc/sekai_service_rpc_objects.rs",
         "docs/object-security.md"
       ],
@@ -972,7 +1006,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/policy_decision.rs",
+        "crates/sekai-types/src/policy_decision.rs",
         "src/grpc/sekai_service_rpc_objects.rs",
         "docs/object-security.md"
       ],
@@ -1538,6 +1572,30 @@
       ],
       "durable_dependencies": [],
       "product_tier": "core"
+    },
+    {
+      "rpc": "SetWriteFreeze",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.authorization"
+      ],
+      "evidence": [
+        "src/sekai/write_freeze.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ListWriteFreezes",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.authorization"
+      ],
+      "evidence": [
+        "src/sekai/write_freeze.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "EnsureTeamNamespace",

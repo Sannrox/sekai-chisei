@@ -2,16 +2,17 @@
 //!
 //! `SEKAI_OBJECT_INDEX_DUAL_READ` compares SQL hop engines. This gate compares
 //! the SQL projection to in-process mikura `ObjectSet::evaluate` (ADR 0081).
-//! ADR 0091: the log owns identity generations; EvaluateObjectSet keeps the
-//! SQL serving projection because the tagged log is not namespace-scoped.
+//! ADR 0091 / ADR 0112: the log owns identity generations keyed by
+//! `(namespace, kind, key)`; EvaluateObjectSet keeps the SQL serving
+//! projection.
 
 use crate::domain::Object;
 use crate::sekai::object_security::ObjectSecurityPolicy;
 use crate::sekai::object_set::{ObjectSetAggregation, ObjectSetDescriptor};
 use crate::sekai::object_type_index::ObjectTypeIndexMember;
 use mikura::{
-    Aggregate, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord, ObjectSet,
-    PropertyAcl, Store,
+    Aggregate, Breakdown, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord,
+    ObjectSet, PropertyAcl, Store,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::env;
@@ -289,28 +290,33 @@ pub fn map_evaluate_request(
             "property filters are not expressible on the tagged object-log evaluate API",
         ));
     }
-    if hops.is_empty() {
+    if !descriptor.order_by.is_empty() {
         return Err(ObjectLogCompareError::Unsupported(
-            "object-log evaluate requires at least one hop",
+            "SQL object-set order_by is one key; the object-log sorts up to three keys",
         ));
     }
     if !aggregation.group_by.is_empty() {
         return Err(ObjectLogCompareError::Unsupported(
-            "group_by buckets are not expressible on the tagged object-log evaluate API",
+            "SQL group_by falls back to the source key when the property is absent; the object-log uses an absent group",
         ));
     }
     let function = aggregation.function.to_ascii_lowercase();
-    if function != "sum" && function != "count" {
+    let uses_breakdown = matches!(function.as_str(), "min" | "max" | "avg" | "distinct");
+    if function != "sum" && function != "count" && !uses_breakdown {
         return Err(ObjectLogCompareError::Unsupported(
-            "object-log evaluate compares count or sum only",
+            "object-log evaluate compares count, sum, min, max, avg, or distinct",
         ));
     }
     let sum_property = if aggregation.property.is_empty() {
         if function == "count" {
             String::new()
-        } else {
+        } else if function == "sum" {
             return Err(ObjectLogCompareError::Unsupported(
                 "sum compare requires aggregation.property",
+            ));
+        } else {
+            return Err(ObjectLogCompareError::Unsupported(
+                "min, max, avg, and distinct compare require aggregation.property",
             ));
         }
     } else {
@@ -333,7 +339,21 @@ pub fn map_evaluate_request(
             ));
         }
     }
+    let breakdown = match function.as_str() {
+        "distinct" => Some(Breakdown {
+            group_by: Vec::new(),
+            max_groups: 0,
+            distinct: Some(sum_property.clone()),
+        }),
+        "min" | "max" | "avg" => Some(Breakdown {
+            group_by: Vec::new(),
+            max_groups: 0,
+            distinct: None,
+        }),
+        _ => None,
+    };
     Ok(EvaluateRequest {
+        namespace: descriptor.namespace.clone(),
         root_kind: descriptor.kind.clone(),
         hops: hops
             .iter()
@@ -349,48 +369,92 @@ pub fn map_evaluate_request(
         sum_property,
         aggregate: Aggregate::CountAndSum,
         acl,
-        // No filter, predicate, object bound, sort, or cursor: count and sum
-        // only, as on the v0.1 contract.
+        breakdown,
+        // No filter, predicate, object bound, sort, or cursor. Extra
+        // aggregates use breakdown; count and sum keep the v0.1 shape.
         ..EvaluateRequest::default()
     })
 }
 
-pub fn sql_compare_signature(
-    paths: &[Vec<&ObjectTypeIndexMember>],
-    aggregation: &ObjectSetAggregation,
-) -> Result<(usize, i64), ObjectLogCompareError> {
-    if !aggregation.group_by.is_empty() {
+#[derive(Debug)]
+struct SqlLogSignature {
+    roots: usize,
+    sum: i64,
+    n: u64,
+    min: Option<i64>,
+    max: Option<i64>,
+}
+
+/// i64 contribution table shared with mikura (ADR 0018). Values that parse as
+/// `f64` but not `i64` would disagree with SQL object-set aggregation, so the
+/// canary refuses rather than skipping them.
+fn contributing_i64(raw: &str) -> Result<Option<i64>, ObjectLogCompareError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(amount) = raw.parse::<i64>() {
+        return Ok(Some(amount));
+    }
+    if raw.parse::<f64>().is_ok() {
         return Err(ObjectLogCompareError::Unsupported(
-            "group_by buckets are not expressible on the tagged object-log evaluate API",
+            "SQL aggregates parse f64; the object-log contributes i64 only",
         ));
     }
+    Ok(None)
+}
+
+fn sql_compare_signature(
+    paths: &[Vec<&ObjectTypeIndexMember>],
+    aggregation: &ObjectSetAggregation,
+) -> Result<SqlLogSignature, ObjectLogCompareError> {
+    if !aggregation.group_by.is_empty() {
+        return Err(ObjectLogCompareError::Unsupported(
+            "SQL group_by falls back to the source key when the property is absent; the object-log uses an absent group",
+        ));
+    }
+    let function = aggregation.function.to_ascii_lowercase();
+    if function == "distinct" {
+        return Err(ObjectLogCompareError::Unsupported(
+            "SQL distinct counts numeric values; the object-log counts any canonical scalar",
+        ));
+    }
+    let measure = matches!(function.as_str(), "sum" | "min" | "max" | "avg");
     let mut roots = HashSet::new();
     let mut sum = 0i64;
-    let summing = aggregation.function.eq_ignore_ascii_case("sum");
+    let mut n = 0u64;
+    let mut min = None;
+    let mut max = None;
     for path in paths {
         if let Some(root) = path.first() {
             roots.insert(root.source_key.as_str());
         }
-        if summing {
+        if measure {
             if aggregation.property.is_empty() {
-                return Err(ObjectLogCompareError::Unsupported(
-                    "sum compare requires aggregation.property",
-                ));
+                return Err(ObjectLogCompareError::Unsupported(if function == "sum" {
+                    "sum compare requires aggregation.property"
+                } else {
+                    "min, max, avg, and distinct compare require aggregation.property"
+                }));
             }
             let leaf = path.last().ok_or(ObjectLogCompareError::Unsupported(
                 "sum compare requires a leaf on every path",
             ))?;
-            let raw = leaf.properties.get(&aggregation.property).ok_or(
-                ObjectLogCompareError::Unsupported(
-                    "sum property missing on a hop leaf; refusing vacuous compare",
-                ),
-            )?;
-            let amount = raw.parse::<i64>().map_err(|_| {
-                ObjectLogCompareError::Unsupported(
-                    "sum property is not an i64; refusing vacuous compare",
-                )
-            })?;
-            sum += amount;
+            match leaf.properties.get(&aggregation.property) {
+                None if function == "sum" => {
+                    return Err(ObjectLogCompareError::Unsupported(
+                        "sum property missing on a hop leaf; refusing vacuous compare",
+                    ));
+                }
+                None => {}
+                Some(raw) => {
+                    if let Some(amount) = contributing_i64(raw)? {
+                        sum = sum.wrapping_add(amount);
+                        n += 1;
+                        min = Some(min.map_or(amount, |seen: i64| seen.min(amount)));
+                        max = Some(max.map_or(amount, |seen: i64| seen.max(amount)));
+                    }
+                }
+            }
         }
     }
     if paths.len() != roots.len() {
@@ -398,7 +462,13 @@ pub fn sql_compare_signature(
             "path multiplicity is not expressible on the tagged object-log evaluate API",
         ));
     }
-    Ok((roots.len(), sum))
+    Ok(SqlLogSignature {
+        roots: roots.len(),
+        sum,
+        n,
+        min,
+        max,
+    })
 }
 
 /// One evaluated kind as the dual-read canary sees it: its active policy, the
@@ -508,20 +578,55 @@ fn compare_sql_to_log_with_cache(
         return Err(ObjectLogCompareError::MissingLog);
     }
     let request = map_evaluate_request(descriptor, hops, aggregation, acl)?;
-    let log = with_object_log_store_cache(cache, path, |store| {
+    let function = aggregation.function.to_ascii_lowercase();
+    let log = match with_object_log_store_cache(cache, path, |store| {
         ObjectSet::new(LocalCompute)
             .evaluate(store, &request)
             .map_err(|error| format!("{error:?}"))
-    })
-    .map_err(ObjectLogCompareError::Evaluate)?;
-    let (sql_roots, sql_sum) = sql_compare_signature(sql_paths, aggregation)?;
-    let sum_matches = request.sum_property.is_empty() || sql_sum == log.sum_amount;
-    if sql_roots == log.two_hop_count && sum_matches {
+    }) {
+        Ok(log) => log,
+        Err(error) if matches!(function.as_str(), "min" | "max") && error.contains("Overflow") => {
+            return Err(ObjectLogCompareError::Unsupported(
+                "SQL min/max do not share the object-log checked average overflow",
+            ));
+        }
+        Err(error) => return Err(ObjectLogCompareError::Evaluate(error)),
+    };
+    let sql = sql_compare_signature(sql_paths, aggregation)?;
+    let matched = match function.as_str() {
+        "count" => sql.roots == log.two_hop_count,
+        "sum" => {
+            sql.roots == log.two_hop_count
+                && (request.sum_property.is_empty() || sql.sum == log.sum_amount)
+        }
+        "min" | "max" | "avg" => {
+            if sql.roots == 0 && log.two_hop_count == 0 && log.groups.is_empty() {
+                true
+            } else {
+                match log.groups.first().filter(|_| log.groups.len() == 1) {
+                    Some(group) => {
+                        let aggregate_matches = match function.as_str() {
+                            "min" => sql.min == group.min,
+                            "max" => sql.max == group.max,
+                            "avg" => (sql.sum, sql.n) == group.avg,
+                            _ => false,
+                        };
+                        sql.roots == log.two_hop_count
+                            && sql.roots == group.count
+                            && aggregate_matches
+                    }
+                    None => false,
+                }
+            }
+        }
+        _ => false,
+    };
+    if matched {
         return Ok(());
     }
     Err(ObjectLogCompareError::Mismatch {
-        sql_roots,
-        sql_sum,
+        sql_roots: sql.roots,
+        sql_sum: sql.sum,
         log,
     })
 }
@@ -560,9 +665,11 @@ pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Optio
         // reason to fail the admission.
         // #1127: a direct identity lookup replaces the full-kind scan.
         let existing = with_cached_object_log_store(&path, |store| {
-            Ok(visible_record(store, &object.kind, &object.id)
-                .filter(|record| record.props == object.properties)
-                .map(|record| record.r#gen))
+            Ok(
+                visible_record(store, &object.namespace, &object.kind, &object.id)
+                    .filter(|record| record.props == object.properties)
+                    .map(|record| record.r#gen),
+            )
         });
         if let Ok(Some(generation)) = existing {
             return Ok(Some(generation));
@@ -798,7 +905,11 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
         let mut seen = HashSet::new();
         let mut batch = Vec::new();
         pending.retain(|ticket| {
-            if !seen.insert((ticket.object.kind.clone(), ticket.object.id.clone())) {
+            if !seen.insert((
+                ticket.object.namespace.clone(),
+                ticket.object.kind.clone(),
+                ticket.object.id.clone(),
+            )) {
                 return true;
             }
             batch.push(ticket.clone());
@@ -813,7 +924,12 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
         return Ok(());
     }
     let generation = |store: &Store, ticket: &IngestTicket| {
-        identity_generation(store, &ticket.object.kind, &ticket.object.id)
+        identity_generation(
+            store,
+            &ticket.object.namespace,
+            &ticket.object.kind,
+            &ticket.object.id,
+        )
     };
     let pages_before = store.committed_pages();
     let records = batch
@@ -873,9 +989,56 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
     Err(error)
 }
 
+/// Resolve one V1 `(kind, key)` to a plane namespace from the SQL projection.
+/// Unknown identities and collisions fail closed (ADR 0112).
+pub fn projection_namespace_for(
+    rows: &[(String, String, String)],
+    kind: &str,
+    key: &str,
+) -> Result<String, String> {
+    let mut found = None;
+    for (namespace, row_kind, row_key) in rows {
+        if row_kind != kind || row_key != key {
+            continue;
+        }
+        match &found {
+            None => found = Some(namespace.clone()),
+            Some(existing) if existing == namespace => {}
+            Some(existing) => {
+                return Err(format!(
+                    "{kind}/{key} is in more than one namespace ({existing} and {namespace})"
+                ));
+            }
+        }
+    }
+    found.ok_or_else(|| format!("{kind}/{key} is unknown to the object projection"))
+}
+
+/// Copy a `MIKURAV1` log to a namespaced `MIKURAV2` log. `src` is only read.
+pub fn migrate_unnamespaced_object_log(
+    src: &Path,
+    dst: &Path,
+    mut namespace_for: impl FnMut(&str, &str) -> Result<String, String>,
+) -> Result<usize, String> {
+    Store::migrate_unnamespaced_with(src, dst, |kind, key| namespace_for(kind, key))
+}
+
+/// Assign each V1 identity its plane namespace from SQL projection rows
+/// `(namespace, kind, source_key)`.
+pub fn migrate_unnamespaced_object_log_from_projection(
+    src: &Path,
+    dst: &Path,
+    rows: &[(String, String, String)],
+) -> Result<usize, String> {
+    migrate_unnamespaced_object_log(src, dst, |kind, key| {
+        projection_namespace_for(rows, kind, key)
+    })
+}
+
 fn object_record(object: &Object) -> ObjectRecord {
     ObjectRecord {
         r#gen: 0,
+        namespace: object.namespace.clone(),
         kind: object.kind.clone(),
         key: object.id.clone(),
         hidden: false,
@@ -883,20 +1046,26 @@ fn object_record(object: &Object) -> ObjectRecord {
         // stays the receipted clerk admission.
         action_id: None,
         props: object.properties.clone(),
+        schema_version: 1,
     }
 }
 
-pub fn identity_generation(store: &Store, kind: &str, key: &str) -> Result<u64, String> {
-    visible_record(store, kind, key)
+pub fn identity_generation(
+    store: &Store,
+    namespace: &str,
+    kind: &str,
+    key: &str,
+) -> Result<u64, String> {
+    visible_record(store, namespace, kind, key)
         .map(|record| record.r#gen)
-        .ok_or_else(|| format!("mikura identity missing for {kind}:{key}"))
+        .ok_or_else(|| format!("mikura identity missing for {namespace}/{kind}:{key}"))
 }
 
 /// The current visible record for one identity, by direct lookup. Missing or
 /// hidden identities read as absent, as the v0.1 visible-kind scan did.
-fn visible_record(store: &Store, kind: &str, key: &str) -> Option<ObjectRecord> {
+fn visible_record(store: &Store, namespace: &str, kind: &str, key: &str) -> Option<ObjectRecord> {
     store
-        .load(kind, key, &PropertyAcl::allow_all())
+        .load(namespace, kind, key, &PropertyAcl::allow_all())
         .ok()
         .filter(|record| !record.hidden)
 }
@@ -961,7 +1130,10 @@ mod tests {
         assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 1);
         assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 2);
         let store = Store::open(&log).unwrap();
-        assert_eq!(identity_generation(&store, "Customer", "c1").unwrap(), 2);
+        assert_eq!(
+            identity_generation(&store, "sales", "Customer", "c1").unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -992,7 +1164,7 @@ mod tests {
         let ingest_and_read = |cache: &Mutex<Option<CachedObjectLogStore>>, path: &Path| {
             with_object_log_store_cache(cache, path, |store| {
                 BatchIngest::run(store, vec![object_record(&object)])?;
-                identity_generation(store, &object.kind, &object.id)
+                identity_generation(store, &object.namespace, &object.kind, &object.id)
             })
         };
 
@@ -1063,10 +1235,14 @@ mod tests {
                 vec![ObjectRecord {
                     action_id: None,
                     r#gen: generation,
+
+                    namespace: "sales".into(),
                     kind: "Customer".into(),
                     key: "c1".into(),
                     hidden: false,
                     props: HashMap::from([("n".into(), generation.to_string())]),
+
+                    schema_version: 1,
                 }],
             )
             .unwrap();
@@ -1158,7 +1334,7 @@ mod tests {
         assert_eq!(store.committed_pages(), pages_before + 1);
         for (id, generation) in ["q1", "q2", "q3", "q4", "leader"].iter().zip(&generations) {
             assert_eq!(
-                identity_generation(&store, "Customer", id).unwrap(),
+                identity_generation(&store, "sales", "Customer", id).unwrap(),
                 *generation
             );
         }
@@ -1223,7 +1399,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         for (id, generation) in ["same", "new-1", "new-2"].iter().zip(&generations) {
             assert_eq!(
-                identity_generation(&store, "Customer", id).unwrap(),
+                identity_generation(&store, "sales", "Customer", id).unwrap(),
                 *generation
             );
         }
@@ -1237,7 +1413,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         for (id, generation) in ["same", "new-1", "new-2"].iter().zip(&generations) {
             assert_eq!(
-                identity_generation(&store, "Customer", id).unwrap(),
+                identity_generation(&store, "sales", "Customer", id).unwrap(),
                 *generation
             );
         }
@@ -1276,7 +1452,7 @@ mod tests {
         assert!(newer > older, "the newer admit commits after its twin");
         let store = Store::open(&path).unwrap();
         assert_eq!(
-            identity_generation(&store, "Customer", "twin").unwrap(),
+            identity_generation(&store, "sales", "Customer", "twin").unwrap(),
             newer
         );
     }
@@ -1367,7 +1543,7 @@ mod tests {
         assert_eq!(results.len(), 80);
         for (id, generation) in &results {
             assert_eq!(
-                identity_generation(&store, "Customer", id).unwrap(),
+                identity_generation(&store, "sales", "Customer", id).unwrap(),
                 *generation
             );
         }
@@ -1385,22 +1561,32 @@ mod tests {
                 ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+
+                    namespace: "sales".into(),
                     kind: "Customer".into(),
                     key: "c1".into(),
                     hidden: false,
                     props: HashMap::from([("region".into(), "eu".into())]),
+
+                    schema_version: 1,
                 },
                 ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+
+                    namespace: "sales".into(),
                     kind: "Order".into(),
                     key: "o1".into(),
                     hidden: false,
                     props: HashMap::from([("customer_id".into(), "c1".into())]),
+
+                    schema_version: 1,
                 },
                 ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+
+                    namespace: "sales".into(),
                     kind: "Shipment".into(),
                     key: "s1".into(),
                     hidden: false,
@@ -1408,10 +1594,14 @@ mod tests {
                         ("order_id".into(), "o1".into()),
                         ("amount".into(), "10".into()),
                     ]),
+
+                    schema_version: 1,
                 },
                 ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+
+                    namespace: "sales".into(),
                     kind: "Shipment".into(),
                     key: "s-hidden".into(),
                     hidden: true,
@@ -1419,11 +1609,14 @@ mod tests {
                         ("order_id".into(), "o1".into()),
                         ("amount".into(), "99".into()),
                     ]),
+
+                    schema_version: 1,
                 },
             ],
         )
         .unwrap();
         let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
@@ -1474,6 +1667,8 @@ mod tests {
             vec![ObjectRecord {
                 action_id: None,
                 r#gen: 1,
+
+                namespace: "sales".into(),
                 kind: "Shipment".into(),
                 key: "s2".into(),
                 hidden: false,
@@ -1481,6 +1676,8 @@ mod tests {
                     ("order_id".into(), "o1".into()),
                     ("amount".into(), "5".into()),
                 ]),
+
+                schema_version: 1,
             }],
         )
         .unwrap();
@@ -1524,6 +1721,7 @@ mod tests {
     #[test]
     fn incoming_hop_fails_closed_instead_of_outbound() {
         let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
@@ -1604,6 +1802,449 @@ mod tests {
         );
     }
 
+    fn member_props(kind: &str, key: &str, properties: &[(&str, &str)]) -> ObjectTypeIndexMember {
+        ObjectTypeIndexMember {
+            kind: kind.into(),
+            source_key: key.into(),
+            object_id: format!("{kind}:{key}"),
+            properties: properties
+                .iter()
+                .map(|(name, value)| ((*name).into(), (*value).into()))
+                .collect(),
+            ..ObjectTypeIndexMember::default()
+        }
+    }
+
+    fn shop_view() -> PropertyAcl {
+        let mut acl = PropertyAcl::allow_all();
+        acl.insert_row_filter("order", "status", ["open", "closed"])
+            .unwrap();
+        acl
+    }
+
+    fn shop_order_record(
+        key: &str,
+        customer: &str,
+        status: &str,
+        priority: &str,
+        owner: &str,
+        amount: &str,
+    ) -> ObjectRecord {
+        let mut props = HashMap::from([
+            ("customer".into(), customer.into()),
+            ("status".into(), status.into()),
+            ("amount".into(), amount.into()),
+        ]);
+        if !priority.is_empty() {
+            props.insert("priority".into(), priority.into());
+        }
+        if !owner.is_empty() {
+            props.insert("owner".into(), owner.into());
+        }
+        ObjectRecord {
+            action_id: None,
+            r#gen: 1,
+            namespace: "shop".into(),
+            kind: "order".into(),
+            key: key.into(),
+            hidden: false,
+            props,
+            schema_version: 1,
+        }
+    }
+
+    fn seed_shop_log(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join(name);
+        let mut store = Store::create(&log).unwrap();
+        BatchIngest::run(
+            &mut store,
+            vec![
+                shop_order_record("o1", "c1", "open", "2", "ann", "10"),
+                shop_order_record("o2", "c1", "closed", "1", "ann", "7"),
+                shop_order_record("o3", "c2", "open", "3", "bob", "4"),
+                shop_order_record("o4", "c3", "open", "", "bob", ""),
+                shop_order_record("o5", "c3", "closed", "2", "cid", "x12"),
+                shop_order_record("o6", "c4", "open", "1", "ann", "-3"),
+                shop_order_record("o7", "c2", "open", "2", "", "10"),
+                shop_order_record("o8", "c1", "archived", "1", "bob", "1000"),
+            ],
+        )
+        .unwrap();
+        for (key, region) in [
+            ("c1", Some("east")),
+            ("c2", Some("west")),
+            ("c3", Some("east")),
+            ("c4", None),
+            ("c5", Some("west")),
+        ] {
+            let props = region
+                .map(|value| HashMap::from([("region".into(), value.into())]))
+                .unwrap_or_default();
+            BatchIngest::run(
+                &mut store,
+                vec![ObjectRecord {
+                    action_id: None,
+                    r#gen: 1,
+                    namespace: "shop".into(),
+                    kind: "customer".into(),
+                    key: key.into(),
+                    hidden: false,
+                    props,
+                    schema_version: 1,
+                }],
+            )
+            .unwrap();
+        }
+        (dir, log)
+    }
+
+    fn shop_visible_orders() -> Vec<ObjectTypeIndexMember> {
+        vec![
+            member_props(
+                "order",
+                "o1",
+                &[
+                    ("customer", "c1"),
+                    ("status", "open"),
+                    ("priority", "2"),
+                    ("owner", "ann"),
+                    ("amount", "10"),
+                ],
+            ),
+            member_props(
+                "order",
+                "o2",
+                &[
+                    ("customer", "c1"),
+                    ("status", "closed"),
+                    ("priority", "1"),
+                    ("owner", "ann"),
+                    ("amount", "7"),
+                ],
+            ),
+            member_props(
+                "order",
+                "o3",
+                &[
+                    ("customer", "c2"),
+                    ("status", "open"),
+                    ("priority", "3"),
+                    ("owner", "bob"),
+                    ("amount", "4"),
+                ],
+            ),
+            member_props(
+                "order",
+                "o4",
+                &[
+                    ("customer", "c3"),
+                    ("status", "open"),
+                    ("owner", "bob"),
+                    ("amount", ""),
+                ],
+            ),
+            member_props(
+                "order",
+                "o5",
+                &[
+                    ("customer", "c3"),
+                    ("status", "closed"),
+                    ("priority", "2"),
+                    ("owner", "cid"),
+                    ("amount", "x12"),
+                ],
+            ),
+            member_props(
+                "order",
+                "o6",
+                &[
+                    ("customer", "c4"),
+                    ("status", "open"),
+                    ("priority", "1"),
+                    ("owner", "ann"),
+                    ("amount", "-3"),
+                ],
+            ),
+            member_props(
+                "order",
+                "o7",
+                &[
+                    ("customer", "c2"),
+                    ("status", "open"),
+                    ("priority", "2"),
+                    ("amount", "10"),
+                ],
+            ),
+        ]
+    }
+
+    fn shop_order_descriptor() -> ObjectSetDescriptor {
+        ObjectSetDescriptor {
+            namespace: "shop".into(),
+            kind: "order".into(),
+            ..ObjectSetDescriptor::default()
+        }
+    }
+
+    fn fixture_agg(function: &str, property: &str) -> ObjectSetAggregation {
+        ObjectSetAggregation {
+            function: function.into(),
+            property: property.into(),
+            group_by: String::new(),
+        }
+    }
+
+    fn compare_shop(
+        log: &std::path::Path,
+        aggregation: &ObjectSetAggregation,
+        orders: &[ObjectTypeIndexMember],
+        acl: PropertyAcl,
+    ) -> Result<(), ObjectLogCompareError> {
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        let paths: Vec<Vec<&ObjectTypeIndexMember>> =
+            orders.iter().map(|order| vec![order]).collect();
+        compare_sql_to_log_with_cache(
+            &cache,
+            log,
+            &shop_order_descriptor(),
+            &[],
+            aggregation,
+            &paths,
+            acl,
+        )
+    }
+
+    #[test]
+    fn fixture_a1_count_sum_min_max_avg_match_without_group_by() {
+        let (_dir, log) = seed_shop_log("fixture-a1.mikura");
+        let orders = shop_visible_orders();
+        let acl = shop_view();
+        compare_shop(&log, &fixture_agg("count", ""), &orders, acl.clone()).unwrap();
+        compare_shop(&log, &fixture_agg("sum", "amount"), &orders, acl.clone()).unwrap();
+        compare_shop(&log, &fixture_agg("min", "amount"), &orders, acl.clone()).unwrap();
+        compare_shop(&log, &fixture_agg("max", "amount"), &orders, acl.clone()).unwrap();
+        compare_shop(&log, &fixture_agg("avg", "amount"), &orders, acl).unwrap();
+    }
+
+    #[test]
+    fn empty_min_max_avg_match_when_both_sides_are_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("fixture-empty.mikura");
+        let mut store = Store::create(&log).unwrap();
+        BatchIngest::run(
+            &mut store,
+            vec![ObjectRecord {
+                action_id: None,
+                r#gen: 1,
+                namespace: "shop".into(),
+                kind: "customer".into(),
+                key: "c1".into(),
+                hidden: false,
+                props: HashMap::new(),
+                schema_version: 1,
+            }],
+        )
+        .unwrap();
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        let descriptor = shop_order_descriptor();
+        let paths: [Vec<&ObjectTypeIndexMember>; 0] = [];
+        for function in ["min", "max", "avg"] {
+            compare_sql_to_log_with_cache(
+                &cache,
+                &log,
+                &descriptor,
+                &[],
+                &fixture_agg(function, "amount"),
+                &paths,
+                PropertyAcl::allow_all(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn fixture_a2_a3_string_distinct_refuses_numeric_only_sql() {
+        let orders = shop_visible_orders();
+        let paths: Vec<Vec<&ObjectTypeIndexMember>> =
+            orders.iter().map(|order| vec![order]).collect();
+        let err = sql_compare_signature(&paths, &fixture_agg("distinct", "owner")).unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("numeric"))
+        );
+        let mapped = map_evaluate_request(
+            &shop_order_descriptor(),
+            &[],
+            &fixture_agg("distinct", "status"),
+            shop_view(),
+        )
+        .unwrap();
+        assert_eq!(
+            mapped
+                .breakdown
+                .as_ref()
+                .and_then(|b| b.distinct.as_deref()),
+            Some("status")
+        );
+        let (_dir, log) = seed_shop_log("fixture-a3.mikura");
+        let orders = shop_visible_orders();
+        let err = compare_shop(
+            &log,
+            &fixture_agg("distinct", "status"),
+            &orders,
+            shop_view(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("numeric"))
+        );
+    }
+
+    #[test]
+    fn fixture_group_by_and_h1_refuse_absent_key_fallback() {
+        for group_by in ["status", "owner", "region"] {
+            let err = map_evaluate_request(
+                &shop_order_descriptor(),
+                &[],
+                &ObjectSetAggregation {
+                    function: "sum".into(),
+                    property: "amount".into(),
+                    group_by: group_by.into(),
+                },
+                shop_view(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("absent group"))
+            );
+        }
+        let err = map_evaluate_request(
+            &ObjectSetDescriptor {
+                namespace: "shop".into(),
+                kind: "customer".into(),
+                ..ObjectSetDescriptor::default()
+            },
+            &[crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "order".into(),
+                join_property: "customer".into(),
+                ..Default::default()
+            }],
+            &ObjectSetAggregation {
+                function: "sum".into(),
+                property: "amount".into(),
+                group_by: "region".into(),
+            },
+            shop_view(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("absent group"))
+        );
+    }
+
+    #[test]
+    fn fixture_sort_queries_refuse_one_key_sql_order_by() {
+        let mut descriptor = shop_order_descriptor();
+        descriptor.order_by = "property:status".into();
+        let err = map_evaluate_request(&descriptor, &[], &fixture_agg("count", ""), shop_view())
+            .unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("three keys"))
+        );
+    }
+
+    #[test]
+    fn fixture_d1_denied_owner_fails_closed_on_distinct() {
+        let (_dir, log) = seed_shop_log("fixture-d1.mikura");
+        let mut acl = shop_view();
+        acl.insert_deny("order", "owner").unwrap();
+        let orders = shop_visible_orders();
+        let err = compare_shop(&log, &fixture_agg("distinct", "owner"), &orders, acl).unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Evaluate(message) if message.contains("Denied"))
+        );
+    }
+
+    #[test]
+    fn fixture_o1_avg_overflows_and_o2_sum_wraps() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("fixture-ovf.mikura");
+        let mut store = Store::create(&log).unwrap();
+        BatchIngest::run(
+            &mut store,
+            vec![
+                ObjectRecord {
+                    action_id: None,
+                    r#gen: 1,
+                    namespace: "ovf".into(),
+                    kind: "order".into(),
+                    key: "o1".into(),
+                    hidden: false,
+                    props: HashMap::from([("amount".into(), "9223372036854775807".into())]),
+                    schema_version: 1,
+                },
+                ObjectRecord {
+                    action_id: None,
+                    r#gen: 1,
+                    namespace: "ovf".into(),
+                    kind: "order".into(),
+                    key: "o2".into(),
+                    hidden: false,
+                    props: HashMap::from([("amount".into(), "1".into())]),
+                    schema_version: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let members = [
+            member_props("order", "o1", &[("amount", "9223372036854775807")]),
+            member_props("order", "o2", &[("amount", "1")]),
+        ];
+        let paths: Vec<Vec<&ObjectTypeIndexMember>> = members.iter().map(|row| vec![row]).collect();
+        let descriptor = ObjectSetDescriptor {
+            namespace: "ovf".into(),
+            kind: "order".into(),
+            ..ObjectSetDescriptor::default()
+        };
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        let err = compare_sql_to_log_with_cache(
+            &cache,
+            &log,
+            &descriptor,
+            &[],
+            &fixture_agg("avg", "amount"),
+            &paths,
+            PropertyAcl::allow_all(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Evaluate(message) if message.contains("Overflow"))
+        );
+        let err = compare_sql_to_log_with_cache(
+            &cache,
+            &log,
+            &descriptor,
+            &[],
+            &fixture_agg("min", "amount"),
+            &paths,
+            PropertyAcl::allow_all(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("overflow"))
+        );
+        compare_sql_to_log_with_cache(
+            &cache,
+            &log,
+            &descriptor,
+            &[],
+            &fixture_agg("sum", "amount"),
+            &paths,
+            PropertyAcl::allow_all(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn dual_read_refuses_unbounded_and_skips_unsampled_without_opening() {
         SAMPLE_TICK.store(0, Ordering::Relaxed);
@@ -1613,6 +2254,7 @@ mod tests {
             sample_n: 2,
         };
         let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
@@ -1652,6 +2294,7 @@ mod tests {
 
     fn canary_descriptor() -> ObjectSetDescriptor {
         ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         }
@@ -1798,6 +2441,8 @@ mod tests {
             &mut store,
             vec![ObjectRecord {
                 r#gen: 0,
+
+                namespace: "sales".into(),
                 kind: "Customer".into(),
                 key: "c1".into(),
                 hidden: false,
@@ -1808,10 +2453,12 @@ mod tests {
                     ("secret".into(), "s".into()),
                     ("email".into(), "e".into()),
                 ]),
+
+                schema_version: 1,
             }],
         )
         .unwrap();
-        let visible = store.load("Customer", "c1", &acl).unwrap();
+        let visible = store.load("sales", "Customer", "c1", &acl).unwrap();
         let mut keys = visible.props.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, ["region", "tier"]);
@@ -1828,6 +2475,8 @@ mod tests {
         let record = |kind: &str, key: &str, props: &[(&str, &str)]| ObjectRecord {
             action_id: None,
             r#gen: 1,
+
+            namespace: "sales".into(),
             kind: kind.into(),
             key: key.into(),
             hidden: false,
@@ -1835,6 +2484,8 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).into(), (*value).into()))
                 .collect(),
+
+            schema_version: 1,
         };
         BatchIngest::run(
             &mut store,
@@ -1864,12 +2515,13 @@ mod tests {
         .unwrap();
         assert!(
             !store
-                .load("Customer", "c1", &acl)
+                .load("sales", "Customer", "c1", &acl)
                 .unwrap()
                 .props
                 .contains_key("secret")
         );
         let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
@@ -1944,5 +2596,149 @@ mod tests {
             project_object_log_acl([customer_kind(None, None, &["anything"])]).unwrap(),
             PropertyAcl::allow_all()
         );
+    }
+
+    #[test]
+    fn projection_namespace_fails_closed_on_unknown_and_colliding_identities() {
+        let rows = vec![
+            ("sales".into(), "Customer".into(), "c1".into()),
+            ("ops".into(), "Customer".into(), "c1".into()),
+            ("sales".into(), "Order".into(), "o1".into()),
+        ];
+        assert_eq!(
+            projection_namespace_for(&rows, "Order", "o1").unwrap(),
+            "sales"
+        );
+        let unknown = projection_namespace_for(&rows, "Customer", "missing").unwrap_err();
+        assert!(unknown.contains("unknown"), "{unknown}");
+        let clash = projection_namespace_for(&rows, "Customer", "c1").unwrap_err();
+        assert!(clash.contains("more than one namespace"), "{clash}");
+    }
+
+    #[test]
+    fn two_namespaces_keep_separate_generations_for_the_same_kind_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let sales = crate::domain::Object {
+            id: "shared".into(),
+            kind: "Customer".into(),
+            name: "Sales".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        let ops = crate::domain::Object {
+            id: "shared".into(),
+            kind: "Customer".into(),
+            name: "Ops".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "us".into())]),
+            created: 1,
+            updated: 1,
+        };
+        assert_eq!(apply_admitted_object_to_log(&log, &sales).unwrap(), 1);
+        assert_eq!(apply_admitted_object_to_log(&log, &ops).unwrap(), 1);
+        assert_eq!(apply_admitted_object_to_log(&log, &sales).unwrap(), 2);
+        let store = Store::open(&log).unwrap();
+        assert_eq!(
+            identity_generation(&store, "sales", "Customer", "shared").unwrap(),
+            2
+        );
+        assert_eq!(
+            identity_generation(&store, "ops", "Customer", "shared").unwrap(),
+            1
+        );
+        drop(store);
+        let reopened = Store::open(&log).unwrap();
+        assert_eq!(
+            identity_generation(&reopened, "sales", "Customer", "shared").unwrap(),
+            2
+        );
+        assert_eq!(
+            identity_generation(&reopened, "ops", "Customer", "shared").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pre_namespace_log_fails_closed_naming_the_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("legacy.mikura");
+        std::fs::write(&log, include_bytes!("mikurav1_superblock.bin")).unwrap();
+        let error = Store::open(&log).err().expect("V1 open must fail closed");
+        assert!(error.contains("migrate_unnamespaced"), "{error}");
+    }
+
+    #[test]
+    fn projection_migration_answers_generations_and_dual_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("legacy.mikura");
+        let dst = dir.path().join("objects.mikura");
+        std::fs::write(&src, include_bytes!("mikurav1_records.bin")).unwrap();
+        let src_bytes = std::fs::read(&src).unwrap();
+        let rows = vec![
+            ("sales".into(), "Customer".into(), "c1".into()),
+            ("sales".into(), "Order".into(), "o1".into()),
+            ("sales".into(), "Shipment".into(), "s1".into()),
+        ];
+        assert_eq!(
+            migrate_unnamespaced_object_log_from_projection(&src, &dst, &rows).unwrap(),
+            3
+        );
+        assert_eq!(std::fs::read(&src).unwrap(), src_bytes);
+        let store = Store::open(&dst).unwrap();
+        assert_eq!(
+            identity_generation(&store, "sales", "Customer", "c1").unwrap(),
+            1
+        );
+        drop(store);
+
+        let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            ..ObjectSetDescriptor::default()
+        };
+        let hops = vec![
+            crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "Order".into(),
+                join_property: "customer_id".into(),
+                ..Default::default()
+            },
+            crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "Shipment".into(),
+                join_property: "order_id".into(),
+                ..Default::default()
+            },
+        ];
+        let aggregation = ObjectSetAggregation {
+            function: "sum".into(),
+            property: "amount".into(),
+            group_by: String::new(),
+        };
+        let customer = member("Customer", "c1", "region", "eu");
+        let order = member("Order", "o1", "customer_id", "c1");
+        let shipment = member("Shipment", "s1", "amount", "10");
+        let paths = vec![vec![&customer, &order, &shipment]];
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        compare_sql_to_log_with_cache(
+            &cache,
+            &dst,
+            &descriptor,
+            &hops,
+            &aggregation,
+            &paths,
+            PropertyAcl::allow_all(),
+        )
+        .unwrap();
+        let unknown = migrate_unnamespaced_object_log_from_projection(
+            &src,
+            &dir.path().join("empty.mikura"),
+            &[("sales".into(), "Customer".into(), "c1".into())],
+        )
+        .unwrap_err();
+        assert!(unknown.contains("unknown"), "{unknown}");
     }
 }

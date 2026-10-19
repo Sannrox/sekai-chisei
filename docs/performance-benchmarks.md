@@ -57,6 +57,42 @@ Do not wire `perf-gate --enforce` to this manifest until at least three
 quiet-machine reports exist. The wide latency budgets in the manifest are
 run-completeness bounds, not capacity claims.
 
+## Object-path workloads
+
+`benchmarks/manifest-object-path-v1.json` measures GetObject, ListObjects,
+CreateObject, UpdateObject, EvaluateObjectSet (filter, sort, one-hop, two-hop),
+Action apply, policy-checked reads, and ApplySourceBatch through the gRPC
+handlers on SQLite and PostgreSQL at 10⁴ and 10⁵ objects (batch sizes 100 and
+1000 for ApplySourceBatch). PostgreSQL rows run when
+`SEKAI_BENCH_POSTGRES_URL` is set. Local and pull-request smoke skip those
+rows when the URL is unset. The scheduled object-path job starts an ephemeral
+TLS PostgreSQL through `scripts/object-path-with-postgres.sh` and fails if
+every postgres workload was dropped.
+
+Published SQLite runner-class budgets:
+
+- GetObject p99 ≤ 5 ms
+- list page of 50, p95 ≤ 25 ms at 10⁵
+- Action apply p99 ≤ 25 ms
+- policy-checked read overhead ≤ 20% over unrestricted GetObject
+- ApplySourceBatch ≥ 2 000 records/s
+
+`.github/workflows/performance.yml` runs a wide-budget smoke subset on pull
+requests (`benchmarks/manifest-object-path-smoke-v1.json`). The scheduled
+object-path job repeats the full matrix three times and fails on a >20% p95
+regression against `benchmarks/baseline-github-ubuntu-latest-object-path.json`.
+That file starts with empty `results`; `MissingFromBaseline` is not a
+regression. Check in the first three runner-class reports before the floor
+has a measured reference:
+
+```bash
+cargo run --release --bin perf-gate -- \
+  --enforce --regression-threshold-percent 20 \
+  --manifest benchmarks/manifest-object-path-v1.json \
+  --baseline benchmarks/baseline-github-ubuntu-latest-object-path.json \
+  run-1.json run-2.json run-3.json
+```
+
 The concurrent persistence workload uses a temporary file-backed WAL database.
 Its benchmark-local pressure recovery is capped at 20 attempts with a one
 millisecond backoff; exhausting that bound fails the run instead of hiding

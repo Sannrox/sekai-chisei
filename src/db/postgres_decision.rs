@@ -1,7 +1,6 @@
 use crate::db::postgres::PostgresDb;
-use crate::sekai::audit::{Decision, DecisionFilter};
+use crate::sekai::audit::{Decision, DecisionFilter, validate_decision};
 use crate::sekai::ledger;
-use std::collections::HashMap;
 
 impl PostgresDb {
     pub fn record_decision(&self, decision: &Decision) -> Result<(), String> {
@@ -177,43 +176,6 @@ pub(crate) fn insert_chained_decision(
     )
     .map(|_| ())
     .map_err(|error| error.to_string())
-}
-
-fn validate_decision(decision: &Decision) -> Result<(), String> {
-    if decision.id.trim().is_empty() {
-        return Err("decision id required".into());
-    }
-    // Serialize once so corrupt/non-string evidence never reaches storage.
-    let evidence = serde_json::to_string(&decision.evidence).map_err(|error| error.to_string())?;
-    let parsed: HashMap<String, String> = serde_json::from_str(&evidence)
-        .map_err(|error| format!("decision evidence must be a string map: {error}"))?;
-    // Do not persist credential-shaped values as free-form evidence summaries.
-    for (key, value) in &parsed {
-        if looks_like_secret(value) {
-            return Err(format!(
-                "decision evidence must not store secret material in field {key}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn looks_like_secret(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    [
-        "sk-",
-        "ghp_",
-        "github_pat_",
-        "glpat-",
-        "xoxb-",
-        "xoxp-",
-        "bearer ",
-        "akia",
-        "asia",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
-        || (lower.starts_with("eyj") && lower.matches('.').count() == 2)
 }
 
 fn row_to_decision(row: postgres::Row) -> Result<Decision, String> {

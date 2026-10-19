@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sekai::markings::{MarkingDecision, is_trusted_service_principal};
+use crate::markings::{MarkingDecision, is_trusted_service_principal};
 
 pub const PURPOSE_AUTHORIZATION_VERSION: &str = "sekai.purpose-authorization/v1";
 

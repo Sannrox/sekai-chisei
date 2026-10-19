@@ -216,6 +216,19 @@ message Grant {
   string principal = 3;
   string role = 4;
   int64 created = 5;
+  string purpose = 6;
+  int64 not_after_ms = 7;
+  string exception_reason = 8;
+}
+
+// Control-plane write freeze (#1458). scope_kind is namespace, tenant, principal, or action.
+message WriteFreeze {
+  string scope_kind = 1;
+  string scope_value = 2;
+  string mode = 3;
+  string reason = 4;
+  bool enabled = 5;
+  int64 updated_ms = 6;
 }
 
 message Decision {
@@ -267,6 +280,16 @@ message CapabilityEntry {
   // Product tier for discovery filters (#386 / research #383): core | advanced | experimental.
   // Empty means untagged (treated as advanced for filtering).
   string product_tier = 19;
+  // Closed parameter JSON Schema copied from the governed Action type. Empty
+  // for query and retrieval entries. Not a second schema language.
+  string parameter_schema_json = 20;
+  // Visible classification markings remaining after restricted-property
+  // redaction. Hidden markings are omitted.
+  repeated string markings = 21;
+  // Governed Action type version selected for this catalog entry. Empty on
+  // query and retrieval entries. When several versions of one type_id are
+  // enabled, the catalog keeps the last row in type_id/version order.
+  string action_version = 22;
 }
 
 message CapabilityLimit {
@@ -292,6 +315,10 @@ message DiscoverCapabilitiesResponse {
   string next_page_token = 4;
   uint32 total_size = 5;
   string cache_scope = 6; // always authorization_context
+  // Published definition revision digest the caller may read. Empty when the
+  // namespace has no published revision or the caller cannot see it.
+  // catalog_version still changes when this value changes.
+  string ontology_revision = 7;
 }
 
 // Fixed graph-backed profile for immutable requirement, invariant, and waiver
@@ -507,6 +534,59 @@ message ObjectTypeIndexStatus {
 }
 message GetObjectTypeIndexStatusResponse {
   ObjectTypeIndexStatus status = 1;
+}
+message SearchPropertyFilter {
+  string property = 1;
+  string value = 2;
+}
+message SearchRequest {
+  string namespace = 1;
+  string text = 2;
+  repeated string kinds = 3;
+  repeated SearchPropertyFilter property_filters = 4;
+  repeated string facets = 5;
+  string page_token = 6;
+  int32 page_size = 7;
+  string source = 8;
+}
+message SearchHighlight {
+  string field = 1;
+  string text = 2;
+}
+message SearchHit {
+  string source = 1;
+  string id = 2;
+  string kind = 3;
+  repeated SearchHighlight highlights = 4;
+  bool authority = 5;
+}
+message SearchFacetValue {
+  string value = 1;
+  int64 count = 2;
+}
+message SearchFacet {
+  string field = 1;
+  repeated SearchFacetValue values = 2;
+}
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  int64 count = 2;
+  bool count_is_lower_bound = 3;
+  repeated SearchFacet facets = 4;
+  string next_page_token = 5;
+  bool authority = 6;
+  int64 lag_ms = 7;
+}
+message GetSearchIndexStatusRequest {
+  string namespace = 1;
+}
+message GetSearchIndexStatusResponse {
+  string namespace = 1;
+  string analyzer_version = 2;
+  int64 lag_ms = 3;
+  int64 object_count = 4;
+  int64 dataset_count = 5;
+  bool authority = 6;
 }
 message PutObjectTypeIndexEditRequest {
   string namespace = 1;
@@ -1370,6 +1450,10 @@ message ListGrantsRequest { string object_id = 1; }
 message ListGrantsResponse { repeated Grant grants = 1; }
 message CheckAccessRequest { string object_id = 1; repeated string principals = 2; }
 message CheckAccessResponse { bool allowed = 1; }
+message SetWriteFreezeRequest { WriteFreeze freeze = 1; }
+message SetWriteFreezeResponse { WriteFreeze freeze = 1; }
+message ListWriteFreezesRequest {}
+message ListWriteFreezesResponse { repeated WriteFreeze freezes = 1; }
 message EnsureTeamNamespaceRequest {
   string namespace = 1;
   string principal = 2;
@@ -1453,6 +1537,16 @@ message GovernedActionType {
   // Principals who may grant or deny a parked instance. Empty means namespace
   // administrators. A submitter never decides their own instance (#1084).
   repeated string approvers = 19;
+  // Review queue for parked instances (#1455). Empty queue_id means no queue.
+  string review_queue_id = 20;
+  int64 review_sla_ms = 21;
+  // auto_deny | reassign | empty
+  string review_escalate = 22;
+  string review_escalate_to = 23;
+  string review_threshold_param = 24;
+  int64 review_threshold = 25;
+  repeated string review_pool = 26;
+  repeated string review_agent_reviewers = 27;
 }
 message PutGovernedActionTypeRequest { GovernedActionType type = 1; string request_id = 2; }
 message PutGovernedActionTypeResponse { GovernedActionType type = 1; }
@@ -1499,6 +1593,12 @@ message ActionInstance {
   // Approver who decided a parked instance, and their decision (grant | deny).
   string decided_by = 18;
   string approval_decision = 19;
+  // Review-queue placement when the type routed this park (#1455).
+  string review_queue_id = 20;
+  string review_assignee = 21;
+  int64 review_sla_deadline_ms = 22;
+  bool review_escalated = 23;
+  bool agent_decision = 24;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;
@@ -2941,6 +3041,8 @@ service SekaiService {
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
   rpc GetObjectTypeIndexStatus(GetObjectTypeIndexStatusRequest) returns (GetObjectTypeIndexStatusResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc GetSearchIndexStatus(GetSearchIndexStatusRequest) returns (GetSearchIndexStatusResponse);
   rpc PutObjectTypeIndexEdit(PutObjectTypeIndexEditRequest) returns (PutObjectTypeIndexEditResponse);
   rpc PutGovernedTransform(PutGovernedTransformRequest) returns (PutGovernedTransformResponse);
   rpc RunGovernedTransform(RunGovernedTransformRequest) returns (RunGovernedTransformResponse);
@@ -3025,6 +3127,8 @@ service SekaiService {
   rpc DeleteGrant(DeleteGrantRequest) returns (DeleteGrantResponse);
   rpc ListGrants(ListGrantsRequest) returns (ListGrantsResponse);
   rpc CheckAccess(CheckAccessRequest) returns (CheckAccessResponse);
+  rpc SetWriteFreeze(SetWriteFreezeRequest) returns (SetWriteFreezeResponse);
+  rpc ListWriteFreezes(ListWriteFreezesRequest) returns (ListWriteFreezesResponse);
   rpc EnsureTeamNamespace(EnsureTeamNamespaceRequest) returns (EnsureTeamNamespaceResponse);
 
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);

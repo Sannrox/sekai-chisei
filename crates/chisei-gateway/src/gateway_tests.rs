@@ -3271,6 +3271,9 @@ fn test_config() -> Config {
         assertion_audience: None,
         assertion_hmac_key: None,
         sekai_endpoint: None,
+        actor_chain_enforcement: false,
+        principal_requests_per_minute: 60,
+        agent_requests_per_minute: 60,
     }
 }
 
@@ -6110,6 +6113,7 @@ async fn explicit_context_manifest_enforces_the_authenticated_callers_acl() {
         principal: "agent:other".to_string(),
         role: crate::test_support::security::Role::Viewer,
         created: 0,
+        ..Default::default()
     })
     .unwrap();
     let (chisei_target, _) = spawn_control_plane_from_db(test_config(), db).await;

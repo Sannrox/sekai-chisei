@@ -61,6 +61,22 @@ pub struct ActionInstance {
     /// require it to still be live.
     #[serde(default)]
     pub autonomous_envelope_id: String,
+    /// Review-queue placement when the type routed this park (#1455).
+    #[serde(default)]
+    pub review: crate::sekai::review_queue::ReviewPlacement,
+    /// Admission classified the submitter as an agent Action. Persisted so
+    /// parked grant and in-flight ack keep that classification after the
+    /// submitting credential is gone.
+    #[serde(default)]
+    pub agent_action: bool,
+    /// Tenant used at admission for freeze matching. Empty when the submit
+    /// had no tenant context and no registered owning tenant.
+    #[serde(default)]
+    pub admission_tenant: String,
+    /// Shared-space owner tenant at admission, when it differed from the
+    /// acting tenant. Parked grant and ack keep checking it.
+    #[serde(default)]
+    pub resource_tenant: String,
 }
 
 impl ActionInstance {
@@ -555,23 +571,29 @@ impl SekaiDb {
             ),
             None => None,
         };
-        tx.execute(
-            "UPDATE sekai_action_instances
+        let updated = tx
+            .execute(
+                "UPDATE sekai_action_instances
              SET status = ?2, deny_reason = ?3, policy_decision = ?4, budget_decision = ?5,
                  decided_at_ms = ?6, body_json = ?7
-             WHERE instance_id = ?1 AND status = ?8",
-            params![
-                granted.instance_id,
-                granted.status,
-                granted.deny_reason,
-                granted.policy_decision,
-                granted.budget_decision,
-                granted.decided_at_ms,
-                body_json,
-                STATUS_PARKED,
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+             WHERE instance_id = ?1 AND status = ?8
+               AND coalesce(json_extract(body_json, '$.review.assignee'), '') = ?9",
+                params![
+                    granted.instance_id,
+                    granted.status,
+                    granted.deny_reason,
+                    granted.policy_decision,
+                    granted.budget_decision,
+                    granted.decided_at_ms,
+                    body_json,
+                    STATUS_PARKED,
+                    granted.review.assignee,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Ok(ParkedGrantOutcome::NotParked);
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(ParkedGrantOutcome::Granted { previous })
     }
@@ -579,7 +601,7 @@ impl SekaiDb {
     /// Moves a parked instance to its decided state. Returns false when the
     /// instance is no longer parked, so the first decision wins.
     pub fn decide_parked_action_instance(&self, decided: &ActionInstance) -> Result<bool, String> {
-        self.transition_action_instance(STATUS_PARKED, decided)
+        self.transition_action_instance(STATUS_PARKED, decided, &decided.review.assignee)
     }
 
     /// Replaces an instance only while it still has `expected_status`.
@@ -587,6 +609,7 @@ impl SekaiDb {
         &self,
         expected_status: &str,
         decided: &ActionInstance,
+        expected_assignee: &str,
     ) -> Result<bool, String> {
         self.migrate_action_instances()?;
         decided.validate_fields()?;
@@ -596,7 +619,8 @@ impl SekaiDb {
             "UPDATE sekai_action_instances
              SET status = ?2, deny_reason = ?3, policy_decision = ?4, budget_decision = ?5,
                  decided_at_ms = ?6, body_json = ?7
-             WHERE instance_id = ?1 AND status = ?8",
+             WHERE instance_id = ?1 AND status = ?8
+               AND coalesce(json_extract(body_json, '$.review.assignee'), '') = ?9",
             params![
                 decided.instance_id,
                 decided.status,
@@ -606,6 +630,7 @@ impl SekaiDb {
                 decided.decided_at_ms,
                 body_json,
                 expected_status,
+                expected_assignee,
             ],
         )
         .map(|updated| updated == 1)
@@ -634,6 +659,10 @@ mod tests {
             parked_object_digest: String::new(),
             decided_by: String::new(),
             approval_decision: String::new(),
+            review: Default::default(),
+            agent_action: false,
+            admission_tenant: String::new(),
+            resource_tenant: String::new(),
             instance_id: "ai-1".into(),
             namespace: "acme".into(),
             type_id: "review.intake".into(),

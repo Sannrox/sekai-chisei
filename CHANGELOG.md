@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+- Agents start propose-only. After enough unchanged approvals and no
+  incidents, an admin can grant auto-apply for that Action type against a
+  live bounded envelope. Matching submits skip review; other types still
+  park. A rejected Action, a dead envelope, or a model pin change revokes
+  the grant. Grant and revoke write Decision receipts
+  (`sekaictl admin autonomy offer|grant-auto-apply|revoke-auto-apply`,
+  #1469).
+
+- Parked Actions can route to a review queue on the type: SLA, assignee pool,
+  threshold, and auto-deny or reassign escalation. `DecideActionInstance`
+  refuses a reviewer who is not the assignee. The approval receipt names the
+  queue, reviewer, and reason (#1455).
+
+- Invoice extraction function revisions are scored on a labelled fixture
+  set before publish. A worse vendor extraction is denied; an unchanged
+  revision still publishes (#1327).
+
+- Operators can freeze writes or agent Actions by tenant, namespace, principal,
+  or Action type. The next object write and Action admission fail closed with
+  the freeze reason. In-flight claims fail at ack. Freeze and unfreeze write
+  Decision receipts. `SetWriteFreeze` / `ListWriteFreezes` stay behind
+  `SEKAI_EXPERIMENTAL_RPCS` (`0083_write_freeze`, GATE:mig, #1458).
+
+- `DiscoverCapabilities` lists enabled governed Action types as
+  `sekai.actions.{type_id}` on the core pack, with parameter schema,
+  selected `action_version`, description, approval matching submit
+  admission, and visible markings from the bound object kind.
+  Catalog-bound `SubmitActionInstance` rechecks the live catalog and fails
+  closed after revoke. Hidden types, restricted properties, and markings stay
+  off the catalog. The response carries `ontology_revision` (ADR 0116, #1459).
+
+- New grants can require a purpose and an end date when a namespace opts in.
+  Permanent grants need an explicit exception. Expired grants stop authorizing.
+  Create and renew write Decision receipts (#1462).
+
+- Action, transform-run, and agent-turn receipts join a per-namespace
+  Ed25519-signed hash chain when `CHISEI_RECEIPT_CHAIN_SIGNING_KEY` is set.
+  Genesis and periodic checkpoints detect truncation. `sekaictl admin
+  assurance receipts export|verify` checks a bundle offline and names the
+  first bad position when `--trusted-key` matches the operator key.
+  Isolated-process `TransformRun` JSON verifies with the same tool.
+  Dataset field redaction rewrites chained transform-run bodies and re-signs
+  the namespace (`0081_receipt_chain`, GATE:mig, ADR 0114, #1449).
+
+- gRPC GetObject, ListObjects, ApplySourceBatch, and object-change reads run
+  store work on `spawn_blocking`, bounded by the connection pool, so a slow
+  batch does not pin a Tokio worker (#1439).
+
+- ApplySourceBatch authorizes a page with one namespace-scoped external-id
+  lookup and one active object-policy load per kind, instead of a lookup
+  pair per record (#1438).
+
+- Object-path gRPC workloads (GetObject, ListObjects, EvaluateObjectSet,
+  Action apply, policy-checked reads, ApplySourceBatch) are measured at 10⁴/10⁵
+  objects on SQLite and PostgreSQL. Scheduled runs start TLS PostgreSQL, fail
+  a missed published budget or a >20% p95 regression, and reject a matrix that
+  dropped every postgres workload. Pull requests run a wide-budget SQLite smoke
+  subset (#1437).
+
+- Object-log dual-read maps min, max, and avg against the tagged object-log
+  when reconstructed hop measures agree with the mikura fixture, including
+  zero-hop whole-set aggregates. `group_by`, distinct, multi-key sort, and
+  min/max whose checked average overflows stay named refusals: SQL still
+  requires one group key and falls back to the source key when it is absent,
+  counts only numeric distinct values, sorts on one `order_by`, and does not
+  share the object-log's checked `(sum, n)` overflow. The plane aggregation
+  contract is unchanged. The mikura pin remains `0d43c57` (#1540).
+
+- Object-log identity is `(namespace, kind, key)`. Ingest, generation reads,
+  dual-read, and the host client pass the plane namespace. `MIKURAV1` logs
+  fail closed until an explicit projection-driven migration. The mikura pin
+  is `0d43c57` (#1552, ADR 0112).
+
+- Enterprise-scoped sessions can publish a governed transform definition with
+  namespace write and read access to its datasets. A scoped Put cannot name a
+  schedule or input-commit trigger. Community Put still requires credential
+  administration. Run stays unadmitted for scoped sessions (#1557).
+
 - A space can be shared across tenants when both the owning tenant and the
   member's home tenant approve. The owning tenant names the namespaces, kinds,
   and marking ceiling the space exposes. Members act under their own home

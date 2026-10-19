@@ -55,6 +55,9 @@ pub struct GovernedActionType {
     /// decides their own instance (#1084).
     #[serde(default)]
     pub approvers: Vec<String>,
+    /// Optional review queue for parked instances (#1455).
+    #[serde(default)]
+    pub review_queue: crate::sekai::review_queue::ReviewQueueSpec,
     pub enabled: bool,
     pub created_by: String,
     pub created_at_ms: i64,
@@ -77,6 +80,7 @@ impl GovernedActionType {
         {
             return Err("approvers must be non-empty principals without whitespace".into());
         }
+        self.review_queue.validate_with_approvers(&self.approvers)?;
         if self.version.trim().is_empty() {
             return Err("version required".into());
         }
@@ -219,6 +223,7 @@ pub(crate) fn body_fingerprint(t: &GovernedActionType) -> Result<String, String>
         "submission_criteria": t.submission_criteria,
         "declared_effect_kinds": t.declared_effect_kinds,
         "system_one": t.system_one,
+        "review_queue": t.review_queue,
     });
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }

@@ -509,6 +509,24 @@ fn with_named_principal<T>(payload: T, principal: &str) -> Request<T> {
     req
 }
 
+fn with_catalog_action<T>(
+    payload: T,
+    principal: &str,
+    capability: &str,
+    namespace: &str,
+) -> Request<T> {
+    let mut req = with_named_principal(payload, principal);
+    req.metadata_mut().insert(
+        "x-sekai-capability",
+        MetadataValue::try_from(capability).unwrap(),
+    );
+    req.metadata_mut().insert(
+        "x-sekai-namespace",
+        MetadataValue::try_from(namespace).unwrap(),
+    );
+    req
+}
+
 fn with_operation_identity<T>(payload: T, operation_id: &str) -> Request<T> {
     let mut req = with_principal(payload);
     req.metadata_mut().insert(
@@ -834,6 +852,7 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
             principal: "other-reader".into(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         };
         svc.security.add_grant(&grant);
         let token = authority.sign(&claims(nonce)).unwrap();
@@ -995,6 +1014,7 @@ async fn definition_branch_edit_rechecks_member_admin() {
         principal: "tester".into(),
         role: security::Role::Viewer,
         created: 1,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&read_grant).unwrap();
     svc.security.add_grant(&read_grant);
@@ -1032,6 +1052,7 @@ async fn definition_branch_edit_rechecks_member_admin() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 2,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&object_admin_grant).unwrap();
     svc.security.add_grant(&object_admin_grant);
@@ -1173,6 +1194,7 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
         principal: "root".into(),
         role: security::Role::Admin,
         created: 1,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&ticket_admin).unwrap();
     svc.security.add_grant(&ticket_admin);
@@ -1445,6 +1467,7 @@ async fn definition_proposal_merge_accepts_one_live_approval() {
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         };
         svc.db.runtime().create_grant(&grant).unwrap();
         svc.security.add_grant(&grant);
@@ -2367,6 +2390,7 @@ async fn list_published_definition_revisions_chains_filters_and_paginates() {
         principal: "other-reader".into(),
         role: security::Role::Viewer,
         created: 1,
+        ..Default::default()
     };
     svc.security.add_grant(&protected);
     assert!(
@@ -2634,6 +2658,60 @@ async fn source_sync_authorized_success_replay_and_state_are_exact() {
         "cursor:2"
     );
     assert_eq!(state_after_older_replay.last_result.as_ref(), Some(&second));
+}
+
+fn source_batch_domain_with_records(
+    namespace: &str,
+    producer: &str,
+    n: usize,
+    idempotency_key: &str,
+) -> crate::sekai::object_sync::SourceBatch {
+    let proto = source_batch(namespace, producer, "", "cursor:1", idempotency_key);
+    let mut domain = from_proto_source_batch(proto).unwrap();
+    let template = domain.records[0].clone();
+    domain.records = (0..n)
+        .map(|i| {
+            let mut record = template.clone();
+            record.external_id = format!("{}", 1000 + i);
+            record
+        })
+        .collect();
+    domain.batch_digest = domain.canonical_digest().unwrap();
+    domain
+}
+
+#[test]
+fn source_batch_object_policy_queries_are_constant_in_record_count() {
+    let svc = service();
+    let namespace = "sync-auth-batch";
+    let producer = "connector/github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    let principals = vec![producer.to_string()];
+    let measure = |n: usize, key: &str| {
+        crate::db::runtime_db::source_batch_auth_counters::LOOKUP_QUERIES.with(|c| c.set(0));
+        crate::db::runtime_db::source_batch_auth_counters::POLICY_LOOKUPS.with(|c| c.set(0));
+        let batch = source_batch_domain_with_records(namespace, producer, n, key);
+        authorize_source_batch_object_policy(svc.db.runtime(), &batch, &principals, None).unwrap();
+        (
+            crate::db::runtime_db::source_batch_auth_counters::LOOKUP_QUERIES.with(|c| c.get()),
+            crate::db::runtime_db::source_batch_auth_counters::POLICY_LOOKUPS.with(|c| c.get()),
+        )
+    };
+    let (lookups_25, policies_25) = measure(25, "batch-25");
+    let (lookups_80, policies_80) = measure(80, "batch-80");
+    assert_eq!(
+        lookups_25, 1,
+        "25-record authorize used {lookups_25} lookups"
+    );
+    assert_eq!(
+        lookups_80, 1,
+        "80-record authorize used {lookups_80} lookups"
+    );
+    assert_eq!(policies_25, policies_80);
+    assert!(
+        policies_25 <= 2,
+        "same-kind batch should resolve policy once, got {policies_25}"
+    );
 }
 
 #[tokio::test]
@@ -3172,6 +3250,7 @@ fn grant_schema_admin(svc: &SekaiServiceImpl) {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -3184,6 +3263,7 @@ fn grant_ontology_admin(svc: &SekaiServiceImpl) {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -3196,6 +3276,7 @@ fn grant_ontology_reader(svc: &SekaiServiceImpl, object_id: &str) {
         principal: "tester".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -3221,6 +3302,7 @@ fn grant_action_admin(svc: &SekaiServiceImpl) {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -3238,6 +3320,7 @@ fn grant_object_role(
         principal: principal.into(),
         role,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -5509,6 +5592,7 @@ async fn rollback_dataset_requires_write_access() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -5783,6 +5867,7 @@ async fn update_dataset_requires_write_access_to_existing_binding() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -7427,6 +7512,14 @@ async fn governed_action_type_registry_put_get_list_disable() {
         submission_criteria: vec![],
         declared_effect_kinds: vec![],
         system_one_json: String::new(),
+        review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
     };
     let put = svc
         .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
@@ -7563,6 +7656,14 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
         system_one_json: String::new(),
+        review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
     };
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(type_def),
@@ -7763,6 +7864,14 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
             system_one_json: String::new(),
+            review_queue_id: String::new(),
+            review_sla_ms: 0,
+            review_escalate: String::new(),
+            review_escalate_to: String::new(),
+            review_threshold_param: String::new(),
+            review_threshold: 0,
+            review_pool: vec![],
+            review_agent_reviewers: vec![],
         }),
         request_id: "put-validated-action".into(),
     }))
@@ -7908,6 +8017,14 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
             system_one_json: String::new(),
+            review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
         }),
         request_id: "put-nul".into(),
     }))
@@ -8001,6 +8118,7 @@ async fn ontology_list_hides_unreadable_definitions() {
         principal: "other-reader".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&hidden_grant).unwrap();
     svc.security.add_grant(&hidden_grant);
@@ -8134,6 +8252,14 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
             system_one_json: String::new(),
+            review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
         }),
         request_id: "put-record".into(),
     }))
@@ -8212,6 +8338,14 @@ async fn submit_action_instance_propagates_one_operation_identity() {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
             system_one_json: String::new(),
+            review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
         }),
         request_id: "put-record-corr".into(),
     }))
@@ -8346,6 +8480,14 @@ async fn describe_and_preview_object_action_are_observational() {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
             system_one_json: String::new(),
+            review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
         }),
         request_id: "put-update".into(),
     }))
@@ -8516,6 +8658,14 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
             system_one_json: system_one_bind_json(),
+            review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
         }),
         request_id: "put-triage".into(),
     }))
@@ -8639,6 +8789,14 @@ async fn preview_records_typesafe_egress_after_admission() {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
             system_one_json: system_one_bind_json(),
+            review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
         }),
         request_id: "put-triage-fill".into(),
     }))
@@ -8761,6 +8919,14 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
                 }]
             })
             .to_string(),
+            review_queue_id: String::new(),
+            review_sla_ms: 0,
+            review_escalate: String::new(),
+            review_escalate_to: String::new(),
+            review_threshold_param: String::new(),
+            review_threshold: 0,
+            review_pool: vec![],
+            review_agent_reviewers: vec![],
         }),
         request_id: "put-triage-invalid-fill".into(),
     }))
@@ -9229,6 +9395,7 @@ async fn ontology_grants_are_managed_through_public_rpcs() {
                 principal: "alice".into(),
                 role: "viewer".into(),
                 created: 1,
+                ..Default::default()
             }),
         }))
         .await
@@ -9267,6 +9434,318 @@ async fn ontology_grants_are_managed_through_public_rpcs() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn namespace_policy_requires_purpose_and_end_date() {
+    let svc = service();
+    grant_schema_admin(&svc);
+    svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+        r#type: Some(widget_schema_type()),
+    }))
+    .await
+    .unwrap();
+    svc.create_object(with_named_principal(
+        CreateObjectRequest {
+            object: Some(Object {
+                id: "term-widget".into(),
+                kind: "widget".into(),
+                name: "widget".into(),
+                namespace: "ops".into(),
+                external_id: "".into(),
+                properties: HashMap::from([("name".into(), "w".into())]),
+                created: 0,
+                updated: 0,
+            }),
+            lease_precondition: None,
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .apply_namespace_grant_policy(
+            &svc.security,
+            &security::NamespaceGrantPolicy {
+                namespace: "ops".into(),
+                max_duration_ms: 86_400_000,
+                require_terms: true,
+            },
+        )
+        .unwrap();
+    let denied = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "term-alice".into(),
+                    object_id: "term-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "audit".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::InvalidArgument);
+    assert!(denied.message().contains("end date"));
+    let created = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "term-alice".into(),
+                    object_id: "term-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "audit".into(),
+                    not_after_ms: crate::sekai::security::unix_now_ms() + 60_000,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .grant
+        .unwrap();
+    assert_eq!(created.purpose, "audit");
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("grant.create".into()),
+            target_id: Some("term-widget".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].outcome, "allowed");
+    assert_eq!(decisions[0].target_id, "term-widget");
+    assert_eq!(
+        decisions[0].evidence.get("grant_id").map(String::as_str),
+        Some("term-alice")
+    );
+    let listed = svc
+        .list_decisions(with_named_principal(
+            ListDecisionsRequest {
+                actor: String::new(),
+                action: "grant.create".into(),
+                after: 0,
+                limit: 10,
+                target_id: "term-widget".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.decisions.len(), 1);
+    let stranger = svc
+        .list_decisions(with_named_principal(
+            ListDecisionsRequest {
+                actor: String::new(),
+                action: "grant.create".into(),
+                after: 0,
+                limit: 10,
+                target_id: String::new(),
+            },
+            "stranger",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stranger.decisions.is_empty());
+    let denied_target = svc
+        .list_decisions(with_named_principal(
+            ListDecisionsRequest {
+                actor: String::new(),
+                action: "grant.create".into(),
+                after: 0,
+                limit: 10,
+                target_id: "term-widget".into(),
+            },
+            "stranger",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_target.code(), tonic::Code::PermissionDenied);
+    let renewed = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "term-alice".into(),
+                    object_id: "term-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 2,
+                    purpose: "audit".into(),
+                    not_after_ms: crate::sekai::security::unix_now_ms() + 120_000,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .grant
+        .unwrap();
+    let again = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "term-alice".into(),
+                    object_id: "term-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 3,
+                    purpose: "audit".into(),
+                    not_after_ms: crate::sekai::security::unix_now_ms() + 180_000,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .grant
+        .unwrap();
+    assert!(again.not_after_ms >= renewed.not_after_ms);
+    let renewals = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("grant.renew".into()),
+            target_id: Some("term-widget".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(renewals.len(), 2);
+    assert!(renewals.iter().all(|decision| {
+        decision.target_id == "term-widget"
+            && decision.evidence.get("grant_id").map(String::as_str) == Some("term-alice")
+    }));
+}
+
+#[tokio::test]
+async fn grant_receipt_accepts_asia_shaped_identifiers() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "asia-widget".into(),
+            kind: "note".into(),
+            name: "asia".into(),
+            namespace: "asia-ops".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let created = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "asia-grant".into(),
+                    object_id: "asia-widget".into(),
+                    principal: "asia".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "regional review".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .grant
+        .unwrap();
+    assert_eq!(created.principal, "asia");
+    let decisions = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("grant.create".into()),
+            target_id: Some("asia-widget".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(
+        decisions[0].evidence.get("namespace").map(String::as_str),
+        Some("asia-ops")
+    );
+    assert_eq!(
+        decisions[0].evidence.get("principal").map(String::as_str),
+        Some("asia")
+    );
+}
+
+#[tokio::test]
+async fn grant_receipt_rejects_secret_shaped_exception_reason() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "secret-widget".into(),
+            kind: "note".into(),
+            name: "secret".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let denied = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "secret-grant".into(),
+                    object_id: "secret-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "audit".into(),
+                    exception_reason: "sk-live-secret".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::Internal);
+    assert!(denied.message().contains("secret material"));
+    let denied_aws = svc
+        .create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "aws-grant".into(),
+                    object_id: "secret-widget".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                    purpose: "ASIAIOSFODNN7EXAMPLE".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_aws.code(), tonic::Code::Internal);
+    assert!(denied_aws.message().contains("secret material"));
 }
 
 #[tokio::test]
@@ -9599,6 +10078,7 @@ async fn grant_and_audit_rpcs_round_trip() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&admin_grant).unwrap();
     svc.security.add_grant(&admin_grant);
@@ -9636,6 +10116,7 @@ async fn grant_and_audit_rpcs_round_trip() {
                 principal: "alice".into(),
                 role: "viewer".into(),
                 created: 1,
+                ..Default::default()
             }),
         }))
         .await
@@ -9685,7 +10166,13 @@ async fn grant_and_audit_rpcs_round_trip() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(listed.decisions.len(), 2);
+    assert_eq!(listed.decisions.len(), 3);
+    assert!(
+        listed
+            .decisions
+            .iter()
+            .any(|decision| decision.action == "grant.create")
+    );
 
     let changes = svc
         .list_object_changes(with_principal(ListObjectChangesRequest {
@@ -9721,6 +10208,7 @@ async fn control_plane_admin_can_recover_managed_acl() {
         principal: "alice".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&member_grant).unwrap();
     svc.security.add_grant(&member_grant);
@@ -9733,6 +10221,7 @@ async fn control_plane_admin_can_recover_managed_acl() {
                 principal: "root".into(),
                 role: "admin".into(),
                 created: 1,
+                ..Default::default()
             }),
         },
         "local",
@@ -9946,6 +10435,7 @@ async fn grants_cannot_preclaim_future_namespace_boundaries() {
                     principal: "mallory".into(),
                     role: "admin".into(),
                     created: 1,
+                    ..Default::default()
                 }),
             },
             "mallory",
@@ -9962,6 +10452,7 @@ async fn grants_cannot_preclaim_future_namespace_boundaries() {
             principal: "mallory".into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
     let bootstrap = svc
@@ -11298,6 +11789,7 @@ async fn list_attestations_paginates_over_visible_rows_only() {
         principal: "tester".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
@@ -11791,6 +12283,7 @@ async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
         principal: "bob".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&denied_grant).unwrap();
     svc.security.add_grant(&denied_grant);
@@ -12363,6 +12856,7 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
         principal: "bob".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     svc.db.runtime().create_grant(&denied_grant).unwrap();
     svc.security.add_grant(&denied_grant);
@@ -13142,6 +13636,657 @@ async fn capability_discovery_rejects_a_stale_pinned_snapshot_without_metadata()
     assert!(!stale.message().contains("widget"));
 }
 
+fn intake_action_type(object_kind: &str) -> GovernedActionType {
+    let parameter_schema_json = if object_kind.is_empty() {
+        r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#
+    } else {
+        r#"{"type":"object","properties":{"object_id":{"type":"string"},"summary":{"type":"string"}},"required":["object_id","summary"],"additionalProperties":false}"#
+    };
+    GovernedActionType {
+        approvers: Vec::new(),
+        namespace: "acme".into(),
+        type_id: "review.intake".into(),
+        version: "1.0.0".into(),
+        description: "Admit review".into(),
+        parameter_schema_json: parameter_schema_json.into(),
+        allowed_effect_kinds: vec!["runtime_dispatch".into()],
+        policy_scope: String::new(),
+        budget_scope: String::new(),
+        enabled: true,
+        created_by: String::new(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        disabled_at_ms: 0,
+        object_kind: object_kind.into(),
+        object_mutation: if object_kind.is_empty() {
+            String::new()
+        } else {
+            "create".into()
+        },
+        submission_criteria: vec![],
+        declared_effect_kinds: vec![],
+        system_one_json: String::new(),
+        review_queue_id: String::new(),
+        review_sla_ms: 0,
+        review_escalate: String::new(),
+        review_escalate_to: String::new(),
+        review_threshold_param: String::new(),
+        review_threshold: 0,
+        review_pool: vec![],
+        review_agent_reviewers: vec![],
+    }
+}
+
+async fn discover_acme(
+    svc: &SekaiServiceImpl,
+    principal: &str,
+) -> crate::grpc::pb::sekai::DiscoverCapabilitiesResponse {
+    svc.discover_capabilities(with_named_principal(
+        DiscoverCapabilitiesRequest {
+            namespace: "acme".into(),
+            page_size: 200,
+            ..Default::default()
+        },
+        principal,
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+/// #1459: a published enabled Action type is a core catalog entry for a
+/// permitted principal, with the type's schema, description, and markings.
+#[tokio::test]
+async fn capability_discovery_lists_published_action_types_for_permitted_principals() {
+    let svc = service();
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let before = discover_acme(&svc, "tester").await;
+    let action_name = capability::action_capability_name("review.intake");
+    assert!(
+        before
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("widget")),
+            request_id: "put-intake".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let discovered = discover_acme(&svc, "tester").await;
+    assert_ne!(discovered.catalog_version, before.catalog_version);
+    assert!(discovered.ontology_revision.is_empty());
+    let entry = discovered
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == action_name)
+        .expect("published action type is discoverable");
+    assert_eq!(entry.product_tier, "core");
+    assert_eq!(entry.kind, "action");
+    assert_eq!(entry.description, "Admit review");
+    assert_eq!(
+        entry.parameter_schema_json,
+        r#"{"type":"object","properties":{"object_id":{"type":"string"},"summary":{"type":"string"}},"required":["object_id","summary"],"additionalProperties":false}"#
+    );
+    assert_eq!(entry.approval_behavior, "none");
+    assert_eq!(entry.action_version, "1.0.0");
+    assert_eq!(entry.input_type, "sekai.SubmitActionInstanceRequest");
+    assert_eq!(entry.output_type, "sekai.SubmitActionInstanceResponse");
+    assert!(
+        entry
+            .required_scopes
+            .iter()
+            .any(|scope| scope == "action:submit")
+    );
+    assert!(
+        entry
+            .policy_decision_points
+            .iter()
+            .any(|point| point == "action_policy")
+    );
+    assert!(
+        entry
+            .policy_decision_points
+            .iter()
+            .any(|point| point == "schema_visibility")
+    );
+    assert!(entry.markings.iter().any(|marking| marking == "public"));
+
+    let mut later = intake_action_type("widget");
+    later.version = "2.0.0".into();
+    later.description = "Admit review v2".into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(later),
+            request_id: "put-intake-v2".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let latest = discover_acme(&svc, "tester").await;
+    let latest_entries: Vec<_> = latest
+        .capabilities
+        .iter()
+        .filter(|entry| entry.name == action_name)
+        .collect();
+    assert_eq!(latest_entries.len(), 1);
+    assert_eq!(latest_entries[0].action_version, "2.0.0");
+    assert_eq!(latest_entries[0].description, "Admit review v2");
+
+    let mut require_approval = action_policy::ActionPolicy::allow_all("agent:tester");
+    require_approval.action_overrides.insert(
+        crate::sekai::action_instance::SUBMIT_POLICY_ACTION.into(),
+        action_policy::ActionDecision::RequireApproval,
+    );
+    svc.db
+        .runtime()
+        .upsert_action_policy(&require_approval)
+        .unwrap();
+    let approved = discover_acme(&svc, "tester").await;
+    let approved_entry = approved
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == action_name)
+        .expect("approval policy still lists the action");
+    assert_eq!(approved_entry.approval_behavior, "required");
+
+    let mut deny_submit = action_policy::ActionPolicy::allow_all("agent:tester");
+    deny_submit.action_overrides.insert(
+        crate::sekai::action_instance::SUBMIT_POLICY_ACTION.into(),
+        action_policy::ActionDecision::Deny,
+    );
+    deny_submit
+        .action_overrides
+        .insert("review.intake".into(), action_policy::ActionDecision::Allow);
+    svc.db.runtime().upsert_action_policy(&deny_submit).unwrap();
+    let submit_denied = discover_acme(&svc, "tester").await;
+    assert!(
+        submit_denied
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+}
+
+/// #1459: a type-level deny drops the catalog entry; catalog-bound submit
+/// then fails closed. Direct submit without catalog headers is unchanged.
+#[tokio::test]
+async fn capability_discovery_omits_denied_action_and_catalog_submit_fails_closed() {
+    use crate::sekai::action_instance::STATUS_ADMITTED;
+
+    let svc = service();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("")),
+            request_id: "put-intake".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let action_name = capability::action_capability_name("review.intake");
+    let listed = discover_acme(&svc, "tester").await;
+    assert!(
+        listed
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == action_name)
+    );
+
+    let mut later = intake_action_type("");
+    later.version = "2.0.0".into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(later),
+            request_id: "put-intake-v2-submit".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let submit = SubmitActionInstanceRequest {
+        namespace: "acme".into(),
+        type_id: "review.intake".into(),
+        version: "2.0.0".into(),
+        parameters_json: r#"{"summary":"ship it"}"#.into(),
+        idempotency_key: "idem-catalog".into(),
+        evidence_submission_ids: vec![],
+        request_id: "req-catalog".into(),
+        ontology_digest: String::new(),
+    };
+    let stale_version = svc
+        .submit_action_instance(with_catalog_action(
+            SubmitActionInstanceRequest {
+                version: "1.0.0".into(),
+                idempotency_key: "idem-old-version".into(),
+                request_id: "req-old-version".into(),
+                ..submit.clone()
+            },
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_version.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(stale_version.message(), "capability unavailable");
+
+    let admitted = svc
+        .submit_action_instance(with_catalog_action(
+            submit.clone(),
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(admitted.status, STATUS_ADMITTED);
+
+    let mut deny = action_policy::ActionPolicy::allow_all("agent:tester");
+    deny.action_overrides
+        .insert("review.intake".into(), action_policy::ActionDecision::Deny);
+    svc.db.runtime().upsert_action_policy(&deny).unwrap();
+
+    let omitted = discover_acme(&svc, "tester").await;
+    assert!(
+        omitted
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+    assert_ne!(omitted.catalog_version, listed.catalog_version);
+
+    let stale = svc
+        .submit_action_instance(with_catalog_action(
+            SubmitActionInstanceRequest {
+                idempotency_key: "idem-stale".into(),
+                request_id: "req-stale".into(),
+                ..submit.clone()
+            },
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(stale.message(), "capability unavailable");
+    assert!(!stale.message().contains("review.intake"));
+
+    let direct = svc
+        .submit_action_instance(with_named_principal(
+            SubmitActionInstanceRequest {
+                idempotency_key: "idem-direct".into(),
+                request_id: "req-direct".into(),
+                ..submit.clone()
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(direct.status, STATUS_ADMITTED);
+
+    let mcp = svc
+        .submit_action_instance(with_catalog_action(
+            SubmitActionInstanceRequest {
+                idempotency_key: "idem-mcp".into(),
+                request_id: "req-mcp".into(),
+                ..submit
+            },
+            "tester",
+            "sekai.actions.submit",
+            "acme",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(mcp.status, STATUS_ADMITTED);
+}
+
+/// #1459: team-managed Viewers keep object queries and lose Action entries.
+#[tokio::test]
+async fn capability_discovery_omits_actions_without_namespace_write() {
+    let svc = service();
+    grant_source_namespace(&svc, "acme", "alice", security::Role::Viewer);
+    grant_source_namespace(&svc, "acme", "tester", security::Role::Editor);
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("")),
+            request_id: "put-intake".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let action_name = capability::action_capability_name("review.intake");
+    let viewer = discover_acme(&svc, "alice").await;
+    assert!(
+        viewer
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+    let editor = discover_acme(&svc, "tester").await;
+    assert!(
+        editor
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == action_name)
+    );
+    assert_ne!(viewer.catalog_version, editor.catalog_version);
+}
+
+/// #1459: discover-only enterprise sessions keep queries and lose Actions.
+#[tokio::test]
+async fn capability_discovery_omits_actions_without_enterprise_write() {
+    let svc = service();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("")),
+            request_id: "put-intake".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let action_name = capability::action_capability_name("review.intake");
+    let discoverer = svc
+        .discover_capabilities(with_discoverer(
+            DiscoverCapabilitiesRequest {
+                namespace: "acme".into(),
+                page_size: 200,
+                ..Default::default()
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        discoverer
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+    let writer = discover_acme(&svc, "tester").await;
+    assert!(
+        writer
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == action_name)
+    );
+}
+
+/// #1459: type_id `submit` publishes as `sekai.actions.submit` and still
+/// rechecks the live catalog. The MCP allowlist skip does not apply.
+#[tokio::test]
+async fn capability_discovery_rechecks_native_submit_type_id() {
+    use crate::sekai::action_instance::STATUS_ADMITTED;
+
+    let svc = service();
+    let mut native_submit = intake_action_type("");
+    native_submit.type_id = "submit".into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(native_submit),
+            request_id: "put-submit-type".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let action_name = capability::action_capability_name("submit");
+    assert_eq!(action_name, "sekai.actions.submit");
+    let listed = discover_acme(&svc, "tester").await;
+    assert!(
+        listed
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == action_name)
+    );
+
+    let submit = SubmitActionInstanceRequest {
+        namespace: "acme".into(),
+        type_id: "submit".into(),
+        version: "1.0.0".into(),
+        parameters_json: r#"{"summary":"ship it"}"#.into(),
+        idempotency_key: "idem-native-submit".into(),
+        evidence_submission_ids: vec![],
+        request_id: "req-native-submit".into(),
+        ontology_digest: String::new(),
+    };
+    let admitted = svc
+        .submit_action_instance(with_catalog_action(
+            submit.clone(),
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(admitted.status, STATUS_ADMITTED);
+
+    let mut deny = action_policy::ActionPolicy::allow_all("agent:tester");
+    deny.action_overrides
+        .insert("submit".into(), action_policy::ActionDecision::Deny);
+    svc.db.runtime().upsert_action_policy(&deny).unwrap();
+    let omitted = discover_acme(&svc, "tester").await;
+    assert!(
+        omitted
+            .capabilities
+            .iter()
+            .all(|entry| entry.name != action_name)
+    );
+    let stale = svc
+        .submit_action_instance(with_catalog_action(
+            SubmitActionInstanceRequest {
+                idempotency_key: "idem-native-submit-stale".into(),
+                request_id: "req-native-submit-stale".into(),
+                ..submit
+            },
+            "tester",
+            &action_name,
+            "acme",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(stale.message(), "capability unavailable");
+}
+
+/// #1459: schema ACL hides types from ungranted principals; restricted
+/// properties and markings stay off the catalog unless the caller may query
+/// them.
+#[tokio::test]
+async fn capability_discovery_hides_restricted_schema_and_markings() {
+    let svc = service();
+    let mut widget = widget_schema_type();
+    widget.properties.push(PropertyDef {
+        name: "secret_note".into(),
+        r#type: "string".into(),
+        required: false,
+        description: "".into(),
+        enum_values: vec![],
+        link_kind: "".into(),
+        compute_expr: "".into(),
+        classification: "internal".into(),
+        struct_fields: vec![],
+    });
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(widget),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let mut classified = widget_schema_type();
+    classified.kind = "classified_widget".into();
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(classified),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    grant_object_role(
+        &svc,
+        &schema_object_id("classified_widget"),
+        "tester",
+        security::Role::Viewer,
+    );
+
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(intake_action_type("widget")),
+            request_id: "put-widget-action".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let mut secret_action = intake_action_type("widget");
+    secret_action.type_id = "review.secret".into();
+    secret_action.description = "Admit review with note".into();
+    secret_action.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"summary":{"type":"string"},"secret_note":{"type":"string"}},"required":["object_id","summary"],"additionalProperties":false}"#.into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(secret_action),
+            request_id: "put-secret-action".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let mut classified_action = intake_action_type("classified_widget");
+    classified_action.type_id = "classified.dispatch".into();
+    classified_action.description = "Classified dispatch".into();
+    svc.put_governed_action_type(with_named_principal(
+        PutGovernedActionTypeRequest {
+            r#type: Some(classified_action),
+            request_id: "put-classified-action".into(),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let widget_action = capability::action_capability_name("review.intake");
+    let secret_action_name = capability::action_capability_name("review.secret");
+    let classified_action_name = capability::action_capability_name("classified.dispatch");
+    let alice = discover_acme(&svc, "alice").await;
+    let alice_names: Vec<&str> = alice
+        .capabilities
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert!(alice_names.contains(&widget_action.as_str()));
+    assert!(!alice_names.contains(&secret_action_name.as_str()));
+    assert!(!alice_names.contains(&classified_action_name.as_str()));
+    assert!(!alice_names.contains(&"sekai.objects.query.classified_widget"));
+    let alice_widget = alice
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == widget_action)
+        .unwrap();
+    assert!(
+        !alice_widget
+            .markings
+            .iter()
+            .any(|marking| marking == "internal")
+    );
+    let alice_query = alice
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == "sekai.objects.query.widget")
+        .expect("world-readable widget query stays visible");
+    assert!(
+        alice_query
+            .object_type
+            .as_ref()
+            .unwrap()
+            .properties
+            .iter()
+            .all(|property| property.name != "secret_note")
+    );
+    assert!(!format!("{alice:?}").contains("classified_widget"));
+    assert!(!format!("{alice:?}").contains("secret_note"));
+
+    let tester = discover_acme(&svc, "tester").await;
+    assert!(
+        tester
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == classified_action_name)
+    );
+    assert!(
+        tester
+            .capabilities
+            .iter()
+            .any(|entry| entry.name == "sekai.objects.query.classified_widget")
+    );
+
+    let local = discover_acme(&svc, "local").await;
+    let local_secret = local
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == secret_action_name)
+        .expect("restricted callers still see parameter schemas they may use");
+    assert!(local_secret.parameter_schema_json.contains("secret_note"));
+    let local_widget = local
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == widget_action)
+        .unwrap();
+    assert!(
+        local_widget
+            .markings
+            .iter()
+            .any(|marking| marking == "internal")
+    );
+    let local_query = local
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == "sekai.objects.query.widget")
+        .unwrap();
+    assert!(
+        local_query
+            .object_type
+            .as_ref()
+            .unwrap()
+            .properties
+            .iter()
+            .any(|property| property.name == "secret_note")
+    );
+}
+
 /// Real transport regression: client extensions cannot cross the wire.
 #[cfg(unix)]
 #[tokio::test]
@@ -13551,6 +14696,7 @@ async fn agent_definition_member_read_crosses_server_transport() {
             principal: "other-reader".into(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         };
         security.add_grant(&grant);
         let denied = client
@@ -13690,6 +14836,7 @@ async fn definition_certification_gate_rpc_reports_bound_states() {
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         });
     }
     seed_agent_eval_run(&svc, "agent-cert", "agent-suite", true);
@@ -13789,6 +14936,7 @@ async fn definition_certification_refuses_self_certify_revoke_undo_and_caller_st
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         });
     }
     svc.create_definition_branch(with_named_principal(
@@ -13940,6 +15088,7 @@ async fn definition_certification_refuses_author_after_unrelated_edit() {
                 principal: principal.into(),
                 role: security::Role::Admin,
                 created: 1,
+                ..Default::default()
             });
         }
     }
@@ -14047,6 +15196,7 @@ async fn definition_certification_revokes_when_the_suite_run_is_gone() {
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         });
     }
     svc.create_definition_branch(with_named_principal(
@@ -14312,6 +15462,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
             principal: "other-author".into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         };
         security.add_grant(&grant);
         let denied = client
@@ -14333,6 +15484,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         principal: "subject-a".into(),
         role: security::Role::Admin,
         created: 1,
+        ..Default::default()
     });
     let saved = client
         .apply_definition_branch_edit(signed(&authority, &claims(), edit.clone()))
@@ -14530,6 +15682,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         principal: "subject-c".into(),
         role: security::Role::Admin,
         created: 1,
+        ..Default::default()
     });
     security.add_grant(&security::Grant {
         id: "ticket-restricted".into(),
@@ -14537,6 +15690,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         principal: "subject-a".into(),
         role: security::Role::Admin,
         created: 1,
+        ..Default::default()
     });
     let mut unreadable = claims();
     unreadable.subject = "subject-c".into();
@@ -14921,13 +16075,27 @@ async fn scoped_transform_preview_and_reads_cross_server_transport() {
             &authority,
             &["sekai.read", "sekai.write"],
             PutGovernedTransformRequest {
-                transform: Some(transform),
+                transform: Some(transform.clone()),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(put.transform.unwrap().transform_id, "scoped-preview");
+    let run = client
+        .run_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            RunGovernedTransformRequest {
+                namespace: "allowed".into(),
+                transform_id: "scoped-preview".into(),
+                incremental: false,
             },
         ))
         .await
         .unwrap_err();
     assert_eq!(
-        (put.code(), put.message()),
+        (run.code(), run.message()),
         (
             tonic::Code::PermissionDenied,
             "RPC is not available to enterprise-scoped credentials"
@@ -14935,6 +16103,326 @@ async fn scoped_transform_preview_and_reads_cross_server_transport() {
     );
     stop.send(()).unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn scoped_put_governed_transform_requires_namespace_write_and_readable_datasets() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{ANALYTICAL_CLASS, CONTRACT_VERSION};
+    use tower::Layer;
+    let sqlite = Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    );
+    let runtime = Arc::new(RuntimeDb::Sqlite(sqlite));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(runtime.clone());
+    for id in ["scoped-in", "scoped-out", "hidden-in"] {
+        runtime
+            .create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: if id == "hidden-in" {
+                    "hidden-object".into()
+                } else {
+                    String::new()
+                },
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+    }
+    runtime
+        .create_object(&crate::domain::Object {
+            id: "hidden-object".into(),
+            kind: "widget".into(),
+            name: "hidden-object".into(),
+            namespace: "foreign".into(),
+            external_id: "widget:hidden-object".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let authority = Arc::new(AssertionAuthority::new(
+        "https://issuer.test",
+        "https://sekai.test",
+        b"synthetic-transform-put-test-key",
+    ));
+    let interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store.clone(),
+        Some(authority.clone()),
+    );
+    let service = crate::grpc::rpc_identity::RpcIdentityService::new(
+        tonic::service::interceptor::InterceptedService::new(
+            crate::rpc_maturity::RpcMaturityLayer::new(true).layer(
+                crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer::new(
+                    SekaiServiceImpl::new(store),
+                ),
+            ),
+            interceptor,
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let mut client =
+        crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    fn scoped<T>(authority: &AssertionAuthority, scopes: &[&str], body: T) -> Request<T> {
+        let claims = IdentityAssertion {
+            contract_version: IDENTITY_ASSERTION_VERSION.into(),
+            issuer: "https://issuer.test".into(),
+            audience: "https://sekai.test".into(),
+            subject: "subject-a".into(),
+            credential_id: "credential-a".into(),
+            credential_kind: "human_session".into(),
+            space: None,
+            space_role: None,
+            act: None,
+            tenant_id: Some("tenant-test".into()),
+            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            expires_at: chrono::Utc::now().timestamp() + 30,
+            nonce: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut request = Request::new(body);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", authority.sign(&claims).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        request
+    }
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "allowed".into(),
+        transform_id: "scoped-put".into(),
+        input_dataset_id: "scoped-in".into(),
+        output_dataset_id: "scoped-out".into(),
+        profile: ANALYTICAL_CLASS.into(),
+        sql: "SELECT id FROM input".into(),
+        ..GovernedTransform::default()
+    };
+    let put = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(transform.clone()),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(put.transform.unwrap().transform_id, "scoped-put");
+    let listed = client
+        .list_governed_transforms(scoped(
+            &authority,
+            &["sekai.read"],
+            ListGovernedTransformsRequest {
+                namespace: "allowed".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.transforms.len(), 1);
+    let read_only = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read"],
+            PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    transform_id: "scoped-put-ro".into(),
+                    ..transform.clone()
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(read_only.code(), tonic::Code::PermissionDenied);
+    let mut foreign = transform.clone();
+    foreign.namespace = "foreign".into();
+    foreign.transform_id = "scoped-put-foreign".into();
+    let foreign = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(foreign),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    let hidden = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    transform_id: "scoped-put-hidden".into(),
+                    input_dataset_id: "hidden-in".into(),
+                    ..transform.clone()
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::PermissionDenied);
+    let scheduled = client
+        .put_governed_transform(scoped(
+            &authority,
+            &["sekai.read", "sekai.write"],
+            PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    transform_id: "scoped-put-scheduled".into(),
+                    schedule_every_ms: 60_000,
+                    ..transform.clone()
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (scheduled.code(), scheduled.message()),
+        (
+            tonic::Code::PermissionDenied,
+            "scoped put cannot schedule or trigger execution"
+        )
+    );
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn community_put_governed_transform_still_requires_credential_admin() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    let request = PutGovernedTransformRequest {
+        transform: Some(GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "community-put".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                columns: vec!["id".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    };
+    let denied = svc
+        .put_governed_transform(with_principal(request.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (denied.code(), denied.message()),
+        (tonic::Code::PermissionDenied, "credential admin required")
+    );
+    svc.put_governed_transform(with_named_principal(request, "local"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn community_human_session_put_still_requires_credential_admin() {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+    let svc = service();
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    let mut req = with_principal(PutGovernedTransformRequest {
+        transform: Some(GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "community-session-put".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                columns: vec!["id".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    });
+    req.extensions_mut()
+        .insert(crate::enterprise::AuthenticatedContext {
+            contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
+            principal: crate::enterprise::AuthenticatedPrincipal {
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+            },
+            credential_kind: crate::enterprise::CredentialKind::HumanSession,
+            space: None,
+            space_role: None,
+            act: None,
+            tenant: None,
+            scopes: vec!["sekai.read".into(), "sekai.write".into()],
+            issuer: "https://issuer.test".into(),
+            resource: "https://sekai.test".into(),
+            expires_at: 100,
+        });
+    let denied = svc.put_governed_transform(req).await.unwrap_err();
+    assert_eq!(
+        (denied.code(), denied.message()),
+        (tonic::Code::PermissionDenied, "credential admin required")
+    );
 }
 
 #[tokio::test]
@@ -15063,6 +16551,10 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         decided_by: String::new(),
         approval_decision: String::new(),
         autonomous_envelope_id: String::new(),
+        review: Default::default(),
+        agent_action: false,
+        admission_tenant: String::new(),
+        resource_tenant: String::new(),
     }
 }
 
@@ -17456,6 +18948,7 @@ async fn get_transform_run_redacts_partition_keys_without_dataset_read() {
         principal: "alice".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     let owner_out = security::Grant {
         id: "owner-out".into(),
@@ -17463,6 +18956,7 @@ async fn get_transform_run_redacts_partition_keys_without_dataset_read() {
         principal: "alice".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner_in).unwrap();
     runtime.create_grant(&owner_out).unwrap();
@@ -17751,6 +19245,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         principal: "alice".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     let owner_out = security::Grant {
         id: "owner-out".into(),
@@ -17758,6 +19253,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         principal: "alice".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner_in).unwrap();
     runtime.create_grant(&owner_out).unwrap();
@@ -17827,6 +19323,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         principal: "local".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&reader).unwrap();
     svc.security.add_grant(&reader);
@@ -17874,6 +19371,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         principal: "local".into(),
         role: security::Role::Editor,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&writer).unwrap();
     svc.security.add_grant(&writer);
@@ -19899,6 +21397,204 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
     assert_eq!(claimed.tenant_id, "tenant-b");
 }
 
+struct IsolatedClaimExtension {
+    deny: bool,
+}
+
+impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
+    fn authenticate_bearer(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError> {
+        (bearer_token == "enterprise-token")
+            .then(|| crate::enterprise::AuthenticatedPrincipal {
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+            })
+            .ok_or(crate::enterprise::ExtensionError::CredentialNotFound)
+    }
+
+    fn authenticate_context(
+        &self,
+        bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError> {
+        let principal = self.authenticate_bearer(bearer_token)?;
+        Ok(crate::enterprise::AuthenticatedContext {
+            contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            home_tenant: None,
+            tenant: Some(self.tenant_context(&principal)?),
+            principal,
+            credential_kind: crate::enterprise::CredentialKind::HumanSession,
+            space: None,
+            space_role: None,
+            act: None,
+            scopes: vec!["sekai.read".into(), "sekai.write".into()],
+            issuer: "https://issuer.test".into(),
+            resource: "https://sekai.test".into(),
+            expires_at: i64::MAX,
+        })
+    }
+
+    fn tenant_context(
+        &self,
+        principal: &crate::enterprise::AuthenticatedPrincipal,
+    ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+        Ok(crate::enterprise::TenantContext {
+            tenant_id: "tenant-a".into(),
+            subject: principal.subject.clone(),
+        })
+    }
+
+    fn authorize_namespace(
+        &self,
+        _context: &crate::enterprise::TenantContext,
+        _namespace: &str,
+        _action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        Ok(())
+    }
+
+    fn authorize_unscoped_namespace(
+        &self,
+        _principal: &crate::enterprise::AuthenticatedPrincipal,
+        _namespace: &str,
+        _action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        Ok(())
+    }
+
+    fn admit_isolated_process_job(
+        &self,
+        _context: &crate::enterprise::AuthenticatedContext,
+        _job: &crate::enterprise::IsolatedProcessJob,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        if self.deny {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn isolated_claim_service(deny: bool) -> SekaiServiceImpl {
+    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(IsolatedClaimExtension { deny })),
+        )
+        .unwrap(),
+    )));
+    SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
+}
+
+async fn enqueue_isolated_claim(svc: &SekaiServiceImpl, transform_id: &str) {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::{
+        CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
+    };
+
+    let runtime = svc.db.runtime();
+    let dataset = |id: &str| Dataset {
+        id: id.into(),
+        name: id.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    };
+    runtime.create_dataset(&dataset("in")).unwrap();
+    runtime.create_dataset(&dataset("out")).unwrap();
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ops".into(),
+        transform_id: transform_id.into(),
+        input_dataset_id: "in".into(),
+        output_dataset_id: "out".into(),
+        steps: Vec::new(),
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: Some(IsolatedProcessSpec {
+            engine: "python".into(),
+            runtime_image: "runner:1".into(),
+            inputs: Vec::new(),
+        }),
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .unwrap();
+    runtime
+        .put_governed_transform_owned(&transform, 10, "tenant-a")
+        .unwrap();
+    runtime
+        .run_governed_transform_owned("ops", transform_id, false, 20, "tenant-a", "")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn isolated_process_claim_is_admitted_by_the_enterprise_extension() {
+    let svc = isolated_claim_service(false);
+    enqueue_isolated_claim(&svc, "t-iso-admit").await;
+    let claimed = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(claimed.transform_id, "t-iso-admit");
+}
+
+#[tokio::test]
+async fn isolated_process_claim_skips_work_the_extension_denies() {
+    let svc = isolated_claim_service(true);
+    enqueue_isolated_claim(&svc, "t-iso-deny").await;
+    let denied = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+    let listed = svc
+        .list_claimable_transform_work(with_tenant_admin(
+            ListClaimableTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                limit: 10,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].transform_id, "t-iso-deny");
+}
+
 #[tokio::test]
 async fn scheduled_isolated_tick_claims_against_the_put_owner() {
     use crate::chisei::budget::PeriodType;
@@ -20654,6 +22350,7 @@ async fn preview_governed_transform_denies_unreadable_input() {
         principal: "bob".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner).unwrap();
     svc.security.add_grant(&owner);
@@ -20773,6 +22470,7 @@ async fn preview_governed_transform_omits_ungranted_columns() {
         principal: "alice".into(),
         role: security::Role::Viewer,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner).unwrap();
     svc.security.add_grant(&owner);
@@ -21075,6 +22773,7 @@ async fn preview_retrieve_denies_unreadable_input() {
         principal: "local".into(),
         role: security::Role::Admin,
         created: 0,
+        ..Default::default()
     };
     runtime.create_grant(&owner).unwrap();
     svc.security.add_grant(&owner);
@@ -21184,6 +22883,7 @@ async fn seed_agent_draft(svc: &SekaiServiceImpl, namespace: &str) -> String {
             principal: principal.into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         });
     }
     svc.create_definition_branch(with_named_principal(
@@ -21588,5 +23288,450 @@ async fn agent_dry_run_refuses_allowed_actions_that_fail_the_type_schema() {
     assert_eq!(
         response.actions[0].reason,
         crate::sekai::agent_dry_run::REFUSAL_INVALID_PARAMETERS
+    );
+}
+
+#[tokio::test]
+async fn write_freeze_refuses_in_scope_writes_and_records_receipts() {
+    let svc = service();
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: "ops".into(),
+                mode: "block_writes".into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let listed = svc
+        .list_write_freezes(with_named_principal(ListWriteFreezesRequest {}, "local"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.freezes.len(), 1);
+    assert!(listed.freezes[0].enabled);
+
+    let mut frozen = widget_object(
+        "frozen-widget",
+        HashMap::from([("name".into(), "frozen".into())]),
+    );
+    frozen.namespace = "ops".into();
+    let refused = svc
+        .create_object(with_principal(CreateObjectRequest {
+            object: Some(frozen),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (namespace/ops/block_writes)")
+    );
+
+    let mut outside = widget_object(
+        "live-widget",
+        HashMap::from([("name".into(), "live".into())]),
+    );
+    outside.namespace = "other".into();
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(outside),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: "ops".into(),
+                mode: "block_writes".into(),
+                reason: "lifted".into(),
+                enabled: false,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let mut thawed = widget_object(
+        "thawed-widget",
+        HashMap::from([("name".into(), "thawed".into())]),
+    );
+    thawed.namespace = "ops".into();
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(thawed),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+
+    let receipts = svc
+        .db
+        .runtime()
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("write_freeze".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    let outcomes: Vec<&str> = receipts
+        .iter()
+        .map(|decision| decision.outcome.as_str())
+        .collect();
+    assert!(outcomes.contains(&"enabled"), "{outcomes:?}");
+    assert!(outcomes.contains(&"disabled"), "{outcomes:?}");
+}
+
+#[tokio::test]
+async fn write_freeze_refuses_source_batch_in_scope() {
+    let svc = service();
+    let namespace = "sync-frozen";
+    let producer = "connector/github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: namespace.into(),
+                mode: "block_writes".into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let refused = svc
+        .apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest {
+                batch: Some(source_batch(
+                    namespace,
+                    producer,
+                    "",
+                    "cursor:1",
+                    "batch-frozen",
+                )),
+            },
+            producer,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (namespace/sync-frozen/block_writes)")
+    );
+
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: namespace.into(),
+                mode: "block_writes".into(),
+                reason: "lifted".into(),
+                enabled: false,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let admitted = svc
+        .apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest {
+                batch: Some(source_batch(
+                    namespace,
+                    producer,
+                    "",
+                    "cursor:1",
+                    "batch-frozen",
+                )),
+            },
+            producer,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .unwrap();
+    assert_eq!(admitted.transaction.as_ref().unwrap().status, "COMMITTED");
+}
+
+#[tokio::test]
+async fn write_freeze_blocks_source_batch_when_registered_tenant_is_frozen() {
+    let svc = service();
+    let namespace = "sync-tenant-frozen";
+    let producer = "github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    svc.db
+        .runtime()
+        .put_service_principal(
+            &crate::sekai::service_principal::ServicePrincipalRegistration {
+                principal: producer.into(),
+                tenant_id: "acme-tenant".into(),
+                namespaces: vec![namespace.into()],
+                action_types: vec!["dispatch".into()],
+                registered_by: "local".into(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "tenant".into(),
+                scope_value: "acme-tenant".into(),
+                mode: "block_writes".into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    let refused = svc
+        .apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest {
+                batch: Some(source_batch(
+                    namespace,
+                    producer,
+                    "",
+                    "cursor:1",
+                    "batch-tenant-frozen",
+                )),
+            },
+            producer,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (tenant/acme-tenant/block_writes)")
+    );
+}
+
+#[tokio::test]
+async fn write_freeze_blocks_machine_action_submit() {
+    let svc = service();
+    grant_action_admin(&svc);
+    svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
+            namespace: "acme".into(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            description: "dispatch work".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["runtime_dispatch".into()],
+            policy_scope: String::new(),
+            budget_scope: String::new(),
+            enabled: true,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+            object_kind: String::new(),
+            object_mutation: String::new(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
+            system_one_json: String::new(),
+            review_queue_id: String::new(),
+            review_sla_ms: 0,
+            review_escalate: String::new(),
+            review_escalate_to: String::new(),
+            review_threshold_param: String::new(),
+            review_threshold: 0,
+            review_pool: vec![],
+            review_agent_reviewers: vec![],
+        }),
+        request_id: "put-freeze-dispatch".into(),
+    }))
+    .await
+    .unwrap();
+    svc.set_write_freeze(with_named_principal(
+        SetWriteFreezeRequest {
+            freeze: Some(WriteFreeze {
+                scope_kind: "namespace".into(),
+                scope_value: "acme".into(),
+                mode: "block_agent_actions".into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 0,
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+
+    svc.submit_action_instance(with_principal(SubmitActionInstanceRequest {
+        namespace: "acme".into(),
+        type_id: "dispatch".into(),
+        version: "1".into(),
+        parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+        idempotency_key: "freeze-human".into(),
+        evidence_submission_ids: Vec::new(),
+        request_id: "req-freeze-human".into(),
+        ontology_digest: String::new(),
+    }))
+    .await
+    .unwrap();
+
+    let mut machine = with_named_principal(
+        SubmitActionInstanceRequest {
+            namespace: "acme".into(),
+            type_id: "dispatch".into(),
+            version: "1".into(),
+            parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+            idempotency_key: "freeze-machine".into(),
+            evidence_submission_ids: Vec::new(),
+            request_id: "req-freeze-machine".into(),
+            ontology_digest: String::new(),
+        },
+        "tester",
+    );
+    machine
+        .extensions_mut()
+        .insert(crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "tester".into(),
+                credential_id: "community-credential".into(),
+            },
+        ));
+    let refused = svc.submit_action_instance(machine).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (namespace/acme/block_agent_actions)")
+    );
+}
+
+#[test]
+fn write_freeze_blocks_shared_space_write_when_owner_tenant_is_frozen() {
+    let extension = Arc::new(SharedSpaceExtension::granting());
+    let db = RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(extension)).unwrap(),
+    ));
+    db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+        scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+        scope_value: "tenant-test".into(),
+        mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+        reason: "incident".into(),
+        enabled: true,
+        updated_ms: 1,
+    })
+    .unwrap();
+    let object = domain::Object {
+        id: "w-owner-freeze".into(),
+        kind: "widget".into(),
+        name: "w-owner-freeze".into(),
+        namespace: "ops".into(),
+        external_id: String::new(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "internal".into(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    let member = crate::enterprise::AuthenticatedContext {
+        space_role: Some(crate::enterprise::SpaceRole::Editor),
+        ..shared_space_member()
+    };
+    let refused = enforce_object_operation_access(
+        &db,
+        &object,
+        &["subject-a".into()],
+        Some(&member),
+        crate::sekai::object_security::ObjectSecurityOperation::Update,
+        "op-owner-freeze",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (tenant/tenant-test/block_writes)")
+    );
+}
+
+#[test]
+fn write_freeze_blocks_object_write_when_registered_tenant_is_frozen() {
+    let db = RuntimeDb::memory();
+    db.put_service_principal(
+        &crate::sekai::service_principal::ServicePrincipalRegistration {
+            principal: "worker-a".into(),
+            tenant_id: "acme-tenant".into(),
+            namespaces: vec!["ops".into()],
+            action_types: vec!["dispatch".into()],
+            registered_by: "local".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+    )
+    .unwrap();
+    db.set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+        scope_kind: crate::sekai::write_freeze::SCOPE_TENANT.into(),
+        scope_value: "acme-tenant".into(),
+        mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+        reason: "incident".into(),
+        enabled: true,
+        updated_ms: 1,
+    })
+    .unwrap();
+    let object = domain::Object {
+        id: "w-registered-tenant-freeze".into(),
+        kind: "widget".into(),
+        name: "w-registered-tenant-freeze".into(),
+        namespace: "ops".into(),
+        external_id: String::new(),
+        properties: HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "internal".into(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    let refused = enforce_object_operation_access(
+        &db,
+        &object,
+        &["worker-a".into()],
+        None,
+        crate::sekai::object_security::ObjectSecurityOperation::Update,
+        "op-registered-tenant-freeze",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("write freeze (tenant/acme-tenant/block_writes)")
     );
 }

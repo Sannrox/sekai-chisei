@@ -36,6 +36,8 @@ pub enum PrincipalRole {
 pub struct PrincipalGrant {
     pub principal: String,
     pub role: PrincipalRole,
+    /// Unix epoch milliseconds. `0` is open-ended.
+    pub not_after_ms: i64,
 }
 
 impl PrincipalGrant {
@@ -43,8 +45,21 @@ impl PrincipalGrant {
         Self {
             principal: principal.into(),
             role,
+            not_after_ms: 0,
         }
     }
+
+    /// Live when open-ended or the deadline is still in the future.
+    pub fn is_live(&self) -> bool {
+        self.not_after_ms == 0 || unix_now_ms() < self.not_after_ms
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Classification-marking outcome for one object and one principal.
@@ -102,31 +117,34 @@ impl PrincipalContext {
             .any(|principal| PRIVILEGED_PRINCIPALS.contains(&principal.as_str()))
     }
 
-    /// True when any grant names one of the principals.
+    /// True when a live grant names one of the principals. Expired rows stay
+    /// in the list so an ACL of only expired grants is not world-readable.
     pub fn holds_grant(&self, grants: &[PrincipalGrant]) -> bool {
         grants
             .iter()
-            .any(|grant| self.principals.contains(&grant.principal))
+            .any(|grant| grant.is_live() && self.principals.contains(&grant.principal))
     }
 
     /// Object read access: privileged subjects always read; an object with no
-    /// grants is unrestricted; otherwise a principal must hold a grant.
+    /// grants is unrestricted; otherwise a principal must hold a live grant.
     pub fn may_read(&self, grants: &[PrincipalGrant]) -> bool {
         self.is_privileged() || grants.is_empty() || self.holds_grant(grants)
     }
 
-    /// Role of the first grant that names one of the principals.
+    /// Role of the first live grant that names one of the principals.
     pub fn role_in(&self, grants: &[PrincipalGrant]) -> Option<PrincipalRole> {
         grants
             .iter()
-            .find(|grant| self.principals.contains(&grant.principal))
+            .find(|grant| grant.is_live() && self.principals.contains(&grant.principal))
             .map(|grant| grant.role)
     }
 
-    /// True when a principal holds an admin grant.
+    /// True when a principal holds a live admin grant.
     pub fn is_admin_in(&self, grants: &[PrincipalGrant]) -> bool {
         grants.iter().any(|grant| {
-            self.principals.contains(&grant.principal) && grant.role == PrincipalRole::Admin
+            grant.is_live()
+                && self.principals.contains(&grant.principal)
+                && grant.role == PrincipalRole::Admin
         })
     }
 }
@@ -189,6 +207,20 @@ mod tests {
         assert!(alice.is_admin_in(&mixed));
         assert!(!alice.is_admin_in(&grants(&[("bob", PrincipalRole::Admin)])));
         assert_eq!(alice.role_in(&[]), None);
+    }
+
+    #[test]
+    fn expired_grants_do_not_authorize_and_do_not_open_the_object() {
+        let alice = PrincipalContext::from_credential("alice");
+        let expired = vec![PrincipalGrant {
+            principal: "alice".into(),
+            role: PrincipalRole::Admin,
+            not_after_ms: 1,
+        }];
+        assert!(!alice.holds_grant(&expired));
+        assert!(!alice.may_read(&expired));
+        assert_eq!(alice.role_in(&expired), None);
+        assert!(!alice.is_admin_in(&expired));
     }
 
     #[test]

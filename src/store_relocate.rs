@@ -66,7 +66,8 @@ pub struct FamilyReport {
 
 pub fn usage() -> &'static str {
     "sekaictl admin store relocate --source <path-or-url> --sekai <path-or-url> --chisei <path-or-url>\n  Online copy of Chisei families from the historical single store into the Chisei destination. Three SQLite paths or three PostgreSQL URLs. --sekai must be the same physical identity as --source. Captures source writes, bulk-copies families from a snapshot while writers run, then fences Chisei writes in the source database and re-copies only the families written during the copy. Restartable per family. Capture changes the source from the start; roll back from a copy taken before the run.\n\
-sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>\n  Operator reconcile after a one-sided restore. Writes the same split generation on both destination stores so mutating RPCs may resume. Independent backups are not a paired restore set."
+sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>\n  Operator reconcile after a one-sided restore. Writes the same split generation on both destination stores so mutating RPCs may resume. Independent backups are not a paired restore set.\n\
+sekaictl admin store migrate-object-log --src <path> --dst <path>\n  Copy a pre-namespace object log to a namespaced log. Each (kind, key) takes its plane namespace from the SQL object projection and clerk objects. Unknown or colliding identities fail closed and write nothing. The source file is only read."
 }
 
 pub fn run_store_command(
@@ -83,6 +84,12 @@ pub fn run_store_command(
             let config = parse_restamp(&args[1..])?;
             let generation = restamp_destinations(&config.sekai, &config.chisei)?;
             println!("{{\"generation\":{generation}}}");
+            Ok(())
+        }
+        Some("migrate-object-log") => {
+            let config = parse_migrate_object_log(&args[1..])?;
+            let count = migrate_object_log(&config.src, &config.dst)?;
+            println!("{{\"records\":{count}}}");
             Ok(())
         }
         _ => Err(std::io::Error::other(usage()).into()),
@@ -150,6 +157,47 @@ fn parse_restamp(args: &[String]) -> Result<RestampArgs, String> {
         sekai: sekai.ok_or("--sekai is required")?,
         chisei: chisei.ok_or("--chisei is required")?,
     })
+}
+
+struct MigrateObjectLogArgs {
+    src: String,
+    dst: String,
+}
+
+fn parse_migrate_object_log(args: &[String]) -> Result<MigrateObjectLogArgs, String> {
+    let mut src = None;
+    let mut dst = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--src" => {
+                src = Some(require_value(args, i, "--src")?);
+                i += 2;
+            }
+            "--dst" => {
+                dst = Some(require_value(args, i, "--dst")?);
+                i += 2;
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    Ok(MigrateObjectLogArgs {
+        src: src.ok_or("--src is required")?,
+        dst: dst.ok_or("--dst is required")?,
+    })
+}
+
+/// Copy a `MIKURAV1` object log to `dst`, mapping each identity from the
+/// configured SQL object projection (ADR 0112).
+pub fn migrate_object_log(src: &str, dst: &str) -> Result<usize, String> {
+    let cfg = crate::config::Config::from_env();
+    let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
+    migrate_object_log_with_db(Path::new(src), Path::new(dst), backend.database().as_ref())
+}
+
+pub fn migrate_object_log_with_db(src: &Path, dst: &Path, db: &RuntimeDb) -> Result<usize, String> {
+    let rows = db.object_log_migration_identities()?;
+    crate::sekai::object_log::migrate_unnamespaced_object_log_from_projection(src, dst, &rows)
 }
 
 fn require_value(args: &[String], i: usize, flag: &str) -> Result<String, String> {
@@ -2443,6 +2491,10 @@ mod tests {
                 parked_object_digest: String::new(),
                 decided_by: String::new(),
                 approval_decision: String::new(),
+                review: Default::default(),
+                agent_action: false,
+                admission_tenant: String::new(),
+                resource_tenant: String::new(),
                 instance_id: instance_id.into(),
                 namespace: "ns".into(),
                 type_id: "type-1043".into(),
@@ -3246,5 +3298,22 @@ mod tests {
                 RuntimeDb::Sqlite(_) => unreachable!("opened as Postgres above"),
             }
         }
+    }
+
+    #[test]
+    fn migrate_object_log_requires_src_and_dst() {
+        let parsed = super::parse_migrate_object_log(&[
+            "--src".into(),
+            "legacy.mikura".into(),
+            "--dst".into(),
+            "objects.mikura".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.src, "legacy.mikura");
+        assert_eq!(parsed.dst, "objects.mikura");
+        assert!(
+            super::parse_migrate_object_log(&["--src".into(), "legacy.mikura".into()]).is_err()
+        );
+        assert!(usage().contains("migrate-object-log"));
     }
 }

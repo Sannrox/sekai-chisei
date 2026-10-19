@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use http::HeaderMap;
 use opentelemetry::Context;
-use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
+use opentelemetry::propagation::{Extractor, TextMapPropagator};
+
+pub use opentelemetry::propagation::Injector;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::propagation::TraceContextPropagator;

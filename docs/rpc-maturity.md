@@ -112,6 +112,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.RegisterObjectTypeDatasource` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.Search` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetSearchIndexStatus` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
@@ -190,6 +192,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.DeleteGrant` | `sekai.authorization` | yes | host | `stable` |
 | `SekaiService.ListGrants` | `sekai.authorization` | yes | host | `stable` |
 | `SekaiService.CheckAccess` | `sekai.authorization` | yes | host | `stable` |
+| `SekaiService.SetWriteFreeze` | `sekai.authorization` | yes | none | `experimental` |
+| `SekaiService.ListWriteFreezes` | `sekai.authorization` | yes | none | `experimental` |
 | `SekaiService.EnsureTeamNamespace` | `sekai.team-namespaces, sekai.authorization, sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RecordDecision` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListDecisions` | `sekai.audit` | yes | none | `experimental` |

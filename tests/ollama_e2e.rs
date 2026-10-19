@@ -87,6 +87,9 @@ fn ollama_config(db_path: String) -> Config {
         assertion_audience: None,
         assertion_hmac_key: None,
         sekai_endpoint: None,
+        actor_chain_enforcement: false,
+        principal_requests_per_minute: 60,
+        agent_requests_per_minute: 60,
     }
 }
 
@@ -269,6 +272,9 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         assertion_audience: None,
         assertion_hmac_key: None,
         sekai_endpoint: None,
+        actor_chain_enforcement: false,
+        principal_requests_per_minute: 60,
+        agent_requests_per_minute: 60,
     };
     let model = e2e_model();
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
@@ -392,6 +398,9 @@ async fn delegation_chain_keeps_private_context_local() {
         assertion_audience: None,
         assertion_hmac_key: None,
         sekai_endpoint: None,
+        actor_chain_enforcement: false,
+        principal_requests_per_minute: 60,
+        agent_requests_per_minute: 60,
     };
     let local_model = e2e_model();
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(

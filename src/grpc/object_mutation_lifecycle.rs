@@ -236,6 +236,9 @@ impl SekaiServiceImpl {
                 },
                 role: security::Role::Admin,
                 created: now_millis(),
+                purpose: "principal profile administration".into(),
+                exception_reason: "principal profile bootstrap".into(),
+                ..Default::default()
             };
             if let Err(error) = self.db.runtime().create_grant(&grant) {
                 let _ = self.db.runtime().delete_object(&created.id);

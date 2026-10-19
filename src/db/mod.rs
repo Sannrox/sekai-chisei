@@ -1,4 +1,5 @@
 pub mod action_governance;
+mod agent_autonomy_store;
 pub mod attestation;
 mod autonomous_envelope_store;
 mod capability_package_store;
@@ -61,6 +62,8 @@ mod peer_import_store;
 #[cfg(test)]
 mod portfolio_route_test_cases;
 pub mod postgres;
+pub(crate) mod postgres_receipt_chain;
+pub(crate) mod receipt_chain;
 #[cfg(test)]
 pub(crate) use postgres::ScratchDatabase;
 pub(crate) use postgres::off_runtime;
@@ -115,11 +118,13 @@ mod postgres_portfolio;
 mod postgres_retention;
 mod postgres_routing_profile;
 mod postgres_schema;
+mod postgres_search_index;
 mod postgres_service_principal;
 mod postgres_source_registry;
 mod postgres_team_namespace;
 mod postgres_usage_ledger;
 mod postgres_workflow_action;
+mod postgres_write_freeze;
 pub(crate) mod schema_plane;
 pub use schema_plane::SchemaPlane;
 pub mod replica_conformance;
@@ -127,6 +132,7 @@ pub mod replica_safety;
 pub mod retention;
 pub mod reusable;
 pub mod runtime_db;
+pub mod search_index;
 pub mod sekai;
 pub mod sekai_rpc_inventory;
 mod service_principal;

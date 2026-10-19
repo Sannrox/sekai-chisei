@@ -157,6 +157,7 @@ impl PostgresDb {
              ) OR EXISTS (
                 SELECT 1 FROM sekai_grants g
                 WHERE g.object_id = o.id AND g.principal = ANY({principals_param})
+                  AND (g.not_after_ms = 0 OR g.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
              ))"
         ));
         if !privileged {
@@ -174,6 +175,8 @@ impl PostgresDb {
                       AND boundary.external_id = 'namespace:' || o.namespace
                       AND boundary.properties::jsonb ->> 'team_managed' = 'true'
                       AND namespace_grant.principal = ANY({principals_param})
+                      AND (namespace_grant.not_after_ms = 0
+                           OR namespace_grant.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
                 ))"
             ));
         }
@@ -305,6 +308,30 @@ impl PostgresDb {
             .collect()
     }
 
+    pub fn find_all_by_external_ids_in_namespace(
+        &self,
+        namespace: &str,
+        external_ids: &[String],
+    ) -> Result<Vec<Object>, String> {
+        if external_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = external_ids.to_vec();
+        self.connection()?
+            .query(
+                &format!(
+                    "SELECT {OBJECT_COLUMNS} FROM sekai_objects
+                     WHERE namespace = $1 AND external_id = ANY($2)
+                     ORDER BY id"
+                ),
+                &[&namespace, &ids],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(row_to_object)
+            .collect()
+    }
+
     pub fn find_all_by_external_id_with_policy_context(
         &self,
         external_id: &str,
@@ -417,6 +444,7 @@ impl PostgresDb {
                  ) OR EXISTS (
                     SELECT 1 FROM sekai_grants g
                     WHERE g.object_id = o.id AND g.principal = ANY({parameter})
+                      AND (g.not_after_ms = 0 OR g.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
                  ))"
             ));
             if !privileged {
@@ -434,6 +462,8 @@ impl PostgresDb {
                           AND boundary.external_id = 'namespace:' || o.namespace
                           AND boundary.properties::jsonb ->> 'team_managed' = 'true'
                           AND namespace_grant.principal = ANY({parameter})
+                          AND (namespace_grant.not_after_ms = 0
+                               OR namespace_grant.not_after_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
                     ))"
                 ));
             }

@@ -150,6 +150,7 @@ fn main() -> Result<(), String> {
         serde_json::to_string_pretty(&report)
             .map_err(|error| format!("serialize benchmark report: {error}"))?
     );
+    sekai_chisei::perf_object_path::release_cached_graphs();
     Ok(())
 }
 
@@ -165,7 +166,7 @@ fn selected_workloads(manifest: &Manifest) -> Result<Vec<&Workload>, String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
-        return Ok(manifest.workloads.iter().collect());
+        return filter_runnable_object_path(manifest.workloads.iter().collect());
     };
     let wanted = filter
         .split(',')
@@ -184,6 +185,28 @@ fn selected_workloads(manifest: &Manifest) -> Result<Vec<&Workload>, String> {
     }
     if selected.is_empty() {
         return Err("SEKAI_BENCH_ONLY selected no workloads".into());
+    }
+    filter_runnable_object_path(selected)
+}
+
+fn filter_runnable_object_path(workloads: Vec<&Workload>) -> Result<Vec<&Workload>, String> {
+    let postgres = sekai_chisei::perf_object_path::postgres_url_configured();
+    let selected = workloads
+        .into_iter()
+        .filter(
+            |workload| match sekai_chisei::perf_object_path::parse_workload_id(&workload.id) {
+                Some(parsed)
+                    if parsed.backend
+                        == sekai_chisei::perf_object_path::ObjectPathBackend::Postgres =>
+                {
+                    postgres
+                }
+                _ => true,
+            },
+        )
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err("no runnable workloads after postgres filter".into());
     }
     Ok(selected)
 }
@@ -313,7 +336,14 @@ fn workload_factory(workload: &Workload) -> Result<Benchmark, String> {
         }
         "provider_failure_fallback" => retry_benchmark(workload.dataset_size),
         "report_attestation_export" => attestation_benchmark(workload.dataset_size),
-        id => return Err(format!("benchmark workload {id} has no runner")),
+        id => match sekai_chisei::perf_object_path::benchmark_for(
+            id,
+            workload.dataset_size,
+            workload.operations_per_iteration,
+        )? {
+            Some(benchmark) => benchmark,
+            None => return Err(format!("benchmark workload {id} has no runner")),
+        },
     })
 }
 

@@ -1,9 +1,13 @@
-//! sekaictl admin assurance compliance export/verify commands (#297).
+//! sekaictl admin assurance compliance export/verify/report commands (#297, #1468).
 
 use crate::compliance_export::{
     ComplianceExportBundle, ComplianceExportRequest, RedactionMode, compliance_bundle_bytes,
     export_compliance_from_db, record_compliance_export_success, sign_compliance_export,
     verify_compliance_export,
+};
+use crate::compliance_pack::{
+    PackReportBundle, build_pack_report, builtin_pack_ids, load_builtin_pack, pack_report_bytes,
+    parse_pack, sign_pack_report, verify_pack_report,
 };
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
@@ -14,13 +18,16 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin assurance compliance export --namespace <ns> --from-ms <ts> --to-ms <ts> --output <file> [--redact] [--request-id <id>] [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl admin assurance compliance verify <bundle> [--trusted-key <file>]\n  sekaictl admin assurance compliance trust-root --namespace <ns> --site-identity <id> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin assurance compliance import-peer --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin assurance compliance list-trust-roots --namespace <ns>"
+    "sekaictl admin assurance compliance export --namespace <ns> --from-ms <ts> --to-ms <ts> --output <file> [--redact] [--request-id <id>] [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl admin assurance compliance verify <bundle> [--trusted-key <file>]\n  sekaictl admin assurance compliance report --bundle <export.json> --output <file> (--pack <id> | --pack-file <pack.json>) [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl admin assurance compliance report-verify <report.json> --bundle <export.json> [--trusted-key <file>]\n  sekaictl admin assurance compliance packs\n  sekaictl admin assurance compliance trust-root --namespace <ns> --site-identity <id> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin assurance compliance import-peer --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin assurance compliance list-trust-roots --namespace <ns>"
 }
 
 pub async fn run_compliance_command(args: Vec<String>) -> Result<(), BoxErr> {
     match args.first().map(String::as_str) {
         Some("export") => export(parse_export(&args[1..])?).await,
         Some("verify") => verify(parse_verify(&args[1..])?),
+        Some("report") => report(parse_report(&args[1..])?),
+        Some("report-verify") => report_verify(parse_report_verify(&args[1..])?),
+        Some("packs") => list_packs(),
         Some("trust-root") => trust_root(parse_trust_root(&args[1..])?).await,
         Some("import-peer") => import_peer(parse_import_peer(&args[1..])?).await,
         Some("list-trust-roots") => list_trust_roots(parse_list_trust_roots(&args[1..])?).await,
@@ -207,6 +214,193 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
         }
         Err(std::io::Error::other("compliance bundle verification failed").into())
     }
+}
+
+#[derive(Debug, Clone)]
+struct ReportConfig {
+    bundle: PathBuf,
+    output: PathBuf,
+    pack: Option<String>,
+    pack_file: Option<PathBuf>,
+    actor: String,
+    signing_key: Option<PathBuf>,
+    identity: Option<String>,
+    key_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReportVerifyConfig {
+    report: PathBuf,
+    bundle: PathBuf,
+    trusted_key: Option<PathBuf>,
+}
+
+fn report(config: ReportConfig) -> Result<(), BoxErr> {
+    let pack = match (&config.pack, &config.pack_file) {
+        (Some(id), None) => load_builtin_pack(id)?,
+        (None, Some(path)) => parse_pack(&std::fs::read_to_string(path)?)?,
+        _ => {
+            return Err(
+                std::io::Error::other("exactly one of --pack or --pack-file is required").into(),
+            );
+        }
+    };
+    let bundle: ComplianceExportBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
+    let generated_at = Utc::now().timestamp_millis();
+    let mut report = build_pack_report(&pack, &bundle, &config.actor, generated_at)?;
+    let signing_parts = [
+        config.signing_key.is_some(),
+        config.identity.is_some(),
+        config.key_id.is_some(),
+    ];
+    if signing_parts.iter().any(|present| *present) && !signing_parts.iter().all(|present| *present)
+    {
+        return Err(std::io::Error::other(
+            "signing requires all of --signing-key, --identity, and --key-id (or none)",
+        )
+        .into());
+    }
+    if let (Some(key_path), Some(identity), Some(key_id)) =
+        (&config.signing_key, &config.identity, &config.key_id)
+    {
+        let signing = load_signing_key(key_path)?;
+        sign_pack_report(
+            &mut report,
+            &signing,
+            identity,
+            key_id,
+            Utc::now().timestamp_millis(),
+        )?;
+    }
+    publish_new_file(&config.output, &pack_report_bytes(&report)?)?;
+    let met = report
+        .controls
+        .iter()
+        .filter(|control| control.status == crate::compliance_pack::ControlStatus::Met)
+        .count();
+    let partly = report
+        .controls
+        .iter()
+        .filter(|control| control.status == crate::compliance_pack::ControlStatus::PartlyMet)
+        .count();
+    let none = report
+        .controls
+        .iter()
+        .filter(|control| control.status == crate::compliance_pack::ControlStatus::NoEvidence)
+        .count();
+    println!(
+        "wrote {} pack={} controls={} met={} partly_met={} no_evidence={} digest={}",
+        config.output.display(),
+        report.manifest.pack_id,
+        report.controls.len(),
+        met,
+        partly,
+        none,
+        report.manifest.content_digest
+    );
+    Ok(())
+}
+
+fn report_verify(config: ReportVerifyConfig) -> Result<(), BoxErr> {
+    let report: PackReportBundle = serde_json::from_slice(&std::fs::read(&config.report)?)?;
+    let bundle: ComplianceExportBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
+    let trusted = match &config.trusted_key {
+        Some(path) => Some(encode_hex(load_verifying_key(path)?.as_bytes())),
+        None => None,
+    };
+    let result = verify_pack_report(&report, &bundle, trusted.as_deref());
+    if result.ok {
+        println!(
+            "ok content_digest_ok={} signature_ok={} pack={} controls={}",
+            result.content_digest_ok,
+            result.signature_ok,
+            report.manifest.pack_id,
+            report.controls.len()
+        );
+        Ok(())
+    } else {
+        for error in &result.errors {
+            eprintln!("error: {error}");
+        }
+        Err(std::io::Error::other("compliance pack report verification failed").into())
+    }
+}
+
+fn list_packs() -> Result<(), BoxErr> {
+    for id in builtin_pack_ids() {
+        let pack = load_builtin_pack(id)?;
+        println!(
+            "{id} framework={} version={} controls={}",
+            pack.framework,
+            pack.version,
+            pack.controls.len()
+        );
+    }
+    Ok(())
+}
+
+fn publish_new_file(output: &Path, bytes: &[u8]) -> Result<(), BoxErr> {
+    if output.exists() {
+        return Err(std::io::Error::other(format!(
+            "output already exists: {} (refusing to overwrite a compliance artifact)",
+            output.display()
+        ))
+        .into());
+    }
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staged = parent.join(format!(
+        ".compliance-artifact-{}-{}.partial",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let write_result = (|| {
+            let mut file = options.open(&staged)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok::<(), BoxErr>(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    }
+    if let Err(error) = std::fs::hard_link(&staged, output) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to publish {}: {error} (destination must not already exist)",
+                output.display()
+            ),
+        )
+        .into());
+    }
+    let _ = std::fs::remove_file(&staged);
+    match std::fs::File::open(parent) {
+        Ok(dir) => {
+            if let Err(error) = dir.sync_all() {
+                let _ = std::fs::remove_file(output);
+                return Err(error.into());
+            }
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(output);
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -466,6 +660,97 @@ fn parse_verify(args: &[String]) -> Result<VerifyConfig, String> {
     })
 }
 
+fn parse_report(args: &[String]) -> Result<ReportConfig, String> {
+    let mut bundle = None;
+    let mut output = None;
+    let mut pack = None;
+    let mut pack_file = None;
+    let mut actor = std::env::var("SEKAI_ACTOR").unwrap_or_else(|_| "local-operator".into());
+    let mut signing_key = None;
+    let mut identity = None;
+    let mut key_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bundle" => {
+                bundle = Some(PathBuf::from(require_value(args, index, "--bundle")?));
+                index += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(require_value(args, index, "--output")?));
+                index += 2;
+            }
+            "--pack" => {
+                pack = Some(require_value(args, index, "--pack")?);
+                index += 2;
+            }
+            "--pack-file" => {
+                pack_file = Some(PathBuf::from(require_value(args, index, "--pack-file")?));
+                index += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, index, "--actor")?;
+                index += 2;
+            }
+            "--signing-key" => {
+                signing_key = Some(PathBuf::from(require_value(args, index, "--signing-key")?));
+                index += 2;
+            }
+            "--identity" => {
+                identity = Some(require_value(args, index, "--identity")?);
+                index += 2;
+            }
+            "--key-id" => {
+                key_id = Some(require_value(args, index, "--key-id")?);
+                index += 2;
+            }
+            other => return Err(format!("unknown report flag: {other}")),
+        }
+    }
+    if pack.is_some() == pack_file.is_some() {
+        return Err("exactly one of --pack or --pack-file is required".into());
+    }
+    Ok(ReportConfig {
+        bundle: bundle.ok_or("--bundle required")?,
+        output: output.ok_or("--output required")?,
+        pack,
+        pack_file,
+        actor,
+        signing_key,
+        identity,
+        key_id,
+    })
+}
+
+fn parse_report_verify(args: &[String]) -> Result<ReportVerifyConfig, String> {
+    let mut report = None;
+    let mut bundle = None;
+    let mut trusted_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bundle" => {
+                bundle = Some(PathBuf::from(require_value(args, index, "--bundle")?));
+                index += 2;
+            }
+            "--trusted-key" => {
+                trusted_key = Some(PathBuf::from(require_value(args, index, "--trusted-key")?));
+                index += 2;
+            }
+            other if !other.starts_with('-') && report.is_none() => {
+                report = Some(PathBuf::from(other));
+                index += 1;
+            }
+            other => return Err(format!("unknown report-verify flag: {other}")),
+        }
+    }
+    Ok(ReportVerifyConfig {
+        report: report.ok_or("report path required")?,
+        bundle: bundle.ok_or("--bundle required")?,
+        trusted_key,
+    })
+}
+
 fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
     args.get(index + 1)
         .cloned()
@@ -522,4 +807,79 @@ fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
                 .map_err(|error| format!("invalid hex: {error}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_report_requires_pack_xor_pack_file() {
+        let error = parse_report(&args(&[
+            "--bundle",
+            "export.json",
+            "--output",
+            "report.json",
+        ]))
+        .unwrap_err();
+        assert!(
+            error.contains("exactly one of --pack or --pack-file"),
+            "{error}"
+        );
+        let both = parse_report(&args(&[
+            "--bundle",
+            "export.json",
+            "--output",
+            "report.json",
+            "--pack",
+            "gdpr",
+            "--pack-file",
+            "custom.json",
+        ]))
+        .unwrap_err();
+        assert!(
+            both.contains("exactly one of --pack or --pack-file"),
+            "{both}"
+        );
+    }
+
+    #[test]
+    fn parse_report_accepts_builtin_pack() {
+        let config = parse_report(&args(&[
+            "--bundle",
+            "export.json",
+            "--output",
+            "report.json",
+            "--pack",
+            "fixture",
+            "--actor",
+            "auditor",
+        ]))
+        .unwrap();
+        assert_eq!(config.pack.as_deref(), Some("fixture"));
+        assert!(config.pack_file.is_none());
+        assert_eq!(config.actor, "auditor");
+    }
+
+    #[test]
+    fn parse_report_verify_requires_bundle_and_report() {
+        let error = parse_report_verify(&args(&["report.json"])).unwrap_err();
+        assert!(error.contains("--bundle required"), "{error}");
+        let config =
+            parse_report_verify(&args(&["report.json", "--bundle", "export.json"])).unwrap();
+        assert_eq!(config.report, PathBuf::from("report.json"));
+        assert_eq!(config.bundle, PathBuf::from("export.json"));
+    }
+
+    #[test]
+    fn usage_names_report_commands() {
+        let text = usage();
+        assert!(text.contains("compliance report "));
+        assert!(text.contains("compliance report-verify "));
+        assert!(text.contains("compliance packs"));
+    }
 }

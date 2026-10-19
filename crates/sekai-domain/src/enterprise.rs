@@ -251,6 +251,11 @@ impl AuthenticatedContext {
             .filter(|tenant| !tenant.trim().is_empty())
     }
 
+    /// Actor chain for rate limits and the agent grant ceiling (#1563).
+    pub fn actor_chain(&self) -> Option<ActorChain> {
+        ActorChain::from_authenticated(&self.principal.subject, self.act.as_deref())
+    }
+
     pub fn authorize_space(&self, action: NamespaceAction) -> Result<(), ExtensionError> {
         // A home tenant is only meaningful next to a non-empty acting tenant.
         if self.home_tenant.as_ref().is_some_and(|home| {
@@ -372,6 +377,7 @@ pub const DELEGATOR_DISABLED: &str = "delegator_disabled";
 pub const DELEGATOR_NOT_MEMBER: &str = "delegator_not_member";
 pub const DELEGATOR_GRANT_MISSING: &str = "delegator_grant_missing";
 pub const DELEGATOR_RECORD_MISSING: &str = "delegator_record_missing";
+pub const AGENT_CEILING_GRANT_MISSING: &str = "agent_ceiling_grant_missing";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatorApplyRefusal {
@@ -379,6 +385,7 @@ pub enum DelegatorApplyRefusal {
     NotMember,
     GrantMissing,
     RecordMissing,
+    AgentCeiling,
 }
 
 impl DelegatorApplyRefusal {
@@ -388,8 +395,80 @@ impl DelegatorApplyRefusal {
             Self::NotMember => DELEGATOR_NOT_MEMBER,
             Self::GrantMissing => DELEGATOR_GRANT_MISSING,
             Self::RecordMissing => DELEGATOR_RECORD_MISSING,
+            Self::AgentCeiling => AGENT_CEILING_GRANT_MISSING,
         }
     }
+}
+
+/// Which identity a rate limit or grant check names on an actor chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorKind {
+    Principal,
+    Agent,
+}
+
+impl ActorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Principal => "principal",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// Delegating user plus optional agent taken from `sub` and `act`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorChain {
+    pub principal: String,
+    pub agent: Option<String>,
+}
+
+impl ActorChain {
+    /// `act` names the user and `subject` the agent when both are present and distinct.
+    pub fn from_authenticated(subject: &str, act: Option<&str>) -> Option<Self> {
+        let subject = subject.trim();
+        if subject.is_empty() {
+            return None;
+        }
+        let act = act.map(str::trim).filter(|value| !value.is_empty());
+        match act {
+            Some(user) if user != subject => Some(Self {
+                principal: user.to_string(),
+                agent: Some(subject.to_string()),
+            }),
+            _ => Some(Self {
+                principal: subject.to_string(),
+                agent: None,
+            }),
+        }
+    }
+
+    pub fn rate_limit_keys(&self) -> impl Iterator<Item = (ActorKind, &str)> {
+        std::iter::once((ActorKind::Principal, self.principal.as_str()))
+            .chain(self.agent.as_deref().map(|agent| (ActorKind::Agent, agent)))
+    }
+}
+
+/// User grants intersect the agent ceiling when an agent is on the chain.
+pub fn grant_clears_agent_ceiling(user_holds: bool, agent_holds: Option<bool>) -> bool {
+    match agent_holds {
+        None => user_holds,
+        Some(agent_holds) => user_holds && agent_holds,
+    }
+}
+
+/// Refuse when the agent is named and does not hold the needed grant.
+pub fn revalidate_agent_ceiling(
+    agent: Option<&str>,
+    agent_holds_needed_grant: bool,
+) -> Result<(), DelegatorApplyRefusal> {
+    if agent.is_none_or(|actor| actor.trim().is_empty()) {
+        return Ok(());
+    }
+    if !agent_holds_needed_grant {
+        return Err(DelegatorApplyRefusal::AgentCeiling);
+    }
+    Ok(())
 }
 
 /// Live facts about the delegating principal, loaded at claim and apply.
@@ -575,6 +654,16 @@ pub struct ModelIdentity {
     pub artifact_digest: Option<String>,
     /// Base URL of the endpoint that will receive the prompt.
     pub endpoint: String,
+}
+
+/// Isolated-process work about to be returned to a runner (#1588).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedProcessJob {
+    pub run_id: String,
+    pub namespace: String,
+    /// Seconds the runner is expected to hold. `0` means the extension should
+    /// apply its own estimate.
+    pub estimated_seconds: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -795,6 +884,20 @@ pub trait EnterpriseExtension: Send + Sync {
         Ok(())
     }
 
+    /// Admit or refuse an isolated-process claim before the runner receives
+    /// it (#1588). Community `TenantQuotaGate` still runs separately.
+    ///
+    /// Default: admit. Return `PermissionDenied` to skip and defer this claim,
+    /// or `Unavailable` when the admission policy cannot decide.
+    fn admit_isolated_process_job(
+        &self,
+        context: &AuthenticatedContext,
+        job: &IsolatedProcessJob,
+    ) -> Result<(), ExtensionError> {
+        let _ = (context, job);
+        Ok(())
+    }
+
     /// Resolve a tenant-scoped model-provider credential (#118).
     ///
     /// Default: unavailable. Enterprise distributions must implement this so
@@ -929,6 +1032,19 @@ mod tests {
         assert_eq!(
             extension.authorize_namespace(&context, "other", NamespaceAction::Write),
             Err(ExtensionError::PermissionDenied)
+        );
+        let auth = extension.authenticate_context("test-token").unwrap();
+        assert!(
+            extension
+                .admit_isolated_process_job(
+                    &auth,
+                    &IsolatedProcessJob {
+                        run_id: "run-1".into(),
+                        namespace: "allowed".into(),
+                        estimated_seconds: 30,
+                    }
+                )
+                .is_ok()
         );
     }
 
@@ -1359,9 +1475,46 @@ mod tests {
             DELEGATOR_GRANT_MISSING
         );
         assert_eq!(
+            DelegatorApplyRefusal::AgentCeiling.as_str(),
+            AGENT_CEILING_GRANT_MISSING
+        );
+        assert_eq!(
             DelegatorApplyRefusal::RecordMissing.as_str(),
             DELEGATOR_RECORD_MISSING
         );
+    }
+
+    #[test]
+    fn actor_chain_treats_distinct_act_as_user_and_subject_as_agent() {
+        let chain = ActorChain::from_authenticated("runtime-1", Some("alice")).unwrap();
+        assert_eq!(chain.principal, "alice");
+        assert_eq!(chain.agent.as_deref(), Some("runtime-1"));
+        assert_eq!(
+            chain.rate_limit_keys().collect::<Vec<_>>(),
+            vec![
+                (ActorKind::Principal, "alice"),
+                (ActorKind::Agent, "runtime-1"),
+            ]
+        );
+        let human = ActorChain::from_authenticated("alice", None).unwrap();
+        assert_eq!(human.principal, "alice");
+        assert!(human.agent.is_none());
+        assert!(ActorChain::from_authenticated("  ", None).is_none());
+    }
+
+    #[test]
+    fn agent_ceiling_requires_both_grants_when_an_agent_is_present() {
+        assert!(grant_clears_agent_ceiling(true, None));
+        assert!(!grant_clears_agent_ceiling(false, None));
+        assert!(grant_clears_agent_ceiling(true, Some(true)));
+        assert!(!grant_clears_agent_ceiling(true, Some(false)));
+        assert!(!grant_clears_agent_ceiling(false, Some(true)));
+        assert!(revalidate_agent_ceiling(None, false).is_ok());
+        assert_eq!(
+            revalidate_agent_ceiling(Some("runtime-1"), false),
+            Err(DelegatorApplyRefusal::AgentCeiling)
+        );
+        assert!(revalidate_agent_ceiling(Some("runtime-1"), true).is_ok());
     }
 
     #[test]

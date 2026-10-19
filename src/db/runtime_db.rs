@@ -6,6 +6,16 @@ use crate::db::sekai::{PrincipalCredential, SekaiDb};
 use postgres::GenericClient;
 use std::sync::Arc;
 
+#[cfg(test)]
+pub(crate) mod source_batch_auth_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static LOOKUP_QUERIES: Cell<usize> = const { Cell::new(0) };
+        pub static POLICY_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
 use crate::chisei::eval;
 use crate::chisei::evaluation_execution::EvaluationExecutionIndex;
 use crate::chisei::evolve;
@@ -107,6 +117,14 @@ pub(crate) const ACTION_BINDINGS_UNAVAILABLE: &str =
     "action bindings are unavailable on the PostgreSQL community runtime";
 
 impl RuntimeDb {
+    /// Connection-pool ceiling used as the gRPC `spawn_blocking` bound.
+    pub(crate) fn connection_pool_max(&self) -> u32 {
+        match self {
+            Self::Sqlite(db) => db.as_ref().pool_max_size(),
+            Self::Postgres(db) => db.as_ref().max_connections(),
+        }
+    }
+
     /// Labels this store's connection-pool signals with the plane it serves.
     pub(crate) fn set_pool_plane(&self, plane: crate::obs::labels::PoolPlane) {
         match self {
@@ -267,6 +285,15 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.put_object_type_index_edit(edit),
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.put_object_type_index_edit(edit))
+            }
+        }
+    }
+
+    pub fn object_log_migration_identities(&self) -> Result<Vec<(String, String, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.object_log_migration_identities(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.object_log_migration_identities())
             }
         }
     }
@@ -1206,6 +1233,8 @@ impl RuntimeDb {
         namespace: &str,
         kind: &str,
     ) -> Result<Option<ObjectSecurityPolicy>, String> {
+        #[cfg(test)]
+        source_batch_auth_counters::POLICY_LOOKUPS.with(|c| c.set(c.get() + 1));
         let Some(activation) = self.get_object_security_activation(namespace)? else {
             return Ok(None);
         };
@@ -2219,6 +2248,18 @@ impl RuntimeDb {
         }
     }
 
+    pub fn export_receipt_chain(
+        &self,
+        namespace: &str,
+    ) -> Result<sekai_types::receipt_chain::ReceiptChainBundle, String> {
+        match self {
+            Self::Sqlite(db) => db.export_receipt_chain(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.export_receipt_chain(namespace))
+            }
+        }
+    }
+
     pub fn get_operation_receipt(
         &self,
         operation_id: &str,
@@ -3089,10 +3130,93 @@ impl RuntimeDb {
         }
     }
 
+    pub fn set_write_freeze(
+        &self,
+        freeze: &crate::sekai::write_freeze::WriteFreeze,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_write_freeze(freeze),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.set_write_freeze(freeze)),
+        }
+    }
+
+    pub fn set_write_freeze_with_decision(
+        &self,
+        freeze: &crate::sekai::write_freeze::WriteFreeze,
+        decision: &crate::sekai::audit::Decision,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_write_freeze_with_decision(freeze, decision),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.set_write_freeze_with_decision(freeze, decision)
+            }),
+        }
+    }
+
+    pub fn list_write_freezes(
+        &self,
+    ) -> Result<Vec<crate::sekai::write_freeze::WriteFreeze>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_write_freezes(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.list_write_freezes()),
+        }
+    }
+
     pub fn create_grant(&self, grant: &Grant) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.create_grant(grant),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.create_grant(grant)),
+        }
+    }
+
+    pub fn create_grant_with_decision(
+        &self,
+        grant: &Grant,
+        decision: &crate::sekai::audit::Decision,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.create_grant_with_decision(grant, decision),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.create_grant_with_decision(grant, decision))
+            }
+        }
+    }
+
+    pub fn set_namespace_grant_policy(&self, policy: &NamespaceGrantPolicy) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_namespace_grant_policy(policy),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.set_namespace_grant_policy(policy))
+            }
+        }
+    }
+
+    /// Stamp namespace grant policy and refresh the in-memory access cache.
+    /// Storage updates existing open-ended grants; the cache would otherwise
+    /// keep `not_after_ms = 0` until process restart.
+    ///
+    /// There is no public policy RPC. Call this on a quiet store (tests or
+    /// operator setup). CreateGrant and this refresh are not a concurrent
+    /// production pair.
+    pub fn apply_namespace_grant_policy(
+        &self,
+        security: &SecurityChecker,
+        policy: &NamespaceGrantPolicy,
+    ) -> Result<(), String> {
+        self.set_namespace_grant_policy(policy)?;
+        security.reload(|| self.list_all_grants())?;
+        Ok(())
+    }
+
+    pub fn namespace_grant_policy(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<NamespaceGrantPolicy>, String> {
+        match self {
+            Self::Sqlite(db) => db.namespace_grant_policy(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.namespace_grant_policy(namespace))
+            }
         }
     }
 
@@ -3457,6 +3581,23 @@ impl RuntimeDb {
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.find_all_by_external_id(external_id))
             }
+        }
+    }
+
+    pub fn find_all_by_external_ids_in_namespace(
+        &self,
+        namespace: &str,
+        external_ids: &[String],
+    ) -> Result<Vec<Object>, String> {
+        #[cfg(test)]
+        if !external_ids.is_empty() {
+            source_batch_auth_counters::LOOKUP_QUERIES.with(|c| c.set(c.get() + 1));
+        }
+        match self {
+            Self::Sqlite(db) => db.find_all_by_external_ids_in_namespace(namespace, external_ids),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.find_all_by_external_ids_in_namespace(namespace, external_ids)
+            }),
         }
     }
 
@@ -4482,6 +4623,27 @@ impl RuntimeDb {
         }
     }
 
+    pub fn update_parked_action_instance(
+        &self,
+        instance: &crate::sekai::action_instance::ActionInstance,
+        expected_assignee: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.transition_action_instance(
+                crate::sekai::action_instance::STATUS_PARKED,
+                instance,
+                expected_assignee,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.transition_action_instance(
+                    crate::sekai::action_instance::STATUS_PARKED,
+                    instance,
+                    expected_assignee,
+                )
+            }),
+        }
+    }
+
     pub fn grant_parked_action_instance(
         &self,
         granted: &crate::sekai::action_instance::ActionInstance,
@@ -4517,12 +4679,16 @@ impl RuntimeDb {
         parked: &crate::sekai::action_instance::ActionInstance,
     ) -> Result<bool, String> {
         match self {
-            Self::Sqlite(db) => db
-                .transition_action_instance(crate::sekai::action_instance::STATUS_ADMITTED, parked),
+            Self::Sqlite(db) => db.transition_action_instance(
+                crate::sekai::action_instance::STATUS_ADMITTED,
+                parked,
+                &parked.review.assignee,
+            ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.transition_action_instance(
                     crate::sekai::action_instance::STATUS_ADMITTED,
                     parked,
+                    &parked.review.assignee,
                 )
             }),
         }
@@ -7635,6 +7801,39 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_agent_autonomy(
+        &self,
+        namespace: &str,
+        principal: &str,
+        type_id: &str,
+    ) -> Result<Option<crate::sekai::agent_autonomy::AgentAutonomyGrant>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_agent_autonomy(namespace, principal, type_id),
+            Self::Postgres(_) => Err(crate::sekai::agent_autonomy::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_agent_autonomy(
+        &self,
+        grant: &crate::sekai::agent_autonomy::AgentAutonomyGrant,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_agent_autonomy(grant),
+            Self::Postgres(_) => Err(crate::sekai::agent_autonomy::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_agent_autonomy_with_receipt(
+        &self,
+        grant: &crate::sekai::agent_autonomy::AgentAutonomyGrant,
+        decision: &crate::sekai::audit::Decision,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_agent_autonomy_with_receipt(grant, decision),
+            Self::Postgres(_) => Err(crate::sekai::agent_autonomy::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn get_federation_revocation(
         &self,
         revocation_id: &str,
@@ -8915,7 +9114,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn conn(&self) -> r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager> {
+    pub fn conn(&self) -> crate::db::sekai::SqliteConn {
         match self {
             Self::Sqlite(db) => db.conn(),
             Self::Postgres(_) => panic!("conn() is only available for the SQLite community store"),

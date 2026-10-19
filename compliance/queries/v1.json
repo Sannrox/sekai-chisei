@@ -1,0 +1,33 @@
+{
+  "catalog_version": "sekai.compliance-evidence-query/v1",
+  "queries": [
+    {
+      "id": "access_reviews",
+      "decision_actions": ["access.review"]
+    },
+    {
+      "id": "grant_expiry",
+      "decision_actions": ["access.grant.expire"]
+    },
+    {
+      "id": "purpose_records",
+      "decision_actions": ["put_purpose_authorization"]
+    },
+    {
+      "id": "deletion_proofs",
+      "decision_actions": ["privacy.subject_erased"]
+    },
+    {
+      "id": "incident_records",
+      "decision_actions": ["incident.record"]
+    },
+    {
+      "id": "key_rotation",
+      "decision_actions": ["rotate_provider_credential", "rotate_credential"]
+    },
+    {
+      "id": "backup_drills",
+      "decision_actions": ["backup.drill"]
+    }
+  ]
+}

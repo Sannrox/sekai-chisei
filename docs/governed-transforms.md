@@ -43,7 +43,10 @@ feature. See [rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities`
 reports `sekai.transforms.projection`, `sekai.transforms.analytical`,
 `sekai.transforms.isolated_process`, and `sekai.transforms.scheduler` on the
 core pack; `lifecycle_state` is `disabled` unless experimental RPCs are
-enabled.
+enabled. Enterprise-scoped sessions may `PutGovernedTransform` with
+namespace Write and read access to the bound datasets; community credentials
+still require credential administration. `RunGovernedTransform` stays
+unadmitted for scoped sessions.
 
 A definition may carry a `schedule` interval and an `on_input_commit` trigger.
 The plane admits due work on an idempotent replica tick. An upstream commit

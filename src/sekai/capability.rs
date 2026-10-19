@@ -6,6 +6,21 @@ use sha2::{Digest, Sha256};
 pub const CONTRACT_VERSION: &str = "1.0";
 pub const DEFAULT_PAGE_SIZE: usize = 50;
 pub const MAX_PAGE_SIZE: usize = 200;
+/// Catalog name for one enabled governed Action type.
+pub const ACTION_CAPABILITY_PREFIX: &str = "sekai.actions.";
+
+/// Native catalog name for a governed Action type. Invocation rechecks this
+/// name live; a previously listed entry is not a grant.
+pub fn action_capability_name(type_id: &str) -> String {
+    format!("{ACTION_CAPABILITY_PREFIX}{type_id}")
+}
+
+/// `type_id` encoded in `sekai.actions.{type_id}`, or `None` if `name` is not
+/// an action catalog entry.
+pub fn action_type_id_from_capability(name: &str) -> Option<&str> {
+    name.strip_prefix(ACTION_CAPABILITY_PREFIX)
+        .filter(|type_id| !type_id.is_empty() && !type_id.contains('/'))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogError {
@@ -113,5 +128,26 @@ mod tests {
         let other = snapshot_version(&["namespace-a".into(), "bob".into()], &entries);
         assert_eq!(first, repeat);
         assert_ne!(first, other);
+    }
+
+    #[test]
+    fn action_catalog_names_encode_a_single_type_id() {
+        assert_eq!(
+            action_capability_name("review.intake"),
+            "sekai.actions.review.intake"
+        );
+        assert_eq!(
+            action_type_id_from_capability("sekai.actions.review.intake"),
+            Some("review.intake")
+        );
+        assert_eq!(action_type_id_from_capability("sekai.actions."), None);
+        assert_eq!(
+            action_type_id_from_capability("sekai.actions.review/intake"),
+            None
+        );
+        assert_eq!(
+            action_type_id_from_capability("sekai.objects.query.widget"),
+            None
+        );
     }
 }

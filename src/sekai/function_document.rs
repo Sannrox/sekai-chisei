@@ -8,18 +8,22 @@
 //! caller-held text against the pinned digest (the plane stores no bytes),
 //! stamps `derived_from` lineage, and resolves the namespace action policy for
 //! every extraction: `deny` refuses, `require_approval` parks the Action at any
-//! confidence, and `allow` writes only at or above the function threshold (a
-//! threshold of 0 writes every `allow` extraction). A write also passes the
-//! caller's object-write authorization.
+//! confidence unless a live auto-apply grant admits it, and `allow` writes
+//! only at or above the function threshold (a threshold of 0 writes every
+//! `allow` extraction). A write also passes the caller's object-write
+//! authorization.
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{Link, Object, REL_DERIVED_FROM, is_valid_property_key};
 use crate::sekai::action::RiskClass;
-use crate::sekai::action_instance::{ActionInstance, STATUS_PARKED, SUBMIT_POLICY_ACTION};
+use crate::sekai::action_instance::{
+    ActionInstance, STATUS_ADMITTED, STATUS_PARKED, SUBMIT_POLICY_ACTION,
+};
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionRequest,
 };
 use crate::sekai::action_policy::ActionDecision;
+use crate::sekai::agent_autonomy;
 use crate::sekai::document::{
     CONTENT_SCHEME_DIGEST, DOCUMENT_UNAVAILABLE, DocumentRetrieve, FIELD_CONTENT_REF,
     FIELD_METADATA, FIELD_RENDITIONS, RENDITION_EXTRACTED_TEXT, content_digest_for, is_expired,
@@ -210,17 +214,10 @@ pub fn extract_from_rendition(
         updated: now_ms,
     };
     let (type_def, decision) = extraction_policy(db, actor, namespace, &action)?;
+    let agent = agent_autonomy::actor_is_agent(db, actor);
     match decision {
         ActionDecision::Deny => {
             return Err("function document extract denied by action policy".into());
-        }
-        ActionDecision::RequireApproval => {
-            let instance =
-                park_extraction(db, actor, namespace, now_ms, &type_def, &action, &object)?;
-            return Ok(FunctionDocumentExtract::Parked {
-                instance: Box::new(instance),
-                invocation,
-            });
         }
         ActionDecision::Allow if (confidence as u32) < llm.minimum_confidence_micros => {
             return Err(
@@ -228,7 +225,38 @@ pub fn extract_from_rendition(
                     .into(),
             );
         }
-        ActionDecision::Allow => authorize_write(&object)?,
+        ActionDecision::Allow if !agent => authorize_write(&object)?,
+        ActionDecision::RequireApproval if !agent => {
+            let instance =
+                park_extraction(db, actor, namespace, now_ms, &type_def, &action, &object)?;
+            return Ok(FunctionDocumentExtract::Parked {
+                instance: Box::new(instance),
+                invocation,
+            });
+        }
+        _ => {
+            // Authorize before admission so a grant that lands on this call
+            // cannot write without the caller's object-write check.
+            authorize_write(&object)?;
+            let instance =
+                park_extraction(db, actor, namespace, now_ms, &type_def, &action, &object)?;
+            if instance.status == STATUS_ADMITTED {
+                let written = db
+                    .get_object(&object.id)
+                    .map_err(|error| format!("function document extract auto-apply: {error}"))?
+                    .ok_or_else(|| {
+                        "function document extract auto-apply wrote no object".to_string()
+                    })?;
+                return Ok(FunctionDocumentExtract::Written {
+                    object: written,
+                    invocation,
+                });
+            }
+            return Ok(FunctionDocumentExtract::Parked {
+                instance: Box::new(instance),
+                invocation,
+            });
+        }
     }
     persist_extracted_object(
         db,
@@ -590,14 +618,15 @@ fn park_extraction(
                 policy_context: PrincipalPolicyContext::default(),
                 delegating_actor: None,
                 budget_already_reserved: false,
+                resource_tenant: String::new(),
             },
             actor,
             now_ms,
         )
         .map_err(|error| format!("function document extract action: {error:?}"))?;
-    if outcome.instance.status != STATUS_PARKED {
+    if outcome.instance.status != STATUS_PARKED && outcome.instance.status != STATUS_ADMITTED {
         return Err(format!(
-            "function document extract expected parked action, got {}",
+            "function document extract expected parked or admitted action, got {}",
             outcome.instance.status
         ));
     }
@@ -682,6 +711,7 @@ mod tests {
                 principal: "root".into(),
                 role: Role::Admin,
                 created: 1,
+                ..Default::default()
             })
             .unwrap();
     }
@@ -696,7 +726,11 @@ mod tests {
     }
 
     fn admit_invoice_document(runtime: &RuntimeDb) -> String {
-        pin_ceiling(runtime, "analyst", "internal");
+        admit_invoice_document_for(runtime, "analyst")
+    }
+
+    fn admit_invoice_document_for(runtime: &RuntimeDb, owner: &str) -> String {
+        pin_ceiling(runtime, owner, "internal");
         let parent = content_ref(
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "application/pdf",
@@ -706,7 +740,7 @@ mod tests {
             contract_version: DOCUMENT_CONTRACT.into(),
             document_id: "doc:invoice".into(),
             namespace: "records".into(),
-            owner: "analyst".into(),
+            owner: owner.into(),
             type_revision: TYPE_REVISION_V1.into(),
             purpose: "case-review".into(),
             classification: "internal".into(),
@@ -721,11 +755,11 @@ mod tests {
             admitted_at_ms: 0,
             deleted_at_ms: 0,
         };
-        let admitted = admit_document(runtime, "analyst", &document, 1_000).unwrap();
+        let admitted = admit_document(runtime, owner, &document, 1_000).unwrap();
         let text_digest = digest_bytes(EXTRACTED.as_bytes());
         attach_rendition(
             runtime,
-            "analyst",
+            owner,
             &DocumentRendition {
                 namespace: "records".into(),
                 document_id: "doc:invoice".into(),
@@ -861,6 +895,17 @@ mod tests {
         output: serde_json::Value,
         authorize_write: &dyn Fn(&Object) -> Result<(), String>,
     ) -> Result<(FunctionDocumentExtract, Option<serde_json::Value>), String> {
+        extract_published_as(runtime, "analyst", function, text, output, authorize_write)
+    }
+
+    fn extract_published_as(
+        runtime: &RuntimeDb,
+        actor: &str,
+        function: &Function,
+        text: &str,
+        output: serde_json::Value,
+        authorize_write: &dyn Fn(&Object) -> Result<(), String>,
+    ) -> Result<(FunctionDocumentExtract, Option<serde_json::Value>), String> {
         let llm = RecordingHost {
             output,
             bound: Mutex::new(None),
@@ -868,7 +913,7 @@ mod tests {
         let result = extract_from_rendition(FunctionDocumentExtractRequest {
             db: runtime,
             function,
-            actor: "analyst",
+            actor,
             namespace: "records",
             document_id: "doc:invoice",
             purpose: "case-review",
@@ -1210,6 +1255,7 @@ mod tests {
                     reason: String::new(),
                     decider_principals: vec!["approver".into()],
                     decider_is_namespace_admin: true,
+                    delegating_actor: None,
                 },
                 "approver",
                 3_000,
@@ -1234,6 +1280,220 @@ mod tests {
             panic!("expected parked action");
         };
         instance
+    }
+
+    fn earn_extract_auto_apply(runtime: &RuntimeDb, principal: &str) {
+        use crate::sekai::action_instance::DECISION_GRANT;
+        use crate::sekai::agent_autonomy::{
+            AutonomyThreshold, GrantAutoApplyRequest, grant_auto_apply,
+        };
+        use crate::sekai::autonomous_envelope::{
+            AutonomousEnvelope, AutonomousPins, ENVELOPE_CONTRACT, PROFILE_SIMULATE,
+            PROFILE_VERSION, RECEIPT_CURRENT, STATUS_LIVE, admit_envelope, envelope_digest_for,
+        };
+        use ed25519_dalek::Signer;
+
+        for (key, now) in [("a", 10i64), ("b", 20)] {
+            runtime
+                .put_action_instance(&ActionInstance {
+                    instance_id: format!("inst-{key}"),
+                    namespace: "records".into(),
+                    type_id: "function.extract_object".into(),
+                    version: "1".into(),
+                    principal: principal.into(),
+                    delegating_actor: None,
+                    parameters_json: r#"{"object_id":"prior"}"#.into(),
+                    request_digest: format!("sha256:{key}"),
+                    idempotency_key: key.into(),
+                    operation_id: format!("op-{key}"),
+                    status: STATUS_ADMITTED.into(),
+                    deny_reason: String::new(),
+                    evidence_submission_ids: Vec::new(),
+                    policy_decision: "require_approval".into(),
+                    budget_decision: "not_configured".into(),
+                    created_at_ms: now,
+                    decided_at_ms: now,
+                    system_one_fill_json: String::new(),
+                    parked_object_digest: String::new(),
+                    decided_by: "ops-admin".into(),
+                    approval_decision: DECISION_GRANT.into(),
+                    autonomous_envelope_id: String::new(),
+                    review: Default::default(),
+                    agent_action: false,
+                    admission_tenant: String::new(),
+                    resource_tenant: String::new(),
+                })
+                .unwrap();
+        }
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let digest = |tag: u8| format!("sha256:{tag:02x}{}", "ab".repeat(31));
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mut envelope = AutonomousEnvelope {
+            contract_version: ENVELOPE_CONTRACT.into(),
+            envelope_id: "auto:extract".into(),
+            namespace: "records".into(),
+            owner: principal.into(),
+            adapter_id: PROFILE_SIMULATE.into(),
+            adapter_version: PROFILE_VERSION.into(),
+            pins: AutonomousPins {
+                state_digest: digest(1),
+                policy_digest: digest(2),
+                model_digest: digest(3),
+                prompt_digest: digest(4),
+                evidence_digest: digest(5),
+                simulation_digest: digest(6),
+                budget_digest: digest(7),
+                lease_digest: digest(8),
+            },
+            signer_id: "signer:ops".into(),
+            signer_digest: format!("sha256:{:x}", Sha256::digest(public_key)),
+            public_key_hex: hex(&public_key),
+            signature_hex: String::new(),
+            envelope_digest: String::new(),
+            receipt_digest: String::new(),
+            receipt_status: RECEIPT_CURRENT.into(),
+            status: STATUS_LIVE.into(),
+            predecessor_id: String::new(),
+            admitted_by: String::new(),
+            admitted_at_ms: 0,
+        };
+        envelope.envelope_digest = envelope_digest_for(&envelope).unwrap();
+        envelope.signature_hex = hex(&signing_key
+            .sign(envelope.envelope_digest.as_bytes())
+            .to_bytes());
+        admit_envelope(runtime, principal, &envelope, 1_000).unwrap();
+        grant_auto_apply(
+            runtime,
+            GrantAutoApplyRequest {
+                actor: "ops-admin",
+                namespace: "records",
+                principal,
+                type_id: "function.extract_object",
+                envelope_id: "auto:extract",
+                now_ms: 1_500,
+                threshold: AutonomyThreshold {
+                    min_reviews: 2,
+                    min_unchanged_bps: 10_000,
+                    max_incidents: 0,
+                },
+            },
+        )
+        .unwrap();
+    }
+
+    fn extract_as_agent(
+        runtime: &RuntimeDb,
+        authorize_write: &dyn Fn(&Object) -> Result<(), String>,
+    ) -> Result<(FunctionDocumentExtract, Option<serde_json::Value>), String> {
+        let function = extract_function(800_000);
+        if !runtime.function_gate_approved(&function).unwrap() {
+            runtime.publish_gated_function(&function).unwrap();
+        }
+        extract_published_as(
+            runtime,
+            "agent:extractor",
+            &function,
+            EXTRACTED,
+            invoice_output(900_000),
+            authorize_write,
+        )
+    }
+
+    #[test]
+    fn auto_apply_extract_returns_written() {
+        let runtime = db();
+        admit_invoice_document_for(&runtime, "agent:extractor");
+        seed_action(&runtime);
+        earn_extract_auto_apply(&runtime, "agent:extractor");
+        let (result, _) = extract_as_agent(&runtime, &|_| Ok(())).unwrap();
+        let FunctionDocumentExtract::Written { object, .. } = result else {
+            panic!("expected written object after auto-apply");
+        };
+        assert_eq!(object.id, "inv-1");
+        assert_eq!(
+            runtime.get_object("inv-1").unwrap().unwrap().kind,
+            "invoice"
+        );
+        let parked = runtime
+            .list_action_instances("records", None, Some(STATUS_PARKED), 10)
+            .unwrap();
+        assert!(parked.is_empty());
+    }
+
+    #[test]
+    fn auto_apply_extract_is_refused_by_the_write_authorization() {
+        let runtime = db();
+        admit_invoice_document_for(&runtime, "agent:extractor");
+        seed_action(&runtime);
+        earn_extract_auto_apply(&runtime, "agent:extractor");
+        let error = extract_as_agent(&runtime, &|object| {
+            Err(format!("write denied for {}", object.id))
+        })
+        .unwrap_err();
+        assert!(error.contains("write denied for inv-1"), "{error}");
+        assert!(runtime.get_object("inv-1").unwrap().is_none());
+        assert!(
+            runtime
+                .list_action_instances("records", None, None, 10)
+                .unwrap()
+                .iter()
+                .all(|instance| instance.principal != "agent:extractor"
+                    || instance.idempotency_key != "extract-1")
+        );
+    }
+
+    #[test]
+    fn agent_extract_requires_write_authorization_before_parking() {
+        let runtime = db();
+        admit_invoice_document_for(&runtime, "agent:extractor");
+        seed_action(&runtime);
+        let error = extract_as_agent(&runtime, &|object| {
+            Err(format!("write denied for {}", object.id))
+        })
+        .unwrap_err();
+        assert!(error.contains("write denied for inv-1"), "{error}");
+        assert!(runtime.get_object("inv-1").unwrap().is_none());
+        assert!(
+            runtime
+                .list_action_instances("records", None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn allow_policy_parks_an_agent_without_a_grant() {
+        let runtime = db();
+        admit_invoice_document_for(&runtime, "agent:extractor");
+        seed_action(&runtime);
+        set_policy(&runtime, ActionDecision::Allow);
+        let (result, _) = extract_as_agent(&runtime, &|_| Ok(())).unwrap();
+        assert!(
+            matches!(result, FunctionDocumentExtract::Parked { .. }),
+            "agent Allow extract must park until auto-apply is granted"
+        );
+        assert!(runtime.get_object("inv-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn allow_policy_auto_apply_extract_returns_written() {
+        let runtime = db();
+        admit_invoice_document_for(&runtime, "agent:extractor");
+        seed_action(&runtime);
+        set_policy(&runtime, ActionDecision::Allow);
+        earn_extract_auto_apply(&runtime, "agent:extractor");
+        let (result, _) = extract_as_agent(&runtime, &|_| Ok(())).unwrap();
+        let FunctionDocumentExtract::Written { object, .. } = result else {
+            panic!("expected written object after Allow auto-apply");
+        };
+        assert_eq!(object.id, "inv-1");
+        assert!(runtime.get_object("inv-1").unwrap().is_some());
     }
 
     #[test]
@@ -1328,6 +1588,7 @@ mod tests {
                 reason: String::new(),
                 decider_principals: vec!["approver".into()],
                 decider_is_namespace_admin: true,
+                delegating_actor: None,
             },
             "approver",
             3_000,
@@ -1363,6 +1624,7 @@ mod tests {
                 reason: String::new(),
                 decider_principals: vec!["approver".into()],
                 decider_is_namespace_admin: true,
+                delegating_actor: None,
             },
             "approver",
             3_000,

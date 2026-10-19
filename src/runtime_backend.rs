@@ -346,10 +346,7 @@ impl RuntimeBackend {
 
     #[cfg(test)]
     pub(crate) fn connection_pool_max(&self) -> u32 {
-        match self.db.as_ref() {
-            RuntimeDb::Sqlite(db) => db.pool_max_size(),
-            RuntimeDb::Postgres(db) => db.max_connections(),
-        }
+        self.db.connection_pool_max()
     }
 }
 

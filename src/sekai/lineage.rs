@@ -1,30 +1,9 @@
 use crate::db::sekai::SekaiDb;
-use crate::domain::{Direction, Object};
+use crate::domain::Direction;
 use crate::sekai::object_security::PrincipalPolicyContext;
 use std::collections::{HashSet, VecDeque};
 
-#[derive(Debug, Clone)]
-pub struct LineageNode {
-    pub object: Object,
-    pub role: String,
-    pub ephemeral: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct LineageEdge {
-    pub from: String,
-    pub to: String,
-    pub relation: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct LineageResult {
-    pub nodes: Vec<LineageNode>,
-    pub edges: Vec<LineageEdge>,
-    pub truncated: bool,
-}
-
-const DEFAULT_MAX: usize = 200;
+pub use sekai_types::lineage::*;
 
 pub fn get_lineage(
     db: &SekaiDb,
@@ -50,7 +29,7 @@ fn walk_lineage(
     context: Option<&PrincipalPolicyContext>,
 ) -> Result<LineageResult, String> {
     let max = if max_nodes == 0 {
-        DEFAULT_MAX
+        DEFAULT_MAX_LINEAGE_NODES
     } else {
         max_nodes.min(500)
     };
@@ -122,33 +101,10 @@ fn walk_lineage(
     Ok(result)
 }
 
-fn role_for(kind: &str) -> String {
-    match kind {
-        "namespace" => "namespace",
-        "commit" => "commit",
-        "pull_request" => "pr",
-        _ => "other",
-    }
-    .into()
-}
-
-fn is_lineage_relation(rel: &str) -> bool {
-    matches!(
-        rel,
-        "contains"
-            | "produces"
-            | "targets"
-            | "executed"
-            | "depends_on"
-            | "evidence_for"
-            | "derived_from"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Link;
+    use crate::domain::{Link, Object};
     use std::collections::HashMap;
 
     #[test]

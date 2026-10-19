@@ -50,6 +50,7 @@ pub struct TokenAuthInterceptor {
     store: Arc<PrincipalCredentialStore>,
     db: crate::db::store::SekaiStore,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+    actor_rate_gate: crate::chisei::actor_limit::ActorRateGate,
 }
 
 impl TokenAuthInterceptor {
@@ -58,6 +59,7 @@ impl TokenAuthInterceptor {
             store,
             db,
             assertion_authority: None,
+            actor_rate_gate: crate::chisei::actor_limit::ActorRateGate::disabled(),
         }
     }
 
@@ -66,6 +68,14 @@ impl TokenAuthInterceptor {
         assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     ) -> Self {
         self.assertion_authority = assertion_authority;
+        self
+    }
+
+    pub fn with_actor_rate_gate(
+        mut self,
+        actor_rate_gate: crate::chisei::actor_limit::ActorRateGate,
+    ) -> Self {
+        self.actor_rate_gate = actor_rate_gate;
         self
     }
 
@@ -82,11 +92,12 @@ impl TokenAuthInterceptor {
         db: crate::db::store::SekaiStore,
         config: &Config,
     ) -> Result<Self, String> {
-        Ok(Self::from_runtime(
-            store,
-            db,
-            config.assertion_authority()?.map(Arc::new),
-        ))
+        Ok(
+            Self::from_runtime(store, db, config.assertion_authority()?.map(Arc::new))
+                .with_actor_rate_gate(crate::chisei::actor_limit::ActorRateGate::from_config(
+                    config,
+                )),
+        )
     }
 
     /// Resolve a raw bearer token to an active principal credential.
@@ -174,6 +185,7 @@ fn is_discover_rpc(method: &str) -> bool {
             | "ListDatasetHealthChecks"
             | "DescribeObjectAction"
             | "DiscoverCapabilities"
+            | "Search"
     )
 }
 
@@ -206,6 +218,7 @@ fn finish_authenticated_audited(
     req: Request<()>,
     authenticated_context: crate::enterprise::AuthenticatedContext,
     enterprise_scoped: bool,
+    actor_rate_gate: &crate::chisei::actor_limit::ActorRateGate,
 ) -> Result<Request<()>, Status> {
     let guest = authenticated_context
         .guest_home_tenant()
@@ -214,11 +227,29 @@ fn finish_authenticated_audited(
     let rpc = rpc_identity::request_rpc_method(&req)
         .map(|(service, method)| format!("{service}/{method}"))
         .unwrap_or_default();
+    if let Some(chain) = authenticated_context.actor_chain() {
+        actor_rate_gate.admit(&chain).map_err(actor_rate_status)?;
+    }
     let result = finish_authenticated(req, authenticated_context, enterprise_scoped);
     if let (Some(context), Err(_)) = (&guest, &result) {
         let _ = record_guest_access(db, context, &rpc, "rpc", false);
     }
     result
+}
+
+fn actor_rate_status(error: crate::chisei::actor_limit::ActorRateError) -> Status {
+    match error {
+        crate::chisei::actor_limit::ActorRateError::Exhausted { retry_after_ms, .. } => {
+            let mut status = Status::resource_exhausted(error.to_string());
+            if let Ok(value) = retry_after_ms.to_string().parse() {
+                status.metadata_mut().insert("retry-after-ms", value);
+            }
+            status
+        }
+        crate::chisei::actor_limit::ActorRateError::Unavailable => {
+            Status::unavailable(error.to_string())
+        }
+    }
 }
 
 /// One `tenant.guest_access` audit record for a guest decision (#1432), with
@@ -453,6 +484,7 @@ impl TokenAuthInterceptor {
             req,
             claims.authenticated_context(),
             true,
+            &self.actor_rate_gate,
         )?;
         req.extensions_mut().insert(claims);
         Ok(req)
@@ -496,7 +528,7 @@ impl TokenAuthInterceptor {
         if context.credential_kind != crate::enterprise::CredentialKind::Machine {
             return Err(refuse(Status::unauthenticated("invalid token")));
         }
-        finish_authenticated_audited(self.db.runtime(), req, context, true)
+        finish_authenticated_audited(self.db.runtime(), req, context, true, &self.actor_rate_gate)
     }
 }
 
@@ -541,6 +573,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                         req,
                         authenticated_context,
                         enterprise_scoped,
+                        &self.actor_rate_gate,
                     );
                 }
                 None if tenant_header.is_some() => {
@@ -607,6 +640,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
             req,
             authenticated_context,
             enterprise_scoped,
+            &self.actor_rate_gate,
         )
     }
 }
@@ -701,6 +735,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListGovernedTransformRuns"
             | "GetGovernedTransformRun"
             | "PreviewGovernedTransform"
+            | "PutGovernedTransform"
             | "ListDatasets"
             | "ListDatasetVersions"
             | "GetDatasetVersion"
@@ -712,6 +747,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListDatasetAlerts"
             | "DescribeObjectAction"
             | "DiscoverCapabilities"
+            | "Search"
+            | "GetSearchIndexStatus"
     )
 }
 
@@ -811,10 +848,25 @@ fn request_is_mutating_rpc<T>(req: &Request<T>) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn local_or_token_interceptor(
     credential_store: Arc<PrincipalCredentialStore>,
     db: Arc<RuntimeDb>,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+) -> LocalOrTokenAuthInterceptor {
+    local_or_token_interceptor_with_rate_gate(
+        credential_store,
+        db,
+        assertion_authority,
+        crate::chisei::actor_limit::ActorRateGate::disabled(),
+    )
+}
+
+fn local_or_token_interceptor_with_rate_gate(
+    credential_store: Arc<PrincipalCredentialStore>,
+    db: Arc<RuntimeDb>,
+    assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+    actor_rate_gate: crate::chisei::actor_limit::ActorRateGate,
 ) -> LocalOrTokenAuthInterceptor {
     LocalOrTokenAuthInterceptor {
         local: LocalInterceptor::new(true),
@@ -822,7 +874,8 @@ fn local_or_token_interceptor(
             credential_store,
             crate::db::store::SekaiStore::from_shared_runtime(db),
             assertion_authority,
-        ),
+        )
+        .with_actor_rate_gate(actor_rate_gate),
     }
 }
 
@@ -953,6 +1006,7 @@ pub fn run_for_plane(
     let evidence_db = execution_evidence_runtime(&stores);
     Ok(async move {
         spawn_service_background_tasks(&config, evidence_db, &sekai_svc, &chisei_svc, plane);
+        let actor_rate_gate = crate::chisei::actor_limit::ActorRateGate::from_config(&config);
 
         if let Some(ops_port) = config.ops_port {
             crate::obs::ops::bind_and_spawn(
@@ -985,7 +1039,8 @@ pub fn run_for_plane(
                         credential_store.clone(),
                         crate::db::store::SekaiStore::from_shared_runtime(db.clone()),
                         assertion_authority.clone(),
-                    ),
+                    )
+                    .with_actor_rate_gate(actor_rate_gate.clone()),
                     stores.clone(),
                 )
                 .await?;
@@ -995,10 +1050,11 @@ pub fn run_for_plane(
                     http_port,
                     sekai_svc.clone(),
                     chisei_svc.clone(),
-                    local_or_token_interceptor(
+                    local_or_token_interceptor_with_rate_gate(
                         credential_store.clone(),
                         db.clone(),
                         assertion_authority.clone(),
+                        actor_rate_gate.clone(),
                     ),
                     stores.clone(),
                 )
@@ -1014,10 +1070,11 @@ pub fn run_for_plane(
                 socket_path,
                 sekai_svc.clone(),
                 chisei_svc.clone(),
-                local_or_token_interceptor(
+                local_or_token_interceptor_with_rate_gate(
                     credential_store.clone(),
                     db.clone(),
                     assertion_authority.clone(),
+                    actor_rate_gate.clone(),
                 ),
                 health_service.clone(),
                 plane,
@@ -1034,6 +1091,7 @@ pub fn run_for_plane(
                     credential_store,
                     db,
                     assertion_authority,
+                    actor_rate_gate,
                     health_service,
                     plane,
                     stores,
@@ -1063,6 +1121,7 @@ pub fn run_for_plane(
             credential_store,
             db,
             assertion_authority,
+            actor_rate_gate,
             health_service,
             plane,
             stores,
@@ -1121,6 +1180,7 @@ async fn run_tcp<H>(
     credential_store: Arc<PrincipalCredentialStore>,
     db: Arc<RuntimeDb>,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+    actor_rate_gate: crate::chisei::actor_limit::ActorRateGate,
     health_service: H,
     plane: ProcessPlane,
     stores: Arc<CombinedStoreLayout>,
@@ -1148,7 +1208,8 @@ where
                 credential_store,
                 crate::db::store::SekaiStore::from_shared_runtime(db),
                 assertion_authority,
-            ),
+            )
+            .with_actor_rate_gate(actor_rate_gate.clone()),
             health_service,
             plane,
             stores,
@@ -1161,7 +1222,12 @@ where
             config,
             sekai_svc,
             chisei_svc,
-            local_or_token_interceptor(credential_store, db, assertion_authority),
+            local_or_token_interceptor_with_rate_gate(
+                credential_store,
+                db,
+                assertion_authority,
+                actor_rate_gate,
+            ),
             health_service,
             plane,
             stores,
@@ -1340,7 +1406,8 @@ pub fn build_services_for_plane(
         sekai_service::SekaiServiceImpl::wrong_plane_placeholder(sekai_store.clone())
     }
     .with_site_id(config.site_id.clone())
-    .with_runtime_token_authority(config.assertion_authority()?.map(Arc::new));
+    .with_runtime_token_authority(config.assertion_authority()?.map(Arc::new))
+    .with_agent_ceiling(config.actor_chain_enforcement);
     if plane == ProcessPlane::Combined {
         let clerk = Arc::new(
             crate::composition::cross_store_admission::CrossStoreAdmission::new(
@@ -2016,6 +2083,39 @@ mod tests {
     }
 
     #[test]
+    fn token_auth_interceptor_throttles_per_principal_when_enabled() {
+        let authority = test_assertion_authority();
+        let mut interceptor = interceptor_with_authority(authority.clone())
+            .with_actor_rate_gate(crate::chisei::actor_limit::ActorRateGate::enabled(1, 1));
+        let expires_at = chrono::Utc::now().timestamp() + 60;
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let first = authority
+            .sign(&test_assertion_claims(
+                &format!("n-limit-a-{unique}"),
+                expires_at,
+            ))
+            .unwrap();
+        interceptor.call(bearer_request(&first)).unwrap();
+        let second = authority
+            .sign(&test_assertion_claims(
+                &format!("n-limit-b-{unique}"),
+                expires_at,
+            ))
+            .unwrap();
+        let error = interceptor.call(bearer_request(&second)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("retry_after"));
+        assert!(error.metadata().get("retry-after-ms").is_some());
+    }
+
+    #[test]
     fn token_auth_interceptor_rejects_unsupported_or_expired_enterprise_context() {
         struct BoundedExtension {
             version: &'static str,
@@ -2197,21 +2297,23 @@ mod tests {
     }
 
     #[test]
-    fn scoped_transform_reads_and_preview_exclude_put() {
-        // Each checks namespace read; preview reads samples under the
-        // caller's policy (ADR 0110). Put needs credential administration.
+    fn scoped_transform_reads_preview_and_put_exclude_run() {
+        // Reads and preview check namespace read (ADR 0110). Put checks
+        // namespace write and dataset read (#1557). Run stays unadmitted.
         for method in [
             "ListGovernedTransforms",
             "ListGovernedTransformRuns",
             "GetGovernedTransformRun",
             "PreviewGovernedTransform",
+            "PutGovernedTransform",
         ] {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
         }
-        for method in ["PutGovernedTransform", "RunGovernedTransform"] {
-            assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
-        }
+        assert!(!enterprise_namespace_rpc(
+            "sekai.SekaiService",
+            "RunGovernedTransform"
+        ));
     }
 
     #[test]

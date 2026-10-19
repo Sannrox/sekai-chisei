@@ -141,12 +141,39 @@ pub(super) async fn submit_action_instance(
         &req,
         crate::sekai::operation_correlation::OPERATION_METADATA,
     );
+    let catalog_capability = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-capability");
+    let catalog_namespace = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-namespace");
     let mut inner = req.into_inner();
     let namespace = inner.namespace.trim().to_string();
     if namespace.is_empty() {
         return Err(Status::invalid_argument("namespace required"));
     }
     let actor = authorize_action_instance_submit(service, &principals, &namespace)?;
+    if let Some(capability_name) = catalog_capability {
+        let expected = crate::sekai::capability::action_capability_name(&inner.type_id);
+        // MCP v1 binds SubmitActionInstance as `sekai.actions.submit`. Skip
+        // the type-specific live catalog check only when that allowlist name
+        // is not also the native entry for this type_id.
+        if capability_name != "sekai.actions.submit" || capability_name == expected {
+            let catalog_namespace = catalog_namespace.unwrap_or_else(|| namespace.clone());
+            if catalog_namespace != namespace {
+                return Err(Status::invalid_argument(
+                    "catalog namespace metadata must match request namespace",
+                ));
+            }
+            let visible = service
+                .discoverable_capabilities(&namespace, &principals, tenant_context.as_ref())?
+                .into_iter()
+                .any(|entry| {
+                    entry.name == capability_name
+                        && capability_name == expected
+                        && entry.action_version == inner.version
+                });
+            if !visible {
+                return Err(Status::failed_precondition("capability unavailable"));
+            }
+        }
+    }
     enforce_namespace_tenant_context(
         service.db.runtime(),
         tenant_context.as_ref(),
@@ -174,6 +201,13 @@ pub(super) async fn submit_action_instance(
         "governed action identity bound"
     );
 
+    let resource_tenant = shared_space_resource_tenant(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &namespace,
+        crate::enterprise::NamespaceAction::Write,
+    )
+    .unwrap_or_default();
     let admission_request = ActionInstanceAdmissionRequest {
         namespace,
         type_id: inner.type_id,
@@ -189,13 +223,24 @@ pub(super) async fn submit_action_instance(
             .as_ref()
             .and_then(|context| context.act.clone()),
         budget_already_reserved: false,
+        resource_tenant,
     };
+    let tenant = acting_tenant(tenant_context.as_ref());
+    let machine_credential = freeze_machine_credential(tenant_context.as_ref());
     let outcome = span.in_scope(|| {
         let result = if let Some(clerk) = &service.cross_store {
-            clerk.admit(admission_request, &actor, now_millis())
+            clerk.admit(
+                admission_request,
+                &actor,
+                now_millis(),
+                tenant,
+                machine_credential,
+            )
         } else {
             ActionInstanceAdmission::new(service.db.runtime(), None)
                 .with_proposal(Some(&crate::chisei::system_one_action::SystemOneProposal))
+                .with_tenant(tenant)
+                .with_machine_credential(machine_credential)
                 .admit(admission_request, &actor, now_millis())
         };
         result.map_err(|error| match error {
@@ -263,6 +308,8 @@ pub(super) async fn decide_action_instance(
     let decider_is_namespace_admin =
         authorize_source_type_namespace_admin(service, &principals, &instance.namespace).is_ok();
     let outcome = ActionInstanceAdmission::new(service.db.runtime(), None)
+        .with_tenant(acting_tenant(tenant_context.as_ref()))
+        .with_machine_credential(freeze_machine_credential(tenant_context.as_ref()))
         .decide(
             ActionInstanceDecisionRequest {
                 instance_id: inner.instance_id,
@@ -270,6 +317,9 @@ pub(super) async fn decide_action_instance(
                 reason: inner.reason,
                 decider_principals: principals,
                 decider_is_namespace_admin,
+                delegating_actor: tenant_context
+                    .as_ref()
+                    .and_then(|context| context.act.clone()),
             },
             &decider,
             now_millis(),
@@ -572,6 +622,11 @@ pub(super) async fn list_action_instances(
         &inner.namespace,
         false,
     )?;
+    let _ = crate::sekai::action_instance_admission::ActionInstanceAdmission::new(
+        service.db.runtime(),
+        None,
+    )
+    .escalate_due(&inner.namespace, now_millis());
     let type_id = if inner.type_id.trim().is_empty() {
         None
     } else {
@@ -1024,6 +1079,7 @@ pub(super) async fn claim_action_work(
     let actor = principals.first().cloned().unwrap_or_default();
     let now = now_millis();
     let claimed = ActionWorkLifecycle::new(service.db.runtime())
+        .with_agent_ceiling(service.enforce_agent_ceiling)
         .claim(
             ClaimActionWorkCommand {
                 effect_id: &inner.effect_id,
@@ -1119,9 +1175,104 @@ pub(super) async fn ack_action_work(
         &inner.runtime_id,
         inner.claim_generation,
     )?;
-    let now = now_millis();
     let actor = principals.first().cloned().unwrap_or_default();
+    let instance = service
+        .db
+        .runtime()
+        .get_action_instance(&existing.instance_id)
+        .map_err(Status::internal)?;
+    if existing.status != crate::sekai::action_effect::EFFECT_STATUS_COMPLETED
+        && existing.status != crate::sekai::action_effect::EFFECT_STATUS_FAILED
+    {
+        let action_type = instance
+            .as_ref()
+            .map(|instance| instance.type_id.as_str())
+            .unwrap_or("");
+        let origin = instance
+            .as_ref()
+            .map(|instance| instance.principal.as_str())
+            .unwrap_or("");
+        let delegating = instance
+            .as_ref()
+            .and_then(|instance| instance.delegating_actor.as_deref());
+        let supplied_tenant = acting_tenant(tenant_context.as_ref());
+        let stored_agent = instance
+            .as_ref()
+            .is_some_and(|instance| instance.agent_action);
+        let actor_agent =
+            freeze_actor_is_agent(service.db.runtime(), &actor, tenant_context.as_ref())?;
+        let origin_agent = stored_agent
+            || crate::sekai::write_freeze::actor_is_agent(
+                service.db.runtime(),
+                origin,
+                delegating,
+                false,
+            )
+            .map_err(Status::internal)?;
+        let request_act = tenant_context
+            .as_ref()
+            .and_then(|context| context.act.as_deref());
+        let actor_tenant = crate::sekai::write_freeze::acting_or_registered_tenant(
+            service.db.runtime(),
+            supplied_tenant,
+            &actor,
+        )
+        .map_err(Status::internal)?;
+        let origin_tenant = crate::sekai::write_freeze::acting_or_registered_tenant(
+            service.db.runtime(),
+            supplied_tenant,
+            origin,
+        )
+        .map_err(Status::internal)?;
+        let mut checks = crate::sekai::write_freeze::write_checks_for_actors(
+            &existing.namespace,
+            actor_tenant.as_ref(),
+            &actor,
+            request_act,
+            action_type,
+            actor_agent,
+        );
+        checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+            &existing.namespace,
+            origin_tenant.as_ref(),
+            origin,
+            delegating,
+            action_type,
+            origin_agent,
+        ));
+        let stored_tenant = instance
+            .as_ref()
+            .map(|instance| instance.admission_tenant.as_str())
+            .unwrap_or("");
+        if !stored_tenant.is_empty() {
+            checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                &existing.namespace,
+                stored_tenant,
+                origin,
+                delegating,
+                action_type,
+                origin_agent,
+            ));
+        }
+        let resource_tenant = instance
+            .as_ref()
+            .map(|instance| instance.resource_tenant.as_str())
+            .unwrap_or("");
+        if !resource_tenant.is_empty() && resource_tenant != stored_tenant {
+            checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                &existing.namespace,
+                resource_tenant,
+                origin,
+                delegating,
+                action_type,
+                origin_agent,
+            ));
+        }
+        crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)?;
+    }
+    let now = now_millis();
     let acked = ActionWorkLifecycle::new(service.db.runtime())
+        .with_agent_ceiling(service.enforce_agent_ceiling)
         .ack(
             AckActionWorkCommand {
                 effect_id: &inner.effect_id,

@@ -752,6 +752,13 @@ impl SekaiDb {
                     owner TEXT NOT NULL,
                     record_json TEXT NOT NULL,
                     PRIMARY KEY(namespace, envelope_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_agent_autonomy (
+                    namespace TEXT NOT NULL,
+                    principal TEXT NOT NULL,
+                    type_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, principal, type_id)
                 );",
             )
             .map_err(|error| error.to_string())?;

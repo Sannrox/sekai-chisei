@@ -2,10 +2,51 @@ use r2d2::{CustomizeConnection, Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+static NEXT_MEMORY_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static MEMORY_CONN_HELD: RefCell<BTreeSet<u64>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+pub struct SqliteConn {
+    inner: PooledConnection<SqliteConnectionManager>,
+    memory_pool_id: Option<u64>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for SqliteConn {
+    fn drop(&mut self) {
+        if let Some(pool_id) = self.memory_pool_id {
+            MEMORY_CONN_HELD.with(|held| {
+                held.borrow_mut().remove(&pool_id);
+            });
+        }
+    }
+}
+
+impl Deref for SqliteConn {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.inner
+    }
+}
+
+impl DerefMut for SqliteConn {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.inner
+    }
+}
 
 use crate::obs::labels::{Outcome, Subsystem, WaitKind};
 use crate::obs::signals;
@@ -21,7 +62,9 @@ pub struct SekaiDb {
     pool: Pool<SqliteConnectionManager>,
     enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
     persistent: bool,
+    memory_pool_id: u64,
     plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
+    pub(crate) search_maintenance: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -157,17 +200,23 @@ impl SekaiDb {
             .connection_customizer(Box::new(SqliteConnectionSetup))
             .build(manager)
             .map_err(|e| e.to_string())?;
+        let memory_pool_id = if persistent {
+            0
+        } else {
+            NEXT_MEMORY_POOL_ID.fetch_add(1, Ordering::Relaxed)
+        };
         let db = Self {
             pool,
             enterprise_extension,
             persistent,
+            memory_pool_id,
             plane: std::sync::OnceLock::new(),
+            search_maintenance: Mutex::new(()),
         };
         db.migrate_for_plane(schema_plane)?;
         Ok(db)
     }
 
-    #[cfg(test)]
     pub(crate) fn pool_max_size(&self) -> u32 {
         self.pool.max_size()
     }
@@ -185,8 +234,20 @@ impl SekaiDb {
             .unwrap_or(crate::obs::labels::PoolPlane::Shared)
     }
 
-    pub(crate) fn conn(&self) -> PooledConnection<SqliteConnectionManager> {
+    pub(crate) fn conn(&self) -> SqliteConn {
         let started = Instant::now();
+        // In-memory pools are single-connection. A nested checkout from the
+        // same thread waits forever on the default 30s timeout loop. Fail
+        // immediately so a missed `drop` cannot hang a test for tens of minutes.
+        // Other threads may legitimately wait for the connection.
+        if !self.persistent
+            && MEMORY_CONN_HELD.with(|held| held.borrow().contains(&self.memory_pool_id))
+        {
+            panic!(
+                "nested SQLite checkout on the single-connection in-memory pool; \
+                 drop the outer connection before calling another store method"
+            );
+        }
         loop {
             match self.pool.get() {
                 Ok(conn) => {
@@ -196,7 +257,19 @@ impl SekaiDb {
                         started.elapsed(),
                     );
                     self.observe_pool_saturation(started.elapsed());
-                    return conn;
+                    let memory_pool_id = if self.persistent {
+                        None
+                    } else {
+                        MEMORY_CONN_HELD.with(|held| {
+                            held.borrow_mut().insert(self.memory_pool_id);
+                        });
+                        Some(self.memory_pool_id)
+                    };
+                    return SqliteConn {
+                        inner: conn,
+                        memory_pool_id,
+                        _not_send: PhantomData,
+                    };
                 }
                 Err(error) => {
                     // r2d2 blocks for `connection_timeout` (30s by default)
@@ -270,6 +343,7 @@ impl SekaiDb {
     fn migrate_sekai_families(&self) -> Result<(), String> {
         self.migrate()?;
         self.migrate_grants()?;
+        self.migrate_write_freeze()?;
         self.migrate_principal_credentials()?;
         self.migrate_audit()?;
         self.migrate_object_sync()?;
@@ -288,6 +362,7 @@ impl SekaiDb {
         self.migrate_leases()?;
         self.migrate_datasets()?;
         self.migrate_object_type_index()?;
+        self.migrate_search_index()?;
         self.migrate_governed_transforms()?;
         self.migrate_functions()?;
         self.migrate_handoffs()?;
@@ -300,6 +375,7 @@ impl SekaiDb {
 
     fn migrate_chisei_families(&self) -> Result<(), String> {
         self.migrate_chisei()?;
+        self.migrate_receipt_chain()?;
         self.migrate_evaluation_plans()?;
         self.migrate_evaluation_manifests()?;
         self.migrate_evaluation_executions()?;
@@ -1371,6 +1447,32 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn find_all_by_external_ids_in_namespace(
+        &self,
+        namespace: &str,
+        external_ids: &[String],
+    ) -> Result<Vec<Object>, String> {
+        if external_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json = serde_json::to_string(external_ids).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE namespace = ?1
+                   AND external_id IN (SELECT value FROM json_each(?2))
+                 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![namespace, ids_json], row_to_object)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn find_all_by_external_id_with_policy_context(
         &self,
         external_id: &str,
@@ -2023,6 +2125,7 @@ fn build_visibility_filter_internal(
                         OR json_extract(team_namespace.properties, '$.team_managed') = 'true'
                       )
                       AND team_grant.principal IN ({principal_placeholders})
+                      AND (team_grant.not_after_ms = 0 OR team_grant.not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
                 )
             )"
         )
@@ -2030,7 +2133,7 @@ fn build_visibility_filter_internal(
 
     (
         format!(
-            " AND (NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id) OR EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id AND principal IN ({principal_placeholders}))){team_namespace_filter}"
+            " AND (NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id) OR EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id AND principal IN ({principal_placeholders}) AND (not_after_ms = 0 OR not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)))){team_namespace_filter}"
         ),
         params,
     )
@@ -2343,6 +2446,25 @@ mod tests {
 
     fn test_db() -> SekaiDb {
         SekaiDb::new(":memory:").unwrap()
+    }
+
+    #[test]
+    fn nested_memory_checkout_fails_fast() {
+        let db = test_db();
+        let started = Instant::now();
+        let _outer = db.conn();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = db.conn();
+        }));
+        assert!(
+            panicked.is_err(),
+            "nested checkout must fail instead of waiting on the single-connection pool"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "nested checkout waited {:?}",
+            started.elapsed()
+        );
     }
 
     fn temp_db_path(name: &str) -> PathBuf {
@@ -2860,6 +2982,7 @@ mod tests {
             principal: "alice".to_string(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
         db.create_grant(&security::Grant {
@@ -2868,6 +2991,7 @@ mod tests {
             principal: "bob".to_string(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
 

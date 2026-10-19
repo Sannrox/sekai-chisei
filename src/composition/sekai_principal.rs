@@ -12,7 +12,7 @@ use crate::db::store::SekaiStore;
 use crate::domain::Object;
 use crate::sekai::classification_lattice::evaluate_lattice_access;
 use crate::sekai::markings;
-use crate::sekai::security::{Grant, Role};
+use crate::sekai::security::Grant;
 
 impl SekaiDb {
     /// Grants on `object_id` as Chisei sees them.
@@ -44,6 +44,7 @@ impl RuntimeDb {
             principal: grant.principal.clone(),
             role: grant.role.into(),
             created,
+            ..Default::default()
         })
     }
 }
@@ -111,7 +112,10 @@ fn trusted_principal_authority(
             continue;
         }
         let grants = db.list_grants(&object.id)?;
-        if grants.iter().any(|grant| matches!(grant.role, Role::Admin)) {
+        if grants
+            .iter()
+            .any(crate::sekai::security::grant_is_live_admin)
+        {
             trusted_profiles.push(object);
         }
     }
@@ -125,6 +129,7 @@ fn trusted_principal_authority(
 mod tests {
     use super::*;
     use crate::chisei::principal::{PrincipalGrant, PrincipalRole};
+    use crate::sekai::security::Role;
     use std::collections::HashMap;
 
     fn object(id: &str, properties: &[(&str, &str)]) -> Object {

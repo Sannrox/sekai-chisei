@@ -6,6 +6,7 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/944 (#944)
 - Supersedes: none
 - Superseded by: none
+- Amended by: [ADR 0112](0112-namespaced-object-log-identity.md)
 - Related: [ADR 0066](0066-object-set-evaluate.md),
   [ADR 0073](0073-source-and-action-objects.md),
   [ADR 0080](0080-dual-community-runtime-storage.md),

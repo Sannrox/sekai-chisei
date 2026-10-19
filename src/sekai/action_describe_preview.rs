@@ -129,7 +129,7 @@ pub fn preview_object_action_admission(
     request: ObjectActionPreviewRequest<'_>,
 ) -> Result<ObjectActionPreview, ObjectActionProjectionError> {
     match admit_object_action(db, budget, &request)? {
-        Admission::Complete(preview) => Ok(preview),
+        Admission::Complete(preview) => Ok(*preview),
         Admission::Allowed(allowed) => Ok(valid_admission_preview(&allowed, request.object)),
     }
 }
@@ -147,8 +147,8 @@ pub fn preview_object_action(
         ..
     } = request;
     let allowed = match admit_object_action(db, budget, &request)? {
-        Admission::Complete(preview) => return Ok(preview),
-        Admission::Allowed(allowed) => allowed,
+        Admission::Complete(preview) => return Ok(*preview),
+        Admission::Allowed(allowed) => *allowed,
     };
     let AdmissionAllowed {
         type_def,
@@ -241,8 +241,8 @@ pub fn preview_object_action(
 }
 
 enum Admission {
-    Complete(ObjectActionPreview),
-    Allowed(AdmissionAllowed),
+    Complete(Box<ObjectActionPreview>),
+    Allowed(Box<AdmissionAllowed>),
 }
 
 struct AdmissionAllowed {
@@ -290,7 +290,7 @@ fn admit_object_action(
     let type_def = match load_object_bound_type(db, object, type_id, version) {
         Ok(type_def) => type_def,
         Err(ObjectActionProjectionError::Unavailable) => {
-            return Ok(Admission::Complete(unavailable_preview(object)));
+            return Ok(Admission::Complete(Box::new(unavailable_preview(object))));
         }
         Err(error) => return Err(error),
     };
@@ -299,7 +299,7 @@ fn admit_object_action(
         || (!expected_object_revision.trim().is_empty()
             && *expected_object_revision != live_revision)
     {
-        return Ok(Admission::Complete(ObjectActionPreview {
+        return Ok(Admission::Complete(Box::new(ObjectActionPreview {
             outcome: PREVIEW_STALE.into(),
             reason_code: "stale".into(),
             request_digest: String::new(),
@@ -314,7 +314,7 @@ fn admit_object_action(
             failing_criterion: String::new(),
             proposed_parameters_json: String::new(),
             system_one_fill_json: String::new(),
-        }));
+        })));
     }
 
     let stored_object = db
@@ -323,7 +323,7 @@ fn admit_object_action(
     let bound_object = stored_object.as_ref().unwrap_or(object);
     let policy = match db.active_object_policy(&bound_object.namespace, &bound_object.kind) {
         Ok(policy) => policy,
-        Err(_) => return Ok(Admission::Complete(unavailable_preview(object))),
+        Err(_) => return Ok(Admission::Complete(Box::new(unavailable_preview(object)))),
     };
     let invoker = invoker_context(actor, *policy_context);
     match evaluate_submission_criteria(
@@ -334,15 +334,15 @@ fn admit_object_action(
     ) {
         CriterionDecision::Pass => {}
         CriterionDecision::Fail { criterion_id } => {
-            return Ok(Admission::Complete(criterion_preview(
+            return Ok(Admission::Complete(Box::new(criterion_preview(
                 &type_def,
                 object,
                 &live_revision,
                 criterion_id,
-            )));
+            ))));
         }
         CriterionDecision::Unavailable => {
-            return Ok(Admission::Complete(unavailable_preview(object)));
+            return Ok(Admission::Complete(Box::new(unavailable_preview(object))));
         }
     }
 
@@ -380,7 +380,7 @@ fn admit_object_action(
         || policy_decision == "require_approval"
         || budget_decision == "budget_exceeded"
     {
-        return Ok(Admission::Complete(ObjectActionPreview {
+        return Ok(Admission::Complete(Box::new(ObjectActionPreview {
             outcome: PREVIEW_DENIED.into(),
             reason_code: if budget_decision == "budget_exceeded" {
                 "budget_exceeded".into()
@@ -399,16 +399,16 @@ fn admit_object_action(
             failing_criterion: String::new(),
             proposed_parameters_json: String::new(),
             system_one_fill_json: String::new(),
-        }));
+        })));
     }
 
-    Ok(Admission::Allowed(AdmissionAllowed {
+    Ok(Admission::Allowed(Box::new(AdmissionAllowed {
         type_def,
         live_revision,
         policy_decision,
         approval_state,
         budget_decision,
-    }))
+    })))
 }
 
 pub(crate) fn load_object_bound_type(

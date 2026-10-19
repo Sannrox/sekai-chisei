@@ -224,7 +224,10 @@ impl SekaiRpcInventory {
 
         // Fail closed when a listed evidence path is absent from the checkout.
         for path in self.all_evidence_paths() {
-            if (path.starts_with("tests/") || path.starts_with("src/")) && !Path::new(path).exists()
+            if (path.starts_with("tests/")
+                || path.starts_with("src/")
+                || path.starts_with("crates/"))
+                && !Path::new(path).exists()
             {
                 return Err(format!("inventory evidence path does not exist: {path}"));
             }
@@ -361,7 +364,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 178);
+        assert_eq!(inventory.entries.len(), 182);
         assert!(inventory.entry("PutGovernedTransform").is_some());
         assert!(inventory.entry("ListGovernedTransforms").is_some());
         assert!(inventory.entry("ListGovernedTransformRuns").is_some());

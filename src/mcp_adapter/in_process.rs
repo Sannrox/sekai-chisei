@@ -74,6 +74,7 @@ impl InProcessSurface {
                 principal: PRINCIPAL.into(),
                 role: Role::Admin,
                 created: 0,
+                ..Default::default()
             })
             .map_err(|error| error.to_string())?;
         }
@@ -226,6 +227,14 @@ impl InProcessSurface {
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
                         system_one_json: String::new(),
+                        review_queue_id: String::new(),
+                        review_sla_ms: 0,
+                        review_escalate: String::new(),
+                        review_escalate_to: String::new(),
+                        review_threshold_param: String::new(),
+                        review_threshold: 0,
+                        review_pool: vec![],
+                        review_agent_reviewers: vec![],
                     }),
                     request_id: "put-mcp-action".into(),
                 },
@@ -360,6 +369,9 @@ fn fixture_config() -> Config {
         assertion_audience: None,
         assertion_hmac_key: None,
         sekai_endpoint: None,
+        actor_chain_enforcement: false,
+        principal_requests_per_minute: 60,
+        agent_requests_per_minute: 60,
     }
 }
 

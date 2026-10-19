@@ -1,0 +1,34 @@
+{
+  "pack_format": "sekai.compliance-pack/v1",
+  "id": "gdpr",
+  "version": "1",
+  "framework": "GDPR",
+  "framework_version": "2016/679",
+  "controls": [
+    {
+      "id": "Art.5(1)(e)",
+      "title": "Storage limitation",
+      "queries": ["grant_expiry", "deletion_proofs"]
+    },
+    {
+      "id": "Art.17",
+      "title": "Right to erasure",
+      "queries": ["deletion_proofs"]
+    },
+    {
+      "id": "Art.32",
+      "title": "Security of processing",
+      "queries": ["key_rotation", "access_reviews"]
+    },
+    {
+      "id": "Art.32(1)(c)",
+      "title": "Ability to restore availability",
+      "queries": ["backup_drills"]
+    },
+    {
+      "id": "Art.33",
+      "title": "Notification of a personal data breach",
+      "queries": ["incident_records"]
+    }
+  ]
+}

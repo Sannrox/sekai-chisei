@@ -13,6 +13,15 @@ impl SekaiServiceImpl {
         &self,
         req: Request<GetObjectRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
+        let service = self.clone();
+        self.spawn_db(move || service.get_visible_object_blocking(req))
+            .await
+    }
+
+    fn get_visible_object_blocking(
+        &self,
+        req: Request<GetObjectRequest>,
+    ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
@@ -101,6 +110,15 @@ impl SekaiServiceImpl {
         }))
     }
     pub(super) async fn list_visible_objects(
+        &self,
+        req: Request<ListObjectsRequest>,
+    ) -> Result<Response<ListObjectsResponse>, Status> {
+        let service = self.clone();
+        self.spawn_db(move || service.list_visible_objects_blocking(req))
+            .await
+    }
+
+    fn list_visible_objects_blocking(
         &self,
         req: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
@@ -209,7 +227,7 @@ impl SekaiServiceImpl {
             let expected = format!("sekai.objects.query.{kind}");
             if capability_name != &expected
                 || !self
-                    .discoverable_capabilities(namespace, &principals)?
+                    .discoverable_capabilities(namespace, &principals, tenant_context.as_ref())?
                     .iter()
                     .any(|entry| entry.name == *capability_name)
             {

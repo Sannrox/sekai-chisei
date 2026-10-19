@@ -1134,6 +1134,33 @@ pub(super) fn to_proto_grant(g: &security::Grant) -> Grant {
         principal: g.principal.clone(),
         role: g.role.as_str().to_string(),
         created: g.created,
+        purpose: g.purpose.clone(),
+        not_after_ms: g.not_after_ms,
+        exception_reason: g.exception_reason.clone(),
+    }
+}
+pub(super) fn to_proto_write_freeze(
+    freeze: &crate::sekai::write_freeze::WriteFreeze,
+) -> WriteFreeze {
+    WriteFreeze {
+        scope_kind: freeze.scope_kind.clone(),
+        scope_value: freeze.scope_value.clone(),
+        mode: freeze.mode.clone(),
+        reason: freeze.reason.clone(),
+        enabled: freeze.enabled,
+        updated_ms: freeze.updated_ms,
+    }
+}
+pub(super) fn from_proto_write_freeze(
+    freeze: WriteFreeze,
+) -> crate::sekai::write_freeze::WriteFreeze {
+    crate::sekai::write_freeze::WriteFreeze {
+        scope_kind: freeze.scope_kind,
+        scope_value: freeze.scope_value,
+        mode: freeze.mode,
+        reason: freeze.reason,
+        enabled: freeze.enabled,
+        updated_ms: freeze.updated_ms,
     }
 }
 pub(super) fn to_proto_contention_scope(scope: &coordination::ContentionScope) -> ContentionScope {
@@ -1461,6 +1488,9 @@ pub(crate) fn from_proto_grant(g: &Grant) -> Result<security::Grant, Status> {
         principal: g.principal.clone(),
         role,
         created: g.created,
+        purpose: g.purpose.clone(),
+        not_after_ms: g.not_after_ms,
+        exception_reason: g.exception_reason.clone(),
     })
 }
 pub(super) fn from_proto_context_root(

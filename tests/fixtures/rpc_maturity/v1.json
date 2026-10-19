@@ -358,6 +358,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "Search",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetSearchIndexStatus",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "PutObjectTypeIndexEdit",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
@@ -1057,6 +1075,24 @@
       "consumer": "host",
       "classification": "stable",
       "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "SetWriteFreeze",
+      "storage_path": "sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListWriteFreezes",
+      "storage_path": "sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
     },
     {
       "service": "SekaiService",

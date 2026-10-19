@@ -238,11 +238,20 @@ impl SekaiDb {
 
         let target_grants = {
             let mut statement = tx
-                .prepare("SELECT principal, role FROM sekai_grants WHERE object_id=?1")
+                .prepare(
+                    "SELECT principal, role, purpose, not_after_ms, exception_reason
+                     FROM sekai_grants WHERE object_id=?1",
+                )
                 .map_err(|error| error.to_string())?;
             statement
                 .query_map([target_object_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
                 })
                 .map_err(|error| error.to_string())?
                 .collect::<Result<Vec<_>, _>>()
@@ -409,16 +418,19 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?;
         }
 
-        for (principal, role) in &target_grants {
+        for (principal, role, purpose, not_after_ms, exception_reason) in &target_grants {
             tx.execute(
-                "INSERT INTO sekai_grants (id, object_id, principal, role, created)
-                 VALUES (?1,?2,?3,?4,?5)",
+                "INSERT INTO sekai_grants (id, object_id, principal, role, created, purpose, not_after_ms, exception_reason)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     format!("grant-{}-{}", submission.id, short_hash(principal)),
                     evidence_object_id,
                     principal,
                     role,
                     now_ms,
+                    purpose,
+                    not_after_ms,
+                    exception_reason,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -426,7 +438,7 @@ impl SekaiDb {
         if envelope.classification != EvidenceClassification::Public
             && !target_grants
                 .iter()
-                .any(|(principal, _)| principal == &submission.producer_identity)
+                .any(|(principal, _, _, _, _)| principal == &submission.producer_identity)
         {
             tx.execute(
                 "INSERT INTO sekai_grants (id, object_id, principal, role, created)

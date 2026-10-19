@@ -725,12 +725,81 @@ pub(super) async fn list_virtual_tables(
         .collect();
     Ok(Response::new(ListVirtualTablesResponse { tables }))
 }
+fn persist_created_grant(
+    service: &SekaiServiceImpl,
+    mut parsed: crate::sekai::security::Grant,
+    actor: &str,
+) -> Result<crate::sekai::security::Grant, Status> {
+    let runtime = service.db.runtime();
+    let now_ms = crate::sekai::security::unix_now_ms();
+    let namespace = runtime
+        .get_object(&parsed.object_id)
+        .map_err(Status::internal)?
+        .map(|object| {
+            crate::sekai::security::policy_namespace_for_object(
+                &object.kind,
+                &object.namespace,
+                &object.external_id,
+            )
+        })
+        .filter(|namespace| !namespace.is_empty());
+    let policy = match namespace.as_deref() {
+        Some(namespace) => runtime
+            .namespace_grant_policy(namespace)
+            .map_err(Status::internal)?,
+        None => None,
+    };
+    let term = parsed
+        .term()
+        .prepare(policy.as_ref(), now_ms)
+        .map_err(|error| Status::invalid_argument(error.as_str()))?;
+    parsed = parsed.with_term(term);
+    let renew = runtime
+        .list_grants(&parsed.object_id)
+        .map_err(Status::internal)?
+        .iter()
+        .any(|grant| grant.principal == parsed.principal);
+    let action = if renew { "grant.renew" } else { "grant.create" };
+    let mut evidence = HashMap::new();
+    evidence.insert("purpose".into(), parsed.purpose.clone());
+    evidence.insert("not_after_ms".into(), parsed.not_after_ms.to_string());
+    evidence.insert("exception_reason".into(), parsed.exception_reason.clone());
+    evidence.insert("principal".into(), parsed.principal.clone());
+    evidence.insert("role".into(), parsed.role.as_str().into());
+    evidence.insert("grant_id".into(), parsed.id.clone());
+    if let Some(namespace) = namespace {
+        evidence.insert("namespace".into(), namespace);
+    }
+    let receipt_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    runtime
+        .create_grant_with_decision(
+            &parsed,
+            &crate::sekai::audit::Decision {
+                id: format!("{action}:{}:{receipt_ns}", parsed.id),
+                timestamp: now_ms,
+                actor: actor.into(),
+                action: action.into(),
+                reason: parsed.purpose.clone(),
+                evidence,
+                target_id: parsed.object_id.clone(),
+                outcome: "allowed".into(),
+            },
+        )
+        .map_err(Status::internal)?;
+    service.security.add_grant(&parsed);
+    Ok(parsed)
+}
+
 pub(super) async fn create_grant(
     service: &SekaiServiceImpl,
     req: Request<CreateGrantRequest>,
 ) -> Result<Response<CreateGrantResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let actor = principals.first().map(String::as_str).unwrap_or_default();
     let grant = req
         .into_inner()
         .grant
@@ -742,12 +811,7 @@ pub(super) async fn create_grant(
         &parsed.object_id,
         &principals,
     )? {
-        service
-            .db
-            .runtime()
-            .create_grant(&parsed)
-            .map_err(Status::invalid_argument)?;
-        service.security.add_grant(&parsed);
+        let parsed = persist_created_grant(service, parsed, actor)?;
         return Ok(Response::new(CreateGrantResponse {
             grant: Some(to_proto_grant(&parsed)),
         }));
@@ -769,12 +833,7 @@ pub(super) async fn create_grant(
         &target,
         &principals,
     )?;
-    service
-        .db
-        .runtime()
-        .create_grant(&parsed)
-        .map_err(Status::invalid_argument)?;
-    service.security.add_grant(&parsed);
+    let parsed = persist_created_grant(service, parsed, actor)?;
     Ok(Response::new(CreateGrantResponse {
         grant: Some(to_proto_grant(&parsed)),
     }))
@@ -905,6 +964,75 @@ pub(super) async fn check_access(
     Ok(Response::new(CheckAccessResponse {
         allowed: service.security.can_access(&inner.object_id, &refs),
     }))
+}
+pub(super) async fn set_write_freeze(
+    service: &SekaiServiceImpl,
+    req: Request<SetWriteFreezeRequest>,
+) -> Result<Response<SetWriteFreezeResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let actor = principals.first().map(String::as_str).unwrap_or_default();
+    let proto = req
+        .into_inner()
+        .freeze
+        .ok_or_else(|| Status::invalid_argument("freeze required"))?;
+    let mut freeze = from_proto_write_freeze(proto);
+    if freeze.updated_ms <= 0 {
+        freeze.updated_ms = now_millis();
+    }
+    freeze.validate().map_err(Status::invalid_argument)?;
+    let runtime = service.db.runtime();
+    let mut evidence = HashMap::new();
+    evidence.insert("scope_kind".into(), freeze.scope_kind.clone());
+    evidence.insert("scope_value".into(), freeze.scope_value.clone());
+    evidence.insert("mode".into(), freeze.mode.clone());
+    evidence.insert("enabled".into(), freeze.enabled.to_string());
+    runtime
+        .set_write_freeze_with_decision(
+            &freeze,
+            &audit::Decision {
+                id: format!(
+                    "write_freeze:{}:{}:{}",
+                    freeze.scope_kind,
+                    freeze.scope_value,
+                    uuid::Uuid::new_v4().simple()
+                ),
+                timestamp: freeze.updated_ms,
+                actor: actor.into(),
+                action: "write_freeze".into(),
+                reason: freeze.reason.clone(),
+                evidence,
+                target_id: String::new(),
+                outcome: if freeze.enabled {
+                    "enabled".into()
+                } else {
+                    "disabled".into()
+                },
+            },
+        )
+        .map_err(Status::internal)?;
+    Ok(Response::new(SetWriteFreezeResponse {
+        freeze: Some(to_proto_write_freeze(&freeze)),
+    }))
+}
+pub(super) async fn list_write_freezes(
+    service: &SekaiServiceImpl,
+    req: Request<ListWriteFreezesRequest>,
+) -> Result<Response<ListWriteFreezesResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let _ = req.into_inner();
+    let freezes = service
+        .db
+        .runtime()
+        .list_write_freezes()
+        .map_err(Status::internal)?
+        .iter()
+        .map(to_proto_write_freeze)
+        .collect();
+    Ok(Response::new(ListWriteFreezesResponse { freezes }))
 }
 pub(super) async fn ensure_team_namespace(
     service: &SekaiServiceImpl,
@@ -1688,8 +1816,15 @@ pub(super) async fn put_governed_transform(
 ) -> Result<Response<PutGovernedTransformResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    require_credential_admin(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let scoped_put = service.db.runtime().enterprise_extension().is_some()
+        && tenant_context.as_ref().is_some_and(|context| {
+            context.credential_kind == crate::enterprise::CredentialKind::HumanSession
+                && context.tenant.is_some()
+        });
+    if !scoped_put {
+        require_credential_admin(&principals)?;
+    }
     let proto = req
         .into_inner()
         .transform
@@ -1743,6 +1878,25 @@ pub(super) async fn put_governed_transform(
             true,
         )?;
     }
+    if scoped_put {
+        check_team_namespace(
+            service.db.runtime(),
+            &principals,
+            &transform.namespace,
+            true,
+        )?;
+        if transform.schedule.is_some() || transform.trigger.is_some() {
+            return Err(Status::permission_denied(
+                "scoped put cannot schedule or trigger execution",
+            ));
+        }
+        authorize_transform_dataset_reads(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &transform,
+        )?;
+    }
     let owner_tenant = tenant_context
         .as_ref()
         .and_then(|context| context.tenant.as_ref())
@@ -1780,6 +1934,68 @@ fn preview_response(
             .collect(),
         error: result.error,
     }
+}
+
+fn authorize_transform_dataset_reads(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+) -> Result<(), Status> {
+    let mut dataset_ids: Vec<String> = transform
+        .input_bindings()
+        .into_iter()
+        .map(|(_, dataset_id)| dataset_id)
+        .collect();
+    if !transform.output_dataset_id.is_empty() {
+        dataset_ids.push(transform.output_dataset_id.clone());
+    }
+    dataset_ids.sort();
+    dataset_ids.dedup();
+    for dataset_id in dataset_ids {
+        authorize_transform_dataset_read(service, principals, tenant_context, &dataset_id)?;
+    }
+    Ok(())
+}
+
+fn authorize_transform_dataset_read(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    dataset_id: &str,
+) -> Result<(), Status> {
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        principals,
+        &dataset,
+        false,
+    )?;
+    if !dataset.object_id.is_empty() {
+        if let Some(object) = service
+            .db
+            .runtime()
+            .get_object(&dataset.object_id)
+            .map_err(Status::internal)?
+        {
+            if !object_is_visible(
+                service.db.runtime(),
+                &service.security,
+                &object,
+                principals,
+                tenant_context,
+            ) {
+                return Err(Status::permission_denied("access denied"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn authorize_preview_inputs(
@@ -2273,11 +2489,11 @@ pub(super) async fn claim_transform_work(
                 } else {
                     false
                 };
-                match admit_tenant_transform(
+                match admit_claimed_isolated_process(
+                    service,
                     quota.as_ref(),
-                    &crate::composition::transform_run_admission::quota_gate(quota.clone()),
                     owner.as_ref(),
-                    &format!("transform-claim:{}", work.run_id),
+                    &work,
                     prior_admission,
                 ) {
                     Ok(held) => {
@@ -2757,6 +2973,59 @@ fn map_quota_error(error: crate::chisei::tenant_quota::TenantQuotaError) -> Stat
         TenantQuotaError::StaleAssignment { .. } => Status::failed_precondition(error.to_string()),
         TenantQuotaError::Exhausted { .. } => Status::resource_exhausted(error.to_string()),
         TenantQuotaError::Storage(message) => Status::internal(message),
+    }
+}
+
+/// Wall-clock seconds reserved when the isolated-process spec carries no
+/// time limit. Matches the runner's default wall clock.
+const DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS: i64 = 30;
+
+fn admit_claimed_isolated_process(
+    service: &SekaiServiceImpl,
+    quota: &crate::db::runtime_db::RuntimeDb,
+    owner: Option<&crate::enterprise::AuthenticatedContext>,
+    work: &crate::sekai::governed_transform::TransformWork,
+    reclaim: bool,
+) -> Result<Option<crate::chisei::tenant_quota::TenantQuotaAdmission>, Status> {
+    admit_extension_isolated_process(service, owner, work)?;
+    admit_tenant_transform(
+        quota,
+        &crate::composition::transform_run_admission::quota_gate(service.quota_runtime()),
+        owner,
+        &format!("transform-claim:{}", work.run_id),
+        reclaim,
+    )
+}
+
+fn admit_extension_isolated_process(
+    service: &SekaiServiceImpl,
+    owner: Option<&crate::enterprise::AuthenticatedContext>,
+    work: &crate::sekai::governed_transform::TransformWork,
+) -> Result<(), Status> {
+    let Some(extension) = service.db.runtime().enterprise_extension() else {
+        return Ok(());
+    };
+    let Some(context) = owner else {
+        return Ok(());
+    };
+    match extension.admit_isolated_process_job(
+        context,
+        &crate::enterprise::IsolatedProcessJob {
+            run_id: work.run_id.clone(),
+            namespace: work.namespace.clone(),
+            estimated_seconds: DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
+        },
+    ) {
+        Ok(()) => Ok(()),
+        Err(crate::enterprise::ExtensionError::PermissionDenied) => {
+            Err(Status::resource_exhausted("tenant quota exceeded"))
+        }
+        Err(crate::enterprise::ExtensionError::Unavailable(message)) => {
+            Err(Status::unavailable(message))
+        }
+        Err(_) => Err(Status::permission_denied(
+            "isolated-process job not admitted",
+        )),
     }
 }
 

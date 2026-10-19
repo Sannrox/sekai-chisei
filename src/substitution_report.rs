@@ -465,6 +465,7 @@ mod tests {
             principal: "alice".into(),
             role: Role::Viewer,
             created: 1,
+            ..Default::default()
         })
         .unwrap();
         db.insert_operation_receipt(&receipt(

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 pub(super) fn authorize_source_type_namespace_admin(
     service: &SekaiServiceImpl,
@@ -395,6 +396,16 @@ pub(super) fn from_proto_governed_action_type(
         declared_effect_kinds: proto.declared_effect_kinds,
         system_one: parse_system_one_json(&proto.system_one_json)?,
         approvers: proto.approvers,
+        review_queue: crate::sekai::review_queue::ReviewQueueSpec {
+            queue_id: proto.review_queue_id,
+            sla_ms: proto.review_sla_ms,
+            escalate: proto.review_escalate,
+            escalate_to: proto.review_escalate_to,
+            threshold_param: proto.review_threshold_param,
+            threshold: proto.review_threshold,
+            pool: proto.review_pool,
+            agent_reviewers: proto.review_agent_reviewers,
+        },
         enabled: proto.enabled,
         created_by: proto.created_by,
         created_at_ms: proto.created_at_ms,
@@ -430,6 +441,14 @@ pub(super) fn to_proto_governed_action_type(
             .map(|bind| serde_json::to_string(bind).unwrap_or_default())
             .unwrap_or_default(),
         approvers: domain.approvers.clone(),
+        review_queue_id: domain.review_queue.queue_id.clone(),
+        review_sla_ms: domain.review_queue.sla_ms,
+        review_escalate: domain.review_queue.escalate.clone(),
+        review_escalate_to: domain.review_queue.escalate_to.clone(),
+        review_threshold_param: domain.review_queue.threshold_param.clone(),
+        review_threshold: domain.review_queue.threshold,
+        review_pool: domain.review_queue.pool.clone(),
+        review_agent_reviewers: domain.review_queue.agent_reviewers.clone(),
         enabled: domain.enabled,
         created_by: domain.created_by.clone(),
         created_at_ms: domain.created_at_ms,
@@ -480,6 +499,11 @@ pub(super) fn to_proto_action_instance(
         system_one_fill_json: domain.system_one_fill_json.clone(),
         decided_by: domain.decided_by.clone(),
         approval_decision: domain.approval_decision.clone(),
+        review_queue_id: domain.review.queue_id.clone(),
+        review_assignee: domain.review.assignee.clone(),
+        review_sla_deadline_ms: domain.review.sla_deadline_ms,
+        review_escalated: domain.review.escalated,
+        agent_decision: domain.review.agent_decision,
     }
 }
 pub(super) fn to_proto_action_effect(
@@ -1316,6 +1340,44 @@ pub(super) fn ensure_authoritative_source_result(
         ))
     }
 }
+fn source_batch_record_id(
+    batch: &crate::sekai::object_sync::SourceBatch,
+    record: &crate::sekai::object_sync::SourceRecord,
+) -> String {
+    if batch.type_digest == source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        record.source_id()
+    } else {
+        format!(
+            "{}:{}#{}/{}",
+            batch.source, batch.source_instance, record.type_name, record.external_id
+        )
+    }
+}
+
+fn load_source_batch_object_policy(
+    db: &RuntimeDb,
+    cache: &mut HashMap<
+        (String, String),
+        Option<crate::sekai::object_security::ObjectSecurityPolicy>,
+    >,
+    namespace: &str,
+    kind: &str,
+) -> Result<Option<crate::sekai::object_security::ObjectSecurityPolicy>, Status> {
+    let key = (namespace.to_string(), kind.to_string());
+    if let Some(hit) = cache.get(&key) {
+        return Ok(hit.clone());
+    }
+    let loaded = match db.active_object_policy(namespace, kind) {
+        Ok(policy) => policy,
+        Err(error) if error.starts_with("object_security_denied") => {
+            return Err(Status::permission_denied("access denied"));
+        }
+        Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+    };
+    cache.insert(key, loaded.clone());
+    Ok(loaded)
+}
+
 pub(super) fn authorize_source_batch_object_policy(
     db: &RuntimeDb,
     batch: &crate::sekai::object_sync::SourceBatch,
@@ -1323,40 +1385,46 @@ pub(super) fn authorize_source_batch_object_policy(
     tenant_context: Option<&RequestEnterpriseContext>,
 ) -> Result<Vec<domain::Object>, Status> {
     let context = principal_policy_context_from(principals, tenant_context);
+    let source_ids = batch
+        .records
+        .iter()
+        .map(|record| source_batch_record_id(batch, record))
+        .collect::<Vec<_>>();
+    let existing_rows = db
+        .find_all_by_external_ids_in_namespace(&batch.namespace, &source_ids)
+        .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+    let mut existing_by_id: HashMap<String, Vec<domain::Object>> = HashMap::new();
+    for existing in existing_rows {
+        existing_by_id
+            .entry(existing.external_id.clone())
+            .or_default()
+            .push(existing);
+    }
+    let mut policy_cache: HashMap<
+        (String, String),
+        Option<crate::sekai::object_security::ObjectSecurityPolicy>,
+    > = HashMap::new();
     let mut authorized = Vec::new();
-    for record in &batch.records {
-        let source_id = if batch.type_digest == source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST {
-            record.source_id()
-        } else {
-            format!(
-                "{}:{}#{}/{}",
-                batch.source, batch.source_instance, record.type_name, record.external_id
-            )
-        };
-        for existing in db
-            .find_all_by_external_id(&source_id)
-            .map_err(|_| Status::unavailable("object authorization unavailable"))?
-        {
+    for (record, source_id) in batch.records.iter().zip(&source_ids) {
+        for existing in existing_by_id.get(source_id).into_iter().flatten() {
             if existing.namespace != batch.namespace {
                 continue;
             }
-            match db.active_object_policy(&existing.namespace, &existing.kind) {
-                Ok(None) => {}
-                Ok(Some(policy)) => {
-                    if !policy.allows(
-                        &context,
-                        &existing,
-                        crate::sekai::object_security::ObjectSecurityOperation::Sync,
-                    ) {
-                        return Err(Status::permission_denied("access denied"));
-                    }
-                }
-                Err(error) if error.starts_with("object_security_denied") => {
+            if let Some(policy) = load_source_batch_object_policy(
+                db,
+                &mut policy_cache,
+                &existing.namespace,
+                &existing.kind,
+            )? {
+                if !policy.allows(
+                    &context,
+                    existing,
+                    crate::sekai::object_security::ObjectSecurityOperation::Sync,
+                ) {
                     return Err(Status::permission_denied("access denied"));
                 }
-                Err(_) => return Err(Status::unavailable("object authorization unavailable")),
             }
-            authorized.push(existing);
+            authorized.push(existing.clone());
         }
         let mut properties = record
             .properties
@@ -1378,48 +1446,43 @@ pub(super) fn authorize_source_batch_object_policy(
             kind: record.type_name.clone(),
             name: record.display_name.clone(),
             namespace: batch.namespace.clone(),
-            external_id: source_id,
+            external_id: source_id.clone(),
             properties,
             created: 1,
             updated: 1,
         };
-        match db.active_object_policy(&object.namespace, &object.kind) {
-            Ok(None) => {}
-            Ok(Some(policy)) => {
-                if !policy.allows(
-                    &context,
-                    &object,
-                    crate::sekai::object_security::ObjectSecurityOperation::Sync,
-                ) {
-                    return Err(Status::permission_denied("access denied"));
-                }
-                if policy.property_grants_enforced() {
-                    for property in record.properties.keys() {
-                        if !policy.allows_property_access(
-                            property,
-                            crate::sekai::object_security::PropertyGrantAccess::Write,
-                        ) {
-                            return Err(Status::permission_denied("access denied"));
-                        }
-                    }
-                }
-                if policy.value_instance_grants_enforced() {
-                    for (property, value) in &record.properties {
-                        if !policy.allows_value_instance_access(
-                            &object.id,
-                            property,
-                            value,
-                            crate::sekai::object_security::PropertyGrantAccess::Write,
-                        ) {
-                            return Err(Status::permission_denied("access denied"));
-                        }
-                    }
-                }
-            }
-            Err(error) if error.starts_with("object_security_denied") => {
+        if let Some(policy) =
+            load_source_batch_object_policy(db, &mut policy_cache, &object.namespace, &object.kind)?
+        {
+            if !policy.allows(
+                &context,
+                &object,
+                crate::sekai::object_security::ObjectSecurityOperation::Sync,
+            ) {
                 return Err(Status::permission_denied("access denied"));
             }
-            Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+            if policy.property_grants_enforced() {
+                for property in record.properties.keys() {
+                    if !policy.allows_property_access(
+                        property,
+                        crate::sekai::object_security::PropertyGrantAccess::Write,
+                    ) {
+                        return Err(Status::permission_denied("access denied"));
+                    }
+                }
+            }
+            if policy.value_instance_grants_enforced() {
+                for (property, value) in &record.properties {
+                    if !policy.allows_value_instance_access(
+                        &object.id,
+                        property,
+                        value,
+                        crate::sekai::object_security::PropertyGrantAccess::Write,
+                    ) {
+                        return Err(Status::permission_denied("access denied"));
+                    }
+                }
+            }
         }
     }
     Ok(authorized)

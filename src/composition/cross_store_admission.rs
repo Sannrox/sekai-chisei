@@ -117,23 +117,33 @@ impl CrossStoreAdmission {
         )
         .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
 
-        if let Some(existing) = self
+        let existing = self
             .chisei
             .get_operation_reservation(namespace, &operation_id)
-            .map_err(ActionInstanceAdmissionError::Internal)?
-        {
+            .map_err(ActionInstanceAdmissionError::Internal)?;
+        if let Some(existing) = existing.as_ref() {
             if existing.request_digest != request_digest {
                 return Err(ActionInstanceAdmissionError::AlreadyExists(
                     "operation identity conflict: same (namespace, operation_id) with different request digest".into(),
                 ));
             }
-            return Ok(existing);
+            if existing.status != RESERVATION_RELEASED {
+                return Ok(existing.clone());
+            }
         }
 
         let budget_subject = submit_budget_subject(namespace, actor, "");
         if let Some(budget) = &self.budget {
+            let budget_key = if let Some(row) = existing
+                .as_ref()
+                .filter(|row| row.status == RESERVATION_RELEASED)
+            {
+                format!("{operation_id}:reacquire:{}", row.updated_at_ms)
+            } else {
+                operation_id.clone()
+            };
             budget
-                .check_and_reserve_idempotent(&budget_subject, 1, &operation_id)
+                .check_and_reserve_idempotent(&budget_subject, 1, &budget_key)
                 .map_err(|error| {
                     if error.contains("exceeded") || error.contains("budget") {
                         ActionInstanceAdmissionError::FailedPrecondition(error)
@@ -172,10 +182,14 @@ impl CrossStoreAdmission {
         mut request: ActionInstanceAdmissionRequest,
         actor: &str,
         now_ms: i64,
+        tenant: &str,
+        machine_credential: bool,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         request.budget_already_reserved = self.budget.is_some();
         ActionInstanceAdmission::new(self.sekai.runtime(), self.budget_port())
             .with_proposal(Some(self.proposal_port()))
+            .with_tenant(tenant)
+            .with_machine_credential(machine_credential)
             .admit(request, actor, now_ms)
     }
 
@@ -270,12 +284,36 @@ impl CrossStoreAdmission {
         request: ActionInstanceAdmissionRequest,
         actor: &str,
         now_ms: i64,
+        tenant: &str,
+        machine_credential: bool,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        let namespace = request.namespace.trim();
+        let operation_id = resolve_operation_id(&request.request_id)?;
+        let existing = self
+            .chisei
+            .get_operation_reservation(namespace, &operation_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?;
+        if existing
+            .as_ref()
+            .is_none_or(|row| row.status == RESERVATION_RELEASED)
+        {
+            refuse_admission_freeze(
+                self.sekai.runtime(),
+                &request,
+                actor,
+                tenant,
+                machine_credential,
+            )?;
+        }
         let reserved = self.reserve(&request, actor, now_ms)?;
-        let outcome = match self.submit_sekai(request, actor, now_ms) {
+        let outcome = match self.submit_sekai(request, actor, now_ms, tenant, machine_credential) {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = self.finalize(&reserved, None, now_ms);
+                if is_write_freeze_refusal(&error) {
+                    let _ = self.release(&reserved, now_ms);
+                } else {
+                    let _ = self.finalize(&reserved, None, now_ms);
+                }
                 return Err(error);
             }
         };
@@ -340,6 +378,55 @@ impl CrossStoreAdmission {
             .put_operation_receipt(&receipt)
             .map_err(ActionInstanceAdmissionError::Internal)
     }
+}
+
+fn refuse_admission_freeze(
+    db: &crate::db::runtime_db::RuntimeDb,
+    request: &ActionInstanceAdmissionRequest,
+    actor: &str,
+    tenant: &str,
+    machine_credential: bool,
+) -> Result<(), ActionInstanceAdmissionError> {
+    let agent = crate::sekai::write_freeze::actor_is_agent(
+        db,
+        actor,
+        request.delegating_actor.as_deref(),
+        machine_credential,
+    )
+    .map_err(ActionInstanceAdmissionError::Internal)?;
+    let tenant = crate::sekai::write_freeze::acting_or_registered_tenant(db, tenant, actor)
+        .map_err(ActionInstanceAdmissionError::Internal)?;
+    let namespace = request.namespace.trim();
+    let mut checks = crate::sekai::write_freeze::write_checks_for_actors(
+        namespace,
+        tenant.as_ref(),
+        actor,
+        request.delegating_actor.as_deref(),
+        request.type_id.trim(),
+        agent,
+    );
+    if !request.resource_tenant.is_empty() && request.resource_tenant != tenant.as_ref() {
+        checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+            namespace,
+            &request.resource_tenant,
+            actor,
+            request.delegating_actor.as_deref(),
+            request.type_id.trim(),
+            agent,
+        ));
+    }
+    match crate::sekai::write_freeze::freeze_reason_any(db, &checks) {
+        Ok(Some(reason)) => Err(ActionInstanceAdmissionError::FailedPrecondition(reason)),
+        Ok(None) => Ok(()),
+        Err(error) => Err(ActionInstanceAdmissionError::Internal(error)),
+    }
+}
+
+fn is_write_freeze_refusal(error: &ActionInstanceAdmissionError) -> bool {
+    matches!(
+        error,
+        ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze")
+    )
 }
 
 fn require_value(name: &str, value: &str) -> Result<(), ActionInstanceAdmissionError> {
@@ -417,6 +504,7 @@ mod tests {
             policy_context: Default::default(),
             delegating_actor: None,
             budget_already_reserved: false,
+            resource_tenant: String::new(),
         }
     }
 
@@ -455,7 +543,7 @@ mod tests {
         let (clerk, _) = clerk_with_budget();
         let req = request("op-commit");
         let _reserved = clerk.reserve(&req, "alice", 10).unwrap();
-        let outcome = clerk.submit_sekai(req, "alice", 11).unwrap();
+        let outcome = clerk.submit_sekai(req, "alice", 11, "", false).unwrap();
         assert_eq!(outcome.instance.status, "admitted");
         let still = clerk
             .chisei
@@ -483,6 +571,71 @@ mod tests {
             error,
             ActionInstanceAdmissionError::AlreadyExists(_)
         ));
+    }
+
+    #[test]
+    fn freeze_refusal_releases_budget() {
+        let (clerk, budget) = clerk_with_budget();
+        clerk
+            .sekai
+            .runtime()
+            .set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+                scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+                scope_value: "acme".into(),
+                mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+                reason: "incident".into(),
+                enabled: true,
+                updated_ms: 1,
+            })
+            .unwrap();
+        let used_before = budget.get_usage("action:governed").tokens_used;
+        let error = clerk
+            .admit(request("op-frozen"), "alice", 10, "", false)
+            .unwrap_err();
+        assert!(
+            matches!(error, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze"))
+        );
+        assert_eq!(budget.get_usage("action:governed").tokens_used, used_before);
+        assert!(
+            clerk
+                .chisei
+                .get_operation_reservation("acme", "op-frozen")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            clerk
+                .sekai
+                .runtime()
+                .get_action_instance_by_operation_id("op-frozen")
+                .unwrap()
+                .is_none()
+        );
+        clerk
+            .sekai
+            .runtime()
+            .set_write_freeze(&crate::sekai::write_freeze::WriteFreeze {
+                scope_kind: crate::sekai::write_freeze::SCOPE_NAMESPACE.into(),
+                scope_value: "acme".into(),
+                mode: crate::sekai::write_freeze::MODE_BLOCK_WRITES.into(),
+                reason: "lifted".into(),
+                enabled: false,
+                updated_ms: 2,
+            })
+            .unwrap();
+        clerk
+            .admit(request("op-frozen"), "alice", 20, "", false)
+            .unwrap();
+        assert!(budget.get_usage("action:governed").tokens_used > used_before);
+        assert_eq!(
+            clerk
+                .chisei
+                .get_operation_reservation("acme", "op-frozen")
+                .unwrap()
+                .unwrap()
+                .status,
+            RESERVATION_FINALIZED
+        );
     }
 
     #[test]
@@ -514,7 +667,9 @@ mod tests {
     fn admit_writes_plane_specific_receipts_without_copying_bodies() {
         let (clerk, _) = clerk_with_budget();
         assert!(clerk.distinct_stores());
-        let outcome = clerk.admit(request("op-receipts"), "alice", 10).unwrap();
+        let outcome = clerk
+            .admit(request("op-receipts"), "alice", 10, "", false)
+            .unwrap();
         let chisei_receipt = clerk
             .chisei
             .get_operation_receipt("op-receipts")
@@ -550,7 +705,9 @@ mod tests {
         seed_type(&sekai);
         let clerk = CrossStoreAdmission::new(chisei, sekai, None);
         assert!(!clerk.distinct_stores());
-        clerk.admit(request("op-shared"), "alice", 10).unwrap();
+        clerk
+            .admit(request("op-shared"), "alice", 10, "", false)
+            .unwrap();
         let receipt = clerk
             .chisei
             .get_operation_receipt("op-shared")

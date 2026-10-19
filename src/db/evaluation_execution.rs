@@ -101,6 +101,7 @@ impl SekaiDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        self.append_operation_receipt_chain(&transaction, receipt)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(index.clone())
     }

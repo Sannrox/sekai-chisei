@@ -26,6 +26,8 @@ mod ontology_definition_lifecycle;
 mod schema_definition_lifecycle;
 #[path = "scored_knowledge_admission.rs"]
 mod scored_knowledge_admission;
+#[path = "search_rpc.rs"]
+mod search_rpc;
 #[cfg(test)]
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
@@ -154,9 +156,12 @@ fn map_schema_definition_lifecycle_error(error: SchemaDefinitionLifecycleError) 
     }
 }
 
+#[derive(Clone)]
 pub struct SekaiServiceImpl {
     pub(super) db: crate::db::store::SekaiStore,
     pub(super) security: Arc<SecurityChecker>,
+    /// Bounds DB `spawn_blocking` work to the store connection pool.
+    db_work: Arc<tokio::sync::Semaphore>,
     pub(super) schema_definitions: SchemaDefinitionLifecycle,
     pub(super) gateway_schema_principals: Vec<String>,
     /// Region/site pin from `SEKAI_SITE_ID` (default `"local"`).
@@ -170,9 +175,35 @@ pub struct SekaiServiceImpl {
     /// Signs runtime tokens for granted Action work claims; none issues none.
     pub(super) runtime_token_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     pub(super) dry_run_host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
+    /// User grants intersect the agent ceiling at claim and apply (#1563).
+    pub(super) enforce_agent_ceiling: bool,
+}
+
+fn db_work_limiter(db: &crate::db::store::SekaiStore) -> Arc<tokio::sync::Semaphore> {
+    let permits = db.runtime().connection_pool_max().max(1) as usize;
+    Arc::new(tokio::sync::Semaphore::new(permits))
 }
 
 impl SekaiServiceImpl {
+    /// Run store work on the blocking pool, bounded by the connection pool.
+    pub(super) async fn spawn_db<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T, Status> + Send + 'static,
+    ) -> Result<T, Status> {
+        let permit = self
+            .db_work
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("database worker closed"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .unwrap_or_else(|_| Err(Status::unavailable("database worker cancelled")))
+    }
+
     pub fn new(db: crate::db::store::SekaiStore) -> Self {
         Self::new_with_gateway_schema_principals(db, Vec::new())
     }
@@ -189,9 +220,11 @@ impl SekaiServiceImpl {
             .runtime()
             .object_query_cursor_key()
             .expect("initialize durable object query cursor key");
+        let db_work = db_work_limiter(&db);
         Self {
             db,
             security,
+            db_work,
             schema_definitions,
             gateway_schema_principals,
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
@@ -204,6 +237,7 @@ impl SekaiServiceImpl {
             cross_store: None,
             runtime_token_authority: None,
             dry_run_host: None,
+            enforce_agent_ceiling: false,
         }
     }
 
@@ -211,9 +245,11 @@ impl SekaiServiceImpl {
     /// without requiring Sekai tables on a Chisei-only dest.
     pub fn wrong_plane_placeholder(db: crate::db::store::SekaiStore) -> Self {
         let schema_definitions = SchemaDefinitionLifecycle::empty(db.runtime_arc());
+        let db_work = db_work_limiter(&db);
         Self {
             db,
             security: Arc::new(SecurityChecker::new()),
+            db_work,
             schema_definitions,
             gateway_schema_principals: Vec::new(),
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
@@ -226,6 +262,7 @@ impl SekaiServiceImpl {
             cross_store: None,
             runtime_token_authority: None,
             dry_run_host: None,
+            enforce_agent_ceiling: false,
         }
     }
 
@@ -236,6 +273,11 @@ impl SekaiServiceImpl {
         authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     ) -> Self {
         self.runtime_token_authority = authority;
+        self
+    }
+
+    pub fn with_agent_ceiling(mut self, enforce: bool) -> Self {
+        self.enforce_agent_ceiling = enforce;
         self
     }
 
@@ -294,7 +336,7 @@ impl SekaiServiceImpl {
     /// Live discovery is rechecked; a previously observed catalog is never a grant.
     fn begin_semantic_catalog_invocation<'a>(
         &'a self,
-        req: &Request<impl prost::Message>,
+        req: &Request<impl prost::Message + 'static>,
         expected_capability: &str,
         namespace: &str,
         principals: &[String],
@@ -324,8 +366,9 @@ impl SekaiServiceImpl {
         let catalog_version = Self::catalog_metadata_value(req, "x-sekai-catalog-version");
         let actor = principals.first().cloned().unwrap_or_default();
 
+        let tenant_context = request_tenant_context(self.db.runtime(), req)?;
         let visible = self
-            .discoverable_capabilities(namespace, principals)?
+            .discoverable_capabilities(namespace, principals, tenant_context.as_ref())?
             .into_iter()
             .any(|entry| entry.name == capability_name && capability_name == expected_capability);
         if !visible {
@@ -662,6 +705,18 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetObjectTypeIndexStatusRequest>,
     ) -> Result<Response<GetObjectTypeIndexStatusResponse>, Status> {
         rpc_objects::get_object_type_index_status(self, req).await
+    }
+    async fn search(
+        &self,
+        req: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        search_rpc::search(self, req).await
+    }
+    async fn get_search_index_status(
+        &self,
+        req: Request<GetSearchIndexStatusRequest>,
+    ) -> Result<Response<GetSearchIndexStatusResponse>, Status> {
+        search_rpc::get_search_index_status(self, req).await
     }
     async fn put_object_type_index_edit(
         &self,
@@ -1432,6 +1487,18 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<CheckAccessResponse>, Status> {
         rpc_data::check_access(self, req).await
     }
+    async fn set_write_freeze(
+        &self,
+        req: Request<SetWriteFreezeRequest>,
+    ) -> Result<Response<SetWriteFreezeResponse>, Status> {
+        rpc_data::set_write_freeze(self, req).await
+    }
+    async fn list_write_freezes(
+        &self,
+        req: Request<ListWriteFreezesRequest>,
+    ) -> Result<Response<ListWriteFreezesResponse>, Status> {
+        rpc_data::list_write_freezes(self, req).await
+    }
     async fn ensure_team_namespace(
         &self,
         req: Request<EnsureTeamNamespaceRequest>,
@@ -1558,6 +1625,39 @@ impl KnowledgeWriter for SekaiServiceImpl {
         request: &KnowledgeWriteRequest,
     ) -> Result<KnowledgeWriteOutcome, String> {
         scored_knowledge_admission::admit(self, request).await
+    }
+}
+
+#[cfg(test)]
+mod spawn_db_tests {
+    use super::*;
+    use crate::db::store::SekaiStore;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_db_does_not_block_the_tokio_worker() {
+        let service = SekaiServiceImpl::new(SekaiStore::memory());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = service.spawn_db(move || {
+            let _ = started_tx.send(());
+            release_rx
+                .recv()
+                .map_err(|_| Status::internal("release signal closed"))?;
+            Ok(())
+        });
+        let probe = async {
+            started_rx.await.expect("blocking work started");
+            tokio::task::yield_now().await;
+            let _ = release_tx.send(());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(blocking, probe);
+            result
+        })
+        .await
+        .expect("spawn_db blocked the Tokio worker")
+        .unwrap();
     }
 }
 

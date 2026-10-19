@@ -1979,6 +1979,7 @@ mod tests {
                 principal: principal.into(),
                 role,
                 created: 1,
+                ..Default::default()
             };
             svc.db.runtime().create_grant(&grant).unwrap();
             svc.security.add_grant(&grant);
@@ -2026,6 +2027,7 @@ mod tests {
                 principal: "root".into(),
                 role: security::Role::Admin,
                 created: 1,
+                ..Default::default()
             };
             svc.db.runtime().create_grant(&grant).unwrap();
             svc.security.add_grant(&grant);
@@ -2185,6 +2187,7 @@ mod tests {
             principal: "service-a".into(),
             role: security::Role::Admin,
             created: 1,
+            ..Default::default()
         };
         svc.db.runtime().create_grant(&grant).unwrap();
         svc.security.add_grant(&grant);
@@ -2258,6 +2261,7 @@ mod tests {
             principal: "other-human".into(),
             role: security::Role::Viewer,
             created: 1,
+            ..Default::default()
         };
         svc.db.runtime().create_grant(&denied_grant).unwrap();
         svc.security.add_grant(&denied_grant);
@@ -3369,30 +3373,37 @@ mod tests {
                 mikura::ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+                    namespace: "sales".into(),
                     kind: "Customer".into(),
                     key: "c1".into(),
                     hidden: false,
                     props: std::collections::HashMap::from([("region".into(), "eu".into())]),
+                    schema_version: 1,
                 },
                 mikura::ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+                    namespace: "sales".into(),
                     kind: "Customer".into(),
                     key: "c-hidden".into(),
                     hidden: true,
                     props: std::collections::HashMap::from([("region".into(), "eu".into())]),
+                    schema_version: 1,
                 },
                 mikura::ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+                    namespace: "sales".into(),
                     kind: "Order".into(),
                     key: "o1".into(),
                     hidden: false,
                     props: std::collections::HashMap::from([("customer_id".into(), "c1".into())]),
+                    schema_version: 1,
                 },
                 mikura::ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+                    namespace: "sales".into(),
                     kind: "Shipment".into(),
                     key: "s1".into(),
                     hidden: false,
@@ -3400,10 +3411,12 @@ mod tests {
                         ("order_id".into(), "o1".into()),
                         ("amount".into(), "10".into()),
                     ]),
+                    schema_version: 1,
                 },
                 mikura::ObjectRecord {
                     action_id: None,
                     r#gen: 1,
+                    namespace: "sales".into(),
                     kind: "Shipment".into(),
                     key: "s-hidden".into(),
                     hidden: true,
@@ -3411,6 +3424,7 @@ mod tests {
                         ("order_id".into(), "o1".into()),
                         ("amount".into(), "99".into()),
                     ]),
+                    schema_version: 1,
                 },
             ],
         )
