@@ -2925,6 +2925,209 @@ pub(super) async fn write_transform_run_result(
     }))
 }
 
+pub(super) async fn apply_streaming_transform_batch(
+    service: &SekaiServiceImpl,
+    req: Request<ApplyStreamingTransformBatchRequest>,
+) -> Result<Response<ApplyStreamingTransformBatchResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let actor = principals.first().cloned().unwrap_or_default();
+    let input = req.into_inner();
+    let run = load_transform_run_or_preview(service, &input.run_id)?;
+    check_team_namespace(service.db.runtime(), &principals, &run.namespace, true)?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &run.namespace,
+            true,
+        )?;
+    }
+    for edit in &input.edits {
+        let object_id = edit.object_id.trim();
+        if object_id.is_empty() {
+            continue;
+        }
+        let exists = service
+            .db
+            .runtime()
+            .get_object(object_id)
+            .map_err(Status::internal)?
+            .is_some();
+        check_object_acl_with_audit(
+            service.db.runtime(),
+            &service.security,
+            object_id,
+            &principals,
+            tenant_context.as_ref(),
+            if exists {
+                crate::sekai::object_security::ObjectSecurityOperation::Update
+            } else {
+                crate::sekai::object_security::ObjectSecurityOperation::Create
+            },
+        )?;
+    }
+    let request = crate::sekai::streaming_transform_apply::StreamingTransformApplyRequest {
+        run_id: input.run_id,
+        runtime_id: input.runtime_id,
+        claim_generation: input.claim_generation,
+        fencing_token: input.fencing_token,
+        checkpoint: input.checkpoint,
+        action_type_id: input.action_type_id,
+        action_type_version: input.action_type_version,
+        edits: input
+            .edits
+            .into_iter()
+            .map(
+                |edit| crate::sekai::streaming_transform_apply::StreamingObjectEdit {
+                    object_id: edit.object_id,
+                    name: edit.name,
+                    properties: edit.properties,
+                },
+            )
+            .collect(),
+        input_positions: input
+            .input_positions
+            .into_iter()
+            .map(
+                |position| crate::sekai::streaming_transform_apply::StreamingInputPosition {
+                    source: position.source,
+                    position: position.position,
+                },
+            )
+            .collect(),
+    };
+    let resource_tenant = shared_space_resource_tenant(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &run.namespace,
+        crate::enterprise::NamespaceAction::Write,
+    )
+    .unwrap_or_default();
+    let policy_context = principal_policy_context_from(&principals, tenant_context.as_ref());
+    let receipt = crate::sekai::streaming_transform_apply::apply(
+        service.db.runtime(),
+        request,
+        now_millis(),
+        crate::sekai::streaming_transform_apply::StreamingApplyAuth {
+            actor: &actor,
+            tenant: acting_tenant(tenant_context.as_ref()),
+            resource_tenant: &resource_tenant,
+            delegating_actor: tenant_context
+                .as_ref()
+                .and_then(|context| context.act.as_deref()),
+            machine_credential: freeze_machine_credential(tenant_context.as_ref()),
+            policy_context: Some(&policy_context),
+        },
+        |existing, object, create| {
+            if let Some(existing) = existing {
+                enforce_object_operation_access(
+                    service.db.runtime(),
+                    existing,
+                    &principals,
+                    tenant_context.as_ref(),
+                    crate::sekai::object_security::ObjectSecurityOperation::Update,
+                    &format!("apply_streaming_transform_batch_existing:{}", existing.id),
+                    None,
+                )
+                .map(|_| ())
+                .map_err(streaming_object_access_status)?;
+            }
+            enforce_object_operation_access(
+                service.db.runtime(),
+                object,
+                &principals,
+                tenant_context.as_ref(),
+                if create {
+                    crate::sekai::object_security::ObjectSecurityOperation::Create
+                } else {
+                    crate::sekai::object_security::ObjectSecurityOperation::Update
+                },
+                &format!("apply_streaming_transform_batch:{}", object.id),
+                None,
+            )
+            .map(|_| ())
+            .map_err(streaming_object_access_status)?;
+            enforce_marking_declassify(
+                service.db.runtime(),
+                existing,
+                object,
+                &principals,
+                tenant_context.as_ref(),
+            )
+            .map_err(streaming_object_access_status)
+        },
+    )
+    .map_err(streaming_apply_status)?;
+    Ok(Response::new(ApplyStreamingTransformBatchResponse {
+        receipt: Some(to_proto_streaming_apply_receipt(receipt)),
+    }))
+}
+
+fn to_proto_streaming_apply_receipt(
+    receipt: crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt,
+) -> StreamingTransformApplyReceipt {
+    StreamingTransformApplyReceipt {
+        run_id: receipt.run_id,
+        claim_generation: receipt.claim_generation,
+        checkpoint: receipt.checkpoint,
+        input_positions: receipt
+            .input_positions
+            .into_iter()
+            .map(|position| StreamingTransformInputPosition {
+                source: position.source,
+                position: position.position,
+            })
+            .collect(),
+        objects: receipt
+            .objects
+            .into_iter()
+            .map(|object| StreamingTransformObjectVersion {
+                object_id: object.object_id,
+                version: object.version,
+            })
+            .collect(),
+        transform_version: receipt.transform_version,
+        action_type_id: receipt.action_type_id,
+        action_type_version: receipt.action_type_version,
+        replay: receipt.replay,
+    }
+}
+
+fn streaming_apply_status(
+    error: crate::sekai::streaming_transform_apply::StreamingApplyError,
+) -> Status {
+    use crate::sekai::streaming_transform_apply::StreamingApplyError;
+    match error {
+        StreamingApplyError::InvalidArgument(message) => Status::invalid_argument(message),
+        StreamingApplyError::FailedPrecondition(message) => Status::failed_precondition(message),
+        StreamingApplyError::NotFound(message) => Status::not_found(message),
+        StreamingApplyError::PermissionDenied(message) => Status::permission_denied(message),
+        StreamingApplyError::Internal(message) => Status::internal(message),
+    }
+}
+
+fn streaming_object_access_status(
+    status: Status,
+) -> crate::sekai::streaming_transform_apply::StreamingApplyError {
+    use crate::sekai::streaming_transform_apply::StreamingApplyError;
+    match status.code() {
+        tonic::Code::PermissionDenied => {
+            StreamingApplyError::PermissionDenied(status.message().into())
+        }
+        tonic::Code::FailedPrecondition => {
+            StreamingApplyError::FailedPrecondition(status.message().into())
+        }
+        tonic::Code::InvalidArgument => {
+            StreamingApplyError::InvalidArgument(status.message().into())
+        }
+        tonic::Code::NotFound => StreamingApplyError::NotFound(status.message().into()),
+        _ => StreamingApplyError::Internal(status.message().into()),
+    }
+}
+
 // Authorize the admitted JobSpec dataset bindings. Snapshot rows stay claim-fenced
 // to this run; dataset-id reuse under a live claim is outside this check.
 fn check_isolated_transform_datasets(

@@ -475,6 +475,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ApplyStreamingTransformBatch",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "TickGovernedTransforms",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

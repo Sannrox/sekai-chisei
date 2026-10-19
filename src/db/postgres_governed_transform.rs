@@ -1213,6 +1213,79 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
+
+    pub fn peek_streaming_transform_apply(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        checkpoint: &str,
+        now_ms: i64,
+    ) -> Result<
+        Option<crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt>,
+        crate::sekai::streaming_transform_apply::StreamingApplyError,
+    > {
+        let mut connection = self.connection().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(error)
+        })?;
+        let mut tx = connection.transaction().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(
+                error.to_string(),
+            )
+        })?;
+        let receipt = load_streaming_apply_receipt_pg(
+            &mut tx,
+            run_id,
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            checkpoint,
+            now_ms,
+        )?;
+        tx.commit().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(
+                error.to_string(),
+            )
+        })?;
+        Ok(receipt)
+    }
+
+    pub fn apply_streaming_transform_batch(
+        &self,
+        batch: crate::sekai::streaming_transform_apply::StreamingTransformApplyBatch,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<
+        crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt,
+        crate::sekai::streaming_transform_apply::StreamingApplyError,
+    > {
+        let mut connection = self.connection().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(error)
+        })?;
+        let mut tx = connection.transaction().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(
+                error.to_string(),
+            )
+        })?;
+        let namespace = peek_transform_work_namespace(&mut tx, &batch.run_id).map_err(|error| {
+            if error.contains("not found") {
+                crate::sekai::streaming_transform_apply::StreamingApplyError::NotFound(error)
+            } else {
+                crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(error)
+            }
+        })?;
+        lock_transform_work_namespace(&mut tx, &namespace).map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(error)
+        })?;
+        let receipt = apply_streaming_transform_batch_pg(&mut tx, &batch, actor, now_ms)?;
+        tx.commit().map_err(|error| {
+            crate::sekai::streaming_transform_apply::StreamingApplyError::Internal(
+                error.to_string(),
+            )
+        })?;
+        Ok(receipt)
+    }
 }
 
 fn lock_transform_datasets(
@@ -1237,6 +1310,135 @@ fn lock_transform_datasets(
         }
     }
     Ok(())
+}
+
+fn load_streaming_apply_receipt_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+    checkpoint: &str,
+    now_ms: i64,
+) -> Result<
+    Option<crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt>,
+    crate::sekai::streaming_transform_apply::StreamingApplyError,
+> {
+    use crate::sekai::streaming_transform_apply::{StreamingApplyError, decode_receipt};
+    let work = load_transform_work_pg(tx, run_id)
+        .map_err(StreamingApplyError::Internal)?
+        .ok_or_else(|| StreamingApplyError::NotFound("transform work not found".into()))?;
+    if !transform_claim_fence_matches(&work, runtime_id, claim_generation, fencing_token, now_ms) {
+        return Err(StreamingApplyError::FailedPrecondition(
+            STALE_TRANSFORM_CLAIM.into(),
+        ));
+    }
+    tx.query_opt(
+        "SELECT receipt_json FROM sekai_streaming_transform_apply
+         WHERE run_id = $1 AND checkpoint = $2 FOR UPDATE",
+        &[&run_id, &checkpoint],
+    )
+    .map_err(|error| StreamingApplyError::Internal(error.to_string()))?
+    .map(|row| {
+        let raw: String = row.get(0);
+        let mut receipt = decode_receipt(&raw).map_err(StreamingApplyError::Internal)?;
+        receipt.replay = true;
+        Ok(receipt)
+    })
+    .transpose()
+}
+
+fn apply_streaming_transform_batch_pg(
+    tx: &mut postgres::Transaction<'_>,
+    batch: &crate::sekai::streaming_transform_apply::StreamingTransformApplyBatch,
+    actor: &str,
+    now_ms: i64,
+) -> Result<
+    crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt,
+    crate::sekai::streaming_transform_apply::StreamingApplyError,
+> {
+    use crate::db::postgres_audit::{insert_created_object_in, update_object_in};
+    use crate::sekai::streaming_transform_apply::{
+        StreamingApplyError, decode_receipt, encode_receipt, map_persist_error, receipt_from_batch,
+    };
+    if let Some(receipt) = load_streaming_apply_receipt_pg(
+        tx,
+        &batch.run_id,
+        &batch.runtime_id,
+        batch.claim_generation,
+        &batch.fencing_token,
+        &batch.checkpoint,
+        now_ms,
+    )? {
+        return Ok(receipt);
+    }
+    let receipt = receipt_from_batch(batch, false);
+    let receipt_json = encode_receipt(&receipt).map_err(StreamingApplyError::Internal)?;
+    match tx.execute(
+        "INSERT INTO sekai_streaming_transform_apply
+         (run_id, checkpoint, claim_generation, transform_version, receipt_json, created_at_ms)
+         VALUES ($1,$2,$3,$4,$5,$6)",
+        &[
+            &batch.run_id,
+            &batch.checkpoint,
+            &batch.claim_generation,
+            &batch.transform_version,
+            &receipt_json,
+            &now_ms,
+        ],
+    ) {
+        Ok(_) => {}
+        Err(error) if error.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION) => {
+            let raw: String = tx
+                .query_one(
+                    "SELECT receipt_json FROM sekai_streaming_transform_apply
+                     WHERE run_id = $1 AND checkpoint = $2",
+                    &[&batch.run_id, &batch.checkpoint],
+                )
+                .map_err(|error| StreamingApplyError::Internal(error.to_string()))?
+                .get(0);
+            let mut stored = decode_receipt(&raw).map_err(StreamingApplyError::Internal)?;
+            stored.replay = true;
+            return Ok(stored);
+        }
+        Err(error) => return Err(StreamingApplyError::Internal(error.to_string())),
+    }
+    // Object helpers take lifecycle then namespace policy. Lock every object
+    // first, in id order, so a concurrent update cannot hold object N while
+    // waiting on the policy lock this transaction already took for object 1.
+    let mut object_ids = batch
+        .edits
+        .iter()
+        .map(|edit| edit.object.id.as_str())
+        .collect::<Vec<_>>();
+    object_ids.sort_unstable();
+    object_ids.dedup();
+    for object_id in object_ids {
+        lock_object_lifecycle(tx, object_id).map_err(map_persist_error)?;
+    }
+    let policy_generation = Some(batch.policy_generation.as_str());
+    for edit in &batch.edits {
+        if edit.create {
+            insert_created_object_in(tx, &edit.object, actor, policy_generation)
+                .map_err(map_persist_error)?;
+        } else {
+            let previous = update_object_in(
+                tx,
+                &edit.object,
+                edit.expected.as_ref(),
+                actor,
+                policy_generation,
+            )
+            .map_err(map_persist_error)?;
+            if previous.is_none() {
+                return Err(StreamingApplyError::FailedPrecondition(format!(
+                    "object {} not found",
+                    edit.object.id
+                )));
+            }
+        }
+    }
+    Ok(receipt)
 }
 
 fn peek_transform_work_namespace(

@@ -827,6 +827,45 @@ message WriteTransformRunResultRequest {
 message WriteTransformRunResultResponse {
   TransformRun run = 1;
 }
+message StreamingTransformObjectEdit {
+  string object_id = 1;
+  string name = 2;
+  map<string, string> properties = 3;
+}
+message StreamingTransformInputPosition {
+  string source = 1;
+  string position = 2;
+}
+message StreamingTransformObjectVersion {
+  string object_id = 1;
+  int64 version = 2;
+}
+message ApplyStreamingTransformBatchRequest {
+  string run_id = 1;
+  string runtime_id = 2;
+  int64 claim_generation = 3;
+  string fencing_token = 4;
+  // Opaque checkpoint identity. Idempotent replay is keyed by (run_id, checkpoint).
+  string checkpoint = 5;
+  string action_type_id = 6;
+  string action_type_version = 7;
+  repeated StreamingTransformObjectEdit edits = 8;
+  repeated StreamingTransformInputPosition input_positions = 9;
+}
+message StreamingTransformApplyReceipt {
+  string run_id = 1;
+  int64 claim_generation = 2;
+  string checkpoint = 3;
+  repeated StreamingTransformInputPosition input_positions = 4;
+  repeated StreamingTransformObjectVersion objects = 5;
+  string transform_version = 6;
+  string action_type_id = 7;
+  string action_type_version = 8;
+  bool replay = 9;
+}
+message ApplyStreamingTransformBatchResponse {
+  StreamingTransformApplyReceipt receipt = 1;
+}
 message ContentReference {
   string scheme = 1;
   string digest = 2;
@@ -3069,6 +3108,7 @@ service SekaiService {
   rpc HeartbeatTransformClaim(HeartbeatTransformClaimRequest) returns (HeartbeatTransformClaimResponse);
   rpc ReadTransformRunInputs(ReadTransformRunInputsRequest) returns (stream ReadTransformRunInputsResponse);
   rpc WriteTransformRunResult(WriteTransformRunResultRequest) returns (WriteTransformRunResultResponse);
+  rpc ApplyStreamingTransformBatch(ApplyStreamingTransformBatchRequest) returns (ApplyStreamingTransformBatchResponse);
   rpc TickGovernedTransforms(TickGovernedTransformsRequest) returns (TickGovernedTransformsResponse);
   rpc GetTransformOutputState(GetTransformOutputStateRequest) returns (GetTransformOutputStateResponse);
   rpc CancelGovernedTransformRun(CancelGovernedTransformRunRequest) returns (CancelGovernedTransformRunResponse);

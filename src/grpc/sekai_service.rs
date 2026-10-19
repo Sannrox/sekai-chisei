@@ -1319,6 +1319,12 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<WriteTransformRunResultResponse>, Status> {
         rpc_data::write_transform_run_result(self, req).await
     }
+    async fn apply_streaming_transform_batch(
+        &self,
+        req: Request<ApplyStreamingTransformBatchRequest>,
+    ) -> Result<Response<ApplyStreamingTransformBatchResponse>, Status> {
+        rpc_data::apply_streaming_transform_batch(self, req).await
+    }
     async fn tick_governed_transforms(
         &self,
         req: Request<TickGovernedTransformsRequest>,

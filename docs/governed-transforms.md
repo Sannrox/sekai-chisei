@@ -14,9 +14,14 @@ runs write output rows, record lineage, and store a receipt. Isolated-process
 runs return a pending receipt; a claimed worker streams the admitted input
 snapshot and writes the output, receipt, and lineage in one fenced
 transaction against the admitted JobSpec. Claim, heartbeat, input, and
-write-back RPCs require credential admin. Workers pin
-`sekai-client::claim` rather than copying those RPCs. Objects stay
-Action-written.
+write-back, and streaming object-apply RPCs require credential admin.
+Workers pin `sekai-client::claim` rather than copying those RPCs. Objects
+stay Action-written. `ApplyStreamingTransformBatch` commits object edits
+and the input checkpoint in one transaction; replay of the same
+`(run_id, checkpoint)` returns the original receipt. Checkpoint identity is
+opaque and is stored without trimming. Admitted `markings_out` is the
+classification floor on every output object; a stricter existing marking is
+kept. Updates still run declassify the same as guarded object writes.
 
 A dataset may declare ordered `partition_keys`. Empty keys keep the
 whole-dataset `sha256-sum-v1:` digest. Partitioned datasets use
@@ -36,7 +41,7 @@ The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `GetGovernedTransformRun`, `ListGovernedTransforms`,
 `ListGovernedTransformRuns`, `ListClaimableTransformWork`,
 `ClaimTransformWork`, `HeartbeatTransformClaim`, `ReadTransformRunInputs`,
-`WriteTransformRunResult`, `TickGovernedTransforms`,
+`WriteTransformRunResult`, `ApplyStreamingTransformBatch`, `TickGovernedTransforms`,
 `GetTransformOutputState`, `CancelGovernedTransformRun`) are `experimental`:
 start the plane with `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
 feature. See [rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities`

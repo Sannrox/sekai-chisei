@@ -26,14 +26,18 @@ raw tonic claim calls. The module lives in `sekai-client` so Action hosts and
 isolated-process transform runners share one crate with `sekai-proto` and the
 compatibility matrix. `CoreLoopClient::runtime_claim()` lists and claims by
 dispatch kind, heartbeats, acks, reports claim events, streams admitted
-transform input snapshots, and writes fenced transform results.
+transform input snapshots, writes fenced transform results, and applies
+fenced streaming object batches.
 
 Typed errors keep fence loss, idle, contention, denial, and unavailability
 distinct. `SdkError` does not retain server status text, so the client maps
 by RPC role: list `FailedPrecondition` is unavailability (including the
 experimental gate); initial `Claim*` `FailedPrecondition` is contention;
-heartbeat, ack, report, and transform read/write `FailedPrecondition` is
-fence loss; empty-queue `ClaimTransformWork` `NotFound` is idle; a targeted
+heartbeat, ack, report, transform read/write, and streaming apply
+`FailedPrecondition` is fence loss; streaming apply `PermissionDenied` is
+an Action admission refusal (policy, freeze, criteria, autonomous types)
+and `InvalidArgument` is a malformed batch; empty-queue `ClaimTransformWork`
+`NotFound` is idle; a targeted
 `run_id` that is gone or held is contention; `ClaimActionWork` `NotFound` is
 a missing effect, not an empty queue. Streamed transform-input item errors
 use the same owned-fence mapping. Fence loss is never

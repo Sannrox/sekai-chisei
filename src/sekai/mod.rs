@@ -62,6 +62,7 @@ pub mod governed_transform;
 pub mod handoff;
 pub(crate) mod handoff_lifecycle;
 pub mod image;
+pub(crate) mod streaming_transform_apply;
 pub use sekai_types::json;
 pub mod lakehouse_snapshot;
 pub mod learning;

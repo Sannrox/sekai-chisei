@@ -1094,6 +1094,57 @@ impl RuntimeDb {
         }
     }
 
+    pub fn peek_streaming_transform_apply(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        checkpoint: &str,
+        now_ms: i64,
+    ) -> Result<
+        Option<crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt>,
+        crate::sekai::streaming_transform_apply::StreamingApplyError,
+    > {
+        match self {
+            Self::Sqlite(db) => db.peek_streaming_transform_apply(
+                run_id,
+                runtime_id,
+                claim_generation,
+                fencing_token,
+                checkpoint,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.peek_streaming_transform_apply(
+                    run_id,
+                    runtime_id,
+                    claim_generation,
+                    fencing_token,
+                    checkpoint,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
+    pub fn apply_streaming_transform_batch(
+        &self,
+        batch: crate::sekai::streaming_transform_apply::StreamingTransformApplyBatch,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<
+        crate::sekai::streaming_transform_apply::StreamingTransformApplyReceipt,
+        crate::sekai::streaming_transform_apply::StreamingApplyError,
+    > {
+        match self {
+            Self::Sqlite(db) => db.apply_streaming_transform_batch(batch, actor, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.apply_streaming_transform_batch(batch, actor, now_ms)
+            }),
+        }
+    }
+
     pub fn preview_governed_transform(
         &self,
         transform: &crate::sekai::governed_transform::GovernedTransform,

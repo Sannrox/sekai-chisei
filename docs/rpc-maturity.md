@@ -126,6 +126,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.HeartbeatTransformClaim` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.WriteTransformRunResult` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.ApplyStreamingTransformBatch` | `sekai.graph` | yes | example | `experimental` |
 | `SekaiService.TickGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.GetTransformOutputState` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.CancelGovernedTransformRun` | `sekai.datasets` | yes | example | `experimental` |
