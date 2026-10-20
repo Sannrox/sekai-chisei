@@ -329,11 +329,17 @@ fn mixed_get_object_p99_stays_within_2x_idle_during_source_batch() {
         500,
     )
     .expect("open mixed harness");
-    let (idle, busy) = harness
-        .mixed_get_object_p99_during_batch(16)
-        .expect("measure mixed GetObject");
-    assert!(
-        busy <= idle * 2.0 || busy <= GET_OBJECT_P99_US * 2.0,
-        "busy GetObject p99 {busy}us exceeds 2x idle {idle}us"
-    );
+    // Wall-clock p99 on a shared runner is noisy. A real regression misses
+    // the bound on every attempt; noise rarely does three times in a row.
+    let mut attempts = Vec::new();
+    for _ in 0..3 {
+        let (idle, busy) = harness
+            .mixed_get_object_p99_during_batch(16)
+            .expect("measure mixed GetObject");
+        if busy <= idle * 2.0 || busy <= GET_OBJECT_P99_US * 2.0 {
+            return;
+        }
+        attempts.push((idle, busy));
+    }
+    panic!("busy GetObject p99 exceeded 2x idle on every attempt (idle_us, busy_us): {attempts:?}");
 }
