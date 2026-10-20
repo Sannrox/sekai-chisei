@@ -108,6 +108,7 @@ pub mod search_index;
 pub mod security;
 pub mod semantic;
 pub mod sentinel;
+pub mod synthetic;
 pub use sekai_types::service_principal;
 pub mod skillextract;
 pub mod source_health;

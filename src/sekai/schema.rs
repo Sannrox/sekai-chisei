@@ -852,6 +852,32 @@ impl SekaiDb {
         Ok(())
     }
 
+    /// Insert a type only when its kind is absent, atomically. Returns
+    /// true when this call inserted it.
+    pub fn insert_object_type_if_absent(&self, object_type: &ObjectType) -> Result<bool, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let properties_json =
+            serde_json::to_string(&object_type.properties).map_err(|error| error.to_string())?;
+        let implements_json =
+            serde_json::to_string(&object_type.implements).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        let inserted = conn
+            .execute(
+                "INSERT INTO sekai_object_types (kind, description, properties_json, implements_json, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(kind) DO NOTHING",
+                params![
+                    object_type.kind,
+                    object_type.description,
+                    properties_json,
+                    implements_json,
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(inserted > 0)
+    }
+
     pub fn delete_object_type(&self, kind: &str) -> Result<bool, String> {
         if kind.trim().is_empty() {
             return Err("kind required".into());
