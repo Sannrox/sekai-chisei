@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Embedding index for object properties: an embedding spec names an object
+  kind, source properties, chunking and dimension. Catch-up follows the
+  object-change feed and re-embeds only changed chunks; a spec or model
+  version change is a recorded rebuild. Vectors carry model, version, source
+  digest, the object's marking and each source property's classification. An
+  external route refuses properties the egress policy keeps in the
+  deployment. Writes are fenced per spec (ADR 0117, `0086_embedding_index`, GATE:mig,
+  #1581).
+
 - Isolated-process streaming workers can apply a batch of Action-written
   object edits together with an input checkpoint in one transaction.
   Replay of the same `(run_id, checkpoint)` returns the original receipt.

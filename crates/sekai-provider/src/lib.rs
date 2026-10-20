@@ -1,5 +1,6 @@
 pub mod content;
 pub mod cost_estimate;
+pub mod embedding;
 pub mod gateway_contract;
 pub mod gateway_keys;
 pub mod llm;
