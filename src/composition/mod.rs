@@ -7,6 +7,7 @@
 
 pub mod capability;
 pub mod cross_store_admission;
+pub mod embedding_catch_up;
 pub mod function_revision_gate;
 pub mod invoice_extraction_eval;
 pub mod lookup_first;

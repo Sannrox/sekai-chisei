@@ -151,6 +151,7 @@ const WRITE_FREEZE_SCHEMA: &str = include_str!("postgres/0083_write_freeze.sql")
 const DECISION_MEMORY_SCHEMA: &str = include_str!("postgres/0084_decision_memory.sql");
 const STREAMING_TRANSFORM_APPLY_SCHEMA: &str =
     include_str!("postgres/0085_streaming_transform_apply.sql");
+const EMBEDDING_INDEX_SCHEMA: &str = include_str!("postgres/0086_embedding_index.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -691,6 +692,12 @@ const MIGRATIONS: &[Migration] = &[
         84,
         "streaming_transform_apply",
         STREAMING_TRANSFORM_APPLY_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        85,
+        "embedding_index",
+        EMBEDDING_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

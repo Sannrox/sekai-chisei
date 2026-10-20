@@ -4,7 +4,7 @@ pub use sekai_obs::{labels, logging, otel, signals};
 pub mod metrics {
     pub use sekai_obs::metrics::{
         db_lock_poisoned_total, record_db_lock_poisoned, search_index_lag_ms,
-        set_search_index_lag_ms,
+        set_embedding_index_lag_ms, set_search_index_lag_ms,
     };
 
     pub fn handle() -> &'static sekai_obs::metrics::PrometheusHandle {

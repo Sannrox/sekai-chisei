@@ -98,6 +98,7 @@ pub mod review_queue;
 pub use sekai_types::policy_decision;
 pub mod propagation;
 pub use sekai_types::purpose_authorization;
+pub mod embedding_index;
 pub mod query;
 pub mod relation_object;
 pub mod retention;
