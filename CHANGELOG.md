@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Agent promotion refuses a regressed candidate: binding a certification
+  records the run's mean case score, and a candidate scoring more than
+  `SEKAI_AGENT_PROMOTION_MAX_REGRESSION_PERCENT` (default 20) below the
+  published revision's certification on the same suite is refused with
+  `agent_promotion_eval_regression` at the gate and at merge. Unscored rows
+  keep the pass/fail gate (`0087_agent_certification_score`, GATE:mig, #1640).
+
 - Identity assertion replay state keeps each nonce only until its assertion's
   expiry plus clock skew, so a caller that mints one assertion per request no
   longer grows the core's memory with total traffic. Replay protection inside

@@ -7,6 +7,13 @@
 //! pass/fail from a stored suite result; authors of agent-member changes
 //! since the published base cannot self-certify, revocation is one-way, and
 //! expiry is capped. Merge does not re-run evaluations.
+//!
+//! Binding also snapshots the run's mean case score (#1640). When the
+//! published revision holds a non-revoked, scored certification on the same
+//! suite, a candidate whose mean score falls more than
+//! `SEKAI_AGENT_PROMOTION_MAX_REGRESSION_PERCENT` (default 20) below it is
+//! refused with `agent_promotion_eval_regression`. No baseline keeps the
+//! pass/fail gate unchanged.
 
 use crate::sekai::definition_branch::{DefinitionRevision, DefinitionRevisionMember};
 
@@ -19,10 +26,12 @@ pub const STATUS_STALE: &str = "stale";
 pub const STATUS_REVOKED: &str = "revoked";
 pub const STATUS_ADMITTED: &str = "admitted";
 pub const STATUS_NOT_REQUIRED: &str = "not_required";
+pub const STATUS_REGRESSED: &str = "regressed";
 pub const REFUSAL_MISSING: &str = "agent_promotion_requires_certification";
 pub const REFUSAL_REVOKED: &str = "agent_promotion_certification_revoked";
 pub const REFUSAL_STALE: &str = "agent_promotion_certification_stale";
 pub const REFUSAL_FAILED: &str = "agent_promotion_certification_failed";
+pub const REFUSAL_REGRESSION: &str = "agent_promotion_eval_regression";
 pub const REFUSAL_SELF_CERTIFY: &str = "agent_promotion_self_certification_forbidden";
 pub const REFUSAL_REVOKE_UNDO: &str = "agent_promotion_certification_revoke_is_final";
 pub const REFUSAL_SUITE_MISSING: &str = "agent_promotion_certification_suite_result_missing";
@@ -30,6 +39,30 @@ pub const REFUSAL_STATUS_MISMATCH: &str = "agent_promotion_certification_status_
 pub const REFUSAL_TTL: &str = "agent_promotion_certification_expiry_exceeds_ttl";
 pub const MAX_CERTIFICATION_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_CERTIFICATION_LINEAGE_WALK: usize = 4_096;
+pub const MAX_REGRESSION_PERCENT_ENV: &str = "SEKAI_AGENT_PROMOTION_MAX_REGRESSION_PERCENT";
+pub const DEFAULT_MAX_REGRESSION_PERCENT: u32 = 20;
+
+/// Allowed mean-score drop against the published certification, in percent
+/// of the published score. Read once from `SEKAI_AGENT_PROMOTION_MAX_REGRESSION_PERCENT`;
+/// an unparsable value keeps the default, and values above 100 clamp to 100.
+pub fn max_regression_percent() -> u32 {
+    static PERCENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let Ok(raw) = std::env::var(MAX_REGRESSION_PERCENT_ENV) else {
+            return DEFAULT_MAX_REGRESSION_PERCENT;
+        };
+        match raw.trim().parse::<u32>() {
+            Ok(percent) => percent.min(100),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "invalid {MAX_REGRESSION_PERCENT_ENV}; using {DEFAULT_MAX_REGRESSION_PERCENT}"
+                );
+                DEFAULT_MAX_REGRESSION_PERCENT
+            }
+        }
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDefinitionCertification {
@@ -43,6 +76,9 @@ pub struct AgentDefinitionCertification {
     pub revoked_at_ms: i64,
     pub bound_by: String,
     pub bound_at_ms: i64,
+    /// Mean case score of the bound run, times 1000. `None` on rows bound
+    /// before #1640; such rows never act as or face a regression baseline.
+    pub mean_score_milli: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +87,7 @@ pub struct StoredSuiteResult {
     pub certification_id: String,
     pub baseline_status: String,
     pub latest_status: String,
+    pub mean_score_milli: Option<i64>,
 }
 
 impl StoredSuiteResult {
@@ -61,7 +98,19 @@ impl StoredSuiteResult {
             certification_id: certification_id.into(),
             baseline_status: status.into(),
             latest_status: status.into(),
+            mean_score_milli: None,
         }
+    }
+
+    /// Records the run's mean case score; an empty run has no score.
+    pub fn with_scores(mut self, scores: impl IntoIterator<Item = i32>) -> Self {
+        let (sum, count) = scores
+            .into_iter()
+            .fold((0_i64, 0_i64), |(sum, count), score| {
+                (sum + i64::from(score), count + 1)
+            });
+        self.mean_score_milli = (count > 0).then(|| sum * 1000 / count);
+        self
     }
 }
 
@@ -165,6 +214,50 @@ impl AgentDefinitionCertification {
     }
 }
 
+impl AgentDefinitionCertification {
+    /// `gate`, then refuse when the mean score regressed past
+    /// `max_percent` against a usable `baseline` (the published revision's
+    /// certification). A revoked, unscored, non-positive, or other-suite
+    /// baseline is ignored.
+    pub fn gate_against(
+        &self,
+        baseline: Option<&AgentDefinitionCertification>,
+        now_ms: i64,
+        max_percent: u32,
+    ) -> AgentPromotionGate {
+        let mut gate = self.gate(now_ms);
+        if gate.admitted && regressed(self, baseline, max_percent) {
+            gate.certification_status = STATUS_REGRESSED.into();
+            gate.admitted = false;
+            gate.refusal = REFUSAL_REGRESSION.into();
+        }
+        gate
+    }
+}
+
+fn regressed(
+    candidate: &AgentDefinitionCertification,
+    baseline: Option<&AgentDefinitionCertification>,
+    max_percent: u32,
+) -> bool {
+    let Some(baseline) = baseline
+        .filter(|baseline| baseline.revoked_at_ms == 0 && baseline.suite_id == candidate.suite_id)
+    else {
+        return false;
+    };
+    let (Some(candidate_score), Some(baseline_score)) =
+        (candidate.mean_score_milli, baseline.mean_score_milli)
+    else {
+        return false;
+    };
+    if baseline_score <= 0 {
+        return false;
+    }
+    // candidate < baseline * (100 - max_percent) / 100, in integers.
+    i128::from(candidate_score) * 100
+        < i128::from(baseline_score) * i128::from(100 - max_percent.min(100))
+}
+
 pub fn missing_gate(namespace: &str, revision_digest: &str) -> AgentPromotionGate {
     AgentPromotionGate {
         namespace: namespace.into(),
@@ -199,6 +292,7 @@ pub fn promotion_gate(
     from: &[DefinitionRevisionMember],
     to: &[DefinitionRevisionMember],
     bound: Option<&AgentDefinitionCertification>,
+    baseline: Option<&AgentDefinitionCertification>,
     now_ms: i64,
     namespace: &str,
     revision_digest: &str,
@@ -207,7 +301,9 @@ pub fn promotion_gate(
         return not_required_gate(namespace, revision_digest);
     }
     match bound {
-        Some(certification) => certification.gate(now_ms),
+        Some(certification) => {
+            certification.gate_against(baseline, now_ms, max_regression_percent())
+        }
         None => missing_gate(namespace, revision_digest),
     }
 }
@@ -316,6 +412,8 @@ pub fn bind_certification(
     {
         return Err(REFUSAL_STATUS_MISMATCH.into());
     }
+    let mut requested = requested;
+    requested.mean_score_milli = suite.mean_score_milli;
     requested.validate()?;
     Ok(requested)
 }
@@ -324,6 +422,7 @@ pub fn require_agent_promotion(
     from: &[DefinitionRevisionMember],
     to: &[DefinitionRevisionMember],
     bound: Option<&AgentDefinitionCertification>,
+    baseline: Option<&AgentDefinitionCertification>,
     now_ms: i64,
 ) -> Result<(), String> {
     if !agent_members_changed(from, to) {
@@ -332,7 +431,7 @@ pub fn require_agent_promotion(
     let Some(certification) = bound else {
         return Err(REFUSAL_MISSING.into());
     };
-    let gate = certification.gate(now_ms);
+    let gate = certification.gate_against(baseline, now_ms, max_regression_percent());
     if gate.admitted {
         Ok(())
     } else {
@@ -365,6 +464,7 @@ mod tests {
             revoked_at_ms: revoked,
             bound_by: "reviewer".into(),
             bound_at_ms: 1,
+            mean_score_milli: None,
         }
     }
 
@@ -372,7 +472,7 @@ mod tests {
     fn non_agent_changes_do_not_require_certification() {
         let from = [member("function", "fn", "a")];
         let to = [member("function", "fn", "b")];
-        require_agent_promotion(&from, &to, None, 10).unwrap();
+        require_agent_promotion(&from, &to, None, None, 10).unwrap();
     }
 
     #[test]
@@ -385,7 +485,7 @@ mod tests {
             member("agent", "triage", "a"),
             member("function", "fn", "c"),
         ];
-        require_agent_promotion(&from, &to, None, 10).unwrap();
+        require_agent_promotion(&from, &to, None, None, 10).unwrap();
     }
 
     #[test]
@@ -393,7 +493,7 @@ mod tests {
         let from = [member("agent", "triage", "a")];
         let to = [member("agent", "triage", "b")];
         assert_eq!(
-            require_agent_promotion(&from, &to, None, 10).unwrap_err(),
+            require_agent_promotion(&from, &to, None, None, 10).unwrap_err(),
             REFUSAL_MISSING
         );
     }
@@ -403,7 +503,7 @@ mod tests {
         let from = [member("agent", "triage", "a")];
         let to = [member("agent", "triage", "b")];
         let bound = cert(STATUS_PASS, 100, 0);
-        require_agent_promotion(&from, &to, Some(&bound), 10).unwrap();
+        require_agent_promotion(&from, &to, Some(&bound), None, 10).unwrap();
         assert!(bound.gate(10).admitted);
     }
 
@@ -433,15 +533,18 @@ mod tests {
         let from = [member("agent", "triage", "a")];
         let to = [member("agent", "triage", "b")];
         assert_eq!(
-            require_agent_promotion(&from, &to, Some(&cert(STATUS_PASS, 100, 5)), 10).unwrap_err(),
+            require_agent_promotion(&from, &to, Some(&cert(STATUS_PASS, 100, 5)), None, 10)
+                .unwrap_err(),
             REFUSAL_REVOKED
         );
         assert_eq!(
-            require_agent_promotion(&from, &to, Some(&cert(STATUS_PASS, 10, 0)), 10).unwrap_err(),
+            require_agent_promotion(&from, &to, Some(&cert(STATUS_PASS, 10, 0)), None, 10)
+                .unwrap_err(),
             REFUSAL_STALE
         );
         assert_eq!(
-            require_agent_promotion(&from, &to, Some(&cert(STATUS_FAIL, 100, 0)), 10).unwrap_err(),
+            require_agent_promotion(&from, &to, Some(&cert(STATUS_FAIL, 100, 0)), None, 10)
+                .unwrap_err(),
             REFUSAL_FAILED
         );
     }
@@ -611,5 +714,83 @@ mod tests {
         assert_eq!(revoked.revoked_at_ms, 4);
         assert_eq!(revoked.baseline_status, existing.baseline_status);
         assert_eq!(revoked.latest_status, existing.latest_status);
+    }
+
+    fn scored(revision: &str, score: Option<i64>) -> AgentDefinitionCertification {
+        AgentDefinitionCertification {
+            revision_digest: revision.into(),
+            mean_score_milli: score,
+            ..cert(STATUS_PASS, 100, 0)
+        }
+    }
+
+    #[test]
+    fn regression_within_the_threshold_is_admitted() {
+        let baseline = scored("pub", Some(1_000));
+        let gate = scored("rev", Some(800)).gate_against(Some(&baseline), 10, 20);
+        assert!(gate.admitted);
+        assert_eq!(gate.certification_status, STATUS_ADMITTED);
+    }
+
+    #[test]
+    fn regression_beyond_the_threshold_is_refused() {
+        let baseline = scored("pub", Some(1_000));
+        let gate = scored("rev", Some(799)).gate_against(Some(&baseline), 10, 20);
+        assert!(!gate.admitted);
+        assert_eq!(gate.certification_status, STATUS_REGRESSED);
+        assert_eq!(gate.refusal, REFUSAL_REGRESSION);
+        let from = [member("agent", "triage", "a")];
+        let to = [member("agent", "triage", "b")];
+        assert_eq!(
+            require_agent_promotion(
+                &from,
+                &to,
+                Some(&scored("rev", Some(0))),
+                Some(&baseline),
+                10
+            )
+            .unwrap_err(),
+            REFUSAL_REGRESSION
+        );
+    }
+
+    #[test]
+    fn missing_or_unusable_baseline_keeps_the_pass_fail_gate() {
+        let candidate = scored("rev", Some(0));
+        let other_suite = AgentDefinitionCertification {
+            suite_id: "other".into(),
+            ..scored("pub", Some(1_000))
+        };
+        for baseline in [
+            None,
+            Some(scored("pub", None)),
+            Some(scored("pub", Some(0))),
+            Some(AgentDefinitionCertification {
+                revoked_at_ms: 5,
+                ..scored("pub", Some(1_000))
+            }),
+            Some(other_suite),
+        ] {
+            assert!(candidate.gate_against(baseline.as_ref(), 10, 20).admitted);
+        }
+        assert!(
+            scored("rev", None)
+                .gate_against(Some(&scored("pub", Some(1_000))), 10, 20)
+                .admitted
+        );
+    }
+
+    #[test]
+    fn bind_snapshots_the_suite_mean_score() {
+        let suite = suite().with_scores([1, 2]);
+        assert_eq!(suite.mean_score_milli, Some(1_500));
+        let bound = bind_certification(&["author".into()], bound(0), None, Some(&suite)).unwrap();
+        assert_eq!(bound.mean_score_milli, Some(1_500));
+        assert_eq!(
+            super::StoredSuiteResult::from_run_pass("s", "c", true)
+                .with_scores([])
+                .mean_score_milli,
+            None
+        );
     }
 }

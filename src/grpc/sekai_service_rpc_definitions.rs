@@ -153,8 +153,25 @@ fn stored_suite_result(
             &run.suite_id,
             &run.id,
             passed,
-        ),
+        )
+        .with_scores(run.results.iter().map(|result| result.score)),
     )
+}
+
+/// The published revision's certification: the #1640 regression baseline.
+fn published_certification(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    published: Option<&crate::sekai::definition_branch::DefinitionRevision>,
+) -> Result<Option<crate::sekai::agent_promotion::AgentDefinitionCertification>, Status> {
+    let Some(published) = published else {
+        return Ok(None);
+    };
+    service
+        .db
+        .runtime()
+        .get_agent_definition_certification(namespace, &published.revision_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))
 }
 
 fn map_certification_bind_error(error: String) -> Status {
@@ -296,6 +313,7 @@ pub(super) async fn put_definition_certification(
         revoked_at_ms: input.revoked_at_ms,
         bound_by: actor.clone(),
         bound_at_ms: now_millis(),
+        mean_score_milli: None,
     };
     let certification = crate::sekai::agent_promotion::bind_certification(
         &authors,
@@ -309,7 +327,12 @@ pub(super) async fn put_definition_certification(
         .runtime()
         .put_agent_definition_certification(&certification)
         .map_err(map_certification_store_error)?;
-    let gate = certification.gate(now_millis());
+    let baseline = published_certification(service, &certification.namespace, published.as_ref())?;
+    let gate = certification.gate_against(
+        baseline.as_ref(),
+        now_millis(),
+        crate::sekai::agent_promotion::max_regression_percent(),
+    );
     Ok(Response::new(PutDefinitionCertificationResponse {
         gate: Some(to_proto_definition_certification_gate(&gate)),
     }))
@@ -364,10 +387,12 @@ pub(super) async fn get_definition_certification_gate(
         .runtime()
         .get_agent_definition_certification(&input.namespace, &input.revision_digest)
         .map_err(|_| Status::internal("definition resource unavailable"))?;
+    let baseline = published_certification(service, &input.namespace, published.as_ref())?;
     let gate = crate::sekai::agent_promotion::promotion_gate(
         from,
         &candidate.members,
         bound.as_ref(),
+        baseline.as_ref(),
         now_millis(),
         &input.namespace,
         &input.revision_digest,
