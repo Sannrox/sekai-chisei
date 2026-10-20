@@ -268,6 +268,12 @@ a stored eval run (`certification_id`) to the candidate revision. Authors
 of agent-member changes since the published base cannot bind; a later bind
 cannot clear `revoked_at_ms`; expiry cannot exceed 90 days from
 `bound_at_ms`.
+Binding also records the run's mean case score. When the published revision
+holds a non-revoked, scored certification on the same suite, a candidate whose
+mean score falls more than `SEKAI_AGENT_PROMOTION_MAX_REGRESSION_PERCENT`
+(default 20) below it is refused with `agent_promotion_eval_regression`
+(status `regressed`). No published certification, another suite, or an
+unscored row keeps the pass/fail gate.
 `GetDefinitionCertificationGate` reports the same admitted or refused state
 the merge uses. Proposals that do not change agent members are unchanged.
 See [ADR 0093](decisions/0093-agent-drafts-use-definition-members.md).

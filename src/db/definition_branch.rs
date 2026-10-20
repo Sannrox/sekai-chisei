@@ -411,6 +411,7 @@ impl SekaiDb {
                     revoked_at_ms INTEGER NOT NULL DEFAULT 0,
                     bound_by TEXT NOT NULL,
                     bound_at_ms INTEGER NOT NULL,
+                    mean_score_milli INTEGER,
                     PRIMARY KEY(namespace, revision_digest)
                 );
 
@@ -479,6 +480,7 @@ impl SekaiDb {
         for statement in [
             "ALTER TABLE sekai_definition_proposals ADD COLUMN receipt_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sekai_definition_proposals ADD COLUMN close_reason_code TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sekai_agent_definition_certifications ADD COLUMN mean_score_milli INTEGER",
         ] {
             match self.conn().execute(statement, []) {
                 Ok(_) => {}
@@ -1192,10 +1194,16 @@ impl SekaiDb {
             &proposal.namespace,
             &candidate.revision_digest,
         )?;
+        let baseline = get_agent_definition_certification_sqlite(
+            &transaction,
+            &proposal.namespace,
+            &published_revision.revision_digest,
+        )?;
         crate::sekai::agent_promotion::require_agent_promotion(
             &published_revision.members,
             &candidate.members,
             bound.as_ref(),
+            baseline.as_ref(),
             now_ms,
         )?;
         let receipt_id = merge_receipt_id(
@@ -1447,7 +1455,7 @@ fn get_agent_definition_certification_sqlite(
     connection
         .query_row(
             "SELECT suite_id, certification_id, baseline_status, latest_status,
-                    expires_at_ms, revoked_at_ms, bound_by, bound_at_ms
+                    expires_at_ms, revoked_at_ms, bound_by, bound_at_ms, mean_score_milli
              FROM sekai_agent_definition_certifications
              WHERE namespace=?1 AND revision_digest=?2",
             params![namespace, revision_digest],
@@ -1464,6 +1472,7 @@ fn get_agent_definition_certification_sqlite(
                         revoked_at_ms: row.get(5)?,
                         bound_by: row.get(6)?,
                         bound_at_ms: row.get(7)?,
+                        mean_score_milli: row.get(8)?,
                     },
                 )
             },
@@ -1496,8 +1505,8 @@ impl SekaiDb {
                 "INSERT INTO sekai_agent_definition_certifications (
                     namespace, revision_digest, suite_id, certification_id,
                     baseline_status, latest_status, expires_at_ms, revoked_at_ms,
-                    bound_by, bound_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    bound_by, bound_at_ms, mean_score_milli
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(namespace, revision_digest) DO UPDATE SET
                     suite_id=excluded.suite_id,
                     certification_id=excluded.certification_id,
@@ -1510,7 +1519,8 @@ impl SekaiDb {
                         ELSE excluded.revoked_at_ms
                     END,
                     bound_by=excluded.bound_by,
-                    bound_at_ms=excluded.bound_at_ms",
+                    bound_at_ms=excluded.bound_at_ms,
+                    mean_score_milli=excluded.mean_score_milli",
                 params![
                     certification.namespace,
                     certification.revision_digest,
@@ -1522,6 +1532,7 @@ impl SekaiDb {
                     certification.revoked_at_ms,
                     certification.bound_by,
                     certification.bound_at_ms,
+                    certification.mean_score_milli,
                 ],
             )
             .map_err(|error| error.to_string())?;

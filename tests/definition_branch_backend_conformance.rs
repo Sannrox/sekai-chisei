@@ -5,8 +5,8 @@ use sekai_chisei::db::definition_branch::DefinitionBranchBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::domain::Object;
 use sekai_chisei::sekai::agent_promotion::{
-    AgentDefinitionCertification, REFUSAL_FAILED, REFUSAL_MISSING, REFUSAL_REVOKE_UNDO,
-    REFUSAL_STALE, STATUS_FAIL, STATUS_PASS,
+    AgentDefinitionCertification, REFUSAL_FAILED, REFUSAL_MISSING, REFUSAL_REGRESSION,
+    REFUSAL_REVOKE_UNDO, REFUSAL_STALE, STATUS_FAIL, STATUS_PASS,
 };
 use sekai_chisei::sekai::definition_branch::{
     ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput, DefinitionMemberRef,
@@ -1195,6 +1195,7 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
         revoked_at_ms: 0,
         bound_by: "reviewer".into(),
         bound_at_ms: 9,
+        mean_score_milli: None,
     };
     db.put_agent_definition_certification(&certification)
         .unwrap();
@@ -1231,6 +1232,40 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
         REFUSAL_STALE
     );
     certification.expires_at_ms = 1_000;
+    // #1640: a scored certification on the published revision is the
+    // baseline; a candidate scoring more than 20% below it is refused.
+    db.put_agent_definition_certification(&AgentDefinitionCertification {
+        revision_digest: parent.clone(),
+        certification_id: "agent-cert-published".into(),
+        mean_score_milli: Some(1_000),
+        ..certification.clone()
+    })
+    .unwrap();
+    certification.mean_score_milli = Some(500);
+    db.put_agent_definition_certification(&certification)
+        .unwrap();
+    assert_eq!(
+        db.get_agent_definition_certification(namespace, &certification.revision_digest)
+            .unwrap()
+            .unwrap()
+            .mean_score_milli,
+        Some(500)
+    );
+    assert_eq!(
+        db.merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "agent-proposal".into(),
+                expected_published_digest: parent.clone(),
+                idempotency_key: "agent-merge-regressed".into(),
+            },
+            "author",
+            9,
+        )
+        .unwrap_err(),
+        REFUSAL_REGRESSION
+    );
+    certification.mean_score_milli = Some(900);
     db.put_agent_definition_certification(&certification)
         .unwrap();
     db.merge_definition_proposal(

@@ -776,10 +776,17 @@ impl PostgresDb {
             &candidate.revision_digest,
             true,
         )?;
+        let baseline = get_agent_definition_certification_postgres(
+            &mut transaction,
+            &proposal.namespace,
+            &published_revision.revision_digest,
+            false,
+        )?;
         crate::sekai::agent_promotion::require_agent_promotion(
             &published_revision.members,
             &candidate.members,
             bound.as_ref(),
+            baseline.as_ref(),
             now_ms,
         )?;
         let receipt_id = merge_receipt_id(
@@ -1239,7 +1246,7 @@ fn get_agent_definition_certification_postgres(
         .query_opt(
             &format!(
                 "SELECT suite_id, certification_id, baseline_status, latest_status,
-                        expires_at_ms, revoked_at_ms, bound_by, bound_at_ms
+                        expires_at_ms, revoked_at_ms, bound_by, bound_at_ms, mean_score_milli
                  FROM sekai_agent_definition_certifications
                  WHERE namespace=$1 AND revision_digest=$2{lock}"
             ),
@@ -1258,6 +1265,7 @@ fn get_agent_definition_certification_postgres(
                 revoked_at_ms: row.get(5),
                 bound_by: row.get(6),
                 bound_at_ms: row.get(7),
+                mean_score_milli: row.get(8),
             },
         ))
 }
@@ -1288,8 +1296,8 @@ impl PostgresDb {
                 "INSERT INTO sekai_agent_definition_certifications (
                     namespace, revision_digest, suite_id, certification_id,
                     baseline_status, latest_status, expires_at_ms, revoked_at_ms,
-                    bound_by, bound_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    bound_by, bound_at_ms, mean_score_milli
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  ON CONFLICT (namespace, revision_digest) DO UPDATE SET
                     suite_id=EXCLUDED.suite_id,
                     certification_id=EXCLUDED.certification_id,
@@ -1302,7 +1310,8 @@ impl PostgresDb {
                         ELSE EXCLUDED.revoked_at_ms
                     END,
                     bound_by=EXCLUDED.bound_by,
-                    bound_at_ms=EXCLUDED.bound_at_ms",
+                    bound_at_ms=EXCLUDED.bound_at_ms,
+                    mean_score_milli=EXCLUDED.mean_score_milli",
                 &[
                     &certification.namespace,
                     &certification.revision_digest,
@@ -1314,6 +1323,7 @@ impl PostgresDb {
                     &certification.revoked_at_ms,
                     &certification.bound_by,
                     &certification.bound_at_ms,
+                    &certification.mean_score_milli,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1329,7 +1339,7 @@ impl PostgresDb {
             .connection()?
             .query_opt(
                 "SELECT suite_id, certification_id, baseline_status, latest_status,
-                        expires_at_ms, revoked_at_ms, bound_by, bound_at_ms
+                        expires_at_ms, revoked_at_ms, bound_by, bound_at_ms, mean_score_milli
                  FROM sekai_agent_definition_certifications
                  WHERE namespace=$1 AND revision_digest=$2",
                 &[&namespace, &revision_digest],
@@ -1347,6 +1357,7 @@ impl PostgresDb {
                     revoked_at_ms: row.get(5),
                     bound_by: row.get(6),
                     bound_at_ms: row.get(7),
+                    mean_score_milli: row.get(8),
                 },
             ))
     }
