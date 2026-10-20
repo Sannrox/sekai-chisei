@@ -5,7 +5,8 @@
 //! configured remains community, tenant-free behavior. Caller-selected tenant
 //! headers never construct or widen context.
 
-use std::collections::{BTreeSet, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -77,7 +78,40 @@ pub struct AssertionAuthority {
     key: Vec<u8>,
     pub clock_skew_secs: i64,
     pub allowed_scopes: BTreeSet<String>,
-    replayed: Arc<Mutex<HashSet<String>>>,
+    replayed: Arc<Mutex<ReplayCache>>,
+}
+
+/// Nonces of accepted assertions, each kept only while its assertion could
+/// still be accepted, so memory is bounded by the live-assertion window
+/// rather than by total traffic.
+#[derive(Debug, Default)]
+struct ReplayCache {
+    retain_until: HashMap<String, i64>,
+    expiry_order: BinaryHeap<Reverse<(i64, String)>>,
+}
+
+impl ReplayCache {
+    /// Record `nonce` until `retain_until`; false if it is already held.
+    /// Entries are pruned one skew window late, so a small backwards step of
+    /// the caller's clock cannot re-admit a nonce that is still acceptable.
+    fn insert(&mut self, nonce: &str, retain_until: i64, now: i64, skew: i64) -> bool {
+        while let Some(Reverse((until, _))) = self.expiry_order.peek() {
+            if until.saturating_add(skew) >= now {
+                break;
+            }
+            let Some(Reverse((_, expired))) = self.expiry_order.pop() else {
+                break;
+            };
+            self.retain_until.remove(&expired);
+        }
+        if self.retain_until.contains_key(nonce) {
+            return false;
+        }
+        self.retain_until.insert(nonce.to_owned(), retain_until);
+        self.expiry_order
+            .push(Reverse((retain_until, nonce.to_owned())));
+        true
+    }
 }
 
 impl AssertionAuthority {
@@ -96,7 +130,7 @@ impl AssertionAuthority {
                 "sekai.read".into(),
                 "sekai.write".into(),
             ]),
-            replayed: Arc::new(Mutex::new(HashSet::new())),
+            replayed: Arc::new(Mutex::new(ReplayCache::default())),
         }
     }
 
@@ -159,7 +193,7 @@ impl AssertionAuthority {
         if assertion.audience != self.audience {
             return Err(AssertionReject::Audience);
         }
-        if assertion.expires_at + self.clock_skew_secs < now {
+        if assertion.expires_at.saturating_add(self.clock_skew_secs) < now {
             return Err(AssertionReject::Expiry);
         }
         if assertion.nonce.is_empty() {
@@ -167,7 +201,10 @@ impl AssertionAuthority {
         }
         {
             let mut seen = self.replayed.lock().expect("assertion replay lock");
-            if !seen.insert(assertion.nonce.clone()) {
+            let retain_until = assertion.expires_at.saturating_add(self.clock_skew_secs);
+            // A negative skew must not prune earlier than expiry allows.
+            let grace = self.clock_skew_secs.max(0);
+            if !seen.insert(&assertion.nonce, retain_until, now, grace) {
                 return Err(AssertionReject::Replay);
             }
         }
@@ -341,6 +378,74 @@ mod tests {
         assert_eq!(
             authority.verify(&token, 50, None).unwrap_err(),
             AssertionReject::ScopeEscalation
+        );
+    }
+
+    #[test]
+    fn replay_state_is_bounded_by_live_assertions() {
+        let authority = authority();
+        let skew = authority.clock_skew_secs;
+        // A live assertion is still refused on replay.
+        let live = authority.sign(&claims("live", 1_000)).unwrap();
+        authority.verify(&live, 900, None).unwrap();
+        assert_eq!(
+            authority.verify(&live, 950, None).unwrap_err(),
+            AssertionReject::Replay
+        );
+        // Many short-lived assertions: once expired past the skew window,
+        // their nonces are no longer retained.
+        for index in 0..1_000 {
+            let token = authority
+                .sign(&claims(&format!("short-{index}"), 1_000))
+                .unwrap();
+            authority.verify(&token, 900, None).unwrap();
+        }
+        assert_eq!(authority.replayed.lock().unwrap().retain_until.len(), 1_001);
+        let later = 1_000 + 2 * skew + 1;
+        let fresh = authority.sign(&claims("fresh", later + 60)).unwrap();
+        authority.verify(&fresh, later, None).unwrap();
+        assert_eq!(authority.replayed.lock().unwrap().retain_until.len(), 1);
+    }
+
+    #[test]
+    fn pruning_never_drops_a_nonce_that_is_still_acceptable() {
+        let authority = authority();
+        let token = authority.sign(&claims("edge", 1_000)).unwrap();
+        authority.verify(&token, 999, None).unwrap();
+        // Still within expiry plus skew: the replay is refused even after
+        // another verification ran at a later clock reading.
+        let other = authority.sign(&claims("other", 2_000)).unwrap();
+        authority
+            .verify(&other, 1_000 + authority.clock_skew_secs, None)
+            .unwrap();
+        assert_eq!(
+            authority
+                .verify(&token, 1_000 + authority.clock_skew_secs, None)
+                .unwrap_err(),
+            AssertionReject::Replay
+        );
+    }
+
+    #[test]
+    fn far_future_expiry_neither_overflows_nor_re_admits_a_replay() {
+        let authority = authority();
+        let token = authority.sign(&claims("far", i64::MAX - 1)).unwrap();
+        authority.verify(&token, 1_000, None).unwrap();
+        assert_eq!(
+            authority.verify(&token, 2_000, None).unwrap_err(),
+            AssertionReject::Replay
+        );
+    }
+
+    #[test]
+    fn a_negative_skew_never_prunes_an_acceptable_nonce() {
+        let mut authority = authority();
+        authority.clock_skew_secs = -10;
+        let token = authority.sign(&claims("negative", 1_000)).unwrap();
+        authority.verify(&token, 980, None).unwrap();
+        assert_eq!(
+            authority.verify(&token, 981, None).unwrap_err(),
+            AssertionReject::Replay
         );
     }
 }
