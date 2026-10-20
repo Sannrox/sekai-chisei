@@ -381,12 +381,17 @@ mod tests {
         );
     }
 
+    /// A random nonce per assertion, as a real issuer mints them.
+    fn fresh_nonce() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
     #[test]
     fn replay_state_is_bounded_by_live_assertions() {
         let authority = authority();
         let skew = authority.clock_skew_secs;
         // A live assertion is still refused on replay.
-        let live = authority.sign(&claims("live", 1_000)).unwrap();
+        let live = authority.sign(&claims(&fresh_nonce(), 1_000)).unwrap();
         authority.verify(&live, 900, None).unwrap();
         assert_eq!(
             authority.verify(&live, 950, None).unwrap_err(),
@@ -394,15 +399,13 @@ mod tests {
         );
         // Many short-lived assertions: once expired past the skew window,
         // their nonces are no longer retained.
-        for index in 0..1_000 {
-            let token = authority
-                .sign(&claims(&format!("short-{index}"), 1_000))
-                .unwrap();
+        for _ in 0..1_000 {
+            let token = authority.sign(&claims(&fresh_nonce(), 1_000)).unwrap();
             authority.verify(&token, 900, None).unwrap();
         }
         assert_eq!(authority.replayed.lock().unwrap().retain_until.len(), 1_001);
         let later = 1_000 + 2 * skew + 1;
-        let fresh = authority.sign(&claims("fresh", later + 60)).unwrap();
+        let fresh = authority.sign(&claims(&fresh_nonce(), later + 60)).unwrap();
         authority.verify(&fresh, later, None).unwrap();
         assert_eq!(authority.replayed.lock().unwrap().retain_until.len(), 1);
     }
@@ -410,11 +413,11 @@ mod tests {
     #[test]
     fn pruning_never_drops_a_nonce_that_is_still_acceptable() {
         let authority = authority();
-        let token = authority.sign(&claims("edge", 1_000)).unwrap();
+        let token = authority.sign(&claims(&fresh_nonce(), 1_000)).unwrap();
         authority.verify(&token, 999, None).unwrap();
         // Still within expiry plus skew: the replay is refused even after
         // another verification ran at a later clock reading.
-        let other = authority.sign(&claims("other", 2_000)).unwrap();
+        let other = authority.sign(&claims(&fresh_nonce(), 2_000)).unwrap();
         authority
             .verify(&other, 1_000 + authority.clock_skew_secs, None)
             .unwrap();
@@ -429,7 +432,9 @@ mod tests {
     #[test]
     fn far_future_expiry_neither_overflows_nor_re_admits_a_replay() {
         let authority = authority();
-        let token = authority.sign(&claims("far", i64::MAX - 1)).unwrap();
+        let token = authority
+            .sign(&claims(&fresh_nonce(), i64::MAX - 1))
+            .unwrap();
         authority.verify(&token, 1_000, None).unwrap();
         assert_eq!(
             authority.verify(&token, 2_000, None).unwrap_err(),
@@ -441,7 +446,7 @@ mod tests {
     fn a_negative_skew_never_prunes_an_acceptable_nonce() {
         let mut authority = authority();
         authority.clock_skew_secs = -10;
-        let token = authority.sign(&claims("negative", 1_000)).unwrap();
+        let token = authority.sign(&claims(&fresh_nonce(), 1_000)).unwrap();
         authority.verify(&token, 980, None).unwrap();
         assert_eq!(
             authority.verify(&token, 981, None).unwrap_err(),
