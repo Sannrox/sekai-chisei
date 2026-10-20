@@ -14893,6 +14893,53 @@ async fn definition_certification_gate_rpc_reports_bound_states() {
     assert!(admitted.admitted);
     assert_eq!(admitted.certification_status, "admitted");
     assert!(admitted.refusal.is_empty());
+    // #1640: the published revision's scored certification (twice the
+    // candidate's mean score of 100) turns the same binding into a regression.
+    svc.db
+        .runtime()
+        .put_agent_definition_certification(
+            &crate::sekai::agent_promotion::AgentDefinitionCertification {
+                namespace: namespace.into(),
+                revision_digest: parent.revision_digest.clone(),
+                suite_id: "agent-suite".into(),
+                certification_id: "agent-cert-published".into(),
+                baseline_status: "pass".into(),
+                latest_status: "pass".into(),
+                expires_at_ms: expires,
+                revoked_at_ms: 0,
+                bound_by: "reviewer".into(),
+                bound_at_ms: now_millis(),
+                mean_score_milli: Some(200_000),
+            },
+        )
+        .unwrap();
+    let regressed = svc
+        .put_definition_certification(with_named_principal(
+            put("agent-cert", "pass", "pass", expires, 0),
+            "reviewer",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!regressed.admitted);
+    assert_eq!(regressed.certification_status, "regressed");
+    assert_eq!(regressed.refusal, "agent_promotion_eval_regression");
+    let reported = svc
+        .get_definition_certification_gate(with_named_principal(
+            GetDefinitionCertificationGateRequest {
+                namespace: namespace.into(),
+                revision_digest: digest.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert_eq!(reported, regressed);
     let revoked = svc
         .put_definition_certification(with_named_principal(
             put("agent-cert", "pass", "pass", expires, 4),
@@ -15253,6 +15300,7 @@ async fn definition_certification_revokes_when_the_suite_run_is_gone() {
                 revoked_at_ms: 0,
                 bound_by: "reviewer".into(),
                 bound_at_ms: now_millis(),
+                mean_score_milli: None,
             },
         )
         .unwrap();
@@ -15794,6 +15842,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
                 revoked_at_ms: 0,
                 bound_by: "reviewer".into(),
                 bound_at_ms: chrono::Utc::now().timestamp_millis(),
+                mean_score_milli: None,
             },
         )
         .unwrap();
