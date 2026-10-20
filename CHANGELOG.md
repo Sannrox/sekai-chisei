@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Identity assertion replay state keeps each nonce only until its assertion's
+  expiry plus clock skew, so a caller that mints one assertion per request no
+  longer grows the core's memory with total traffic. Replay protection inside
+  the live window is unchanged (#1638).
+
 - Embedding index for object properties: an embedding spec names an object
   kind, source properties, chunking and dimension. Catch-up follows the
   object-change feed and re-embeds only changed chunks; a spec or model
