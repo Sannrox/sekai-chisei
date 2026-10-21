@@ -14970,6 +14970,128 @@ async fn definition_certification_gate_rpc_reports_bound_states() {
 }
 
 #[tokio::test]
+async fn certification_gate_refuses_a_tool_that_changes_things_without_a_policy() {
+    let svc = service();
+    let namespace = "definition-tools";
+    let parent = seed_definition_parent(&svc, namespace);
+    grant_source_namespace(&svc, namespace, "root", security::Role::Admin);
+    grant_source_namespace(&svc, namespace, "reviewer", security::Role::Admin);
+    for principal in ["root", "reviewer"] {
+        svc.security.add_grant(&security::Grant {
+            id: format!("{namespace}-{principal}-agent-admin"),
+            object_id: "schema:agent:triage".into(),
+            principal: principal.into(),
+            role: security::Role::Admin,
+            created: 1,
+            ..Default::default()
+        });
+    }
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: "create-tools".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let edit =
+        |tools: serde_json::Value, expected: String, key: &str| ApplyDefinitionBranchEditRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            expected_head_digest: expected,
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "agent".into(),
+                member_id: "triage".into(),
+                member_digest: String::new(),
+                definition_json: serde_json::json!({
+                    "contract_version": "sekai.agent-definition/v1",
+                    "name": "Triage",
+                    "task_class": "lookup",
+                    "instructions": "Inspect records.",
+                    "allowed_action_types": [],
+                    "tools": tools
+                })
+                .to_string(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: key.into(),
+        };
+    let unapproved = svc
+        .apply_definition_branch_edit(with_named_principal(
+            edit(
+                serde_json::json!([{"kind": "query", "name": "open_tickets"}, {"kind": "action", "name": "Ticket.close"}]),
+                parent.revision_digest.clone(),
+                "edit-unapproved",
+            ),
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    seed_agent_eval_run(&svc, "tools-cert", "agent-suite", true);
+    let expires = now_millis() + 86_400_000;
+    let certify = |digest: &str| PutDefinitionCertificationRequest {
+        namespace: namespace.into(),
+        revision_digest: digest.into(),
+        suite_id: "agent-suite".into(),
+        certification_id: "tools-cert".into(),
+        baseline_status: "pass".into(),
+        latest_status: "pass".into(),
+        expires_at_ms: expires,
+        revoked_at_ms: 0,
+    };
+    svc.put_definition_certification(with_named_principal(certify(&unapproved), "reviewer"))
+        .await
+        .unwrap();
+    let gate = |digest: String| GetDefinitionCertificationGateRequest {
+        namespace: namespace.into(),
+        revision_digest: digest,
+    };
+    let refused = svc
+        .get_definition_certification_gate(with_named_principal(gate(unapproved.clone()), "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(!refused.admitted);
+    assert_eq!(refused.refusal, "agent_tool_approval_required:Ticket.close");
+
+    let approved = svc
+        .apply_definition_branch_edit(with_named_principal(
+            edit(
+                serde_json::json!([{"kind": "query", "name": "open_tickets"}, {"kind": "action", "name": "Ticket.close", "approval_policy": "owner"}]),
+                unapproved,
+                "edit-approved",
+            ),
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.put_definition_certification(with_named_principal(certify(&approved), "reviewer"))
+        .await
+        .unwrap();
+    let admitted = svc
+        .get_definition_certification_gate(with_named_principal(gate(approved), "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert!(admitted.admitted, "{}", admitted.refusal);
+}
+
+#[tokio::test]
 async fn definition_certification_refuses_self_certify_revoke_undo_and_caller_statuses() {
     let svc = service();
     let namespace = "definition-cert-guard";

@@ -174,6 +174,25 @@ fn published_certification(
         .map_err(|_| Status::internal("definition resource unavailable"))
 }
 
+/// #1644: whether every agent of `revision_digest` has an approval policy on
+/// each tool that mutates or destroys. The inner error is the refusal
+/// (`agent_tool_approval_required:<tool>`); an Action type that cannot be
+/// read counts as destructive.
+fn agent_tool_approvals(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    revision_digest: &str,
+) -> Result<Result<(), String>, Status> {
+    let runtime = service.db.runtime();
+    let members = runtime
+        .get_definition_members(namespace, revision_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?;
+    let action_types = runtime
+        .list_governed_action_types(namespace, None, false)
+        .unwrap_or_default();
+    Ok(crate::sekai::agent_definition::require_revision_tool_approvals(&members, &action_types))
+}
+
 fn map_certification_bind_error(error: String) -> Status {
     if error.starts_with("agent_promotion_self_certification") {
         Status::permission_denied(error)
@@ -388,7 +407,7 @@ pub(super) async fn get_definition_certification_gate(
         .get_agent_definition_certification(&input.namespace, &input.revision_digest)
         .map_err(|_| Status::internal("definition resource unavailable"))?;
     let baseline = published_certification(service, &input.namespace, published.as_ref())?;
-    let gate = crate::sekai::agent_promotion::promotion_gate(
+    let mut gate = crate::sekai::agent_promotion::promotion_gate(
         from,
         &candidate.members,
         bound.as_ref(),
@@ -397,6 +416,14 @@ pub(super) async fn get_definition_certification_gate(
         &input.namespace,
         &input.revision_digest,
     );
+    // The gate reports the same tool-approval refusal merge applies (#1644).
+    if gate.admitted
+        && let Err(refusal) =
+            agent_tool_approvals(service, &input.namespace, &input.revision_digest)?
+    {
+        gate.admitted = false;
+        gate.refusal = refusal;
+    }
     Ok(Response::new(GetDefinitionCertificationGateResponse {
         gate: Some(to_proto_definition_certification_gate(&gate)),
     }))
@@ -764,6 +791,8 @@ pub(super) async fn merge_definition_proposal(
             "definition write is not current",
         ));
     }
+    agent_tool_approvals(service, &proposal.namespace, &proposal.candidate_digest)?
+        .map_err(Status::failed_precondition)?;
     let result = service
         .db
         .runtime()

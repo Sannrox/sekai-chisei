@@ -199,6 +199,7 @@ mod tests {
             task_class: "lookup".into(),
             instructions: "Inspect records.".into(),
             allowed_action_types: allowed.iter().map(|name| (*name).into()).collect(),
+            tools: Vec::new(),
         }
     }
 

@@ -742,6 +742,19 @@ impl PostgresDb {
             )?;
         let published_members = load_members_postgres(&mut transaction, &published_revision)?;
         let candidate_members = load_members_postgres(&mut transaction, &candidate)?;
+        // #1644: tool approvals hold on every merge path, not only the RPC.
+        let action_types = transaction
+            .query(
+                "SELECT body_json FROM sekai_governed_action_types WHERE namespace = $1",
+                &[&proposal.namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0));
+        crate::sekai::agent_definition::require_revision_tool_approvals(
+            &candidate_members,
+            &crate::sekai::agent_definition::parse_action_types(action_types),
+        )?;
         crate::sekai::definition_diff::require_merge_compatibility(
             &published_revision,
             &published_members,
