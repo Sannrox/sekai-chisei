@@ -380,7 +380,7 @@ fn validate_object_schema(
         .map_err(ActionObjectMutationError::FailedPrecondition)
 }
 
-fn object_properties(
+pub(crate) fn object_properties(
     parameters: &serde_json::Value,
 ) -> Result<HashMap<String, String>, ActionObjectMutationError> {
     let Some(object) = parameters.as_object() else {

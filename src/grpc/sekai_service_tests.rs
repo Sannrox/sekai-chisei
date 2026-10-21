@@ -24345,3 +24345,79 @@ async fn apply_streaming_transform_batch_stamps_markings_and_refuses_declassify(
         Some("confidential")
     );
 }
+
+/// #1615: two generated tenants answer the same read checks as real ones.
+/// A viewer reads a part with its restricted `unit_cost` redacted, the
+/// tenant admin reads it, the other tenant reads nothing, and an object
+/// marked above the viewer's clearance is refused.
+#[tokio::test]
+async fn synthetic_tenants_pass_the_real_read_checks() {
+    use crate::sekai::synthetic::{SizePreset, Spec, SupplyChain, apply, generate};
+    let db = Arc::new(RuntimeDb::memory());
+    let tenant = |namespace: &str, seed| {
+        generate(
+            &SupplyChain,
+            &Spec {
+                namespace: namespace.into(),
+                seed,
+                preset: SizePreset::Demo,
+            },
+        )
+        .unwrap()
+    };
+    let north = tenant("synthetic-north", 1);
+    let south = tenant("synthetic-south", 2);
+    apply(&db, &north).unwrap();
+    apply(&db, &south).unwrap();
+    let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db));
+
+    let rank = |token: &str| {
+        ["public", "internal", "confidential", "restricted"]
+            .iter()
+            .position(|level| *level == token)
+            .unwrap()
+    };
+    let principal = |plan: &crate::sekai::synthetic::SyntheticPlan, role: &str| {
+        plan.principals
+            .iter()
+            .find(|principal| principal.role == role)
+            .unwrap()
+            .clone()
+    };
+    let viewer = principal(&north, "viewer");
+    let admin = principal(&north, "admin");
+    let outsider = principal(&south, "admin");
+    let marking = |object: &crate::domain::Object| {
+        rank(&object.properties[markings::OBJECT_CLASSIFICATION_PROPERTY])
+    };
+    let part = north
+        .objects
+        .iter()
+        .find(|object| object.kind == "synthetic_part" && marking(object) == 0)
+        .unwrap();
+    let read = |id: &str, principal: &str| {
+        svc.get_object(with_named_principal(
+            GetObjectRequest { id: id.into() },
+            principal,
+        ))
+    };
+
+    let seen = read(&part.id, &viewer.id).await.unwrap().into_inner();
+    assert_eq!(seen.object.unwrap().properties["unit_cost"], REDACTED_VALUE);
+    let seen = read(&part.id, &admin.id).await.unwrap().into_inner();
+    assert_eq!(
+        seen.object.unwrap().properties["unit_cost"],
+        part.properties["unit_cost"]
+    );
+    let refused = read(&part.id, &outsider.id).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+    let above_clearance = north
+        .objects
+        .iter()
+        .find(|object| marking(object) > rank(&viewer.clearance))
+        .unwrap();
+    let refused = read(&above_clearance.id, &viewer.id).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    read(&above_clearance.id, &admin.id).await.unwrap();
+}
