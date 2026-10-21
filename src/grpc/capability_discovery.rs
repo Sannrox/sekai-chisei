@@ -98,6 +98,16 @@ impl SekaiServiceImpl {
             .list_governed_action_types(namespace, None, true)
             .map_err(|_| Status::internal("capability catalog unavailable"))?;
         let actor = principals.first().map(String::as_str).unwrap_or("");
+        // #1646: the tool effect spans every enabled version of a type, the
+        // same rule the publish refusal applies.
+        let mut versions: std::collections::BTreeMap<String, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for type_def in types.iter().filter(|type_def| type_def.enabled) {
+            versions
+                .entry(type_def.type_id.clone())
+                .or_default()
+                .push(type_def.clone());
+        }
         let mut latest = std::collections::BTreeMap::new();
         for type_def in types {
             if !type_def.enabled {
@@ -146,12 +156,21 @@ impl SekaiServiceImpl {
             {
                 continue;
             }
-            entries.push(action_capability(
+            let mut entry = action_capability(
                 &type_def,
                 action_submit_decision(policy.as_ref()),
                 schema,
                 include_restricted,
-            ));
+            );
+            entry.tool_effect = crate::sekai::agent_definition::action_effect(
+                versions
+                    .get(&type_def.type_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )
+            .as_str()
+            .into();
+            entries.push(entry);
         }
         Ok(entries)
     }
@@ -212,6 +231,7 @@ fn base_capability(
         parameter_schema_json: String::new(),
         markings: Vec::new(),
         action_version: String::new(),
+        tool_effect: String::new(),
     }
 }
 

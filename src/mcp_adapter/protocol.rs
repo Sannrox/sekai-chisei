@@ -550,6 +550,7 @@ fn capability_entry(
         parameter_schema_json: String::new(),
         markings: vec![],
         action_version: String::new(),
+        tool_effect: String::new(),
     }
 }
 

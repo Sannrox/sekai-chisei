@@ -1164,7 +1164,10 @@ impl SekaiDb {
         // #1644: tool approvals hold on every merge path, not only the RPC.
         // A missing or unreadable type table leaves types unknown (destructive).
         let action_types = transaction
-            .prepare("SELECT body_json FROM sekai_governed_action_types WHERE namespace = ?1")
+            .prepare(
+                "SELECT body_json FROM sekai_governed_action_types \
+                 WHERE namespace = ?1 AND enabled != 0",
+            )
             .and_then(|mut statement| {
                 statement
                     .query_map(params![proposal.namespace], |row| row.get::<_, String>(0))?

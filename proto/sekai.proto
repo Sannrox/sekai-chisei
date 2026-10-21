@@ -290,6 +290,9 @@ message CapabilityEntry {
   // query and retrieval entries. When several versions of one type_id are
   // enabled, the catalog keeps the last row in type_id/version order.
   string action_version = 22;
+  // Derived effect of an Action entry as an agent tool: read, mutating or
+  // destructive (#1646). Empty on query and retrieval entries.
+  string tool_effect = 23;
 }
 
 message CapabilityLimit {
@@ -2694,6 +2697,19 @@ message DefinitionCertificationGate {
   int64 expires_at_ms = 8;
   bool admitted = 9;
   string refusal = 10;
+  // Each agent member's bound tools with their derived effect (#1646).
+  repeated AgentToolEffect tools = 11;
+}
+
+message AgentToolEffect {
+  string member_id = 1;
+  string kind = 2; // action | query | gateway
+  string name = 3;
+  string effect = 4; // read | mutating | destructive
+  string approval_policy = 5;
+  // True when this tool alone would refuse publish: it changes data and has
+  // no approval policy.
+  bool blocks_publish = 6;
 }
 
 
