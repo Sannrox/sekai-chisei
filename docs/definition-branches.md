@@ -274,6 +274,18 @@ mean score falls more than `SEKAI_AGENT_PROMOTION_MAX_REGRESSION_PERCENT`
 (default 20) below it is refused with `agent_promotion_eval_regression`
 (status `regressed`). No published certification, another suite, or an
 unscored row keeps the pass/fail gate.
+An agent definition may bind `tools`: entries of kind `action`, `query` or
+`gateway` with a name and an optional `approval_policy`. When the list is
+empty it is omitted, so existing definitions keep their digests. A tool's
+effect is derived, never declared:
+- a query reads;
+- an Action is destructive if its governed type may `external_mutate`, and
+  mutating if it creates or updates objects, dispatches runtime work or
+  notifies; an unknown Action type is destructive;
+- a gateway tool is destructive until the gateway publishes its annotations.
+Merge refuses a revision whose mutating or destructive tool has no approval
+policy, with `agent_tool_approval_required:<tool>`. Drafts may be saved
+without policies. Enforcing the policy at runtime is the gateway's job.
 `GetDefinitionCertificationGate` reports the same admitted or refused state
 the merge uses. Proposals that do not change agent members are unchanged.
 See [ADR 0093](decisions/0093-agent-drafts-use-definition-members.md).

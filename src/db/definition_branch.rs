@@ -1161,6 +1161,20 @@ impl SekaiDb {
             )?;
         let published_members = load_members_sqlite(&transaction, &published_revision)?;
         let candidate_members = load_members_sqlite(&transaction, &candidate)?;
+        // #1644: tool approvals hold on every merge path, not only the RPC.
+        // A missing or unreadable type table leaves types unknown (destructive).
+        let action_types = transaction
+            .prepare("SELECT body_json FROM sekai_governed_action_types WHERE namespace = ?1")
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![proposal.namespace], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        crate::sekai::agent_definition::require_revision_tool_approvals(
+            &candidate_members,
+            &crate::sekai::agent_definition::parse_action_types(action_types),
+        )?;
         crate::sekai::definition_diff::require_merge_compatibility(
             &published_revision,
             &published_members,

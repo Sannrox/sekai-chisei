@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Agent definitions can bind tools (`action`, `query` or `gateway`), each
+  with an optional approval policy. Effects are derived from the governed
+  Action type, and unknown Actions and gateway tools count as destructive.
+  Merge and the certification gate refuse a mutating or destructive tool
+  without a policy (`agent_tool_approval_required:<tool>`). Definitions
+  without tools keep their digests (#1644).
+
 - Agent promotion refuses a regressed candidate: binding a certification
   records the run's mean case score, and a candidate scoring more than
   `SEKAI_AGENT_PROMOTION_MAX_REGRESSION_PERCENT` (default 20) below the
