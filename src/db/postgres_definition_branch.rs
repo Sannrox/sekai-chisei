@@ -745,7 +745,8 @@ impl PostgresDb {
         // #1644: tool approvals hold on every merge path, not only the RPC.
         let action_types = transaction
             .query(
-                "SELECT body_json FROM sekai_governed_action_types WHERE namespace = $1",
+                "SELECT body_json FROM sekai_governed_action_types \
+                 WHERE namespace = $1 AND enabled",
                 &[&proposal.namespace],
             )
             .map_err(|error| error.to_string())?

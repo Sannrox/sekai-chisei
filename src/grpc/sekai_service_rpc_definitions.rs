@@ -188,7 +188,7 @@ fn agent_tool_approvals(
         .get_definition_members(namespace, revision_digest)
         .map_err(|_| Status::internal("definition resource unavailable"))?;
     let action_types = runtime
-        .list_governed_action_types(namespace, None, false)
+        .list_governed_action_types(namespace, None, true)
         .unwrap_or_default();
     Ok(crate::sekai::agent_definition::require_revision_tool_approvals(&members, &action_types))
 }
@@ -229,7 +229,50 @@ fn to_proto_definition_certification_gate(
         expires_at_ms: gate.expires_at_ms,
         admitted: gate.admitted,
         refusal: gate.refusal.clone(),
+        tools: Vec::new(),
     }
+}
+
+/// #1646: every agent member's bound tools with the core's derived effect,
+/// so a console never re-derives it.
+fn agent_tool_effects(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    revision_digest: &str,
+) -> Result<Vec<crate::grpc::pb::sekai::AgentToolEffect>, Status> {
+    let runtime = service.db.runtime();
+    let members = runtime
+        .get_definition_members(namespace, revision_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?;
+    let action_types = runtime
+        .list_governed_action_types(namespace, None, true)
+        .unwrap_or_default();
+    let mut tools = Vec::new();
+    for member in members
+        .iter()
+        .filter(|member| member.member_kind == crate::sekai::agent_promotion::MEMBER_KIND_AGENT)
+    {
+        let definition: crate::sekai::agent_definition::AgentDefinition =
+            serde_json::from_str(&member.definition_json)
+                .map_err(|_| Status::internal("definition resource unavailable"))?;
+        for (tool, effect, blocks_publish) in definition.tool_effects(|name| {
+            action_types
+                .iter()
+                .filter(|action| action.type_id == name)
+                .cloned()
+                .collect()
+        }) {
+            tools.push(crate::grpc::pb::sekai::AgentToolEffect {
+                member_id: member.member_id.clone(),
+                kind: tool.kind.clone(),
+                name: tool.name.clone(),
+                effect: effect.as_str().into(),
+                approval_policy: tool.approval_policy.clone().unwrap_or_default(),
+                blocks_publish,
+            });
+        }
+    }
+    Ok(tools)
 }
 
 pub(super) async fn put_definition_certification(
@@ -353,7 +396,10 @@ pub(super) async fn put_definition_certification(
         crate::sekai::agent_promotion::max_regression_percent(),
     );
     Ok(Response::new(PutDefinitionCertificationResponse {
-        gate: Some(to_proto_definition_certification_gate(&gate)),
+        gate: Some(DefinitionCertificationGate {
+            tools: agent_tool_effects(service, &gate.namespace, &gate.revision_digest)?,
+            ..to_proto_definition_certification_gate(&gate)
+        }),
     }))
 }
 
@@ -425,7 +471,10 @@ pub(super) async fn get_definition_certification_gate(
         gate.refusal = refusal;
     }
     Ok(Response::new(GetDefinitionCertificationGateResponse {
-        gate: Some(to_proto_definition_certification_gate(&gate)),
+        gate: Some(DefinitionCertificationGate {
+            tools: agent_tool_effects(service, &gate.namespace, &gate.revision_digest)?,
+            ..to_proto_definition_certification_gate(&gate)
+        }),
     }))
 }
 

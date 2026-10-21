@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The certification gate lists each agent member's bound tools with the
+  derived effect and whether it blocks publish, and `DiscoverCapabilities`
+  returns `tool_effect` on Action entries. Effects now use the enabled versions
+  of an Action type (#1646).
+
 - Agent definitions can bind tools (`action`, `query` or `gateway`), each
   with an optional approval policy. Effects are derived from the governed
   Action type, and unknown Actions and gateway tools count as destructive.

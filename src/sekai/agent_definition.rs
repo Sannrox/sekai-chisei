@@ -34,7 +34,7 @@ pub struct ToolBinding {
 
 /// Refuse a revision when any of its agent members binds a mutating or
 /// destructive tool without an approval policy. `action_types` are the
-/// namespace's registered governed Action types, all versions.
+/// namespace's enabled governed Action type versions.
 pub fn require_revision_tool_approvals(
     members: &[crate::sekai::definition_branch::DefinitionMember],
     action_types: &[crate::sekai::governed_action_type::GovernedActionType],
@@ -75,8 +75,18 @@ pub enum ToolEffect {
     Destructive,
 }
 
-/// The effect of a governed Action from its registered versions: the most
-/// consequential version wins, and an unknown type is destructive.
+impl ToolEffect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Mutating => "mutating",
+            Self::Destructive => "destructive",
+        }
+    }
+}
+
+/// The effect of a governed Action from its enabled versions: the most
+/// consequential version wins, and a type with none is destructive.
 pub fn action_effect(
     versions: &[crate::sekai::governed_action_type::GovernedActionType],
 ) -> ToolEffect {
@@ -176,17 +186,37 @@ impl AgentDefinition {
         Ok(())
     }
 
+    /// Each bound tool with its derived effect and whether it alone blocks
+    /// publish (it changes data and has no approval policy).
+    pub fn tool_effects(
+        &self,
+        action_versions: impl Fn(&str) -> Vec<crate::sekai::governed_action_type::GovernedActionType>,
+    ) -> Vec<(&ToolBinding, ToolEffect, bool)> {
+        self.tools
+            .iter()
+            .map(|tool| {
+                let effect = tool_effect(tool, &action_versions);
+                (
+                    tool,
+                    effect,
+                    tool.approval_policy.is_none() && effect != ToolEffect::Read,
+                )
+            })
+            .collect()
+    }
+
     /// Refuse publish when a mutating or destructive tool has no approval
     /// policy, naming the first such tool.
     pub fn require_tool_approvals(
         &self,
         action_versions: impl Fn(&str) -> Vec<crate::sekai::governed_action_type::GovernedActionType>,
     ) -> Result<(), String> {
-        match self.tools.iter().find(|tool| {
-            tool.approval_policy.is_none()
-                && tool_effect(tool, &action_versions) != ToolEffect::Read
-        }) {
-            Some(tool) => Err(format!("{REFUSAL_TOOL_APPROVAL}:{}", tool.name)),
+        match self
+            .tool_effects(action_versions)
+            .into_iter()
+            .find(|(_, _, blocks)| *blocks)
+        {
+            Some((tool, _, _)) => Err(format!("{REFUSAL_TOOL_APPROVAL}:{}", tool.name)),
             None => Ok(()),
         }
     }

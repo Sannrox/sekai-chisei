@@ -286,6 +286,11 @@ effect is derived, never declared:
 Merge refuses a revision whose mutating or destructive tool has no approval
 policy, with `agent_tool_approval_required:<tool>`. Drafts may be saved
 without policies. Enforcing the policy at runtime is the gateway's job.
+Effects use the enabled versions of a governed Action type, the same rule
+`SubmitActionInstance` admits. `GetDefinitionCertificationGate` and
+`PutDefinitionCertification` return each agent member's bound tools with the
+derived `effect` and `blocks_publish`. `DiscoverCapabilities` returns
+`tool_effect` on each Action entry, so a console never re-derives effects.
 `GetDefinitionCertificationGate` reports the same admitted or refused state
 the merge uses. Proposals that do not change agent members are unchanged.
 See [ADR 0093](decisions/0093-agent-drafts-use-definition-members.md).

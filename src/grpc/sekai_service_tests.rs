@@ -13743,6 +13743,10 @@ async fn capability_discovery_lists_published_action_types_for_permitted_princip
     );
     assert_eq!(entry.approval_behavior, "none");
     assert_eq!(entry.action_version, "1.0.0");
+    assert_eq!(
+        entry.tool_effect, "mutating",
+        "derived from runtime_dispatch"
+    );
     assert_eq!(entry.input_type, "sekai.SubmitActionInstanceRequest");
     assert_eq!(entry.output_type, "sekai.SubmitActionInstanceResponse");
     assert!(
@@ -15062,6 +15066,25 @@ async fn certification_gate_refuses_a_tool_that_changes_things_without_a_policy(
         .unwrap();
     assert!(!refused.admitted);
     assert_eq!(refused.refusal, "agent_tool_approval_required:Ticket.close");
+    let effects: Vec<(&str, &str, bool)> = refused
+        .tools
+        .iter()
+        .map(|tool| {
+            (
+                tool.name.as_str(),
+                tool.effect.as_str(),
+                tool.blocks_publish,
+            )
+        })
+        .collect();
+    assert_eq!(
+        effects,
+        [
+            ("open_tickets", "read", false),
+            ("Ticket.close", "destructive", true)
+        ],
+        "the gate reports each tool's derived effect"
+    );
 
     let approved = svc
         .apply_definition_branch_edit(with_named_principal(
