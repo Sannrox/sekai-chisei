@@ -1117,6 +1117,45 @@
       "product_tier": "core"
     },
     {
+      "rpc": "PutTrustScoringRule",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetTrustScoringRule",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ScoreObjectTrust",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExpandNeighborhood",
       "kind": "persistent",
       "surfaces": [

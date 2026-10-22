@@ -119,6 +119,7 @@ pub mod source_quarantine;
 pub mod source_type_descriptor;
 pub mod source_webhook;
 pub mod transform_engine;
+pub mod trust_score;
 pub mod virtual_pushdown;
 pub mod warehouse_projection;
 pub(crate) mod work_unit_lifecycle;

@@ -128,6 +128,8 @@ lives in the separate [research index](research/README.md).
   objects and dataset metadata under the live read policy.
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   `ExpandNeighborhood` and `FindPaths` under the live read policy at every hop.
+- [Trust scores](trust-scores.md) — experimental `PutTrustScoringRule`,
+  `GetTrustScoringRule` and `ScoreObjectTrust`.
 - [Evidence producer contract](action-evidence-producer-contract.md) —
   evidence submission with optional ActionInstance creation.
 - [Inbound object sync](object-sync.md) — authenticated source batches,

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Experimental trust scores: a versioned per-namespace scoring rule turns
+  source health, age against expected freshness, manual verification and
+  corroborating or contradicting links into a 0 to 100 score per object
+  with its reasons. `ScoreObjectTrust` scores an object-set page as the
+  caller and filters or sorts by score. Rule changes are credential-admin,
+  compare-and-set and audited in the object change log
+  (docs/trust-scores.md, #1456).
+
 - Experimental gRPC for dataset branches (ADR 0119): create, list, delete,
   compare, propose a merge, merge, and run a governed transform on a branch.
   The tenant comes from the authenticated context, reads need dataset read

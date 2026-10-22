@@ -833,6 +833,7 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     FACT_KIND,
     WAIVER_KIND,
     markings::PRINCIPAL_PROFILE_KIND,
+    crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
 ];
 
 fn is_reserved_governance_kind(kind: &str) -> bool {

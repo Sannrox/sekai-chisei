@@ -1176,6 +1176,51 @@ message SimulateObjectPolicyChangeResponse {
   string candidate_digest = 3;
   repeated PolicySimulationDifference differences = 4;
 }
+// A namespace's trust scoring rule revision (`sekai.trust-scoring-rule/v1`).
+message TrustScoringRuleRevision {
+  string namespace = 1;
+  string rule_json = 2;
+  string revision_digest = 3;
+  uint64 version = 4;
+  string updated_by = 5;
+  int64 updated_at_ms = 6;
+}
+// Credential admin only. Stores a new revision when `expected_revision_digest`
+// names the current one (empty for the first rule); the same revision again
+// is a no-op. Audited in the rule object's change log.
+message PutTrustScoringRuleRequest {
+  string rule_json = 1;
+  string expected_revision_digest = 2;
+}
+message PutTrustScoringRuleResponse { TrustScoringRuleRevision rule = 1; }
+message GetTrustScoringRuleRequest { string namespace = 1; }
+message GetTrustScoringRuleResponse { TrustScoringRuleRevision rule = 1; }
+message TrustReason {
+  string factor = 1;
+  int32 delta = 2;
+  string detail = 3;
+}
+message ObjectTrustScore {
+  string object_id = 1;
+  uint32 score = 2;
+  repeated TrustReason reasons = 3;
+}
+// Score one page of an object set under the namespace's trust scoring rule.
+// Members are read with the caller's authority; signals come from what the
+// caller can see.
+message ScoreObjectTrustRequest {
+  ObjectSetDescriptor descriptor = 1;
+  string page_token = 2;
+  // Omit members scoring below this (0..=100).
+  uint32 min_score = 3;
+  // Highest score first, then object id; otherwise object-set order.
+  bool order_by_score = 4;
+}
+message ScoreObjectTrustResponse {
+  string rule_revision_digest = 1;
+  repeated ObjectTrustScore scores = 2;
+  string next_page_token = 3;
+}
 message ObjectPolicyAuditEvent {
   string event_id = 1;
   string namespace = 2;
@@ -3273,6 +3318,9 @@ service SekaiService {
   rpc GetClassificationLattice(GetClassificationLatticeRequest) returns (GetClassificationLatticeResponse);
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
+  rpc PutTrustScoringRule(PutTrustScoringRuleRequest) returns (PutTrustScoringRuleResponse);
+  rpc GetTrustScoringRule(GetTrustScoringRuleRequest) returns (GetTrustScoringRuleResponse);
+  rpc ScoreObjectTrust(ScoreObjectTrustRequest) returns (ScoreObjectTrustResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);
 
