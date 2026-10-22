@@ -1168,6 +1168,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ReplayGovernedTransform",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetTransformReplay",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "PutDatasetHealthCheck",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

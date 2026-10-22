@@ -29,6 +29,7 @@ pub mod dataset;
 pub mod dataset_health;
 pub use sekai_types::dataset_branch;
 pub use sekai_types::dataset_version;
+pub use sekai_types::transform_replay;
 pub mod decision_ledger;
 pub use sekai_types::receipt_chain;
 pub mod deduplication;

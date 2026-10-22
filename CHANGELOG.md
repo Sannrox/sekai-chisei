@@ -25,6 +25,15 @@
   impact reports; advisory bindings keep the ADR 0067 non-disclosure
   (ADR 0067 amended, #1635).
 
+- Experimental transform replays (ADR 0120): `ReplayGovernedTransform`
+  re-runs a governed transform, as stored or as a candidate definition,
+  over input dataset versions pinned by id or by time, on a fresh branch of
+  its output. The record pins inputs, definition and engine, flags
+  non-deterministic SQL, diffs the result against a baseline output version
+  by key and names the datasets and object types downstream. Promote it by
+  merging the branch, discard it by deleting it. `GetTransformReplay`
+  returns the record (#1585).
+
 - Experimental comment threads on objects and their properties, with
   mentions, resolve and reopen. A comment is visible only to callers who
   can read its object and property, quoted values of hidden properties are

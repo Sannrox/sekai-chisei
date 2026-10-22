@@ -1564,6 +1564,18 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<RunGovernedTransformOnBranchResponse>, Status> {
         rpc_data::run_governed_transform_on_branch(self, req).await
     }
+    async fn replay_governed_transform(
+        &self,
+        req: Request<ReplayGovernedTransformRequest>,
+    ) -> Result<Response<ReplayGovernedTransformResponse>, Status> {
+        rpc_data::replay_governed_transform(self, req).await
+    }
+    async fn get_transform_replay(
+        &self,
+        req: Request<GetTransformReplayRequest>,
+    ) -> Result<Response<GetTransformReplayResponse>, Status> {
+        rpc_data::get_transform_replay(self, req).await
+    }
     async fn rollback_dataset(
         &self,
         req: Request<RollbackDatasetRequest>,
