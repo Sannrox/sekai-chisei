@@ -70,6 +70,7 @@ mod governed_image_adr;
 mod governed_image_backend_conformance;
 mod graph_backend_conformance;
 mod guarded_mutation_backend_conformance;
+mod hoshi_reference_actions;
 mod host_executor_permit_conformance;
 mod hosted_provider_smoke;
 mod identity_assertion_conformance;
@@ -235,6 +236,7 @@ const GROUPED_MODULES: &[&str] = &[
     "governed_image_backend_conformance",
     "graph_backend_conformance",
     "guarded_mutation_backend_conformance",
+    "hoshi_reference_actions",
     "host_executor_permit_conformance",
     "hosted_provider_smoke",
     "identity_assertion_conformance",
@@ -408,6 +410,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 136);
+    assert_eq!(GROUPED_MODULES.len(), 137);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }
