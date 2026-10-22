@@ -242,6 +242,8 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "ProposeDatasetBranchMerge"
                 | "MergeDatasetBranch"
                 | "RunGovernedTransformOnBranch"
+                | "ReplayGovernedTransform"
+                | "GetTransformReplay"
                 | "GetGovernedFactVersion"
                 | "ResolveInvariantSet"
                 | "ListSchemaTypes"

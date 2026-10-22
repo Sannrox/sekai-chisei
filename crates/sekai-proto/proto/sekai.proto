@@ -1732,6 +1732,82 @@ message RunGovernedTransformOnBranchResponse {
   repeated string branch_inputs = 3;
   string markings_out = 4;
 }
+// Replay a governed transform over pinned input versions on a fresh branch
+// of its output (#1585). Experimental.
+message ReplayGovernedTransformRequest {
+  string namespace = 1;
+  string transform_id = 2;
+  // Input dataset id to version id; unpinned inputs read the version at
+  // as_of_ms, or their latest when it is 0.
+  map<string, string> input_versions = 3;
+  int64 as_of_ms = 4;
+  // A candidate definition (JSON) to run instead of the stored one.
+  string definition_json = 5;
+  // The output version to diff against; default as for unpinned inputs.
+  string baseline_version_id = 6;
+  // The row key; default the key of an object type backed by the output.
+  string key_column = 7;
+}
+message ReplayInput {
+  string alias = 1;
+  string dataset_id = 2;
+  string version_id = 3;
+  int64 rows = 4;
+  string digest = 5;
+  // Declared columns used; versions do not keep their schema, so these are
+  // the dataset's columns at replay time.
+  repeated string columns = 6;
+}
+message ReplayRowChange {
+  string key = 1;
+  map<string, string> before = 2;
+  map<string, string> after = 3;
+}
+message ReplayDiff {
+  string key_column = 1;
+  repeated string columns_added = 2;
+  repeated string columns_removed = 3;
+  int64 baseline_rows = 4;
+  int64 replay_rows = 5;
+  string baseline_digest = 6;
+  string replay_digest = 7;
+  int64 rows_added = 8;
+  int64 rows_removed = 9;
+  int64 rows_changed = 10;
+  repeated string changed_keys = 11;
+  repeated ReplayRowChange samples = 12;
+  bool reproduced = 13;
+}
+message ReplayDownstream {
+  string dataset_id = 1;
+  string via_transform = 2;
+  repeated string object_types = 3;
+}
+message TransformReplay {
+  string id = 1;
+  string namespace = 2;
+  string transform_id = 3;
+  string output_dataset_id = 4;
+  // Promote by proposing and merging this branch; discard by deleting it.
+  string branch = 5;
+  repeated ReplayInput inputs = 6;
+  string definition_digest = 7;
+  bool candidate = 8;
+  string engine_version = 9;
+  int64 as_of_ms = 10;
+  string baseline_version_id = 11;
+  repeated string non_deterministic = 12;
+  string markings_out = 13;
+  string output_digest = 14;
+  ReplayDiff diff = 15;
+  repeated ReplayDownstream downstream = 16;
+  string actor = 17;
+  int64 created_at_ms = 18;
+}
+message ReplayGovernedTransformResponse { TransformReplay replay = 1; }
+// The stored record: counts and digests, without changed keys or samples.
+message GetTransformReplayRequest { string id = 1; }
+message GetTransformReplayResponse { TransformReplay replay = 1; }
 
 message DatasetHealthCheck {
   string dataset_id = 1;
@@ -3518,6 +3594,8 @@ service SekaiService {
   rpc ProposeDatasetBranchMerge(ProposeDatasetBranchMergeRequest) returns (ProposeDatasetBranchMergeResponse);
   rpc MergeDatasetBranch(MergeDatasetBranchRequest) returns (MergeDatasetBranchResponse);
   rpc RunGovernedTransformOnBranch(RunGovernedTransformOnBranchRequest) returns (RunGovernedTransformOnBranchResponse);
+  rpc ReplayGovernedTransform(ReplayGovernedTransformRequest) returns (ReplayGovernedTransformResponse);
+  rpc GetTransformReplay(GetTransformReplayRequest) returns (GetTransformReplayResponse);
   rpc PutDatasetHealthCheck(PutDatasetHealthCheckRequest) returns (PutDatasetHealthCheckResponse);
   rpc ListDatasetHealthChecks(ListDatasetHealthChecksRequest) returns (ListDatasetHealthChecksResponse);
   rpc ListDatasetHealthResults(ListDatasetHealthResultsRequest) returns (ListDatasetHealthResultsResponse);

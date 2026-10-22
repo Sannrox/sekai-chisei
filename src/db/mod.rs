@@ -48,6 +48,7 @@ mod peer_import_store;
 pub mod postgres;
 pub(crate) mod postgres_receipt_chain;
 pub(crate) mod receipt_chain;
+pub mod transform_replay;
 #[cfg(test)]
 pub(crate) use postgres::ScratchDatabase;
 pub(crate) use postgres::off_runtime;

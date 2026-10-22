@@ -155,6 +155,7 @@ const EMBEDDING_INDEX_SCHEMA: &str = include_str!("postgres/0086_embedding_index
 const AGENT_CERTIFICATION_SCORE_SCHEMA: &str =
     include_str!("postgres/0087_agent_certification_score.sql");
 const DATASET_BRANCHES_SCHEMA: &str = include_str!("postgres/0088_dataset_branches.sql");
+const TRANSFORM_REPLAYS_SCHEMA: &str = include_str!("postgres/0089_transform_replays.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -713,6 +714,12 @@ const MIGRATIONS: &[Migration] = &[
         87,
         "dataset_branches",
         DATASET_BRANCHES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        88,
+        "transform_replays",
+        TRANSFORM_REPLAYS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
