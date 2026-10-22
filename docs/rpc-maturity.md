@@ -159,6 +159,10 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.PutTrustScoringRule` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetTrustScoringRule` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ScoreObjectTrust` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.CreateObjectComment` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.UpdateObjectComment` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ListObjectComments` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ListCommentMentions` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.FindPaths` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |

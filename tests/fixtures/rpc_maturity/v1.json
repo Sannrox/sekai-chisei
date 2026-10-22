@@ -781,6 +781,42 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "CreateObjectComment",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "UpdateObjectComment",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListObjectComments",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListCommentMentions",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ExpandNeighborhood",
       "storage_path": "sekai.graph",
       "real_backend": "yes",

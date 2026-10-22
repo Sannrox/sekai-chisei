@@ -128,6 +128,9 @@ lives in the separate [research index](research/README.md).
   objects and dataset metadata under the live read policy.
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   `ExpandNeighborhood` and `FindPaths` under the live read policy at every hop.
+- [Object comments](object-comments.md) — experimental
+  `CreateObjectComment`, `UpdateObjectComment`, `ListObjectComments` and
+  `ListCommentMentions` under the target's read policy.
 - [Trust scores](trust-scores.md) — experimental `PutTrustScoringRule`,
   `GetTrustScoringRule` and `ScoreObjectTrust`.
 - [Evidence producer contract](action-evidence-producer-contract.md) —
