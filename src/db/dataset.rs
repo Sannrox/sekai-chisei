@@ -93,8 +93,14 @@ pub trait DatasetBackend: Send + Sync {
         &self,
         dataset_id: &str,
         name: &str,
+        tenant: &str,
     ) -> Result<DatasetBranchDiff, String>;
-    fn delete_dataset_branch(&self, dataset_id: &str, name: &str) -> Result<(), String>;
+    fn delete_dataset_branch(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        tenant: &str,
+    ) -> Result<(), String>;
     fn propose_dataset_branch(
         &self,
         request: &ProposeDatasetBranch,
@@ -153,8 +159,8 @@ impl DatasetBackend for SekaiDb {
     sqlite_forward!(list_dataset_branches(dataset_id: &str) -> Result<Vec<DatasetBranch>, String>);
     sqlite_forward!(dataset_branch_rows(dataset_id: &str, name: &str) -> Result<Vec<HashMap<String, String>>, String>);
     sqlite_forward!(write_dataset_branch_rows(dataset_id: &str, name: &str, rows: &[HashMap<String, String>], replace: bool) -> Result<i64, String>);
-    sqlite_forward!(compare_dataset_branch(dataset_id: &str, name: &str) -> Result<DatasetBranchDiff, String>);
-    sqlite_forward!(delete_dataset_branch(dataset_id: &str, name: &str) -> Result<(), String>);
+    sqlite_forward!(compare_dataset_branch(dataset_id: &str, name: &str, tenant: &str) -> Result<DatasetBranchDiff, String>);
+    sqlite_forward!(delete_dataset_branch(dataset_id: &str, name: &str, tenant: &str) -> Result<(), String>);
     sqlite_forward!(propose_dataset_branch(request: &ProposeDatasetBranch) -> Result<DatasetBranchProposal, String>);
     sqlite_forward!(get_dataset_branch_proposal(dataset_id: &str, id: &str) -> Result<DatasetBranchProposal, String>);
     sqlite_forward!(merge_dataset_branch(request: &MergeDatasetBranch) -> Result<DatasetBranchProposal, String>);
@@ -292,11 +298,17 @@ impl DatasetBackend for PostgresDb {
         &self,
         dataset_id: &str,
         name: &str,
+        tenant: &str,
     ) -> Result<DatasetBranchDiff, String> {
-        PostgresDb::compare_dataset_branch(self, dataset_id, name)
+        PostgresDb::compare_dataset_branch(self, dataset_id, name, tenant)
     }
-    fn delete_dataset_branch(&self, dataset_id: &str, name: &str) -> Result<(), String> {
-        PostgresDb::delete_dataset_branch(self, dataset_id, name)
+    fn delete_dataset_branch(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        tenant: &str,
+    ) -> Result<(), String> {
+        PostgresDb::delete_dataset_branch(self, dataset_id, name, tenant)
     }
     fn propose_dataset_branch(
         &self,

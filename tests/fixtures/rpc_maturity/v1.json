@@ -1006,6 +1006,69 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "CreateDatasetBranch",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListDatasetBranches",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteDatasetBranch",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CompareDatasetBranch",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ProposeDatasetBranchMerge",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "MergeDatasetBranch",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RunGovernedTransformOnBranch",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "PutDatasetHealthCheck",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

@@ -220,10 +220,14 @@ impl PostgresDb {
         &self,
         dataset_id: &str,
         name: &str,
+        tenant: &str,
     ) -> Result<DatasetBranchDiff, String> {
         let mut connection = self.connection()?;
         let mut tx = read_snapshot(&mut connection)?;
         let branch = load_branch(&mut tx, dataset_id, name, false)?;
+        if branch.tenant != tenant {
+            return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+        }
         let head = branch_rows(&mut tx, &branch)?;
         let parent = decode(
             &tx.query(
@@ -235,13 +239,20 @@ impl PostgresDb {
         Ok(dataset_branch::diff_rows(&parent, &head))
     }
 
-    pub fn delete_dataset_branch(&self, dataset_id: &str, name: &str) -> Result<(), String> {
+    pub fn delete_dataset_branch(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        tenant: &str,
+    ) -> Result<(), String> {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_dataset_rows(&mut tx, dataset_id)?;
-        load_branch(&mut tx, dataset_id, name, true)?;
+        if load_branch(&mut tx, dataset_id, name, true)?.tenant != tenant {
+            return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+        }
         drop_branch(&mut tx, dataset_id, name)?;
         tx.commit().map_err(|error| error.to_string())
     }
@@ -311,6 +322,10 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         lock_dataset_rows(&mut tx, &request.dataset_id)?;
         let mut proposal = load_proposal(&mut tx, &request.dataset_id, &request.proposal_id, true)?;
+        // Another tenant's proposal reads as missing, replay included.
+        if proposal.tenant != request.tenant {
+            return Err(dataset_branch::PROPOSAL_NOT_FOUND.into());
+        }
         if proposal.status == dataset_branch::STATUS_MERGED {
             return Ok(proposal);
         }

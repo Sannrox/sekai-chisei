@@ -24424,3 +24424,123 @@ async fn synthetic_tenants_pass_the_real_read_checks() {
 
 #[path = "isolation_probes.rs"]
 mod isolation_probes;
+
+#[tokio::test]
+async fn dataset_branch_rpcs_isolate_then_merge_once_by_another_principal() {
+    let svc = service();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "branched".into(),
+            name: "branched".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "branched".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v1".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let branch = svc
+        .create_dataset_branch(with_principal(CreateDatasetBranchRequest {
+            dataset_id: "branched".into(),
+            name: "dev".into(),
+            from_version_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .branch
+        .unwrap();
+    assert!(!branch.written);
+    svc.db
+        .runtime()
+        .write_dataset_branch_rows(
+            "branched",
+            "dev",
+            &[[("kind".to_string(), "v2".to_string())].into()],
+            false,
+        )
+        .unwrap();
+    let diff = svc
+        .compare_dataset_branch(with_principal(CompareDatasetBranchRequest {
+            dataset_id: "branched".into(),
+            name: "dev".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((diff.parent_rows, diff.branch_rows), (1, 2));
+    let proposal = svc
+        .propose_dataset_branch_merge(with_principal(ProposeDatasetBranchMergeRequest {
+            dataset_id: "branched".into(),
+            name: "dev".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    let merge = |principal: &str| {
+        with_named_principal(
+            MergeDatasetBranchRequest {
+                dataset_id: "branched".into(),
+                proposal_id: proposal.id.clone(),
+                reason: String::new(),
+            },
+            principal,
+        )
+    };
+    let own = svc.merge_dataset_branch(merge("tester")).await.unwrap_err();
+    assert_eq!(own.code(), tonic::Code::PermissionDenied);
+    let merged = svc
+        .merge_dataset_branch(merge("reviewer"))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(merged.status, "merged");
+    assert!(merged.receipt_id.starts_with("sha256:"));
+    let versions = svc
+        .list_dataset_versions(with_principal(ListDatasetVersionsRequest {
+            dataset_id: "branched".into(),
+            as_of_ms: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(versions.len(), 2);
+    assert_eq!(
+        versions.last().unwrap().version_id,
+        merged.merged_version_id
+    );
+    let listed = svc
+        .list_dataset_branches(with_principal(ListDatasetBranchesRequest {
+            dataset_id: "branched".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(listed.branches.is_empty());
+    let missing = svc
+        .delete_dataset_branch(with_principal(DeleteDatasetBranchRequest {
+            dataset_id: "branched".into(),
+            name: "dev".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}

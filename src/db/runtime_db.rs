@@ -6555,21 +6555,27 @@ impl RuntimeDb {
         &self,
         dataset_id: &str,
         name: &str,
+        tenant: &str,
     ) -> Result<crate::sekai::dataset_branch::DatasetBranchDiff, String> {
         match self {
-            Self::Sqlite(db) => db.compare_dataset_branch(dataset_id, name),
-            Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.compare_dataset_branch(dataset_id, name))
-            }
+            Self::Sqlite(db) => db.compare_dataset_branch(dataset_id, name, tenant),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.compare_dataset_branch(dataset_id, name, tenant)
+            }),
         }
     }
 
-    pub fn delete_dataset_branch(&self, dataset_id: &str, name: &str) -> Result<(), String> {
+    pub fn delete_dataset_branch(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        tenant: &str,
+    ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.delete_dataset_branch(dataset_id, name),
-            Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.delete_dataset_branch(dataset_id, name))
-            }
+            Self::Sqlite(db) => db.delete_dataset_branch(dataset_id, name, tenant),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.delete_dataset_branch(dataset_id, name, tenant)
+            }),
         }
     }
 

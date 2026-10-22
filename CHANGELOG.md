@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Experimental gRPC for dataset branches (ADR 0119): create, list, delete,
+  compare, propose a merge, merge, and run a governed transform on a branch.
+  The tenant comes from the authenticated context, reads need dataset read
+  access and changes need write access, and a merge is refused for the
+  proposer (#1444).
+
 - Experimental `ExpandNeighborhood` and `FindPaths` explore how objects are
   linked: a bounded expansion from seed objects with a total count, and all
   shortest paths between two objects up to depth 4. Every hop applies the

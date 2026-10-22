@@ -742,6 +742,12 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListDatasetVersions"
             | "GetDatasetVersion"
             | "RollbackDataset"
+            | "CreateDatasetBranch"
+            | "ListDatasetBranches"
+            | "DeleteDatasetBranch"
+            | "CompareDatasetBranch"
+            | "ProposeDatasetBranchMerge"
+            | "MergeDatasetBranch"
             | "PutDatasetHealthCheck"
             | "ListDatasetHealthChecks"
             | "ListDatasetHealthResults"
@@ -1835,6 +1841,18 @@ mod tests {
             rpc_namespace_action("RollbackDataset"),
             NamespaceAction::Write
         );
+        for method in ["ListDatasetBranches", "CompareDatasetBranch"] {
+            assert_eq!(rpc_namespace_action(method), NamespaceAction::Read);
+        }
+        for method in [
+            "CreateDatasetBranch",
+            "DeleteDatasetBranch",
+            "ProposeDatasetBranchMerge",
+            "MergeDatasetBranch",
+        ] {
+            assert_eq!(rpc_namespace_action(method), NamespaceAction::Write);
+            assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
+        }
         assert_eq!(
             rpc_namespace_action("DescribeObjectAction"),
             NamespaceAction::Discover
@@ -2312,10 +2330,9 @@ mod tests {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
         }
-        assert!(!enterprise_namespace_rpc(
-            "sekai.SekaiService",
-            "RunGovernedTransform"
-        ));
+        for method in ["RunGovernedTransform", "RunGovernedTransformOnBranch"] {
+            assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
+        }
     }
 
     #[test]
