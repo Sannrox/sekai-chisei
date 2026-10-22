@@ -58,6 +58,10 @@ pub struct DefinitionProposal {
     pub restored_from_digest: String,
     #[serde(default)]
     pub migration_plan_digest: String,
+    /// Approved as a new major revision: it may break blocking consumer
+    /// bindings (ADR 0067, amended).
+    #[serde(default)]
+    pub major_revision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +74,8 @@ pub struct CreateDefinitionProposal {
     pub eval_plan_digests: Vec<String>,
     pub named_foreign_digests: Vec<String>,
     pub idempotency_key: String,
+    #[serde(default)]
+    pub major_revision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +356,7 @@ impl CreateDefinitionProposal {
             named_foreign_digests: &named_foreign_digests,
             restored_from_digest: "",
             migration_plan_digest: "",
+            major_revision: self.major_revision,
         })?;
         let request_digest = canonical_digest(
             "create_definition_proposal",
@@ -363,6 +370,7 @@ impl CreateDefinitionProposal {
                 named_foreign_digests: &named_foreign_digests,
                 restored_from_digest: "",
                 migration_plan_digest: "",
+                major_revision: self.major_revision,
             },
         )?;
         Ok((
@@ -479,6 +487,7 @@ impl DefinitionProposal {
             named_foreign_digests: &self.named_foreign_digests,
             restored_from_digest: &self.restored_from_digest,
             migration_plan_digest: &self.migration_plan_digest,
+            major_revision: self.major_revision,
         })?;
         if expected != self.proposal_digest {
             return Err("definition proposal content binding is invalid".into());
@@ -813,6 +822,9 @@ pub(crate) struct PreparedProposalDigestInput<'a> {
     pub(crate) restored_from_digest: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     pub(crate) migration_plan_digest: &'a str,
+    /// Omitted when false, so digests of earlier proposals are unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) major_revision: bool,
 }
 
 fn canonical_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
@@ -847,6 +859,7 @@ mod tests {
             eval_plan_digests: vec![digest('e')],
             named_foreign_digests: vec![digest('f')],
             idempotency_key: "propose-1".into(),
+            major_revision: false,
         }
     }
 
@@ -925,6 +938,7 @@ mod tests {
             close_reason_code: String::new(),
             restored_from_digest: String::new(),
             migration_plan_digest: String::new(),
+            major_revision: false,
         };
         proposal.proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
             namespace: &proposal.namespace,
@@ -936,6 +950,7 @@ mod tests {
             named_foreign_digests: &proposal.named_foreign_digests,
             restored_from_digest: "",
             migration_plan_digest: "",
+            major_revision: false,
         })
         .unwrap();
         proposal.verify().unwrap();

@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::sekai::definition_consumer_impact::{
-    BINDING_KIND, COMPLETENESS_UNAVAILABLE, MAX_VISIBLE_BINDINGS, report_consumer_impact,
+    BINDING_KIND, COMPLETENESS_COMPLETE, COMPLETENESS_PARTIAL, COMPLETENESS_STALE,
+    COMPLETENESS_UNAVAILABLE, MAX_VISIBLE_BINDINGS, any_stale_binding, broken_blocking_bindings,
+    list_blocking_bindings, report_consumer_impact,
 };
 
 impl SekaiServiceImpl {
@@ -58,7 +60,43 @@ impl SekaiServiceImpl {
             |objects, _, _| Ok(objects),
         )
         .map_err(|_| Status::failed_precondition(COMPLETENESS_UNAVAILABLE))?;
-        let report = report_consumer_impact(&diff, &bindings);
+        // Advisory bindings stay visibility-bound and bounded. Blocking ones
+        // are disclosed to producers whatever the caller can see (ADR 0067,
+        // amended) and are evaluated as the publish gate evaluates them, so
+        // an advisory overflow never hides a binding that would block.
+        let overflow = bindings.len() > MAX_VISIBLE_BINDINGS;
+        let advisory: Vec<domain::Object> = bindings
+            .into_iter()
+            .filter(|object| {
+                object
+                    .properties
+                    .get("blocking")
+                    .is_none_or(|value| value != "true")
+            })
+            .collect();
+        let mut report = report_consumer_impact(&diff, &advisory);
+        if overflow {
+            report.completeness = COMPLETENESS_PARTIAL.into();
+            report.impacts.clear();
+        }
+        let blocking = list_blocking_bindings(
+            |filter| self.db.runtime().list_objects(filter),
+            &input.namespace,
+        )
+        .map_err(|_| Status::failed_precondition(COMPLETENESS_UNAVAILABLE))?;
+        if report.completeness == COMPLETENESS_COMPLETE && any_stale_binding(&blocking) {
+            report.completeness = COMPLETENESS_STALE.into();
+        }
+        let compatibility = definition_diff_domain::classify_definition_revision_compatibility(
+            &from,
+            &from_members,
+            &to,
+            &to_members,
+        )
+        .map_err(map_definition_write_error)?;
+        report
+            .impacts
+            .extend(broken_blocking_bindings(&compatibility, &blocking));
         Ok(Response::new(ReportDefinitionConsumerImpactResponse {
             completeness: report.completeness,
             from_revision_digest: report.from_revision_digest,
@@ -73,6 +111,7 @@ impl SekaiServiceImpl {
                     member_id: impact.member_id,
                     property: impact.property,
                     source_locator: impact.source_locator,
+                    blocking: impact.blocking,
                 })
                 .collect(),
         }))

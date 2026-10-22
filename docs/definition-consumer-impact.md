@@ -26,8 +26,25 @@ Every report carries one of:
   evaluated
 
 Zero visible dependents is not proof of zero impact. Hidden consumer
-names, paths, counts, and locators stay undisclosed. The report does not
-authorize publication.
+names, paths, counts, and locators of advisory bindings stay undisclosed.
+An advisory report does not authorize or block publication.
+
+## Blocking bindings
+
+A consumer may set the property `blocking` to `true` on its binding (the
+declaration digest then covers the flag). A blocking binding:
+
+- is disclosed to producers: impact reports include it whatever the caller
+  can see, marked `blocking`;
+- blocks publishing: `MergeDefinitionProposal` fails with
+  `FAILED_PRECONDITION` (`definition_publish_blocked`) when the revision
+  would remove or change a member or property it depends on, naming each
+  blocking binding;
+- does not block a proposal created with `major_revision: true` once that
+  proposal is approved and merged; the flag is part of the approved
+  proposal digest.
+
+A blocking binding with a stale digest does not block.
 
 See [ADR 0067](decisions/0067-definition-consumer-impact.md) and
 Discussion [863](https://github.com/Sannrox/sekai-chisei/discussions/863).

@@ -614,6 +614,7 @@ pub(super) async fn create_definition_proposal(
         eval_plan_digests: input.eval_plan_digests,
         named_foreign_digests: input.named_foreign_digests,
         idempotency_key: input.idempotency_key,
+        major_revision: input.major_revision,
     };
     request.prepare().map_err(Status::invalid_argument)?;
     authorize_definition_revision(
