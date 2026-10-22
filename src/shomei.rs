@@ -451,6 +451,31 @@ impl TrustedKeyring {
     fn get(&self, identity: &str, key_id: &str) -> Option<&TrustedKey> {
         self.keys.get(&(identity.to_string(), key_id.to_string()))
     }
+
+    /// Verifies an Ed25519 `signature` over `message` by the trusted key
+    /// `identity`/`key_id`, which must be usable now (or at the pinned time).
+    pub fn verify_message(
+        &self,
+        identity: &str,
+        key_id: &str,
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<(), String> {
+        let trusted = self
+            .get(identity, key_id)
+            .ok_or_else(|| format!("signer {identity} key {key_id} is not trusted"))?;
+        let at = self
+            .verification_time_override
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        let key_errors = verify_key_metadata(&trusted.metadata, at).errors;
+        if !key_errors.is_empty() {
+            return Err(key_errors.join("; "));
+        }
+        trusted
+            .key
+            .verify_strict(message, &Signature::from_bytes(signature))
+            .map_err(|_| "signature verification failed".to_string())
+    }
 }
 
 pub fn verify_bundle(
