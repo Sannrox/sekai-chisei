@@ -4385,3 +4385,317 @@ pub(super) async fn delete_governed_document(
         document: Some(to_proto_document(&document)),
     }))
 }
+
+// Dataset branches (ADR 0119). The tenant always comes from the caller's
+// authenticated context; another tenant's branch reads as missing.
+
+fn branch_status(error: String) -> Status {
+    use crate::sekai::dataset_branch as branch;
+    match error.as_str() {
+        branch::BRANCH_NOT_FOUND | branch::PROPOSAL_NOT_FOUND => Status::not_found(error),
+        branch::BRANCH_EXISTS => Status::already_exists(error),
+        branch::BRANCH_NAME_INVALID => Status::invalid_argument(error),
+        branch::PROPOSAL_SELF_MERGE => Status::permission_denied(error),
+        branch::PROPOSAL_NOT_OPEN
+        | branch::PROPOSAL_STALE_PARENT
+        | branch::PROPOSAL_STALE_BRANCH
+        | branch::BRANCH_RUN_ISOLATED
+        | branch::BRANCH_RUN_RAISES_MARKING => Status::failed_precondition(error),
+        _ if error.starts_with("branch run") => Status::failed_precondition(error),
+        _ => map_dataset_version_error(error),
+    }
+}
+
+fn context_tenant(context: Option<&RequestEnterpriseContext>) -> String {
+    context
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.clone())
+        .unwrap_or_default()
+}
+
+/// The caller, its tenant, and the dataset after the read or write check.
+fn branch_caller<T: 'static>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    dataset_id: &str,
+    write: bool,
+) -> Result<(String, String), Status> {
+    let principals = caller_principals(req);
+    require_authenticated(&principals)?;
+    let context = request_tenant_context(service.db.runtime(), req)?;
+    let tenant = context_tenant(context.as_ref());
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    // The bound object's namespace must be one the authenticated context
+    // may read or write, whatever ACL grants the caller also holds.
+    if let Some(context) = context.as_ref()
+        && !dataset.object_id.is_empty()
+        && let Some(object) = service
+            .db
+            .runtime()
+            .get_object(&dataset.object_id)
+            .map_err(Status::internal)?
+    {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &object.namespace,
+            write,
+        )?;
+    }
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        write,
+    )?;
+    let actor = principals
+        .first()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    Ok((actor, tenant))
+}
+
+fn to_proto_branch(branch: crate::sekai::dataset_branch::DatasetBranch) -> DatasetBranch {
+    DatasetBranch {
+        dataset_id: branch.dataset_id,
+        name: branch.name,
+        base_version_id: branch.base_version_id,
+        written: branch.written,
+        created_by: branch.created_by,
+        created_at_ms: branch.created_at_ms,
+    }
+}
+
+fn to_proto_proposal(
+    proposal: crate::sekai::dataset_branch::DatasetBranchProposal,
+) -> DatasetBranchProposal {
+    DatasetBranchProposal {
+        id: proposal.id,
+        dataset_id: proposal.dataset_id,
+        branch: proposal.branch,
+        parent_version_id: proposal.parent_version_id,
+        branch_digest: proposal.branch_digest,
+        proposer: proposal.proposer,
+        status: proposal.status,
+        merged_by: proposal.merged_by,
+        merged_version_id: proposal.merged_version_id,
+        receipt_id: proposal.receipt_id,
+        created_at_ms: proposal.created_at_ms,
+        merged_at_ms: proposal.merged_at_ms,
+    }
+}
+
+pub(super) async fn create_dataset_branch(
+    service: &SekaiServiceImpl,
+    req: Request<CreateDatasetBranchRequest>,
+) -> Result<Response<CreateDatasetBranchResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
+    let inner = req.into_inner();
+    let branch = service
+        .db
+        .runtime()
+        .create_dataset_branch(&crate::sekai::dataset_branch::CreateDatasetBranch {
+            dataset_id,
+            name: inner.name,
+            from_version_id: inner.from_version_id,
+            actor,
+            tenant,
+        })
+        .map_err(branch_status)?;
+    Ok(Response::new(CreateDatasetBranchResponse {
+        branch: Some(to_proto_branch(branch)),
+    }))
+}
+
+pub(super) async fn list_dataset_branches(
+    service: &SekaiServiceImpl,
+    req: Request<ListDatasetBranchesRequest>,
+) -> Result<Response<ListDatasetBranchesResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (_, tenant) = branch_caller(service, &req, &dataset_id, false)?;
+    let branches = service
+        .db
+        .runtime()
+        .list_dataset_branches(&dataset_id)
+        .map_err(branch_status)?
+        .into_iter()
+        .filter(|branch| branch.tenant == tenant)
+        .map(to_proto_branch)
+        .collect();
+    Ok(Response::new(ListDatasetBranchesResponse { branches }))
+}
+
+pub(super) async fn delete_dataset_branch(
+    service: &SekaiServiceImpl,
+    req: Request<DeleteDatasetBranchRequest>,
+) -> Result<Response<DeleteDatasetBranchResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (_, tenant) = branch_caller(service, &req, &dataset_id, true)?;
+    let name = req.into_inner().name;
+    service
+        .db
+        .runtime()
+        .delete_dataset_branch(&dataset_id, &name, &tenant)
+        .map_err(branch_status)?;
+    Ok(Response::new(DeleteDatasetBranchResponse {}))
+}
+
+pub(super) async fn compare_dataset_branch(
+    service: &SekaiServiceImpl,
+    req: Request<CompareDatasetBranchRequest>,
+) -> Result<Response<CompareDatasetBranchResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (_, tenant) = branch_caller(service, &req, &dataset_id, false)?;
+    let name = req.into_inner().name;
+    let diff = service
+        .db
+        .runtime()
+        .compare_dataset_branch(&dataset_id, &name, &tenant)
+        .map_err(branch_status)?;
+    Ok(Response::new(CompareDatasetBranchResponse {
+        columns_added: diff.columns_added,
+        columns_removed: diff.columns_removed,
+        parent_rows: diff.parent_rows,
+        branch_rows: diff.branch_rows,
+        parent_digest: diff.parent_digest,
+        branch_digest: diff.branch_digest,
+    }))
+}
+
+pub(super) async fn propose_dataset_branch_merge(
+    service: &SekaiServiceImpl,
+    req: Request<ProposeDatasetBranchMergeRequest>,
+) -> Result<Response<ProposeDatasetBranchMergeResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
+    let proposal = service
+        .db
+        .runtime()
+        .propose_dataset_branch(&crate::sekai::dataset_branch::ProposeDatasetBranch {
+            dataset_id,
+            branch: req.into_inner().name,
+            actor,
+            tenant,
+        })
+        .map_err(branch_status)?;
+    Ok(Response::new(ProposeDatasetBranchMergeResponse {
+        proposal: Some(to_proto_proposal(proposal)),
+    }))
+}
+
+pub(super) async fn merge_dataset_branch(
+    service: &SekaiServiceImpl,
+    req: Request<MergeDatasetBranchRequest>,
+) -> Result<Response<MergeDatasetBranchResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
+    let inner = req.into_inner();
+    let proposal = service
+        .db
+        .runtime()
+        .merge_dataset_branch(&crate::sekai::dataset_branch::MergeDatasetBranch {
+            dataset_id,
+            proposal_id: inner.proposal_id,
+            actor,
+            tenant,
+            reason: inner.reason,
+        })
+        .map_err(branch_status)?;
+    Ok(Response::new(MergeDatasetBranchResponse {
+        proposal: Some(to_proto_proposal(proposal)),
+    }))
+}
+
+/// Admitted like a parent run (credential admin, namespace tenant, transform
+/// quota gate). A successful run keeps its request charge; a branch run
+/// leaves no run receipt, so no usage row is recorded.
+pub(super) async fn run_governed_transform_on_branch(
+    service: &SekaiServiceImpl,
+    req: Request<RunGovernedTransformOnBranchRequest>,
+) -> Result<Response<RunGovernedTransformOnBranchResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let actor = principals.first().cloned().unwrap_or_default();
+    let input = req.into_inner();
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &input.namespace,
+            true,
+        )?;
+    }
+    // Charge the caller's tenant, or for a tenantless operator the stored
+    // quota owner, as a parent run does. Branch ownership stays with the
+    // caller's tenant.
+    let owner_ctx = if tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .is_some()
+    {
+        tenant_context.clone()
+    } else {
+        match service
+            .db
+            .runtime()
+            .transform_quota_owner(&input.namespace, &input.transform_id)
+            .map_err(Status::internal)?
+        {
+            Some(tenant_id) => Some(crate::provider_credentials::tenant_context(
+                &tenant_id, "local",
+            )),
+            None => tenant_context.clone(),
+        }
+    };
+    let quota = service.quota_runtime();
+    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let admission_id = format!(
+        "transform-branch-run:{}:{}:{}:{}",
+        input.namespace,
+        input.transform_id,
+        input.branch,
+        now_millis()
+    );
+    let held = admit_tenant_transform(
+        quota.as_ref(),
+        &gate,
+        owner_ctx.as_ref(),
+        &admission_id,
+        false,
+    )?;
+    let result = service.db.runtime().run_governed_transform_on_branch(
+        &input.namespace,
+        &input.transform_id,
+        &input.branch,
+        &actor,
+        &context_tenant(tenant_context.as_ref()),
+        now_millis(),
+    );
+    // A run that wrote its branch keeps its request charge; a failed one is
+    // refunded.
+    let run = match result {
+        Ok(run) => {
+            release_tenant_transform(service.db.runtime(), &gate, &admission_id, held.as_ref())?;
+            run
+        }
+        Err(error) => {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            return Err(branch_status(error));
+        }
+    };
+    Ok(Response::new(RunGovernedTransformOnBranchResponse {
+        output_dataset_id: run.output_dataset_id,
+        rows_written: run.rows_written,
+        branch_inputs: run.branch_inputs,
+        markings_out: run.markings_out,
+    }))
+}
