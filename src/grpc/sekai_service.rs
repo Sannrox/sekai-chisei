@@ -14,6 +14,8 @@ mod catalog_invocation;
 mod computed_response;
 #[path = "definition_consumer_impact.rs"]
 mod definition_consumer_impact;
+#[path = "graph_explore_rpc.rs"]
+mod graph_explore_rpc;
 #[path = "object_change_subscription.rs"]
 mod object_change_subscription;
 #[path = "object_mutation_lifecycle.rs"]
@@ -793,6 +795,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_objects::simulate_object_policy_change(self, req).await
     }
 
+    async fn query_counterfactual_view(
+        &self,
+        req: Request<QueryCounterfactualViewRequest>,
+    ) -> Result<Response<QueryCounterfactualViewResponse>, Status> {
+        rpc_objects::query_counterfactual_view(self, req).await
+    }
+
     async fn query_object_policy_audit(
         &self,
         req: Request<QueryObjectPolicyAuditRequest>,
@@ -841,6 +850,18 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<TraverseRequest>,
     ) -> Result<Response<TraverseResponse>, Status> {
         rpc_retrieval::traverse(self, req).await
+    }
+    async fn expand_neighborhood(
+        &self,
+        req: Request<ExpandNeighborhoodRequest>,
+    ) -> Result<Response<ExpandNeighborhoodResponse>, Status> {
+        graph_explore_rpc::expand_neighborhood(self, req).await
+    }
+    async fn find_paths(
+        &self,
+        req: Request<FindPathsRequest>,
+    ) -> Result<Response<FindPathsResponse>, Status> {
+        graph_explore_rpc::find_paths(self, req).await
     }
     async fn retrieve_context(
         &self,

@@ -294,6 +294,8 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "sekai.search.status" => Some("GetSearchIndexStatus"),
         "sekai.objects.read_change_subscription" => Some("ReadObjectChangeSubscription"),
         "sekai.relations.traverse" => Some("Traverse"),
+        "sekai.relations.neighborhood" => Some("ExpandNeighborhood"),
+        "sekai.relations.paths" => Some("FindPaths"),
         "sekai.semantic.expand_relations" => Some("ExpandRelations"),
         "sekai.context.retrieve" => Some("RetrieveContext"),
         "sekai.semantic.explain_derivation" => Some("ExplainDerivation"),
@@ -490,7 +492,7 @@ mod tests {
     #[test]
     fn table_matches_proto_and_stays_within_the_stable_limit() {
         let table = RpcMaturityTable::load().expect("maturity table");
-        assert_eq!(table.entries.len(), 229);
+        assert_eq!(table.entries.len(), 232);
         assert_eq!(table.stable_rpcs().len(), 68);
         assert!(
             table

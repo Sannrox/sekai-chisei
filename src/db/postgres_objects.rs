@@ -759,6 +759,18 @@ impl PostgresDb {
         direction: &Direction,
         context: &PrincipalPolicyContext,
     ) -> Result<Vec<Link>, String> {
+        self.get_links_with_policy_context_limited(object_id, relation, direction, context, None)
+    }
+
+    /// [`Self::get_links_with_policy_context`] reading at most `limit` rows.
+    pub fn get_links_with_policy_context_limited(
+        &self,
+        object_id: &str,
+        relation: &str,
+        direction: &Direction,
+        context: &PrincipalPolicyContext,
+        limit: Option<usize>,
+    ) -> Result<Vec<Link>, String> {
         let context = context.clone().normalized();
         let neighbor = match direction {
             Direction::Outgoing => "l.to_id",
@@ -783,8 +795,11 @@ impl PostgresDb {
              FROM sekai_links l
              JOIN sekai_objects o ON o.id = {neighbor}
              WHERE {root} = $1{relation_sql}{}
-             ORDER BY l.relation, l.id, l.from_id, l.to_id",
-            postgres_object_security_filter(subjects, scopes)
+             ORDER BY l.relation, l.id, l.from_id, l.to_id{}",
+            postgres_object_security_filter(subjects, scopes),
+            limit
+                .map(|limit| format!(" LIMIT {limit}"))
+                .unwrap_or_default()
         );
         if relation.is_empty() {
             self.connection()?

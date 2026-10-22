@@ -125,6 +125,9 @@ If you want to deploy or operate the control plane:
 - [Permission-aware search](search.md) — experimental text search over
   objects and dataset metadata. Hits, counts, facets, and highlights come
   from the live authorized projection. A page is not authority.
+- [Neighborhood and path queries](graph-exploration.md) — experimental
+  bounded expansion and shortest paths over links, with read policy at
+  every hop. Hidden objects are omitted, not placeholders.
 - [Object-change subscriptions](object-change-subscriptions.md) —
   plane-owned create/update/delete pages over event-subscription cursors.
   Snapshot, then stream; a page is not authority.

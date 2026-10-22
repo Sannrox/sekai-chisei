@@ -695,6 +695,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetLinks"
             | "GetLinkedObjects"
             | "Traverse"
+            | "ExpandNeighborhood"
+            | "FindPaths"
             | "ListObjectChanges"
             | "GetPublishedDefinitionRevision"
             | "ListPublishedDefinitionRevisions"

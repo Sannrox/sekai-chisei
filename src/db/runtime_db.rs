@@ -1272,6 +1272,16 @@ impl RuntimeDb {
         }
     }
 
+    pub fn classification_lattice_recorded_at_ms(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<i64>, String> {
+        match self {
+            Self::Sqlite(db) => db.classification_lattice_recorded_at_ms(namespace),
+            Self::Postgres(_) => Ok(None),
+        }
+    }
+
     pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
         match self {
             Self::Sqlite(db) => db.object_query_cursor_key(),
@@ -3960,6 +3970,35 @@ impl RuntimeDb {
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.get_links(object_id, relation, dir))
             }
+        }
+    }
+
+    /// At most `limit` links, so a caller can bound the read itself, not only its result.
+    pub fn get_links_with_policy_context_limited(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+        limit: usize,
+    ) -> Result<Vec<Link>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_links_with_policy_context_limited(
+                object_id,
+                relation,
+                dir,
+                context,
+                Some(limit),
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_links_with_policy_context_limited(
+                    object_id,
+                    relation,
+                    dir,
+                    context,
+                    Some(limit),
+                )
+            }),
         }
     }
 

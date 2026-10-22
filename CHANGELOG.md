@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- `QueryCounterfactualView` shows what a namespace's objects would have
+  shown at a past time under candidate object security policies or a
+  candidate marking rule, per principal: visible then, visible under the
+  candidate, hidden and revealed. The object set is rebuilt from the
+  recorded change log; objects deleted since, rules changed since and times
+  before the retained history fail closed. Credential-admin, read-only,
+  recorded as a decision, and behind
+  `SEKAI_EXPERIMENTAL_RPCS` (#1453).
+
+- Experimental `ExpandNeighborhood` and `FindPaths` explore how objects are
+  linked: a bounded expansion from seed objects with a total count, and all
+  shortest paths between two objects up to depth 4. Every hop applies the
+  caller's read policy, including the marking join along the path. Hidden
+  objects are omitted, never counted, and never used as a step; a hidden
+  start object is the same not-found as a missing one
+  (docs/graph-exploration.md, #1562).
+
 - A governed transform can run on a dataset branch (ADR 0119). Inputs read
   their branch where it exists and the parent otherwise. The output is
   written only to the output dataset's branch, so the parent's rows,

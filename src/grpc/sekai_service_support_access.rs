@@ -629,6 +629,27 @@ pub(super) fn object_is_visible_for(
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
 ) -> bool {
+    object_is_visible_for_purpose(
+        db,
+        security,
+        object,
+        principals,
+        tenant_context,
+        operation,
+        None,
+    )
+}
+/// [`object_is_visible_for`] with the request's purpose presented to the object
+/// security policy, so purpose-bound objects stay visible to a valid presentation.
+pub(super) fn object_is_visible_for_purpose(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+) -> bool {
     !is_reserved_governance_kind(&object.kind)
         && check_team_namespace(db, principals, &object.namespace, false).is_ok()
         && enforce_collaboration_namespace(db, tenant_context, &object.namespace, false).is_ok()
@@ -641,7 +662,7 @@ pub(super) fn object_is_visible_for(
         .unwrap_or(false)
         && check_read(security, &object.id, principals).is_ok()
         && object_passes_marking(db, object, principals).unwrap_or(false)
-        && object_passes_security_policy(db, object, principals, tenant_context, operation, None)
+        && object_passes_security_policy(db, object, principals, tenant_context, operation, purpose)
             .unwrap_or(false)
 }
 pub(super) fn object_security_generation(

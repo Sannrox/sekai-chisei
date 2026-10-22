@@ -146,6 +146,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | sqlite only | none | `experimental` |
 | `SekaiService.PutClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
 | `SekaiService.GetClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
+| `SekaiService.QueryCounterfactualView` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.FindByExternalId` | `sekai.graph` | yes | none | `stable` |
@@ -155,6 +156,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetLinks` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.GetLinkedObjects` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.Traverse` | `sekai.graph` | yes | none | `stable` |
+| `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.FindPaths` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
 | `SekaiService.ExpandRelations` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
 | `SekaiService.ExplainDerivation` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
