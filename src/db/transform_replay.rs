@@ -450,7 +450,15 @@ mod tests {
     fn postgres_replays_reproduce_diff_and_promote() {
         let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
             .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
-        let db = Arc::new(crate::db::postgres::PostgresDb::connect(&url, 4).unwrap());
+        let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                &url,
+                4,
+                &std::fs::read(path).unwrap(),
+            ),
+            Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
+        };
+        let db = Arc::new(db.unwrap());
         exercise(&RuntimeDb::Postgres(db.clone()), db.as_ref());
     }
 }
