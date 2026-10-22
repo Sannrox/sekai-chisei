@@ -1017,9 +1017,23 @@ impl ChiseiServiceImpl {
     ) -> Result<(String, String, String, String), Status> {
         let route_override = input.route_override.trim();
         if !route_override.is_empty() && !route_override_allowed(policy, route_override) {
-            return Err(Status::invalid_argument(format!(
-                "route override {route_override:?} is not allowed by namespace policy"
-            )));
+            let refusal =
+                format!("route override {route_override:?} is not allowed by namespace policy");
+            self.observe_policy_shadow(
+                super::rpc_policy_shadow::ShadowRequest {
+                    scopes: std::slice::from_ref(&input.namespace),
+                    effective_scope: None,
+                    preferred_runtime: &super::policy_resolution::override_provider(
+                        route_override,
+                        &input.preferred_runtime,
+                    ),
+                    requested_model: &input.preferred_model,
+                    route_override,
+                },
+                |_| route_override.to_string(),
+                &Err(refusal.clone()),
+            );
+            return Err(Status::invalid_argument(refusal));
         }
         let recommended_model = run
             .recommended_model()
@@ -1050,10 +1064,32 @@ impl ChiseiServiceImpl {
         } else {
             input.preferred_runtime.clone()
         };
-        let (runtime, model) = self
-            .policy
-            .resolve(&input.namespace, &preferred_runtime, &preferred_model)
-            .map_err(Status::invalid_argument)?;
+        let active_route =
+            self.policy
+                .resolve(&input.namespace, &preferred_runtime, &preferred_model);
+        self.observe_policy_shadow(
+            super::rpc_policy_shadow::ShadowRequest {
+                scopes: std::slice::from_ref(&input.namespace),
+                effective_scope: None,
+                preferred_runtime: &preferred_runtime,
+                requested_model: &input.preferred_model,
+                route_override,
+            },
+            |candidate| {
+                if route_override.is_empty() {
+                    choose_preferred_model(
+                        &input.preferred_model,
+                        &recommended_model,
+                        route_bias,
+                        Some(candidate),
+                    )
+                } else {
+                    route_override.to_string()
+                }
+            },
+            &active_route,
+        );
+        let (runtime, model) = active_route.map_err(Status::invalid_argument)?;
         let model = self
             .resolve_live_model_with_override(
                 &model,

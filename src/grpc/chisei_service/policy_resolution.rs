@@ -6,6 +6,7 @@
 //! portfolio runtime helpers, runtime canonicalization, and fallback projection.
 
 use super::live_model::{final_runtime_for_model, route_override_allowed};
+use super::rpc_policy_shadow::ShadowRequest;
 use super::*;
 
 impl ChiseiServiceImpl {
@@ -122,21 +123,29 @@ impl ChiseiServiceImpl {
         if !route_override.is_empty() {
             validate_explicit_requested_model(route_override).map_err(Status::invalid_argument)?;
             if !route_override_allowed(effective_policy.as_ref(), route_override) {
-                return Err(Status::invalid_argument(format!(
-                    "route override {route_override:?} is not allowed by effective policy"
-                )));
+                let refusal =
+                    format!("route override {route_override:?} is not allowed by effective policy");
+                self.observe_policy_shadow(
+                    ShadowRequest {
+                        scopes: &scopes,
+                        effective_scope: effective_policy.as_ref().map(|_| policy_scope.as_str()),
+                        preferred_runtime: &override_provider(route_override, &r.preferred_runtime),
+                        requested_model: &r.preferred_model,
+                        route_override,
+                    },
+                    |_| route_override.to_string(),
+                    &Err(refusal.clone()),
+                );
+                return Err(Status::invalid_argument(refusal));
             }
         }
         let requested_preferred_model = &r.preferred_model;
-        let preferred_model = if !route_override.is_empty() {
-            route_override
-        } else { eval_regressed
-            .then_some(())
-            .as_ref()
-            .and(effective_policy.as_ref())
-            .map(|policy| policy.default_model.as_str())
-            .filter(|model| !model.is_empty())
-            .unwrap_or(requested_preferred_model) };
+        let preferred_model = preferred_model_for(
+            effective_policy.as_ref(),
+            route_override,
+            eval_regressed,
+            requested_preferred_model,
+        );
         validate_explicit_requested_model(preferred_model).map_err(Status::invalid_argument)?;
         let override_runtime = (!route_override.is_empty())
             .then(|| crate::provider_resolution::resolve_model(route_override))
@@ -144,15 +153,33 @@ impl ChiseiServiceImpl {
             .map_err(Status::invalid_argument)?
             .map(|model| model.provider);
         let preferred_runtime = override_runtime.as_deref().unwrap_or(&r.preferred_runtime);
-        let (mut runtime, model) = if let Some(policy) = effective_policy.as_ref() {
+        let active_route = if let Some(policy) = effective_policy.as_ref() {
             self.policy
                 .apply_policy(policy, preferred_runtime, preferred_model)
-                .map_err(Status::invalid_argument)?
         } else {
             self.policy
                 .resolve(&policy_scope, preferred_runtime, preferred_model)
-                .map_err(Status::invalid_argument)?
         };
+        self.observe_policy_shadow(
+            ShadowRequest {
+                scopes: &scopes,
+                effective_scope: effective_policy.as_ref().map(|_| policy_scope.as_str()),
+                preferred_runtime,
+                requested_model: requested_preferred_model,
+                route_override,
+            },
+            |candidate| {
+                preferred_model_for(
+                    Some(candidate),
+                    route_override,
+                    eval_regressed,
+                    requested_preferred_model,
+                )
+                .to_string()
+            },
+            &active_route,
+        );
+        let (mut runtime, model) = active_route.map_err(Status::invalid_argument)?;
 
         let data_class = self.data_class(effective_policy.as_ref());
         let task_class = TaskClass::parse(&r.task_class);
@@ -586,6 +613,33 @@ pub(super) struct ResolvePolicyRequest {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ResolvePolicyResponse {
     pub(super) resolution: Option<PolicyResolution>,
+}
+
+/// The runtime a route override resolves to, or `fallback` when it does not
+/// resolve. Used only to describe an observation of a refused override.
+pub(super) fn override_provider(route_override: &str, fallback: &str) -> String {
+    crate::provider_resolution::resolve_model(route_override)
+        .map(|model| model.provider)
+        .unwrap_or_else(|_| fallback.to_string())
+}
+
+/// The model preference a policy is applied to. A route override wins; while
+/// an evaluation regression is active, the policy's own default replaces the
+/// requested model.
+fn preferred_model_for<'a>(
+    policy: Option<&'a Policy>,
+    route_override: &'a str,
+    eval_regressed: bool,
+    requested: &'a str,
+) -> &'a str {
+    if !route_override.is_empty() {
+        return route_override;
+    }
+    policy
+        .filter(|_| eval_regressed)
+        .map(|policy| policy.default_model.as_str())
+        .filter(|model| !model.is_empty())
+        .unwrap_or(requested)
 }
 
 fn policy_scopes(req: &ResolvePolicyRequest) -> Vec<String> {

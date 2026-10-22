@@ -20,6 +20,7 @@ mod evaluation_manifest;
 mod evaluation_plan;
 mod handle;
 mod learning_change_store;
+pub mod policy_shadow;
 #[cfg(test)]
 mod portfolio_route_test_cases;
 mod ports;
@@ -46,5 +47,6 @@ pub use ports::{
     ChiseiEvaluationStore, ChiseiEvolveStore, ChiseiExternalActionStore, ChiseiGatewayStore,
     ChiseiGovernedSubjectStore, ChiseiGunshiStore, ChiseiKiokuStore, ChiseiLearningChangeStore,
     ChiseiModelReleaseEvidenceStore, ChiseiModelReviewStore, ChiseiObservationStore,
-    ChiseiPermitStore, ChiseiPortfolioStore, ChiseiReceiptStore, ChiseiRoutingProfileStore,
+    ChiseiPermitStore, ChiseiPolicyShadowStore, ChiseiPortfolioStore, ChiseiReceiptStore,
+    ChiseiRoutingProfileStore,
 };

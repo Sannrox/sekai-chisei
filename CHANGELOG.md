@@ -10,6 +10,14 @@
   unverified, or incompatible packages are refused by name and write nothing
   (docs/definition-branches.md, #1700).
 
+- Experimental live policy shadow: `StartPolicyShadow` evaluates a candidate
+  namespace route policy beside the active one on every live resolution,
+  without changing the decision. `GetPolicyShadowReport` shows the match
+  rate and bounded samples of differing decisions, and `SetNamespacePolicy`
+  refuses the shadowed candidate until the report passes. Start and stop
+  are recorded as decisions (docs/policy-dry-run.md,
+  `0090_chisei_policy_shadow`, GATE:mig, #1630).
+
 - Experimental `GetOntologyChangelog` lists what changed in a reader's
   namespaces over a window: each published definition revision with a
   plain-language summary, compatibility, author, approvers, publisher and

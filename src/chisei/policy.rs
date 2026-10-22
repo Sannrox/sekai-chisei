@@ -389,7 +389,7 @@ where
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Policy {
     pub allowed_runtimes: Vec<String>,
     pub allowed_models: Vec<String>,
