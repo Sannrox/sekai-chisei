@@ -163,6 +163,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.UpdateObjectComment` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ListObjectComments` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ListCommentMentions` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetOntologyChangelog` | `sekai.definitions` | yes | none | `experimental` |
 | `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.FindPaths` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
