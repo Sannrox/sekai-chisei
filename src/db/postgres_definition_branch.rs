@@ -14,12 +14,13 @@ use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
     DefinitionProposal, DefinitionProposalApproval, DefinitionProposalMergeResult,
     MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, PreparedProposalDigestInput,
-    ProposeDefinitionRollback, PublishedDefinitionHistoryStore,
-    PublishedDefinitionRevisionHistoryEntry, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
-    dataset_column_names, history_entry_from_merged_proposal, list_published_definition_history,
-    merge_receipt_id, object_property_keys, proposal_content_digest, reject_foreign_member_grants,
-    require_descendant_candidate, require_rollback_migration_plan,
-    rollback_may_drop_live_object_type_properties, rollback_member_edits,
+    ProposeDefinitionImport, ProposeDefinitionRollback, PublishedDefinitionHistoryStore,
+    PublishedDefinitionRevisionHistoryEntry, ReplacementProposal, STATUS_CLOSED, STATUS_MERGED,
+    STATUS_OPEN, dataset_column_names, history_entry_from_merged_proposal,
+    list_published_definition_history, merge_receipt_id, object_property_keys,
+    proposal_content_digest, reject_foreign_member_grants, require_descendant_candidate,
+    require_rollback_migration_plan, rollback_may_drop_live_object_type_properties,
+    rollback_member_edits,
 };
 
 impl PostgresDb {
@@ -314,6 +315,101 @@ impl PostgresDb {
         load_proposal_postgres(&mut *self.connection()?, namespace, proposal_id)
     }
 
+    pub fn propose_definition_import(
+        &self,
+        request: &ProposeDefinitionImport,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        let request_digest = request.prepare()?;
+        validate_write_context(actor, now_ms)?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_write(&mut transaction, request, actor)?;
+        lock_published_head(&mut transaction, &request.namespace)?;
+        if let Some(replayed) = replay_postgres(
+            &mut transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        if load_proposal_postgres(&mut transaction, &request.namespace, &request.proposal_id)?
+            .is_some()
+        {
+            return Err("definition_proposal_conflict: proposal identity is already in use".into());
+        }
+        if load_branch_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+            true,
+        )?
+        .is_some()
+        {
+            return Err("definition_branch_conflict: branch identity is already in use".into());
+        }
+        let published = load_published_head_postgres(&mut transaction, &request.namespace)?
+            .ok_or_else(|| {
+                "definition_revision_not_found: published head is unavailable".to_string()
+            })?;
+        if published != request.expected_published_digest {
+            return Err(
+                "stale_published_definition_head: expected published digest does not match published head"
+                    .into(),
+            );
+        }
+        let published_revision =
+            load_revision_postgres(&mut transaction, &request.namespace, &published)?
+                .filter(|revision| revision.published)
+                .ok_or_else(|| {
+                    "definition_revision_not_found: published revision is unavailable".to_string()
+                })?;
+        let published_members = load_members_postgres(&mut transaction, &published_revision)?;
+        crate::sekai::definition_package::check_importable(
+            &published_revision,
+            &published_members,
+            &request.members,
+        )?;
+        let proposal = open_replacement_proposal_postgres(
+            &mut transaction,
+            &ReplacementProposal {
+                namespace: &request.namespace,
+                branch_id: &request.branch_id,
+                proposal_id: &request.proposal_id,
+                members: request.members.clone(),
+                restored_from_digest: "",
+                migration_plan_digest: "",
+                source_package_digest: &request.source_package_digest,
+            },
+            &published,
+            &published_revision,
+            actor,
+            now_ms,
+        )?;
+        let result = DefinitionWriteResult::CreateProposal {
+            proposal: proposal.clone(),
+        };
+        persist_result_postgres(
+            &mut transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &published,
+            &proposal.candidate_digest,
+            "propose_import",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
     pub fn propose_definition_rollback(
         &self,
         request: &ProposeDefinitionRollback,
@@ -388,96 +484,22 @@ impl PostgresDb {
             return Err("definition_revision_not_found: restore revision is unavailable".into());
         }
         let restore_members = load_members_postgres(&mut transaction, &restore)?;
-        let (upserts, removals) = rollback_member_edits(&published_revision, &restore_members)?;
-        let branch = DefinitionBranch {
-            contract_version: crate::sekai::definition_branch::BRANCH_CONTRACT_VERSION.into(),
-            namespace: request.namespace.clone(),
-            branch_id: request.branch_id.clone(),
-            base_revision_digest: published.clone(),
-            head_revision_digest: published.clone(),
-            created_by: actor.into(),
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-        };
-        transaction
-            .execute(
-                "INSERT INTO sekai_definition_branches (
-                    namespace, branch_id, base_revision_digest, head_revision_digest,
-                    created_by, created_at_ms, updated_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $6)",
-                &[
-                    &branch.namespace,
-                    &branch.branch_id,
-                    &branch.base_revision_digest,
-                    &branch.head_revision_digest,
-                    &branch.created_by,
-                    &branch.created_at_ms,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        let candidate =
-            match apply_member_changes(&published_revision, &upserts, &removals, actor, now_ms) {
-                Err(error) if error.starts_with("definition_edit_no_change") => {
-                    return Err(
-                        "definition_proposal_no_change: restore matches the published member set"
-                            .into(),
-                    );
-                }
-                other => other?,
-            };
-        insert_members_postgres(&mut transaction, &upserts)?;
-        let revision = insert_revision_postgres(&mut transaction, &candidate)?;
-        let updated = transaction
-            .execute(
-                "UPDATE sekai_definition_branches
-                 SET head_revision_digest=$1, updated_at_ms=$2
-                 WHERE namespace=$3 AND branch_id=$4 AND head_revision_digest=$5",
-                &[
-                    &revision.revision_digest,
-                    &now_ms,
-                    &request.namespace,
-                    &request.branch_id,
-                    &published,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if updated != 1 {
-            return Err("stale_definition_branch_head: expected head is no longer current".into());
-        }
-        let proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
-            namespace: &request.namespace,
-            branch_id: &request.branch_id,
-            proposal_id: &request.proposal_id,
-            base_digest: &published,
-            candidate_digest: &revision.revision_digest,
-            eval_plan_digests: &[],
-            named_foreign_digests: &[],
-            restored_from_digest: &request.restore_from_digest,
-            migration_plan_digest: &request.migration_plan_digest,
-            major_revision: false,
-        })?;
-        let proposal = DefinitionProposal {
-            contract_version: PROPOSAL_CONTRACT_VERSION.into(),
-            namespace: request.namespace.clone(),
-            branch_id: request.branch_id.clone(),
-            proposal_id: request.proposal_id.clone(),
-            base_digest: published.clone(),
-            candidate_digest: revision.revision_digest.clone(),
-            proposal_digest,
-            eval_plan_digests: Vec::new(),
-            named_foreign_digests: Vec::new(),
-            approvals: Vec::new(),
-            status: STATUS_OPEN.into(),
-            created_by: actor.into(),
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-            receipt_id: String::new(),
-            close_reason_code: String::new(),
-            restored_from_digest: request.restore_from_digest.clone(),
-            migration_plan_digest: request.migration_plan_digest.clone(),
-            major_revision: false,
-        };
-        insert_proposal_postgres(&mut transaction, &proposal)?;
+        let proposal = open_replacement_proposal_postgres(
+            &mut transaction,
+            &ReplacementProposal {
+                namespace: &request.namespace,
+                branch_id: &request.branch_id,
+                proposal_id: &request.proposal_id,
+                members: restore_members,
+                restored_from_digest: &request.restore_from_digest,
+                migration_plan_digest: &request.migration_plan_digest,
+                source_package_digest: "",
+            },
+            &published,
+            &published_revision,
+            actor,
+            now_ms,
+        )?;
         let result = DefinitionWriteResult::CreateProposal {
             proposal: proposal.clone(),
         };
@@ -581,6 +603,7 @@ impl PostgresDb {
             restored_from_digest: String::new(),
             migration_plan_digest: String::new(),
             major_revision: request.major_revision,
+            source_package_digest: String::new(),
         };
         insert_proposal_postgres(&mut transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
@@ -1188,6 +1211,110 @@ fn load_proposal_postgres(
             Ok(proposal)
         })
         .transpose()
+}
+
+/// PostgreSQL twin of `open_replacement_proposal_sqlite`.
+fn open_replacement_proposal_postgres(
+    transaction: &mut postgres::Transaction<'_>,
+    replacement: &ReplacementProposal<'_>,
+    published: &str,
+    published_revision: &DefinitionRevision,
+    actor: &str,
+    now_ms: i64,
+) -> Result<DefinitionProposal, String> {
+    let (upserts, removals) = rollback_member_edits(published_revision, &replacement.members)?;
+    let branch = DefinitionBranch {
+        contract_version: crate::sekai::definition_branch::BRANCH_CONTRACT_VERSION.into(),
+        namespace: replacement.namespace.to_string(),
+        branch_id: replacement.branch_id.to_string(),
+        base_revision_digest: published.to_string(),
+        head_revision_digest: published.to_string(),
+        created_by: actor.into(),
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    };
+    transaction
+        .execute(
+            "INSERT INTO sekai_definition_branches (
+                namespace, branch_id, base_revision_digest, head_revision_digest,
+                created_by, created_at_ms, updated_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $6)",
+            &[
+                &branch.namespace,
+                &branch.branch_id,
+                &branch.base_revision_digest,
+                &branch.head_revision_digest,
+                &branch.created_by,
+                &branch.created_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    let candidate =
+        match apply_member_changes(published_revision, &upserts, &removals, actor, now_ms) {
+            Err(error) if error.starts_with("definition_edit_no_change") => {
+                return Err(
+                    "definition_proposal_no_change: proposed members match the published member set"
+                        .into(),
+                );
+            }
+            other => other?,
+        };
+    insert_members_postgres(transaction, &upserts)?;
+    let revision = insert_revision_postgres(transaction, &candidate)?;
+    let updated = transaction
+        .execute(
+            "UPDATE sekai_definition_branches
+             SET head_revision_digest=$1, updated_at_ms=$2
+             WHERE namespace=$3 AND branch_id=$4 AND head_revision_digest=$5",
+            &[
+                &revision.revision_digest,
+                &now_ms,
+                &replacement.namespace,
+                &replacement.branch_id,
+                &published,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err("stale_definition_branch_head: expected head is no longer current".into());
+    }
+    let proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
+        namespace: replacement.namespace,
+        branch_id: replacement.branch_id,
+        proposal_id: replacement.proposal_id,
+        base_digest: published,
+        candidate_digest: &revision.revision_digest,
+        eval_plan_digests: &[],
+        named_foreign_digests: &[],
+        restored_from_digest: replacement.restored_from_digest,
+        migration_plan_digest: replacement.migration_plan_digest,
+        major_revision: false,
+        source_package_digest: replacement.source_package_digest,
+    })?;
+    let proposal = DefinitionProposal {
+        contract_version: PROPOSAL_CONTRACT_VERSION.into(),
+        namespace: replacement.namespace.to_string(),
+        branch_id: replacement.branch_id.to_string(),
+        proposal_id: replacement.proposal_id.to_string(),
+        base_digest: published.to_string(),
+        candidate_digest: revision.revision_digest.clone(),
+        proposal_digest,
+        eval_plan_digests: Vec::new(),
+        named_foreign_digests: Vec::new(),
+        approvals: Vec::new(),
+        status: STATUS_OPEN.into(),
+        created_by: actor.into(),
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        receipt_id: String::new(),
+        close_reason_code: String::new(),
+        restored_from_digest: replacement.restored_from_digest.into(),
+        migration_plan_digest: replacement.migration_plan_digest.into(),
+        major_revision: false,
+        source_package_digest: replacement.source_package_digest.into(),
+    };
+    insert_proposal_postgres(transaction, &proposal)?;
+    Ok(proposal)
 }
 
 fn insert_proposal_postgres(

@@ -1762,6 +1762,30 @@ impl RuntimeDb {
         }
     }
 
+    pub fn propose_definition_import(
+        &self,
+        request: &crate::sekai::definition_proposal::ProposeDefinitionImport,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::propose_definition_import(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::propose_definition_import(
+                    db.as_ref(),
+                    request,
+                    actor,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
     pub fn propose_definition_rollback(
         &self,
         request: &ProposeDefinitionRollback,

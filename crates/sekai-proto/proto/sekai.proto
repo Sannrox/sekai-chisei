@@ -3037,6 +3037,8 @@ message DefinitionProposal {
   string migration_plan_digest = 18; // pin required when rollback would drop live properties
   // Approved as a new major revision: may break blocking consumer bindings.
   bool major_revision = 19;
+  // Package digest of the definition package this proposal imports (#1700).
+  string source_package_digest = 20;
 }
 
 message CreateDefinitionProposalRequest {
@@ -3129,6 +3131,34 @@ message ListPublishedDefinitionRevisionsRequest {
 message ListPublishedDefinitionRevisionsResponse {
   repeated PublishedDefinitionRevisionHistoryEntry entries = 1;
   string next_page_token = 2;
+}
+
+message ExportDefinitionPackageRequest {
+  string namespace = 1;
+  // A published revision; empty exports the published head.
+  string revision_digest = 2;
+}
+
+message ExportDefinitionPackageResponse {
+  // sekai.definition-package/v1 envelope: package, provenance, signature.
+  string envelope_json = 1;
+  string package_digest = 2;
+}
+
+message ImportDefinitionPackageRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string envelope_json = 4;
+  string idempotency_key = 5;
+}
+
+message ImportDefinitionPackageResponse {
+  DefinitionProposal proposal = 1;
+  DefinitionRevisionDiff preview = 2;
+  string source_namespace = 3;
+  string source_revision_digest = 4;
+  string signer_identity = 5;
 }
 
 message ProposeDefinitionRollbackRequest {
@@ -3373,6 +3403,11 @@ service SekaiService {
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc ListPublishedDefinitionRevisions(ListPublishedDefinitionRevisionsRequest) returns (ListPublishedDefinitionRevisionsResponse);
   rpc ProposeDefinitionRollback(ProposeDefinitionRollbackRequest) returns (ProposeDefinitionRollbackResponse);
+  // Signed, namespace-independent definition packages (#1700). Export signs
+  // a published revision with this plane's package key; import verifies the
+  // envelope against this plane's trusted package keys and opens a proposal.
+  rpc ExportDefinitionPackage(ExportDefinitionPackageRequest) returns (ExportDefinitionPackageResponse);
+  rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);

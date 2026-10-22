@@ -62,6 +62,10 @@ pub struct DefinitionProposal {
     /// bindings (ADR 0067, amended).
     #[serde(default)]
     pub major_revision: bool,
+    /// Package digest of the signed definition package this proposal
+    /// imports (#1700). Empty for proposals not created by import.
+    #[serde(default)]
+    pub source_package_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +361,7 @@ impl CreateDefinitionProposal {
             restored_from_digest: "",
             migration_plan_digest: "",
             major_revision: self.major_revision,
+            source_package_digest: "",
         })?;
         let request_digest = canonical_digest(
             "create_definition_proposal",
@@ -371,6 +376,7 @@ impl CreateDefinitionProposal {
                 restored_from_digest: "",
                 migration_plan_digest: "",
                 major_revision: self.major_revision,
+                source_package_digest: "",
             },
         )?;
         Ok((
@@ -420,6 +426,56 @@ impl CloseDefinitionProposal {
             MAX_DEFINITION_ID_BYTES,
         )?;
         canonical_digest("close_definition_proposal", self)
+    }
+}
+
+/// Opens a proposal whose candidate holds exactly a verified package's
+/// members (#1700). `members` are already prepared for `namespace`; the
+/// package digest binds them, so they stay out of the request digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposeDefinitionImport {
+    pub namespace: String,
+    pub branch_id: String,
+    pub proposal_id: String,
+    pub source_package_digest: String,
+    #[serde(default, skip_serializing)]
+    pub members: Vec<DefinitionMember>,
+    // Captured for compare-and-swap only, like rollback.
+    #[serde(default, skip_serializing)]
+    pub expected_published_digest: String,
+    pub idempotency_key: String,
+}
+
+impl ProposeDefinitionImport {
+    pub fn prepare(&self) -> Result<String, String> {
+        validate_namespace(&self.namespace)?;
+        validate_identifier("branch_id", &self.branch_id, MAX_DEFINITION_ID_BYTES)?;
+        validate_identifier("proposal_id", &self.proposal_id, MAX_DEFINITION_ID_BYTES)?;
+        validate_digest("source_package_digest", &self.source_package_digest)?;
+        validate_digest("expected_published_digest", &self.expected_published_digest).map_err(
+            |_| {
+                "stale_published_definition_head: expected published digest is required".to_string()
+            },
+        )?;
+        if self
+            .members
+            .iter()
+            .any(|member| member.namespace != self.namespace)
+        {
+            return Err("import members must be prepared for the target namespace".into());
+        }
+        if self.members.len() > crate::sekai::definition_branch::MAX_DEFINITION_MEMBERS {
+            return Err(format!(
+                "{}: package exceeds the supported member count",
+                crate::sekai::definition_package::REFUSAL_INCOMPATIBLE
+            ));
+        }
+        validate_identifier(
+            "idempotency_key",
+            &self.idempotency_key,
+            MAX_DEFINITION_ID_BYTES,
+        )?;
+        canonical_digest("propose_definition_import", self)
     }
 }
 
@@ -477,6 +533,9 @@ impl DefinitionProposal {
         if !self.migration_plan_digest.is_empty() {
             validate_digest("migration_plan_digest", &self.migration_plan_digest)?;
         }
+        if !self.source_package_digest.is_empty() {
+            validate_digest("source_package_digest", &self.source_package_digest)?;
+        }
         let expected = proposal_content_digest(&PreparedProposalDigestInput {
             namespace: &self.namespace,
             branch_id: &self.branch_id,
@@ -488,6 +547,7 @@ impl DefinitionProposal {
             restored_from_digest: &self.restored_from_digest,
             migration_plan_digest: &self.migration_plan_digest,
             major_revision: self.major_revision,
+            source_package_digest: &self.source_package_digest,
         })?;
         if expected != self.proposal_digest {
             return Err("definition proposal content binding is invalid".into());
@@ -612,6 +672,19 @@ pub fn merge_receipt_id(
             restored_from_digest,
         },
     )
+}
+
+/// A proposal whose candidate holds exactly `members` on top of the
+/// published head: a rollback (`restored_from_digest`) or a package import
+/// (`source_package_digest`). Members absent from `members` become removals.
+pub(crate) struct ReplacementProposal<'a> {
+    pub namespace: &'a str,
+    pub branch_id: &'a str,
+    pub proposal_id: &'a str,
+    pub members: Vec<DefinitionMember>,
+    pub restored_from_digest: &'a str,
+    pub migration_plan_digest: &'a str,
+    pub source_package_digest: &'a str,
 }
 
 /// Upserts every member of a prior published revision and removes members that
@@ -825,6 +898,9 @@ pub(crate) struct PreparedProposalDigestInput<'a> {
     /// Omitted when false, so digests of earlier proposals are unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) major_revision: bool,
+    /// Omitted when empty, so digests of earlier proposals are unchanged.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub(crate) source_package_digest: &'a str,
 }
 
 fn canonical_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
@@ -939,6 +1015,7 @@ mod tests {
             restored_from_digest: String::new(),
             migration_plan_digest: String::new(),
             major_revision: false,
+            source_package_digest: String::new(),
         };
         proposal.proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
             namespace: &proposal.namespace,
@@ -951,6 +1028,7 @@ mod tests {
             restored_from_digest: "",
             migration_plan_digest: "",
             major_revision: false,
+            source_package_digest: "",
         })
         .unwrap();
         proposal.verify().unwrap();

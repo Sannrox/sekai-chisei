@@ -36,6 +36,7 @@ pub mod definition_branch;
 pub mod definition_consumer_impact;
 pub mod definition_diff;
 pub mod definition_migration;
+pub mod definition_package;
 pub mod definition_proposal;
 pub(crate) mod delegating_principal;
 pub mod document;

@@ -17,8 +17,8 @@ use sekai_chisei::sekai::definition_diff::{
 };
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
-    CreateDefinitionProposal, MergeDefinitionProposal, ProposeDefinitionRollback, STATUS_CLOSED,
-    STATUS_MERGED, STATUS_OPEN,
+    CreateDefinitionProposal, MergeDefinitionProposal, ProposeDefinitionImport,
+    ProposeDefinitionRollback, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
 };
 
 fn member(namespace: &str, member_id: &str, definition_json: &str) -> DefinitionMemberInput {
@@ -1502,6 +1502,68 @@ fn exercise_definition_rollback(db: &dyn DefinitionBranchBackend, namespace: &st
     );
 }
 
+/// Import opens a proposal holding exactly the given members: missing
+/// target members are removals, the package digest is pinned, and a retry
+/// replays the same proposal.
+fn exercise_definition_import(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let published = seed_ticket(db, namespace, r#"{"name":"Ticket","properties":["title"]}"#);
+    let incoming = typed_member(
+        namespace,
+        "ontology_class",
+        "TicketClass",
+        r#"{"name":"TicketClass"}"#,
+    )
+    .prepare(namespace)
+    .unwrap();
+    let request = ProposeDefinitionImport {
+        namespace: namespace.into(),
+        branch_id: "pkg-import".into(),
+        proposal_id: "pkg-cs-import".into(),
+        source_package_digest: digest('e'),
+        members: vec![incoming.clone()],
+        expected_published_digest: published.clone(),
+        idempotency_key: "pkg-import-1".into(),
+    };
+    let DefinitionWriteResult::CreateProposal { proposal } = db
+        .propose_definition_import(&request, "author", 20)
+        .unwrap()
+    else {
+        panic!("expected import proposal");
+    };
+    assert_eq!(proposal.status, STATUS_OPEN);
+    assert_eq!(proposal.base_digest, published);
+    assert_eq!(proposal.source_package_digest, digest('e'));
+    assert_eq!(
+        member_set(db, namespace, &proposal.candidate_digest),
+        vec![(
+            incoming.member_kind.clone(),
+            incoming.member_id.clone(),
+            incoming.member_digest.clone()
+        )]
+    );
+    let DefinitionWriteResult::CreateProposal { proposal: replayed } = db
+        .propose_definition_import(&request, "author", 21)
+        .unwrap()
+    else {
+        panic!("expected replayed import proposal");
+    };
+    assert_eq!(replayed, proposal);
+    let stale = ProposeDefinitionImport {
+        proposal_id: "pkg-cs-stale".into(),
+        branch_id: "pkg-stale".into(),
+        expected_published_digest: digest('d'),
+        idempotency_key: "pkg-import-stale".into(),
+        ..request
+    };
+    let refused = db
+        .propose_definition_import(&stale, "author", 22)
+        .unwrap_err();
+    assert!(
+        refused.starts_with("stale_published_definition_head"),
+        "{refused}"
+    );
+}
+
 fn exercise_rollback_live_values(
     db: &dyn DefinitionBranchBackend,
     namespace: &str,
@@ -1879,6 +1941,7 @@ fn sqlite_definition_branch_backend_conformance() {
     exercise_named_compatibility_gate_refusal(&SekaiDb::new(":memory:").unwrap(), "sqlite-gate");
     exercise_published_revision_history(&SekaiDb::new(":memory:").unwrap(), "sqlite-history");
     exercise_definition_rollback(&SekaiDb::new(":memory:").unwrap(), "sqlite-rollback");
+    exercise_definition_import(&SekaiDb::new(":memory:").unwrap(), "sqlite-import");
     {
         let db = SekaiDb::new(":memory:").unwrap();
         let namespace = "sqlite-rollback-live";
@@ -1921,6 +1984,7 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_named_compatibility_gate_refusal(db.as_ref(), &format!("{prefix}-gate"));
     exercise_published_revision_history(db.as_ref(), &format!("{prefix}-history"));
     exercise_definition_rollback(db.as_ref(), &format!("{prefix}-rollback"));
+    exercise_definition_import(db.as_ref(), &format!("{prefix}-import"));
     {
         let namespace = format!("{prefix}-rollback-live");
         exercise_rollback_live_values(db.as_ref(), &namespace, || {

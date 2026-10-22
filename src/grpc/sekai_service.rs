@@ -59,6 +59,8 @@ mod rpc_actions;
 mod rpc_coordination;
 #[path = "sekai_service_rpc_data.rs"]
 mod rpc_data;
+#[path = "sekai_service_rpc_definition_package.rs"]
+mod rpc_definition_package;
 #[path = "sekai_service_rpc_definitions.rs"]
 mod rpc_definitions;
 #[path = "sekai_service_rpc_leases.rs"]
@@ -605,6 +607,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ProposeDefinitionRollbackRequest>,
     ) -> Result<Response<ProposeDefinitionRollbackResponse>, Status> {
         rpc_definitions::propose_definition_rollback(self, req).await
+    }
+
+    async fn export_definition_package(
+        &self,
+        req: Request<ExportDefinitionPackageRequest>,
+    ) -> Result<Response<ExportDefinitionPackageResponse>, Status> {
+        rpc_definition_package::export_definition_package(self, req).await
+    }
+
+    async fn import_definition_package(
+        &self,
+        req: Request<ImportDefinitionPackageRequest>,
+    ) -> Result<Response<ImportDefinitionPackageResponse>, Status> {
+        rpc_definition_package::import_definition_package(self, req).await
     }
 
     async fn compare_definition_revisions(

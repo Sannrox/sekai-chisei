@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Experimental signed definition packages: `ExportDefinitionPackage` signs a
+  published revision as a namespace-independent `sekai.definition-package/v1`
+  envelope, and `ImportDefinitionPackage` verifies it against the plane's
+  trusted package keys and opens a proposal holding exactly its members, with
+  `source_package_digest` recorded. Import never merges; tampered,
+  unverified, or incompatible packages are refused by name and write nothing
+  (docs/definition-branches.md, #1700).
+
 - A consumer can mark its definition consumer binding `blocking`.
   Publishing a revision that breaks a valid blocking binding then fails and
   names it, unless the proposal is an approved major revision

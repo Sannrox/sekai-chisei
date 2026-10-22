@@ -979,7 +979,9 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("definition_rollback_requires_migration_plan")
     {
         Status::failed_precondition("definition write is not current")
-    } else if error.starts_with("agent_promotion_") {
+    } else if error.starts_with("agent_promotion_")
+        || error.starts_with(crate::sekai::definition_package::REFUSAL_INCOMPATIBLE)
+    {
         Status::failed_precondition(error)
     } else if let Some(gate) = error.strip_prefix("compatibility_gate:") {
         Status::failed_precondition(format!("compatibility_gate:{gate}"))
@@ -1029,6 +1031,7 @@ pub(super) fn to_proto_definition_proposal(
         restored_from_digest: proposal.restored_from_digest.clone(),
         migration_plan_digest: proposal.migration_plan_digest.clone(),
         major_revision: proposal.major_revision,
+        source_package_digest: proposal.source_package_digest.clone(),
     }
 }
 pub(super) fn authorize_proposal_member_writes(
