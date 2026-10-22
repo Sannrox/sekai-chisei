@@ -22,7 +22,7 @@ use crate::sekai::action_type_criteria::{
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
 use crate::sekai::{action_effect, action_object_mutation, action_policy, audit, object_log};
-use sekai_provider::receipt::{
+use sekai_domain::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
 };
 use std::collections::{BTreeMap, HashMap};

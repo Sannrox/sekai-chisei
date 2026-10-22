@@ -85,7 +85,6 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain;
-use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::action_work_lifecycle::{
@@ -135,6 +134,7 @@ use crate::sekai::work_unit_lifecycle::{
 use crate::sekai::{
     audit, compute, coordination, dataset, function, ontology, retrieval, security, semantic,
 };
+use sekai_domain::gateway_keys::hash_gateway_key;
 use uuid::Uuid;
 
 use self::catalog_invocation::CatalogInvocation;

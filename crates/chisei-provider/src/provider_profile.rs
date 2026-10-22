@@ -2933,7 +2933,7 @@ mod tests {
     #[tokio::test]
     async fn async_refresh_returns_the_snapshot_for_its_state_path() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-path-snapshot-{}",
+            "chisei-provider-path-snapshot-{}",
             uuid::Uuid::new_v4()
         ));
         let enabled_path = directory.join("enabled.json");
@@ -3158,8 +3158,10 @@ mod tests {
 
     #[test]
     fn experimental_provider_cannot_skip_canary_admission() {
-        let directory =
-            std::env::temp_dir().join(format!("sekai-provider-admission-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!(
+            "chisei-provider-admission-{}",
+            uuid::Uuid::new_v4()
+        ));
         let path = directory.join("registry.json");
         refresh_provider_registry(&path).unwrap();
         let direct = update_registry_lifecycle(
@@ -3219,7 +3221,7 @@ mod tests {
     #[test]
     fn provider_registry_state_round_trip_preserves_full_history() {
         let directory =
-            std::env::temp_dir().join(format!("sekai-provider-registry-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("chisei-provider-registry-{}", uuid::Uuid::new_v4()));
         let path = directory.join("state.json");
         let mut registry = ProviderRegistry::built_in();
         registry.state_version = 2;
@@ -3315,7 +3317,7 @@ mod tests {
     #[test]
     fn provider_registry_state_fails_closed_after_initialized_file_disappears() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-missing-{}",
+            "chisei-provider-registry-missing-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("state.json");
@@ -3336,7 +3338,7 @@ mod tests {
     #[test]
     fn provider_registry_storage_probe_removes_both_links() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-probe-{}",
+            "chisei-provider-registry-probe-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("state.json");
@@ -3350,7 +3352,7 @@ mod tests {
     #[test]
     fn legacy_empty_lock_is_rejected() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-legacy-lock-{}",
+            "chisei-provider-registry-legacy-lock-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("state.json");
@@ -3366,7 +3368,7 @@ mod tests {
     #[test]
     fn current_protocol_lock_allows_concurrent_fresh_initialization() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-current-lock-{}",
+            "chisei-provider-registry-current-lock-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("state.json");
@@ -3384,7 +3386,7 @@ mod tests {
     #[test]
     fn current_protocol_waits_for_a_legacy_writer_lock() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-mixed-lock-{}",
+            "chisei-provider-registry-mixed-lock-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("state.json");
@@ -3417,7 +3419,7 @@ mod tests {
     #[test]
     fn concurrent_fresh_initializers_share_atomically_published_lock() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-concurrent-{}",
+            "chisei-provider-registry-concurrent-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("state.json");
@@ -3449,7 +3451,7 @@ mod tests {
     #[test]
     fn interrupted_lock_publication_does_not_poison_fresh_initialization() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-interrupted-{}",
+            "chisei-provider-registry-interrupted-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("state.json");
@@ -3487,7 +3489,7 @@ mod tests {
     #[test]
     fn stale_cleanup_preserves_active_and_unrelated_publications() {
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-active-publication-{}",
+            "chisei-provider-registry-active-publication-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("state.json");
@@ -3554,7 +3556,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-symlink-race-{}",
+            "chisei-provider-registry-symlink-race-{}",
             uuid::Uuid::new_v4()
         ));
         let publication = directory.join("publication");
@@ -3591,8 +3593,9 @@ mod tests {
         const CHILD_PATH: &str = "SEKAI_QUARANTINE_UMASK_CHILD_PATH";
         const CHILD_TOKEN: &str = "SEKAI_QUARANTINE_UMASK_CHILD_TOKEN";
         let token = uuid::Uuid::new_v4().to_string();
-        let directory =
-            std::env::temp_dir().join(format!("sekai-provider-registry-restrictive-umask-{token}"));
+        let directory = std::env::temp_dir().join(format!(
+            "chisei-provider-registry-restrictive-umask-{token}"
+        ));
         let publication = directory.join("publication");
         let owner_marker = directory.join(".owner");
         std::fs::create_dir_all(&directory).unwrap();
@@ -3633,7 +3636,7 @@ mod tests {
         assert_eq!(parsed.to_string(), token);
         let publication = PathBuf::from(path);
         assert_eq!(publication.file_name().unwrap(), "publication");
-        let expected_directory = format!("sekai-provider-registry-restrictive-umask-{token}");
+        let expected_directory = format!("chisei-provider-registry-restrictive-umask-{token}");
         let expected_parent = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -3678,7 +3681,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let directory = std::env::temp_dir().join(format!(
-            "sekai-provider-registry-non-utf8-{}",
+            "chisei-provider-registry-non-utf8-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join(std::ffi::OsString::from_vec(vec![

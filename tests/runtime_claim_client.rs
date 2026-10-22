@@ -7,7 +7,6 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::store::SekaiStore;
-use sekai_chisei::gateway_keys::hash_gateway_key;
 use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
 use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
 use sekai_chisei::rpc_maturity::RpcMaturityLayer;
@@ -24,6 +23,7 @@ use sekai_client::claim::{
 };
 use sekai_client::protocol::sekai::TransformRunInputRow;
 use sekai_client::{ClientConfig, CoreLoopClient};
+use sekai_domain::gateway_keys::hash_gateway_key;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tower::Layer;

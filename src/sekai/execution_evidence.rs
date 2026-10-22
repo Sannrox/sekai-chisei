@@ -9,7 +9,7 @@ use crate::sekai::external_permit::{HostContext, Permit, Redemption};
 use crate::shomei::{AttestationBundle, canonical_json};
 use ed25519_dalek::VerifyingKey;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use sekai_provider::receipt::{
+use sekai_domain::receipt::{
     GovernedReference, OperationReceiptEvent, ReceiptEventKind, ReceiptSurface,
 };
 use serde::{Deserialize, Serialize};
@@ -679,7 +679,7 @@ mod tests {
     };
     use crate::sekai::external_permit::{PERMIT_VERSION, REDEMPTION_MODE, SIGNATURE_ALGORITHM};
     use ed25519_dalek::SigningKey;
-    use sekai_provider::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, UncoveredSurface};
+    use sekai_domain::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, UncoveredSurface};
 
     fn permit(executor: &str, capability: &str) -> (Permit, SigningKey) {
         let key = SigningKey::from_bytes(&[7; 32]);

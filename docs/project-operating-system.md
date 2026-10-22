@@ -115,7 +115,7 @@ creating a second project-management tree.
 | --- | --- | --- |
 | `src/sekai/` | Sekai maintainers | Durable graph, audit, lineage, security, evidence, coordination, and memory primitives. |
 | `src/chisei/` | Chisei maintainers | Policy, budget, routing, approval, evaluation, and learning decisions. |
-| `crates/sekai-provider/` | Provider maintainers | Provider registry, provider-specific execution, pricing, and shared receipt contracts. |
+| `crates/chisei-provider/` | Provider maintainers | Chisei provider registry, provider-specific execution, pricing, and routing. |
 | `crates/chisei-gateway/` | Gateway maintainers | Compatible HTTP egress proxy, setup/report clients, and gateway-local observability. |
 | `src/grpc/`, `proto/` | API maintainers | Transport implementations and public native contracts. |
 | `adapters/` | Integration owners | Domain-neutral external evidence adapters; not core ontology. |

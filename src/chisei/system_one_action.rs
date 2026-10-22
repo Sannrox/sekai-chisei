@@ -6,7 +6,7 @@
 use crate::chisei::egress::{self, ContextEgressRecord};
 use crate::chisei::object_schema::ObjectType;
 use crate::domain::Object;
-use sekai_provider::system_one::{
+use chisei_provider::system_one::{
     SystemOneBind, SystemOneRequest, SystemOneResponse, TypeSafeClient, parameters_from_answers,
     request_from_bind,
 };
@@ -164,7 +164,7 @@ pub async fn fill_proposed_parameters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sekai_provider::system_one::SystemOneQuestionBind;
+    use chisei_provider::system_one::SystemOneQuestionBind;
     use serde_json::json;
     use std::collections::HashMap;
 

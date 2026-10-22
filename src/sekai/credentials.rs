@@ -8,7 +8,7 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::PrincipalCredential;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::gateway_keys::hash_gateway_key;
+use sekai_domain::gateway_keys::hash_gateway_key;
 
 /// Maximum age of a process-local credential cache snapshot before a same-epoch
 /// reload is forced. Revocation/rotation bumps the activity epoch and reloads

@@ -30,7 +30,6 @@ use crate::client::connect_sekai;
 use crate::client::{
     GatewayClient, connect_sekai_as_gateway_with_timeout, connect_sekai_with_timeout,
 };
-use crate::gateway_keys::hash_gateway_key;
 use crate::gateway_support::METRIC_REQUESTS;
 use crate::llm::HttpTimeouts;
 use crate::pricing::lookup_pricing_entry;
@@ -40,6 +39,11 @@ use crate::provider_profile::{
     ProviderRegistry, normalize_responses_request, provider_registry_snapshot,
     provider_registry_state_path, refresh_provider_registry, validate_provider_registry_storage,
     validate_responses_request_fields,
+};
+use sekai_domain::gateway_keys::hash_gateway_key;
+use sekai_domain::receipt::{
+    GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
+    ReceiptEventKind, UncoveredSurface,
 };
 #[cfg(test)]
 use sekai_proto::chisei::GetEffectivePolicySummaryRequest;
@@ -54,10 +58,6 @@ use sekai_proto::sekai::{
     CreateLinkRequest, CreateObjectRequest, Dataset, Decision, FindByExternalIdRequest,
     FindByPropertyRequest, Link, ListSchemaTypesRequest, Object as SekaiObject, QueryRowsRequest,
     RecordDecisionRequest, RetrieveContextRequest, Row, RowFilter, RowQuery, UpdateDatasetRequest,
-};
-use sekai_provider::receipt::{
-    GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
-    ReceiptEventKind, UncoveredSurface,
 };
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
@@ -115,7 +115,7 @@ const DEFAULT_GATEWAY_TIER: &str = "standard";
 const MIN_ADMIN_TOKEN_BYTES: usize = 32;
 const DEFAULT_USAGE_RECOVERY_PATH: &str = "data/chisei-gateway-usage-recovery.json";
 const DEFAULT_RECOVERY_SPOOL_PATH: &str = "data/chisei-gateway-recovery.jsonl";
-pub(crate) use sekai_provider::gateway_contract::LLM_CALLS_COLUMNS;
+pub(crate) use chisei_provider::gateway_contract::LLM_CALLS_COLUMNS;
 
 #[path = "gateway_runtime.rs"]
 mod runtime;

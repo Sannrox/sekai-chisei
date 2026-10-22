@@ -447,7 +447,7 @@ pub(super) async fn preview_object_action(
             .get_object_type(&object.kind)
             .ok()
             .flatten();
-        let client = sekai_provider::system_one::TypeSafeClient::from_env()
+        let client = chisei_provider::system_one::TypeSafeClient::from_env()
             .map_err(Status::failed_precondition)?;
         let (filled, record) = crate::chisei::system_one_action::fill_proposed_parameters(
             &type_def,
