@@ -1687,6 +1687,32 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ReplayGovernedTransform",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/transform_replay.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetTransformReplay",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/transform_replay.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutDatasetHealthCheck",
       "kind": "persistent",
       "surfaces": [

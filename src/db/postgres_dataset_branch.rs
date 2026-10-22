@@ -91,129 +91,140 @@ impl PostgresDb {
         tenant: &str,
         now_ms: i64,
     ) -> Result<DatasetBranchRun, String> {
-        use crate::db::postgres_audit::lock_object_lifecycle;
-        use crate::db::postgres_governed_transform::{
-            load_dataset_column_names, load_dataset_object_id, load_object_marking_token,
-            load_row_records, load_transform, lock_transform_datasets,
-        };
-        use crate::sekai::governed_transform::{
-            InputLoadBudget, TransformInputRows, compute_run_tables_until,
-            derive_transform_markings, require_bound_output_for_markings,
-        };
-        dataset_branch::validate_branch_name(branch)?;
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let transform = load_transform(&mut tx, namespace, transform_id)?
-            .ok_or_else(|| "governed transform not found".to_string())?;
-        if transform.is_isolated_process() {
-            return Err(dataset_branch::BRANCH_RUN_ISOLATED.into());
-        }
-        let bindings = transform.input_bindings();
-        let output = transform.output_dataset_id.clone();
-        let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
-        lock_ids.push(&output);
-        lock_transform_datasets(&mut tx, &lock_ids)?;
-        let mut budget = InputLoadBudget::for_transform(&transform);
-        let mut loaded = Vec::new();
-        let mut tokens = Vec::new();
-        let mut branch_inputs = Vec::new();
-        for (alias, dataset_id) in &bindings {
-            let records = match load_branch(&mut tx, dataset_id, branch, true) {
-                Ok(head) if head.tenant != tenant => {
-                    return Err(dataset_branch::BRANCH_NOT_FOUND.into());
-                }
-                Ok(head) => {
-                    branch_inputs.push(dataset_id.clone());
-                    branch_records_budgeted(&mut tx, &head, budget.as_mut())?
-                }
-                Err(_) => load_row_records(&mut tx, dataset_id, 0, budget.as_mut())?,
-            };
-            if let Some(reason) = budget.as_ref().and_then(|budget| budget.exceeded) {
-                return Err(format!("branch run refused: {reason}"));
-            }
-            loaded.push((
-                alias.clone(),
-                load_dataset_column_names(&mut tx, dataset_id)?,
-                records,
-            ));
-            let object_id = load_dataset_object_id(&mut tx, dataset_id)?;
-            tokens.push(load_object_marking_token(&mut tx, &object_id)?);
-        }
-        let output_object_id = load_dataset_object_id(&mut tx, &output)?;
-        // Held to commit, so the marking checked here is the one the branch
-        // rows land under, as on a parent run.
-        if !output_object_id.trim().is_empty() {
-            lock_object_lifecycle(&mut tx, &output_object_id)?;
-        }
-        let prior = load_object_marking_token(&mut tx, &output_object_id)?;
-        let (_, markings_out) = derive_transform_markings(
-            None,
-            tokens.iter().map(|token| token.as_deref()),
-            prior.as_deref(),
-            loaded
-                .iter()
-                .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row)),
-        )?;
-        require_bound_output_for_markings(&output_object_id, &markings_out)?;
-        if markings_out.trim() != prior.as_deref().unwrap_or("").trim() {
-            return Err(dataset_branch::BRANCH_RUN_RAISES_MARKING.into());
-        }
-        if let Some(budget) = budget.as_mut() {
-            budget.expire_if_past();
-            if let Some(reason) = budget.exceeded {
-                return Err(format!("branch run refused: {reason}"));
-            }
-        }
-        let tables: Vec<TransformInputRows<'_>> = loaded
-            .iter()
-            .map(|(alias, columns, records)| TransformInputRows {
-                alias,
-                records,
-                columns,
-            })
-            .collect();
-        let (run, rows) = compute_run_tables_until(
-            &transform,
-            None,
-            &tables,
-            false,
-            now_ms,
-            uuid::Uuid::new_v4().to_string(),
-            budget.as_ref().map(|budget| budget.deadline()),
-        );
-        if run.quarantined {
-            return Err(format!("branch run quarantined by {}", run.quality_rule));
-        }
-        match load_branch(&mut tx, &output, branch, true) {
-            Ok(head) if head.tenant != tenant => {
-                return Err(dataset_branch::BRANCH_NOT_FOUND.into());
-            }
-            Ok(_) => {}
-            Err(_) => {
-                create_branch_pg(
-                    &mut tx,
-                    &CreateDatasetBranch {
-                        dataset_id: output.clone(),
-                        name: branch.into(),
-                        from_version_id: String::new(),
-                        actor: actor.into(),
-                        tenant: tenant.into(),
-                    },
-                )?;
-            }
-        }
-        let rows_written = write_branch_rows_pg(&mut tx, &output, branch, &rows, true)?;
+        let transform = crate::db::postgres_governed_transform::load_transform(
+            &mut tx,
+            namespace,
+            transform_id,
+        )?
+        .ok_or_else(|| "governed transform not found".to_string())?;
+        let (run, _) = branch_run_pg(&mut tx, &transform, branch, None, actor, tenant, now_ms)?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(DatasetBranchRun {
-            transform_id: transform_id.into(),
-            branch: branch.into(),
-            output_dataset_id: output,
-            rows_written,
-            branch_inputs,
-            markings_out,
+        Ok(run)
+    }
+
+    /// PostgreSQL twin of the SQLite replay run: the branch and its record
+    /// commit together.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replay_transform_into_branch(
+        &self,
+        _namespace: &str,
+        transform: &crate::sekai::governed_transform::GovernedTransform,
+        branch: &str,
+        pins: &std::collections::BTreeMap<String, String>,
+        actor: &str,
+        tenant: &str,
+        now_ms: i64,
+        baseline_version_id: &str,
+        definition_digest: &str,
+        describe: &crate::sekai::transform_replay::Describe<'_>,
+    ) -> Result<crate::sekai::transform_replay::TransformReplay, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        // FOR SHARE holds off a redefinition or delete until commit.
+        let current: Option<String> = tx
+            .query_opt(
+                "SELECT definition_digest FROM sekai_governed_transform
+                 WHERE namespace = $1 AND transform_id = $2 FOR SHARE",
+                &[&transform.namespace, &transform.transform_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        if current.as_deref() != Some(definition_digest) {
+            return Err(crate::sekai::transform_replay::REPLAY_TRANSFORM_CHANGED.into());
+        }
+        let (run, rows) = branch_run_pg(
+            &mut tx,
+            transform,
+            branch,
+            Some(pins),
+            actor,
+            tenant,
+            now_ms,
+        )?;
+        if !baseline_version_id.is_empty() {
+            require_live_version_pg(&mut tx, &run.output_dataset_id, baseline_version_id)?;
+        }
+        // The baseline is read in the same transaction as the inputs, so the
+        // diff sees one state, and is charged to the transform's memory and
+        // time budget (the preview default when it has none).
+        let mut budget = crate::sekai::governed_transform::InputLoadBudget::for_preview(transform);
+        let baseline = branch_records_budgeted(
+            &mut tx,
+            &DatasetBranch {
+                dataset_id: run.output_dataset_id.clone(),
+                base_version_id: baseline_version_id.into(),
+                ..DatasetBranch::default()
+            },
+            Some(&mut budget),
+        )?;
+        budget.expire_if_past();
+        if let Some(reason) = budget.exceeded {
+            return Err(format!("branch run refused: {reason}"));
+        }
+        let baseline: Rows = baseline.into_iter().map(|(_, row)| row).collect();
+        let replay = describe(&run, &rows, &baseline)?;
+        let json =
+            serde_json::to_string(&replay.without_rows()).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_transform_replays
+             (id, namespace, transform_id, output_dataset_id, tenant, record_json, created_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &replay.id,
+                &replay.namespace,
+                &replay.transform_id,
+                &replay.output_dataset_id,
+                &replay.tenant,
+                &json,
+                &replay.created_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(replay)
+    }
+
+    pub fn get_transform_replay(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::sekai::transform_replay::TransformReplay>, String> {
+        let row = self
+            .connection()?
+            .query_opt(
+                "SELECT record_json FROM sekai_transform_replays WHERE id = $1",
+                &[&id],
+            )
+            .map_err(|error| error.to_string())?;
+        row.map(|row| {
+            serde_json::from_str(&row.get::<_, String>(0)).map_err(|error| error.to_string())
         })
+        .transpose()
+    }
+
+    pub fn list_object_type_datasources(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeDatasource>, String> {
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT kind, dataset_id, key_column FROM sekai_object_type_datasource
+                 WHERE namespace = $1 ORDER BY kind",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                crate::db::dataset_branch::datasource(namespace, row.get(0), row.get(1), row.get(2))
+            })
+            .collect())
     }
 
     pub fn compare_dataset_branch(
@@ -499,6 +510,187 @@ pub(crate) fn write_branch_rows_pg(
     )
     .map_err(|error| error.to_string())?;
     Ok(head.len() as i64)
+}
+
+/// One branch run inside `tx`; see [`PostgresDb::run_governed_transform_on_branch`].
+/// With `pins`, each input reads its pinned version instead, and the output
+/// branch must be new.
+fn branch_run_pg(
+    tx: &mut Transaction<'_>,
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+    branch: &str,
+    pins: Option<&std::collections::BTreeMap<String, String>>,
+    actor: &str,
+    tenant: &str,
+    now_ms: i64,
+) -> Result<(DatasetBranchRun, Rows), String> {
+    use crate::db::postgres_audit::lock_object_lifecycle;
+    use crate::db::postgres_governed_transform::{
+        load_dataset_column_names, load_dataset_object_id, load_object_marking_token,
+        load_row_records, lock_transform_datasets,
+    };
+    use crate::sekai::governed_transform::{
+        InputLoadBudget, TransformInputRows, compute_run_tables_until, derive_transform_markings,
+        require_bound_output_for_markings,
+    };
+    dataset_branch::validate_branch_name(branch)?;
+    if transform.is_isolated_process() {
+        return Err(dataset_branch::BRANCH_RUN_ISOLATED.into());
+    }
+    let bindings = transform.input_bindings();
+    let output = transform.output_dataset_id.clone();
+    let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
+    lock_ids.push(&output);
+    lock_transform_datasets(tx, &lock_ids)?;
+    let mut budget = InputLoadBudget::for_transform(transform);
+    let mut loaded = Vec::new();
+    let mut tokens = Vec::new();
+    let mut branch_inputs = Vec::new();
+    let mut read = Vec::new();
+    for (alias, dataset_id) in &bindings {
+        let records = if let Some(pins) = pins {
+            // A replay reads the pinned version, or nothing when the
+            // dataset had no version.
+            let version_id = pins.get(dataset_id).cloned().unwrap_or_default();
+            let pinned = DatasetBranch {
+                dataset_id: dataset_id.clone(),
+                base_version_id: version_id.clone(),
+                ..DatasetBranch::default()
+            };
+            if !version_id.is_empty() {
+                require_live_version_pg(tx, dataset_id, &version_id)?;
+            }
+            let records = branch_records_budgeted(tx, &pinned, budget.as_mut())?;
+            let rows: Rows = records.iter().map(|(_, row)| row.clone()).collect();
+            read.push(crate::sekai::transform_replay::ReplayInput {
+                alias: alias.clone(),
+                dataset_id: dataset_id.clone(),
+                version_id,
+                rows: rows.len() as i64,
+                digest: dataset_branch::rows_digest(&rows),
+                columns: Vec::new(),
+            });
+            records
+        } else {
+            match load_branch(tx, dataset_id, branch, true) {
+                Ok(head) if head.tenant != tenant => {
+                    return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+                }
+                Ok(head) => {
+                    branch_inputs.push(dataset_id.clone());
+                    branch_records_budgeted(tx, &head, budget.as_mut())?
+                }
+                Err(_) => load_row_records(tx, dataset_id, 0, budget.as_mut())?,
+            }
+        };
+        if let Some(reason) = budget.as_ref().and_then(|budget| budget.exceeded) {
+            return Err(format!("branch run refused: {reason}"));
+        }
+        let columns = load_dataset_column_names(tx, dataset_id)?;
+        if let (Some(_), Some(input)) = (pins, read.last_mut()) {
+            input.columns = columns.clone();
+        }
+        loaded.push((alias.clone(), columns, records));
+        let object_id = load_dataset_object_id(tx, dataset_id)?;
+        tokens.push(load_object_marking_token(tx, &object_id)?);
+    }
+    let output_object_id = load_dataset_object_id(tx, &output)?;
+    // Held to commit, so the marking checked here is the one the branch
+    // rows land under, as on a parent run.
+    if !output_object_id.trim().is_empty() {
+        lock_object_lifecycle(tx, &output_object_id)?;
+    }
+    let prior = load_object_marking_token(tx, &output_object_id)?;
+    let (_, markings_out) = derive_transform_markings(
+        None,
+        tokens.iter().map(|token| token.as_deref()),
+        prior.as_deref(),
+        loaded
+            .iter()
+            .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row)),
+    )?;
+    require_bound_output_for_markings(&output_object_id, &markings_out)?;
+    if markings_out.trim() != prior.as_deref().unwrap_or("").trim() {
+        return Err(dataset_branch::BRANCH_RUN_RAISES_MARKING.into());
+    }
+    if let Some(budget) = budget.as_mut() {
+        budget.expire_if_past();
+        if let Some(reason) = budget.exceeded {
+            return Err(format!("branch run refused: {reason}"));
+        }
+    }
+    let tables: Vec<TransformInputRows<'_>> = loaded
+        .iter()
+        .map(|(alias, columns, records)| TransformInputRows {
+            alias,
+            records,
+            columns,
+        })
+        .collect();
+    let (run, rows) = compute_run_tables_until(
+        transform,
+        None,
+        &tables,
+        false,
+        now_ms,
+        uuid::Uuid::new_v4().to_string(),
+        budget.as_ref().map(|budget| budget.deadline()),
+    );
+    if run.quarantined {
+        return Err(format!("branch run quarantined by {}", run.quality_rule));
+    }
+    match load_branch(tx, &output, branch, true) {
+        // A replay's branch is its own, never an existing one.
+        Ok(_) if pins.is_some() => return Err(dataset_branch::BRANCH_EXISTS.into()),
+        Ok(head) if head.tenant != tenant => {
+            return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+        }
+        Ok(_) => {}
+        Err(_) => {
+            create_branch_pg(
+                tx,
+                &CreateDatasetBranch {
+                    dataset_id: output.clone(),
+                    name: branch.into(),
+                    from_version_id: String::new(),
+                    actor: actor.into(),
+                    tenant: tenant.into(),
+                },
+            )?;
+        }
+    }
+    let rows_written = write_branch_rows_pg(tx, &output, branch, &rows, true)?;
+    Ok((
+        DatasetBranchRun {
+            transform_id: transform.transform_id.clone(),
+            branch: branch.into(),
+            output_dataset_id: output,
+            rows_written,
+            branch_inputs,
+            markings_out,
+            inputs: read,
+        },
+        rows,
+    ))
+}
+
+/// A pinned version must exist and still hold its rows.
+fn require_live_version_pg(
+    tx: &mut Transaction<'_>,
+    dataset_id: &str,
+    version_id: &str,
+) -> Result<(), String> {
+    let row = tx
+        .query_opt(
+            "SELECT purged FROM sekai_dataset_versions WHERE dataset_id = $1 AND version_id = $2",
+            &[&dataset_id, &version_id],
+        )
+        .map_err(|error| error.to_string())?;
+    match row.map(|row| row.get::<_, i32>(0)) {
+        None => Err(dataset_version::DATASET_VERSION_NOT_FOUND.into()),
+        Some(0) => Ok(()),
+        Some(_) => Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into()),
+    }
 }
 
 /// Branch head rows as run input, streamed and charged to `budget` while

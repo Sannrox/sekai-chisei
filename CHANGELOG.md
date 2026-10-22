@@ -8,7 +8,7 @@
   rate and bounded samples of differing decisions, and `SetNamespacePolicy`
   refuses the shadowed candidate until the report passes. Start and stop
   are recorded as decisions (docs/policy-dry-run.md,
-  `0089_chisei_policy_shadow`, GATE:mig, #1630).
+  `0090_chisei_policy_shadow`, GATE:mig, #1630).
 
 - Experimental `GetOntologyChangelog` lists what changed in a reader's
   namespaces over a window: each published definition revision with a
@@ -24,6 +24,15 @@
   (`major_revision`). Blocking bindings are disclosed to producers in
   impact reports; advisory bindings keep the ADR 0067 non-disclosure
   (ADR 0067 amended, #1635).
+
+- Experimental transform replays (ADR 0120): `ReplayGovernedTransform`
+  re-runs a governed transform, as stored or as a candidate definition,
+  over input dataset versions pinned by id or by time, on a fresh branch of
+  its output. The record pins inputs, definition and engine, flags
+  non-deterministic SQL, diffs the result against a baseline output version
+  by key and names the datasets and object types downstream. Promote it by
+  merging the branch, discard it by deleting it. `GetTransformReplay`
+  returns the record (#1585).
 
 - Experimental comment threads on objects and their properties, with
   mentions, resolve and reopen. A comment is visible only to callers who

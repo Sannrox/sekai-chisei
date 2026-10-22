@@ -103,6 +103,9 @@ pub struct DatasetBranchRun {
     /// Input datasets read from the branch; the others read the parent.
     pub branch_inputs: Vec<String>,
     pub markings_out: String,
+    /// What each input read, for a replay's determinism record.
+    #[serde(default)]
+    pub inputs: Vec<crate::transform_replay::ReplayInput>,
 }
 
 /// Branch head against the parent's live rows.
