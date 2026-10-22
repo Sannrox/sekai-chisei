@@ -745,6 +745,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ExpandNeighborhood",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "FindPaths",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "RetrieveContext",
       "storage_path": "sekai.graph, sekai.authorization, sekai.ontology-definitions",
       "real_backend": "yes",

@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 183);
+        assert_eq!(inventory.entries.len(), 185);
         assert!(inventory.entry("PutGovernedTransform").is_some());
         assert!(inventory.entry("ListGovernedTransforms").is_some());
         assert!(inventory.entry("ListGovernedTransformRuns").is_some());

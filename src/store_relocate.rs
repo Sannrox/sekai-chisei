@@ -1594,6 +1594,8 @@ pub fn is_mutating_rpc(method: &str) -> bool {
         || name.starts_with("Search")
         || name.starts_with("Lookup")
         || name.starts_with("Watch")
+        || name == "ExpandNeighborhood"
+        || name == "FindPaths"
         || name == "Check"
         || name == "CheckAccess"
         || name == "CheckReady"

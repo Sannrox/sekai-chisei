@@ -59,6 +59,8 @@ impl SekaiServiceImpl {
         let experimental = crate::rpc_maturity::experimental_rpcs_enabled();
         entries.push(search_query_capability(experimental));
         entries.push(search_status_capability(experimental));
+        entries.push(neighborhood_capability(experimental));
+        entries.push(paths_capability(experimental));
         entries.push(experimental_rpc_capability(experimental));
         entries.push(hosted_transform_capability(experimental));
         entries.push(analytical_transform_capability(experimental));
@@ -365,6 +367,7 @@ fn capability_product_tier(name: &str) -> &'static str {
         other if other.starts_with("sekai.actions.") => "core",
         other if other.contains("kioku") => "experimental",
         "sekai.search.query" | "sekai.search.status" => "experimental",
+        "sekai.relations.neighborhood" | "sekai.relations.paths" => "experimental",
         _ => "advanced",
     }
 }
@@ -532,6 +535,97 @@ fn traverse_capability() -> CapabilityEntry {
         name: "max_depth".into(),
         value: 10,
     }];
+    entry
+}
+
+/// Policy every hop of ExpandNeighborhood and FindPaths applies, as Traverse does.
+fn graph_explore_policy_points() -> Vec<String> {
+    [
+        "namespace_access",
+        "row_filter",
+        "object_acl",
+        "marking",
+        "marking_path_join",
+        "purpose",
+        "property_grant",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn neighborhood_capability(enabled: bool) -> CapabilityEntry {
+    use super::graph_explore_rpc as explore;
+    let mut entry = base_capability(
+        explore::NEIGHBORHOOD_CAPABILITY.into(),
+        "Expand seed objects over links in both directions with depth, fan-out and size caps; hidden objects are omitted.".into(),
+        "query",
+        "sekai.ExpandNeighborhoodRequest",
+        "sekai.ExpandNeighborhoodResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = graph_explore_policy_points();
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.limits = vec![
+        CapabilityLimit {
+            name: "max_depth".into(),
+            value: explore::MAX_DEPTH as u64,
+        },
+        CapabilityLimit {
+            name: "max_seeds".into(),
+            value: explore::MAX_SEEDS as u64,
+        },
+        CapabilityLimit {
+            name: "max_fan_out".into(),
+            value: explore::MAX_FAN_OUT as u64,
+        },
+        CapabilityLimit {
+            name: "max_nodes".into(),
+            value: explore::MAX_NODES as u64,
+        },
+        CapabilityLimit {
+            name: "examination_budget".into(),
+            value: explore::EXAMINATION_BUDGET as u64,
+        },
+        CapabilityLimit {
+            name: "scan_limit".into(),
+            value: explore::SCAN_LIMIT as u64,
+        },
+    ];
+    entry
+}
+
+fn paths_capability(enabled: bool) -> CapabilityEntry {
+    use super::graph_explore_rpc as explore;
+    let mut entry = base_capability(
+        explore::PATHS_CAPABILITY.into(),
+        "Shortest link paths between two readable objects through the caller's visible graph."
+            .into(),
+        "query",
+        "sekai.FindPathsRequest",
+        "sekai.FindPathsResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = graph_explore_policy_points();
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.limits = vec![
+        CapabilityLimit {
+            name: "max_depth".into(),
+            value: explore::MAX_DEPTH as u64,
+        },
+        CapabilityLimit {
+            name: "max_paths".into(),
+            value: explore::MAX_PATHS as u64,
+        },
+        CapabilityLimit {
+            name: "examination_budget".into(),
+            value: explore::EXAMINATION_BUDGET as u64,
+        },
+        CapabilityLimit {
+            name: "scan_limit".into(),
+            value: explore::SCAN_LIMIT as u64,
+        },
+    ];
     entry
 }
 
@@ -846,6 +940,23 @@ mod tests {
         );
         let on = scheduler_transform_capability(true);
         assert_eq!(on.lifecycle_state, "active");
+    }
+
+    #[test]
+    fn graph_explore_capabilities_follow_the_experimental_gate() {
+        for (entry, backing) in [
+            (neighborhood_capability(false), "ExpandNeighborhood"),
+            (paths_capability(false), "FindPaths"),
+        ] {
+            assert_eq!(entry.lifecycle_state, "disabled");
+            assert_eq!(entry.product_tier, "experimental");
+            assert_eq!(
+                crate::rpc_maturity::capability_backing_rpc(&entry.name),
+                Some(backing)
+            );
+        }
+        assert_eq!(neighborhood_capability(true).lifecycle_state, "active");
+        assert_eq!(paths_capability(true).lifecycle_state, "active");
     }
 
     #[test]

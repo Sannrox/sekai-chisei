@@ -1117,6 +1117,30 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ExpandNeighborhood",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/graph_explore_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "FindPaths",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/graph_explore_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "RetrieveContext",
       "kind": "computed",
       "surfaces": [],
