@@ -754,7 +754,7 @@
     },
     {
       "service": "SekaiService",
-      "rpc": "CreateObjectComment",
+      "rpc": "PutTrustScoringRule",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
       "consumer": "none",
@@ -763,7 +763,7 @@
     },
     {
       "service": "SekaiService",
-      "rpc": "UpdateObjectComment",
+      "rpc": "GetTrustScoringRule",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
       "consumer": "none",
@@ -772,16 +772,7 @@
     },
     {
       "service": "SekaiService",
-      "rpc": "ListObjectComments",
-      "storage_path": "sekai.graph",
-      "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "SekaiService",
-      "rpc": "ListCommentMentions",
+      "rpc": "ScoreObjectTrust",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
       "consumer": "none",

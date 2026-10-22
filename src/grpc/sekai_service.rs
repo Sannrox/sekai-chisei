@@ -18,8 +18,6 @@ mod definition_consumer_impact;
 mod graph_explore_rpc;
 #[path = "object_change_subscription.rs"]
 mod object_change_subscription;
-#[path = "object_comment_rpc.rs"]
-mod object_comment_rpc;
 #[path = "object_mutation_lifecycle.rs"]
 mod object_mutation_lifecycle;
 #[path = "object_set_query.rs"]
@@ -40,6 +38,8 @@ use scored_knowledge_admission::{
 mod semantic_retrieval_lifecycle;
 #[path = "sekai_service_support_access.rs"]
 mod support_access;
+#[path = "trust_score_rpc.rs"]
+mod trust_score_rpc;
 use support_access::*;
 #[path = "sekai_service_support_mapping.rs"]
 mod support_mapping;
@@ -418,7 +418,7 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     governed_fact_domain::PROFILE_KIND,
     governed_fact_domain::FACT_KIND,
     governed_fact_domain::WAIVER_KIND,
-    crate::sekai::object_comment::OBJECT_COMMENT_KIND,
+    crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
 ];
 
 const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
@@ -805,32 +805,25 @@ impl SekaiService for SekaiServiceImpl {
         rpc_objects::query_counterfactual_view(self, req).await
     }
 
-    async fn create_object_comment(
+    async fn put_trust_scoring_rule(
         &self,
-        req: Request<CreateObjectCommentRequest>,
-    ) -> Result<Response<CreateObjectCommentResponse>, Status> {
-        object_comment_rpc::create_object_comment(self, req).await
+        req: Request<PutTrustScoringRuleRequest>,
+    ) -> Result<Response<PutTrustScoringRuleResponse>, Status> {
+        trust_score_rpc::put_trust_scoring_rule(self, req).await
     }
 
-    async fn update_object_comment(
+    async fn get_trust_scoring_rule(
         &self,
-        req: Request<UpdateObjectCommentRequest>,
-    ) -> Result<Response<UpdateObjectCommentResponse>, Status> {
-        object_comment_rpc::update_object_comment(self, req).await
+        req: Request<GetTrustScoringRuleRequest>,
+    ) -> Result<Response<GetTrustScoringRuleResponse>, Status> {
+        trust_score_rpc::get_trust_scoring_rule(self, req).await
     }
 
-    async fn list_object_comments(
+    async fn score_object_trust(
         &self,
-        req: Request<ListObjectCommentsRequest>,
-    ) -> Result<Response<ListObjectCommentsResponse>, Status> {
-        object_comment_rpc::list_object_comments(self, req).await
-    }
-
-    async fn list_comment_mentions(
-        &self,
-        req: Request<ListCommentMentionsRequest>,
-    ) -> Result<Response<ListCommentMentionsResponse>, Status> {
-        object_comment_rpc::list_comment_mentions(self, req).await
+        req: Request<ScoreObjectTrustRequest>,
+    ) -> Result<Response<ScoreObjectTrustResponse>, Status> {
+        trust_score_rpc::score_object_trust(self, req).await
     }
 
     async fn query_object_policy_audit(

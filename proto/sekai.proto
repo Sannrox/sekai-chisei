@@ -1224,56 +1224,51 @@ message QueryCounterfactualViewResponse {
   string report_digest = 8;
   string decision_id = 9;
 }
-// A comment on an object, or on one of its properties. Shown only to
-// callers who can read the target object and the property; a body that
-// quoted a property hidden from the caller is redacted, except for its author.
-message ObjectComment {
-  string comment_id = 1;
-  string object_id = 2;
-  // Empty when the comment is on the whole object.
-  string property = 3;
-  string body = 4;
-  string author = 5;
-  repeated string mentions = 6;
-  bool resolved = 7;
-  string resolved_by = 8;
-  int64 created_at_ms = 9;
-  int64 updated_at_ms = 10;
-  // Id of the latest object change-log entry for this comment.
-  string receipt_id = 11;
+// A namespace's trust scoring rule revision (`sekai.trust-scoring-rule/v1`).
+message TrustScoringRuleRevision {
+  string namespace = 1;
+  string rule_json = 2;
+  string revision_digest = 3;
+  uint64 version = 4;
+  string updated_by = 5;
+  int64 updated_at_ms = 6;
 }
-// Every mentioned principal must be able to read the object and property.
-message CreateObjectCommentRequest {
+// Credential admin only. Stores a new revision when `expected_revision_digest`
+// names the current one (empty for the first rule); the same revision again
+// is a no-op. Audited in the rule object's change log.
+message PutTrustScoringRuleRequest {
+  string rule_json = 1;
+  string expected_revision_digest = 2;
+}
+message PutTrustScoringRuleResponse { TrustScoringRuleRevision rule = 1; }
+message GetTrustScoringRuleRequest { string namespace = 1; }
+message GetTrustScoringRuleResponse { TrustScoringRuleRevision rule = 1; }
+message TrustReason {
+  string factor = 1;
+  int32 delta = 2;
+  string detail = 3;
+}
+message ObjectTrustScore {
   string object_id = 1;
-  string property = 2;
-  string body = 3;
-  repeated string mentions = 4;
+  uint32 score = 2;
+  repeated TrustReason reasons = 3;
 }
-message CreateObjectCommentResponse { ObjectComment comment = 1; }
-// Edit the body and mentions (author only) and/or resolve or reopen (any
-// reader of the target). `expected_updated_at_ms` must match the stored
-// comment, so a stale writer fails with FAILED_PRECONDITION.
-message UpdateObjectCommentRequest {
-  string comment_id = 1;
-  optional string body = 2;
-  repeated string mentions = 3;
-  optional bool resolved = 4;
-  int64 expected_updated_at_ms = 5;
+// Score one page of an object set under the namespace's trust scoring rule.
+// Members are read with the caller's authority; signals come from what the
+// caller can see.
+message ScoreObjectTrustRequest {
+  ObjectSetDescriptor descriptor = 1;
+  string page_token = 2;
+  // Omit members scoring below this (0..=100).
+  uint32 min_score = 3;
+  // Highest score first, then object id; otherwise object-set order.
+  bool order_by_score = 4;
 }
-message UpdateObjectCommentResponse { ObjectComment comment = 1; }
-message ListObjectCommentsRequest {
-  string object_id = 1;
-  bool include_resolved = 2;
+message ScoreObjectTrustResponse {
+  string rule_revision_digest = 1;
+  repeated ObjectTrustScore scores = 2;
+  string next_page_token = 3;
 }
-message ListObjectCommentsResponse {
-  repeated ObjectComment comments = 1;
-  // Comments the caller can see, resolved ones included.
-  int32 total = 2;
-}
-// Comments in `namespace` that mention the caller, on objects the caller can
-// still read.
-message ListCommentMentionsRequest { string namespace = 1; }
-message ListCommentMentionsResponse { repeated ObjectComment comments = 1; }
 message ObjectPolicyAuditEvent {
   string event_id = 1;
   string namespace = 2;
@@ -3372,10 +3367,9 @@ service SekaiService {
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
   rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
-  rpc CreateObjectComment(CreateObjectCommentRequest) returns (CreateObjectCommentResponse);
-  rpc UpdateObjectComment(UpdateObjectCommentRequest) returns (UpdateObjectCommentResponse);
-  rpc ListObjectComments(ListObjectCommentsRequest) returns (ListObjectCommentsResponse);
-  rpc ListCommentMentions(ListCommentMentionsRequest) returns (ListCommentMentionsResponse);
+  rpc PutTrustScoringRule(PutTrustScoringRuleRequest) returns (PutTrustScoringRuleResponse);
+  rpc GetTrustScoringRule(GetTrustScoringRuleRequest) returns (GetTrustScoringRuleResponse);
+  rpc ScoreObjectTrust(ScoreObjectTrustRequest) returns (ScoreObjectTrustResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);
 

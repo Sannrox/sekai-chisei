@@ -1131,53 +1131,40 @@
       "product_tier": "core"
     },
     {
-      "rpc": "CreateObjectComment",
+      "rpc": "PutTrustScoringRule",
       "kind": "persistent",
       "surfaces": [
         "sekai.graph"
       ],
       "evidence": [
-        "src/sekai/object_comment.rs",
-        "src/grpc/object_comment_rpc.rs"
+        "src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
     },
     {
-      "rpc": "UpdateObjectComment",
+      "rpc": "GetTrustScoringRule",
       "kind": "persistent",
       "surfaces": [
         "sekai.graph"
       ],
       "evidence": [
-        "src/sekai/object_comment.rs",
-        "src/grpc/object_comment_rpc.rs"
+        "src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
     },
     {
-      "rpc": "ListObjectComments",
+      "rpc": "ScoreObjectTrust",
       "kind": "persistent",
       "surfaces": [
         "sekai.graph"
       ],
       "evidence": [
-        "src/sekai/object_comment.rs",
-        "src/grpc/object_comment_rpc.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ListCommentMentions",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "src/sekai/object_comment.rs",
-        "src/grpc/object_comment_rpc.rs"
+        "src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"

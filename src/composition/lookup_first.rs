@@ -15,7 +15,8 @@
 use crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION;
 use crate::chisei::principal::{PrincipalContext, PrincipalGrant};
 use crate::chisei::sekai_facts::SekaiFactReader;
-use crate::db::store::{ChiseiDecisionStore, ChiseiStore, SekaiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiStore};
+use crate::db::store::SekaiStore;
 use crate::domain::Object;
 use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
 use crate::sekai::compute;
@@ -833,7 +834,7 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     FACT_KIND,
     WAIVER_KIND,
     markings::PRINCIPAL_PROFILE_KIND,
-    crate::sekai::object_comment::OBJECT_COMMENT_KIND,
+    crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
 ];
 
 fn is_reserved_governance_kind(kind: &str) -> bool {
@@ -2118,7 +2119,8 @@ pub fn seed_s1_fixture_graph(db: &SekaiStore) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::store::{ChiseiStore, SekaiStore};
+    use crate::chisei_store::ChiseiStore;
+    use crate::db::store::SekaiStore;
 
     #[test]
     fn allowlist_matches_151_surfaces_only() {
