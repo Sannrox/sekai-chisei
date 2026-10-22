@@ -43,6 +43,7 @@ const RESERVED_OBJECT_KINDS: &[&str] = &[
     governed_facts::PROFILE_KIND,
     governed_facts::FACT_KIND,
     governed_facts::WAIVER_KIND,
+    crate::sekai::object_comment::OBJECT_COMMENT_KIND,
 ];
 
 #[derive(Debug, Clone)]

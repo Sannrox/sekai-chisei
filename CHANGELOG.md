@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Experimental comment threads on objects and their properties, with
+  mentions, resolve and reopen. A comment is visible only to callers who
+  can read its object and property, quoted values of hidden properties are
+  redacted, and mentioning a principal without read access is refused.
+  Every write is in the audited object change log, which is the edit
+  history and the receipt (docs/object-comments.md, #1442).
+
 - `QueryCounterfactualView` shows what a namespace's objects would have
   shown at a past time under candidate object security policies or a
   candidate marking rule, per principal: visible then, visible under the

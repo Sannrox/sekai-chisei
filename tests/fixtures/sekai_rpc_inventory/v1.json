@@ -1131,6 +1131,58 @@
       "product_tier": "core"
     },
     {
+      "rpc": "CreateObjectComment",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/object_comment.rs",
+        "src/grpc/object_comment_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "UpdateObjectComment",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/object_comment.rs",
+        "src/grpc/object_comment_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListObjectComments",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/object_comment.rs",
+        "src/grpc/object_comment_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListCommentMentions",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/object_comment.rs",
+        "src/grpc/object_comment_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExpandNeighborhood",
       "kind": "persistent",
       "surfaces": [

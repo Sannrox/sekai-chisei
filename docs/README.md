@@ -128,6 +128,8 @@ If you want to deploy or operate the control plane:
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   bounded expansion and shortest paths over links, with read policy at
   every hop. Hidden objects are omitted, not placeholders.
+- [Object comments](object-comments.md) — experimental comment threads and
+  mentions on objects, visible only to readers of the object.
 - [Object-change subscriptions](object-change-subscriptions.md) —
   plane-owned create/update/delete pages over event-subscription cursors.
   Snapshot, then stream; a page is not authority.
