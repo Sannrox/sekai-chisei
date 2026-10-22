@@ -190,6 +190,86 @@ impl Rng {
     }
 }
 
+/// Principals in a fixed role rotation, so every tenant has at least one
+/// admin, one editor and one viewer; clearances are seeded.
+pub(crate) fn standard_principals(spec: &Spec, rng: &mut Rng) -> Vec<GeneratedPrincipal> {
+    let roles = [Role::Admin, Role::Editor, Role::Viewer, Role::Viewer];
+    let mut per_role: HashMap<&'static str, usize> = HashMap::new();
+    (0..spec.preset.principals())
+        .map(|index| {
+            let role = &roles[index % roles.len()];
+            let clearance = if *role == Role::Admin {
+                "restricted"
+            } else {
+                rng.weighted(CLEARANCES)
+            };
+            let name = match role {
+                Role::Admin => "admin",
+                Role::Editor => "editor",
+                Role::Viewer => "viewer",
+            };
+            let count = per_role.entry(name).or_default();
+            *count += 1;
+            GeneratedPrincipal {
+                label: format!("{name}-{count}"),
+                role: role.clone(),
+                clearance: clearance.into(),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn principals_with_role(principals: &[GeneratedPrincipal], role: &Role) -> Vec<usize> {
+    principals
+        .iter()
+        .enumerate()
+        .filter(|(_, principal)| principal.role == *role)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// A working space with every principal, and an oversight space with the
+/// admins as approvers and the viewers.
+pub(crate) fn role_spaces(
+    principals: &[GeneratedPrincipal],
+    working: &str,
+    oversight: &str,
+) -> Vec<GeneratedSpace> {
+    vec![
+        GeneratedSpace {
+            name: working.into(),
+            members: principals
+                .iter()
+                .enumerate()
+                .map(|(index, principal)| {
+                    let role = match principal.role {
+                        Role::Admin => "administrator",
+                        Role::Editor => "editor",
+                        Role::Viewer => "viewer",
+                    };
+                    (index, role.to_string())
+                })
+                .collect(),
+        },
+        GeneratedSpace {
+            name: oversight.into(),
+            members: principals
+                .iter()
+                .enumerate()
+                .filter(|(_, principal)| principal.role != Role::Editor)
+                .map(|(index, principal)| {
+                    let role = if principal.role == Role::Admin {
+                        "approver"
+                    } else {
+                        "viewer"
+                    };
+                    (index, role.to_string())
+                })
+                .collect(),
+        },
+    ]
+}
+
 /// The built-in domain: a small supply chain.
 pub struct SupplyChain;
 
@@ -197,7 +277,7 @@ const REGIONS: &[&str] = &["north", "south", "east", "west", "central"];
 const STATUSES: &[&str] = &["planned", "in_transit", "delivered", "delayed"];
 const SEVERITIES: &[&str] = &["low", "medium", "high"];
 /// Seeded share of each object marking, lowest first.
-const MARKINGS: &[(&str, usize)] = &[
+pub(crate) const MARKINGS: &[(&str, usize)] = &[
     ("public", 50),
     ("internal", 30),
     ("confidential", 15),
@@ -208,7 +288,7 @@ const CLEARANCES: &[(&str, usize)] = &[("public", 1), ("internal", 2), ("confide
 const INCIDENT_STATES: &[&str] = &["open", "triaged"];
 const INCIDENT_TRIAGE: &str = "synthetic.incident.triage";
 
-fn property(name: &str, prop_type: PropertyType, required: bool) -> PropertyDef {
+pub(crate) fn property(name: &str, prop_type: PropertyType, required: bool) -> PropertyDef {
     PropertyDef {
         name: name.into(),
         prop_type,
@@ -223,13 +303,13 @@ fn property(name: &str, prop_type: PropertyType, required: bool) -> PropertyDef 
 }
 
 /// A property only principals that administer the object may read.
-fn restricted_property(name: &str, prop_type: PropertyType) -> PropertyDef {
+pub(crate) fn restricted_property(name: &str, prop_type: PropertyType) -> PropertyDef {
     let mut def = property(name, prop_type, true);
     def.classification = "internal".into();
     def
 }
 
-fn enum_property(name: &str, values: &[&str]) -> PropertyDef {
+pub(crate) fn enum_property(name: &str, values: &[&str]) -> PropertyDef {
     let mut def = property(name, PropertyType::Enum, true);
     def.enum_values = values.iter().map(ToString::to_string).collect();
     def
@@ -319,71 +399,9 @@ impl DomainGenerator for SupplyChain {
     }
 
     fn governance(&self, spec: &Spec, data: &DomainData, rng: &mut Rng) -> DomainGovernance {
-        // Roles in a fixed rotation, so every tenant has at least one admin,
-        // one editor and one viewer; clearances are seeded.
-        let roles = [Role::Admin, Role::Editor, Role::Viewer, Role::Viewer];
-        let mut per_role: HashMap<&'static str, usize> = HashMap::new();
-        let principals: Vec<GeneratedPrincipal> = (0..spec.preset.principals())
-            .map(|index| {
-                let role = &roles[index % roles.len()];
-                let clearance = if *role == Role::Admin {
-                    "restricted"
-                } else {
-                    rng.weighted(CLEARANCES)
-                };
-                let name = match role {
-                    Role::Admin => "admin",
-                    Role::Editor => "editor",
-                    Role::Viewer => "viewer",
-                };
-                let count = per_role.entry(name).or_default();
-                *count += 1;
-                GeneratedPrincipal {
-                    label: format!("{name}-{count}"),
-                    role: role.clone(),
-                    clearance: clearance.into(),
-                }
-            })
-            .collect();
-        let editors: Vec<usize> = principals
-            .iter()
-            .enumerate()
-            .filter(|(_, principal)| principal.role == Role::Editor)
-            .map(|(index, _)| index)
-            .collect();
-        let spaces = vec![
-            GeneratedSpace {
-                name: "operations".into(),
-                members: principals
-                    .iter()
-                    .enumerate()
-                    .map(|(index, principal)| {
-                        let role = match principal.role {
-                            Role::Admin => "administrator",
-                            Role::Editor => "editor",
-                            Role::Viewer => "viewer",
-                        };
-                        (index, role.to_string())
-                    })
-                    .collect(),
-            },
-            GeneratedSpace {
-                name: "audit".into(),
-                members: principals
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, principal)| principal.role != Role::Editor)
-                    .map(|(index, principal)| {
-                        let role = if principal.role == Role::Admin {
-                            "approver"
-                        } else {
-                            "viewer"
-                        };
-                        (index, role.to_string())
-                    })
-                    .collect(),
-            },
-        ];
+        let principals = standard_principals(spec, rng);
+        let editors = principals_with_role(&principals, &Role::Editor);
+        let spaces = role_spaces(&principals, "operations", "audit");
         // Each Action triages one open incident, so every incident has at
         // most one history entry.
         let actions = data

@@ -11,6 +11,12 @@
   advisory draft with reproduction steps instead of any public report
   (`docs/isolation-probes.md`, #1621).
 
+- The game reference workload is a synthetic tenant domain (`GameWorkload`):
+  its kinds and links come from the pinned `hoshi-ontology/v1` package
+  (players own planets, fleets are stationed at planets, players ally), and
+  it runs through the same `generate` and `apply` as every domain, with
+  seeded markings, principals and governed fleet orders (#1616).
+
 - Relational change capture beyond PostgreSQL has one contract (ADR 0118):
   per-family positions (LSN, GTID set, SCN) with a comparison rule, snapshot
   handoff, committed records with optional transaction markers, schema
