@@ -814,6 +814,21 @@ impl SekaiDb {
         Ok(lattice)
     }
 
+    /// When the namespace's current classification lattice was stored.
+    pub fn classification_lattice_recorded_at_ms(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<i64>, String> {
+        self.conn()
+            .query_row(
+                "SELECT created_at_ms FROM sekai_classification_lattices WHERE namespace = ?1",
+                params![namespace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn get_classification_lattice(
         &self,
         namespace: &str,

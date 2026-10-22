@@ -795,6 +795,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_objects::simulate_object_policy_change(self, req).await
     }
 
+    async fn query_counterfactual_view(
+        &self,
+        req: Request<QueryCounterfactualViewRequest>,
+    ) -> Result<Response<QueryCounterfactualViewResponse>, Status> {
+        rpc_objects::query_counterfactual_view(self, req).await
+    }
+
     async fn query_object_policy_audit(
         &self,
         req: Request<QueryObjectPolicyAuditRequest>,

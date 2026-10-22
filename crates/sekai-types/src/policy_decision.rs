@@ -491,7 +491,8 @@ pub fn snapshot_digest(snapshot: &PolicySnapshot) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn compile_for_snapshot(
+/// Compile one principal's access to `kind` under a policy snapshot.
+pub fn compile_for_snapshot(
     snapshot: &PolicySnapshot,
     principal: &SimulatedPrincipal,
     kind: &str,
