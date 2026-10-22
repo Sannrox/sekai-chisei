@@ -1479,6 +1479,79 @@ message RollbackDatasetResponse {
   repeated Row rows = 2;
 }
 
+// Dataset branches (ADR 0119). The tenant always comes from the caller's
+// authenticated context.
+message DatasetBranch {
+  string dataset_id = 1;
+  string name = 2;
+  string base_version_id = 3;
+  bool written = 4;
+  string created_by = 5;
+  int64 created_at_ms = 6;
+}
+message CreateDatasetBranchRequest {
+  string dataset_id = 1;
+  string name = 2;
+  // Empty forks the dataset's latest version.
+  string from_version_id = 3;
+}
+message CreateDatasetBranchResponse { DatasetBranch branch = 1; }
+message ListDatasetBranchesRequest { string dataset_id = 1; }
+message ListDatasetBranchesResponse { repeated DatasetBranch branches = 1; }
+message DeleteDatasetBranchRequest {
+  string dataset_id = 1;
+  string name = 2;
+}
+message DeleteDatasetBranchResponse {}
+message CompareDatasetBranchRequest {
+  string dataset_id = 1;
+  string name = 2;
+}
+message CompareDatasetBranchResponse {
+  repeated string columns_added = 1;
+  repeated string columns_removed = 2;
+  int64 parent_rows = 3;
+  int64 branch_rows = 4;
+  string parent_digest = 5;
+  string branch_digest = 6;
+}
+message DatasetBranchProposal {
+  string id = 1;
+  string dataset_id = 2;
+  string branch = 3;
+  string parent_version_id = 4;
+  string branch_digest = 5;
+  string proposer = 6;
+  string status = 7;
+  string merged_by = 8;
+  string merged_version_id = 9;
+  string receipt_id = 10;
+  int64 created_at_ms = 11;
+  int64 merged_at_ms = 12;
+}
+message ProposeDatasetBranchMergeRequest {
+  string dataset_id = 1;
+  string name = 2;
+}
+message ProposeDatasetBranchMergeResponse { DatasetBranchProposal proposal = 1; }
+message MergeDatasetBranchRequest {
+  string dataset_id = 1;
+  string proposal_id = 2;
+  string reason = 3;
+}
+message MergeDatasetBranchResponse { DatasetBranchProposal proposal = 1; }
+message RunGovernedTransformOnBranchRequest {
+  string namespace = 1;
+  string transform_id = 2;
+  string branch = 3;
+}
+message RunGovernedTransformOnBranchResponse {
+  string output_dataset_id = 1;
+  int64 rows_written = 2;
+  repeated string branch_inputs = 3;
+  string markings_out = 4;
+}
+
 message DatasetHealthCheck {
   string dataset_id = 1;
   string check_id = 2;
@@ -3241,6 +3314,13 @@ service SekaiService {
   rpc ListDatasetVersions(ListDatasetVersionsRequest) returns (ListDatasetVersionsResponse);
   rpc GetDatasetVersion(GetDatasetVersionRequest) returns (GetDatasetVersionResponse);
   rpc RollbackDataset(RollbackDatasetRequest) returns (RollbackDatasetResponse);
+  rpc CreateDatasetBranch(CreateDatasetBranchRequest) returns (CreateDatasetBranchResponse);
+  rpc ListDatasetBranches(ListDatasetBranchesRequest) returns (ListDatasetBranchesResponse);
+  rpc DeleteDatasetBranch(DeleteDatasetBranchRequest) returns (DeleteDatasetBranchResponse);
+  rpc CompareDatasetBranch(CompareDatasetBranchRequest) returns (CompareDatasetBranchResponse);
+  rpc ProposeDatasetBranchMerge(ProposeDatasetBranchMergeRequest) returns (ProposeDatasetBranchMergeResponse);
+  rpc MergeDatasetBranch(MergeDatasetBranchRequest) returns (MergeDatasetBranchResponse);
+  rpc RunGovernedTransformOnBranch(RunGovernedTransformOnBranchRequest) returns (RunGovernedTransformOnBranchResponse);
   rpc PutDatasetHealthCheck(PutDatasetHealthCheckRequest) returns (PutDatasetHealthCheckResponse);
   rpc ListDatasetHealthChecks(ListDatasetHealthChecksRequest) returns (ListDatasetHealthChecksResponse);
   rpc ListDatasetHealthResults(ListDatasetHealthResultsRequest) returns (ListDatasetHealthResultsResponse);
