@@ -25007,3 +25007,169 @@ async fn blocking_consumer_bindings_gate_breaking_publishes() {
     .await
     .unwrap();
 }
+
+fn changelog_binding(namespace: &str) -> domain::Object {
+    use crate::sekai::definition_consumer_impact::{
+        BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+    };
+    let mut binding = DefinitionConsumerBinding {
+        contract_version: BINDING_CONTRACT.into(),
+        owner: "billing-team".into(),
+        resource_identity: "app:invoices".into(),
+        namespace: namespace.into(),
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        property: "title".into(),
+        declaration_digest: String::new(),
+        source_locator: "invoices/src/ticket.rs".into(),
+        blocking: false,
+    };
+    binding.declaration_digest = binding_digest(&binding);
+    domain::Object {
+        id: "binding-invoices".into(),
+        kind: BINDING_KIND.into(),
+        name: "binding-invoices".into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:binding-invoices"),
+        properties: HashMap::from([
+            ("contract_version".into(), binding.contract_version),
+            ("owner".into(), binding.owner),
+            ("resource_identity".into(), binding.resource_identity),
+            ("member_kind".into(), binding.member_kind),
+            ("member_id".into(), binding.member_id),
+            ("property".into(), binding.property),
+            ("declaration_digest".into(), binding.declaration_digest),
+            ("source_locator".into(), binding.source_locator),
+        ]),
+        created: 1,
+        updated: 1,
+    }
+}
+
+async fn changelog(
+    svc: &SekaiServiceImpl,
+    caller: &str,
+    reader: &str,
+) -> GetOntologyChangelogResponse {
+    svc.get_ontology_changelog(with_named_principal(
+        GetOntologyChangelogRequest {
+            namespaces: vec!["orders".into()],
+            since_ms: now_millis() - 7 * 24 * 60 * 60 * 1000,
+            until_ms: now_millis() + 1_000,
+            reader: reader.into(),
+        },
+        caller,
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+#[tokio::test]
+async fn ontology_changelog_lists_the_week_with_authors_approvers_and_consumers() {
+    let svc = service();
+    let namespace = "orders";
+    let parent = seed_definition_parent(&svc, namespace);
+    svc.db
+        .runtime()
+        .create_object(&changelog_binding(namespace))
+        .unwrap();
+    let ticket = |properties: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        definition_json: format!(r#"{{"name":"Ticket","properties":{properties}}}"#),
+        member_digest: String::new(),
+    };
+    let (added, _) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "log-1",
+        "log-cs-1",
+        vec![ticket(r#"["title"]"#)],
+    )
+    .await;
+    // Dropping `title` breaks the invoices app bound to it.
+    let (revision, receipt) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &added,
+        "log-2",
+        "log-cs-2",
+        vec![ticket(r#"["body"]"#)],
+    )
+    .await;
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(namespace, "orders-team", security::Role::Admin, "local")
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+
+    let digest = changelog(&svc, "root", "orders-team").await;
+    assert_eq!(digest.reader, "orders-team");
+    let entries: Vec<_> = digest
+        .entries
+        .iter()
+        .filter(|entry| entry.change_kind == "definition_revision")
+        .collect();
+    assert_eq!(entries.len(), 2, "{digest:?}");
+    assert_eq!(
+        entries[0].summary,
+        ["changed object type Ticket: added properties title"]
+    );
+    assert!(entries[0].affected_consumers.is_empty());
+    let entry = entries[1];
+    assert_eq!(entry.revision_digest, revision);
+    assert_eq!(entry.receipt_id, receipt);
+    assert_eq!(entry.author, "root");
+    assert_eq!(entry.approvers, ["root"]);
+    assert_eq!(entry.published_by, "root");
+    assert_eq!(
+        entry.summary,
+        ["changed object type Ticket: added properties body; removed properties title"]
+    );
+    assert!(
+        entry
+            .affected_consumers
+            .iter()
+            .any(|consumer| consumer.resource_identity == "app:invoices"),
+        "{entry:?}"
+    );
+
+    // With no namespaces named, the team's own namespaces are covered.
+    let by_role = svc
+        .get_ontology_changelog(with_named_principal(
+            GetOntologyChangelogRequest {
+                namespaces: Vec::new(),
+                since_ms: now_millis() - 7 * 24 * 60 * 60 * 1000,
+                until_ms: now_millis() + 1_000,
+                reader: "orders-team".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(by_role.entries, digest.entries);
+
+    // A team without access to the namespace gets nothing for it.
+    let outsider = changelog(&svc, "root", "outsider-team").await;
+    assert!(outsider.entries.is_empty(), "{outsider:?}");
+    // Building another reader's digest is for credential admins only.
+    let denied = svc
+        .get_ontology_changelog(with_named_principal(
+            GetOntologyChangelogRequest {
+                namespaces: vec![namespace.into()],
+                since_ms: 0,
+                until_ms: 1_000,
+                reader: "orders-team".into(),
+            },
+            "outsider-team",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+}

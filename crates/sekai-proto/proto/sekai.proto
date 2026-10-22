@@ -1319,6 +1319,44 @@ message ListObjectCommentsResponse {
 // still read.
 message ListCommentMentionsRequest { string namespace = 1; }
 message ListCommentMentionsResponse { repeated ObjectComment comments = 1; }
+// One change in an ontology changelog.
+message OntologyChangelogEntry {
+  string namespace = 1;
+  // definition_revision | policy_activation
+  string change_kind = 2;
+  string revision_digest = 3;
+  string previous_revision_digest = 4;
+  // One plain-language line per change; members the reader cannot read are
+  // left out.
+  repeated string summary = 5;
+  // compatible | conditional | breaking | unknown (definition revisions).
+  string compatibility = 6;
+  string author = 7;
+  repeated string approvers = 8;
+  string published_by = 9;
+  int64 changed_at_ms = 10;
+  string receipt_id = 11;
+  // Registered consumers the reader can see that the change affects.
+  repeated DefinitionConsumerImpactPath affected_consumers = 12;
+  string impact_completeness = 13;
+}
+// Changes in [since_ms, until_ms) (at most 31 days) across `namespaces`, or
+// every namespace the reader holds a role in when empty, oldest first. The
+// reader is the caller, or a team or principal a credential admin names to
+// build its digest; everything is authorized as the reader, so a namespace
+// the reader cannot read contributes nothing.
+message GetOntologyChangelogRequest {
+  repeated string namespaces = 1;
+  int64 since_ms = 2;
+  int64 until_ms = 3;
+  string reader = 4;
+}
+message GetOntologyChangelogResponse {
+  string reader = 1;
+  int64 since_ms = 2;
+  int64 until_ms = 3;
+  repeated OntologyChangelogEntry entries = 4;
+}
 message ObjectPolicyAuditEvent {
   string event_id = 1;
   string namespace = 2;
@@ -3410,6 +3448,7 @@ service SekaiService {
   rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
+  rpc GetOntologyChangelog(GetOntologyChangelogRequest) returns (GetOntologyChangelogResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);
   rpc ExecuteDefinitionFactMigration(ExecuteDefinitionFactMigrationRequest) returns (ExecuteDefinitionFactMigrationResponse);
   rpc GetDefinitionFactMigration(GetDefinitionFactMigrationRequest) returns (GetDefinitionFactMigrationResponse);

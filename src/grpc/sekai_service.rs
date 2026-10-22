@@ -24,6 +24,8 @@ mod object_comment_rpc;
 mod object_mutation_lifecycle;
 #[path = "object_set_query.rs"]
 mod object_set_query;
+#[path = "ontology_changelog_rpc.rs"]
+mod ontology_changelog_rpc;
 #[path = "ontology_definition_lifecycle.rs"]
 mod ontology_definition_lifecycle;
 #[path = "schema_definition_lifecycle.rs"]
@@ -628,6 +630,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<CompareDefinitionRevisionsRequest>,
     ) -> Result<Response<CompareDefinitionRevisionsResponse>, Status> {
         rpc_definitions::compare_definition_revisions(self, req).await
+    }
+
+    async fn get_ontology_changelog(
+        &self,
+        req: Request<GetOntologyChangelogRequest>,
+    ) -> Result<Response<GetOntologyChangelogResponse>, Status> {
+        ontology_changelog_rpc::get_ontology_changelog(self, req).await
     }
 
     async fn report_definition_consumer_impact(

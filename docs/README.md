@@ -128,6 +128,8 @@ If you want to deploy or operate the control plane:
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   bounded expansion and shortest paths over links, with read policy at
   every hop. Hidden objects are omitted, not placeholders.
+- [Ontology changelog](ontology-changelog.md) — experimental changelog and
+  team digest of definition revisions and policy activations, as the reader.
 - [Object comments](object-comments.md) — experimental comment threads and
   mentions on objects, visible only to readers of the object.
 - [Trust scores](trust-scores.md) — experimental per-object confidence

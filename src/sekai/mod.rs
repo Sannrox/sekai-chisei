@@ -93,6 +93,7 @@ pub mod object_sync;
 pub mod object_type_index;
 pub mod observation;
 pub mod ontology;
+pub mod ontology_changelog;
 pub mod open_table;
 pub mod operation_correlation;
 pub(crate) mod parameter_schema;
