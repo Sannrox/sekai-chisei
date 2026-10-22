@@ -19,7 +19,7 @@ use crate::chisei::decision_ledger::Decision;
 use crate::chisei::model_availability::AvailableModel;
 use crate::chisei::policy::Policy;
 use crate::chisei::routing_profiles::{HostedRoutingProfile, hosted_runtime};
-use crate::db::store::{ChiseiDecisionStore, ChiseiModelReviewStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiModelReviewStore, ChiseiStore};
 use crate::enterprise::ModelIdentity;
 
 pub const MODEL_REVIEW_CONTRACT: &str = "chisei.model-review/v1";

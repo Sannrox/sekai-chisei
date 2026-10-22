@@ -6,7 +6,7 @@
 //! streaming, evolve/scoring bookkeeping, and terminal receipt completion.
 
 use super::*;
-use crate::db::store::{ChiseiKiokuStore, ChiseiRoutingProfileStore};
+use crate::chisei_store::{ChiseiKiokuStore, ChiseiRoutingProfileStore};
 
 /// Result of the post-authz lookup-first attempt on ExecutePlanStream.
 #[derive(Debug)]

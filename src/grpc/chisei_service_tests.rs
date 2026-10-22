@@ -2,7 +2,7 @@ use super::*;
 use crate::chisei::evaluation_execution::{
     DeterministicEvaluator, DeterministicEvaluatorOutput, EVALUATOR_RESULT_CONTRACT, STATUS_PASS,
 };
-use crate::db::store::{
+use crate::chisei_store::{
     ChiseiBudgetStore, ChiseiDecisionStore, ChiseiEvaluationStore, ChiseiKiokuStore,
     ChiseiObservationStore, ChiseiReceiptStore,
 };
@@ -593,7 +593,7 @@ async fn resolve_policy_rejects_unknown_explicit_provider_without_policy() {
         SekaiDb::new(":memory:").unwrap(),
     )));
     let svc = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config(":memory:"),
     );
     let request = resolve_policy_request("unscoped", "bogus", "bogus/model");
@@ -671,7 +671,7 @@ async fn live_model_resolution_rejects_unknown_explicit_provider() {
         SekaiDb::new(":memory:").unwrap(),
     )));
     let svc = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config(":memory:"),
     );
 
@@ -696,7 +696,7 @@ async fn resolve_policy_normalizes_loaded_legacy_native_runtime() {
         SekaiDb::new(":memory:").unwrap(),
     )));
     let svc = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config(":memory:"),
     );
     svc.policy.set_namespace_policy(
@@ -742,7 +742,10 @@ async fn resolve_policy_routes_bulk_task_class_to_cheaper_model() {
     let mut cfg = config(":memory:");
     // Treat openai as available without a key so routing can resolve.
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     svc.policy.set_namespace_policy(
         "proj",
         crate::chisei::policy::Policy {
@@ -790,7 +793,10 @@ async fn resolve_policy_reverts_only_the_regressed_task_class_to_capable() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     svc.policy.set_namespace_policy(
         "proj",
         crate::chisei::policy::Policy {
@@ -873,7 +879,10 @@ async fn request_namespace_regression_is_not_masked_by_stable_policy_scope() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     svc.policy.set_namespace_policy(
         "project-scope",
         crate::chisei::policy::Policy {
@@ -930,7 +939,10 @@ async fn resolve_policy_respects_a_promoted_capable_override() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     svc.policy.set_namespace_policy(
         "proj",
         crate::chisei::policy::Policy {
@@ -1002,7 +1014,10 @@ async fn resolve_policy_records_no_bias_when_no_cheaper_model_exists() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     // Only one allowed model, so the cheap tier resolves to the same model.
     svc.policy.set_namespace_policy(
         "proj",
@@ -1035,7 +1050,10 @@ async fn resolve_policy_records_no_bias_for_equal_cost_models() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     // Both allowed models are the same cost tier ("mini"), so the cheap
     // alias finds nothing strictly cheaper than the capable default.
     svc.policy.set_namespace_policy(
@@ -1244,7 +1262,7 @@ fn stochastic_admission_fails_closed_before_external_or_unbudgetable_calls() {
 }
 
 /// Shared-compatibility layout: Sekai facts live in the Chisei test store.
-fn shared_sekai_store(db: &crate::db::store::ChiseiStore) -> crate::db::store::SekaiStore {
+fn shared_sekai_store(db: &crate::chisei_store::ChiseiStore) -> crate::db::store::SekaiStore {
     crate::db::store::SekaiStore::from_shared_runtime(db.runtime_arc())
 }
 
@@ -1252,7 +1270,7 @@ fn memory_service() -> ChiseiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
     ChiseiServiceImpl::new(chisei, config(":memory:"))
         .with_sekai_facts(facts)
@@ -1266,7 +1284,7 @@ fn gunshi_planning_service() -> ChiseiServiceImpl {
     let mut config = config(":memory:");
     config.gateway_provided_providers = vec!["openai".into()];
     ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config,
     )
 }
@@ -1622,7 +1640,7 @@ fn managed_execution_service() -> ChiseiServiceImpl {
     let mut managed_config = config(":memory:");
     managed_config.openai_api_key = Some("synthetic-server-side-key".into());
     let service = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         managed_config,
     );
     service.policy.set_namespace_policy(
@@ -1862,7 +1880,7 @@ fn managed_ollama_execution_service(provider_url: String) -> ChiseiServiceImpl {
     let mut managed_config = config(":memory:");
     managed_config.ollama_url = provider_url;
     let service = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         managed_config,
     );
     service.policy.set_namespace_policy(
@@ -2302,7 +2320,7 @@ fn evaluation_execution_service(delay_ms: u64) -> ChiseiServiceImpl {
             Arc::new(SchemaFixtureEvaluator { delay_ms }),
         )
         .unwrap();
-    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
     ChiseiServiceImpl::new_with_evaluator_registry(chisei, config(":memory:"), registry)
         .with_sekai_facts(facts)
@@ -4991,7 +5009,7 @@ async fn effective_policy_summary_reports_unconfigured_sections() {
 
 fn file_service(path: &str) -> ChiseiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(path).unwrap())));
-    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
     ChiseiServiceImpl::new(chisei, config(path))
         .with_sekai_facts(facts)
@@ -6448,7 +6466,7 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
     {
         let mut cfg = config(&path);
         cfg.gateway_provided_providers = vec!["openai".into()];
-        let chisei = crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(
+        let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(Arc::new(
             RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(&path).unwrap())),
         ));
         let svc = ChiseiServiceImpl::new(chisei.clone(), cfg)
@@ -6508,9 +6526,9 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
 
     let mut cfg = config(&path);
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
-        std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
-    )));
+    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(Arc::new(
+        RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(&path).unwrap())),
+    ));
     let svc = ChiseiServiceImpl::new(chisei.clone(), cfg)
         .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
             shared_sekai_store(&chisei),
@@ -9861,7 +9879,10 @@ async fn decide_gateway_execution_admits_and_denies_closed() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     svc.policy.set_namespace_policy(
         "team-a",
         crate::chisei::policy::Policy {
@@ -10076,7 +10097,10 @@ fn openai_team_a_service() -> ChiseiServiceImpl {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     svc.policy.set_namespace_policy(
         "team-a",
         crate::chisei::policy::Policy {
@@ -10230,7 +10254,10 @@ async fn decide_rejects_mixed_capability_catalogs_as_unsupported() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
+    let svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
     svc.policy.set_namespace_policy(
         "team-a",
         crate::chisei::policy::Policy {
@@ -10746,7 +10773,7 @@ async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed()
     config.routing_endpoint_allowlist =
         crate::chisei::routing_profiles::endpoint_allowlist_from("https://models.example.com");
     config.routing_credential_refs = vec!["ACME".into()];
-    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
     let service = ChiseiServiceImpl::new(chisei, config.clone())
         .with_sekai_facts(facts)
@@ -10999,7 +11026,7 @@ async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed()
     let mut narrowed = config;
     narrowed.routing_endpoint_allowlist = Vec::new();
     let narrowed = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(service.db.runtime_arc()),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(service.db.runtime_arc()),
         narrowed,
     );
     let visible = narrowed
@@ -11083,7 +11110,7 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
         crate::chisei::routing_profiles::endpoint_allowlist_from(&origin);
     config.routing_credential_refs = vec!["ACME".into()];
     let service = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config,
     );
     let hosted_policy = |data_class: &str| crate::chisei::policy::Policy {
@@ -11284,7 +11311,7 @@ async fn customer_hosted_routes_serve_content_execution_from_live_state() {
         crate::chisei::routing_profiles::endpoint_allowlist_from(&origin);
     config.routing_credential_refs = vec!["ACME".into()];
     let service = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config,
     );
     for namespace in ["support", "open"] {
@@ -11449,7 +11476,7 @@ async fn hosted_routes_never_fall_back_and_read_the_catalog_only_when_authorized
     // another provider. #1185/#1186/#1187: the hosted catalog is read only
     // for hosted-relevant requests, only after namespace access, and once
     // per hosted execution.
-    use crate::db::runtime_db::HOSTED_PROFILE_LISTS;
+    use crate::chisei_store::runtime::HOSTED_PROFILE_LISTS;
     let lists = || HOSTED_PROFILE_LISTS.with(std::cell::Cell::get);
     let observed = HostedEndpointObservations::default();
     let app = Router::new()
@@ -11473,7 +11500,7 @@ async fn hosted_routes_never_fall_back_and_read_the_catalog_only_when_authorized
         crate::chisei::routing_profiles::endpoint_allowlist_from(&origin);
     config.routing_credential_refs = vec!["ACME".into()];
     let service = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config,
     );
     service
@@ -11655,7 +11682,7 @@ async fn a_policy_mirrored_from_the_routing_list_admits_the_hosted_route() {
         crate::chisei::routing_profiles::endpoint_allowlist_from("https://models.example.com");
     config.routing_credential_refs = vec!["ACME".into()];
     let service = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config,
     );
     service
@@ -11805,7 +11832,7 @@ fn split_store_service() -> (ChiseiServiceImpl, Arc<RuntimeDb>) {
         SekaiDb::new(":memory:").unwrap(),
     )));
     let service = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(chisei_db),
+        crate::chisei_store::ChiseiStore::from_shared_runtime(chisei_db),
         config(":memory:"),
     )
     .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
@@ -11851,7 +11878,10 @@ fn review_admission_service() -> ChiseiServiceImpl {
         let mut cfg = config(":memory:");
         cfg.openai_api_key = Some("synthetic-server-side-key".into());
         cfg.gateway_provided_providers = vec!["openai".into()];
-        ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg)
+        ChiseiServiceImpl::new(
+            crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+            cfg,
+        )
     })
 }
 
@@ -12217,7 +12247,7 @@ async fn unreviewed_hosted_route_is_refused_at_planning() {
             SekaiDb::new(":memory:").unwrap(),
         )));
         ChiseiServiceImpl::new(
-            crate::db::store::ChiseiStore::from_shared_runtime(db),
+            crate::chisei_store::ChiseiStore::from_shared_runtime(db),
             config.clone(),
         )
     });

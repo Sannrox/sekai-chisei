@@ -8,6 +8,7 @@ pub mod build_info {
 pub mod capability_codegen;
 pub mod capability_projection;
 pub mod chisei;
+pub mod chisei_store;
 pub mod compliance_cli;
 pub mod compliance_export;
 pub mod compliance_pack;

@@ -3,9 +3,9 @@
 use crate::chisei::model_release_evidence::{
     self, EvaluationTrustRoots, ModelReleaseFeedback, ModelReleaseIdentity, ModelRuntimeEvidence,
 };
+use crate::chisei_store::ChiseiStore;
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
-use crate::db::store::ChiseiStore;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 

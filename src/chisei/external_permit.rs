@@ -4,9 +4,9 @@
 //! and redeems those records.
 
 use crate::chisei::external_action::{AuthorizationRecord, REDEMPTION_VERSION};
-use crate::db::sekai::SekaiDb;
 #[cfg(test)]
-use crate::db::store::ChiseiStore;
+use crate::chisei_store::ChiseiStore;
+use crate::db::sekai::SekaiDb;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -1014,7 +1014,7 @@ mod tests {
         ASSURANCE_VERSION, AssuranceDeclaration, AuthorizationClaim, ExternalActionDecision,
         ExternalActionRequest, REQUEST_VERSION,
     };
-    use crate::db::store::{ChiseiExternalActionStore, ChiseiPermitStore};
+    use crate::chisei_store::{ChiseiExternalActionStore, ChiseiPermitStore};
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration;
 

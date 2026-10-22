@@ -1,7 +1,7 @@
 //! Backend-neutral operation receipt and gateway alias persistence.
 
-use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 
 /// How long an open (`completed_at_ms = None`) receipt continues to overlap
 /// windowed lists. Matches max action-work claim TTL so in-flight harvest
@@ -214,7 +214,7 @@ impl ChiseiReceiptBackend for PostgresDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, ReceiptEventKind, ReceiptSurface};
+    use sekai_domain::receipt::{OPERATION_RECEIPT_VERSION, ReceiptEventKind, ReceiptSurface};
     use std::collections::BTreeMap;
 
     fn receipt() -> OperationReceipt {

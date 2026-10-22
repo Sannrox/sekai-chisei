@@ -1,4 +1,4 @@
-use crate::db::store::ChiseiKiokuStore;
+use crate::chisei_store::ChiseiKiokuStore;
 use std::collections::HashSet;
 
 use base64::Engine as _;
@@ -8,7 +8,7 @@ use crate::chisei::kioku::{
     HumanMemoryReview, HumanReviewAction, KiokuCandidateCursor, KiokuEvidenceBasis,
     KiokuEvidenceLink, KiokuEvidenceReassessmentRequest, KiokuMemory, MemoryLifecycleEvent,
 };
-use crate::db::store::ChiseiStore;
+use crate::chisei_store::ChiseiStore;
 
 const CANDIDATE_PAGE_SIZE: usize = 100;
 const MAX_CANDIDATE_PAGES: usize = 4;

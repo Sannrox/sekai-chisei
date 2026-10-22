@@ -1,8 +1,8 @@
 //! PostgreSQL persistence for immutable governed-subject provenance exports.
 
-use crate::chisei::governed_subject_provenance::ExportRecord;
 use crate::db::postgres::PostgresDb;
 use postgres::GenericClient;
+use sekai_types::governed_subject_provenance::ExportRecord;
 
 impl PostgresDb {
     pub fn put_governed_subject_provenance_export(

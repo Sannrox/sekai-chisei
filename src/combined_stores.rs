@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use postgres::Config as PostgresConfig;
 
+use crate::chisei_store::{ChiseiStore, split_shared_runtime};
 use crate::db::runtime_db::RuntimeDb;
-use crate::db::store::{ChiseiStore, SekaiStore, split_shared_runtime};
+use crate::db::store::SekaiStore;
 use crate::runtime_backend::{
     BackendIdentity, COMMUNITY_REQUIRED_SURFACES, RuntimeBackend, RuntimeBackendConfig,
 };
@@ -723,7 +724,7 @@ pub(crate) fn optional_trimmed_env(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::store::ChiseiDecisionStore;
+    use crate::chisei_store::ChiseiDecisionStore;
 
     fn sqlite_pair(sekai: &str, chisei: &str) -> CombinedStoreSources {
         CombinedStoreSources {

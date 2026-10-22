@@ -2,8 +2,8 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 use crate::db::sekai::SekaiDb;
+use sekai_domain::receipt::{OperationReceipt, ReceiptEventKind};
 use sekai_types::governed_transform::{TransformRun, redact_run_partition_receipts};
 use sekai_types::receipt_chain::{
     BUNDLE_VERSION, CHECKPOINT_INTERVAL, ChainEntry, Checkpoint, CheckpointKind, DIGEST_ALGORITHM,
@@ -765,13 +765,13 @@ fn parse_checkpoint_kind(value: &str) -> Result<CheckpointKind, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::receipt::{
-        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
-    };
     use crate::db::governed_transform::{
         insert_transform_run, redact_transform_partition_receipts, stamp_run_dispatch,
     };
     use rusqlite::TransactionBehavior;
+    use sekai_domain::receipt::{
+        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+    };
     use sekai_types::governed_transform::{
         ISOLATED_CLASS, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformPartition,
         TransformRun,

@@ -4,7 +4,7 @@ use sekai_chisei::chisei::eval::{
     Assertion, Case, CaseResult, Iteration, Run, Suite, check_assertions,
 };
 use sekai_chisei::chisei::scoring::SampleObservation;
-use sekai_chisei::db::chisei_eval_backend::ChiseiEvalBackend;
+use sekai_chisei::chisei_store::chisei_eval_backend::ChiseiEvalBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 
 trait EvalHarness: ChiseiEvalBackend {}

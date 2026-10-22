@@ -3,9 +3,9 @@
 use crate::chisei::evidence_vocabulary::{EvidenceClassification, EvidenceLifecycleState};
 use crate::chisei::principal::{PrincipalContext, PrincipalGrant, PrincipalRole};
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
-use crate::db::sekai::SekaiDb;
 #[cfg(test)]
-use crate::db::store::ChiseiStore;
+use crate::chisei_store::ChiseiStore;
+use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2740,7 +2740,7 @@ impl SekaiDb {
                 return Err("only active memories can be assigned to holdout".into());
             }
         }
-        crate::db::chisei::upsert_operation_receipt(&tx, receipt)?;
+        crate::chisei_store::chisei::upsert_operation_receipt(&tx, receipt)?;
         self.append_operation_receipt_chain(&tx, receipt)?;
         for (memory_id, memory_version) in holdouts {
             insert_lifecycle_event(
@@ -2767,7 +2767,7 @@ mod tests {
     use crate::chisei::receipt::{
         GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceiptEvent, ReceiptEventKind,
     };
-    use crate::db::store::{ChiseiKiokuStore, ChiseiReceiptStore};
+    use crate::chisei_store::{ChiseiKiokuStore, ChiseiReceiptStore};
     use crate::domain::Object;
     use std::collections::{BTreeMap, HashMap};
 
@@ -3190,7 +3190,7 @@ mod tests {
 
     #[test]
     fn evidence_reassessment_is_idempotent_and_preserves_active_lineage() {
-        let (sekai, db) = crate::db::store::paired_memory();
+        let (sekai, db) = crate::chisei_store::paired_memory();
         sekai
             .create_object(&Object {
                 id: "namespace-payments".into(),
@@ -3578,7 +3578,7 @@ mod tests {
 
     #[test]
     fn retrieves_active_memories_by_scope_affinity_and_classification() {
-        let (sekai, db) = crate::db::store::paired_memory();
+        let (sekai, db) = crate::chisei_store::paired_memory();
         for object in [
             Object {
                 id: "namespace-payments".into(),

@@ -2,7 +2,7 @@
 
 use crate::chisei::decision_ledger::Decision;
 use crate::chisei::sekai_facts::SekaiFactReader;
-use crate::db::store::{ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiStore};
 use crate::domain::Object;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -647,7 +647,7 @@ mod tests {
         ChiseiStore,
         crate::chisei::sekai_facts::SekaiFacts,
     ) {
-        let (sekai, db) = crate::db::store::paired_memory();
+        let (sekai, db) = crate::chisei_store::paired_memory();
         let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(sekai.clone());
         (sekai, db, facts)
     }
