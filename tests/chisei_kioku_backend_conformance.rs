@@ -4,7 +4,7 @@ use sekai_chisei::chisei::kioku::{
     HumanMemoryReview, HumanReviewAction, KIOKU_MEMORY_VERSION, KiokuEvidenceLink, KiokuMemory,
     MemoryEvidenceStance, MemoryKind, MemoryLifecycleState,
 };
-use sekai_chisei::db::chisei_kioku::ChiseiKiokuBackend;
+use sekai_chisei::chisei_store::chisei_kioku::ChiseiKiokuBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::sekai::evidence::EvidenceClassification;
 

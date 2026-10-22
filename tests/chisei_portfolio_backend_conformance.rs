@@ -3,7 +3,7 @@
 use sekai_chisei::chisei::portfolio::{
     LEGACY_PROMPT_VARIANT, Objective, ObjectiveMode, Observation,
 };
-use sekai_chisei::db::chisei_portfolio_backend::ChiseiPortfolioBackend;
+use sekai_chisei::chisei_store::chisei_portfolio_backend::ChiseiPortfolioBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 
 trait PortfolioHarness: ChiseiPortfolioBackend {}

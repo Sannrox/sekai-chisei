@@ -79,7 +79,7 @@ impl InProcessSurface {
             .map_err(|error| error.to_string())?;
         }
         let sekai_store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
-        let chisei_store = crate::db::store::ChiseiStore::from_shared_runtime(db);
+        let chisei_store = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
         let budget = Arc::new(BudgetTracker::new(chisei_store.clone()));
         let clerk = crate::composition::cross_store_admission::CrossStoreAdmission::new(
             chisei_store.clone(),

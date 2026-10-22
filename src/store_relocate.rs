@@ -2021,8 +2021,8 @@ pub fn open_layout_or_fence(default_sqlite_path: &str) -> Result<CombinedStoreLa
 mod tests {
     use super::*;
     use crate::chisei::budget::{BudgetTracker, PeriodType};
+    use crate::chisei_store::ChiseiStore;
     use crate::db::sekai::SekaiDb;
-    use crate::db::store::ChiseiStore;
     use crate::sekai::action_instance::{ActionInstance, STATUS_ADMITTED};
     use std::sync::Arc;
 

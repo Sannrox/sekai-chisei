@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::store::{ChiseiBudgetStore, ChiseiPermitStore};
+use crate::chisei_store::{ChiseiBudgetStore, ChiseiPermitStore};
 
 pub(super) async fn evaluate_governed_subject(
     service: &ChiseiServiceImpl,

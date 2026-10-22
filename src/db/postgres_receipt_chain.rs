@@ -2,9 +2,9 @@
 
 use postgres::{GenericClient, IsolationLevel};
 
-use crate::chisei::receipt::OperationReceipt;
 use crate::db::postgres::PostgresDb;
 use crate::db::receipt_chain::{current_signer, kind_for_operation_receipt};
+use sekai_domain::receipt::OperationReceipt;
 use sekai_types::governed_transform::{TransformRun, redact_run_partition_receipts};
 use sekai_types::receipt_chain::{
     BUNDLE_VERSION, CHECKPOINT_INTERVAL, ChainEntry, Checkpoint, CheckpointKind, DIGEST_ALGORITHM,

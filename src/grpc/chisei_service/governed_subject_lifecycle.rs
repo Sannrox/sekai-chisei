@@ -1,7 +1,7 @@
 //! Governed Subject evaluation and situation-specific provenance lifecycle.
 
 use super::*;
-use crate::db::store::{ChiseiGovernedSubjectStore, ChiseiReceiptStore};
+use crate::chisei_store::{ChiseiGovernedSubjectStore, ChiseiReceiptStore};
 
 pub(super) struct ProvenanceExportOutcome {
     pub record: subject_provenance::ExportRecord,
@@ -9,14 +9,14 @@ pub(super) struct ProvenanceExportOutcome {
 }
 
 pub(super) struct GovernedSubjectLifecycle {
-    db: crate::db::store::ChiseiStore,
+    db: crate::chisei_store::ChiseiStore,
     sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
     config: Config,
 }
 
 impl GovernedSubjectLifecycle {
     pub(super) fn new(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
         config: Config,
     ) -> Self {

@@ -14,11 +14,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sekai_chisei::chisei::budget::BudgetTracker;
+use sekai_chisei::chisei_store::ChiseiStore;
 use sekai_chisei::combined_stores::CombinedStoreSources;
 use sekai_chisei::config::Config;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
-use sekai_chisei::db::store::{ChiseiStore, SekaiStore};
+use sekai_chisei::db::store::SekaiStore;
 use sekai_chisei::grpc::build_services;
 use sekai_chisei::grpc::client::connect_sekai;
 use sekai_chisei::grpc::pb::chisei::SetBudgetLimitRequest;

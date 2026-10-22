@@ -7623,7 +7623,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
         SekaiDb::new(":memory:").unwrap(),
     )));
     let sekai_store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
-    let chisei_store = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let chisei_store = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
     let budget = Arc::new(BudgetTracker::new(chisei_store.clone()));
     budget
         .set_limit("action:governed", 1, PeriodType::Daily)
@@ -19743,8 +19743,9 @@ async fn split_plane_run_records_usage_on_the_chisei_dest() {
     let dir = tempfile::tempdir().unwrap();
     let sekai =
         crate::db::store::SekaiStore::open_sqlite(dir.path().join("sekai.db").to_str().unwrap());
-    let chisei =
-        crate::db::store::ChiseiStore::open_sqlite(dir.path().join("chisei.db").to_str().unwrap());
+    let chisei = crate::chisei_store::ChiseiStore::open_sqlite(
+        dir.path().join("chisei.db").to_str().unwrap(),
+    );
     let svc = SekaiServiceImpl::new(sekai.clone()).with_cross_store_admission(Arc::new(
         CrossStoreAdmission::new(chisei.clone(), sekai.clone(), None),
     ));

@@ -539,7 +539,7 @@ mod tests {
         request.memory_actor = "alice".into();
         request.external_egress = false;
         crate::chisei::pipeline::default_pipeline()
-            .run(&mut request, &crate::db::store::ChiseiStore::memory())
+            .run(&mut request, &crate::chisei_store::ChiseiStore::memory())
     }
 
     #[tokio::test(flavor = "multi_thread")]

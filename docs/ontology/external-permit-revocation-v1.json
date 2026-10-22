@@ -49,7 +49,7 @@
   "provenance": [
     {
       "subject": "ExternalPermitPersistenceModule",
-      "source": "src/db/chisei_external_permit.rs",
+      "source": "src/chisei_store/chisei_external_permit.rs",
       "locator": "ChiseiExternalPermitBackend",
       "confidence": 1.0
     },

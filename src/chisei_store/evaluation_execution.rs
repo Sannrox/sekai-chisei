@@ -1,9 +1,9 @@
 //! SQLite execution index for receipt-authoritative evaluation runs.
 
 use crate::chisei::evaluation_execution::{EXECUTOR_VERSION, EvaluationExecutionIndex};
-use crate::chisei::receipt::OperationReceipt;
 use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sekai_domain::receipt::OperationReceipt;
 
 impl SekaiDb {
     pub(crate) fn migrate_evaluation_executions(&self) -> Result<(), String> {

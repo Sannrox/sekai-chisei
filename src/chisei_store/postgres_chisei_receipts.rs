@@ -1,12 +1,12 @@
 //! PostgreSQL operation receipt and gateway request-alias persistence.
 
-use crate::chisei::receipt::{
-    OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind,
-};
 use crate::db::chisei_receipt::{
     open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
 };
 use crate::db::postgres::PostgresDb;
+use sekai_domain::receipt::{
+    OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind,
+};
 
 impl PostgresDb {
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {

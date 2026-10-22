@@ -1,8 +1,8 @@
 //! SQLite persistence for immutable governed-subject provenance exports.
 
-use crate::chisei::governed_subject_provenance::ExportRecord;
 use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use sekai_types::governed_subject_provenance::ExportRecord;
 
 impl SekaiDb {
     pub(crate) fn migrate_governed_subject_provenance(&self) -> Result<(), String> {
@@ -118,8 +118,8 @@ fn immutable_replay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::governed_subject_provenance::{ProvenanceEnvelope, signing_key_from_hex};
     use base64::Engine as _;
+    use sekai_types::governed_subject_provenance::{ProvenanceEnvelope, signing_key_from_hex};
 
     fn digest(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))

@@ -5,10 +5,10 @@ use crate::chisei::kioku::{
     KiokuEvidenceLink, KiokuMemory, MemoryEvidenceStance, MemoryLifecycleEvent,
     MemoryLifecycleState, MemoryValidation, namespace_classification_ceiling,
 };
-use crate::chisei::principal::PrincipalContext;
 use crate::chisei::sekai_principal::principal_grants;
 use crate::db::postgres::PostgresDb;
 use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
+use sekai_types::principal::PrincipalContext;
 
 impl PostgresDb {
     pub fn insert_kioku_memory(

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::db::chisei_eval_backend::{EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS};
-use crate::db::store::{ChiseiEvalStore, ChiseiStore};
+use crate::chisei_store::chisei_eval_backend::{EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS};
+use crate::chisei_store::{ChiseiEvalStore, ChiseiStore};
 
 const SUPPORTED_ASSERTION_TYPES: [&str; 4] = ["status", "contains", "not_contains", "min_score"];
 const MAX_REPORTED_ASSERTION_TYPE_CHARS: usize = 64;

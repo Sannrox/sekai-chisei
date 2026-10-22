@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::store::{
+use crate::chisei_store::{
     ChiseiEvaluationStore, ChiseiGatewayStore, ChiseiKiokuStore, ChiseiObservationStore,
     ChiseiReceiptStore, ChiseiRoutingProfileStore,
 };

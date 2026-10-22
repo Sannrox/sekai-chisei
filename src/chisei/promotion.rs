@@ -11,7 +11,7 @@ use crate::chisei::decision_ledger::DecisionFilter;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::evolve::{self, TaskRecord};
 use crate::chisei::scoring::normalize_task_class;
-use crate::db::store::{ChiseiDecisionStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiStore};
 
 /// What a candidate would change if promoted.
 pub const KIND_ROUTING_BIAS: &str = "routing_bias";
@@ -363,7 +363,7 @@ pub fn propose_template_candidates(
 mod tests {
     use super::*;
     use crate::chisei::scoring::{Judge, JudgeError, JudgeVerdict, SampleObservation, ScoringJob};
-    use crate::db::store::ChiseiObservationStore;
+    use crate::chisei_store::ChiseiObservationStore;
     use std::sync::Arc;
 
     /// Batch size used for regression-signal tests: must be >= `scoring::MIN_OBS_FOR_REGRESSION`

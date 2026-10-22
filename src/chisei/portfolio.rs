@@ -1,4 +1,4 @@
-use crate::db::store::{ChiseiPortfolioStore, ChiseiStore};
+use crate::chisei_store::{ChiseiPortfolioStore, ChiseiStore};
 
 pub const LEGACY_PROMPT_VARIANT: &str = "legacy@1";
 

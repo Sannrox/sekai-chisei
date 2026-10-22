@@ -5,7 +5,7 @@
 //! persist ordering, permit issuance, and approve/deny/cancel CAS transitions.
 
 use super::*;
-use crate::db::store::{ChiseiExternalActionStore, ChiseiPermitStore};
+use crate::chisei_store::{ChiseiExternalActionStore, ChiseiPermitStore};
 
 impl ChiseiServiceImpl {
     pub(super) fn issue_external_permit(
