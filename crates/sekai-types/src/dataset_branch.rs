@@ -21,6 +21,11 @@ pub const PROPOSAL_STALE_PARENT: &str =
     "the parent dataset changed since the proposal; propose again";
 pub const PROPOSAL_STALE_BRANCH: &str = "the branch changed since the proposal; propose again";
 
+pub const BRANCH_RUN_ISOLATED: &str =
+    "an isolated-process transform cannot run on a dataset branch";
+pub const BRANCH_RUN_RAISES_MARKING: &str =
+    "this branch run would raise the output marking; run it on the parent first";
+
 pub const STATUS_OPEN: &str = "open";
 pub const STATUS_MERGED: &str = "merged";
 pub const STATUS_CLOSED: &str = "closed";
@@ -86,6 +91,18 @@ pub struct MergeDatasetBranch {
     pub actor: String,
     pub tenant: String,
     pub reason: String,
+}
+
+/// What a transform run on a branch read and wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DatasetBranchRun {
+    pub transform_id: String,
+    pub branch: String,
+    pub output_dataset_id: String,
+    pub rows_written: i64,
+    /// Input datasets read from the branch; the others read the parent.
+    pub branch_inputs: Vec<String>,
+    pub markings_out: String,
 }
 
 /// Branch head against the parent's live rows.

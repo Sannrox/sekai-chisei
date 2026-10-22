@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A governed transform can run on a dataset branch (ADR 0119). Inputs read
+  their branch where it exists and the parent otherwise. The output is
+  written only to the output dataset's branch, so the parent's rows,
+  checkpoint and marking stay as they were. A run that would raise the
+  output marking, or that targets another tenant's branch, is refused; an
+  isolated-process transform cannot run on a branch yet (#1444).
+
 - Datasets have branches (ADR 0119): a branch is one working copy forked from
   a version, and until its first write it reads that version, so creating one
   copies nothing. Branch writes never touch the parent. Compare reports
