@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "Player",
+      "description": "A tenant who owns planets and fleets."
+    },
+    {
+      "name": "Planet",
+      "description": "An owned world. Hidden from other tenants unless allied or cleared."
+    },
+    {
+      "name": "Fleet",
+      "description": "Parked or in-flight ships."
+    },
+    {
+      "name": "Faction",
+      "description": "An NPC diplomatic counterpart."
+    },
+    {
+      "name": "Outpost",
+      "description": "A pirate or contested world."
+    },
+    {
+      "name": "Marking",
+      "description": "Classification and compartments on a fact, plan, report or law."
+    },
+    {
+      "name": "Compartment",
+      "description": "A need-to-know label that a clearance must include."
+    },
+    {
+      "name": "Clearance",
+      "description": "Highest classification and compartments a role or leader may see."
+    },
+    {
+      "name": "SharingAgreement",
+      "description": "Allied-faction access to marked objects at a stated class and compartment set."
+    },
+    {
+      "name": "Region",
+      "description": "A market venue keyed by a star-system coordinate."
+    },
+    {
+      "name": "Warehouse",
+      "description": "Per-region inventory for a trader."
+    },
+    {
+      "name": "Good",
+      "description": "A traded resource priced in metal."
+    },
+    {
+      "name": "Order",
+      "description": "A limit or market bid or ask on a regional book."
+    },
+    {
+      "name": "Contract",
+      "description": "A delivery or procurement agreement with a deadline and penalty."
+    },
+    {
+      "name": "Trader",
+      "description": "The player or an NPC counterparty on the regional market."
+    },
+    {
+      "name": "Shipment",
+      "description": "Goods in transit between regions. Pays fuel and takes flight time."
+    },
+    {
+      "name": "Treasury",
+      "description": "Empire cash account. Income and expenses are valued materials, energy and labour."
+    },
+    {
+      "name": "Budget",
+      "description": "A period spending cap on a cost center, with forecast and actual."
+    },
+    {
+      "name": "CostCenter",
+      "description": "A department, fleet or colony that spending is charged to."
+    },
+    {
+      "name": "Expense",
+      "description": "A valued spend of materials, energy or labour in the current period."
+    },
+    {
+      "name": "Forecast",
+      "description": "Expected spend from queued work and held approvals."
+    },
+    {
+      "name": "Approval",
+      "description": "A decision that releases a held spend over a budget or role limit."
+    },
+    {
+      "name": "Kpi",
+      "description": "A named series computed from live production, energy, waste, treasury, incidents, missions or trade."
+    },
+    {
+      "name": "Target",
+      "description": "A goal value on a KPI owned by the empire, a colony or a role."
+    },
+    {
+      "name": "Measurement",
+      "description": "A period sample of a KPI with variance versus its target and source event ids."
+    },
+    {
+      "name": "Report",
+      "description": "An archived period of KPI measurements, highlights and pending decisions."
+    },
+    {
+      "name": "Incident",
+      "description": "A structured lifecycle for a raid, failure, shortage, accident or contract miss."
+    },
+    {
+      "name": "Risk",
+      "description": "A known threat with likelihood, impact and a review date."
+    },
+    {
+      "name": "Resolution",
+      "description": "The closing action and note on an incident."
+    },
+    {
+      "name": "Review",
+      "description": "A post-incident archive with timeline, root cause and follow-ups."
+    },
+    {
+      "name": "FollowUp",
+      "description": "A recommended law, maintenance or fleet change from a review."
+    },
+    {
+      "name": "Asset",
+      "description": "A building, defence battery or vehicle whose condition is tracked."
+    },
+    {
+      "name": "Condition",
+      "description": "Health of an asset from use, age and heat, from 1.0 (new) to worn."
+    },
+    {
+      "name": "MaintenancePlan",
+      "description": "A time-based or usage-based service interval for an asset."
+    },
+    {
+      "name": "WorkOrder",
+      "description": "Scheduled service or repair that takes an asset offline for a cost."
+    },
+    {
+      "name": "TelemetryReading",
+      "description": "A noisy sample of temperature, vibration and power for an asset."
+    },
+    {
+      "name": "FailurePrediction",
+      "description": "Chance an asset fails within the configured horizon, from the hourly bathtub rate."
+    }
+  ],
+  "relations": [
+    {
+      "name": "owns",
+      "domain": "Player",
+      "range": "Planet",
+      "description": "The player who holds the planet."
+    },
+    {
+      "name": "stationed-at",
+      "domain": "Fleet",
+      "range": "Planet",
+      "description": "Where a parked fleet sits."
+    },
+    {
+      "name": "allied-with",
+      "domain": "Player",
+      "range": "Player",
+      "description": "Alliance that grants shared visibility."
+    },
+    {
+      "name": "placed-in",
+      "domain": "Order",
+      "range": "Region",
+      "description": "The book that holds the order."
+    },
+    {
+      "name": "binds",
+      "domain": "Contract",
+      "range": "Trader",
+      "description": "The holder who accepted the contract."
+    },
+    {
+      "name": "fulfils",
+      "domain": "Shipment",
+      "range": "Contract",
+      "description": "A shipment that delivers against an accepted contract."
+    },
+    {
+      "name": "charged-to",
+      "domain": "Expense",
+      "range": "CostCenter",
+      "description": "The department, fleet or colony that bears the spend."
+    },
+    {
+      "name": "approved-by",
+      "domain": "Approval",
+      "range": "Player",
+      "description": "The player or assigned leader who released a held spend."
+    },
+    {
+      "name": "measured-over",
+      "domain": "Measurement",
+      "range": "Kpi",
+      "description": "The series a measurement samples."
+    },
+    {
+      "name": "compared-with",
+      "domain": "Measurement",
+      "range": "Target",
+      "description": "The goal a measurement is scored against."
+    },
+    {
+      "name": "owned-by",
+      "domain": "Target",
+      "range": "Planet",
+      "description": "A colony or role that holds a KPI target. Empire targets have no planet owner."
+    },
+    {
+      "name": "generated-from",
+      "domain": "Report",
+      "range": "Measurement",
+      "description": "The samples archived into a periodic report."
+    },
+    {
+      "name": "affects",
+      "domain": "Incident",
+      "range": "Planet",
+      "description": "Objects named on an open incident."
+    },
+    {
+      "name": "assigned-to",
+      "domain": "Incident",
+      "range": "Player",
+      "description": "The leader who owns the incident."
+    },
+    {
+      "name": "caused-by",
+      "domain": "Incident",
+      "range": "Report",
+      "description": "History events that opened or explain the incident."
+    },
+    {
+      "name": "closed-by",
+      "domain": "Incident",
+      "range": "Resolution",
+      "description": "The resolution that closed the incident."
+    },
+    {
+      "name": "reviewed-in",
+      "domain": "Incident",
+      "range": "Review",
+      "description": "The post-incident review archived for a serious case."
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "Player",
+      "source": "hoshi-ontology/v1",
+      "locator": "chisei-api:1.3.0",
+      "confidence": 1.0
+    }
+  ]
+}
