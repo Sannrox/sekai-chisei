@@ -38,6 +38,8 @@ use scored_knowledge_admission::{
 mod semantic_retrieval_lifecycle;
 #[path = "sekai_service_support_access.rs"]
 mod support_access;
+#[path = "trust_score_rpc.rs"]
+mod trust_score_rpc;
 use support_access::*;
 #[path = "sekai_service_support_mapping.rs"]
 mod support_mapping;
@@ -416,6 +418,7 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     governed_fact_domain::PROFILE_KIND,
     governed_fact_domain::FACT_KIND,
     governed_fact_domain::WAIVER_KIND,
+    crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
 ];
 
 const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
@@ -800,6 +803,27 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<QueryCounterfactualViewRequest>,
     ) -> Result<Response<QueryCounterfactualViewResponse>, Status> {
         rpc_objects::query_counterfactual_view(self, req).await
+    }
+
+    async fn put_trust_scoring_rule(
+        &self,
+        req: Request<PutTrustScoringRuleRequest>,
+    ) -> Result<Response<PutTrustScoringRuleResponse>, Status> {
+        trust_score_rpc::put_trust_scoring_rule(self, req).await
+    }
+
+    async fn get_trust_scoring_rule(
+        &self,
+        req: Request<GetTrustScoringRuleRequest>,
+    ) -> Result<Response<GetTrustScoringRuleResponse>, Status> {
+        trust_score_rpc::get_trust_scoring_rule(self, req).await
+    }
+
+    async fn score_object_trust(
+        &self,
+        req: Request<ScoreObjectTrustRequest>,
+    ) -> Result<Response<ScoreObjectTrustResponse>, Status> {
+        trust_score_rpc::score_object_trust(self, req).await
     }
 
     async fn query_object_policy_audit(

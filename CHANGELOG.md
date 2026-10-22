@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Experimental trust scores: a versioned per-namespace scoring rule turns
+  source health, age against expected freshness, manual verification and
+  corroborating or contradicting links into a 0 to 100 score per object
+  with its reasons. `ScoreObjectTrust` scores an object-set page as the
+  caller and filters or sorts by score. Rule changes are credential-admin,
+  compare-and-set and audited in the object change log
+  (docs/trust-scores.md, #1456).
+
 - `QueryCounterfactualView` shows what a namespace's objects would have
   shown at a past time under candidate object security policies or a
   candidate marking rule, per principal: visible then, visible under the

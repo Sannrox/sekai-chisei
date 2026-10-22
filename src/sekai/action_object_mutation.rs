@@ -43,6 +43,7 @@ const RESERVED_OBJECT_KINDS: &[&str] = &[
     governed_facts::PROFILE_KIND,
     governed_facts::FACT_KIND,
     governed_facts::WAIVER_KIND,
+    crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
 ];
 
 #[derive(Debug, Clone)]
