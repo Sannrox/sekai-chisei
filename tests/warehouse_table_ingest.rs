@@ -183,6 +183,7 @@ async fn publish_object_type(
                 eval_plan_digests: Vec::new(),
                 named_foreign_digests: Vec::new(),
                 idempotency_key: "orders-propose".into(),
+                major_revision: false,
             },
             SCHEMA_ADMIN,
         ))

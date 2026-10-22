@@ -3035,6 +3035,8 @@ message DefinitionProposal {
   string close_reason_code = 16; // set only after close
   string restored_from_digest = 17; // prior published revision restored by this proposal
   string migration_plan_digest = 18; // pin required when rollback would drop live properties
+  // Approved as a new major revision: may break blocking consumer bindings.
+  bool major_revision = 19;
 }
 
 message CreateDefinitionProposalRequest {
@@ -3046,6 +3048,9 @@ message CreateDefinitionProposalRequest {
   repeated string eval_plan_digests = 6;
   repeated string named_foreign_digests = 7;
   string idempotency_key = 8;
+  // Propose a new major revision. Once approved it may break blocking
+  // consumer bindings; the flag is part of the approved proposal digest.
+  bool major_revision = 9;
 }
 
 message CreateDefinitionProposalResponse {
@@ -3176,6 +3181,8 @@ message DefinitionConsumerImpactPath {
   string member_id = 4;
   string property = 5;
   string source_locator = 6;
+  // The binding blocks breaking publishes and is disclosed to producers.
+  bool blocking = 7;
 }
 message ReportDefinitionConsumerImpactRequest {
   string namespace = 1;

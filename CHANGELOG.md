@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A consumer can mark its definition consumer binding `blocking`.
+  Publishing a revision that breaks a valid blocking binding then fails and
+  names it, unless the proposal is an approved major revision
+  (`major_revision`). Blocking bindings are disclosed to producers in
+  impact reports; advisory bindings keep the ADR 0067 non-disclosure
+  (ADR 0067 amended, #1635).
+
 - Experimental comment threads on objects and their properties, with
   mentions, resolve and reopen. A comment is visible only to callers who
   can read its object and property, quoted values of hidden properties are

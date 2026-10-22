@@ -296,6 +296,7 @@ async fn exercise_product_loop(server: &LoopServer) {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "loop-propose".into(),
+            major_revision: false,
         })
         .await
         .unwrap_or_else(|error| panic!("propose: {error}\n{}", logs()));
