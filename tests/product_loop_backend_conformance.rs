@@ -35,7 +35,7 @@ use crate::postgres_scratch::ScratchDatabase;
 
 const WAIT_BUDGET: Duration = Duration::from_secs(30);
 
-enum Backend {
+pub(crate) enum Backend {
     Sqlite,
     Postgres {
         sekai_url: String,
@@ -44,7 +44,7 @@ enum Backend {
     },
 }
 
-struct LoopServer {
+pub(crate) struct LoopServer {
     child: Child,
     #[allow(dead_code)]
     dir: tempfile::TempDir,
@@ -53,7 +53,7 @@ struct LoopServer {
 }
 
 impl LoopServer {
-    fn spawn(backend: &Backend) -> Self {
+    pub(crate) fn spawn(backend: &Backend) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("sekai.sock");
         let log_path = dir.path().join("sekai.log");
@@ -128,7 +128,7 @@ impl LoopServer {
         }
     }
 
-    fn logs(&self) -> String {
+    pub(crate) fn logs(&self) -> String {
         let mut contents = String::new();
         if let Ok(mut file) = std::fs::File::open(&self.log_path) {
             let _ = file.read_to_string(&mut contents);
@@ -136,7 +136,7 @@ impl LoopServer {
         contents
     }
 
-    fn socket_str(&self) -> String {
+    pub(crate) fn socket_str(&self) -> String {
         self.socket.to_str().expect("utf8 socket").to_string()
     }
 
@@ -150,7 +150,7 @@ impl LoopServer {
             .expect("run sekaictl")
     }
 
-    fn sekaictl_ok(&self, args: &[&str]) -> String {
+    pub(crate) fn sekaictl_ok(&self, args: &[&str]) -> String {
         let output = self.sekaictl(args);
         assert!(
             output.status.success(),
@@ -162,12 +162,14 @@ impl LoopServer {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    fn token(&self, principal: &str) -> String {
+    pub(crate) fn token(&self, principal: &str) -> String {
         let token = self.sekaictl_ok(&["admin", "access", "credential", "create", principal]);
         token.trim().to_string()
     }
 
-    async fn sekai(&self) -> SekaiServiceClient<sekai_chisei::grpc::client::GatewayClient> {
+    pub(crate) async fn sekai(
+        &self,
+    ) -> SekaiServiceClient<sekai_chisei::grpc::client::GatewayClient> {
         SekaiServiceClient::new(connect_sekai(&self.socket_str()).await.expect("connect"))
     }
 
@@ -175,7 +177,7 @@ impl LoopServer {
         ChiseiServiceClient::new(connect_sekai(&self.socket_str()).await.expect("connect"))
     }
 
-    fn panics(&self) -> usize {
+    pub(crate) fn panics(&self) -> usize {
         self.logs().matches("panicked").count()
     }
 }
@@ -195,7 +197,7 @@ fn fixture(relative: &str) -> String {
         .to_string()
 }
 
-fn bearer<T>(token: &str, message: T) -> Request<T> {
+pub(crate) fn bearer<T>(token: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     request.metadata_mut().insert(
         "authorization",
