@@ -2,9 +2,9 @@
 
 use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
 use sekai_chisei::db::sekai::PrincipalCredential;
-use sekai_chisei::gateway_keys::hash_gateway_key;
 use sekai_chisei::grpc::TokenAuthInterceptor;
 use sekai_chisei::sekai::credentials::{CREDENTIAL_CACHE_MAX_STALE_MS, PrincipalCredentialStore};
+use sekai_domain::gateway_keys::hash_gateway_key;
 use std::sync::Arc;
 use tonic::Request;
 use tonic::service::Interceptor;

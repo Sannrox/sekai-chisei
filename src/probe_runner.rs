@@ -582,12 +582,12 @@ mod tests {
     use std::sync::Arc;
 
     use crate::db::runtime_db::RuntimeDb;
-    use crate::gateway_keys::hash_gateway_key;
     use crate::grpc::TokenAuthInterceptor;
     use crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
     use crate::sekai::credentials::PrincipalCredentialStore;
     use crate::sekai::security::{Grant, Role};
     use crate::sekai::synthetic::{SizePreset, Spec, SupplyChain, SyntheticPlan, apply, generate};
+    use sekai_domain::gateway_keys::hash_gateway_key;
 
     /// A deployment-like target: the real service behind token
     /// authentication on an ephemeral port, with two synthetic tenants.

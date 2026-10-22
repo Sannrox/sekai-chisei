@@ -137,7 +137,7 @@ pub(super) async fn proxy_gateway_inner_scoped(
                 "provider capability matrix requires GET",
             );
         }
-        let discovery = sekai_provider::model_availability::ModelDiscoveryConfig {
+        let discovery = chisei_provider::model_availability::ModelDiscoveryConfig {
             openai_base_url: state.config.openai_base_url.clone(),
             openai_api_key: state.config.openai_api_key.clone(),
             anthropic_base_url: state.config.anthropic_base_url.clone(),
@@ -150,7 +150,8 @@ pub(super) async fn proxy_gateway_inner_scoped(
             native_configured: state.config.native_base_url.is_some(),
         };
         let availability =
-            sekai_provider::model_availability::refresh_model_availability(&discovery, false).await;
+            chisei_provider::model_availability::refresh_model_availability(&discovery, false)
+                .await;
         let mut response = json_response(
             StatusCode::OK,
             serde_json::to_value(CapabilityMatrix::public_discovery(availability))
@@ -182,7 +183,7 @@ pub(super) async fn proxy_gateway_inner_scoped(
                 .find_map(|pair| pair.strip_prefix("provider="))
                 .map(str::to_string)
         });
-        let discovery = sekai_provider::model_availability::ModelDiscoveryConfig {
+        let discovery = chisei_provider::model_availability::ModelDiscoveryConfig {
             openai_base_url: state.config.openai_base_url.clone(),
             openai_api_key: state.config.openai_api_key.clone(),
             anthropic_base_url: state.config.anthropic_base_url.clone(),
@@ -195,7 +196,8 @@ pub(super) async fn proxy_gateway_inner_scoped(
             native_configured: state.config.native_base_url.is_some(),
         };
         let availability =
-            sekai_provider::model_availability::refresh_model_availability(&discovery, false).await;
+            chisei_provider::model_availability::refresh_model_availability(&discovery, false)
+                .await;
         let mut response = json_response(
             StatusCode::OK,
             serde_json::to_value(availability.public_models(provider.as_deref()))

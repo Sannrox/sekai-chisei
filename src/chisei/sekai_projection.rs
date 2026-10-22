@@ -5,7 +5,7 @@
 //! only Chisei types. This module maps Sekai governed Action types, evidence
 //! submissions, and retrieval explanations into them.
 
-use sekai_provider::system_one::SystemOneBind;
+use chisei_provider::system_one::SystemOneBind;
 
 use crate::chisei::epistemic_descriptor::{EpistemicDescriptor, ExternalEvidenceFacts};
 use crate::chisei::system_one_action::SystemOneActionType;

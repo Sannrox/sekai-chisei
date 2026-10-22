@@ -72,6 +72,7 @@ pub(crate) mod lease_lifecycle;
 pub mod ledger;
 pub mod lineage;
 pub use sekai_types::markings;
+pub mod counterfactual;
 pub mod model_platform;
 pub mod namespace_access;
 pub mod namespace_snapshot;

@@ -9179,7 +9179,7 @@ async fn execute_plan_stream_refuses_when_planning_delegator_is_disabled() {
         .runtime()
         .create_principal_credential(
             "origin-user",
-            &crate::gateway_keys::hash_gateway_key("delegator-secret"),
+            &sekai_domain::gateway_keys::hash_gateway_key("delegator-secret"),
             1,
         )
         .unwrap();

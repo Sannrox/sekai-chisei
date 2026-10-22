@@ -146,6 +146,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | sqlite only | none | `experimental` |
 | `SekaiService.PutClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
 | `SekaiService.GetClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
+| `SekaiService.QueryCounterfactualView` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.FindByExternalId` | `sekai.graph` | yes | none | `stable` |

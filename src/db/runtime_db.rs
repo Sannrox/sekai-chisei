@@ -1272,6 +1272,16 @@ impl RuntimeDb {
         }
     }
 
+    pub fn classification_lattice_recorded_at_ms(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<i64>, String> {
+        match self {
+            Self::Sqlite(db) => db.classification_lattice_recorded_at_ms(namespace),
+            Self::Postgres(_) => Ok(None),
+        }
+    }
+
     pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
         match self {
             Self::Sqlite(db) => db.object_query_cursor_key(),

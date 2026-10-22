@@ -258,7 +258,7 @@ mod tests {
     };
     use crate::db::runtime_db::RuntimeDb;
     use ed25519_dalek::SigningKey;
-    use sekai_provider::receipt::{
+    use sekai_domain::receipt::{
         OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
     };
     use std::collections::BTreeMap;

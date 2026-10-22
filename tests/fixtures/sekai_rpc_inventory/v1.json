@@ -1005,6 +1005,20 @@
       "product_tier": "core"
     },
     {
+      "rpc": "QueryCounterfactualView",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/counterfactual.rs",
+        "src/grpc/sekai_service_rpc_objects.rs",
+        "docs/object-security.md"
+      ],
+      "durable_dependencies": [
+        "sekai.object-security"
+      ],
+      "product_tier": "core"
+    },
+    {
       "rpc": "SimulateObjectPolicyChange",
       "kind": "query",
       "surfaces": [],

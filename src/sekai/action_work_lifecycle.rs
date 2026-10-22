@@ -16,7 +16,7 @@ use crate::sekai::delegating_principal::{
     DelegatorApplyError, current_delegating_principal_state, revalidate_delegator_at_apply,
 };
 use crate::sekai::parked_work::{ActionWorkContinuation, ActionWorkPark};
-use sekai_provider::receipt::{
+use sekai_domain::receipt::{
     OperationReceipt, OperationReceiptEvent, ReceiptArtifact, ReceiptEventKind,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -1013,7 +1013,7 @@ mod tests {
     use crate::sekai::action_instance::{ActionInstance, STATUS_ADMITTED};
     use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
     use crate::sekai::security::{Grant, Role};
-    use sekai_provider::receipt::{
+    use sekai_domain::receipt::{
         OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptArtifact,
         ReceiptSurface, UncoveredSurface,
     };
@@ -2288,7 +2288,7 @@ mod tests {
         seed_open_receipt(&db, &effect);
         db.create_principal_credential(
             DELEGATOR,
-            &crate::gateway_keys::hash_gateway_key("delegator-secret"),
+            &sekai_domain::gateway_keys::hash_gateway_key("delegator-secret"),
             1,
         )
         .unwrap();
@@ -2440,7 +2440,7 @@ mod tests {
         let (db, effect, _) = seed_delegated_apply_path();
         db.create_principal_credential(
             "runtime",
-            &crate::gateway_keys::hash_gateway_key("runtime-secret"),
+            &sekai_domain::gateway_keys::hash_gateway_key("runtime-secret"),
             1,
         )
         .unwrap();

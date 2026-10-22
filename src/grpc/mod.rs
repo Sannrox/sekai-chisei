@@ -21,12 +21,12 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::PrincipalCredential;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
 use crate::plane::ProcessPlane;
 use crate::rpc_maturity::RpcMaturityLayer;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
+use sekai_domain::gateway_keys::hash_gateway_key;
 use std::convert::Infallible;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;

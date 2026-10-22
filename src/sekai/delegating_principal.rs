@@ -13,7 +13,7 @@ use crate::enterprise::{
 use crate::sekai::namespace_access::{
     principal_can_access_namespace, principal_can_write_namespace,
 };
-use sekai_provider::receipt::ReceiptEventKind;
+use sekai_domain::receipt::ReceiptEventKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DelegatorApplyError {
