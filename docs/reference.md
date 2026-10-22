@@ -128,6 +128,7 @@ lives in the separate [research index](research/README.md).
   objects and dataset metadata under the live read policy.
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   `ExpandNeighborhood` and `FindPaths` under the live read policy at every hop.
+- [Data catalog](catalog.md) — experimental `RegisterCatalogEntry`.
 - [Ontology changelog](ontology-changelog.md) — experimental
   `GetOntologyChangelog` for a reader and a window of at most 31 days.
 - [Object comments](object-comments.md) — experimental

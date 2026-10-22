@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Experimental governed catalog entries for datasets, object types and
+  pipelines: `RegisterCatalogEntry` records owners, steward, tags,
+  markings, schema summary, freshness and status, idempotently by the
+  source's stable id. Entries are `catalog_entry` objects, so reads and
+  search follow the ordinary read policy; only registration writes them,
+  markings only rise, and deregistration deprecates. A background
+  reconciler registers and retires entries for published object types
+  (ADR 0121, #1559).
+
 - Experimental live policy shadow: `StartPolicyShadow` evaluates a candidate
   namespace route policy beside the active one on every live resolution,
   without changing the decision. `GetPolicyShadowReport` shows the match

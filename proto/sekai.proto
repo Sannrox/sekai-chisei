@@ -1357,6 +1357,33 @@ message GetOntologyChangelogResponse {
   int64 until_ms = 3;
   repeated OntologyChangelogEntry entries = 4;
 }
+// Register or update the catalog entry a source system owns, keyed by its
+// stable id: one entry per (namespace, entry_kind, source_system, source_id).
+// Needs namespace write. Identical content is a no-op; a marking is only
+// raised; `deprecated` deregisters without deleting. Entries are objects of
+// kind `catalog_entry`, read and searched under the ordinary read policy.
+message RegisterCatalogEntryRequest {
+  string namespace = 1;
+  // dataset | object_type | pipeline
+  string entry_kind = 2;
+  string source_system = 3;
+  string source_id = 4;
+  string display_name = 5;
+  string description = 6;
+  repeated string owners = 7;
+  string steward = 8;
+  repeated string tags = 9;
+  string access_marking = 10;
+  string schema_summary = 11;
+  int64 freshness_ms = 12;
+  bool deprecated = 13;
+}
+message RegisterCatalogEntryResponse {
+  // Empty when the caller may write the entry but not read it.
+  Object entry = 1;
+  // False when the stored entry already said exactly this.
+  bool changed = 2;
+}
 message ObjectPolicyAuditEvent {
   string event_id = 1;
   string namespace = 2;
@@ -3539,6 +3566,7 @@ service SekaiService {
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
   rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
+  rpc RegisterCatalogEntry(RegisterCatalogEntryRequest) returns (RegisterCatalogEntryResponse);
   rpc CreateObjectComment(CreateObjectCommentRequest) returns (CreateObjectCommentResponse);
   rpc UpdateObjectComment(UpdateObjectCommentRequest) returns (UpdateObjectCommentResponse);
   rpc ListObjectComments(ListObjectCommentsRequest) returns (ListObjectCommentsResponse);

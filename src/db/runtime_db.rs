@@ -1673,6 +1673,15 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_published_definition_namespaces(&self) -> Result<Vec<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_published_definition_namespaces(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_published_definition_namespaces())
+            }
+        }
+    }
+
     pub fn get_published_definition_revision(
         &self,
         namespace: &str,

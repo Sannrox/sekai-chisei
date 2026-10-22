@@ -764,6 +764,19 @@ impl SekaiDb {
         load_proposal_sqlite(&self.conn(), namespace, proposal_id)
     }
 
+    /// Namespaces that have a published definition revision, sorted.
+    pub fn list_published_definition_namespaces(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare("SELECT namespace FROM sekai_definition_published_heads ORDER BY namespace")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn propose_definition_rollback(
         &self,
         request: &ProposeDefinitionRollback,

@@ -19,6 +19,7 @@ pub mod autonomous_envelope;
 pub mod capability;
 pub mod capability_package;
 pub mod capacity;
+pub mod catalog;
 pub use sekai_types::classification_lattice;
 pub mod client_package;
 pub mod compute;

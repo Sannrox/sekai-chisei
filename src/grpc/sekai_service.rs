@@ -10,6 +10,8 @@ mod authorized_query_lifecycle;
 mod capability_discovery;
 #[path = "catalog_invocation.rs"]
 mod catalog_invocation;
+#[path = "catalog_rpc.rs"]
+mod catalog_rpc;
 #[path = "computed_response.rs"]
 mod computed_response;
 #[path = "definition_consumer_impact.rs"]
@@ -864,6 +866,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListCommentMentionsRequest>,
     ) -> Result<Response<ListCommentMentionsResponse>, Status> {
         object_comment_rpc::list_comment_mentions(self, req).await
+    }
+
+    async fn register_catalog_entry(
+        &self,
+        req: Request<RegisterCatalogEntryRequest>,
+    ) -> Result<Response<RegisterCatalogEntryResponse>, Status> {
+        catalog_rpc::register_catalog_entry(self, req).await
     }
 
     async fn query_object_policy_audit(

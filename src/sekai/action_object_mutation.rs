@@ -45,6 +45,7 @@ const RESERVED_OBJECT_KINDS: &[&str] = &[
     governed_facts::WAIVER_KIND,
     crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
     crate::sekai::object_comment::OBJECT_COMMENT_KIND,
+    crate::sekai::catalog::CATALOG_ENTRY_KIND,
 ];
 
 #[derive(Debug, Clone)]
