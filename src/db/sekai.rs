@@ -913,26 +913,7 @@ impl SekaiDb {
     }
 
     pub fn create_object(&self, o: &Object) -> Result<(), String> {
-        if o.external_id.starts_with("namespace:") && o.kind != "namespace" {
-            return Err("namespace:* external IDs are reserved for namespace boundaries".into());
-        }
-        let conn = self.conn();
-        let historical_changes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = ?1",
-                params![o.id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if historical_changes > 0 {
-            return Err("object IDs with audit history cannot be reused".into());
-        }
-        let props = crate::domain::storage_properties_json(&o.properties)?;
-        conn.execute(
-            "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![o.id, o.kind, o.name, o.namespace, o.external_id, props, o.created, o.updated],
-        ).map_err(|e| e.to_string())?;
-        Ok(())
+        insert_object(&self.conn(), o)
     }
 
     pub fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
@@ -1954,6 +1935,31 @@ fn require_authorized_link_endpoints(
     if !from.persisted_state_matches(expected_from) || !to.persisted_state_matches(expected_to) {
         return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
     }
+    Ok(())
+}
+
+/// Insert one object on `conn`, so a caller can write it in the same
+/// transaction as related rows. Refuses reserved boundary ids and ids with
+/// audit history.
+pub(crate) fn insert_object(conn: &rusqlite::Connection, o: &Object) -> Result<(), String> {
+    if o.external_id.starts_with("namespace:") && o.kind != "namespace" {
+        return Err("namespace:* external IDs are reserved for namespace boundaries".into());
+    }
+    let historical_changes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = ?1",
+            params![o.id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if historical_changes > 0 {
+        return Err("object IDs with audit history cannot be reused".into());
+    }
+    let props = crate::domain::storage_properties_json(&o.properties)?;
+    conn.execute(
+        "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![o.id, o.kind, o.name, o.namespace, o.external_id, props, o.created, o.updated],
+    ).map_err(|e| e.to_string())?;
     Ok(())
 }
 

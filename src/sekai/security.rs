@@ -381,7 +381,7 @@ impl SekaiDb {
     }
 }
 
-fn insert_grant(conn: &rusqlite::Connection, grant: &Grant) -> Result<(), String> {
+pub(crate) fn insert_grant(conn: &rusqlite::Connection, grant: &Grant) -> Result<(), String> {
     conn.execute(
         "INSERT INTO sekai_grants (id,object_id,principal,role,created,purpose,not_after_ms,exception_reason)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)

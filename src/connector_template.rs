@@ -125,7 +125,7 @@ mod tests {
         let template = FILES[0].1;
         let checkout = manifest(template, &SdkSource::Checkout("/src/chisei".into()));
         assert!(checkout.contains(
-            r#"sekai-source-sdk = { version = "1.2.0", path = "/src/chisei/crates/sekai-source-sdk" }"#
+            r#"sekai-source-sdk = { version = "1.3.0", path = "/src/chisei/crates/sekai-source-sdk" }"#
         ));
         let quoted = manifest(template, &SdkSource::Checkout(r#"/src/a"b\c"#.into()));
         assert!(quoted.contains(r#"path = "/src/a\"b\\c/crates/sekai-proto" }"#));
