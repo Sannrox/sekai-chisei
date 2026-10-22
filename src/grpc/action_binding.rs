@@ -32,14 +32,40 @@ impl SekaiServiceImpl {
         )?;
         // Installing unattended writes is a namespace-administration act.
         let actor = authorize_source_type_namespace_admin(self, &principals, &binding.namespace)?;
+        self.check_bound_action(
+            &binding.namespace,
+            &binding.type_id,
+            &binding.version,
+            &binding.run_as,
+            &binding.parameters.keys().cloned().collect::<Vec<_>>(),
+        )?;
+        let stored = self
+            .db
+            .runtime()
+            .put_action_binding(&binding, &actor, now_millis())
+            .map_err(map_binding_store_error)?;
+        Ok(Response::new(PutActionBindingResponse {
+            binding_json: serde_json::to_string(&stored)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            revision: stored.revision,
+        }))
+    }
+
+    /// Checks what a binding install pins: the bound type and version exist
+    /// and are enabled, every mapped parameter is declared, every required
+    /// one is mapped, and `run_as` holds namespace write.
+    pub(super) fn check_bound_action(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        version: &str,
+        run_as: &str,
+        mapped: &[String],
+    ) -> Result<(), Status> {
         let type_def = self
             .db
             .runtime()
-            .require_enabled_governed_action_type(
-                &binding.namespace,
-                &binding.type_id,
-                &binding.version,
-            )
+            .require_enabled_governed_action_type(namespace, type_id, version)
             .map_err(|_| Status::failed_precondition("bound action type unavailable"))?;
         let schema = serde_json::from_str::<serde_json::Value>(&type_def.parameter_schema_json)
             .ok()
@@ -55,11 +81,7 @@ impl SekaiServiceImpl {
             .as_object()
             .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        if let Some(name) = binding
-            .parameters
-            .keys()
-            .find(|name| !declared.contains(name))
-        {
+        if let Some(name) = mapped.iter().find(|name| !declared.contains(name)) {
             return Err(Status::invalid_argument(format!(
                 "parameter {name:?} is not declared by the bound action type"
             )));
@@ -72,29 +94,15 @@ impl SekaiServiceImpl {
             .into_iter()
             .flatten()
             .filter_map(|name| name.as_str())
-            .find(|name| !binding.parameters.contains_key(*name))
+            .find(|name| !mapped.iter().any(|mapped| mapped == name))
         {
             return Err(Status::invalid_argument(format!(
                 "required parameter {name:?} of the bound action type is not mapped"
             )));
         }
-        check_team_namespace(
-            self.db.runtime(),
-            std::slice::from_ref(&binding.run_as),
-            &binding.namespace,
-            true,
-        )
-        .map_err(|_| Status::failed_precondition("run_as lacks namespace write"))?;
-        let stored = self
-            .db
-            .runtime()
-            .put_action_binding(&binding, &actor, now_millis())
-            .map_err(map_binding_store_error)?;
-        Ok(Response::new(PutActionBindingResponse {
-            binding_json: serde_json::to_string(&stored)
-                .map_err(|error| Status::internal(error.to_string()))?,
-            revision: stored.revision,
-        }))
+        check_team_namespace(self.db.runtime(), &[run_as.to_string()], namespace, true)
+            .map_err(|_| Status::failed_precondition("run_as lacks namespace write"))?;
+        Ok(())
     }
 
     /// Reads the binding's own subscription as its service principal and
@@ -133,42 +141,12 @@ impl SekaiServiceImpl {
             return Err(Status::failed_precondition("action binding is disabled"));
         }
         let run_as = vec![binding.run_as.clone()];
-        // The service principal's grants decide both what it reads and what
-        // it may submit, checked before any page is consumed.
-        check_team_namespace(self.db.runtime(), &run_as, &binding.namespace, true)
-            .map_err(|_| Status::failed_precondition("run_as lacks namespace write"))?;
-        let tenant = crate::sekai::write_freeze::acting_or_registered_tenant(
-            self.db.runtime(),
-            acting_tenant(tenant_context.as_ref()),
-            &binding.run_as,
-        )
-        .map_err(Status::internal)?;
-        let resource_tenant = shared_space_resource_tenant(
-            self.db.runtime(),
+        let (tenant, resource_tenant) = self.prepare_bound_run(
             tenant_context.as_ref(),
             &binding.namespace,
-            crate::enterprise::NamespaceAction::Write,
-        )
-        .unwrap_or_default();
-        let mut freeze_checks = crate::sekai::write_freeze::write_checks_for_actors(
-            &binding.namespace,
-            tenant.as_ref(),
             &binding.run_as,
-            None,
-            binding.type_id.trim(),
-            true,
-        );
-        if !resource_tenant.is_empty() && resource_tenant != tenant.as_ref() {
-            freeze_checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
-                &binding.namespace,
-                &resource_tenant,
-                &binding.run_as,
-                None,
-                binding.type_id.trim(),
-                true,
-            ));
-        }
-        crate::sekai::write_freeze::refuse_if_frozen_any(self.db.runtime(), &freeze_checks)?;
+            &binding.type_id,
+        )?;
 
         let scope = ObjectChangeScope {
             namespace: binding.namespace.clone(),
@@ -232,9 +210,10 @@ impl SekaiServiceImpl {
                     visible_objects,
                     |object_ids| {
                         *objects_resolved = true;
-                        load_action_binding_objects(
+                        load_bound_objects(
                             self,
-                            &binding,
+                            &binding.namespace,
+                            &binding.kind,
                             object_ids,
                             &run_as,
                             &event_property_keys,
@@ -346,9 +325,10 @@ impl SekaiServiceImpl {
                 .filter(|event| event.op != OP_DELETE)
                 .map(|event| event.object_id.clone())
                 .collect::<Vec<_>>();
-            visible_objects = load_action_binding_objects(
+            visible_objects = load_bound_objects(
                 self,
-                &binding,
+                &binding.namespace,
+                &binding.kind,
                 &pending_ids,
                 &run_as,
                 &event_property_keys,
@@ -365,7 +345,7 @@ impl SekaiServiceImpl {
                 &binding,
                 event,
                 visible_by_id.get(&event.object_id),
-                tenant.as_ref(),
+                &tenant,
                 &resource_tenant,
             );
             if let Some(reason) = submission
@@ -383,6 +363,55 @@ impl SekaiServiceImpl {
             .advance_action_binding_cursor(&binding, &cursor, now_millis())
             .map_err(map_binding_store_error)?;
         Ok(Response::new(response))
+    }
+
+    /// Checks a binding's service principal before any event is read: its
+    /// grants decide both what it reads and what it may submit, and a write
+    /// freeze on its tenant or the resource tenant stops the run. Returns
+    /// the acting tenant and the shared-space resource tenant.
+    pub(super) fn prepare_bound_run(
+        &self,
+        tenant_context: Option<&RequestEnterpriseContext>,
+        namespace: &str,
+        run_as: &str,
+        type_id: &str,
+    ) -> Result<(String, String), Status> {
+        check_team_namespace(self.db.runtime(), &[run_as.to_string()], namespace, true)
+            .map_err(|_| Status::failed_precondition("run_as lacks namespace write"))?;
+        let tenant = crate::sekai::write_freeze::acting_or_registered_tenant(
+            self.db.runtime(),
+            acting_tenant(tenant_context),
+            run_as,
+        )
+        .map_err(Status::internal)?
+        .into_owned();
+        let resource_tenant = shared_space_resource_tenant(
+            self.db.runtime(),
+            tenant_context,
+            namespace,
+            crate::enterprise::NamespaceAction::Write,
+        )
+        .unwrap_or_default();
+        let mut freeze_checks = crate::sekai::write_freeze::write_checks_for_actors(
+            namespace,
+            &tenant,
+            run_as,
+            None,
+            type_id.trim(),
+            true,
+        );
+        if !resource_tenant.is_empty() && resource_tenant != tenant {
+            freeze_checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+                namespace,
+                &resource_tenant,
+                run_as,
+                None,
+                type_id.trim(),
+                true,
+            ));
+        }
+        crate::sekai::write_freeze::refuse_if_frozen_any(self.db.runtime(), &freeze_checks)?;
+        Ok((tenant, resource_tenant))
     }
 
     fn submit_bound_event(
@@ -417,13 +446,45 @@ impl SekaiServiceImpl {
                 return submission;
             }
         };
+        match self.admit_bound_action(
+            BoundAction {
+                namespace: &binding.namespace,
+                type_id: &binding.type_id,
+                version: &binding.version,
+                run_as: &binding.run_as,
+                parameters_json,
+                idempotency_key,
+            },
+            tenant,
+            resource_tenant,
+        ) {
+            Ok((instance_id, status, replay)) => {
+                submission.instance_id = instance_id;
+                submission.status = status;
+                submission.replay = replay;
+            }
+            Err(reason) => submission.skipped_reason = reason,
+        }
+        submission
+    }
+
+    /// Submits one bound Action as its service principal through normal
+    /// admission, so ACL, policy, budget, schema and approval apply to every
+    /// event. Returns the instance id, its status and whether the submit
+    /// replayed, or a bounded reason it was refused.
+    pub(super) fn admit_bound_action(
+        &self,
+        action: BoundAction<'_>,
+        tenant: &str,
+        resource_tenant: &str,
+    ) -> Result<(String, String, bool), String> {
         let request = ActionInstanceAdmissionRequest {
-            namespace: binding.namespace.clone(),
-            type_id: binding.type_id.clone(),
-            version: binding.version.clone(),
-            parameters_json,
-            request_id: format!("op-{idempotency_key}"),
-            idempotency_key,
+            namespace: action.namespace.to_string(),
+            type_id: action.type_id.to_string(),
+            version: action.version.to_string(),
+            parameters_json: action.parameters_json,
+            request_id: format!("op-{}", action.idempotency_key),
+            idempotency_key: action.idempotency_key,
             evidence_submission_ids: Vec::new(),
             ontology_digest: String::new(),
             autonomous_envelope_id: String::new(),
@@ -433,43 +494,56 @@ impl SekaiServiceImpl {
             resource_tenant: resource_tenant.to_string(),
         };
         let result = if let Some(clerk) = &self.cross_store {
-            clerk.admit(request, &binding.run_as, now_millis(), tenant, true)
+            clerk.admit(request, action.run_as, now_millis(), tenant, true)
         } else {
             ActionInstanceAdmission::new(self.db.runtime(), None)
                 .with_proposal(Some(&crate::chisei::system_one_action::SystemOneProposal))
                 .with_tenant(tenant)
                 .with_machine_credential(true)
-                .admit(request, &binding.run_as, now_millis())
+                .admit(request, action.run_as, now_millis())
         };
         match result {
-            Ok(outcome) => {
-                submission.instance_id = outcome.instance.instance_id;
-                submission.status = outcome.instance.status;
-                submission.replay = outcome.replay;
-            }
-            Err(error) => {
-                submission.skipped_reason = match error {
-                    ActionInstanceAdmissionError::InvalidArgument(message) => {
-                        format!("invalid_argument: {message}")
-                    }
-                    ActionInstanceAdmissionError::FailedPrecondition(message) => {
-                        format!("failed_precondition: {message}")
-                    }
-                    ActionInstanceAdmissionError::AlreadyExists(message) => {
-                        format!("already_exists: {message}")
-                    }
-                    ActionInstanceAdmissionError::PermissionDenied(_) => "access_denied".into(),
-                    ActionInstanceAdmissionError::Internal(_) => "internal".into(),
-                };
-            }
+            Ok(outcome) => Ok((
+                outcome.instance.instance_id,
+                outcome.instance.status,
+                outcome.replay,
+            )),
+            Err(error) => Err(match error {
+                ActionInstanceAdmissionError::InvalidArgument(message) => {
+                    format!("invalid_argument: {message}")
+                }
+                ActionInstanceAdmissionError::FailedPrecondition(message) => {
+                    format!("failed_precondition: {message}")
+                }
+                ActionInstanceAdmissionError::AlreadyExists(message) => {
+                    format!("already_exists: {message}")
+                }
+                ActionInstanceAdmissionError::PermissionDenied(_) => "access_denied".into(),
+                ActionInstanceAdmissionError::Internal(_) => "internal".into(),
+            }),
         }
-        submission
     }
 }
 
-fn load_action_binding_objects(
+/// One Action a binding submits for one event.
+pub(super) struct BoundAction<'a> {
+    pub namespace: &'a str,
+    pub type_id: &'a str,
+    pub version: &'a str,
+    pub run_as: &'a str,
+    pub parameters_json: String,
+    pub idempotency_key: String,
+}
+
+/// The objects of `kind` in `namespace` among `object_ids` that `principals`
+/// may read, with only `property_keys` kept and marked ones dropped.
+/// Properties the active object policy does not grant, and restricted ones
+/// `principals` may not read, are removed rather than redacted, so a mapping
+/// that needs one skips its event instead of submitting a placeholder.
+pub(super) fn load_bound_objects(
     service: &SekaiServiceImpl,
-    binding: &ActionBinding,
+    namespace: &str,
+    kind: &str,
     object_ids: &[String],
     principals: &[String],
     property_keys: &HashSet<String>,
@@ -481,23 +555,39 @@ fn load_action_binding_objects(
         .runtime()
         .list_objects_by_ids_with_policy_context(object_ids, &principal_refs, &context)
         .map_err(Status::internal)?;
-    Ok(objects
-        .into_iter()
-        .filter_map(|mut object| {
-            if object.namespace != binding.namespace
-                || object.kind != binding.kind
-                || RESERVED_GOVERNANCE_KINDS.contains(&object.kind.as_str())
-                || !object_passes_marking(service.db.runtime(), &object, principals)
-                    .unwrap_or(false)
-            {
-                return None;
-            }
-            object
-                .properties
-                .retain(|key, _| property_keys.contains(key));
-            Some(object)
-        })
-        .collect())
+    let schema = service
+        .schema_definitions
+        .snapshot()
+        .map_err(map_schema_definition_lifecycle_error)?;
+    let restricted = restricted_property_names_for_kind(&schema, kind);
+    let mut visible = Vec::with_capacity(objects.len());
+    for object in objects {
+        if object.namespace != namespace
+            || object.kind != kind
+            || RESERVED_GOVERNANCE_KINDS.contains(&object.kind.as_str())
+            || !object_passes_marking(service.db.runtime(), &object, principals).unwrap_or(false)
+        {
+            continue;
+        }
+        let mut object = service
+            .db
+            .runtime()
+            .project_object_property_grants(object)
+            .map_err(|error| {
+                if error.starts_with("object_security_denied") {
+                    Status::permission_denied("access denied")
+                } else {
+                    Status::unavailable("object authorization unavailable")
+                }
+            })?;
+        let reads_restricted =
+            can_read_restricted_properties(&service.security, &object, principals);
+        object.properties.retain(|key, _| {
+            property_keys.contains(key) && (reads_restricted || !restricted.contains(key))
+        });
+        visible.push(object);
+    }
+    Ok(visible)
 }
 
 fn map_binding_store_error(error: String) -> Status {

@@ -14,6 +14,8 @@ mod catalog_invocation;
 mod computed_response;
 #[path = "definition_consumer_impact.rs"]
 mod definition_consumer_impact;
+#[path = "fence_binding.rs"]
+mod fence_binding;
 #[path = "graph_explore_rpc.rs"]
 mod graph_explore_rpc;
 #[path = "object_change_subscription.rs"]
@@ -1106,6 +1108,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<RunActionBindingRequest>,
     ) -> Result<Response<RunActionBindingResponse>, Status> {
         self.run_action_binding_once(req).await
+    }
+
+    async fn put_fence_binding(
+        &self,
+        req: Request<PutFenceBindingRequest>,
+    ) -> Result<Response<PutFenceBindingResponse>, Status> {
+        self.put_fence_binding_definition(req).await
+    }
+
+    async fn run_fence_binding(
+        &self,
+        req: Request<RunFenceBindingRequest>,
+    ) -> Result<Response<RunFenceBindingResponse>, Status> {
+        self.run_fence_binding_once(req).await
     }
 
     async fn describe_object_action(
