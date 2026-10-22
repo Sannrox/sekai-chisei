@@ -37,7 +37,8 @@ pub const DOMAIN_DOC_VERSION: &str = "sekai.ontology-product/v1";
 pub const SEED_DOC_VERSION: &str = "sekai.seed/v1";
 
 pub fn usage() -> &'static str {
-    "sekaictl ontology <inspect|apply|seed|run|first-run|context|expand|explain> ...\n  \
+    "sekaictl ontology <inspect|apply|export|seed|run|first-run|context|expand|explain> ...\n  \
+     sekaictl ontology export --namespace <ns> --out <dir> [--target <url-or-socket>]\n  \
      sekaictl ontology apply --file <domain.json> [--target <url-or-socket>]\n  \
      sekaictl ontology seed --file <seed.json> [--target <url-or-socket>]\n  \
      sekaictl ontology run --namespace <ns> --task-type <capability> --spec <json-or-@file> [--target ...]\n  \
@@ -887,6 +888,19 @@ pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxEr
         return Err(std::io::Error::other(usage()).into());
     };
     match sub {
+        "export" => {
+            let rest = &args[1..];
+            let namespace = require_flag(rest, "--namespace").map_err(std::io::Error::other)?;
+            let out = require_flag(rest, "--out").map_err(std::io::Error::other)?;
+            let files = crate::ontology_export::export(
+                &target_from_args(rest),
+                &namespace,
+                Path::new(&out),
+            )
+            .await?;
+            println!("exported {namespace}: {files} files to {out}");
+            Ok(())
+        }
         "apply" => {
             let rest = &args[1..];
             let file = require_flag(rest, "--file").map_err(std::io::Error::other)?;

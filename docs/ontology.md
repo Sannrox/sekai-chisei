@@ -283,6 +283,41 @@ general administration console. See
 [ADR 0003](decisions/0003-authenticated-static-ontology-inspection.md) for the
 trust-boundary decision.
 
+## Export a namespace as files
+
+```sh
+sekaictl ontology export --namespace <ns> --out <dir> [--target <url-or-socket>]
+```
+
+Writes the namespace's published definition revision as a file tree for review
+in Git. The directory must not exist or must be empty.
+
+- `<member_kind>/<member_id>.json`: one file per member (object types, link
+  types, Action types, functions, policies, transforms and the other governed
+  member kinds). Path segments are percent-encoded except ASCII letters,
+  digits, `-` and `_`.
+- `markings/lattice.json`: the classification lattice, when the namespace has
+  one, as sorted tokens, parent edges and incomparable pairs.
+- `layout.json`: the layout version, `sekai.ontology-export/v1`. The layout is a
+  contract; a change gets a new version.
+
+Bodies are pretty-printed with sorted keys and a trailing newline. Digests, the
+namespace, actors and times are left out, so the same definitions export to
+byte-identical trees from any namespace; exporting, applying the members into an
+empty namespace through a definition proposal, and exporting again reproduces
+the tree. Export never reads object data or credentials. As a further guard, a
+string beneath a credential-shaped key (a word `secret`, `password`,
+`credential`, `token` or `apikey`, or `api_key` / `private_key`), at any depth, is
+written as `[credential reference omitted]`. Property names in a definition's
+`properties` list are strings in an array, so a property called `password`
+keeps its name. An id whose encoded name passes 200 bytes is
+written under a shortened name with a SHA-256 suffix, and `layout.json` maps that
+path to the full id under `long_ids`. Two ids that differ only in case are
+refused, because their files would collide on a case-insensitive file system.
+The tree is written beside the target and renamed into place, so a failed export
+leaves nothing behind. Importing a
+tree is not part of the command; apply it through the governed definition flow.
+
 ## Evidence-driven definition proposals
 
 The evidence-driven proposal workflow was retired from the 1.0 runtime

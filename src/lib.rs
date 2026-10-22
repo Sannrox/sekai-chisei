@@ -51,6 +51,7 @@ pub mod models_cli;
 pub mod obs;
 pub mod onboarding;
 pub mod ontology_codegen;
+pub mod ontology_export;
 pub mod ontology_inspect;
 pub mod ontology_product_cli;
 pub mod operation_report;
