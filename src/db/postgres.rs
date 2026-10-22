@@ -156,6 +156,7 @@ const AGENT_CERTIFICATION_SCORE_SCHEMA: &str =
     include_str!("postgres/0087_agent_certification_score.sql");
 const DATASET_BRANCHES_SCHEMA: &str = include_str!("postgres/0088_dataset_branches.sql");
 const TRANSFORM_REPLAYS_SCHEMA: &str = include_str!("postgres/0089_transform_replays.sql");
+const CHISEI_POLICY_SHADOW_SCHEMA: &str = include_str!("postgres/0090_chisei_policy_shadow.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -721,6 +722,12 @@ const MIGRATIONS: &[Migration] = &[
         "transform_replays",
         TRANSFORM_REPLAYS_SCHEMA,
         MigrationOwner::Sekai,
+    ),
+    mig(
+        89,
+        "chisei_policy_shadow",
+        CHISEI_POLICY_SHADOW_SCHEMA,
+        MigrationOwner::Chisei,
     ),
 ];
 

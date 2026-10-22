@@ -83,6 +83,8 @@ mod rpc_execution;
 mod rpc_model_release_evidence;
 #[path = "chisei_service_rpc_model_review.rs"]
 mod rpc_model_review;
+#[path = "chisei_service_rpc_policy_shadow.rs"]
+mod rpc_policy_shadow;
 
 #[cfg(test)]
 use crate::chisei::policy::ContextAdmissionAction;
@@ -730,6 +732,27 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<RevokeRoutingProfileRequest>,
     ) -> Result<Response<RevokeRoutingProfileResponse>, Status> {
         rpc_execution::revoke_routing_profile(self, req).await
+    }
+
+    async fn start_policy_shadow(
+        &self,
+        req: Request<StartPolicyShadowRequest>,
+    ) -> Result<Response<StartPolicyShadowResponse>, Status> {
+        rpc_policy_shadow::start_policy_shadow(self, req).await
+    }
+
+    async fn get_policy_shadow_report(
+        &self,
+        req: Request<GetPolicyShadowReportRequest>,
+    ) -> Result<Response<GetPolicyShadowReportResponse>, Status> {
+        rpc_policy_shadow::get_policy_shadow_report(self, req).await
+    }
+
+    async fn stop_policy_shadow(
+        &self,
+        req: Request<StopPolicyShadowRequest>,
+    ) -> Result<Response<StopPolicyShadowResponse>, Status> {
+        rpc_policy_shadow::stop_policy_shadow(self, req).await
     }
 
     async fn set_model_review(

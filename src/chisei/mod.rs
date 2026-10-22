@@ -48,6 +48,7 @@ pub mod object_schema;
 pub mod pipeline;
 pub mod policy;
 pub mod policy_dry_run;
+pub mod policy_shadow;
 pub mod portfolio;
 pub use sekai_types::principal;
 pub mod privacy;

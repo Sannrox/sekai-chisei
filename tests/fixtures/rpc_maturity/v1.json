@@ -1951,6 +1951,33 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "StartPolicyShadow",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetPolicyShadowReport",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "StopPolicyShadow",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "ListRoutingProfiles",
       "storage_path": "chisei.provider_registry",
       "real_backend": "yes",

@@ -289,6 +289,9 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `ChiseiService.DecideGatewayExecution` | `chisei.policy, chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
 | `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.StartPolicyShadow` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.GetPolicyShadowReport` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.StopPolicyShadow` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.ListRoutingProfiles` | `chisei.provider_registry` | yes | none | `experimental` |
 | `ChiseiService.PutRoutingProfile` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.RevokeRoutingProfile` | `chisei.policy` | yes | none | `experimental` |

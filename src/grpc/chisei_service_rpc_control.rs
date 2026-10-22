@@ -303,6 +303,7 @@ pub(super) async fn set_namespace_policy(
     req: Request<SetNamespacePolicyRequest>,
 ) -> Result<Response<SetNamespacePolicyResponse>, Status> {
     require_control_plane_admin(&req, "namespace policy mutation")?;
+    let actor = authenticated_actor(&req);
     let registry = service.refresh_provider_registry_for_resolution().await?;
     let validated_registry_version = registry.state_version;
     crate::provider_profile::with_provider_registry_snapshot(registry, async {
@@ -339,6 +340,12 @@ pub(super) async fn set_namespace_policy(
                 "provider registry changed while validating namespace policy",
             ));
         }
+        let shadow = super::rpc_policy_shadow::admit_policy_activation(
+            service,
+            &actor,
+            &r.namespace,
+            &policy_version,
+        )?;
         persist_namespace_policy(
             service
                 .sekai_facts
@@ -362,6 +369,9 @@ pub(super) async fn set_namespace_policy(
         let default_runtime = policy.default_runtime.clone();
         let default_model = policy.default_model.clone();
         service.policy.set_namespace_policy(&r.namespace, policy);
+        if let Some(shadow) = shadow.as_ref() {
+            super::rpc_policy_shadow::end_policy_shadow(service, &actor, shadow);
+        }
         if let Some(context_policy) = context_admission_policy {
             service
                 .policy

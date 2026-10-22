@@ -843,6 +843,67 @@ message SetNamespacePolicyRequest {
 }
 message SetNamespacePolicyResponse { PolicyResolution resolution = 1; }
 
+message StartPolicyShadowRequest {
+  string namespace = 1;
+  repeated string allowed_runtimes = 2;
+  repeated string allowed_models = 3;
+  string default_runtime = 4;
+  string default_model = 5;
+  string data_class = 6;
+  // Live decisions required before the report can pass. At least 1.
+  uint32 min_evaluations = 7;
+  // Required share of unchanged decisions, in basis points (0 to 10000).
+  uint32 min_match_rate_bps = 8;
+}
+
+message StartPolicyShadowResponse { PolicyShadowReport report = 1; }
+
+message GetPolicyShadowReportRequest { string namespace = 1; }
+
+message GetPolicyShadowReportResponse { PolicyShadowReport report = 1; }
+
+message StopPolicyShadowRequest {
+  string namespace = 1;
+  string reason = 2;
+}
+
+message StopPolicyShadowResponse { bool stopped = 1; }
+
+// One live decision the candidate decided differently.
+message PolicyShadowSample {
+  string delta = 1; // re_routed | would_deny | would_allow
+  string preferred_runtime = 2;
+  string preferred_model = 3;
+  string active = 4;
+  string candidate = 5;
+  int64 observed_at_ms = 6;
+}
+
+message PolicyShadowReport {
+  string contract_version = 1;
+  string namespace = 2;
+  string candidate_policy_version = 3;
+  // Empty when the namespace had no policy when the shadow started.
+  string active_policy_version = 4;
+  uint32 min_evaluations = 5;
+  uint32 min_match_rate_bps = 6;
+  string started_by = 7;
+  int64 started_at_ms = 8;
+  int64 evaluated = 9;
+  int64 unchanged = 10;
+  int64 re_routed = 11;
+  int64 would_deny = 12;
+  int64 would_allow = 13;
+  uint32 match_rate_bps = 14;
+  bool passing = 15;
+  // Why the report does not pass; empty when passing.
+  string verdict_reason = 16;
+  // At most 16 per differing delta class.
+  repeated PolicyShadowSample samples = 17;
+  // Identifies this run; a restart gets a new id.
+  string shadow_id = 18;
+}
+
 message GetEffectivePolicySummaryRequest {
   string namespace = 1;
   string provider = 2;
@@ -1706,6 +1767,13 @@ service ChiseiService {
   rpc SetNamespacePolicy(SetNamespacePolicyRequest) returns (SetNamespacePolicyResponse);
   // Read-only, operator-safe live projection of effective namespace policy.
   rpc GetEffectivePolicySummary(GetEffectivePolicySummaryRequest) returns (GetEffectivePolicySummaryResponse);
+  // Live shadow of a candidate namespace route policy (#1630). The candidate
+  // is evaluated beside the active policy on each live resolution; only the
+  // active decision takes effect. Activating the shadowed candidate through
+  // SetNamespacePolicy requires a passing report.
+  rpc StartPolicyShadow(StartPolicyShadowRequest) returns (StartPolicyShadowResponse);
+  rpc GetPolicyShadowReport(GetPolicyShadowReportRequest) returns (GetPolicyShadowReportResponse);
+  rpc StopPolicyShadow(StopPolicyShadowRequest) returns (StopPolicyShadowResponse);
   // Pipeline
   // Native governed entry path. Planning resolves policy, context, routing,
   // budget, and evaluation state before a provider call is allowed.
