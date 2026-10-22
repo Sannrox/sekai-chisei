@@ -4,8 +4,8 @@
 //! Gunshi allocation status / kill switch. No shadow database.
 
 use crate::chisei::gunshi_auto::{self, NamespaceAllocationStatus};
+use crate::chisei_store::ChiseiStore;
 use crate::db::runtime_db::RuntimeDb;
-use crate::db::store::ChiseiStore;
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};
 use crate::operation_statistics::{self, OperationStatistics};
 #[cfg(test)]

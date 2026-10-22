@@ -317,7 +317,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::db::portfolio_route_test_cases::assert_route_contract;
+    use crate::chisei_store::portfolio_route_test_cases::assert_route_contract;
 
     const TEST_DATABASE_URL_ENV: &str = "SEKAI_TEST_POSTGRES_URL";
     const TEST_CA_CERT_ENV: &str = "SEKAI_TEST_POSTGRES_CA_CERT";

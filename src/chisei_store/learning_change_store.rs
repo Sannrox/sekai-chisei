@@ -2,8 +2,8 @@
 
 use rusqlite::{OptionalExtension, params};
 
-use super::sekai::SekaiDb;
 use crate::chisei::learning_change::LearningChange;
+use crate::db::sekai::SekaiDb;
 
 impl SekaiDb {
     pub(crate) fn migrate_learning_changes(&self) -> Result<(), String> {

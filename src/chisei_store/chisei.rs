@@ -2,17 +2,17 @@ use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::sekai::SekaiDb;
 use crate::chisei::{
     eval, evolve,
     receipt::{OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind},
 };
-use crate::db::chisei_eval_backend::{
+use crate::chisei_store::chisei_eval_backend::{
     EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS, decode_eval_gate_cases, decode_eval_gate_run,
 };
 use crate::db::chisei_receipt::{
     open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
 };
+use crate::db::sekai::SekaiDb;
 
 fn outcome_evidence(event: &OperationReceiptEvent) -> Result<Option<(&str, f64, bool)>, String> {
     if !matches!(
@@ -2223,7 +2223,7 @@ mod tests {
         completed_at_ms: Option<i64>,
     ) -> OperationReceipt {
         OperationReceipt {
-            version: crate::chisei::receipt::OPERATION_RECEIPT_VERSION.into(),
+            version: sekai_domain::receipt::OPERATION_RECEIPT_VERSION.into(),
             operation_id: operation_id.into(),
             parent_operation_id: None,
             namespace: "acme".into(),

@@ -4,7 +4,7 @@
 use super::*;
 use crate::chisei::model_release_evidence::{self, ModelReleaseEvidenceFailure};
 use crate::chisei::model_review::{self, AdmissionRefusal};
-use crate::db::store::ChiseiRoutingProfileStore;
+use crate::chisei_store::ChiseiRoutingProfileStore;
 
 impl ChiseiServiceImpl {
     pub(super) async fn with_execution_registry<T>(

@@ -17,7 +17,7 @@ use crate::chisei::promotion::{
     Candidate, CandidateStore, KIND_ROUTING_BIAS, RoutingBiasPayload, STATUS_GATE_PASSED,
     STATUS_PROMOTED, STATUS_ROLLED_BACK,
 };
-use crate::db::store::{ChiseiDecisionStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiStore};
 
 /// Live, governed routing-bias overrides keyed by (namespace, task_class), consulted by
 /// `resolve_policy` (`grpc/chisei_service/policy_resolution.rs`) alongside the static `cheap_route_bias` heuristic.

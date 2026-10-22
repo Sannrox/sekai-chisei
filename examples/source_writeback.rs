@@ -519,7 +519,7 @@ impl ControlPlane {
             db_path,
             sekai: SekaiServiceImpl::new(sekai_store.clone()),
             chisei: ChiseiServiceImpl::new(
-                sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
+                sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(db),
                 config,
             )
             .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(
@@ -544,7 +544,7 @@ impl ControlPlane {
             db_path,
             sekai: SekaiServiceImpl::new(sekai_store.clone()),
             chisei: ChiseiServiceImpl::new(
-                sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
+                sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(db),
                 config,
             )
             .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(

@@ -17,7 +17,7 @@
 
 use super::budget::PressureLevel;
 use super::pipeline::{PipelineRequest, Step, StepDecision, complexity_class};
-use crate::db::store::ChiseiStore;
+use crate::chisei_store::ChiseiStore;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 

@@ -7,7 +7,7 @@
 //! ordering, and terminal process-state cleanup.
 
 use super::*;
-use crate::db::store::{ChiseiEvaluationStore, ChiseiReceiptStore};
+use crate::chisei_store::{ChiseiEvaluationStore, ChiseiReceiptStore};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -15,7 +15,7 @@ use std::sync::{
 use tokio::sync::Mutex as AsyncMutex;
 
 pub(crate) struct EvaluationExecutionLifecycle {
-    db: crate::db::store::ChiseiStore,
+    db: crate::chisei_store::ChiseiStore,
     budget: Arc<BudgetTracker>,
     evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
     stochastic_evaluator_registry: Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
@@ -26,7 +26,7 @@ pub(crate) struct EvaluationExecutionLifecycle {
 
 impl EvaluationExecutionLifecycle {
     pub(super) fn new(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         budget: Arc<BudgetTracker>,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
         stochastic_evaluator_registry: Arc<
@@ -749,7 +749,8 @@ mod tests {
 
     #[test]
     fn process_state_is_shared_per_manifest() {
-        let db = crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::memory()));
+        let db =
+            crate::chisei_store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::memory()));
         let lifecycle = EvaluationExecutionLifecycle::new(
             db.clone(),
             Arc::new(BudgetTracker::new(db)),

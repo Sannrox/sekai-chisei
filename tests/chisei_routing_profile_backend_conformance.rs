@@ -2,7 +2,7 @@
 //! (#1171).
 
 use sekai_chisei::chisei::routing_profiles::HostedRoutingProfile;
-use sekai_chisei::db::chisei_routing_profile::ChiseiRoutingProfileBackend;
+use sekai_chisei::chisei_store::chisei_routing_profile::ChiseiRoutingProfileBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 
 fn profile(namespace: &str, name: &str, origin: &str) -> HostedRoutingProfile {

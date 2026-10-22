@@ -6,7 +6,7 @@
 //! preflight, durable put, post-commit attribution audit, and sample persist.
 
 use super::*;
-use crate::db::store::{ChiseiKiokuStore, ChiseiObservationStore, ChiseiReceiptStore};
+use crate::chisei_store::{ChiseiKiokuStore, ChiseiObservationStore, ChiseiReceiptStore};
 
 const GATEWAY_RECEIPT_ACTION: &str = "operation.receipt.upsert";
 

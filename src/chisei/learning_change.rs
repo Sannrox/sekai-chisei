@@ -7,7 +7,8 @@
 
 use crate::chisei::decision_ledger::Decision;
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
-use crate::db::store::{ChiseiDecisionStore, ChiseiLearningChangeStore, ChiseiStore, SekaiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiLearningChangeStore, ChiseiStore};
+use crate::db::store::SekaiStore;
 use crate::domain::KIND_LEARNING;
 use crate::shomei;
 use serde::{Deserialize, Serialize};

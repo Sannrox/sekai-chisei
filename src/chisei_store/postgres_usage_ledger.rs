@@ -1,10 +1,10 @@
 //! PostgreSQL persistence for the tenant usage ledger (#122).
 
-use crate::chisei::receipt::OperationReceipt;
 use crate::chisei::usage_ledger::{
     UsageAggregate, UsageEvent, UsageSource, UsageUnit, measured_usage_events, validate_event,
 };
 use crate::db::postgres::PostgresDb;
+use sekai_domain::receipt::OperationReceipt;
 
 impl PostgresDb {
     pub fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String> {
@@ -96,8 +96,8 @@ impl PostgresDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::receipt::OPERATION_RECEIPT_VERSION;
     use crate::db::postgres::ScratchDatabase;
+    use sekai_domain::receipt::OPERATION_RECEIPT_VERSION;
 
     fn sample_receipt(op: &str) -> OperationReceipt {
         OperationReceipt {

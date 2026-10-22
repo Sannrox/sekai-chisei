@@ -5,7 +5,7 @@
 //! fail-closed manifest construction, snapshot consistency, and persistence.
 
 use super::*;
-use crate::db::store::ChiseiEvaluationStore;
+use crate::chisei_store::ChiseiEvaluationStore;
 
 /// Governed objects live on Sekai. Combined reads them in process; a Chisei
 /// plane without that store fails closed.
@@ -943,13 +943,13 @@ fn resolve_evaluation_manifest_live(
 }
 
 pub(super) struct EvaluationManifestResolutionLifecycle {
-    db: crate::db::store::ChiseiStore,
+    db: crate::chisei_store::ChiseiStore,
     sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
 }
 
 impl EvaluationManifestResolutionLifecycle {
     pub(super) fn new(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
     ) -> Self {
         Self {
@@ -996,7 +996,7 @@ impl EvaluationManifestResolutionLifecycle {
                     chrono::Utc::now().timestamp_millis(),
                 )?;
                 let write = outcome.manifest.as_ref().map(|manifest| {
-                    crate::db::runtime_db::EvaluationManifestWrite {
+                    crate::chisei_store::runtime::EvaluationManifestWrite {
                         manifest: manifest.clone(),
                         request_id: prepared.request.request_id.clone(),
                         request_digest: prepared.request_digest.clone(),

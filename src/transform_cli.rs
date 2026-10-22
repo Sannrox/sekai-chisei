@@ -448,7 +448,8 @@ mod tests {
         use crate::chisei::budget::PeriodType;
         use crate::chisei::tenant_quota::TenantQuotaLimits;
         use crate::chisei::usage_ledger::UsageUnit;
-        use crate::db::store::{ChiseiStore, SekaiStore};
+        use crate::chisei_store::ChiseiStore;
+        use crate::db::store::SekaiStore;
 
         let dir = tempfile::tempdir().unwrap();
         let sekai = SekaiStore::open_sqlite(dir.path().join("sekai.db").to_str().unwrap());

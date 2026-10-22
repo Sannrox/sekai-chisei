@@ -5,10 +5,11 @@
 //! measured path is the gRPC service implementation, not a parallel copy.
 
 use crate::chisei::budget::{BudgetTracker, PeriodType};
+use crate::chisei_store::ChiseiStore;
 use crate::composition::cross_store_admission::CrossStoreAdmission;
 use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
-use crate::db::store::{ChiseiStore, SekaiStore};
+use crate::db::store::SekaiStore;
 use crate::domain::{Link, Object};
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{

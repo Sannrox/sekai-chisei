@@ -4,7 +4,7 @@ use crate::chisei::gunshi::{
     compare_advisory, score_advisory_comparisons,
 };
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
-use crate::db::store::{ChiseiDecisionStore, ChiseiReceiptStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiReceiptStore, ChiseiStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};

@@ -1,8 +1,8 @@
 //! PostgreSQL execution index for receipt-authoritative evaluation runs.
 
 use crate::chisei::evaluation_execution::{EXECUTOR_VERSION, EvaluationExecutionIndex};
-use crate::chisei::receipt::OperationReceipt;
 use crate::db::postgres::PostgresDb;
+use sekai_domain::receipt::OperationReceipt;
 
 impl PostgresDb {
     pub fn get_evaluation_execution_index(

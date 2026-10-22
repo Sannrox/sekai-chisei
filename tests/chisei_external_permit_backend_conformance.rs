@@ -2,7 +2,7 @@
 
 use sekai_chisei::chisei::external_action::PERMIT_VERSION;
 use sekai_chisei::chisei::external_permit::{ExternalPermitPolicy, Permit};
-use sekai_chisei::db::chisei_external_permit::ChiseiExternalPermitBackend;
+use sekai_chisei::chisei_store::chisei_external_permit::ChiseiExternalPermitBackend;
 use sekai_chisei::db::decision::DecisionBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use std::collections::BTreeMap;

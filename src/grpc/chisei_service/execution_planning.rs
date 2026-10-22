@@ -10,7 +10,7 @@
 
 use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
-use crate::db::store::ChiseiKiokuStore;
+use crate::chisei_store::ChiseiKiokuStore;
 
 const LEARNING_PIN_UNAVAILABLE: &str = "learning pin is unavailable";
 

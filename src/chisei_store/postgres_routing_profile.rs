@@ -1,7 +1,7 @@
 //! PostgreSQL parity for customer-hosted routing profiles (#1171).
 
 use crate::chisei::routing_profiles::HostedRoutingProfile;
-use crate::db::chisei_routing_profile::hosted_profile_from_parts;
+use crate::chisei_store::chisei_routing_profile::hosted_profile_from_parts;
 use crate::db::postgres::PostgresDb;
 
 impl PostgresDb {
