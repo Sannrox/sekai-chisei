@@ -2,14 +2,11 @@
 
 ## Unreleased
 
-- `QueryCounterfactualView` shows what a namespace's objects would have
-  shown at a past time under candidate object security policies or a
-  candidate marking rule, per principal: visible then, visible under the
-  candidate, hidden and revealed. The object set is rebuilt from the
-  recorded change log; objects deleted since, rules changed since and times
-  before the retained history fail closed. Credential-admin, read-only,
-  recorded as a decision, and behind
-  `SEKAI_EXPERIMENTAL_RPCS` (#1453).
+- Experimental gRPC for dataset branches (ADR 0119): create, list, delete,
+  compare, propose a merge, merge, and run a governed transform on a branch.
+  The tenant comes from the authenticated context, reads need dataset read
+  access and changes need write access, and a merge is refused for the
+  proposer (#1444).
 
 - Experimental `ExpandNeighborhood` and `FindPaths` explore how objects are
   linked: a bounded expansion from seed objects with a total count, and all
