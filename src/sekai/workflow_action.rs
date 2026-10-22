@@ -12,7 +12,7 @@ use crate::sekai::action_instance_admission::{
 };
 use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 use crate::shomei;
-use sekai_provider::receipt::OperationReceipt;
+use sekai_domain::receipt::OperationReceipt;
 
 pub const BRIDGE_CONTRACT: &str = "sekai.workflow-action-bridge/v1";
 pub const PROFILE_JOB_STEP: &str = "adapter.workflow.job_step";

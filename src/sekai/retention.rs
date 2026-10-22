@@ -5178,7 +5178,7 @@ mod tests {
             .unwrap();
         db.create_principal_credential(
             "alice",
-            &crate::gateway_keys::hash_gateway_key("secret"),
+            &sekai_domain::gateway_keys::hash_gateway_key("secret"),
             1,
         )
         .unwrap();

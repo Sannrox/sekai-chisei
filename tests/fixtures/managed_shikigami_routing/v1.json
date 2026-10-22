@@ -69,8 +69,8 @@
       "class": "positive",
       "summary": "A provider tool-call stream is normalized without losing call id, tool name, or fragmented arguments.",
       "evidence_tests": [
-        "crates/sekai-provider/src/llm/openai.rs#preserves_fragmented_interleaved_tool_calls",
-        "crates/sekai-provider/src/llm/anthropic.rs#preserves_fragmented_interleaved_tool_uses",
+        "crates/chisei-provider/src/llm/openai.rs#preserves_fragmented_interleaved_tool_calls",
+        "crates/chisei-provider/src/llm/anthropic.rs#preserves_fragmented_interleaved_tool_uses",
         "src/grpc/chisei_service_tests.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
       ]
     },

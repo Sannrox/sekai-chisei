@@ -1375,11 +1375,11 @@ mod tests {
     use super::*;
     use crate::db::sekai::SekaiDb;
     use crate::domain::Object;
-    use crate::gateway_keys::hash_gateway_key;
     use crate::sekai::credentials::PrincipalCredentialStore;
     use crate::sekai::security::Grant;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use sekai_domain::gateway_keys::hash_gateway_key;
     use std::collections::HashMap as StdHashMap;
     use tower::ServiceExt;
 

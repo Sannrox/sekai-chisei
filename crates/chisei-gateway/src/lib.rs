@@ -15,7 +15,7 @@ mod harness;
 pub use sekai_domain::secrets;
 pub use sekai_obs as obs;
 
-pub use sekai_provider::{
+pub use chisei_provider::{
     cost_estimate, gateway_keys, llm, model_availability, pricing, provider_profile,
     provider_resolution,
 };

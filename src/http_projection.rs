@@ -873,7 +873,6 @@ mod tests {
     use crate::config::Config;
     use crate::db::runtime_db::RuntimeDb;
     use crate::db::sekai::SekaiDb;
-    use crate::gateway_keys::hash_gateway_key;
     use crate::grpc::TokenAuthInterceptor;
     use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
     use crate::grpc::pb::sekai::{
@@ -883,6 +882,7 @@ mod tests {
     use crate::sekai::credentials::PrincipalCredentialStore;
     use crate::sekai::security::{Grant, Role};
     use http_body_util::BodyExt;
+    use sekai_domain::gateway_keys::hash_gateway_key;
     use tower::ServiceExt;
 
     fn fixture_config() -> Config {

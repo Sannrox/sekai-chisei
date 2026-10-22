@@ -184,7 +184,7 @@ fn enterprise_rejects_community_credentials_on_every_rpc() {
     )));
     db.create_principal_credential(
         "machine-a",
-        &crate::gateway_keys::hash_gateway_key("machine-token"),
+        &sekai_domain::gateway_keys::hash_gateway_key("machine-token"),
         1,
     )
     .unwrap();
@@ -8740,7 +8740,7 @@ async fn preview_records_typesafe_egress_after_admission() {
     let app = axum::Router::new().route(
         "/v1/systemone",
         axum::routing::post(|| async {
-            axum::Json(sekai_provider::system_one::SystemOneResponse {
+            axum::Json(chisei_provider::system_one::SystemOneResponse {
                 model: "jev-1.13.0".into(),
                 answers: [(
                     "department".into(),
@@ -8758,9 +8758,9 @@ async fn preview_records_typesafe_egress_after_admission() {
         axum::serve(listener, app).await.unwrap();
     });
     unsafe {
-        std::env::set_var(sekai_provider::system_one::API_KEY_ENV, "test-key");
+        std::env::set_var(chisei_provider::system_one::API_KEY_ENV, "test-key");
         std::env::set_var(
-            sekai_provider::system_one::BASE_URL_ENV,
+            chisei_provider::system_one::BASE_URL_ENV,
             format!("http://{addr}/v1/systemone"),
         );
     }
@@ -8847,8 +8847,8 @@ async fn preview_records_typesafe_egress_after_admission() {
         0
     );
     unsafe {
-        std::env::remove_var(sekai_provider::system_one::API_KEY_ENV);
-        std::env::remove_var(sekai_provider::system_one::BASE_URL_ENV);
+        std::env::remove_var(chisei_provider::system_one::API_KEY_ENV);
+        std::env::remove_var(chisei_provider::system_one::BASE_URL_ENV);
     }
 }
 
@@ -8861,7 +8861,7 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
     let app = axum::Router::new().route(
         "/v1/systemone",
         axum::routing::post(|| async {
-            axum::Json(sekai_provider::system_one::SystemOneResponse {
+            axum::Json(chisei_provider::system_one::SystemOneResponse {
                 model: "jev-1.13.0".into(),
                 answers: [(
                     "dept-name".into(),
@@ -8879,9 +8879,9 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
         axum::serve(listener, app).await.unwrap();
     });
     unsafe {
-        std::env::set_var(sekai_provider::system_one::API_KEY_ENV, "test-key");
+        std::env::set_var(chisei_provider::system_one::API_KEY_ENV, "test-key");
         std::env::set_var(
-            sekai_provider::system_one::BASE_URL_ENV,
+            chisei_provider::system_one::BASE_URL_ENV,
             format!("http://{addr}/v1/systemone"),
         );
     }
@@ -8960,8 +8960,8 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
             .is_empty()
     );
     unsafe {
-        std::env::remove_var(sekai_provider::system_one::API_KEY_ENV);
-        std::env::remove_var(sekai_provider::system_one::BASE_URL_ENV);
+        std::env::remove_var(chisei_provider::system_one::API_KEY_ENV);
+        std::env::remove_var(chisei_provider::system_one::BASE_URL_ENV);
     }
 }
 

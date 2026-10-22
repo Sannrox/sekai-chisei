@@ -8,5 +8,4 @@ pub mod model_availability;
 pub mod pricing;
 pub mod provider_profile;
 pub mod provider_resolution;
-pub mod receipt;
 pub mod system_one;
