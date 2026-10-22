@@ -1083,8 +1083,40 @@ fn hop_marking_permitted(
     parent: Option<&domain::Object>,
     object: &domain::Object,
 ) -> Result<Option<String>, String> {
-    if markings::is_trusted_service_principal(&authority.principal) {
+    let paths = permitted_hop_paths(db, authority, &accumulated.borrow(), parent, object)?;
+    let Some(paths) = paths else {
         return Ok(Some("trusted".into()));
+    };
+    let mut added_key = None;
+    for path in paths {
+        let key = path.visit_key();
+        if accumulated
+            .borrow_mut()
+            .entry(object.id.clone())
+            .or_default()
+            .insert(path)
+        {
+            added_key = Some(key);
+        }
+    }
+    Ok(added_key)
+}
+
+/// The marking-joined classifications under which `object` is readable when reached
+/// from any recorded path of `parent`; empty when the caller is denied on every path.
+/// `None` for a trusted service principal, whose hops are never marking-restricted.
+pub(super) fn permitted_hop_paths(
+    db: &RuntimeDb,
+    authority: &markings::PrincipalAuthority,
+    accumulated: &HashMap<
+        String,
+        BTreeSet<crate::sekai::classification_lattice::PathClassification>,
+    >,
+    parent: Option<&domain::Object>,
+    object: &domain::Object,
+) -> Result<Option<Vec<crate::sekai::classification_lattice::PathClassification>>, String> {
+    if markings::is_trusted_service_principal(&authority.principal) {
+        return Ok(None);
     }
     let lattice = db.get_classification_lattice(&object.namespace)?;
     let child_digest = lattice
@@ -1093,21 +1125,17 @@ fn hop_marking_permitted(
         .transpose()?;
     let parent_paths = parent
         .map(|parent| {
-            accumulated
-                .borrow()
-                .get(&parent.id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    BTreeSet::from([crate::sekai::classification_lattice::PathClassification {
-                        namespace: parent.namespace.clone(),
-                        lattice_digest: None,
-                        token: markings::object_marking_token(parent).map(str::to_string),
-                    }])
-                })
+            accumulated.get(&parent.id).cloned().unwrap_or_else(|| {
+                BTreeSet::from([crate::sekai::classification_lattice::PathClassification {
+                    namespace: parent.namespace.clone(),
+                    lattice_digest: None,
+                    token: markings::object_marking_token(parent).map(str::to_string),
+                }])
+            })
         })
         .unwrap_or_default();
     let child_token = markings::object_marking_token(object).map(str::to_string);
-    let mut added_key = None;
+    let mut permitted = Vec::new();
     for parent_path in parent_paths {
         if !crate::sekai::classification_lattice::path_marking_compatible(
             Some(&parent_path),
@@ -1150,15 +1178,7 @@ fn hop_marking_permitted(
             lattice_digest: child_digest.clone(),
             token: joined,
         };
-        let key = path.visit_key();
-        if accumulated
-            .borrow_mut()
-            .entry(object.id.clone())
-            .or_default()
-            .insert(path)
-        {
-            added_key = Some(key);
-        }
+        permitted.push(path);
     }
-    Ok(added_key)
+    Ok(Some(permitted))
 }

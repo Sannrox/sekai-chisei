@@ -56,6 +56,60 @@ message GraphResult {
   repeated Link links = 2;
 }
 
+// Experimental (#1562). Bounded expansion from seed objects over links in both
+// directions. Every hop applies the caller's read policy; hidden objects and
+// links to them are omitted, so counts describe the visible graph only.
+message ExpandNeighborhoodRequest {
+  repeated string seed_ids = 1;
+  // Link relations to follow; empty follows every relation.
+  repeated string relations = 2;
+  // Object kinds to include and expand beyond the seeds; empty includes all.
+  repeated string object_kinds = 3;
+  // Hops from the seeds, 1 to 4; 0 means 1.
+  int32 depth = 4;
+  // Neighbors of one node that are returned and expanded further; 0 means 100.
+  int32 fan_out_cap = 5;
+  // Objects returned, seeds first then breadth-first; 0 means 100.
+  int32 limit = 6;
+}
+message ExpandNeighborhoodResponse {
+  repeated Object objects = 1;
+  // Links whose two ends are both in `objects`.
+  repeated Link links = 2;
+  // Visible objects within `depth`, including seeds and those past a cap.
+  int64 total_count = 3;
+  // True when a fan-out cap or the examination budget left nodes unexpanded.
+  bool total_is_lower_bound = 4;
+  // True when `objects` holds fewer than `total_count` objects.
+  bool truncated = 5;
+}
+
+// Experimental (#1562). Shortest link paths between two objects over the
+// caller's visible graph, following links in both directions.
+message FindPathsRequest {
+  string from_id = 1;
+  string to_id = 2;
+  // 1 to 4; 0 means 4.
+  int32 max_depth = 3;
+  repeated string relations = 4;
+  // Paths returned; 0 means 10.
+  int32 limit = 5;
+}
+message ObjectPath {
+  // From `from_id` to `to_id`.
+  repeated string object_ids = 1;
+  // `links[i]` joins `object_ids[i]` and `object_ids[i + 1]`, in either direction.
+  repeated Link links = 2;
+}
+message FindPathsResponse {
+  // All shortest paths, up to `limit`, in a stable order.
+  repeated ObjectPath paths = 1;
+  // Every object on a returned path, once.
+  repeated Object objects = 2;
+  // True when more shortest paths exist than `limit` or the examination budget ran out.
+  bool truncated = 3;
+}
+
 message ObjectType {
   string kind = 1;
   string description = 2;
@@ -3155,6 +3209,8 @@ service SekaiService {
   rpc GetLinkedObjects(GetLinkedObjectsRequest) returns (GetLinkedObjectsResponse);
 
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
+  rpc ExpandNeighborhood(ExpandNeighborhoodRequest) returns (ExpandNeighborhoodResponse);
+  rpc FindPaths(FindPathsRequest) returns (FindPathsResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
   rpc ExpandRelations(ExpandRelationsRequest) returns (ExpandRelationsResponse);
   rpc ExplainDerivation(ExplainDerivationRequest) returns (ExplainDerivationResponse);

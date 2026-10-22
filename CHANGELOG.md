@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Experimental `ExpandNeighborhood` and `FindPaths` explore how objects are
+  linked: a bounded expansion from seed objects with a total count, and all
+  shortest paths between two objects up to depth 4. Every hop applies the
+  caller's read policy, including the marking join along the path. Hidden
+  objects are omitted, never counted, and never used as a step; a hidden
+  start object is the same not-found as a missing one
+  (docs/graph-exploration.md, #1562).
+
 - A governed transform can run on a dataset branch (ADR 0119). Inputs read
   their branch where it exists and the parent otherwise. The output is
   written only to the output dataset's branch, so the parent's rows,

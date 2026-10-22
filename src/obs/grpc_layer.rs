@@ -233,6 +233,8 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "GetLinks"
                 | "GetLinkedObjects"
                 | "Traverse"
+                | "ExpandNeighborhood"
+                | "FindPaths"
                 | "GetGovernedFactVersion"
                 | "ResolveInvariantSet"
                 | "ListSchemaTypes"

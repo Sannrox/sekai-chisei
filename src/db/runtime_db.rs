@@ -3963,6 +3963,35 @@ impl RuntimeDb {
         }
     }
 
+    /// At most `limit` links, so a caller can bound the read itself, not only its result.
+    pub fn get_links_with_policy_context_limited(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+        limit: usize,
+    ) -> Result<Vec<Link>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_links_with_policy_context_limited(
+                object_id,
+                relation,
+                dir,
+                context,
+                Some(limit),
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_links_with_policy_context_limited(
+                    object_id,
+                    relation,
+                    dir,
+                    context,
+                    Some(limit),
+                )
+            }),
+        }
+    }
+
     pub fn get_links_with_policy_context(
         &self,
         object_id: &str,

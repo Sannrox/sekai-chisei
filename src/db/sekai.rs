@@ -1819,6 +1819,18 @@ impl SekaiDb {
         dir: &Direction,
         context: &PrincipalPolicyContext,
     ) -> Result<Vec<Link>, String> {
+        self.get_links_with_policy_context_limited(object_id, relation, dir, context, None)
+    }
+
+    /// [`Self::get_links_with_policy_context`] reading at most `limit` rows.
+    pub fn get_links_with_policy_context_limited(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+        limit: Option<usize>,
+    ) -> Result<Vec<Link>, String> {
         let (subjects, scopes) = policy_context_json(context)?;
         let neighbor = match dir {
             Direction::Outgoing => "l.to_id",
@@ -1839,6 +1851,9 @@ impl SekaiDb {
             sql.push_str(" AND l.relation = ?2");
         }
         sql.push_str(&sqlite_object_security_filter(start_param));
+        if let Some(limit) = limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
         let conn = self.conn();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = if relation.is_empty() {
