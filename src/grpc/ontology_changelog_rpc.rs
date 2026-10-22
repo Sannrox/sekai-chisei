@@ -134,6 +134,7 @@ impl Reader<'_> {
                         member_id: impact.member_id,
                         property: impact.property,
                         source_locator: impact.source_locator,
+                        blocking: impact.blocking,
                     })
                     .collect();
             }
