@@ -87,6 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
         }
+        "probes" => {
+            sekai_chisei::probe_cli::run_probes_command(args.into_iter().skip(1).collect()).await
+        }
         "federation" => {
             sekai_chisei::federation_cli::run_federation_command(args.into_iter().skip(1).collect())
                 .await
@@ -512,6 +515,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("assurance"), Some("attest")) => ("attest", 3),
         (Some("assurance"), Some("compliance")) => ("compliance", 3),
         (Some("assurance"), Some("receipts")) => ("receipts", 3),
+        (Some("assurance"), Some("probes")) => ("probes", 3),
         (Some("assurance"), Some("provenance")) => ("provenance", 3),
         (Some("assurance"), Some("replay")) => ("replay", 3),
         (Some("federation"), _) => ("federation", 2),
@@ -704,7 +708,7 @@ fn print_admin_usage() {
            sekaictl admin evaluation lookup-first-gate ...\n\
          \n\
          Assurance:\n\
-           sekaictl admin assurance <attest|compliance|provenance|replay|receipts> ...\n\
+           sekaictl admin assurance <attest|compliance|provenance|replay|receipts|probes> ...\n\
          \n\
          Federation:\n\
            sekaictl admin federation ...\n\
@@ -793,6 +797,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "attest" => Some(sekai_chisei::attest_cli::usage().to_string()),
         "compliance" => Some(sekai_chisei::compliance_cli::usage().to_string()),
         "receipts" => Some(sekai_chisei::receipt_chain_cli::usage().to_string()),
+        "probes" => Some(sekai_chisei::probe_cli::usage().to_string()),
         "provenance" => Some("usage: sekaictl admin assurance provenance <work-unit>".to_string()),
         "replay" => Some(sekai_chisei::replay_cli::usage().to_string()),
         "team" => Some(format!(
@@ -905,6 +910,7 @@ mod tests {
             (vec!["assurance", "attest"], "attest"),
             (vec!["assurance", "compliance"], "compliance"),
             (vec!["assurance", "receipts"], "receipts"),
+            (vec!["assurance", "probes"], "probes"),
             (vec!["assurance", "provenance"], "provenance"),
             (vec!["assurance", "replay"], "replay"),
             (vec!["federation"], "federation"),

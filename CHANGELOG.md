@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `sekaictl admin assurance probes run` checks an allow-listed deployment's
+  object reads for isolation (unauthenticated and cross-tenant) as two
+  synthetic tenants. The
+  target guard fails closed on an endpoint off `SEKAI_PROBE_TARGET_ALLOWLIST`
+  or a tenant that is not synthetic. Every attempt is appended to a ledger,
+  `probes summary` reports the week from it, and a bypass writes a private
+  advisory draft with reproduction steps instead of any public report
+  (`docs/isolation-probes.md`, #1621).
+
 - Relational change capture beyond PostgreSQL has one contract (ADR 0118):
   per-family positions (LSN, GTID set, SCN) with a comparison rule, snapshot
   handoff, committed records with optional transaction markers, schema
