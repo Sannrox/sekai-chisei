@@ -49,8 +49,12 @@ reviewable and leave a record.
 
 ## Consequences
 
-Transforms reading a branch, falling back to the parent, and writing only to
-it build on these tables in a follow-up layer. The isolated transform runtime
-refuses a branch until it carries one. Abandoned open branches do not expire;
+A transform run on a branch reads each input's branch head where that
+dataset has the branch, and the parent's live rows otherwise. It computes in
+full and writes only the output dataset's branch, creating it on demand in
+the caller's tenant. It writes no parent rows, checkpoint, trigger or marking
+stamp. Because a branch cannot carry a stricter stamp than its parent, a run
+whose derived marking would raise the output's marking is refused. The
+isolated transform runtime refuses branch runs until it carries a branch. Abandoned open branches do not expire;
 an operator deletes them. Row-level merge conflicts are out of scope: a moved
 parent means proposing again.

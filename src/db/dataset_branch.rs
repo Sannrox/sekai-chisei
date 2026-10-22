@@ -12,7 +12,7 @@ use crate::sekai::dataset::{
 };
 use crate::sekai::dataset_branch::{
     self, BranchRowEdit, CreateDatasetBranch, DatasetBranch, DatasetBranchDiff,
-    DatasetBranchProposal, MergeDatasetBranch, ProposeDatasetBranch,
+    DatasetBranchProposal, DatasetBranchRun, MergeDatasetBranch, ProposeDatasetBranch,
 };
 use crate::sekai::dataset_version::{self, encode_row_map};
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -64,58 +64,9 @@ impl SekaiDb {
         &self,
         request: &CreateDatasetBranch,
     ) -> Result<DatasetBranch, String> {
-        dataset_branch::validate_branch_name(&request.name)?;
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        dataset_exists(&tx, &request.dataset_id)?;
-        let base_version_id = if request.from_version_id.is_empty() {
-            latest_version_id(&tx, &request.dataset_id)?
-        } else {
-            let purged: Option<bool> = tx
-                .query_row(
-                    "SELECT purged FROM sekai_dataset_versions
-                     WHERE dataset_id = ?1 AND version_id = ?2",
-                    params![request.dataset_id, request.from_version_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            match purged {
-                None => return Err(dataset_version::DATASET_VERSION_NOT_FOUND.into()),
-                Some(true) => return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into()),
-                Some(false) => request.from_version_id.clone(),
-            }
-        };
-        let branch = DatasetBranch {
-            dataset_id: request.dataset_id.clone(),
-            name: request.name.clone(),
-            base_version_id,
-            written: false,
-            incarnation: uuid::Uuid::new_v4().to_string(),
-            created_by: request.actor.clone(),
-            tenant: request.tenant.clone(),
-            created_at_ms: dataset_version::now_ms(),
-        };
-        let inserted = tx
-            .execute(
-                "INSERT OR IGNORE INTO sekai_dataset_branches
-                 (dataset_id, name, base_version_id, written, incarnation, created_by, tenant,
-                  created_at_ms)
-                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)",
-                params![
-                    branch.dataset_id,
-                    branch.name,
-                    branch.base_version_id,
-                    branch.incarnation,
-                    branch.created_by,
-                    branch.tenant,
-                    branch.created_at_ms
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if inserted == 0 {
-            return Err(dataset_branch::BRANCH_EXISTS.into());
-        }
+        let branch = create_branch_tx(&tx, request)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(branch)
     }
@@ -158,33 +109,144 @@ impl SekaiDb {
     ) -> Result<i64, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let branch = load_branch(&tx, dataset_id, name)?;
-        let mut head = if replace {
-            Vec::new()
-        } else {
-            branch_rows_tx(&tx, &branch)?
-        };
-        head.extend(rows.iter().cloned());
-        tx.execute(
-            "DELETE FROM sekai_dataset_branch_rows WHERE dataset_id = ?1 AND name = ?2",
-            params![dataset_id, name],
-        )
-        .map_err(|error| error.to_string())?;
-        for (row_id, row) in head.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO sekai_dataset_branch_rows (dataset_id, name, row_id, data)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![dataset_id, name, row_id as i64, encode_row_map(row)?],
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        tx.execute(
-            "UPDATE sekai_dataset_branches SET written = 1 WHERE dataset_id = ?1 AND name = ?2",
-            params![dataset_id, name],
-        )
-        .map_err(|error| error.to_string())?;
+        let written = write_branch_rows_tx(&tx, dataset_id, name, rows, replace)?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(head.len() as i64)
+        Ok(written)
+    }
+
+    /// Run a transform on `branch`: each input reads its branch head when
+    /// that dataset has the branch, else the parent's live rows; the output
+    /// is written to the output dataset's branch only, created on demand.
+    /// Nothing on the parent changes: no rows, checkpoint, trigger or
+    /// marking stamp. A run whose derived marking would raise the output's
+    /// marking is refused, since the branch cannot carry a stricter stamp.
+    pub fn run_governed_transform_on_branch(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        branch: &str,
+        actor: &str,
+        tenant: &str,
+        now_ms: i64,
+    ) -> Result<DatasetBranchRun, String> {
+        use crate::db::governed_transform::{
+            dataset_exists, list_row_records_after, load_dataset_column_names,
+            load_dataset_object_id, load_lattice, load_object_marking_token, load_transform,
+        };
+        use crate::sekai::governed_transform::{
+            InputLoadBudget, TransformInputRows, compute_run_tables_until,
+            derive_transform_markings, require_bound_output_for_markings,
+        };
+        dataset_branch::validate_branch_name(branch)?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let transform =
+            load_transform(&tx, namespace, transform_id)?.ok_or("governed transform not found")?;
+        if transform.is_isolated_process() {
+            return Err(dataset_branch::BRANCH_RUN_ISOLATED.into());
+        }
+        // The same load budget as a run on the parent, shared by every input.
+        let mut budget = InputLoadBudget::for_transform(&transform);
+        let mut loaded = Vec::new();
+        let mut tokens = Vec::new();
+        let mut branch_inputs = Vec::new();
+        for (alias, dataset_id) in transform.input_bindings() {
+            if !dataset_exists(&tx, &dataset_id)? {
+                return Err(dataset_version::DATASET_NOT_FOUND.into());
+            }
+            let records = match load_branch(&tx, &dataset_id, branch) {
+                Ok(head) if head.tenant != tenant => {
+                    return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+                }
+                Ok(head) => {
+                    branch_inputs.push(dataset_id.clone());
+                    branch_records_budgeted(&tx, &head, budget.as_mut())?
+                }
+                Err(_) => list_row_records_after(&tx, &dataset_id, 0, budget.as_mut())?,
+            };
+            if let Some(reason) = budget.as_ref().and_then(|budget| budget.exceeded) {
+                return Err(format!("branch run refused: {reason}"));
+            }
+            loaded.push((alias, load_dataset_column_names(&tx, &dataset_id)?, records));
+            tokens.push(load_object_marking_token(
+                &tx,
+                &load_dataset_object_id(&tx, &dataset_id)?,
+            )?);
+        }
+        let output = &transform.output_dataset_id;
+        if !dataset_exists(&tx, output)? {
+            return Err(dataset_version::DATASET_NOT_FOUND.into());
+        }
+        let output_object_id = load_dataset_object_id(&tx, output)?;
+        let prior = load_object_marking_token(&tx, &output_object_id)?;
+        let (_, markings_out) = derive_transform_markings(
+            load_lattice(&tx, namespace)?.as_ref(),
+            tokens.iter().map(|token| token.as_deref()),
+            prior.as_deref(),
+            loaded
+                .iter()
+                .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row)),
+        )?;
+        require_bound_output_for_markings(&output_object_id, &markings_out)?;
+        if markings_out.trim() != prior.as_deref().unwrap_or("").trim() {
+            return Err(dataset_branch::BRANCH_RUN_RAISES_MARKING.into());
+        }
+        if let Some(budget) = budget.as_mut() {
+            budget.expire_if_past();
+            if let Some(reason) = budget.exceeded {
+                return Err(format!("branch run refused: {reason}"));
+            }
+        }
+        let tables: Vec<TransformInputRows<'_>> = loaded
+            .iter()
+            .map(|(alias, columns, records)| TransformInputRows {
+                alias,
+                records,
+                columns,
+            })
+            .collect();
+        let (run, rows) = compute_run_tables_until(
+            &transform,
+            None,
+            &tables,
+            false,
+            now_ms,
+            uuid::Uuid::new_v4().to_string(),
+            budget.as_ref().map(|budget| budget.deadline()),
+        );
+        if run.quarantined {
+            return Err(format!("branch run quarantined by {}", run.quality_rule));
+        }
+        match load_branch(&tx, output, branch) {
+            Ok(head) if head.tenant != tenant => {
+                return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+            }
+            Ok(_) => {}
+            Err(_) => {
+                create_branch_tx(
+                    &tx,
+                    &CreateDatasetBranch {
+                        dataset_id: output.clone(),
+                        name: branch.into(),
+                        from_version_id: String::new(),
+                        actor: actor.into(),
+                        tenant: tenant.into(),
+                    },
+                )?;
+            }
+        }
+        let rows_written = write_branch_rows_tx(&tx, output, branch, &rows, true)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(DatasetBranchRun {
+            transform_id: transform_id.into(),
+            branch: branch.into(),
+            output_dataset_id: output.clone(),
+            rows_written,
+            branch_inputs,
+            markings_out,
+        })
     }
 
     pub fn compare_dataset_branch(
@@ -346,6 +408,144 @@ impl SekaiDb {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
     }
+}
+
+pub(crate) fn create_branch_tx(
+    tx: &Transaction<'_>,
+    request: &CreateDatasetBranch,
+) -> Result<DatasetBranch, String> {
+    dataset_branch::validate_branch_name(&request.name)?;
+    dataset_exists(tx, &request.dataset_id)?;
+    let base_version_id = if request.from_version_id.is_empty() {
+        latest_version_id(tx, &request.dataset_id)?
+    } else {
+        let purged: Option<bool> = tx
+            .query_row(
+                "SELECT purged FROM sekai_dataset_versions
+                     WHERE dataset_id = ?1 AND version_id = ?2",
+                params![request.dataset_id, request.from_version_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        match purged {
+            None => return Err(dataset_version::DATASET_VERSION_NOT_FOUND.into()),
+            Some(true) => return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into()),
+            Some(false) => request.from_version_id.clone(),
+        }
+    };
+    let branch = DatasetBranch {
+        dataset_id: request.dataset_id.clone(),
+        name: request.name.clone(),
+        base_version_id,
+        written: false,
+        incarnation: uuid::Uuid::new_v4().to_string(),
+        created_by: request.actor.clone(),
+        tenant: request.tenant.clone(),
+        created_at_ms: dataset_version::now_ms(),
+    };
+    let inserted = tx
+        .execute(
+            "INSERT OR IGNORE INTO sekai_dataset_branches
+                 (dataset_id, name, base_version_id, written, incarnation, created_by, tenant,
+                  created_at_ms)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)",
+            params![
+                branch.dataset_id,
+                branch.name,
+                branch.base_version_id,
+                branch.incarnation,
+                branch.created_by,
+                branch.tenant,
+                branch.created_at_ms
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if inserted == 0 {
+        return Err(dataset_branch::BRANCH_EXISTS.into());
+    }
+    Ok(branch)
+}
+
+pub(crate) fn write_branch_rows_tx(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    name: &str,
+    rows: &[HashMap<String, String>],
+    replace: bool,
+) -> Result<i64, String> {
+    let branch = load_branch(tx, dataset_id, name)?;
+    let mut head = if replace {
+        Vec::new()
+    } else {
+        branch_rows_tx(tx, &branch)?
+    };
+    head.extend(rows.iter().cloned());
+    tx.execute(
+        "DELETE FROM sekai_dataset_branch_rows WHERE dataset_id = ?1 AND name = ?2",
+        params![dataset_id, name],
+    )
+    .map_err(|error| error.to_string())?;
+    for (row_id, row) in head.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO sekai_dataset_branch_rows (dataset_id, name, row_id, data)
+                 VALUES (?1, ?2, ?3, ?4)",
+            params![dataset_id, name, row_id as i64, encode_row_map(row)?],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.execute(
+        "UPDATE sekai_dataset_branches SET written = 1 WHERE dataset_id = ?1 AND name = ?2",
+        params![dataset_id, name],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(head.len() as i64)
+}
+
+/// Branch head rows as run input, charged to `budget` while decoding the way
+/// parent reads are; stops at the first row past the budget.
+fn branch_records_budgeted(
+    tx: &Transaction<'_>,
+    branch: &DatasetBranch,
+    mut budget: Option<&mut crate::sekai::governed_transform::InputLoadBudget>,
+) -> Result<Vec<crate::sekai::dataset::DatasetRowRecord>, String> {
+    let (sql, key) = if branch.written {
+        (
+            "SELECT data FROM sekai_dataset_branch_rows
+             WHERE dataset_id = ?1 AND name = ?2 ORDER BY row_id",
+            branch.name.as_str(),
+        )
+    } else if branch.base_version_id.is_empty() {
+        return Ok(Vec::new());
+    } else {
+        (
+            "SELECT data FROM sekai_dataset_version_rows
+             WHERE dataset_id = ?1 AND version_id = ?2 ORDER BY row_id",
+            branch.base_version_id.as_str(),
+        )
+    };
+    let mut stmt = tx.prepare(sql).map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query(params![branch.dataset_id, key])
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let data: String = row.get(0).map_err(|error| error.to_string())?;
+        if let Some(budget) = budget.as_mut()
+            && !budget.allow_encoded(data.len() as u64)
+        {
+            break;
+        }
+        let values: HashMap<String, String> =
+            serde_json::from_str(&data).map_err(|error| error.to_string())?;
+        if let Some(budget) = budget.as_mut()
+            && !budget.charge(&values)
+        {
+            break;
+        }
+        records.push((records.len() as i64 + 1, values));
+    }
+    Ok(records)
 }
 
 /// Checks that need no storage: open, another principal, the same tenant.
@@ -755,6 +955,121 @@ mod tests {
         );
     }
 
+    /// A transform run on a branch reads input branches where they exist and
+    /// writes only the output's branch. `put` stores the transform.
+    fn exercise_branch_run(
+        db: &dyn DatasetBackend,
+        put: &dyn Fn(&crate::sekai::governed_transform::GovernedTransform),
+    ) {
+        use crate::sekai::governed_transform::{
+            CONTRACT_VERSION, GovernedTransform, TransformStep,
+        };
+        let suffix = uuid::Uuid::new_v4().as_simple().to_string();
+        let (input, output, namespace) = (
+            format!("in-{suffix}"),
+            format!("out-{suffix}"),
+            format!("ops-{suffix}"),
+        );
+        for id in [&input, &output] {
+            db.create_dataset(&Dataset {
+                id: id.clone(),
+                name: id.clone(),
+                columns: ["id", "keep"]
+                    .map(|name| ColumnDef {
+                        name: name.into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .to_vec(),
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        }
+        let keep = |id: &str, keep: &str| {
+            HashMap::from([
+                ("id".to_string(), id.to_string()),
+                ("keep".into(), keep.into()),
+            ])
+        };
+        db.append_rows(
+            &input,
+            &[
+                keep("1", "yes"),
+                keep("2", "no"),
+                keep("3", "yes"),
+                keep("4", "no"),
+            ],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: namespace.clone(),
+            transform_id: "t1".into(),
+            input_dataset_id: input.clone(),
+            output_dataset_id: output.clone(),
+            steps: vec![TransformStep {
+                kind: "filter".into(),
+                column: "keep".into(),
+                op: "eq".into(),
+                value: "yes".into(),
+                columns: Vec::new(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        put(&transform);
+        let out_versions = db.list_dataset_versions(&output).unwrap();
+
+        // Without an input branch the run reads the parent's rows.
+        let run = db
+            .run_governed_transform_on_branch(&namespace, "t1", "dev", "dev", "t1", 20)
+            .unwrap();
+        assert!(run.branch_inputs.is_empty());
+        assert_eq!(run.rows_written, 2);
+        // With an input branch it reads the branch.
+        db.create_dataset_branch(&CreateDatasetBranch {
+            dataset_id: input.clone(),
+            name: "dev".into(),
+            actor: "dev".into(),
+            tenant: "t1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.write_dataset_branch_rows(&input, "dev", &[keep("5", "yes")], false)
+            .unwrap();
+        let run = db
+            .run_governed_transform_on_branch(&namespace, "t1", "dev", "dev", "t1", 30)
+            .unwrap();
+        assert_eq!(run.branch_inputs, vec![input.clone()]);
+        assert_eq!(run.rows_written, 3);
+        assert_eq!(db.dataset_branch_rows(&output, "dev").unwrap().len(), 3);
+        // The parent output is untouched.
+        assert!(live(db, &output).is_empty());
+        assert_eq!(db.list_dataset_versions(&output).unwrap(), out_versions);
+        // Another tenant cannot run into this tenant's branches.
+        assert_eq!(
+            db.run_governed_transform_on_branch(&namespace, "t1", "dev", "x", "t2", 40)
+                .unwrap_err(),
+            dataset_branch::BRANCH_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn sqlite_transform_run_on_a_branch_writes_only_its_output_branch() {
+        let db = crate::db::sekai::SekaiDb::new(":memory:").unwrap();
+        exercise_branch_run(&db, &|transform| {
+            db.put_governed_transform(transform, 10).unwrap();
+        });
+    }
+
     #[test]
     fn sqlite_branches_isolate_merge_once_and_free_on_delete() {
         exercise(&crate::db::sekai::SekaiDb::new(":memory:").unwrap());
@@ -773,6 +1088,10 @@ mod tests {
             ),
             Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
         };
-        exercise(&db.unwrap());
+        let db = db.unwrap();
+        exercise(&db);
+        exercise_branch_run(&db, &|transform| {
+            db.put_governed_transform(transform, 10).unwrap();
+        });
     }
 }

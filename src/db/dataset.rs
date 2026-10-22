@@ -108,6 +108,15 @@ pub trait DatasetBackend: Send + Sync {
         &self,
         request: &MergeDatasetBranch,
     ) -> Result<DatasetBranchProposal, String>;
+    fn run_governed_transform_on_branch(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        branch: &str,
+        actor: &str,
+        tenant: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranchRun, String>;
 }
 
 macro_rules! sqlite_forward {
@@ -149,6 +158,7 @@ impl DatasetBackend for SekaiDb {
     sqlite_forward!(propose_dataset_branch(request: &ProposeDatasetBranch) -> Result<DatasetBranchProposal, String>);
     sqlite_forward!(get_dataset_branch_proposal(dataset_id: &str, id: &str) -> Result<DatasetBranchProposal, String>);
     sqlite_forward!(merge_dataset_branch(request: &MergeDatasetBranch) -> Result<DatasetBranchProposal, String>);
+    sqlite_forward!(run_governed_transform_on_branch(namespace: &str, transform_id: &str, branch: &str, actor: &str, tenant: &str, now_ms: i64) -> Result<crate::sekai::dataset_branch::DatasetBranchRun, String>);
 }
 
 impl DatasetBackend for PostgresDb {
@@ -306,5 +316,24 @@ impl DatasetBackend for PostgresDb {
         request: &MergeDatasetBranch,
     ) -> Result<DatasetBranchProposal, String> {
         PostgresDb::merge_dataset_branch(self, request)
+    }
+    fn run_governed_transform_on_branch(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        branch: &str,
+        actor: &str,
+        tenant: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranchRun, String> {
+        PostgresDb::run_governed_transform_on_branch(
+            self,
+            namespace,
+            transform_id,
+            branch,
+            actor,
+            tenant,
+            now_ms,
+        )
     }
 }

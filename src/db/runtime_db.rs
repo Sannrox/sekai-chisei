@@ -6581,6 +6581,37 @@ impl RuntimeDb {
         }
     }
 
+    pub fn run_governed_transform_on_branch(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        branch: &str,
+        actor: &str,
+        tenant: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranchRun, String> {
+        match self {
+            Self::Sqlite(db) => db.run_governed_transform_on_branch(
+                namespace,
+                transform_id,
+                branch,
+                actor,
+                tenant,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.run_governed_transform_on_branch(
+                    namespace,
+                    transform_id,
+                    branch,
+                    actor,
+                    tenant,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
     pub fn rollback_dataset(&self, request: &DatasetRollback) -> Result<DatasetVersion, String> {
         match self {
             Self::Sqlite(db) => db.rollback_dataset(request),

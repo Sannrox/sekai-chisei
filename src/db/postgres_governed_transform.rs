@@ -1288,7 +1288,7 @@ impl PostgresDb {
     }
 }
 
-fn lock_transform_datasets(
+pub(crate) fn lock_transform_datasets(
     tx: &mut postgres::Transaction<'_>,
     dataset_ids: &[&str],
 ) -> Result<(), String> {
@@ -1467,7 +1467,7 @@ fn lock_transform_work_namespace(
     .map_err(|error| error.to_string())
 }
 
-fn load_transform(
+pub(crate) fn load_transform(
     tx: &mut postgres::Transaction<'_>,
     namespace: &str,
     transform_id: &str,
@@ -1667,7 +1667,7 @@ fn load_preview_row_records(
     Ok(results)
 }
 
-fn load_row_records(
+pub(crate) fn load_row_records(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
     after_id: i64,
@@ -1788,7 +1788,7 @@ fn row_to_run(row: Row) -> Result<TransformRun, String> {
     })
 }
 
-fn load_dataset_column_names(
+pub(crate) fn load_dataset_column_names(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
 ) -> Result<Vec<String>, String> {
@@ -1803,7 +1803,7 @@ fn load_dataset_column_names(
     crate::db::governed_transform::dataset_column_names(&json)
 }
 
-fn load_dataset_object_id(
+pub(crate) fn load_dataset_object_id(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
 ) -> Result<String, String> {
@@ -1816,7 +1816,7 @@ fn load_dataset_object_id(
     .ok_or_else(|| "dataset not found".into())
 }
 
-fn load_object_marking_token(
+pub(crate) fn load_object_marking_token(
     tx: &mut postgres::Transaction<'_>,
     object_id: &str,
 ) -> Result<Option<String>, String> {
