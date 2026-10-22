@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `sekaictl ontology export --namespace <ns> --out <dir>` writes a namespace's
+  published definitions and marking lattice as a canonical file tree, one file
+  per definition with a versioned layout (`sekai.ontology-export/v1`). Exports
+  are byte-identical across runs and across namespaces with the same
+  definitions, and never contain object data or credentials (#1617).
+
 - Experimental `ExpandNeighborhood` and `FindPaths` explore how objects are
   linked: a bounded expansion from seed objects with a total count, and all
   shortest paths between two objects up to depth 4. Every hop applies the
