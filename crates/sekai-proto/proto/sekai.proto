@@ -1176,50 +1176,53 @@ message SimulateObjectPolicyChangeResponse {
   string candidate_digest = 3;
   repeated PolicySimulationDifference differences = 4;
 }
-// A namespace's trust scoring rule revision (`sekai.trust-scoring-rule/v1`).
-message TrustScoringRuleRevision {
+// Candidate marking rule for a counterfactual view: objects of `kind` whose
+// properties equal every `property_equals` entry carry `marking` instead.
+message CounterfactualMarkingRule {
+  string kind = 1;
+  map<string, string> property_equals = 2;
+  string marking = 3;
+}
+// Read-only: rebuild a namespace's objects as of `as_of_ms` from the recorded
+// change log and compare what each principal could read then with what it
+// could have read under the candidate policies or marking rule. Credential
+// admin only; every call is recorded as a decision.
+message QueryCounterfactualViewRequest {
   string namespace = 1;
-  string rule_json = 2;
-  string revision_digest = 3;
-  uint64 version = 4;
-  string updated_by = 5;
-  int64 updated_at_ms = 6;
+  int64 as_of_ms = 2;
+  // Narrow the object set. Empty means every kind or every object.
+  string kind = 3;
+  repeated string object_ids = 4;
+  // Replace the policy in effect for each named kind.
+  repeated ObjectSecurityPolicyBinding candidate_policies = 5;
+  CounterfactualMarkingRule candidate_marking_rule = 6;
+  // Empty means the caller.
+  repeated string principals = 7;
 }
-// Credential admin only. Stores a new revision when `expected_revision_digest`
-// names the current one (empty for the first rule); the same revision again
-// is a no-op. Audited in the rule object's change log.
-message PutTrustScoringRuleRequest {
-  string rule_json = 1;
-  string expected_revision_digest = 2;
+message CounterfactualPrincipalView {
+  string principal = 1;
+  repeated string actual_visible_object_ids = 2;
+  repeated string counterfactual_visible_object_ids = 3;
+  // Visible then, hidden under the candidate.
+  repeated string hidden_object_ids = 4;
+  // Hidden then, visible under the candidate.
+  repeated string revealed_object_ids = 5;
 }
-message PutTrustScoringRuleResponse { TrustScoringRuleRevision rule = 1; }
-message GetTrustScoringRuleRequest { string namespace = 1; }
-message GetTrustScoringRuleResponse { TrustScoringRuleRevision rule = 1; }
-message TrustReason {
-  string factor = 1;
-  int32 delta = 2;
-  string detail = 3;
-}
-message ObjectTrustScore {
-  string object_id = 1;
-  uint32 score = 2;
-  repeated TrustReason reasons = 3;
-}
-// Score one page of an object set under the namespace's trust scoring rule.
-// Members are read with the caller's authority; signals come from what the
-// caller can see.
-message ScoreObjectTrustRequest {
-  ObjectSetDescriptor descriptor = 1;
-  string page_token = 2;
-  // Omit members scoring below this (0..=100).
-  uint32 min_score = 3;
-  // Highest score first, then object id; otherwise object-set order.
-  bool order_by_score = 4;
-}
-message ScoreObjectTrustResponse {
-  string rule_revision_digest = 1;
-  repeated ObjectTrustScore scores = 2;
-  string next_page_token = 3;
+message QueryCounterfactualViewResponse {
+  string namespace = 1;
+  int64 as_of_ms = 2;
+  string actual_digest = 3;
+  string candidate_digest = 4;
+  repeated CounterfactualPrincipalView views = 5;
+  repeated PolicySimulationDifference differences = 6;
+  // Existed at `as_of_ms` but the log cannot rebuild their values (deleted
+  // since). Left out of both views.
+  repeated string unreconstructable_object_ids = 7;
+  // Digest of the evaluated object set, principals, ACL denials and time.
+  string input_digest = 10;
+  // Digest of the whole report; equal inputs and history give an equal digest.
+  string report_digest = 8;
+  string decision_id = 9;
 }
 message ObjectPolicyAuditEvent {
   string event_id = 1;
@@ -3317,10 +3320,8 @@ service SekaiService {
   rpc PutClassificationLattice(PutClassificationLatticeRequest) returns (PutClassificationLatticeResponse);
   rpc GetClassificationLattice(GetClassificationLatticeRequest) returns (GetClassificationLatticeResponse);
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
+  rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
-  rpc PutTrustScoringRule(PutTrustScoringRuleRequest) returns (PutTrustScoringRuleResponse);
-  rpc GetTrustScoringRule(GetTrustScoringRuleRequest) returns (GetTrustScoringRuleResponse);
-  rpc ScoreObjectTrust(ScoreObjectTrustRequest) returns (ScoreObjectTrustResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);
 

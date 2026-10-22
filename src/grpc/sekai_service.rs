@@ -38,8 +38,6 @@ use scored_knowledge_admission::{
 mod semantic_retrieval_lifecycle;
 #[path = "sekai_service_support_access.rs"]
 mod support_access;
-#[path = "trust_score_rpc.rs"]
-mod trust_score_rpc;
 use support_access::*;
 #[path = "sekai_service_support_mapping.rs"]
 mod support_mapping;
@@ -87,7 +85,6 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain;
-use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::action_work_lifecycle::{
@@ -137,6 +134,7 @@ use crate::sekai::work_unit_lifecycle::{
 use crate::sekai::{
     audit, compute, coordination, dataset, function, ontology, retrieval, security, semantic,
 };
+use sekai_domain::gateway_keys::hash_gateway_key;
 use uuid::Uuid;
 
 use self::catalog_invocation::CatalogInvocation;
@@ -418,7 +416,6 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     governed_fact_domain::PROFILE_KIND,
     governed_fact_domain::FACT_KIND,
     governed_fact_domain::WAIVER_KIND,
-    crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
 ];
 
 const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
@@ -798,25 +795,11 @@ impl SekaiService for SekaiServiceImpl {
         rpc_objects::simulate_object_policy_change(self, req).await
     }
 
-    async fn put_trust_scoring_rule(
+    async fn query_counterfactual_view(
         &self,
-        req: Request<PutTrustScoringRuleRequest>,
-    ) -> Result<Response<PutTrustScoringRuleResponse>, Status> {
-        trust_score_rpc::put_trust_scoring_rule(self, req).await
-    }
-
-    async fn get_trust_scoring_rule(
-        &self,
-        req: Request<GetTrustScoringRuleRequest>,
-    ) -> Result<Response<GetTrustScoringRuleResponse>, Status> {
-        trust_score_rpc::get_trust_scoring_rule(self, req).await
-    }
-
-    async fn score_object_trust(
-        &self,
-        req: Request<ScoreObjectTrustRequest>,
-    ) -> Result<Response<ScoreObjectTrustResponse>, Status> {
-        trust_score_rpc::score_object_trust(self, req).await
+        req: Request<QueryCounterfactualViewRequest>,
+    ) -> Result<Response<QueryCounterfactualViewResponse>, Status> {
+        rpc_objects::query_counterfactual_view(self, req).await
     }
 
     async fn query_object_policy_audit(
