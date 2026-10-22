@@ -1176,6 +1176,54 @@ message SimulateObjectPolicyChangeResponse {
   string candidate_digest = 3;
   repeated PolicySimulationDifference differences = 4;
 }
+// Candidate marking rule for a counterfactual view: objects of `kind` whose
+// properties equal every `property_equals` entry carry `marking` instead.
+message CounterfactualMarkingRule {
+  string kind = 1;
+  map<string, string> property_equals = 2;
+  string marking = 3;
+}
+// Read-only: rebuild a namespace's objects as of `as_of_ms` from the recorded
+// change log and compare what each principal could read then with what it
+// could have read under the candidate policies or marking rule. Credential
+// admin only; every call is recorded as a decision.
+message QueryCounterfactualViewRequest {
+  string namespace = 1;
+  int64 as_of_ms = 2;
+  // Narrow the object set. Empty means every kind or every object.
+  string kind = 3;
+  repeated string object_ids = 4;
+  // Replace the policy in effect for each named kind.
+  repeated ObjectSecurityPolicyBinding candidate_policies = 5;
+  CounterfactualMarkingRule candidate_marking_rule = 6;
+  // Empty means the caller.
+  repeated string principals = 7;
+}
+message CounterfactualPrincipalView {
+  string principal = 1;
+  repeated string actual_visible_object_ids = 2;
+  repeated string counterfactual_visible_object_ids = 3;
+  // Visible then, hidden under the candidate.
+  repeated string hidden_object_ids = 4;
+  // Hidden then, visible under the candidate.
+  repeated string revealed_object_ids = 5;
+}
+message QueryCounterfactualViewResponse {
+  string namespace = 1;
+  int64 as_of_ms = 2;
+  string actual_digest = 3;
+  string candidate_digest = 4;
+  repeated CounterfactualPrincipalView views = 5;
+  repeated PolicySimulationDifference differences = 6;
+  // Existed at `as_of_ms` but the log cannot rebuild their values (deleted
+  // since). Left out of both views.
+  repeated string unreconstructable_object_ids = 7;
+  // Digest of the evaluated object set, principals, ACL denials and time.
+  string input_digest = 10;
+  // Digest of the whole report; equal inputs and history give an equal digest.
+  string report_digest = 8;
+  string decision_id = 9;
+}
 message ObjectPolicyAuditEvent {
   string event_id = 1;
   string namespace = 2;
@@ -3272,6 +3320,7 @@ service SekaiService {
   rpc PutClassificationLattice(PutClassificationLatticeRequest) returns (PutClassificationLatticeResponse);
   rpc GetClassificationLattice(GetClassificationLatticeRequest) returns (GetClassificationLatticeResponse);
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
+  rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);

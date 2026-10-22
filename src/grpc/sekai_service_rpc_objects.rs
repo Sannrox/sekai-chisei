@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) async fn create_object(
     service: &SekaiServiceImpl,
@@ -631,6 +631,333 @@ pub(super) async fn simulate_object_policy_change(
     }))
 }
 
+/// Rebuild a namespace's objects as of a past time and compare each
+/// principal's view under the rules in effect then with the candidate rules.
+/// Read-only and recorded as a decision. Rules changed after `as_of_ms` fail
+/// closed: earlier activations and lattices are not retained.
+pub(super) async fn query_counterfactual_view(
+    service: &SekaiServiceImpl,
+    req: Request<QueryCounterfactualViewRequest>,
+) -> Result<Response<QueryCounterfactualViewResponse>, Status> {
+    use crate::sekai::counterfactual::{
+        CounterfactualInput, MarkingRule, Rules, evaluate_counterfactual, history_covers,
+        objects_as_of,
+    };
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let db = service.db.runtime();
+    let tenant_context = request_tenant_context(db, &req)?;
+    let input = req.into_inner();
+    if input.namespace.trim().is_empty() {
+        return Err(Status::invalid_argument("namespace is required"));
+    }
+    if input.as_of_ms <= 0 || input.as_of_ms > now_millis() {
+        return Err(Status::invalid_argument("as_of_ms must be a past time"));
+    }
+    enforce_namespace_tenant_context(db, tenant_context.as_ref(), &input.namespace, false)?;
+    check_team_namespace(db, &principals, &input.namespace, false)?;
+    let activation = db
+        .get_object_security_activation(&input.namespace)
+        .map_err(map_object_security_error)?;
+    if activation
+        .as_ref()
+        .is_some_and(|activation| activation.activated_at_ms > input.as_of_ms)
+    {
+        return Err(Status::failed_precondition(
+            "object security policies were activated after as_of_ms; earlier activations are not retained",
+        ));
+    }
+    let actual = snapshot_from_activation(db, &input.namespace, activation.as_ref())?;
+    // After the snapshot: a lattice is stamped with the time it is stored, so
+    // a replacement between the reads is newer than `as_of_ms` too.
+    if db
+        .classification_lattice_recorded_at_ms(&input.namespace)
+        .map_err(Status::internal)?
+        .is_some_and(|recorded_at_ms| recorded_at_ms > input.as_of_ms)
+    {
+        return Err(Status::failed_precondition(
+            "the classification lattice changed after as_of_ms; earlier lattices are not retained",
+        ));
+    }
+    let actual_activated = activation.is_some();
+
+    let mut candidate = actual.clone();
+    let mut candidate_kinds = BTreeSet::new();
+    for binding in &input.candidate_policies {
+        if binding.kind.trim().is_empty() || binding.revision_digest.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "each candidate policy kind and revision is required",
+            ));
+        }
+        if !candidate_kinds.insert(binding.kind.clone()) {
+            return Err(Status::invalid_argument(
+                "each candidate policy kind must appear exactly once",
+            ));
+        }
+        let revision = db
+            .get_object_security_policy(&input.namespace, &binding.revision_digest)
+            .map_err(map_object_security_error)?
+            .ok_or_else(|| Status::not_found("candidate policy revision not found"))?;
+        let policy = crate::sekai::object_security::ObjectSecurityPolicy::from_canonical_input(
+            &revision.canonical_policy_json,
+        )
+        .map_err(Status::invalid_argument)?;
+        if policy.kind != binding.kind {
+            return Err(Status::invalid_argument(
+                "candidate policy kind does not match stored revision",
+            ));
+        }
+        candidate.policies.insert(binding.kind.clone(), policy);
+    }
+    if !candidate_kinds.is_empty() {
+        candidate.activation_digest = "candidate".into();
+    }
+    let marking_rule = match input.candidate_marking_rule {
+        Some(rule) => {
+            if rule.kind.trim().is_empty() || rule.marking.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "candidate marking rule kind and marking are required",
+                ));
+            }
+            // The change log records an absent property as an empty value, so
+            // an empty match value could not be decided for past objects.
+            if rule.property_equals.values().any(String::is_empty) {
+                return Err(Status::invalid_argument(
+                    "candidate marking rule property values must not be empty",
+                ));
+            }
+            crate::sekai::classification_lattice::validate_written_marking_token(
+                Some(&rule.marking),
+                actual.lattice.as_ref(),
+            )
+            .map_err(Status::invalid_argument)?;
+            Some(MarkingRule {
+                kind: rule.kind,
+                property_equals: rule.property_equals.into_iter().collect(),
+                marking: rule.marking.trim().into(),
+            })
+        }
+        None => None,
+    };
+    if candidate_kinds.is_empty() && marking_rule.is_none() {
+        return Err(Status::invalid_argument(
+            "a candidate policy or marking rule is required",
+        ));
+    }
+
+    let (live, changes) = read_live_objects_and_history(db, &input.namespace)?;
+    if !history_covers(&changes, input.as_of_ms) {
+        return Err(Status::failed_precondition(
+            "as_of_ms predates the retained object history",
+        ));
+    }
+    let mut as_of = objects_as_of(&input.namespace, &live, &changes, input.as_of_ms);
+    let selected = |id: &str, kind: &str| {
+        (input.kind.is_empty() || kind == input.kind)
+            && (input.object_ids.is_empty() || input.object_ids.iter().any(|wanted| wanted == id))
+    };
+    as_of.objects.retain(|object| {
+        !is_reserved_governance_kind(&object.kind)
+            && object.kind != markings::PRINCIPAL_PROFILE_KIND
+            && selected(&object.id, &object.kind)
+    });
+    as_of.unreconstructable.retain(|id| {
+        changes.iter().any(|mutation| {
+            let change = &mutation.change;
+            let kind = match change.field.as_str() {
+                "_deleted" => change.old_value.split('/').next().unwrap_or_default(),
+                "_created" => change.new_value.split('/').next().unwrap_or_default(),
+                _ => mutation.object_kind.as_str(),
+            };
+            change.object_id == *id && selected(id, kind)
+        })
+    });
+
+    let named = if input.principals.is_empty() {
+        principals.clone()
+    } else {
+        input.principals.clone()
+    };
+    // Principals are evaluated with their current authority, namespace
+    // grants and object ACLs; those are not candidates and keep no history.
+    let mut simulated = Vec::new();
+    let mut acl_denied = BTreeSet::new();
+    for principal in named {
+        let one = std::slice::from_ref(&principal);
+        let authority = resolve_principal_authority(db, one)?;
+        let namespace_granted = check_team_namespace(db, one, &input.namespace, false).is_ok();
+        for object in &as_of.objects {
+            if !service
+                .security
+                .can_access(&object.id, &[principal.as_str()])
+            {
+                acl_denied.insert((principal.clone(), object.id.clone()));
+            }
+        }
+        simulated.push(crate::sekai::policy_decision::SimulatedPrincipal {
+            principal: principal.clone(),
+            context: crate::sekai::object_security::PrincipalPolicyContext {
+                delegated_subject: None,
+                subjects: vec![principal],
+                scopes: Vec::new(),
+            }
+            .normalized(),
+            authority,
+            purpose: None,
+            purpose_authorization: None,
+            namespace_granted,
+        });
+    }
+    let report = evaluate_counterfactual(CounterfactualInput {
+        as_of: &as_of,
+        principals: &simulated,
+        actual: Rules {
+            snapshot: &actual,
+            activated: actual_activated,
+        },
+        candidate: Rules {
+            snapshot: &candidate,
+            activated: actual_activated || !candidate_kinds.is_empty(),
+        },
+        marking_rule: marking_rule.as_ref(),
+        acl_denied: &acl_denied,
+        operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+        as_of_ms: input.as_of_ms,
+    })
+    .map_err(Status::internal)?;
+
+    let decision_id = format!("counterfactual:{}", uuid::Uuid::new_v4().as_simple());
+    db.record_decision(&audit::Decision {
+        id: decision_id.clone(),
+        timestamp: now_millis(),
+        actor: principals.first().cloned().unwrap_or_default(),
+        action: "query_counterfactual_view".into(),
+        reason: "counterfactual view over recorded history".into(),
+        evidence: HashMap::from([
+            ("as_of_ms".into(), report.as_of_ms.to_string()),
+            ("actual_digest".into(), report.actual_digest.clone()),
+            ("candidate_digest".into(), report.candidate_digest.clone()),
+            ("input_digest".into(), report.input_digest.clone()),
+            ("report_digest".into(), report.report_digest.clone()),
+            ("principal_count".into(), report.views.len().to_string()),
+        ]),
+        target_id: input.namespace.clone(),
+        outcome: "allow".into(),
+    })
+    .map_err(Status::internal)?;
+
+    Ok(Response::new(QueryCounterfactualViewResponse {
+        namespace: report.namespace,
+        as_of_ms: report.as_of_ms,
+        actual_digest: report.actual_digest,
+        candidate_digest: report.candidate_digest,
+        views: report
+            .views
+            .into_iter()
+            .map(|view| CounterfactualPrincipalView {
+                principal: view.principal,
+                actual_visible_object_ids: view.actual_visible,
+                counterfactual_visible_object_ids: view.counterfactual_visible,
+                hidden_object_ids: view.hidden,
+                revealed_object_ids: view.revealed,
+            })
+            .collect(),
+        differences: report
+            .differences
+            .into_iter()
+            .map(|diff| PolicySimulationDifference {
+                principal: diff.principal,
+                object_id: diff.object_id,
+                object_kind: diff.object_kind,
+                property: diff.property,
+                current_outcome: diff.current_outcome.as_str().into(),
+                candidate_outcome: diff.candidate_outcome.as_str().into(),
+            })
+            .collect(),
+        unreconstructable_object_ids: report.unreconstructable,
+        input_digest: report.input_digest,
+        report_digest: report.report_digest,
+        decision_id,
+    }))
+}
+
+/// Read every live object of `namespace` and its recorded change history.
+///
+/// Offset pages are not one snapshot, so a write while reading could shift a
+/// page and drop an unchanged object, and a retention purge could drop later
+/// pages of history. The newest and oldest retained change bracket the read;
+/// a recorded write or purge in between retries, and a namespace that keeps
+/// changing fails closed.
+fn read_live_objects_and_history(
+    db: &crate::db::runtime_db::RuntimeDb,
+    namespace: &str,
+) -> Result<
+    (
+        Vec<crate::domain::Object>,
+        Vec<crate::sekai::object_change_subscription::CommittedObjectMutation>,
+    ),
+    Status,
+> {
+    use crate::sekai::counterfactual::{MAX_COUNTERFACTUAL_CHANGES, MAX_COUNTERFACTUAL_OBJECTS};
+    for _ in 0..3 {
+        let watermark = db
+            .object_change_watermark(namespace)
+            .map_err(Status::internal)?;
+        let mut live = Vec::new();
+        loop {
+            let page = db
+                .list_objects(&crate::domain::ListFilter {
+                    namespace: Some(namespace.into()),
+                    limit: crate::domain::MAX_LIST_LIMIT,
+                    offset: live.len() as i32,
+                    ..crate::domain::ListFilter::default()
+                })
+                .map_err(Status::internal)?;
+            let full = page.len() == crate::domain::MAX_LIST_LIMIT as usize;
+            live.extend(page);
+            if live.len() > MAX_COUNTERFACTUAL_OBJECTS {
+                return Err(Status::failed_precondition(
+                    "namespace has too many objects for a counterfactual view",
+                ));
+            }
+            if !full {
+                break;
+            }
+        }
+        let mut changes: Vec<crate::sekai::object_change_subscription::CommittedObjectMutation> =
+            Vec::new();
+        loop {
+            let after = changes.last().map_or(0, |mutation| mutation.seq);
+            let page = db
+                .list_committed_object_mutations_after(namespace, after, 1_000)
+                .map_err(Status::internal)?;
+            if page.is_empty() {
+                break;
+            }
+            changes.extend(page);
+            if changes.len() > MAX_COUNTERFACTUAL_CHANGES {
+                return Err(Status::failed_precondition(
+                    "namespace history is too long for a counterfactual view",
+                ));
+            }
+        }
+        // Retention deletes the oldest changes; a purge during the read moves
+        // the oldest retained sequence past the first one read.
+        let oldest = db
+            .object_change_oldest_seq(namespace)
+            .map_err(Status::internal)?;
+        let unchanged = changes.iter().all(|mutation| mutation.seq <= watermark)
+            && changes.first().map_or(0, |mutation| mutation.seq) == oldest;
+        if unchanged {
+            return Ok((live, changes));
+        }
+    }
+    Err(Status::aborted(
+        "namespace changed while reading its history; retry the counterfactual view",
+    ))
+}
+
 pub(super) async fn query_object_policy_audit(
     service: &SekaiServiceImpl,
     req: Request<QueryObjectPolicyAuditRequest>,
@@ -1058,5 +1385,223 @@ mod policy_decision_rpc_tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    fn profile(svc: &SekaiServiceImpl, principal: &str, ceiling: &str) {
+        let id = format!("profile-{principal}");
+        svc.db
+            .runtime()
+            .create_object(&crate::domain::Object {
+                id: id.clone(),
+                kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: principal.into(),
+                namespace: "acme".into(),
+                external_id: markings::principal_profile_external_id(principal),
+                properties: HashMap::from([
+                    (
+                        markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                        ceiling.into(),
+                    ),
+                    (
+                        markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                        "true".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        svc.db
+            .runtime()
+            .create_grant(&crate::sekai::security::Grant {
+                id: format!("grant-{id}"),
+                object_id: id,
+                principal: "root".into(),
+                role: crate::sekai::security::Role::Admin,
+                created: 0,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    fn change(object_id: &str, field: &str, old: &str, new: &str, at: i64) -> audit::ObjectChange {
+        audit::ObjectChange {
+            id: uuid::Uuid::new_v4().to_string(),
+            object_id: object_id.into(),
+            field: field.into(),
+            old_value: old.into(),
+            new_value: new.into(),
+            changed_by: "writer".into(),
+            timestamp: at,
+        }
+    }
+
+    /// `doc-fin` was internal at `as_of` and declassified after it, `doc-gone`
+    /// existed at `as_of` and was deleted after it.
+    fn counterfactual_fixture() -> (SekaiServiceImpl, i64) {
+        let svc = service();
+        let now = now_millis();
+        let as_of = now - 60_000;
+        let mut fin = document("doc-fin", "alice");
+        fin.properties.insert("team".into(), "finance".into());
+        fin.properties.insert(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "public".into(),
+        );
+        let mut ops = document("doc-ops", "bob");
+        ops.properties.insert("team".into(), "ops".into());
+        for object in [&fin, &ops] {
+            svc.db.runtime().create_object(object).unwrap();
+        }
+        profile(&svc, "alice", "confidential");
+        profile(&svc, "bob", "restricted");
+        svc.db
+            .runtime()
+            .record_object_changes(&[
+                change(
+                    "doc-fin",
+                    "properties.access_marking",
+                    "",
+                    "internal",
+                    as_of - 1_000,
+                ),
+                change(
+                    "doc-gone",
+                    "_created",
+                    "",
+                    "document/doc-gone",
+                    as_of - 1_000,
+                ),
+                change(
+                    "doc-fin",
+                    "properties.access_marking",
+                    "internal",
+                    "public",
+                    now - 30_000,
+                ),
+                change(
+                    "doc-gone",
+                    "_deleted",
+                    "document/doc-gone",
+                    "",
+                    now - 30_000,
+                ),
+                change("doc-gone", "_namespace", "acme", "", now - 30_000),
+            ])
+            .unwrap();
+        (svc, as_of)
+    }
+
+    fn finance_restricted(as_of_ms: i64) -> QueryCounterfactualViewRequest {
+        QueryCounterfactualViewRequest {
+            namespace: "acme".into(),
+            as_of_ms,
+            kind: "document".into(),
+            candidate_marking_rule: Some(CounterfactualMarkingRule {
+                kind: "document".into(),
+                property_equals: HashMap::from([("team".into(), "finance".into())]),
+                marking: "restricted".into(),
+            }),
+            principals: vec!["alice".into(), "bob".into()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn counterfactual_marking_hides_past_objects_from_principals_below_it() {
+        let (svc, as_of) = counterfactual_fixture();
+        let report = query_counterfactual_view(&svc, admin(finance_restricted(as_of)))
+            .await
+            .unwrap()
+            .into_inner();
+        let view = |name: &str| report.views.iter().find(|v| v.principal == name).unwrap();
+        // Then, `doc-fin` was internal: both clearances saw it.
+        assert_eq!(
+            view("alice").actual_visible_object_ids,
+            ["doc-fin", "doc-ops"]
+        );
+        assert_eq!(view("alice").hidden_object_ids, ["doc-fin"]);
+        assert_eq!(view("alice").counterfactual_visible_object_ids, ["doc-ops"]);
+        assert_eq!(
+            view("bob").actual_visible_object_ids,
+            ["doc-fin", "doc-ops"]
+        );
+        assert!(view("bob").hidden_object_ids.is_empty());
+        assert!(
+            report
+                .views
+                .iter()
+                .all(|v| v.revealed_object_ids.is_empty())
+        );
+        assert_eq!(report.unreconstructable_object_ids, ["doc-gone"]);
+        let payload = serde_json::to_string(&report.differences).unwrap();
+        assert!(!payload.contains("hidden-doc-fin"));
+
+        let again = query_counterfactual_view(&svc, admin(finance_restricted(as_of)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(again.report_digest, report.report_digest);
+        assert_eq!(again.views, report.views);
+        assert_ne!(again.decision_id, report.decision_id);
+
+        let decision = svc
+            .db
+            .runtime()
+            .get_decision(&report.decision_id)
+            .unwrap()
+            .expect("counterfactual read is recorded");
+        assert_eq!(decision.action, "query_counterfactual_view");
+        assert_eq!(decision.evidence["report_digest"], report.report_digest);
+        // Read-only: live objects are unchanged.
+        let live = svc.db.runtime().get_object("doc-fin").unwrap().unwrap();
+        assert_eq!(
+            live.properties[markings::OBJECT_CLASSIFICATION_PROPERTY],
+            "public"
+        );
+    }
+
+    #[tokio::test]
+    async fn counterfactual_view_fails_closed() {
+        let (svc, as_of) = counterfactual_fixture();
+        let unauthenticated =
+            query_counterfactual_view(&svc, Request::new(finance_restricted(as_of)))
+                .await
+                .unwrap_err();
+        assert_eq!(unauthenticated.code(), tonic::Code::Unauthenticated);
+        let mut not_admin = Request::new(finance_restricted(as_of));
+        not_admin
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::try_from("alice").unwrap());
+        let denied = query_counterfactual_view(&svc, not_admin)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let no_candidate = query_counterfactual_view(
+            &svc,
+            admin(QueryCounterfactualViewRequest {
+                candidate_marking_rule: None,
+                ..finance_restricted(as_of)
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(no_candidate.code(), tonic::Code::InvalidArgument);
+
+        svc.db
+            .runtime()
+            .put_classification_lattice(
+                &crate::sekai::classification_lattice::ClassificationLattice::default_evidence_lattice(
+                    "acme",
+                ),
+                "local",
+                now_millis(),
+            )
+            .unwrap();
+        let changed_since = query_counterfactual_view(&svc, admin(finance_restricted(as_of)))
+            .await
+            .unwrap_err();
+        assert_eq!(changed_since.code(), tonic::Code::FailedPrecondition);
     }
 }

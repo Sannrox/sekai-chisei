@@ -26,6 +26,39 @@ RPCs (`GetObjectSecurityPolicyRevision`, `PutPurposeAuthorization`,
 generic object mutation cannot edit policy, purpose-authorization, or lattice
 state.
 
+## Counterfactual views
+
+`QueryCounterfactualView` answers what each principal could have read in a
+namespace at a past time (`as_of_ms`) under candidate policy revisions or a
+candidate marking rule. It is a read: it writes no object, starts no Action,
+and records
+one decision (`query_counterfactual_view`) carrying the input and report
+digests. It shares the credential-admin boundary and the experimental gate.
+
+- The object set is rebuilt from the recorded object change log by reverting
+  every change committed after `as_of_ms`. Objects with no later change are as
+  they are now. An object deleted since keeps no property values, so it is
+  reported in `unreconstructable_object_ids` and left out of both views. The
+  log records an absent property and an empty value alike, so an empty past
+  value reads as absent; v1 row predicates and markings never match an empty
+  value, and marking rule values must not be empty. A write recorded while the
+  history is read retries the read, then fails with `ABORTED`. A time before
+  the oldest retained change fails closed, since retention may have removed
+  the changes after it.
+- The rules in effect then are the current activation and lattice. If either
+  changed after `as_of_ms` the query fails closed, because earlier activations
+  and lattices are not retained.
+- Candidate policies replace the policy for their kind. A marking rule sets
+  `access_marking` on objects of its kind whose properties equal every
+  `property_equals` entry; the marking must be valid for the lattice.
+- Principals are evaluated with their current clearance. Each view lists the
+  objects visible then, visible under the candidate, hidden, and revealed.
+  Equal inputs and history give an equal `report_digest`.
+- Principals keep their current namespace grants and object ACLs; those are
+  not candidates. In an activated namespace a kind without a policy is denied,
+  as on reads.
+- Namespaces over 10,000 objects or 200,000 recorded changes fail closed.
+
 Inactive namespaces preserve existing ACL, team-namespace, and classification
 marking behavior. Activated namespaces fail closed when policy is absent,
 invalid, unsupported, or does not match. An intentionally broad rollout uses
