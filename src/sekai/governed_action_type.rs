@@ -49,7 +49,7 @@ pub struct GovernedActionType {
     pub declared_effect_kinds: Vec<String>,
     /// Optional System One Function bind. Empty means preview does not fill.
     #[serde(default)]
-    pub system_one: Option<sekai_provider::system_one::SystemOneBind>,
+    pub system_one: Option<sekai_types::system_one_bind::SystemOneBind>,
     /// Principals who may grant or deny a parked instance of this type.
     /// Empty means namespace administrators decide. A submitter never
     /// decides their own instance (#1084).
@@ -140,7 +140,7 @@ impl GovernedActionType {
             &self.object_mutation,
         )?;
         if let Some(bind) = self.system_one.as_ref().filter(|bind| !bind.is_empty()) {
-            sekai_provider::system_one::validate_bind_against_schema(
+            sekai_types::system_one_bind::validate_bind_against_schema(
                 bind,
                 &self.parameter_schema_json,
             )?;
@@ -602,9 +602,9 @@ mod tests {
         type_def.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"department":{"type":"string","enum":["billing","technical"]}},"required":["object_id","department"],"additionalProperties":false}"#.into();
         type_def.object_kind = "customer_record".into();
         type_def.object_mutation = OBJECT_MUTATION_UPDATE.into();
-        type_def.system_one = Some(sekai_provider::system_one::SystemOneBind {
+        type_def.system_one = Some(sekai_types::system_one_bind::SystemOneBind {
             model: "jev-latest".into(),
-            questions: vec![sekai_provider::system_one::SystemOneQuestionBind {
+            questions: vec![sekai_types::system_one_bind::SystemOneQuestionBind {
                 parameter: "department".into(),
                 question_type: "choice".into(),
                 instructions: "Which team".into(),

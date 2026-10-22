@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::sekai::SekaiDb;
-use crate::gateway_keys::hash_gateway_key;
 use crate::provider_profile::ProviderRegistry;
+use sekai_domain::gateway_keys::hash_gateway_key;
 
 pub const DEFAULT_STATE_DIR: &str = "./data";
 pub const DEFAULT_CREDENTIAL_PATH: &str = "./data/local-credential.json";

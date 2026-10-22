@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use sekai_chisei::db::store::SekaiStore;
-use sekai_chisei::gateway_keys::hash_gateway_key;
 use sekai_chisei::grpc::pb::chisei::GetOperationReceiptRequest;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{GetActionInstanceRequest, SubmitActionInstanceRequest};
 use sekai_chisei::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType};
+use sekai_domain::gateway_keys::hash_gateway_key;
 use tempfile::tempdir;
 
 const TOKEN: &str = "plane-hop-token";

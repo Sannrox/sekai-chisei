@@ -14,7 +14,7 @@ use crate::sekai::embedding_index::{
 };
 use crate::sekai::markings::object_marking_token;
 use crate::sekai::object_change_subscription::CommittedObjectMutation;
-use sekai_provider::embedding::Embedder;
+use chisei_provider::embedding::Embedder;
 use std::collections::BTreeSet;
 
 const REBUILD_PAGE: i64 = 500;
@@ -359,7 +359,7 @@ mod tests {
     use super::*;
     use crate::chisei::object_schema::{PropertyDef, PropertyType};
     use async_trait::async_trait;
-    use sekai_provider::embedding::HashEmbedder;
+    use chisei_provider::embedding::HashEmbedder;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const NS: &str = "ops";

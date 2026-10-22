@@ -105,7 +105,7 @@ tests for the affected path.
 | [`src/grpc/`](src/grpc/) | Tonic services and transport boundary |
 | [`src/sekai/`](src/sekai/) | Graph, audit, lineage, security, coordination, and memory |
 | [`src/chisei/`](src/chisei/) | Policy, budgets, routing, evaluation, and learning |
-| [`crates/sekai-provider/`](crates/sekai-provider/) | Provider registry, adapters, pricing, and shared receipt contracts |
+| [`crates/chisei-provider/`](crates/chisei-provider/) | Chisei provider registry, adapters, pricing, and routing |
 | [`crates/chisei-gateway/`](crates/chisei-gateway/) | Standalone compatible HTTP gateway |
 | [`adapters/`](adapters/) | External evidence and workflow reference adapters |
 | [`examples/`](examples/) | Runnable integration examples |
@@ -117,7 +117,7 @@ tests for the affected path.
 - Use namespace as the isolation and policy boundary; do not introduce a
   separate application scope.
 - Keep domain concepts in schemas and adapters rather than the core ontology.
-- Put provider-specific behavior behind `crates/sekai-provider/` abstractions
+- Put provider-specific behavior behind `crates/chisei-provider/` abstractions
   (re-exported as `sekai_chisei::llm`).
 - Prefer explicit policy, audit, approval, and authorization behavior over
   hidden side effects.

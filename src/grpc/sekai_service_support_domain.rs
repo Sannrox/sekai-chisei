@@ -1670,12 +1670,12 @@ pub(super) fn object_action_preview_to_proto(
 
 fn parse_system_one_json(
     raw: &str,
-) -> Result<Option<sekai_provider::system_one::SystemOneBind>, Status> {
+) -> Result<Option<chisei_provider::system_one::SystemOneBind>, Status> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(None);
     }
-    let bind: sekai_provider::system_one::SystemOneBind =
+    let bind: chisei_provider::system_one::SystemOneBind =
         serde_json::from_str(raw).map_err(|error| {
             Status::invalid_argument(format!("system_one_json must be JSON: {error}"))
         })?;

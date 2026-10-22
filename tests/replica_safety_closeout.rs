@@ -10,12 +10,12 @@
 use sekai_chisei::chisei::eval::{EvalStore, Suite};
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
-use sekai_chisei::gateway_keys::hash_gateway_key;
 use sekai_chisei::sekai::coordination::{
     ADMISSION_POLICY_FIFO, ContentionScope, ReconcileFilter, WORK_UNIT_STATUS_PENDING,
     WORK_UNIT_STATUS_STALE, WorkUnit,
 };
 use sekai_chisei::sekai::credentials::PrincipalCredentialStore;
+use sekai_domain::gateway_keys::hash_gateway_key;
 use std::path::Path;
 use std::sync::Arc;
 

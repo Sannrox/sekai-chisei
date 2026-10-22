@@ -33,4 +33,5 @@ pub mod risk_class;
 pub mod security;
 pub mod sekai_principal;
 pub mod service_principal;
+pub mod system_one_bind;
 pub mod transform_sql;
