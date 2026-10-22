@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Datasets have branches (ADR 0119): a branch is one working copy forked from
+  a version, and until its first write it reads that version, so creating one
+  copies nothing. Branch writes never touch the parent. Compare reports
+  columns, row counts and a row digest against the parent. A merge goes
+  through a proposal that pins both heads, is merged by another principal,
+  and writes exactly one new version with a receipt id; a replay writes
+  nothing. Deleting a branch frees its rows, and retention keeps any version
+  an open branch forks from (`0088_dataset_branches`, GATE:mig, #1444).
+
 - `sekaictl admin assurance probes run` checks an allow-listed deployment's
   object reads for isolation (unauthenticated and cross-tenant) as two
   synthetic tenants. The

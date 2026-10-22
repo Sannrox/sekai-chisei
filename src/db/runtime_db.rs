@@ -6470,6 +6470,117 @@ impl RuntimeDb {
         }
     }
 
+    pub fn create_dataset_branch(
+        &self,
+        request: &crate::sekai::dataset_branch::CreateDatasetBranch,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranch, String> {
+        match self {
+            Self::Sqlite(db) => db.create_dataset_branch(request),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.create_dataset_branch(request))
+            }
+        }
+    }
+
+    pub fn list_dataset_branches(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Vec<crate::sekai::dataset_branch::DatasetBranch>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_dataset_branches(dataset_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_dataset_branches(dataset_id))
+            }
+        }
+    }
+
+    pub fn dataset_branch_rows(
+        &self,
+        dataset_id: &str,
+        name: &str,
+    ) -> Result<Vec<HashMap<String, String>>, String> {
+        match self {
+            Self::Sqlite(db) => db.dataset_branch_rows(dataset_id, name),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.dataset_branch_rows(dataset_id, name))
+            }
+        }
+    }
+
+    pub fn write_dataset_branch_rows(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        rows: &[HashMap<String, String>],
+        replace: bool,
+    ) -> Result<i64, String> {
+        match self {
+            Self::Sqlite(db) => db.write_dataset_branch_rows(dataset_id, name, rows, replace),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.write_dataset_branch_rows(dataset_id, name, rows, replace)
+            }),
+        }
+    }
+
+    pub fn compare_dataset_branch(
+        &self,
+        dataset_id: &str,
+        name: &str,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranchDiff, String> {
+        match self {
+            Self::Sqlite(db) => db.compare_dataset_branch(dataset_id, name),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.compare_dataset_branch(dataset_id, name))
+            }
+        }
+    }
+
+    pub fn delete_dataset_branch(&self, dataset_id: &str, name: &str) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.delete_dataset_branch(dataset_id, name),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.delete_dataset_branch(dataset_id, name))
+            }
+        }
+    }
+
+    pub fn propose_dataset_branch(
+        &self,
+        request: &crate::sekai::dataset_branch::ProposeDatasetBranch,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranchProposal, String> {
+        match self {
+            Self::Sqlite(db) => db.propose_dataset_branch(request),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.propose_dataset_branch(request))
+            }
+        }
+    }
+
+    pub fn get_dataset_branch_proposal(
+        &self,
+        dataset_id: &str,
+        id: &str,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranchProposal, String> {
+        match self {
+            Self::Sqlite(db) => db.get_dataset_branch_proposal(dataset_id, id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_dataset_branch_proposal(dataset_id, id))
+            }
+        }
+    }
+
+    pub fn merge_dataset_branch(
+        &self,
+        request: &crate::sekai::dataset_branch::MergeDatasetBranch,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranchProposal, String> {
+        match self {
+            Self::Sqlite(db) => db.merge_dataset_branch(request),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.merge_dataset_branch(request))
+            }
+        }
+    }
+
     pub fn rollback_dataset(&self, request: &DatasetRollback) -> Result<DatasetVersion, String> {
         match self {
             Self::Sqlite(db) => db.rollback_dataset(request),

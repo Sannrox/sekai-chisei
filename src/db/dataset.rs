@@ -3,6 +3,10 @@
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
+use crate::sekai::dataset_branch::{
+    CreateDatasetBranch, DatasetBranch, DatasetBranchDiff, DatasetBranchProposal,
+    MergeDatasetBranch, ProposeDatasetBranch,
+};
 use crate::sekai::dataset_health::{
     DatasetAlert, DatasetHealthCheck, DatasetHealthResult, DatasetHealthState,
 };
@@ -69,6 +73,41 @@ pub trait DatasetBackend: Send + Sync {
         dataset_id: &str,
         now_ms: i64,
     ) -> Result<Vec<DatasetHealthResult>, String>;
+    // Branches (ADR 0119).
+    fn create_dataset_branch(&self, request: &CreateDatasetBranch)
+    -> Result<DatasetBranch, String>;
+    fn list_dataset_branches(&self, dataset_id: &str) -> Result<Vec<DatasetBranch>, String>;
+    fn dataset_branch_rows(
+        &self,
+        dataset_id: &str,
+        name: &str,
+    ) -> Result<Vec<HashMap<String, String>>, String>;
+    fn write_dataset_branch_rows(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        rows: &[HashMap<String, String>],
+        replace: bool,
+    ) -> Result<i64, String>;
+    fn compare_dataset_branch(
+        &self,
+        dataset_id: &str,
+        name: &str,
+    ) -> Result<DatasetBranchDiff, String>;
+    fn delete_dataset_branch(&self, dataset_id: &str, name: &str) -> Result<(), String>;
+    fn propose_dataset_branch(
+        &self,
+        request: &ProposeDatasetBranch,
+    ) -> Result<DatasetBranchProposal, String>;
+    fn get_dataset_branch_proposal(
+        &self,
+        dataset_id: &str,
+        id: &str,
+    ) -> Result<DatasetBranchProposal, String>;
+    fn merge_dataset_branch(
+        &self,
+        request: &MergeDatasetBranch,
+    ) -> Result<DatasetBranchProposal, String>;
 }
 
 macro_rules! sqlite_forward {
@@ -101,6 +140,15 @@ impl DatasetBackend for SekaiDb {
     sqlite_forward!(dataset_health_state(dataset_id: &str) -> Result<DatasetHealthState, String>);
     sqlite_forward!(list_dataset_alerts(dataset_id: &str) -> Result<Vec<DatasetAlert>, String>);
     sqlite_forward!(run_dataset_health_checks(dataset_id: &str, now_ms: i64) -> Result<Vec<DatasetHealthResult>, String>);
+    sqlite_forward!(create_dataset_branch(request: &CreateDatasetBranch) -> Result<DatasetBranch, String>);
+    sqlite_forward!(list_dataset_branches(dataset_id: &str) -> Result<Vec<DatasetBranch>, String>);
+    sqlite_forward!(dataset_branch_rows(dataset_id: &str, name: &str) -> Result<Vec<HashMap<String, String>>, String>);
+    sqlite_forward!(write_dataset_branch_rows(dataset_id: &str, name: &str, rows: &[HashMap<String, String>], replace: bool) -> Result<i64, String>);
+    sqlite_forward!(compare_dataset_branch(dataset_id: &str, name: &str) -> Result<DatasetBranchDiff, String>);
+    sqlite_forward!(delete_dataset_branch(dataset_id: &str, name: &str) -> Result<(), String>);
+    sqlite_forward!(propose_dataset_branch(request: &ProposeDatasetBranch) -> Result<DatasetBranchProposal, String>);
+    sqlite_forward!(get_dataset_branch_proposal(dataset_id: &str, id: &str) -> Result<DatasetBranchProposal, String>);
+    sqlite_forward!(merge_dataset_branch(request: &MergeDatasetBranch) -> Result<DatasetBranchProposal, String>);
 }
 
 impl DatasetBackend for PostgresDb {
@@ -204,5 +252,59 @@ impl DatasetBackend for PostgresDb {
         now_ms: i64,
     ) -> Result<Vec<DatasetHealthResult>, String> {
         self.run_dataset_health_checks(dataset_id, now_ms)
+    }
+    fn create_dataset_branch(
+        &self,
+        request: &CreateDatasetBranch,
+    ) -> Result<DatasetBranch, String> {
+        PostgresDb::create_dataset_branch(self, request)
+    }
+    fn list_dataset_branches(&self, dataset_id: &str) -> Result<Vec<DatasetBranch>, String> {
+        PostgresDb::list_dataset_branches(self, dataset_id)
+    }
+    fn dataset_branch_rows(
+        &self,
+        dataset_id: &str,
+        name: &str,
+    ) -> Result<Vec<HashMap<String, String>>, String> {
+        PostgresDb::dataset_branch_rows(self, dataset_id, name)
+    }
+    fn write_dataset_branch_rows(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        rows: &[HashMap<String, String>],
+        replace: bool,
+    ) -> Result<i64, String> {
+        PostgresDb::write_dataset_branch_rows(self, dataset_id, name, rows, replace)
+    }
+    fn compare_dataset_branch(
+        &self,
+        dataset_id: &str,
+        name: &str,
+    ) -> Result<DatasetBranchDiff, String> {
+        PostgresDb::compare_dataset_branch(self, dataset_id, name)
+    }
+    fn delete_dataset_branch(&self, dataset_id: &str, name: &str) -> Result<(), String> {
+        PostgresDb::delete_dataset_branch(self, dataset_id, name)
+    }
+    fn propose_dataset_branch(
+        &self,
+        request: &ProposeDatasetBranch,
+    ) -> Result<DatasetBranchProposal, String> {
+        PostgresDb::propose_dataset_branch(self, request)
+    }
+    fn get_dataset_branch_proposal(
+        &self,
+        dataset_id: &str,
+        id: &str,
+    ) -> Result<DatasetBranchProposal, String> {
+        PostgresDb::get_dataset_branch_proposal(self, dataset_id, id)
+    }
+    fn merge_dataset_branch(
+        &self,
+        request: &MergeDatasetBranch,
+    ) -> Result<DatasetBranchProposal, String> {
+        PostgresDb::merge_dataset_branch(self, request)
     }
 }
