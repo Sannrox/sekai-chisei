@@ -10,6 +10,14 @@
   are recorded as decisions (docs/policy-dry-run.md,
   `0089_chisei_policy_shadow`, GATE:mig, #1630).
 
+- Experimental `GetOntologyChangelog` lists what changed in a reader's
+  namespaces over a window: each published definition revision with a
+  plain-language summary, compatibility, author, approvers, publisher and
+  affected registered consumers, and policy activations. A credential admin
+  can build a team's weekly digest, authorized as that team alone; a
+  namespace the reader cannot read contributes nothing
+  (docs/ontology-changelog.md, #1471).
+
 - A consumer can mark its definition consumer binding `blocking`.
   Publishing a revision that breaks a valid blocking binding then fails and
   names it, unless the proposal is an approved major revision
