@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 185);
+        assert_eq!(inventory.entries.len(), 186);
         assert!(inventory.entry("PutGovernedTransform").is_some());
         assert!(inventory.entry("ListGovernedTransforms").is_some());
         assert!(inventory.entry("ListGovernedTransformRuns").is_some());
@@ -385,6 +385,7 @@ mod tests {
             "PutClassificationLattice",
             "GetClassificationLattice",
             "SimulateObjectPolicyChange",
+            "QueryCounterfactualView",
             "QueryObjectPolicyAudit",
         ] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
