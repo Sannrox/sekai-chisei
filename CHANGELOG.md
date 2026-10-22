@@ -2,12 +2,12 @@
 
 ## Unreleased
 
-- A consumer can mark its definition consumer binding `blocking`.
-  Publishing a revision that breaks a valid blocking binding then fails and
-  names it, unless the proposal is an approved major revision
-  (`major_revision`). Blocking bindings are disclosed to producers in
-  impact reports; advisory bindings keep the ADR 0067 non-disclosure
-  (ADR 0067 amended, #1635).
+- Experimental comment threads on objects and their properties, with
+  mentions, resolve and reopen. A comment is visible only to callers who
+  can read its object and property, quoted values of hidden properties are
+  redacted, and mentioning a principal without read access is refused.
+  Every write is in the audited object change log, which is the edit
+  history and the receipt (docs/object-comments.md, #1442).
 
 - Experimental trust scores: a versioned per-namespace scoring rule turns
   source health, age against expected freshness, manual verification and
