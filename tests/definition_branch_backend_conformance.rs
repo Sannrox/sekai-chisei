@@ -255,6 +255,7 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         eval_plan_digests: vec![eval_digest.clone()],
         named_foreign_digests: vec![foreign_digest.clone()],
         idempotency_key: "propose-1".into(),
+        major_revision: false,
     };
     let created = db
         .create_definition_proposal(&propose, "author", 4)
@@ -380,6 +381,7 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         eval_plan_digests: vec![digest('e')],
         named_foreign_digests: vec![digest('f')],
         idempotency_key: "propose-2".into(),
+        major_revision: false,
     };
     db.create_definition_proposal(&second_propose, "author", 13)
         .unwrap();
@@ -954,6 +956,7 @@ fn exercise_coordinated_artifact_merge(db: &dyn DefinitionBranchBackend, namespa
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-four".into(),
+            major_revision: false,
         },
         "author",
         4,
@@ -1033,6 +1036,7 @@ fn exercise_named_compatibility_gate_refusal(db: &dyn DefinitionBranchBackend, n
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-gate".into(),
+            major_revision: false,
         },
         "author",
         4,
@@ -1149,6 +1153,7 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "agent-propose".into(),
+            major_revision: false,
         },
         "author",
         7,
@@ -1658,6 +1663,7 @@ fn publish_revision(
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: format!("{branch_id}-propose"),
+            major_revision: false,
         },
         "author",
         t + 2,

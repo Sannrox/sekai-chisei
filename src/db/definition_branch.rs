@@ -893,6 +893,7 @@ impl SekaiDb {
             named_foreign_digests: &[],
             restored_from_digest: &request.restore_from_digest,
             migration_plan_digest: &request.migration_plan_digest,
+            major_revision: false,
         })?;
         let proposal = DefinitionProposal {
             contract_version: PROPOSAL_CONTRACT_VERSION.into(),
@@ -913,6 +914,7 @@ impl SekaiDb {
             close_reason_code: String::new(),
             restored_from_digest: request.restore_from_digest.clone(),
             migration_plan_digest: request.migration_plan_digest.clone(),
+            major_revision: false,
         };
         insert_proposal_sqlite(&transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
@@ -1005,6 +1007,7 @@ impl SekaiDb {
             close_reason_code: String::new(),
             restored_from_digest: String::new(),
             migration_plan_digest: String::new(),
+            major_revision: request.major_revision,
         };
         insert_proposal_sqlite(&transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
@@ -1090,6 +1093,27 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
         let request_digest = request.request_digest()?;
+        // Blocking consumer bindings (ADR 0067, amended) are checked before
+        // anything is published.
+        if let Some(proposal) =
+            self.get_definition_proposal(&request.namespace, &request.proposal_id)?
+        {
+            crate::sekai::definition_consumer_impact::refuse_breaking_blocking_bindings(
+                crate::sekai::definition_consumer_impact::GateReads {
+                    list: |filter: &crate::domain::ListFilter| self.list_objects(filter),
+                    revision: |digest: &str| {
+                        let Some(revision) =
+                            self.get_definition_revision(&proposal.namespace, digest)?
+                        else {
+                            return Ok(None);
+                        };
+                        let members = self.get_definition_members(&proposal.namespace, digest)?;
+                        Ok(Some((revision, members)))
+                    },
+                },
+                &proposal,
+            )?;
+        }
         validate_write_context(actor, now_ms)?;
         let mut connection = self.conn();
         let transaction = connection
@@ -2300,6 +2324,7 @@ mod tests {
                 eval_plan_digests: Vec::new(),
                 named_foreign_digests: Vec::new(),
                 idempotency_key: "propose-foreign".into(),
+                major_revision: false,
             },
             "author",
             4,
@@ -2371,6 +2396,7 @@ mod tests {
                 eval_plan_digests: Vec::new(),
                 named_foreign_digests: Vec::new(),
                 idempotency_key: "propose-1".into(),
+                major_revision: false,
             },
             "author",
             4,

@@ -1266,6 +1266,7 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
+            major_revision: false,
         },
         "root",
     ))
@@ -1434,6 +1435,7 @@ async fn definition_proposal_close_rechecks_member_admin() {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
+            major_revision: false,
         },
         "root",
     ))
@@ -1513,6 +1515,7 @@ async fn definition_proposal_merge_accepts_one_live_approval() {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
+            major_revision: false,
         },
         "root",
     ))
@@ -1599,6 +1602,7 @@ async fn definition_proposal_rpc_publishes_or_rejects_without_partial_head_move(
             eval_plan_digests: vec![format!("sha256:{}", "e".repeat(64))],
             named_foreign_digests: vec![format!("sha256:{}", "f".repeat(64))],
             idempotency_key: "propose-1".into(),
+            major_revision: false,
         },
         "root",
     ))
@@ -1756,6 +1760,7 @@ async fn publish_definition_history_entry(
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: format!("{branch_id}-propose"),
+            major_revision: false,
         },
         "root",
     ))
@@ -2358,6 +2363,7 @@ async fn list_published_definition_revisions_chains_filters_and_paginates() {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "hist-drop-class-propose".into(),
+            major_revision: false,
         },
         "root",
     ))
@@ -15804,6 +15810,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         eval_plan_digests: vec![],
         named_foreign_digests: vec![],
         idempotency_key: "publish-proposal".into(),
+        major_revision: false,
     };
     read_only.nonce = uuid::Uuid::new_v4().to_string();
     let mut foreign_proposal = propose.clone();
@@ -24544,4 +24551,244 @@ async fn dataset_branch_rpcs_isolate_then_merge_once_by_another_principal() {
         .await
         .unwrap_err();
     assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+fn gate_binding(namespace: &str, blocking: bool) -> domain::Object {
+    use crate::sekai::definition_consumer_impact::{
+        BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+    };
+    let mut binding = DefinitionConsumerBinding {
+        contract_version: BINDING_CONTRACT.into(),
+        owner: "billing-team".into(),
+        resource_identity: "app:invoices".into(),
+        namespace: namespace.into(),
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        property: "title".into(),
+        declaration_digest: String::new(),
+        source_locator: "invoices/src/ticket.rs".into(),
+        blocking,
+    };
+    binding.declaration_digest = binding_digest(&binding);
+    let mut properties = HashMap::from([
+        ("contract_version".into(), binding.contract_version),
+        ("owner".into(), binding.owner),
+        ("resource_identity".into(), binding.resource_identity),
+        ("member_kind".into(), binding.member_kind),
+        ("member_id".into(), binding.member_id),
+        ("property".into(), binding.property),
+        ("declaration_digest".into(), binding.declaration_digest),
+        ("source_locator".into(), binding.source_locator),
+    ]);
+    if blocking {
+        properties.insert("blocking".into(), "true".into());
+    }
+    domain::Object {
+        id: "binding-invoices".into(),
+        kind: BINDING_KIND.into(),
+        name: "binding-invoices".into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:binding-invoices"),
+        properties,
+        created: 1,
+        updated: 1,
+    }
+}
+
+/// Branch, edit, propose, approve and merge; the merge result is returned.
+async fn try_publish(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    parent: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    properties: &str,
+    major_revision: bool,
+) -> Result<String, Status> {
+    let _ = svc
+        .create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: namespace.into(),
+                branch_id: branch_id.into(),
+                parent_revision_digest: parent.into(),
+                idempotency_key: format!("{branch_id}-create"),
+            },
+            "root",
+        ))
+        .await;
+    let candidate = match svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: branch_id.into(),
+                expected_head_digest: parent.into(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: format!(r#"{{"name":"Ticket","properties":{properties}}}"#),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: format!("{branch_id}-edit"),
+            },
+            "root",
+        ))
+        .await
+    {
+        Ok(applied) => applied.into_inner().revision.unwrap().revision_digest,
+        Err(_) => {
+            svc.get_definition_branch(with_named_principal(
+                GetDefinitionBranchRequest {
+                    namespace: namespace.into(),
+                    branch_id: branch_id.into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .branch
+            .unwrap()
+            .head_revision_digest
+        }
+    };
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            proposal_id: proposal_id.into(),
+            base_digest: parent.into(),
+            candidate_digest: candidate,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("{proposal_id}-propose"),
+            major_revision,
+        },
+        "root",
+    ))
+    .await?;
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: proposal_id.into(),
+            idempotency_key: format!("{proposal_id}-approve"),
+        },
+        "root",
+    ))
+    .await?;
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: proposal_id.into(),
+                expected_published_digest: parent.into(),
+                idempotency_key: format!("{proposal_id}-merge"),
+            },
+            "root",
+        ))
+        .await?
+        .into_inner();
+    Ok(merged.published_revision.unwrap().revision_digest)
+}
+
+#[tokio::test]
+async fn blocking_consumer_bindings_gate_breaking_publishes() {
+    let svc = service();
+    let namespace = "gate-team";
+    let parent = seed_definition_parent(&svc, namespace);
+    let with_title = try_publish(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "g-1",
+        "g-cs-1",
+        r#"["title"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&gate_binding(namespace, true))
+        .unwrap();
+
+    // Making `title` required is breaking too, though no property is removed.
+    let tightened = try_publish(
+        &svc,
+        namespace,
+        &with_title,
+        "g-req",
+        "g-cs-req",
+        r#"["title"],"required":["title"]"#,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        tightened.code(),
+        tonic::Code::FailedPrecondition,
+        "{tightened:?}"
+    );
+    assert!(
+        tightened.message().contains("app:invoices"),
+        "{tightened:?}"
+    );
+
+    // Dropping `title` breaks the blocking binding: refused, naming it.
+    let blocked = try_publish(
+        &svc,
+        namespace,
+        &with_title,
+        "g-2",
+        "g-cs-2",
+        r#"["body"]"#,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(blocked.code(), tonic::Code::FailedPrecondition);
+    assert!(blocked.message().contains("app:invoices"), "{blocked:?}");
+    assert!(blocked.message().contains("Ticket.title"), "{blocked:?}");
+
+    // The same change as an approved major revision publishes past the gate.
+    let major = try_publish(
+        &svc,
+        namespace,
+        &with_title,
+        "g-2",
+        "g-cs-2-major",
+        r#"["body"]"#,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_ne!(major, with_title);
+
+    // An advisory binding never blocks and is not disclosed.
+    let restored = try_publish(
+        &svc,
+        namespace,
+        &major,
+        "g-3",
+        "g-cs-3",
+        r#"["title"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .update_object(&gate_binding(namespace, false))
+        .unwrap();
+    try_publish(
+        &svc,
+        namespace,
+        &restored,
+        "g-4",
+        "g-cs-4",
+        r#"["body"]"#,
+        false,
+    )
+    .await
+    .unwrap();
 }
