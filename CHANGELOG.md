@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Relational change capture beyond PostgreSQL has one contract (ADR 0118):
+  per-family positions (LSN, GTID set, SCN) with a comparison rule, snapshot
+  handoff, committed records with optional transaction markers, schema
+  change classes mapped onto drift handling, and a distinct retention-loss
+  state. `sekai-source-sdk` 1.3.0 adds `assert_change_capture` and per-family
+  fixtures; the conformance digest covers them (#1578).
+
 - The certification gate lists each agent member's bound tools with the
   derived effect and whether it blocks publish, and `DiscoverCapabilities`
   returns `tool_effect` on Action entries. Effects now use the enabled versions

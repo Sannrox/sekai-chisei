@@ -139,3 +139,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0115: Compliance packs map controls to export evidence as data](0115-compliance-packs.md)
 - [ADR 0116: Discover governed Action types through the native capability catalog](0116-action-type-capability-discovery.md)
 - [ADR 0117: Embeddings are a derived index that inherits source governance](0117-governed-embedding-index.md)
+- [ADR 0118: One change-capture contract for relational sources beyond PostgreSQL](0118-relational-change-capture-contract.md)

@@ -162,7 +162,10 @@ PostgreSQL-first relational profile (`postgres.table`) may advertise
 stream onto those three guarantees; source log position is adapter-private
 resume state, not the plane-owned offset. Snapshot-only relations stay on
 v1 and must not start v2. See
-[ADR 0100](decisions/0100-relational-source-family.md).
+[ADR 0100](decisions/0100-relational-source-family.md). MySQL, SQL Server,
+and Oracle connectors map their positions, transactions, schema changes, and
+retention loss onto one contract and certify with `assert_change_capture`
+([ADR 0118](decisions/0118-relational-change-capture-contract.md)).
 
 Snapshot completion still does not imply tombstone-by-absence. Every deletion
 must arrive as an explicit `deleted: true` source record.

@@ -97,6 +97,7 @@ fn surface_from_source(src_root: &Path) -> Vec<String> {
     let mut names = Vec::new();
     scan_file(src_root.join("lib.rs"), None, &mut names);
     for module in [
+        "change_capture",
         "conformance",
         "contract",
         "discover",

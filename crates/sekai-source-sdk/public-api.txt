@@ -1,13 +1,18 @@
-# crate-version: 1.2.0
+# crate-version: 1.3.0
 ADAPTER_GITHUB_OBJECT_SYNC
 ADAPTER_GITHUB_OBJECT_SYNC_VERSION
 ADAPTER_REGISTERED_OBJECT_SYNC
 ADAPTER_REGISTERED_OBJECT_SYNC_VERSION
 ApplySourceBatchReply
+CHANGE_CAPTURE_CONFORMANCE_VERSION
+CaptureEvent
+CaptureSummary
+CapturedChange
 ChangeFeedPage
 ChangeFeedRunError
 ChangeFeedSource
 ChangeFeedSourceFailure
+ChangeOperation
 ColumnProfileHint
 ConnectionFailure
 DEFAULT_MAX_ENTRY_BYTES
@@ -17,6 +22,7 @@ DescriptorDraft
 DirectFeedCapability
 DiscoveredColumn
 DiscoveredRecordKind
+DriftHandling
 FAMILY_OBJECT_SYNC
 FlushDisposition
 FlushEntry
@@ -59,6 +65,7 @@ ObjectLineage
 OperationOutcome
 OutboxLimits
 PROFILE_RATIO_SCALE
+PositionFamily
 ReplayDisposition
 SDK_VERSION: &str
 SOURCE_BATCH_V2_VERSION
@@ -66,6 +73,7 @@ SOURCE_BATCH_VERSION
 SOURCE_DISCOVERY_VERSION
 SOURCE_GITHUB
 SOURCE_TYPE_REVISION_VERSION
+SchemaChangeClass
 SnapshotPage
 SnapshotPageSource
 SnapshotRead
@@ -88,6 +96,7 @@ SourceDiscovery
 SourceGenerationStatus
 SourceInspector
 SourceOutbox
+SourcePosition
 SourceRecord
 SourceRecordResult
 SourceRunDisposition
@@ -101,6 +110,7 @@ SourceTypeRevisionDescriptor
 SyncDecision
 SyncedObject
 TransportFailure
+assert_change_capture
 assert_cross_page_identity
 assert_deterministic_batch
 assert_deterministic_discovery
@@ -112,6 +122,58 @@ bind_writeback
 build_registered_source_batch
 build_source_batch
 build_source_batch_v2
+change_capture::CHANGE_CAPTURE_CONFORMANCE_VERSION: &str
+change_capture::CaptureEvent
+change_capture::CaptureEvent::Change(CapturedChange)
+change_capture::CaptureEvent::RetentionLost{checkpoint:String}
+change_capture::CaptureEvent::SchemaChange{record_kind:String,class:SchemaChangeClass,new_key:Option<Vec<String>>}
+change_capture::CaptureEvent::Snapshot{generation:u64,position:String}
+change_capture::CaptureEvent::TransactionBegin{transaction_id:String}
+change_capture::CaptureEvent::TransactionEnd{transaction_id:String,commit_position:String}
+change_capture::CaptureSummary
+change_capture::CaptureSummary.changes: usize
+change_capture::CaptureSummary.generations: u64
+change_capture::CaptureSummary.retention_lost: bool
+change_capture::CaptureSummary.transactions: usize
+change_capture::CapturedChange
+change_capture::CapturedChange.after: Option<BTreeMap<String,String>>
+change_capture::CapturedChange.before: Option<BTreeMap<String,String>>
+change_capture::CapturedChange.commit_position: String
+change_capture::CapturedChange.commit_time_ms: i64
+change_capture::CapturedChange.key: Vec<(String,String)>
+change_capture::CapturedChange.operation: ChangeOperation
+change_capture::CapturedChange.record_kind: String
+change_capture::CapturedChange.transaction_id: String
+change_capture::ChangeOperation
+change_capture::ChangeOperation::Delete
+change_capture::ChangeOperation::Insert
+change_capture::ChangeOperation::Update
+change_capture::DriftHandling
+change_capture::DriftHandling::AwaitRevision
+change_capture::DriftHandling::Commit
+change_capture::DriftHandling::Resnapshot
+change_capture::PositionFamily
+change_capture::PositionFamily::MysqlGtidSet
+change_capture::PositionFamily::OracleScn
+change_capture::PositionFamily::PostgresLsn
+change_capture::PositionFamily::SqlServerLsn
+change_capture::PositionFamily::commit_positions_can_tie(self) -> bool
+change_capture::PositionFamily::parse(self,&str) -> Result<SourcePosition,String>
+change_capture::PositionFamily::token(self) -> &str
+change_capture::SchemaChangeClass
+change_capture::SchemaChangeClass::Additive
+change_capture::SchemaChangeClass::Breaking
+change_capture::SchemaChangeClass::Compatible
+change_capture::SchemaChangeClass::handling(self) -> DriftHandling
+change_capture::SourcePosition
+change_capture::SourcePosition::GtidSet(BTreeMap<String,Vec<(u64,u64)>>)
+change_capture::SourcePosition::Lsn(u64)
+change_capture::SourcePosition::Scn(u64)
+change_capture::SourcePosition::SqlServerLsn(u32,u32,u16)
+change_capture::SourcePosition::compare(&self,&Self) -> Option<Ordering>
+change_capture::assert_change_capture(PositionFamily,&BTreeMap<String,Vec<String>>,Option<(u64,&str)>,&[CaptureEvent]) -> Result<CaptureSummary,String>
+change_capture::change_capture_fixture(PositionFamily) -> (BTreeMap<String,Vec<String>>,Vec<CaptureEvent>)
+change_capture_fixture
 column_name_suggests_sensitive
 conformance::LifecycleConformanceReport
 conformance::LifecycleConformanceReport.adapter_id: String
