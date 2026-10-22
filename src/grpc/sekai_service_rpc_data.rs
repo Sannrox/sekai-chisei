@@ -4707,3 +4707,219 @@ pub(super) async fn run_governed_transform_on_branch(
         markings_out: run.markings_out,
     }))
 }
+
+/// Replay a transform over pinned input versions (#1585). Admitted like a
+/// branch run (credential admin, namespace tenant, transform quota gate);
+/// the caller must read every input, the stored and candidate alike, and
+/// write the output, where the replay branch is created.
+pub(super) async fn replay_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<ReplayGovernedTransformRequest>,
+) -> Result<Response<ReplayGovernedTransformResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.get_ref().clone();
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &input.namespace,
+            true,
+        )?;
+    }
+    let stored = service
+        .db
+        .runtime()
+        .get_governed_transform(&input.namespace, &input.transform_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("governed transform not found"))?;
+    let transform =
+        crate::db::transform_replay::candidate_or_stored(&stored, &input.definition_json)
+            .map_err(Status::invalid_argument)?;
+    let mut readable: Vec<String> = stored
+        .input_bindings()
+        .into_iter()
+        .chain(transform.input_bindings())
+        .map(|(_, dataset_id)| dataset_id)
+        .collect();
+    readable.sort();
+    readable.dedup();
+    for dataset_id in &readable {
+        branch_caller(service, &req, dataset_id, false)?;
+    }
+    let (actor, tenant) = branch_caller(service, &req, &transform.output_dataset_id, true)?;
+    // The run, its branch and the diff samples carry whole rows, including
+    // fields of older versions; property read grants are not applied to
+    // them, so any dataset under enforced grants is refused.
+    for dataset_id in readable.iter().chain([&transform.output_dataset_id]) {
+        let dataset = service
+            .db
+            .runtime()
+            .get_dataset(dataset_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("dataset not found"))?;
+        if preview_column_allowlist(service, &dataset)?.is_some() {
+            return Err(Status::failed_precondition(
+                crate::sekai::transform_replay::REPLAY_PROPERTY_RESTRICTED,
+            ));
+        }
+    }
+    let owner_ctx = if tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .is_some()
+    {
+        tenant_context.clone()
+    } else {
+        match service
+            .db
+            .runtime()
+            .transform_quota_owner(&input.namespace, &input.transform_id)
+            .map_err(Status::internal)?
+        {
+            Some(tenant_id) => Some(crate::provider_credentials::tenant_context(
+                &tenant_id, "local",
+            )),
+            None => tenant_context.clone(),
+        }
+    };
+    let quota = service.quota_runtime();
+    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let admission_id = format!(
+        "transform-replay:{}:{}:{}",
+        input.namespace,
+        input.transform_id,
+        uuid::Uuid::new_v4()
+    );
+    let held = admit_tenant_transform(
+        quota.as_ref(),
+        &gate,
+        owner_ctx.as_ref(),
+        &admission_id,
+        false,
+    )?;
+    let result = service.db.runtime().replay_governed_transform(
+        &crate::sekai::transform_replay::ReplayTransform {
+            namespace: input.namespace,
+            transform_id: input.transform_id,
+            input_versions: input.input_versions.into_iter().collect(),
+            as_of_ms: input.as_of_ms,
+            definition_json: input.definition_json,
+            baseline_version_id: input.baseline_version_id,
+            key_column: input.key_column,
+            // The definition whose inputs and output were checked above.
+            expected_definition_digest: stored.definition_digest.clone(),
+            actor,
+            tenant,
+        },
+        now_millis(),
+    );
+    let replay = match result {
+        Ok(replay) => {
+            release_tenant_transform(service.db.runtime(), &gate, &admission_id, held.as_ref())?;
+            replay
+        }
+        Err(error) => {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            return Err(branch_status(error));
+        }
+    };
+    Ok(Response::new(ReplayGovernedTransformResponse {
+        replay: Some(to_proto_replay(replay)),
+    }))
+}
+
+/// A replay record, for a caller of its tenant who may read its output and
+/// every input; another tenant's reads as missing.
+pub(super) async fn get_transform_replay(
+    service: &SekaiServiceImpl,
+    req: Request<GetTransformReplayRequest>,
+) -> Result<Response<GetTransformReplayResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let missing = || Status::not_found(crate::sekai::transform_replay::REPLAY_NOT_FOUND);
+    let replay = service
+        .db
+        .runtime()
+        .get_transform_replay(&req.get_ref().id)
+        .map_err(Status::internal)?
+        .ok_or_else(missing)?;
+    let (_, tenant) = branch_caller(service, &req, &replay.output_dataset_id, false)?;
+    if tenant != replay.tenant {
+        return Err(missing());
+    }
+    for input in &replay.inputs {
+        branch_caller(service, &req, &input.dataset_id, false)?;
+    }
+    Ok(Response::new(GetTransformReplayResponse {
+        replay: Some(to_proto_replay(replay)),
+    }))
+}
+
+fn to_proto_replay(replay: crate::sekai::transform_replay::TransformReplay) -> TransformReplay {
+    let reproduced = replay.diff.reproduced();
+    let diff = replay.diff;
+    TransformReplay {
+        id: replay.id,
+        namespace: replay.namespace,
+        transform_id: replay.transform_id,
+        output_dataset_id: replay.output_dataset_id,
+        branch: replay.branch,
+        inputs: replay
+            .inputs
+            .into_iter()
+            .map(|input| ReplayInput {
+                alias: input.alias,
+                dataset_id: input.dataset_id,
+                version_id: input.version_id,
+                rows: input.rows,
+                digest: input.digest,
+                columns: input.columns,
+            })
+            .collect(),
+        definition_digest: replay.definition_digest,
+        candidate: replay.candidate,
+        engine_version: replay.engine_version,
+        as_of_ms: replay.as_of_ms,
+        baseline_version_id: replay.baseline_version_id,
+        non_deterministic: replay.non_deterministic,
+        markings_out: replay.markings_out,
+        output_digest: replay.output_digest,
+        diff: Some(ReplayDiff {
+            key_column: diff.key_column,
+            columns_added: diff.columns_added,
+            columns_removed: diff.columns_removed,
+            baseline_rows: diff.baseline_rows,
+            replay_rows: diff.replay_rows,
+            baseline_digest: diff.baseline_digest,
+            replay_digest: diff.replay_digest,
+            rows_added: diff.rows_added,
+            rows_removed: diff.rows_removed,
+            rows_changed: diff.rows_changed,
+            changed_keys: diff.changed_keys,
+            samples: diff
+                .samples
+                .into_iter()
+                .map(|change| ReplayRowChange {
+                    key: change.key,
+                    before: change.before.into_iter().collect(),
+                    after: change.after.into_iter().collect(),
+                })
+                .collect(),
+            reproduced,
+        }),
+        downstream: replay
+            .downstream
+            .into_iter()
+            .map(|impact| ReplayDownstream {
+                dataset_id: impact.dataset_id,
+                via_transform: impact.via_transform,
+                object_types: impact.object_types,
+            })
+            .collect(),
+        actor: replay.actor,
+        created_at_ms: replay.created_at_ms,
+    }
+}

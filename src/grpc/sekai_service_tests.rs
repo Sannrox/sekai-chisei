@@ -24958,3 +24958,185 @@ async fn ontology_changelog_lists_the_week_with_authors_approvers_and_consumers(
         .unwrap_err();
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 }
+
+#[tokio::test]
+async fn transform_replay_rpc_reproduces_and_needs_read_on_every_input() {
+    let svc = service();
+    seed_lineage_object(&svc, "replay-secret", "replays");
+    for (id, object_id) in [("replay-in", "replay-secret"), ("replay-out", "")] {
+        svc.create_dataset(with_named_principal(
+            CreateDatasetRequest {
+                dataset: Some(Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: ["id", "keep"]
+                        .map(|name| ColumnDef {
+                            name: name.into(),
+                            r#type: "string".into(),
+                            classification: "public".into(),
+                        })
+                        .to_vec(),
+                    object_id: object_id.into(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                }),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    // Only root may read the input.
+    svc.security.add_grant(&security::Grant {
+        id: "replay-grant".into(),
+        object_id: "replay-secret".into(),
+        principal: "root".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    });
+    let runtime = svc.db.runtime();
+    runtime
+        .append_rows(
+            "replay-in",
+            &[
+                [
+                    ("id".to_string(), "1".to_string()),
+                    ("keep".into(), "yes".into()),
+                ]
+                .into(),
+                [
+                    ("id".to_string(), "2".to_string()),
+                    ("keep".into(), "no".into()),
+                ]
+                .into(),
+            ],
+        )
+        .unwrap();
+    let transform = crate::sekai::governed_transform::GovernedTransform {
+        contract_version: crate::sekai::governed_transform::CONTRACT_VERSION.into(),
+        namespace: "replays".into(),
+        transform_id: "keep".into(),
+        input_dataset_id: "replay-in".into(),
+        output_dataset_id: "replay-out".into(),
+        steps: vec![crate::sekai::governed_transform::TransformStep {
+            kind: "filter".into(),
+            column: "keep".into(),
+            op: "eq".into(),
+            value: "yes".into(),
+            columns: Vec::new(),
+        }],
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: None,
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .unwrap();
+    runtime.put_governed_transform(&transform, 10).unwrap();
+    let original = runtime
+        .run_governed_transform("replays", "keep", false, 20)
+        .unwrap();
+    let request = |principal: &str| {
+        with_named_principal(
+            ReplayGovernedTransformRequest {
+                namespace: "replays".into(),
+                transform_id: "keep".into(),
+                key_column: "id".into(),
+                ..Default::default()
+            },
+            principal,
+        )
+    };
+    let refused = svc
+        .replay_governed_transform(request("local"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (tonic::Code::PermissionDenied, "access denied")
+    );
+    let replay = svc
+        .replay_governed_transform(request("root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .replay
+        .unwrap();
+    assert!(replay.diff.as_ref().unwrap().reproduced);
+    assert_eq!(replay.output_digest, original.output_digest);
+    assert_eq!(replay.inputs[0].dataset_id, "replay-in");
+    let get = |principal: &str| {
+        with_named_principal(
+            GetTransformReplayRequest {
+                id: replay.id.clone(),
+            },
+            principal,
+        )
+    };
+    let fetched = svc
+        .get_transform_replay(get("root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .replay
+        .unwrap();
+    // The stored record keeps counts and digests, not row values.
+    assert_eq!(
+        fetched.diff.unwrap().replay_digest,
+        replay.diff.as_ref().unwrap().replay_digest
+    );
+    assert_eq!(fetched.id, replay.id);
+    // Someone who cannot read the input cannot read the record either.
+    let hidden = svc.get_transform_replay(get("local")).await.unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::PermissionDenied);
+    let missing = svc
+        .get_transform_replay(with_named_principal(
+            GetTransformReplayRequest { id: "nope".into() },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    // Once property grants are enforced, the whole-row replay is refused.
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "replays".into(),
+        kind: "widget".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+            property: "id".into(),
+            access: crate::sekai::object_security::PropertyGrantAccess::Read,
+        }]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = runtime
+        .put_object_security_policy(&policy, "root", "put-replay-grants", 30)
+        .unwrap();
+    runtime
+        .activate_object_security_policies(
+            "replays",
+            &BTreeMap::from([("widget".into(), revision.revision_digest)]),
+            "root",
+            "activate-replay-grants",
+            31,
+        )
+        .unwrap();
+    let restricted = svc
+        .replay_governed_transform(request("root"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (restricted.code(), restricted.message()),
+        (
+            tonic::Code::FailedPrecondition,
+            crate::sekai::transform_replay::REPLAY_PROPERTY_RESTRICTED
+        )
+    );
+}

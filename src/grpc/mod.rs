@@ -2330,7 +2330,11 @@ mod tests {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
         }
-        for method in ["RunGovernedTransform", "RunGovernedTransformOnBranch"] {
+        for method in [
+            "RunGovernedTransform",
+            "RunGovernedTransformOnBranch",
+            "ReplayGovernedTransform",
+        ] {
             assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
         }
     }
