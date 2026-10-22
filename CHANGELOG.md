@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Experimental `GetOntologyChangelog` lists what changed in a reader's
+  namespaces over a window: each published definition revision with a
+  plain-language summary, compatibility, author, approvers, publisher and
+  affected registered consumers, and policy activations. A credential admin
+  can build a team's weekly digest, authorized as that team alone; a
+  namespace the reader cannot read contributes nothing
+  (docs/ontology-changelog.md, #1471).
+
 - Experimental comment threads on objects and their properties, with
   mentions, resolve and reopen. A comment is visible only to callers who
   can read its object and property, quoted values of hidden properties are

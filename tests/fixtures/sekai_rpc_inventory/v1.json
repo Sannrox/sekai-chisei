@@ -1222,6 +1222,19 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "GetOntologyChangelog",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/ontology_changelog.rs",
+        "src/grpc/ontology_changelog_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.definitions"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExpandNeighborhood",
       "kind": "persistent",
       "surfaces": [
