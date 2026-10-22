@@ -7,6 +7,7 @@
 pub mod action_policy;
 pub mod classification_lattice;
 pub mod dataset;
+pub mod dataset_branch;
 pub mod dataset_version;
 pub mod decision_ledger;
 pub mod evidence;

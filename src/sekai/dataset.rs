@@ -29,7 +29,7 @@ pub(crate) fn parse_columns(value: &str) -> Result<Vec<ColumnDef>, String> {
     }
 }
 
-fn reindex_dataset_partition_keys(
+pub(crate) fn reindex_dataset_partition_keys(
     tx: &Transaction<'_>,
     dataset_id: &str,
     keys: &[String],
@@ -107,6 +107,7 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         crate::sekai::dataset_health::migrate_dataset_health(&conn)?;
+        crate::db::dataset_branch::migrate_dataset_branches(&conn)?;
         let _ = conn.execute(
             "ALTER TABLE sekai_datasets ADD COLUMN partition_keys TEXT NOT NULL DEFAULT '[]'",
             [],
@@ -731,6 +732,9 @@ impl SekaiDb {
             result.fields_redacted += changed;
         }
         redact_dataset_version_rows_tx(&tx, dataset_id, filters, &fields, &keys)?;
+        crate::db::dataset_branch::edit_branch_rows_tx(&tx, dataset_id, &|row| {
+            redact_branch_row(row, filters, &fields)
+        })?;
         if result.rows_updated > 0 {
             snapshot_dataset_version_tx(
                 &tx,
@@ -884,7 +888,7 @@ fn map_dataset_version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetV
     })
 }
 
-fn query_dataset_version_rows_tx(
+pub(crate) fn query_dataset_version_rows_tx(
     tx: &Transaction<'_>,
     dataset_id: &str,
     version_id: &str,
@@ -908,6 +912,36 @@ fn query_dataset_version_rows_tx(
     Ok(rows)
 }
 
+/// The redaction of one branch working-copy row: matching rows get the
+/// fields replaced, and a row that no longer decodes is dropped.
+pub(crate) fn redact_branch_row(
+    row: Option<HashMap<String, String>>,
+    filters: &[RowFilter],
+    fields: &[&str],
+) -> crate::sekai::dataset_branch::BranchRowEdit {
+    use crate::sekai::dataset_branch::BranchRowEdit;
+    let Some(mut values) = row else {
+        return BranchRowEdit::Delete;
+    };
+    if !matches_row_filters(&values, filters) {
+        return BranchRowEdit::Keep;
+    }
+    let mut changed = false;
+    for field in fields {
+        if let Some(value) = values.get_mut(*field)
+            && value != "[redacted]"
+        {
+            *value = "[redacted]".into();
+            changed = true;
+        }
+    }
+    if changed {
+        BranchRowEdit::Replace(values)
+    } else {
+        BranchRowEdit::Keep
+    }
+}
+
 pub(crate) fn erase_matching_dataset_version_rows_tx(
     tx: &Transaction<'_>,
     dataset_id: &str,
@@ -924,6 +958,10 @@ pub(crate) fn erase_matching_dataset_version_rows_tx(
     if table.is_none() {
         return Ok(());
     }
+    crate::db::dataset_branch::edit_branch_rows_tx(tx, dataset_id, &|row| match row {
+        Some(values) if !matches(&values) => crate::sekai::dataset_branch::BranchRowEdit::Keep,
+        _ => crate::sekai::dataset_branch::BranchRowEdit::Delete,
+    })?;
     let rows: Vec<(String, i64, String)> = {
         let mut stmt = tx
             .prepare(
@@ -1163,6 +1201,9 @@ fn prune_dataset_versions_tx(tx: &Transaction<'_>, dataset_id: &str) -> Result<(
                 SELECT last_healthy_version_id FROM sekai_dataset_health_state
                 WHERE dataset_id = ?1
               ), '')
+              AND version_id NOT IN (
+                SELECT base_version_id FROM sekai_dataset_branches WHERE dataset_id = ?1
+              )
          )",
         params![dataset_id, cutoff],
     )
@@ -1173,14 +1214,17 @@ fn prune_dataset_versions_tx(tx: &Transaction<'_>, dataset_id: &str) -> Result<(
            AND version_id != COALESCE((
              SELECT last_healthy_version_id FROM sekai_dataset_health_state
              WHERE dataset_id = ?1
-           ), '')",
+           ), '')
+           AND version_id NOT IN (
+             SELECT base_version_id FROM sekai_dataset_branches WHERE dataset_id = ?1
+           )",
         params![dataset_id, cutoff],
     )
     .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn mark_consuming_transform_outputs_stale_tx(
+pub(crate) fn mark_consuming_transform_outputs_stale_tx(
     tx: &Transaction<'_>,
     dataset_id: &str,
     cause_ref: &str,

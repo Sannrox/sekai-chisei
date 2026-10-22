@@ -528,6 +528,16 @@ fn erase_supported_subject_data(
 ) -> Result<(), String> {
     let subject = request.subject.as_str();
 
+    // Same order as dataset and branch writers: the dataset rows lock first.
+    client
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 467))",
+            &[&crate::db::postgres::advisory_lock_key(&[
+                "dataset_rows",
+                "llm_calls",
+            ])],
+        )
+        .map_err(err)?;
     for row in client
         .query(
             "SELECT id,data FROM sekai_dataset_rows
@@ -565,6 +575,16 @@ fn erase_supported_subject_data(
                 .map_err(err)?;
         }
     }
+    crate::db::postgres_dataset_branch::edit_branch_rows_pg(client, "llm_calls", &|row| {
+        let mentions = row
+            .and_then(|values| serde_json::to_string(&values).ok())
+            .is_none_or(|data| value_mentions_subject(&data, &request.subject_kind, subject));
+        if mentions {
+            crate::sekai::dataset_branch::BranchRowEdit::Delete
+        } else {
+            crate::sekai::dataset_branch::BranchRowEdit::Keep
+        }
+    })?;
     client
         .execute(
             "UPDATE sekai_dataset_versions SET row_count = (

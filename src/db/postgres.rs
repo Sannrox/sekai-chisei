@@ -154,6 +154,7 @@ const STREAMING_TRANSFORM_APPLY_SCHEMA: &str =
 const EMBEDDING_INDEX_SCHEMA: &str = include_str!("postgres/0086_embedding_index.sql");
 const AGENT_CERTIFICATION_SCORE_SCHEMA: &str =
     include_str!("postgres/0087_agent_certification_score.sql");
+const DATASET_BRANCHES_SCHEMA: &str = include_str!("postgres/0088_dataset_branches.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -706,6 +707,12 @@ const MIGRATIONS: &[Migration] = &[
         86,
         "agent_certification_score",
         AGENT_CERTIFICATION_SCORE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        87,
+        "dataset_branches",
+        DATASET_BRANCHES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

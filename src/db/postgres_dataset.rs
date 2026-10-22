@@ -298,6 +298,11 @@ impl PostgresDb {
             result.fields_redacted += changed;
         }
         redact_dataset_version_rows_pg(&mut transaction, dataset_id, filters, &fields, &keys)?;
+        crate::db::postgres_dataset_branch::edit_branch_rows_pg(
+            &mut transaction,
+            dataset_id,
+            &|row| crate::sekai::dataset::redact_branch_row(row, filters, &fields),
+        )?;
         if result.rows_updated > 0 {
             snapshot_dataset_version_pg(
                 &mut transaction,
@@ -876,6 +881,9 @@ fn prune_dataset_versions_pg(
                 SELECT last_healthy_version_id FROM sekai_dataset_health_state
                 WHERE dataset_id = $1
               ), '')
+              AND version_id NOT IN (
+                SELECT base_version_id FROM sekai_dataset_branches WHERE dataset_id = $1
+              )
          )",
         &[&dataset_id, &cutoff],
     )
@@ -886,14 +894,17 @@ fn prune_dataset_versions_pg(
            AND version_id != COALESCE((
              SELECT last_healthy_version_id FROM sekai_dataset_health_state
              WHERE dataset_id = $1
-           ), '')",
+           ), '')
+           AND version_id NOT IN (
+             SELECT base_version_id FROM sekai_dataset_branches WHERE dataset_id = $1
+           )",
         &[&dataset_id, &cutoff],
     )
     .map(|_| ())
     .map_err(|error| error.to_string())
 }
 
-fn mark_consuming_transform_outputs_stale_pg(
+pub(crate) fn mark_consuming_transform_outputs_stale_pg(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
     cause_ref: &str,
