@@ -5,6 +5,7 @@
 //! and `conformance_suite_digest()` are the pins connector certification
 //! records.
 
+pub mod change_capture;
 pub mod conformance;
 pub mod contract;
 pub mod discover;
@@ -14,6 +15,11 @@ pub mod lineage;
 pub mod sdk;
 pub mod snapshot;
 
+pub use change_capture::{
+    CHANGE_CAPTURE_CONFORMANCE_VERSION, CaptureEvent, CaptureSummary, CapturedChange,
+    ChangeOperation, DriftHandling, PositionFamily, SchemaChangeClass, SourcePosition,
+    assert_change_capture, change_capture_fixture,
+};
 pub use conformance::{
     LifecycleConformanceReport, LifecycleFixture, LifecycleObservation, LifecycleProjection,
     LifecycleStage, OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION, assert_cross_page_identity,
@@ -88,6 +94,10 @@ pub fn conformance_suite_digest() -> String {
     hasher.update(SOURCE_DISCOVERY_VERSION.as_bytes());
     hasher.update(b"\n");
     hasher.update(include_str!("conformance.rs").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(CHANGE_CAPTURE_CONFORMANCE_VERSION.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(include_str!("change_capture.rs").as_bytes());
     format!("sha256:{:x}", hasher.finalize())
 }
 
