@@ -1228,6 +1228,14 @@ pub(super) async fn list_object_changes(
         .get_object(&inner.object_id)
         .map_err(Status::internal)?;
     match object.as_ref() {
+        // Reserved governance objects, such as comments, carry their own read
+        // rules; their raw history is for credential admins only.
+        Some(object)
+            if is_reserved_governance_kind(&object.kind)
+                && require_credential_admin(&principals).is_err() =>
+        {
+            return Err(Status::not_found("not found"));
+        }
         Some(object) => {
             enforce_collaboration_namespace(
                 service.db.runtime(),

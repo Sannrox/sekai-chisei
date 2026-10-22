@@ -718,6 +718,40 @@ pub(super) fn object_passes_security_policy(
             == crate::sekai::policy_decision::PolicyOutcome::Allow,
     )
 }
+/// Refuse a write into `namespace` while a write freeze covers it, the acting
+/// principal, its delegator, or the acting or owning tenant.
+pub(super) fn refuse_frozen_object_write(
+    db: &RuntimeDb,
+    namespace: &str,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    action: crate::enterprise::NamespaceAction,
+) -> Result<(), Status> {
+    let principal = principals.first().map(String::as_str).unwrap_or_default();
+    let act = tenant_context.and_then(|context| context.act.as_deref());
+    let acting = crate::sekai::write_freeze::acting_or_registered_tenant(
+        db,
+        acting_tenant(tenant_context),
+        principal,
+    )
+    .map_err(Status::internal)?;
+    let owner = shared_space_resource_tenant(db, tenant_context, namespace, action);
+    let agent = freeze_actor_is_agent(db, principal, tenant_context)?;
+    let mut checks = crate::sekai::write_freeze::write_checks_for_actors(
+        namespace,
+        acting.as_ref(),
+        principal,
+        act,
+        "",
+        agent,
+    );
+    if let Some(owner) = owner.as_deref().filter(|owner| *owner != acting.as_ref()) {
+        checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
+            namespace, owner, principal, act, "", agent,
+        ));
+    }
+    crate::sekai::write_freeze::refuse_if_frozen_any(db, &checks)
+}
 pub(super) fn enforce_object_operation_access(
     db: &RuntimeDb,
     object: &domain::Object,
@@ -742,35 +776,7 @@ pub(super) fn enforce_object_operation_access(
             | crate::sekai::object_security::ObjectSecurityOperation::Query
             | crate::sekai::object_security::ObjectSecurityOperation::Export
     ) {
-        let principal = principals.first().map(String::as_str).unwrap_or_default();
-        let act = tenant_context.and_then(|context| context.act.as_deref());
-        let acting = crate::sekai::write_freeze::acting_or_registered_tenant(
-            db,
-            acting_tenant(tenant_context),
-            principal,
-        )
-        .map_err(Status::internal)?;
-        let owner = shared_space_resource_tenant(db, tenant_context, &object.namespace, action);
-        let agent = freeze_actor_is_agent(db, principal, tenant_context)?;
-        let mut checks = crate::sekai::write_freeze::write_checks_for_actors(
-            &object.namespace,
-            acting.as_ref(),
-            principal,
-            act,
-            "",
-            agent,
-        );
-        if let Some(owner) = owner.as_deref().filter(|owner| *owner != acting.as_ref()) {
-            checks.extend(crate::sekai::write_freeze::write_checks_for_actors(
-                &object.namespace,
-                owner,
-                principal,
-                act,
-                "",
-                agent,
-            ));
-        }
-        crate::sekai::write_freeze::refuse_if_frozen_any(db, &checks)?;
+        refuse_frozen_object_write(db, &object.namespace, principals, tenant_context, action)?;
     }
     let decision =
         decide_object_access(db, object, principals, tenant_context, operation, purpose)?;
