@@ -614,6 +614,19 @@ chisei_store_trait! {
 }
 
 chisei_store_trait! {
+    /// Live policy shadow state and reports (#1630).
+    pub trait ChiseiPolicyShadowStore {
+        fn start_policy_shadow(&self, shadow: &crate::chisei::policy_shadow::PolicyShadow) -> Result<(), String>;
+        fn stop_policy_shadow(&self, namespace: &str, shadow_id: Option<&str>, unclaimed_at_ms: Option<i64>) -> Result<bool, String>;
+        fn claim_policy_shadow_activation(&self, namespace: &str, shadow_id: &str, now_ms: i64) -> Result<bool, String>;
+        fn confirm_policy_shadow_activation(&self, namespace: &str, shadow_id: &str, claimed_at_ms: i64, now_ms: i64) -> Result<bool, String>;
+        fn find_policy_shadow(&self, scopes: &[String]) -> Result<Option<crate::chisei::policy_shadow::PolicyShadow>, String>;
+        fn record_policy_shadow_observation(&self, shadow_id: &str, sample: &crate::chisei::policy_shadow::ShadowSample) -> Result<(), String>;
+        fn policy_shadow_report(&self, namespace: &str) -> Result<Option<crate::chisei::policy_shadow::PolicyShadowReport>, String>;
+    }
+}
+
+chisei_store_trait! {
     /// Per-namespace model review state and family enablement (#1493).
     pub trait ChiseiModelReviewStore {
         fn put_model_review_record(&self, record: &crate::chisei::model_review::ModelReviewRecord) -> Result<(), String>;

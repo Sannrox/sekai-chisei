@@ -151,6 +151,45 @@
       "product_tier": "core"
     },
     {
+      "rpc": "StartPolicyShadow",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_policy_shadow_backend_conformance.rs",
+        "src/chisei_store/policy_shadow.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetPolicyShadowReport",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_policy_shadow_backend_conformance.rs",
+        "src/chisei_store/policy_shadow.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "StopPolicyShadow",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_policy_shadow_backend_conformance.rs",
+        "src/chisei_store/policy_shadow.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetEvaluationGateEvidence",
       "kind": "query",
       "surfaces": [],

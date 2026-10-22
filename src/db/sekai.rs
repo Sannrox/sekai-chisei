@@ -389,6 +389,7 @@ impl SekaiDb {
         self.migrate_portfolio()?;
         self.migrate_routing_profiles()?;
         self.migrate_model_review()?;
+        self.migrate_policy_shadow()?;
         self.migrate_model_release_evidence()?;
         self.migrate_usage_ledger()?;
         self.ensure_external_permit_tables()?;

@@ -754,6 +754,100 @@ impl RuntimeDb {
         }
     }
 
+    pub fn start_policy_shadow(
+        &self,
+        shadow: &crate::chisei::policy_shadow::PolicyShadow,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.start_policy_shadow(shadow),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.start_policy_shadow(shadow))
+            }
+        }
+    }
+
+    pub fn stop_policy_shadow(
+        &self,
+        namespace: &str,
+        shadow_id: Option<&str>,
+        unclaimed_at_ms: Option<i64>,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.stop_policy_shadow(namespace, shadow_id, unclaimed_at_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.stop_policy_shadow(namespace, shadow_id, unclaimed_at_ms)
+            }),
+        }
+    }
+
+    pub fn claim_policy_shadow_activation(
+        &self,
+        namespace: &str,
+        shadow_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.claim_policy_shadow_activation(namespace, shadow_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.claim_policy_shadow_activation(namespace, shadow_id, now_ms)
+            }),
+        }
+    }
+
+    pub fn confirm_policy_shadow_activation(
+        &self,
+        namespace: &str,
+        shadow_id: &str,
+        claimed_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.confirm_policy_shadow_activation(namespace, shadow_id, claimed_at_ms, now_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.confirm_policy_shadow_activation(namespace, shadow_id, claimed_at_ms, now_ms)
+            }),
+        }
+    }
+
+    pub fn find_policy_shadow(
+        &self,
+        scopes: &[String],
+    ) -> Result<Option<crate::chisei::policy_shadow::PolicyShadow>, String> {
+        match self {
+            Self::Sqlite(db) => db.find_policy_shadow(scopes),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.find_policy_shadow(scopes))
+            }
+        }
+    }
+
+    pub fn record_policy_shadow_observation(
+        &self,
+        shadow_id: &str,
+        sample: &crate::chisei::policy_shadow::ShadowSample,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.record_policy_shadow_observation(shadow_id, sample),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.record_policy_shadow_observation(shadow_id, sample)
+            }),
+        }
+    }
+
+    pub fn policy_shadow_report(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<crate::chisei::policy_shadow::PolicyShadowReport>, String> {
+        match self {
+            Self::Sqlite(db) => db.policy_shadow_report(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.policy_shadow_report(namespace))
+            }
+        }
+    }
+
     pub fn put_model_review_record(
         &self,
         record: &crate::chisei::model_review::ModelReviewRecord,

@@ -946,6 +946,10 @@ pub(super) fn to_proto_definition_revision(
     }
 }
 pub(super) fn map_definition_write_error(error: String) -> Status {
+    // Names only blocking bindings, which consumers disclosed by opting in.
+    if error.starts_with("definition_publish_blocked") {
+        return Status::failed_precondition(error);
+    }
     if error.starts_with("definition_revision_not_found")
         || error.starts_with("definition_branch_not_found")
         || error.starts_with("definition_member_not_found")
@@ -1024,6 +1028,7 @@ pub(super) fn to_proto_definition_proposal(
         close_reason_code: proposal.close_reason_code.clone(),
         restored_from_digest: proposal.restored_from_digest.clone(),
         migration_plan_digest: proposal.migration_plan_digest.clone(),
+        major_revision: proposal.major_revision,
     }
 }
 pub(super) fn authorize_proposal_member_writes(

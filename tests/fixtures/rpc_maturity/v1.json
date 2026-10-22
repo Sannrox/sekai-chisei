@@ -781,6 +781,42 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "CreateObjectComment",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "UpdateObjectComment",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListObjectComments",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListCommentMentions",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ExpandNeighborhood",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
@@ -1885,6 +1921,33 @@
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "StartPolicyShadow",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetPolicyShadowReport",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "StopPolicyShadow",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
     },
     {
       "service": "ChiseiService",

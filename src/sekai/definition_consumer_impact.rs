@@ -4,9 +4,17 @@
 //! joins `CompareDefinitionRevisions` to visible declarations. The plane does
 //! not infer undeclared dependents, and zero visible hits is not proof of
 //! zero impact.
+//!
+//! A consumer may mark its binding `blocking` (ADR 0067, amended). A blocking
+//! binding is disclosed to the producer: impact reports include it whatever
+//! the caller can see, and publishing a revision that breaks it fails unless
+//! the proposal is an approved major revision. Advisory bindings keep the
+//! original non-disclosure.
 
 use crate::domain::Object;
-use crate::sekai::definition_diff::DefinitionRevisionDiff;
+use crate::sekai::definition_diff::{
+    DefinitionCompatibilityReason, DefinitionRevisionCompatibility, DefinitionRevisionDiff,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -30,6 +38,9 @@ pub struct DefinitionConsumerBinding {
     pub property: String,
     pub declaration_digest: String,
     pub source_locator: String,
+    /// Opted in to block breaking publishes, and so disclosed to producers.
+    #[serde(default)]
+    pub blocking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +51,7 @@ pub struct ConsumerImpactPath {
     pub member_id: String,
     pub property: String,
     pub source_locator: String,
+    pub blocking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +76,11 @@ pub fn binding_digest(binding: &DefinitionConsumerBinding) -> String {
     ] {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
+    }
+    // Only a blocking binding adds to the digest, so advisory declarations
+    // written before blocking existed keep their digest.
+    if binding.blocking {
+        hasher.update(b"\0blocking");
     }
     format!("sha256:{:x}", hasher.finalize())
 }
@@ -94,6 +111,10 @@ pub fn binding_from_object(object: &Object) -> Result<DefinitionConsumerBinding,
             .unwrap_or_default(),
         declaration_digest: required("declaration_digest")?,
         source_locator: required("source_locator")?,
+        blocking: object
+            .properties
+            .get("blocking")
+            .is_some_and(|value| value == "true"),
     };
     if binding.contract_version != BINDING_CONTRACT {
         return Err(COMPLETENESS_UNAVAILABLE.into());
@@ -135,6 +156,7 @@ pub fn report_consumer_impact(
             member_id: binding.member_id,
             property: binding.property,
             source_locator: binding.source_locator,
+            blocking: binding.blocking,
         });
     }
     impacts.sort_by(|left, right| {
@@ -157,6 +179,179 @@ pub fn report_consumer_impact(
         to_revision_digest: diff.to_revision_digest.clone(),
         impacts,
     }
+}
+
+/// Blocking bindings read per namespace. More fail closed.
+pub const MAX_BLOCKING_BINDINGS: usize = 10_000;
+
+/// Every blocking binding in `namespace` from `list` (a backend's object
+/// listing), read without a caller's visibility: opting in to blocking
+/// discloses a binding to producers.
+pub fn list_blocking_bindings(
+    list: impl Fn(&crate::domain::ListFilter) -> Result<Vec<Object>, String>,
+    namespace: &str,
+) -> Result<Vec<Object>, String> {
+    let mut bindings = Vec::new();
+    loop {
+        let page = list(&crate::domain::ListFilter {
+            kind: Some(BINDING_KIND.into()),
+            namespace: Some(namespace.into()),
+            property_filters: vec![crate::domain::PropertyFilter {
+                key: "blocking".into(),
+                op: "eq".into(),
+                value: "true".into(),
+            }],
+            limit: crate::domain::MAX_LIST_LIMIT,
+            offset: bindings.len() as i32,
+            ..crate::domain::ListFilter::default()
+        })?;
+        let full = page.len() == crate::domain::MAX_LIST_LIMIT as usize;
+        bindings.extend(page);
+        if bindings.len() > MAX_BLOCKING_BINDINGS {
+            return Err(
+                "definition_publish_blocked: too many blocking consumer bindings to evaluate"
+                    .into(),
+            );
+        }
+        if !full {
+            return Ok(bindings);
+        }
+    }
+}
+
+/// Reads a backend offers the publish gate.
+pub struct GateReads<L, R> {
+    /// Object listing.
+    pub list: L,
+    /// A revision and its members, by digest.
+    pub revision: R,
+}
+
+/// Refuse publishing `proposal` when it breaks a blocking binding in its
+/// namespace (ADR 0067, amended), naming each one. A merged proposal (a
+/// replay) and an approved major revision pass. Every backend merge calls
+/// this before it publishes.
+pub fn refuse_breaking_blocking_bindings<L, R>(
+    reads: GateReads<L, R>,
+    proposal: &crate::sekai::definition_proposal::DefinitionProposal,
+) -> Result<(), String>
+where
+    L: Fn(&crate::domain::ListFilter) -> Result<Vec<Object>, String>,
+    R: Fn(
+        &str,
+    ) -> Result<
+        Option<(
+            crate::sekai::definition_branch::DefinitionRevision,
+            Vec<crate::sekai::definition_branch::DefinitionMember>,
+        )>,
+        String,
+    >,
+{
+    if proposal.status == crate::sekai::definition_proposal::STATUS_MERGED
+        || proposal.major_revision
+    {
+        return Ok(());
+    }
+    let blocking = list_blocking_bindings(&reads.list, &proposal.namespace)?;
+    if blocking.is_empty() {
+        return Ok(());
+    }
+    let revision = |digest: &str| {
+        (reads.revision)(digest)?
+            .ok_or_else(|| "definition_revision_not_found: publish revision is missing".to_string())
+    };
+    let (base, base_members) = revision(&proposal.base_digest)?;
+    let (candidate, candidate_members) = revision(&proposal.candidate_digest)?;
+    let compatibility = crate::sekai::definition_diff::classify_definition_revision_compatibility(
+        &base,
+        &base_members,
+        &candidate,
+        &candidate_members,
+    )?;
+    let broken = broken_blocking_bindings(&compatibility, &blocking);
+    if broken.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = broken
+        .iter()
+        .map(|path| {
+            let target = if path.property.is_empty() {
+                format!("{} {}", path.member_kind, path.member_id)
+            } else {
+                format!("{} {}.{}", path.member_kind, path.member_id, path.property)
+            };
+            format!("{} ({}) on {target}", path.resource_identity, path.owner)
+        })
+        .collect();
+    Err(format!(
+        "definition_publish_blocked: breaks blocking consumer bindings: {}; propose a major revision to publish",
+        named.join(", ")
+    ))
+}
+
+/// Whether any of `bindings` is malformed or has a stale declaration digest.
+pub fn any_stale_binding(bindings: &[Object]) -> bool {
+    bindings.iter().any(|object| {
+        binding_from_object(object).map_or(true, |binding| {
+            binding.declaration_digest != binding_digest(&binding)
+        })
+    })
+}
+
+/// Valid blocking bindings among `bindings` that the change breaks: a
+/// breaking or unknown compatibility reason on the bound member, and on the
+/// bound property when the binding names one. Uses the compatibility
+/// classifier rather than the advisory diff matcher, so constraint changes
+/// such as a newly required property count. A binding with a stale digest
+/// is not trusted to block.
+pub fn broken_blocking_bindings(
+    compatibility: &DefinitionRevisionCompatibility,
+    bindings: &[Object],
+) -> Vec<ConsumerImpactPath> {
+    let breaking: Vec<&DefinitionCompatibilityReason> = compatibility
+        .reasons
+        .iter()
+        .filter(|reason| matches!(reason.class.as_str(), "breaking" | "unknown"))
+        .collect();
+    let mut broken: Vec<ConsumerImpactPath> = bindings
+        .iter()
+        .filter_map(|object| binding_from_object(object).ok())
+        .filter(|binding| {
+            binding.blocking
+                && binding.declaration_digest == binding_digest(binding)
+                && breaking.iter().any(|reason| {
+                    reason.member_kind == binding.member_kind
+                        && reason.member_id == binding.member_id
+                        && (binding.property.is_empty()
+                            || reason.property.is_empty()
+                            || reason.property == binding.property)
+                })
+        })
+        .map(|binding| ConsumerImpactPath {
+            owner: binding.owner,
+            resource_identity: binding.resource_identity,
+            member_kind: binding.member_kind,
+            member_id: binding.member_id,
+            property: binding.property,
+            source_locator: binding.source_locator,
+            blocking: true,
+        })
+        .collect();
+    broken.sort_by(|left, right| {
+        (
+            &left.owner,
+            &left.resource_identity,
+            &left.member_id,
+            &left.property,
+        )
+            .cmp(&(
+                &right.owner,
+                &right.resource_identity,
+                &right.member_id,
+                &right.property,
+            ))
+    });
+    broken
 }
 
 fn affected_references(diff: &DefinitionRevisionDiff) -> BTreeSet<(String, String, String)> {
@@ -262,6 +457,7 @@ mod tests {
             property: property.into(),
             declaration_digest: String::new(),
             source_locator: locator.into(),
+            blocking: false,
         };
         binding.declaration_digest = digest.unwrap_or(&binding_digest(&binding)).into();
         Object {

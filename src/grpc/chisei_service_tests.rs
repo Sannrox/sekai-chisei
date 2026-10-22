@@ -6118,6 +6118,179 @@ async fn set_namespace_policy_applies_to_resolve_policy() {
 }
 
 #[tokio::test]
+async fn policy_shadow_reports_live_differences_and_gates_activation() {
+    let svc = memory_service();
+    let policy = |allowed: &[&str]| SetNamespacePolicyRequest {
+        namespace: "shadowed".into(),
+        allowed_runtimes: allowed.iter().map(|_| "native".to_string()).collect(),
+        allowed_models: allowed.iter().map(|model| model.to_string()).collect(),
+        default_runtime: "native".into(),
+        default_model: "native-default".into(),
+        data_class: String::new(),
+        context_admission_policy_json: String::new(),
+    };
+    // Unsorted runtimes: the cached and the persisted baseline must agree.
+    svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+        allowed_runtimes: vec!["ollama".into(), "native".into()],
+        ..policy(&["native-default"])
+    }))
+    .await
+    .unwrap();
+    // The candidate drops the allow lists, so a request for another model is
+    // routed to that model instead of falling back to the default.
+    let candidate = policy(&[]);
+    let started = svc
+        .start_policy_shadow(Request::new(StartPolicyShadowRequest {
+            namespace: "shadowed".into(),
+            allowed_runtimes: candidate.allowed_runtimes.clone(),
+            allowed_models: candidate.allowed_models.clone(),
+            default_runtime: candidate.default_runtime.clone(),
+            default_model: candidate.default_model.clone(),
+            data_class: String::new(),
+            min_evaluations: 2,
+            min_match_rate_bps: 5_000,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert_eq!(started.evaluated, 0);
+    assert!(!started.passing);
+
+    let refused = svc
+        .set_namespace_policy(Request::new(candidate.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::chisei::policy_shadow::REFUSAL_NOT_PASSING)
+    );
+
+    for preferred in ["native-default", "gpt-5.5"] {
+        let runtime = if preferred == "gpt-5.5" {
+            "openai"
+        } else {
+            "native"
+        };
+        let resolved = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "shadowed", runtime, preferred,
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(
+            (resolved.runtime.as_str(), resolved.model.as_str()),
+            ("native", "native-default"),
+            "the shadow must not change the live decision"
+        );
+    }
+
+    let report = svc
+        .get_policy_shadow_report(Request::new(GetPolicyShadowReportRequest {
+            namespace: "shadowed".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert_eq!(
+        (report.evaluated, report.unchanged, report.re_routed),
+        (2, 1, 1)
+    );
+    assert_eq!((report.would_deny, report.would_allow), (0, 0));
+    assert_eq!(report.samples.len(), 1);
+    assert_eq!(report.samples[0].delta, "re_routed");
+    assert_eq!(report.samples[0].candidate, "allow openai/gpt-5.5");
+    assert_eq!(report.samples[0].preferred_model, "gpt-5.5");
+    assert!(report.passing, "{}", report.verdict_reason);
+
+    svc.set_namespace_policy(Request::new(candidate))
+        .await
+        .unwrap();
+    let retired = svc
+        .get_policy_shadow_report(Request::new(GetPolicyShadowReportRequest {
+            namespace: "shadowed".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(retired.code(), tonic::Code::NotFound);
+    let actions = svc
+        .db
+        .list_decisions(&crate::sekai::audit::DecisionFilter {
+            target_id: Some("shadowed".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|decision| decision.action)
+        .collect::<Vec<_>>();
+    for action in [
+        "policy.shadow_start",
+        "policy.shadow_activation",
+        "policy.shadow_stop",
+    ] {
+        assert!(
+            actions.iter().any(|recorded| recorded == action),
+            "{action}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn policy_shadow_observes_a_namespace_that_inherits_its_policy() {
+    let svc = memory_service();
+    svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+        namespace: "project-wide".into(),
+        allowed_runtimes: vec!["native".into()],
+        allowed_models: vec!["native-default".into()],
+        default_runtime: "native".into(),
+        default_model: "native-default".into(),
+        data_class: String::new(),
+        context_admission_policy_json: String::new(),
+    }))
+    .await
+    .unwrap();
+    svc.start_policy_shadow(Request::new(StartPolicyShadowRequest {
+        namespace: "team".into(),
+        default_runtime: "native".into(),
+        default_model: "native-default".into(),
+        min_evaluations: 1,
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let mut request = resolve_policy_request("team", "openai", "gpt-5.5");
+    request.project = "project-wide".into();
+    let resolved = svc
+        .resolve_policy(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner()
+        .resolution
+        .unwrap();
+    assert_eq!(resolved.policy_scope, "project-wide");
+
+    let report = svc
+        .get_policy_shadow_report(Request::new(GetPolicyShadowReportRequest {
+            namespace: "team".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert_eq!((report.evaluated, report.re_routed), (1, 1));
+}
+
+#[tokio::test]
 async fn set_namespace_policy_normalizes_legacy_openai_family_defaults() {
     let svc = memory_service();
     let resolution = svc

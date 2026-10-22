@@ -278,6 +278,15 @@ and `routing_profile_pinned`, so an unpinned plan still records the route it
 took. This catalog is not the gateway's `chisei.provider-capabilities/v1`
 matrix, and the two are not interchangeable.
 
+### Live policy shadow (#1630)
+
+`ChiseiService.StartPolicyShadow`, `GetPolicyShadowReport`, and
+`StopPolicyShadow` (experimental) evaluate a candidate namespace route policy
+beside the active one on live resolutions under contract
+`chisei.policy-shadow/v1`. Only the active decision takes effect.
+`SetNamespacePolicy` refuses the shadowed candidate until its report passes.
+See [policy-dry-run.md](policy-dry-run.md#live-shadow).
+
 ### Model review state (#1493)
 
 `ChiseiService.SetModelReview`, `RevokeModelReview`, `ListModelReviews`,
