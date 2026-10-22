@@ -11,7 +11,7 @@ use crate::chisei::decision_ledger::Decision;
 use crate::chisei::eval::{Assertion, Case, Suite};
 use crate::chisei::gunshi::{OperatorResponse, ResourceSelection};
 use crate::chisei::gunshi_feedback::{FEEDBACK_RECORD_VERSION, GunshiFeedbackRecord};
-use crate::db::store::{ChiseiDecisionStore, ChiseiEvalStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiEvalStore, ChiseiStore};
 
 pub const FEEDBACK_SUITE_PREFIX: &str = "feedback-";
 pub const PROMOTE_ACTION: &str = "gunshi.feedback_promoted_to_eval";
@@ -310,7 +310,7 @@ mod tests {
         VerificationStrategy,
     };
     use crate::chisei::gunshi_feedback::record_issued_recommendations;
-    use crate::db::store::ChiseiStore;
+    use crate::chisei_store::ChiseiStore;
 
     fn plan() -> AllocationPlan {
         AllocationPlan {

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::chisei::decision_ledger::Decision;
 use crate::chisei::eval::{Assertion, Case, EvalStore, Suite};
 use crate::chisei::evolve::{self, TaskRecord};
-use crate::db::store::{ChiseiDecisionStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiStore};
 use crate::domain::{KIND_CAPABILITY, Link, ListFilter, Object, REL_DEPENDS_ON};
 use crate::sekai::audit::{insert_object_changes, object_diff_changes};
 

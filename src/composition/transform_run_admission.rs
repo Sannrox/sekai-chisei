@@ -10,9 +10,9 @@ use crate::chisei::tenant_quota::{
     TenantQuotaGate, TenantQuotaLimits, tenant_scope_id,
 };
 use crate::chisei::usage_ledger::UsageEvent;
+use crate::chisei_store::ChiseiStore;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
-use crate::db::store::ChiseiStore;
 use crate::enterprise::AuthenticatedContext;
 use crate::sekai::governed_transform::{TRANSFORM_CLASS, TransformRun};
 

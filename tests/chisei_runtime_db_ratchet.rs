@@ -2,7 +2,7 @@
 //!
 //! Counts `.runtime()` and `.runtime_arc()` calls per file under `src/chisei`
 //! and compares them with `ALLOWED`. Chisei-owned persistence goes through the
-//! Chisei store traits in `crate::db::store`; Sekai fact reads go through the
+//! Chisei store traits in `crate::chisei_store`; Sekai fact reads go through the
 //! Chisei-owned Sekai read port. A file whose count rises fails, and so does a
 //! file whose count fell without lowering `ALLOWED`, so the totals only shrink.
 //! `ChiseiStore::runtime()` is crate-private; this ratchet stays at zero.

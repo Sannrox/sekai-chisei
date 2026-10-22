@@ -4,7 +4,7 @@ use sekai_chisei::chisei::external_action::{
     AuthorizationClaim, AuthorizationRecord, DECISION_VERSION, ExternalActionDecision,
     ExternalActionRequest, REQUEST_VERSION,
 };
-use sekai_chisei::db::chisei_external_action::ChiseiExternalActionBackend;
+use sekai_chisei::chisei_store::chisei_external_action::ChiseiExternalActionBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use std::collections::BTreeMap;
 

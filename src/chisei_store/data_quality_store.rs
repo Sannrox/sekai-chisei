@@ -2,8 +2,8 @@
 
 use rusqlite::{OptionalExtension, params};
 
-use super::sekai::SekaiDb;
 use crate::chisei::data_quality::{DataQualityResult, DataQualityRule};
+use crate::db::sekai::SekaiDb;
 
 impl SekaiDb {
     pub(crate) fn migrate_data_quality_rules(&self) -> Result<(), String> {

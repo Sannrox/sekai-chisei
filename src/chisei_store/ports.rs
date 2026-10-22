@@ -19,7 +19,6 @@ use crate::chisei::external_action::{
 use crate::chisei::external_permit::{
     ExternalPermitPolicy, HostContext, Permit, Redemption, RedemptionTiming,
 };
-use crate::chisei::governed_subject_provenance::ExportRecord;
 use crate::chisei::kioku::{
     CandidateDerivation, HumanMemoryReview, HumanReviewAction, KiokuCandidateCursor,
     KiokuEvidenceAuthorizationRequest, KiokuEvidenceLink, KiokuEvidenceReassessmentRequest,
@@ -28,10 +27,11 @@ use crate::chisei::kioku::{
     MemoryRetrievalRequest, MemoryValidation, RetrievedMemory,
 };
 use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
-use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent};
 use crate::db::chisei_operation_reservation::OperationReservation;
 use crate::sekai::audit::{Decision, DecisionFilter};
 use crate::sekai::evidence::EvidenceClassification;
+use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent};
+use sekai_types::governed_subject_provenance::ExportRecord;
 
 /// Declares a Chisei persistence trait and implements it for [`ChiseiStore`]
 /// by forwarding each method to the backend method of the same name.
@@ -664,7 +664,7 @@ chisei_store_trait! {
 chisei_store_trait! {
     /// Evolve task records.
     pub trait ChiseiEvolveStore {
-        fn list_evolve_task_records(&self) -> Result<Vec<crate::chisei::evolve::TaskRecord>, String>;
+        fn list_evolve_task_records(&self) -> Result<Vec<sekai_types::evolve::TaskRecord>, String>;
     }
 }
 

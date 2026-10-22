@@ -18,7 +18,7 @@ use sha2::{Digest as _, Sha256};
 use crate::chisei::decision_ledger::Decision;
 use crate::chisei::eval::{EvalStore, GateDecision};
 use crate::chisei::routing_profiles::HostedRoutingProfile;
-use crate::db::store::{ChiseiDecisionStore, ChiseiModelReleaseEvidenceStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiModelReleaseEvidenceStore, ChiseiStore};
 
 pub const RUNTIME_EVIDENCE_SCHEMA: &str = "tenkai.model_runtime_evidence.v1";
 pub const EVALUATION_EVIDENCE_SCHEMA: &str = "chisei.model_evaluation_evidence.v1";
@@ -1206,7 +1206,7 @@ mod tests {
     }
     #[test]
     fn opt_in_profile_admits_ingested_runtime_evidence() {
-        use crate::db::store::ChiseiStore;
+        use crate::chisei_store::ChiseiStore;
         let db = ChiseiStore::memory();
         let (key, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();
@@ -1240,7 +1240,7 @@ mod tests {
 
     #[test]
     fn opt_in_profile_without_evidence_is_refused() {
-        use crate::db::store::ChiseiStore;
+        use crate::chisei_store::ChiseiStore;
         let db = ChiseiStore::memory();
         let (_, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();
@@ -1261,7 +1261,7 @@ mod tests {
     #[test]
     fn compare_runs_export_signs_regression_outcome() {
         use crate::chisei::eval::{CaseResult, Run};
-        use crate::db::store::ChiseiStore;
+        use crate::chisei_store::ChiseiStore;
         let db = ChiseiStore::memory();
         let eval = EvalStore::with_db(db.clone());
         eval.put_suite(crate::chisei::eval::Suite {
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn opt_in_profile_refuses_a_foreign_namespace_that_omits_digest() {
-        use crate::db::store::ChiseiStore;
+        use crate::chisei_store::ChiseiStore;
         let db = ChiseiStore::memory();
         let (key, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();
@@ -1404,7 +1404,7 @@ mod tests {
     }
     #[test]
     fn opt_in_profile_does_not_admit_a_sibling_model() {
-        use crate::db::store::ChiseiStore;
+        use crate::chisei_store::ChiseiStore;
         let db = ChiseiStore::memory();
         let (key, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();
@@ -1428,7 +1428,7 @@ mod tests {
     #[test]
     fn export_rejects_runs_from_another_suite() {
         use crate::chisei::eval::{CaseResult, Run};
-        use crate::db::store::ChiseiStore;
+        use crate::chisei_store::ChiseiStore;
         let db = ChiseiStore::memory();
         let eval = EvalStore::with_db(db.clone());
         eval.put_suite(crate::chisei::eval::Suite {
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[test]
     fn older_runtime_evidence_does_not_replace_newer() {
-        use crate::db::store::ChiseiStore;
+        use crate::chisei_store::ChiseiStore;
         let db = ChiseiStore::memory();
         let (key, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();
@@ -1522,7 +1522,7 @@ mod tests {
 
     #[test]
     fn future_dated_runtime_evidence_is_not_ingested() {
-        use crate::db::store::ChiseiStore;
+        use crate::chisei_store::ChiseiStore;
         let db = ChiseiStore::memory();
         let (key, roots) = signing_pair();
         install_trust_roots(&db, roots, NOW_MS).unwrap();

@@ -14,7 +14,7 @@ use crate::chisei::promotion::{
     STATUS_GATE_FAILED, STATUS_GATE_PASSED, STATUS_PROPOSED,
 };
 use crate::chisei::scoring::sampling_suite_id;
-use crate::db::store::{ChiseiDecisionStore, ChiseiStore};
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiStore};
 
 /// Minimum aggregate success rate a template candidate's namespace task history must show to pass
 /// the gate.
@@ -238,7 +238,7 @@ mod tests {
         STATUS_SUPERSEDED, propose_routing_bias_candidate, propose_template_candidates,
     };
     use crate::chisei::scoring::{Judge, JudgeError, JudgeVerdict, SampleObservation, ScoringJob};
-    use crate::db::store::ChiseiObservationStore;
+    use crate::chisei_store::ChiseiObservationStore;
     use std::sync::Arc;
 
     const REGRESSION_BATCH: usize = 5;

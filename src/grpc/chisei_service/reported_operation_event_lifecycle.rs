@@ -1,7 +1,7 @@
 //! Admission lifecycle for externally reported canonical receipt events.
 
 use super::*;
-use crate::db::store::{ChiseiKiokuStore, ChiseiReceiptStore, ChiseiStore};
+use crate::chisei_store::{ChiseiKiokuStore, ChiseiReceiptStore, ChiseiStore};
 
 pub(super) fn record_reported_memory_outcomes(
     db: &ChiseiStore,

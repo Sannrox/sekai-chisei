@@ -1,4 +1,4 @@
-use crate::db::store::ChiseiEvolveStore;
+use crate::chisei_store::ChiseiEvolveStore;
 use base64::Engine as _;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -38,13 +38,13 @@ use crate::chisei::receipt::{
     GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
     ReceiptEventKind, ReceiptSurface, UncoveredSurface,
 };
+use crate::chisei_store::ChiseiDecisionStore;
 use crate::composition::lookup_first;
 use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::db::store::ChiseiDecisionStore;
 use crate::domain::{ListFilter, Object};
 #[cfg(test)]
 use crate::sekai::action_policy::ActionDecision;
@@ -118,7 +118,7 @@ pub struct ChiseiServiceImpl {
     pub(super) active_promotions: Arc<ActivePromotions>,
     pub(super) evaluation_execution_lifecycle:
         evaluation_execution_lifecycle::EvaluationExecutionLifecycle,
-    pub(super) db: crate::db::store::ChiseiStore,
+    pub(super) db: crate::chisei_store::ChiseiStore,
     pub(super) config: Config,
     pub(super) provider_registry_state_path: Option<PathBuf>,
     pub(super) sekai_commit_lookup: Option<Arc<dyn crate::chisei::sekai_commit::SekaiCommitLookup>>,
@@ -272,7 +272,7 @@ impl ChiseiServiceImpl {
         }
     }
 
-    pub fn new(db: impl Into<crate::db::store::ChiseiStore>, config: Config) -> Self {
+    pub fn new(db: impl Into<crate::chisei_store::ChiseiStore>, config: Config) -> Self {
         Self::new_with_evaluator_registries(
             db,
             config.clone(),
@@ -290,7 +290,7 @@ impl ChiseiServiceImpl {
     }
 
     pub fn new_with_evaluator_registry(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         config: Config,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
     ) -> Self {
@@ -303,7 +303,7 @@ impl ChiseiServiceImpl {
     }
 
     pub fn new_with_evaluator_registries(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         config: Config,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
         stochastic_evaluator_registry: Arc<
@@ -387,7 +387,7 @@ impl ChiseiServiceImpl {
     }
 
     pub fn with_budget(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         config: Config,
         budget: Arc<BudgetTracker>,
     ) -> Self {

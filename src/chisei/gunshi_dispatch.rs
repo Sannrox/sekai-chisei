@@ -12,7 +12,7 @@ use crate::chisei::gunshi::{
 };
 use crate::chisei::receipt::ReceiptEventKind;
 use crate::chisei::sekai_facts::SekaiFactReader;
-use crate::db::store::{ChiseiReceiptStore, ChiseiStore};
+use crate::chisei_store::{ChiseiReceiptStore, ChiseiStore};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutoDispatchPolicy {
@@ -475,7 +475,7 @@ mod tests {
     }
 
     fn fixtures() -> (crate::chisei::sekai_facts::SekaiFacts, ChiseiStore) {
-        let (sekai, db) = crate::db::store::paired_memory();
+        let (sekai, db) = crate::chisei_store::paired_memory();
         sekai
             .create_object(&Object {
                 id: "memory-1".into(),

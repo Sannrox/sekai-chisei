@@ -11,7 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SQLITE_ONLY_SURFACES_CONTRACT: &str = "sekai.sqlite-only-surfaces/v1";
 pub const SQLITE_ONLY_SURFACES_JSON: &str =
     include_str!("../tests/fixtures/sqlite_only_surfaces/v1.json");
-pub const RUNTIME_DB_SRC: &str = include_str!("db/runtime_db.rs");
+/// `RuntimeDb` source: Sekai methods plus the Chisei-typed methods in `chisei_store`.
+pub const RUNTIME_DB_SRC: &str = concat!(
+    include_str!("db/runtime_db.rs"),
+    include_str!("chisei_store/runtime.rs")
+);
 pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

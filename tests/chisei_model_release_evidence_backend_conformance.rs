@@ -8,8 +8,8 @@ use sekai_chisei::chisei::model_release_evidence::{
     ModelReleaseIdentity, RuntimeCanary, RuntimeEvidenceDraft, RuntimeHealth, TrustedSigner,
     sign_runtime_evidence,
 };
+use sekai_chisei::chisei_store::ChiseiStore;
 use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::db::store::ChiseiStore;
 use sha2::Digest as _;
 
 const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

@@ -12,8 +12,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::chisei::budget::{BudgetTracker, PeriodType};
+use crate::chisei_store::ChiseiStore;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
-use crate::db::store::ChiseiStore;
 use crate::enterprise::AuthenticatedContext;
 
 /// In-flight concurrency units reserved while a tenant operation is active.

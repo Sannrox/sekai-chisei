@@ -369,7 +369,7 @@ impl SekaiDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::portfolio_route_test_cases::assert_route_contract;
+    use crate::chisei_store::portfolio_route_test_cases::assert_route_contract;
 
     #[test]
     fn damped_route_matches_shared_contract() {

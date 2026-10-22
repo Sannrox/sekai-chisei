@@ -5,8 +5,8 @@ use sekai_chisei::chisei::model_review::{
     self, FamilyEnablementRecord, MODEL_REVIEW_CONTRACT, ModelReviewIdentity, ModelReviewRecord,
     ModelReviewStatus,
 };
+use sekai_chisei::chisei_store::{ChiseiDecisionStore, ChiseiModelReviewStore, ChiseiStore};
 use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::db::store::{ChiseiDecisionStore, ChiseiModelReviewStore, ChiseiStore};
 
 fn review(namespace: &str, model: &str, status: ModelReviewStatus, at: i64) -> ModelReviewRecord {
     ModelReviewRecord {

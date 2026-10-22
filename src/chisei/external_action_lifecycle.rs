@@ -10,8 +10,8 @@ use crate::chisei::external_action::{
     self, AuthorizationRecord, ExternalActionDecision, ExternalActionRequest,
 };
 use crate::chisei::risk_class::RiskClass;
+use crate::chisei_store::{ChiseiDecisionStore, ChiseiExternalActionStore, ChiseiStore};
 use crate::db::chisei_budget::METRIC_TOKENS;
-use crate::db::store::{ChiseiDecisionStore, ChiseiExternalActionStore, ChiseiStore};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug)]
