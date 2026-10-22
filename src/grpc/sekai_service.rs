@@ -1442,6 +1442,48 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetDatasetVersionResponse>, Status> {
         rpc_data::get_dataset_version(self, req).await
     }
+    async fn create_dataset_branch(
+        &self,
+        req: Request<CreateDatasetBranchRequest>,
+    ) -> Result<Response<CreateDatasetBranchResponse>, Status> {
+        rpc_data::create_dataset_branch(self, req).await
+    }
+    async fn list_dataset_branches(
+        &self,
+        req: Request<ListDatasetBranchesRequest>,
+    ) -> Result<Response<ListDatasetBranchesResponse>, Status> {
+        rpc_data::list_dataset_branches(self, req).await
+    }
+    async fn delete_dataset_branch(
+        &self,
+        req: Request<DeleteDatasetBranchRequest>,
+    ) -> Result<Response<DeleteDatasetBranchResponse>, Status> {
+        rpc_data::delete_dataset_branch(self, req).await
+    }
+    async fn compare_dataset_branch(
+        &self,
+        req: Request<CompareDatasetBranchRequest>,
+    ) -> Result<Response<CompareDatasetBranchResponse>, Status> {
+        rpc_data::compare_dataset_branch(self, req).await
+    }
+    async fn propose_dataset_branch_merge(
+        &self,
+        req: Request<ProposeDatasetBranchMergeRequest>,
+    ) -> Result<Response<ProposeDatasetBranchMergeResponse>, Status> {
+        rpc_data::propose_dataset_branch_merge(self, req).await
+    }
+    async fn merge_dataset_branch(
+        &self,
+        req: Request<MergeDatasetBranchRequest>,
+    ) -> Result<Response<MergeDatasetBranchResponse>, Status> {
+        rpc_data::merge_dataset_branch(self, req).await
+    }
+    async fn run_governed_transform_on_branch(
+        &self,
+        req: Request<RunGovernedTransformOnBranchRequest>,
+    ) -> Result<Response<RunGovernedTransformOnBranchResponse>, Status> {
+        rpc_data::run_governed_transform_on_branch(self, req).await
+    }
     async fn rollback_dataset(
         &self,
         req: Request<RollbackDatasetRequest>,

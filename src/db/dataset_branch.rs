@@ -249,14 +249,16 @@ impl SekaiDb {
         })
     }
 
+    /// Compare the caller's branch; another tenant's reads as missing.
     pub fn compare_dataset_branch(
         &self,
         dataset_id: &str,
         name: &str,
+        tenant: &str,
     ) -> Result<DatasetBranchDiff, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let branch = load_branch(&tx, dataset_id, name)?;
+        let branch = load_owned_branch(&tx, dataset_id, name, tenant)?;
         let head = branch_rows_tx(&tx, &branch)?;
         Ok(dataset_branch::diff_rows(
             &live_rows(&tx, dataset_id)?,
@@ -265,10 +267,15 @@ impl SekaiDb {
     }
 
     /// Delete a branch and its working copy, closing its open proposals.
-    pub fn delete_dataset_branch(&self, dataset_id: &str, name: &str) -> Result<(), String> {
+    pub fn delete_dataset_branch(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        tenant: &str,
+    ) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        load_branch(&tx, dataset_id, name)?;
+        load_owned_branch(&tx, dataset_id, name, tenant)?;
         drop_branch(&tx, dataset_id, name)?;
         tx.commit().map_err(|error| error.to_string())
     }
@@ -336,6 +343,10 @@ impl SekaiDb {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let mut proposal = load_proposal(&tx, &request.dataset_id, &request.proposal_id)?;
+        // Another tenant's proposal reads as missing, replay included.
+        if proposal.tenant != request.tenant {
+            return Err(dataset_branch::PROPOSAL_NOT_FOUND.into());
+        }
         if proposal.status == dataset_branch::STATUS_MERGED {
             return Ok(proposal);
         }
@@ -628,6 +639,19 @@ fn load_branch(
     .ok_or_else(|| dataset_branch::BRANCH_NOT_FOUND.to_string())
 }
 
+/// The branch if it belongs to `tenant`, checked in the caller's transaction.
+fn load_owned_branch(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    name: &str,
+    tenant: &str,
+) -> Result<DatasetBranch, String> {
+    load_branch(tx, dataset_id, name)
+        .ok()
+        .filter(|branch| branch.tenant == tenant)
+        .ok_or_else(|| dataset_branch::BRANCH_NOT_FOUND.to_string())
+}
+
 fn branch_rows_tx(
     tx: &Transaction<'_>,
     branch: &DatasetBranch,
@@ -844,7 +868,7 @@ mod tests {
         db.write_dataset_branch_rows(&id, "fix", &[row("3", "c")], false)
             .unwrap();
         assert_eq!(db.dataset_branch_rows(&id, "fix").unwrap().len(), 3);
-        let diff = db.compare_dataset_branch(&id, "fix").unwrap();
+        let diff = db.compare_dataset_branch(&id, "fix", "t1").unwrap();
         assert_eq!((diff.parent_rows, diff.branch_rows), (2, 3));
         assert!(!diff.identical());
         // The parent is untouched by branch work.
@@ -921,7 +945,7 @@ mod tests {
                 .unwrap()
                 .purged
         );
-        db.delete_dataset_branch(&id, "late").unwrap();
+        db.delete_dataset_branch(&id, "late", "t1").unwrap();
         assert_eq!(
             db.dataset_branch_rows(&id, "late").unwrap_err(),
             dataset_branch::BRANCH_NOT_FOUND

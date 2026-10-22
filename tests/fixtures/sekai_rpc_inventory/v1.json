@@ -1492,6 +1492,97 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "CreateDatasetBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListDatasetBranches",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DeleteDatasetBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "CompareDatasetBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ProposeDatasetBranchMerge",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "MergeDatasetBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RunGovernedTransformOnBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutDatasetHealthCheck",
       "kind": "persistent",
       "surfaces": [

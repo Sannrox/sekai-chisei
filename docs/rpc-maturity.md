@@ -185,6 +185,13 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.ListDatasetVersions` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetDatasetVersion` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RollbackDataset` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.CreateDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListDatasetBranches` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.DeleteDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.CompareDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ProposeDatasetBranchMerge` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.MergeDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.RunGovernedTransformOnBranch` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutDatasetHealthCheck` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListDatasetHealthChecks` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListDatasetHealthResults` | `sekai.datasets` | yes | none | `experimental` |
