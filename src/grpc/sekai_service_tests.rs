@@ -24421,3 +24421,6 @@ async fn synthetic_tenants_pass_the_real_read_checks() {
     assert_eq!(refused.code(), tonic::Code::PermissionDenied);
     read(&above_clearance.id, &admin.id).await.unwrap();
 }
+
+#[path = "isolation_probes.rs"]
+mod isolation_probes;
