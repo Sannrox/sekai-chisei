@@ -2,13 +2,12 @@
 
 ## Unreleased
 
-- Experimental `GetOntologyChangelog` lists what changed in a reader's
-  namespaces over a window: each published definition revision with a
-  plain-language summary, compatibility, author, approvers, publisher and
-  affected registered consumers, and policy activations. A credential admin
-  can build a team's weekly digest, authorized as that team alone; a
-  namespace the reader cannot read contributes nothing
-  (docs/ontology-changelog.md, #1471).
+- A consumer can mark its definition consumer binding `blocking`.
+  Publishing a revision that breaks a valid blocking binding then fails and
+  names it, unless the proposal is an approved major revision
+  (`major_revision`). Blocking bindings are disclosed to producers in
+  impact reports; advisory bindings keep the ADR 0067 non-disclosure
+  (ADR 0067 amended, #1635).
 
 - Experimental comment threads on objects and their properties, with
   mentions, resolve and reopen. A comment is visible only to callers who
