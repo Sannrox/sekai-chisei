@@ -65,12 +65,13 @@ dataset, like creating a branch, and is experimental like the bundle RPC.
 
 - The branch is named `bundle-` plus the start of the bundle digest and
   forks from the dataset's latest version. The dataset itself is never
-  written, and a dry-run branch is never proposed for merge: applying a
-  bundle is a later, governed step.
+  written, and `ProposeDatasetBranchMerge` and `MergeDatasetBranch` refuse
+  bundle branches: only [apply](#apply) merges one, through the approved
+  proposal.
 - Copies run first, then defaults fill properties that are still empty.
   No column is dropped: a renamed source column stays beside its copy, so
-  dataset redaction still finds the rows by their original fields; dropping
-  it is the apply step's. Columns follow the datasource's property mapping.
+  dataset redaction still finds the rows by their original fields. Apply
+  keeps it too. Columns follow the datasource's property mapping.
 - The branch is written once, from the bundle and the fork; a rerun returns
   it as it stands (including any redaction applied since), and a retry
   after a crash or a concurrent call fills it once. Delete the branch to
@@ -104,4 +105,86 @@ dataset, like creating a branch, and is experimental like the bundle RPC.
 - The base read, backfill and branch write share one storage transaction
   under the lock dataset redaction takes, fenced on the branch incarnation:
   a branch recreated meanwhile fails with `ABORTED` (retry).
+
+## Apply
+
+`ApplyDefinitionChangeBundle` (#1693) applies the bundle of an approved
+proposal as one governed change. It takes the `proposal_id`, the `hints`, the
+`bundle_digest` the reviewers approved, and the `expected_published_digest`
+the final publish compare-and-swaps against. It is experimental like the
+other bundle RPCs, and the caller needs what `MergeDefinitionProposal` needs:
+not the proposal's creator (operator identities excepted), read on both
+revisions, write on the changed members, and a still-current approval. The
+proposal must carry the bundle's digest as its `migration_plan_digest`, set
+when it was created and so covered by the approval: the bundle is
+regenerated from the proposal's pinned base and candidate with the request's
+`hints` and must have that digest
+(`definition_bundle_apply_unapproved_bundle`), so an applier cannot change
+the approved renames or defaults. A bundle with manual migration steps is
+refused.
+
+Apply keeps a durable record (`sekai.definition-bundle-apply/v1`, one per
+proposal) of ordered steps:
+
+1. For each dataset backing an object type the bundle backfills:
+   `backfill:<dataset>` fills the bundle branch as the dry run does,
+   replacing a branch this apply did not fill (a dry run's, which may predate
+   a datasource change), and its own fill is written once; `verify:<dataset>` checks the backfill
+   would change nothing more on the branch; `merge:<dataset>` opens a
+   dataset merge proposal (proposer `definition-proposal:<id>`, so any
+   applier keeps the dataset's two-person rule) and merges it as one new
+   dataset version, then defines the target columns the dataset does not
+   define yet (`public`: copies come only from public columns, defaults are
+   approved literals), so a datasource mapping a property to them stays
+   valid; a later refill may write those columns again, but only while they
+   are still `public` (a column reclassified since, perhaps redacted, is
+   refused like any defined column). A recorded dataset
+   proposal that can no longer merge (closed, its branch gone or changed)
+   starts the dataset over. The backfill records the branch incarnation it filled;
+   verify and merge refuse another (`definition_bundle_apply_branch_changed`),
+   and the dataset proposal captures the branch rows only while it is still
+   that incarnation, in the same transaction.
+   The proposal must find the version the branch forked from as its parent:
+   when the dataset was written since the backfill, the step fails
+   (`definition_bundle_apply_stale_base`), the derived branch is dropped, and
+   the dataset's steps start over, so the next apply refills from the new
+   version. The merge checks the copy and overwrite rules again on the
+   column definitions it reads under its dataset lock, so a source
+   reclassified since a dry run never reaches live data under a new name.
+2. `publish` merges the definition proposal, last, with an idempotency key
+   derived from the record. A proposal already merged (by an earlier
+   attempt or by hand) completes the step. Every merged dataset must still
+   be at the version its merge wrote, checked in the publish transaction
+   itself (under the store's write lock on SQLite, each dataset's rows lock
+   on PostgreSQL): a dataset written since fails the step
+   (`definition_bundle_apply_data_moved`) and starts over, so the next apply
+   backfills the new rows before publishing. Every migrated object type's
+   datasource must still have the configuration the steps used, checked in
+   the same transaction (`definition_bundle_apply_datasource_changed`); on
+   PostgreSQL registration and the publish share a lock per object type, so
+   a registration (even of a type with no binding yet) waits for the publish.
+
+The steps follow the datasets backing the bundle at each call: a type
+rebound to another dataset, newly backed, or no longer backed since the last
+attempt gets steps for its dataset now (completed steps of datasets still
+backing are kept). The record also keeps, for every object type the bundle
+backfills, a digest of its datasource configuration (dataset, key column,
+property mapping, hidden column; empty when unbacked): when it changed
+between attempts, the dataset's bundle branch is dropped and its steps start
+over, and the publish requires every digest unchanged. A step's effect (the branch incarnation it
+filled, the dataset proposal it opened) is kept apart from its error text, so
+a retry after an ambiguous commit replays that effect instead of making a
+second one.
+
+A step is recorded done only after its effect, and each effect is idempotent
+(the branch is written once, the merge step records its dataset proposal
+before merging and a merged proposal replays, the publish replays by key),
+so calling apply again after a crash continues from the first step not done
+and applies none twice. A failed step leaves the published revision
+unchanged and the record `failed` with `failed_step` and `error`; calling
+apply again retries from that step. A completed record is returned as is,
+to a caller who may read both revisions.
+Every record write is a compare-and-swap on its revision; a concurrent
+applier fails with `ABORTED` (retry). `GetDefinitionBundleApply` returns the
+record to a caller who may read both revisions.
 

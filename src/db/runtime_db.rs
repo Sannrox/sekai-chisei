@@ -5654,6 +5654,16 @@ impl RuntimeDb {
         }
     }
 
+    /// The dataset's newest version id; empty when it has none.
+    pub fn latest_dataset_version_id(&self, dataset_id: &str) -> Result<String, String> {
+        Ok(self
+            .list_dataset_versions(dataset_id)?
+            .into_iter()
+            .max_by_key(|version| version.seq)
+            .map(|version| version.version_id)
+            .unwrap_or_default())
+    }
+
     pub fn list_dataset_versions(&self, dataset_id: &str) -> Result<Vec<DatasetVersion>, String> {
         match self {
             Self::Sqlite(db) => db.list_dataset_versions(dataset_id),
@@ -5849,6 +5859,19 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.merge_dataset_branch(request),
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.merge_dataset_branch(request))
+            }
+        }
+    }
+
+    pub fn merge_dataset_branch_checked(
+        &self,
+        request: &crate::sekai::dataset_branch::MergeDatasetBranch,
+        check: &dyn Fn(&[crate::sekai::dataset::ColumnDef]) -> Result<(), String>,
+    ) -> Result<crate::sekai::dataset_branch::DatasetBranchProposal, String> {
+        match self {
+            Self::Sqlite(db) => db.merge_dataset_branch_checked(request, check),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.merge_dataset_branch_checked(request, check))
             }
         }
     }
@@ -6370,6 +6393,19 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.update_contention_scope(scope),
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.update_contention_scope(scope))
+            }
+        }
+    }
+
+    pub fn add_dataset_columns(
+        &self,
+        dataset_id: &str,
+        columns: &[crate::sekai::dataset::ColumnDef],
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.add_dataset_columns(dataset_id, columns),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.add_dataset_columns(dataset_id, columns))
             }
         }
     }

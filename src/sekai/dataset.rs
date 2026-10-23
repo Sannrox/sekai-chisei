@@ -192,6 +192,58 @@ impl SekaiDb {
         Ok(())
     }
 
+    /// Append the column definitions the dataset lacks, against the
+    /// definitions read in this transaction: a concurrent change to an
+    /// existing column is never overwritten (#1693).
+    pub fn add_dataset_columns(
+        &self,
+        dataset_id: &str,
+        columns: &[ColumnDef],
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let json: String = tx
+            .query_row(
+                "SELECT columns FROM sekai_datasets WHERE id=?1",
+                params![dataset_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("dataset {dataset_id:?} not found"))?;
+        let mut current = parse_columns(&json)?;
+        let before = current.len();
+        for column in columns {
+            if !current.iter().any(|defined| defined.name == column.name) {
+                current.push(column.clone());
+            }
+        }
+        if current.len() == before {
+            return Ok(());
+        }
+        let encoded = serde_json::to_string(
+            &current
+                .iter()
+                .map(|c| {
+                    (
+                        &c.name,
+                        &c.col_type,
+                        crate::sekai::schema::normalize_property_classification(&c.classification),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE sekai_datasets SET columns=?2 WHERE id=?1",
+            params![dataset_id, encoded],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     pub fn update_dataset(&self, d: &Dataset) -> Result<(), String> {
         for column in &d.columns {
             if !crate::sekai::schema::is_valid_property_classification(&column.classification) {

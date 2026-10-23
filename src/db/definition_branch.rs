@@ -398,6 +398,15 @@ impl SekaiDb {
                     updated_at_ms INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS sekai_definition_bundle_applies (
+                    namespace TEXT NOT NULL,
+                    proposal_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY(namespace, proposal_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS sekai_definition_proposals (
                     namespace TEXT NOT NULL,
                     proposal_id TEXT NOT NULL,
@@ -1046,7 +1055,7 @@ impl SekaiDb {
             receipt_id: String::new(),
             close_reason_code: String::new(),
             restored_from_digest: String::new(),
-            migration_plan_digest: String::new(),
+            migration_plan_digest: request.migration_plan_digest.clone(),
             major_revision: request.major_revision,
             source_package_digest: String::new(),
         };
@@ -1207,6 +1216,70 @@ impl SekaiDb {
             return Err(
                 "stale_published_definition_head: published head does not match pinned base".into(),
             );
+        }
+        // The immediate transaction holds the write lock: no dataset write
+        // lands between this check and the publish.
+        for (dataset, version) in &request.expected_dataset_versions {
+            let latest: Option<String> = transaction
+                .query_row(
+                    "SELECT version_id FROM sekai_dataset_versions
+                     WHERE dataset_id = ?1 ORDER BY seq DESC LIMIT 1",
+                    params![dataset],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if latest.unwrap_or_default() != *version {
+                return Err(format!(
+                    "{}: dataset {dataset} was written since its migration",
+                    crate::sekai::definition_proposal::MERGE_DATASET_MOVED
+                ));
+            }
+        }
+        for (kind, fingerprint) in &request.expected_datasources {
+            let current = transaction
+                .query_row(
+                    "SELECT dataset_id, key_column, property_mapping, hidden_column, edits_only
+                     FROM sekai_object_type_datasource WHERE namespace = ?1 AND kind = ?2",
+                    params![request.namespace, kind],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let actual = match current {
+                Some((dataset_id, key_column, mapping, hidden_column, edits_only)) => {
+                    crate::sekai::object_type_index::datasource_fingerprint(
+                        &crate::sekai::object_type_index::ObjectTypeDatasource {
+                            contract_version: crate::sekai::object_type_index::CONTRACT_VERSION
+                                .into(),
+                            namespace: request.namespace.clone(),
+                            kind: kind.clone(),
+                            definition_digest: String::new(),
+                            dataset_id,
+                            key_column,
+                            property_mapping: serde_json::from_str(&mapping)
+                                .map_err(|error| error.to_string())?,
+                            hidden_column,
+                            edits_only: edits_only != 0,
+                        },
+                    )
+                }
+                None => String::new(),
+            };
+            if actual != *fingerprint {
+                return Err(format!(
+                    "{}: object type {kind} was reconfigured since its migration",
+                    crate::sekai::definition_proposal::MERGE_DATASOURCE_CHANGED
+                ));
+            }
         }
         let candidate = load_revision_sqlite(
             &transaction,
@@ -2203,6 +2276,164 @@ fn persist_result_sqlite<T: serde::Serialize>(
     Ok(())
 }
 
+impl crate::sekai::definition_bundle_apply::BundleApplyStore for SekaiDb {
+    fn get_definition_bundle_apply(
+        &self,
+        namespace: &str,
+        proposal_id: &str,
+    ) -> Result<Option<(crate::sekai::definition_bundle_apply::BundleApply, i64)>, String> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT record_json, revision FROM sekai_definition_bundle_applies
+                 WHERE namespace = ?1 AND proposal_id = ?2",
+                params![namespace, proposal_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        row.map(|(json, revision)| {
+            serde_json::from_str(&json)
+                .map(|apply| (apply, revision))
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+    }
+
+    fn put_definition_bundle_apply(
+        &self,
+        apply: &crate::sekai::definition_bundle_apply::BundleApply,
+        expected_revision: i64,
+    ) -> Result<i64, String> {
+        let json = serde_json::to_string(apply).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        let changed = if expected_revision == 0 {
+            conn.execute(
+                "INSERT INTO sekai_definition_bundle_applies
+                 (namespace, proposal_id, record_json, revision, updated_at_ms)
+                 VALUES (?1, ?2, ?3, 1, ?4)
+                 ON CONFLICT(namespace, proposal_id) DO NOTHING",
+                params![
+                    apply.namespace,
+                    apply.proposal_id,
+                    json,
+                    apply.updated_at_ms
+                ],
+            )
+        } else {
+            conn.execute(
+                "UPDATE sekai_definition_bundle_applies
+                 SET record_json = ?3, revision = revision + 1, updated_at_ms = ?4
+                 WHERE namespace = ?1 AND proposal_id = ?2 AND revision = ?5",
+                params![
+                    apply.namespace,
+                    apply.proposal_id,
+                    json,
+                    apply.updated_at_ms,
+                    expected_revision
+                ],
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err(crate::sekai::definition_bundle_apply::APPLY_REVISION_CONFLICT.into());
+        }
+        Ok(expected_revision + 1)
+    }
+}
+
+impl crate::sekai::definition_bundle_apply::BundleApplyStore for PostgresDb {
+    fn get_definition_bundle_apply(
+        &self,
+        namespace: &str,
+        proposal_id: &str,
+    ) -> Result<Option<(crate::sekai::definition_bundle_apply::BundleApply, i64)>, String> {
+        let row = self
+            .connection()?
+            .query_opt(
+                "SELECT record_json, revision FROM sekai_definition_bundle_applies
+                 WHERE namespace = $1 AND proposal_id = $2",
+                &[&namespace, &proposal_id],
+            )
+            .map_err(|error| error.to_string())?;
+        row.map(|row| {
+            serde_json::from_str(&row.get::<_, String>(0))
+                .map(|apply| (apply, row.get::<_, i64>(1)))
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+    }
+
+    fn put_definition_bundle_apply(
+        &self,
+        apply: &crate::sekai::definition_bundle_apply::BundleApply,
+        expected_revision: i64,
+    ) -> Result<i64, String> {
+        let json = serde_json::to_string(apply).map_err(|error| error.to_string())?;
+        let mut connection = self.connection()?;
+        let changed = if expected_revision == 0 {
+            connection.execute(
+                "INSERT INTO sekai_definition_bundle_applies
+                 (namespace, proposal_id, record_json, revision, updated_at_ms)
+                 VALUES ($1, $2, $3, 1, $4)
+                 ON CONFLICT (namespace, proposal_id) DO NOTHING",
+                &[
+                    &apply.namespace,
+                    &apply.proposal_id,
+                    &json,
+                    &apply.updated_at_ms,
+                ],
+            )
+        } else {
+            connection.execute(
+                "UPDATE sekai_definition_bundle_applies
+                 SET record_json = $3, revision = revision + 1, updated_at_ms = $4
+                 WHERE namespace = $1 AND proposal_id = $2 AND revision = $5",
+                &[
+                    &apply.namespace,
+                    &apply.proposal_id,
+                    &json,
+                    &apply.updated_at_ms,
+                    &expected_revision,
+                ],
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err(crate::sekai::definition_bundle_apply::APPLY_REVISION_CONFLICT.into());
+        }
+        Ok(expected_revision + 1)
+    }
+}
+
+impl crate::sekai::definition_bundle_apply::BundleApplyStore for crate::db::runtime_db::RuntimeDb {
+    fn get_definition_bundle_apply(
+        &self,
+        namespace: &str,
+        proposal_id: &str,
+    ) -> Result<Option<(crate::sekai::definition_bundle_apply::BundleApply, i64)>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_definition_bundle_apply(namespace, proposal_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_definition_bundle_apply(namespace, proposal_id)
+            }),
+        }
+    }
+
+    fn put_definition_bundle_apply(
+        &self,
+        apply: &crate::sekai::definition_bundle_apply::BundleApply,
+        expected_revision: i64,
+    ) -> Result<i64, String> {
+        match self {
+            Self::Sqlite(db) => db.put_definition_bundle_apply(apply, expected_revision),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_definition_bundle_apply(apply, expected_revision)
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2472,6 +2703,7 @@ mod tests {
                 named_foreign_digests: Vec::new(),
                 idempotency_key: "propose-foreign".into(),
                 major_revision: false,
+                migration_plan_digest: String::new(),
             },
             "author",
             4,
@@ -2494,6 +2726,8 @@ mod tests {
                     proposal_id: "cs-foreign".into(),
                     expected_published_digest: parent.revision_digest.clone(),
                     idempotency_key: "merge-foreign".into(),
+                    expected_dataset_versions: Vec::new(),
+                    expected_datasources: Vec::new(),
                 },
                 "author",
                 6,
@@ -2544,6 +2778,7 @@ mod tests {
                 named_foreign_digests: Vec::new(),
                 idempotency_key: "propose-1".into(),
                 major_revision: false,
+                migration_plan_digest: String::new(),
             },
             "author",
             4,
@@ -2576,6 +2811,8 @@ mod tests {
                     proposal_id: "cs-1".into(),
                     expected_published_digest: parent.revision_digest.clone(),
                     idempotency_key: "merge-interrupted".into(),
+                    expected_dataset_versions: Vec::new(),
+                    expected_datasources: Vec::new(),
                 },
                 "author",
                 6,

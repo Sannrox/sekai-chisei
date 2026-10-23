@@ -28,6 +28,45 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
+    /// Append the column definitions the dataset lacks, against the
+    /// definitions read under the dataset rows lock: a concurrent change to
+    /// an existing column is never overwritten (#1693).
+    pub fn add_dataset_columns(
+        &self,
+        dataset_id: &str,
+        columns: &[ColumnDef],
+    ) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_dataset_rows(&mut tx, dataset_id)?;
+        let json: String = tx
+            .query_opt(
+                "SELECT columns FROM sekai_datasets WHERE id=$1",
+                &[&dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0))
+            .ok_or_else(|| format!("dataset {dataset_id:?} not found"))?;
+        let mut current = crate::sekai::dataset::parse_columns(&json)?;
+        let before = current.len();
+        for column in columns {
+            if !current.iter().any(|defined| defined.name == column.name) {
+                current.push(column.clone());
+            }
+        }
+        if current.len() == before {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE sekai_datasets SET columns=$2 WHERE id=$1",
+            &[&dataset_id, &encode_columns(&current)?],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     pub fn update_dataset(&self, dataset: &Dataset) -> Result<(), String> {
         validate_columns(&dataset.columns)?;
         let columns = encode_columns(&dataset.columns)?;

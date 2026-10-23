@@ -63,8 +63,10 @@ The server does not automatically merge it.
 `CreateDefinitionProposal` pins the current published head as `base_digest`
 and the branch head as `candidate_digest`. Optional `eval_plan_digests` are
 frozen Chisei dependencies; `named_foreign_digests` may be recorded but never
-enter the published member map. Creating a proposal does not move the
-published head.
+enter the published member map. Optional `migration_plan_digest` names the
+[change bundle](definition-change-bundles.md#apply) the proposal migrates by;
+it is part of the approved proposal digest, so `ApplyDefinitionChangeBundle`
+runs only that bundle. Creating a proposal does not move the published head.
 
 `ApproveDefinitionProposal` records a live approval on an open proposal.
 An agent principal that created the proposal cannot approve or merge it,

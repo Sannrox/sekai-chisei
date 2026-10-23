@@ -170,6 +170,8 @@ const OBJECT_CHANGE_WRITER_SCHEMA: &str = include_str!("postgres/0098_object_cha
 const DATASET_RUN_ARTIFACTS_SCHEMA: &str =
     include_str!("postgres/0099_chisei_dataset_run_artifacts.sql");
 const ACTION_PLANS_SCHEMA: &str = include_str!("postgres/0100_sekai_action_plans.sql");
+const DEFINITION_BUNDLE_APPLIES_SCHEMA: &str =
+    include_str!("postgres/0101_definition_bundle_applies.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -797,6 +799,12 @@ const MIGRATIONS: &[Migration] = &[
         ACTION_PLANS_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        100,
+        "definition_bundle_applies",
+        DEFINITION_BUNDLE_APPLIES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -839,6 +847,23 @@ pub(crate) fn advisory_lock_key(parts: &[&str]) -> String {
 
 /// Serializes dataset-row writers with incremental transform reads so a
 /// checkpoint cannot skip an identity allocated by an uncommitted append.
+/// Serializes an object type's datasource registration with the definition
+/// publish that requires it unchanged (#1693). It locks the binding by name,
+/// so it also covers a binding that does not exist yet.
+pub(crate) fn lock_object_type_datasource(
+    tx: &mut postgres::Transaction<'_>,
+    namespace: &str,
+    kind: &str,
+) -> Result<(), String> {
+    let lock_key = advisory_lock_key(&["object_type_datasource", namespace, kind]);
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 467))",
+        &[&lock_key],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) fn lock_dataset_rows(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,

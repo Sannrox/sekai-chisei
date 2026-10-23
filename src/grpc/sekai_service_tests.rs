@@ -1340,6 +1340,7 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
             major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1509,6 +1510,7 @@ async fn definition_proposal_close_rechecks_member_admin() {
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
             major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1589,6 +1591,7 @@ async fn definition_proposal_merge_accepts_one_live_approval() {
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
             major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1676,6 +1679,7 @@ async fn definition_proposal_rpc_publishes_or_rejects_without_partial_head_move(
             named_foreign_digests: vec![format!("sha256:{}", "f".repeat(64))],
             idempotency_key: "propose-1".into(),
             major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1834,6 +1838,7 @@ async fn publish_definition_history_entry(
             named_foreign_digests: Vec::new(),
             idempotency_key: format!("{branch_id}-propose"),
             major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -2652,6 +2657,7 @@ async fn list_published_definition_revisions_chains_filters_and_paginates() {
             named_foreign_digests: Vec::new(),
             idempotency_key: "hist-drop-class-propose".into(),
             major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -16228,6 +16234,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         named_foreign_digests: vec![],
         idempotency_key: "publish-proposal".into(),
         major_revision: false,
+        migration_plan_digest: String::new(),
     };
     read_only.nonce = uuid::Uuid::new_v4().to_string();
     let mut foreign_proposal = propose.clone();
@@ -25122,6 +25129,7 @@ async fn try_publish(
             named_foreign_digests: Vec::new(),
             idempotency_key: format!("{proposal_id}-propose"),
             major_revision,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -25797,6 +25805,7 @@ async fn publishing_an_object_type_registers_and_retires_its_catalog_entry() {
                         named_foreign_digests: Vec::new(),
                         idempotency_key: "cat-2-propose".into(),
                         major_revision: true,
+                        migration_plan_digest: String::new(),
                     },
                     "root",
                 ))
@@ -27339,6 +27348,827 @@ async fn sync_needs_the_device_proof_and_a_revoked_device_gets_only_wipe() {
     assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 }
 
+/// Opens (and approves, when asked) a proposal renaming `Ticket.title` to
+/// `subject` and requiring `priority` on top of `parent`, carrying its
+/// change bundle under `hints`, without merging it. Returns the candidate.
+async fn open_approved_ticket_proposal(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    parent: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    approve: bool,
+    hints: &DefinitionChangeHints,
+) -> String {
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            parent_revision_digest: parent.into(),
+            idempotency_key: format!("{branch_id}-create"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: branch_id.into(),
+                expected_head_digest: parent.into(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket","properties":["subject","state","priority"],"required":["priority"]}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: format!("{branch_id}-edit"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    // The proposal carries its change bundle, so approval binds it.
+    let bundle_digest = svc
+        .generate_definition_change_bundle(with_named_principal(
+            GenerateDefinitionChangeBundleRequest {
+                namespace: namespace.into(),
+                from_revision_digest: parent.into(),
+                to_revision_digest: candidate.clone(),
+                hints: Some(hints.clone()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bundle_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            proposal_id: proposal_id.into(),
+            base_digest: parent.into(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("{proposal_id}-propose"),
+            major_revision: false,
+            migration_plan_digest: bundle_digest,
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    if approve {
+        svc.approve_definition_proposal(with_named_principal(
+            ApproveDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: proposal_id.into(),
+                idempotency_key: format!("{proposal_id}-approve"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    candidate
+}
+
+/// A published `Ticket` (title, state) backed by a `tickets` dataset with two
+/// rows, and an open proposal renaming title to subject and requiring
+/// priority (default "normal"). Returns the apply request.
+async fn bundle_apply_fixture(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    dataset_columns: &[&str],
+    approve: bool,
+) -> ApplyDefinitionChangeBundleRequest {
+    let parent = seed_definition_parent(svc, namespace);
+    let from = try_publish(
+        svc,
+        namespace,
+        &parent.revision_digest,
+        "ap-1",
+        "ap-cs-1",
+        r#"["title","state"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    let hints = DefinitionChangeHints {
+        renames: vec![DefinitionPropertyRename {
+            object_type: "Ticket".into(),
+            from_property: "title".into(),
+            to_property: "subject".into(),
+        }],
+        defaults: vec![DefinitionPropertyDefault {
+            object_type: "Ticket".into(),
+            property: "priority".into(),
+            value: "normal".into(),
+        }],
+        type_changes: Vec::new(),
+    };
+    let to =
+        open_approved_ticket_proposal(svc, namespace, &from, "ap-2", "ap-cs-2", approve, &hints)
+            .await;
+    svc.create_dataset(with_named_principal(
+        CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "tickets".into(),
+                name: "tickets".into(),
+                columns: dataset_columns
+                    .iter()
+                    .map(|name| ColumnDef {
+                        name: (*name).into(),
+                        r#type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .collect(),
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let rows = ["Broken", "Slow"]
+        .iter()
+        .enumerate()
+        .map(|(index, title)| {
+            HashMap::from([
+                ("id".to_string(), index.to_string()),
+                ("title".to_string(), title.to_string()),
+                ("state".to_string(), "open".to_string()),
+            ])
+        })
+        .collect::<Vec<_>>();
+    svc.db.runtime().append_rows("tickets", &rows).unwrap();
+    svc.db
+        .runtime()
+        .register_object_type_datasource(
+            &crate::sekai::object_type_index::ObjectTypeDatasource {
+                contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: namespace.into(),
+                kind: "Ticket".into(),
+                definition_digest: "sha256:ticket".into(),
+                dataset_id: "tickets".into(),
+                key_column: "id".into(),
+                property_mapping: BTreeMap::new(),
+                hidden_column: String::new(),
+                edits_only: false,
+            },
+            1,
+        )
+        .unwrap();
+    let bundle_digest = svc
+        .generate_definition_change_bundle(with_named_principal(
+            GenerateDefinitionChangeBundleRequest {
+                namespace: namespace.into(),
+                from_revision_digest: from.clone(),
+                to_revision_digest: to,
+                hints: Some(hints.clone()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bundle_digest;
+    ApplyDefinitionChangeBundleRequest {
+        namespace: namespace.into(),
+        proposal_id: "ap-cs-2".into(),
+        hints: Some(hints),
+        bundle_digest,
+        expected_published_digest: from,
+    }
+}
+
+async fn published_digest(svc: &SekaiServiceImpl, namespace: &str) -> String {
+    svc.db
+        .runtime()
+        .get_published_definition_revision(namespace)
+        .unwrap()
+        .unwrap()
+        .revision_digest
+}
+
+fn ticket_rows(svc: &SekaiServiceImpl) -> Vec<HashMap<String, String>> {
+    let mut rows = svc
+        .db
+        .runtime()
+        .query_rows("tickets", &Default::default())
+        .unwrap();
+    rows.sort_by(|a, b| a["id"].cmp(&b["id"]));
+    rows
+}
+
+#[tokio::test]
+async fn approved_bundle_applies_the_backfill_then_publishes_last() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let apply = svc
+        .apply_definition_change_bundle(with_named_principal(request.clone(), "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(apply.status, "completed", "{apply:?}");
+    assert_eq!(
+        apply
+            .steps
+            .iter()
+            .map(|step| step.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "backfill:tickets",
+            "verify:tickets",
+            "merge:tickets",
+            "publish"
+        ]
+    );
+    let published = published_digest(&svc, "apply").await;
+    assert_ne!(published, from);
+    assert_eq!(apply.steps[3].detail, published);
+    let rows = ticket_rows(&svc);
+    assert_eq!(rows[0]["subject"], "Broken");
+    assert_eq!(rows[1]["priority"], "normal");
+    // A rerun returns the completed record and writes nothing more.
+    let versions = svc
+        .db
+        .runtime()
+        .list_dataset_versions("tickets")
+        .unwrap()
+        .len();
+    let again = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(again, apply);
+    assert_eq!(
+        svc.db
+            .runtime()
+            .list_dataset_versions("tickets")
+            .unwrap()
+            .len(),
+        versions
+    );
+}
+
+#[tokio::test]
+async fn a_failing_backfill_leaves_the_published_revision_unchanged() {
+    let svc = service();
+    // `subject` already holds data, so the copy would overwrite it.
+    let request = bundle_apply_fixture(
+        &svc,
+        "apply-fail",
+        &["id", "title", "state", "subject"],
+        true,
+    )
+    .await;
+    let from = request.expected_published_digest.clone();
+    let apply = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(apply.status, "failed");
+    assert_eq!(apply.failed_step, "backfill:tickets");
+    assert!(
+        apply
+            .error
+            .contains("definition_change_bundle_overwrites_column"),
+        "{}",
+        apply.error
+    );
+    assert_eq!(published_digest(&svc, "apply-fail").await, from);
+    let stored = svc
+        .get_definition_bundle_apply(with_named_principal(
+            GetDefinitionBundleApplyRequest {
+                namespace: "apply-fail".into(),
+                proposal_id: "ap-cs-2".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(stored, apply);
+}
+
+#[tokio::test]
+async fn an_interrupted_apply_resumes_with_each_step_applied_once() {
+    use crate::sekai::definition_bundle_apply::BundleApplyStore;
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-resume", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let versions_before = svc
+        .db
+        .runtime()
+        .list_dataset_versions("tickets")
+        .unwrap()
+        .len();
+    // The publish's compare-and-swap fails: everything before it is done.
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    let failed = svc
+        .apply_definition_change_bundle(with_named_principal(stale, "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(failed.failed_step, "publish");
+    assert_eq!(published_digest(&svc, "apply-resume").await, from);
+    // Crash after the dataset merge but before the record noted it done.
+    let (mut record, revision) = svc
+        .db
+        .runtime()
+        .get_definition_bundle_apply("apply-resume", "ap-cs-2")
+        .unwrap()
+        .unwrap();
+    record.steps[2].status = "pending".into();
+    svc.db
+        .runtime()
+        .put_definition_bundle_apply(&record, revision)
+        .unwrap();
+    let resumed = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(resumed.status, "completed", "{resumed:?}");
+    assert_ne!(published_digest(&svc, "apply-resume").await, from);
+    // One merge: exactly one new dataset version.
+    assert_eq!(
+        svc.db
+            .runtime()
+            .list_dataset_versions("tickets")
+            .unwrap()
+            .len(),
+        versions_before + 1
+    );
+}
+
+#[tokio::test]
+async fn an_unapproved_bundle_cannot_be_applied() {
+    use crate::sekai::definition_bundle_apply::BundleApplyStore;
+    let svc = service();
+    let request =
+        bundle_apply_fixture(&svc, "apply-unapproved", &["id", "title", "state"], false).await;
+    let from = request.expected_published_digest.clone();
+    let status = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert_eq!(published_digest(&svc, "apply-unapproved").await, from);
+    assert!(
+        svc.db
+            .runtime()
+            .get_definition_bundle_apply("apply-unapproved", "ap-cs-2")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Dry-runs the bundle an apply request names, as a reviewer would first.
+async fn dry_run_apply_bundle(
+    svc: &SekaiServiceImpl,
+    request: &ApplyDefinitionChangeBundleRequest,
+) {
+    let candidate = svc
+        .db
+        .runtime()
+        .get_definition_proposal(&request.namespace, &request.proposal_id)
+        .unwrap()
+        .unwrap()
+        .candidate_digest;
+    svc.dry_run_definition_change_bundle(with_named_principal(
+        DryRunDefinitionChangeBundleRequest {
+            namespace: request.namespace.clone(),
+            from_revision_digest: request.expected_published_digest.clone(),
+            to_revision_digest: candidate,
+            hints: request.hints.clone(),
+            bundle_digest: request.bundle_digest.clone(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+}
+
+async fn apply_bundle(
+    svc: &SekaiServiceImpl,
+    request: &ApplyDefinitionChangeBundleRequest,
+) -> DefinitionBundleApply {
+    svc.apply_definition_change_bundle(with_named_principal(request.clone(), "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_apply_after_a_dry_run_refills_the_branch_from_the_current_version() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-stale", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    dry_run_apply_bundle(&svc, &request).await;
+    // A row lands after the dry run filled the branch.
+    svc.db
+        .runtime()
+        .append_rows(
+            "tickets",
+            &[HashMap::from([
+                ("id".to_string(), "2".to_string()),
+                ("title".to_string(), "Late".to_string()),
+                ("state".to_string(), "open".to_string()),
+            ])],
+        )
+        .unwrap();
+    // Apply refills the bundle branch itself, from the version it finds.
+    let done = apply_bundle(&svc, &request).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    assert_ne!(published_digest(&svc, "apply-stale").await, from);
+    let rows = ticket_rows(&svc);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2]["subject"], "Late");
+}
+
+#[tokio::test]
+async fn a_source_reclassified_after_the_dry_run_never_merges_its_copy() {
+    let svc = service();
+    let request =
+        bundle_apply_fixture(&svc, "apply-reclassified", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    dry_run_apply_bundle(&svc, &request).await;
+    let mut dataset = svc.db.runtime().get_dataset("tickets").unwrap().unwrap();
+    for column in &mut dataset.columns {
+        if column.name == "title" {
+            column.classification = "sensitive".into();
+        }
+    }
+    svc.db.runtime().update_dataset(&dataset).unwrap();
+    let apply = apply_bundle(&svc, &request).await;
+    assert_eq!(apply.failed_step, "backfill:tickets", "{apply:?}");
+    assert!(
+        apply
+            .error
+            .contains("definition_change_bundle_classified_copy"),
+        "{}",
+        apply.error
+    );
+    assert_eq!(published_digest(&svc, "apply-reclassified").await, from);
+    assert!(
+        ticket_rows(&svc)
+            .iter()
+            .all(|row| !row.contains_key("subject"))
+    );
+}
+
+#[tokio::test]
+async fn an_apply_finishes_when_its_proposal_was_merged_meanwhile() {
+    let svc = service();
+    let request =
+        bundle_apply_fixture(&svc, "apply-takeover", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // Someone merges the proposal before the apply runs again.
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "apply-takeover".into(),
+            proposal_id: "ap-cs-2".into(),
+            expected_published_digest: from.clone(),
+            idempotency_key: "manual-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let done = apply_bundle(&svc, &stale).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    assert_eq!(
+        done.steps[3].detail,
+        published_digest(&svc, "apply-takeover").await
+    );
+}
+
+#[tokio::test]
+async fn apply_refuses_hints_other_than_the_proposal_carries() {
+    let svc = service();
+    let mut request =
+        bundle_apply_fixture(&svc, "apply-hints", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let candidate = svc
+        .db
+        .runtime()
+        .get_definition_proposal("apply-hints", "ap-cs-2")
+        .unwrap()
+        .unwrap()
+        .candidate_digest;
+    // Another default than the approved one, with its own matching digest.
+    let mut hints = request.hints.clone().unwrap();
+    hints.defaults[0].value = "high".into();
+    request.bundle_digest = svc
+        .generate_definition_change_bundle(with_named_principal(
+            GenerateDefinitionChangeBundleRequest {
+                namespace: "apply-hints".into(),
+                from_revision_digest: from.clone(),
+                to_revision_digest: candidate,
+                hints: Some(hints.clone()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bundle_digest;
+    request.hints = Some(hints);
+    let status = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains("definition_bundle_apply_unapproved_bundle")
+    );
+    assert_eq!(published_digest(&svc, "apply-hints").await, from);
+}
+
+#[tokio::test]
+async fn an_ordinary_merge_refuses_a_bundle_branch_proposal() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-direct", &["id", "title", "state"], true).await;
+    dry_run_apply_bundle(&svc, &request).await;
+    let branch = svc
+        .db
+        .runtime()
+        .list_dataset_branches("tickets")
+        .unwrap()
+        .into_iter()
+        .find(|branch| {
+            branch
+                .name
+                .starts_with(crate::sekai::dataset_branch::BUNDLE_BRANCH_PREFIX)
+        })
+        .unwrap();
+    let proposal = svc
+        .db
+        .runtime()
+        .propose_dataset_branch(&crate::sekai::dataset_branch::ProposeDatasetBranch {
+            expected_incarnation: None,
+            dataset_id: "tickets".into(),
+            branch: branch.name.clone(),
+            actor: "someone-else".into(),
+            tenant: branch.tenant.clone(),
+        })
+        .unwrap();
+    let status = svc
+        .merge_dataset_branch(with_named_principal(
+            MergeDatasetBranchRequest {
+                dataset_id: "tickets".into(),
+                proposal_id: proposal.id,
+                reason: String::new(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert!(
+        ticket_rows(&svc)
+            .iter()
+            .all(|row| !row.contains_key("subject"))
+    );
+}
+
+#[tokio::test]
+async fn rows_written_between_merge_and_publish_are_backfilled_before_publishing() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-moved", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // A row in the old shape lands after the merge.
+    svc.db
+        .runtime()
+        .append_rows(
+            "tickets",
+            &[HashMap::from([
+                ("id".to_string(), "2".to_string()),
+                ("title".to_string(), "Late".to_string()),
+                ("state".to_string(), "open".to_string()),
+            ])],
+        )
+        .unwrap();
+    let moved = apply_bundle(&svc, &request).await;
+    assert_eq!(moved.failed_step, "publish", "{moved:?}");
+    assert!(
+        moved.error.contains("definition_bundle_apply_data_moved"),
+        "{}",
+        moved.error
+    );
+    assert_eq!(published_digest(&svc, "apply-moved").await, from);
+    let done = apply_bundle(&svc, &request).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    let rows = ticket_rows(&svc);
+    assert_eq!(
+        (rows[2]["subject"].as_str(), rows[2]["priority"].as_str()),
+        ("Late", "normal")
+    );
+}
+
+#[tokio::test]
+async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-fence", &["id", "title", "state"], true).await;
+    let refused = svc
+        .db
+        .runtime()
+        .merge_definition_proposal(
+            &definition_proposal_domain::MergeDefinitionProposal {
+                namespace: "apply-fence".into(),
+                proposal_id: "ap-cs-2".into(),
+                expected_published_digest: request.expected_published_digest.clone(),
+                idempotency_key: "fenced-merge".into(),
+                expected_dataset_versions: vec![("tickets".into(), "not-the-latest".into())],
+                expected_datasources: Vec::new(),
+            },
+            "root",
+            1,
+        )
+        .unwrap_err();
+    assert!(
+        refused.starts_with(crate::sekai::definition_proposal::MERGE_DATASET_MOVED),
+        "{refused}"
+    );
+    let latest = svc
+        .db
+        .runtime()
+        .latest_dataset_version_id("tickets")
+        .unwrap();
+    let reconfigured = svc
+        .db
+        .runtime()
+        .merge_definition_proposal(
+            &definition_proposal_domain::MergeDefinitionProposal {
+                namespace: "apply-fence".into(),
+                proposal_id: "ap-cs-2".into(),
+                expected_published_digest: request.expected_published_digest.clone(),
+                idempotency_key: "fenced-merge-2".into(),
+                expected_dataset_versions: vec![("tickets".into(), latest)],
+                expected_datasources: vec![("Ticket".into(), "not-this-mapping".into())],
+            },
+            "root",
+            1,
+        )
+        .unwrap_err();
+    assert!(
+        reconfigured.starts_with(crate::sekai::definition_proposal::MERGE_DATASOURCE_CHANGED),
+        "{reconfigured}"
+    );
+    assert_eq!(
+        published_digest(&svc, "apply-fence").await,
+        request.expected_published_digest
+    );
+}
+
+#[tokio::test]
+async fn a_datasource_remapped_between_attempts_is_migrated_again() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-remap", &["id", "title", "state"], true).await;
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // The object type now reads `subject` from another column.
+    svc.db
+        .runtime()
+        .register_object_type_datasource(
+            &crate::sekai::object_type_index::ObjectTypeDatasource {
+                contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: "apply-remap".into(),
+                kind: "Ticket".into(),
+                definition_digest: "sha256:ticket".into(),
+                dataset_id: "tickets".into(),
+                key_column: "id".into(),
+                property_mapping: BTreeMap::from([("subject".into(), "subject_col".into())]),
+                hidden_column: String::new(),
+                edits_only: false,
+            },
+            2,
+        )
+        .unwrap();
+    let done = apply_bundle(&svc, &request).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    let rows = ticket_rows(&svc);
+    assert_eq!(rows[0]["subject_col"], "Broken");
+    // The mapped column is defined, so the datasource stays valid.
+    let columns = svc
+        .db
+        .runtime()
+        .get_dataset("tickets")
+        .unwrap()
+        .unwrap()
+        .columns;
+    let subject = columns
+        .iter()
+        .find(|column| column.name == "subject_col")
+        .unwrap();
+    assert_eq!(subject.classification, "public");
+}
+
+#[tokio::test]
+async fn an_unmergeable_recorded_proposal_starts_the_dataset_over() {
+    use crate::sekai::definition_bundle_apply::BundleApplyStore;
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-lost", &["id", "title", "state"], true).await;
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // The recorded dataset proposal is gone (as after its branch was deleted).
+    let (mut record, revision) = svc
+        .db
+        .runtime()
+        .get_definition_bundle_apply("apply-lost", "ap-cs-2")
+        .unwrap()
+        .unwrap();
+    record.steps[2].status = "pending".into();
+    record.steps[2].effect = "no-such-proposal".into();
+    svc.db
+        .runtime()
+        .put_definition_bundle_apply(&record, revision)
+        .unwrap();
+    let restarted = apply_bundle(&svc, &request).await;
+    assert_eq!(restarted.failed_step, "merge:tickets", "{restarted:?}");
+    let done = apply_bundle(&svc, &request).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    assert_eq!(ticket_rows(&svc)[0]["subject"], "Broken");
+}
+
+#[tokio::test]
+async fn a_refill_never_overwrites_a_bundle_column_reclassified_since() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-redact", &["id", "title", "state"], true).await;
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // The bundle's `subject` column is reclassified, and a row lands, so the
+    // next apply must refill the dataset.
+    let mut dataset = svc.db.runtime().get_dataset("tickets").unwrap().unwrap();
+    for column in &mut dataset.columns {
+        if column.name == "subject" {
+            column.classification = "sensitive".into();
+        }
+    }
+    svc.db.runtime().update_dataset(&dataset).unwrap();
+    svc.db
+        .runtime()
+        .append_rows(
+            "tickets",
+            &[HashMap::from([
+                ("id".to_string(), "2".to_string()),
+                ("title".to_string(), "Late".to_string()),
+                ("state".to_string(), "open".to_string()),
+            ])],
+        )
+        .unwrap();
+    assert_eq!(apply_bundle(&svc, &request).await.failed_step, "publish");
+    let refused = apply_bundle(&svc, &request).await;
+    assert_eq!(refused.failed_step, "backfill:tickets", "{refused:?}");
+    assert!(
+        refused
+            .error
+            .contains("definition_change_bundle_overwrites_column"),
+        "{}",
+        refused.error
+    );
+}
 #[tokio::test]
 async fn plans_are_stored_simulated_through_preview_and_read_back() {
     let svc = service();

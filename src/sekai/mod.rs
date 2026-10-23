@@ -37,6 +37,7 @@ pub mod decision_ledger;
 pub use sekai_types::receipt_chain;
 pub mod deduplication;
 pub mod definition_branch;
+pub mod definition_bundle_apply;
 pub mod definition_change_bundle;
 pub mod definition_consumer_impact;
 pub mod definition_diff;

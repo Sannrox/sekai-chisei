@@ -295,6 +295,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ApplyDefinitionChangeBundle",
+      "storage_path": "sekai.definition-branch, sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetDefinitionBundleApply",
+      "storage_path": "sekai.definition-branch, sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ClassifyDefinitionRevisionCompatibility",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
