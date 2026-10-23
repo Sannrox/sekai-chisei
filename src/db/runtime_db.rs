@@ -3134,6 +3134,37 @@ impl RuntimeDb {
         }
     }
 
+    /// Creates `object` with change rows stamped with `operation_id`, for
+    /// writes made by a governed operation (#1689).
+    pub fn create_object_for_operation(
+        &self,
+        object: &Object,
+        actor: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.create_object_for_operation(object, actor, operation_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.create_object_for_operation(object, actor, operation_id)
+            }),
+        }
+    }
+
+    /// Updates `object` with change rows stamped with `operation_id`.
+    pub fn update_object_for_operation(
+        &self,
+        object: &Object,
+        actor: &str,
+        operation_id: &str,
+    ) -> Result<Option<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.update_object_for_operation(object, actor, operation_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.update_object_for_operation(object, actor, operation_id)
+            }),
+        }
+    }
+
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
         self.create_object_with_authorized_policy(object, actor, None)
     }
@@ -5312,10 +5343,9 @@ impl RuntimeDb {
     ) -> Result<Vec<ObjectChange>, String> {
         match self {
             Self::Sqlite(db) => db.list_visible_object_changes(object_id, limit, offset),
-            Self::Postgres(_) => Err(
-                "list_visible_object_changes is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_visible_object_changes(object_id, limit, offset)
+            }),
         }
     }
 
@@ -5396,8 +5426,8 @@ impl RuntimeDb {
     pub fn object_change_kind(&self, object_id: &str) -> Result<Option<String>, String> {
         match self {
             Self::Sqlite(db) => db.object_change_kind(object_id),
-            Self::Postgres(_) => {
-                Err("object_change_kind is unavailable on the PostgreSQL community runtime".into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.object_change_kind(object_id))
             }
         }
     }
@@ -5405,9 +5435,9 @@ impl RuntimeDb {
     pub fn object_change_namespace(&self, object_id: &str) -> Result<Option<String>, String> {
         match self {
             Self::Sqlite(db) => db.object_change_namespace(object_id),
-            Self::Postgres(_) => Err(
-                "object_change_namespace is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.object_change_namespace(object_id))
+            }
         }
     }
 

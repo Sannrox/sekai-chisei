@@ -16,7 +16,7 @@ pub const RUNTIME_DB_SRC: &str = concat!(
     include_str!("db/runtime_db.rs"),
     include_str!("chisei_store/runtime.rs")
 );
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 20;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 19;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,14 +231,9 @@ pub fn listed_methods_are_fail_closed(
 /// RuntimeDb methods a public RPC handler reaches besides `pascal_to_snake(rpc)`.
 ///
 /// Same-name methods stay implied. This table is the evidence CI uses when a
-/// fail-closed helper is not named after the RPC (`ListObjectChanges` calls
-/// `list_visible_object_changes`, not `list_object_changes`).
+/// fail-closed helper is not named after the RPC (`SubmitEvidence` calls
+/// `record_execution_evidence`, not `submit_evidence`).
 pub const RPC_HANDLER_EVIDENCE_METHODS: &[(&str, &str, &[&str])] = &[
-    (
-        "SekaiService",
-        "ListObjectChanges",
-        &["list_visible_object_changes"],
-    ),
     (
         "SekaiService",
         "SubmitEvidence",
@@ -428,7 +423,7 @@ mod tests {
         real_backend_matches_list(&table, MATURITY_DOCS, &list).unwrap();
         assert_eq!(list.surfaces.len(), SQLITE_ONLY_SURFACE_LIMIT);
         assert!(list.contains_rpc("SekaiService", "PutPurposeAuthorization"));
-        assert!(list.contains_rpc("SekaiService", "ListObjectChanges"));
+        assert!(!list.contains_rpc("SekaiService", "ListObjectChanges"));
         assert!(list.contains_rpc("SekaiService", "SubmitEvidence"));
         assert!(!list.contains_rpc("SekaiService", "RegisterSourceTypeDescriptor"));
         assert!(!list.contains_rpc("SekaiService", "DecideActionInstance"));
@@ -465,10 +460,10 @@ mod tests {
         let table = RpcMaturityTable::load().expect("table");
         let mut list = SqliteOnlySurfaces::load().expect("list");
         list.surfaces
-            .retain(|surface| surface.id != "SekaiService.ListObjectChanges");
+            .retain(|surface| surface.id != "SekaiService.SubmitEvidence");
         let error = unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC)
             .expect_err("aliased sqlite-only RPC must fail");
-        assert!(error.contains("ListObjectChanges"), "{error}");
+        assert!(error.contains("SubmitEvidence"), "{error}");
     }
 
     #[test]

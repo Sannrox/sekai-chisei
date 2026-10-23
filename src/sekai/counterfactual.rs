@@ -472,6 +472,7 @@ mod tests {
                 new_value: new.into(),
                 changed_by: "writer".into(),
                 timestamp: at,
+                operation_id: String::new(),
             },
             seq,
             object_kind: "document".into(),

@@ -1214,11 +1214,6 @@ pub(super) async fn list_object_changes(
     let principals = caller_principals(&req);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     require_authenticated(&principals)?;
-    if service.db.runtime().backend_name() == "postgres" {
-        return Err(Status::unavailable(
-            "list_visible_object_changes is unavailable on the PostgreSQL community runtime",
-        ));
-    }
     let inner = req.into_inner();
     check_object_namespace_access(service.db.runtime(), &principals, &inner.object_id, false)?;
     check_read(&service.security, &inner.object_id, &principals)?;
@@ -1320,13 +1315,6 @@ pub(super) async fn list_object_changes(
             .map_err(|_| Status::unavailable("object authorization unavailable"))?,
         None => None,
     };
-    let operation_id = crate::sekai::operation_correlation::operation_ids_for_objects(
-        service.db.runtime(),
-        &[inner.object_id.clone()].into_iter().collect(),
-    )
-    .map_err(Status::internal)?
-    .remove(&inner.object_id)
-    .unwrap_or_default();
     let changes = match visible_collaboration_history_page(
         service.db.runtime(),
         tenant_context.as_ref(),
@@ -1343,6 +1331,8 @@ pub(super) async fn list_object_changes(
     }
     .into_iter()
     .map(|change| {
+        // Each change carries the operation stored with it (#1689).
+        let operation_id = change.operation_id.clone();
         let mut mapped = if let Some(kind) = object_kind.as_deref() {
             redact_object_change_values(
                 change,
@@ -1365,7 +1355,7 @@ pub(super) async fn list_object_changes(
                 operation_id: String::new(),
             }
         };
-        mapped.operation_id = operation_id.clone();
+        mapped.operation_id = operation_id;
         mapped
     })
     .collect();

@@ -537,7 +537,13 @@ impl<'a> ActionInstanceAdmission<'a> {
             ) {
                 Ok(None) => None,
                 Ok(Some(planned)) => {
-                    match action_object_mutation::apply(self.db, planned, actor, now) {
+                    match action_object_mutation::apply(
+                        self.db,
+                        planned,
+                        actor,
+                        &stored.operation_id,
+                        now,
+                    ) {
                         Ok(applied) => Some(applied),
                         Err(error) => {
                             let _ = self.db.delete_action_instance(&stored.instance_id);

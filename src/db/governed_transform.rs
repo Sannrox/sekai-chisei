@@ -1879,6 +1879,7 @@ fn apply_streaming_transform_batch_tx(
                 &edit.object,
                 actor,
                 policy_generation,
+                "",
             )
             .map_err(map_persist_error)?;
         } else {
@@ -1888,6 +1889,7 @@ fn apply_streaming_transform_batch_tx(
                 edit.expected.as_ref(),
                 actor,
                 policy_generation,
+                "",
             )
             .map_err(map_persist_error)?;
             if previous.is_none() {

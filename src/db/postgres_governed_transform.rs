@@ -1419,7 +1419,7 @@ fn apply_streaming_transform_batch_pg(
     let policy_generation = Some(batch.policy_generation.as_str());
     for edit in &batch.edits {
         if edit.create {
-            insert_created_object_in(tx, &edit.object, actor, policy_generation)
+            insert_created_object_in(tx, &edit.object, actor, policy_generation, "")
                 .map_err(map_persist_error)?;
         } else {
             let previous = update_object_in(
@@ -1428,6 +1428,7 @@ fn apply_streaming_transform_batch_pg(
                 edit.expected.as_ref(),
                 actor,
                 policy_generation,
+                "",
             )
             .map_err(map_persist_error)?;
             if previous.is_none() {

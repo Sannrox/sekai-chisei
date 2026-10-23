@@ -562,12 +562,25 @@ impl SekaiDb {
         }
         let previous = match write {
             Some(ParkedGrantWrite::Create(object)) => {
-                crate::sekai::audit::insert_created_object_in(&tx, object, actor, None)?;
+                crate::sekai::audit::insert_created_object_in(
+                    &tx,
+                    object,
+                    actor,
+                    None,
+                    &granted.operation_id,
+                )?;
                 None
             }
             Some(ParkedGrantWrite::Update(object)) => Some(
-                crate::sekai::audit::update_object_in(&tx, object, None, actor, None)?
-                    .ok_or_else(|| format!("object {} not found", object.id))?,
+                crate::sekai::audit::update_object_in(
+                    &tx,
+                    object,
+                    None,
+                    actor,
+                    None,
+                    &granted.operation_id,
+                )?
+                .ok_or_else(|| format!("object {} not found", object.id))?,
             ),
             None => None,
         };

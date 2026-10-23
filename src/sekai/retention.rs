@@ -3884,6 +3884,7 @@ mod tests {
             new_value: "new".into(),
             changed_by: "actor".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
         db.set_retention_policy(&RetentionPolicy {
@@ -3936,6 +3937,7 @@ mod tests {
             new_value: "new".into(),
             changed_by: "actor".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
         db.create_dataset(&Dataset {
@@ -4748,6 +4750,7 @@ mod tests {
             new_value: "released".into(),
             changed_by: "erase-agent".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
         db.record_object_change(&crate::sekai::audit::ObjectChange {
@@ -4758,6 +4761,7 @@ mod tests {
             new_value: "budget:keep-agent:daily".into(),
             changed_by: "privacy-admin".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
         db.record_object_change(&crate::sekai::audit::ObjectChange {
@@ -4768,6 +4772,7 @@ mod tests {
             new_value: "project/erase-agent".into(),
             changed_by: "privacy-admin".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
         db.record_object_change(&crate::sekai::audit::ObjectChange {
@@ -4778,6 +4783,7 @@ mod tests {
             new_value: "unrelated-object".into(),
             changed_by: "privacy-admin".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
         db.record_object_change(&crate::sekai::audit::ObjectChange {
@@ -4788,6 +4794,7 @@ mod tests {
             new_value: "public".into(),
             changed_by: "privacy-admin".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
 
@@ -5065,6 +5072,7 @@ mod tests {
             new_value: "unchanged".into(),
             changed_by: "agent10".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
         db.create_object(&crate::domain::Object {
@@ -5441,6 +5449,7 @@ mod tests {
             new_value: "public".into(),
             changed_by: "project:default/agent:bot".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
 

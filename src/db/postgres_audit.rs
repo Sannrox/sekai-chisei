@@ -1,6 +1,8 @@
 use crate::db::postgres::PostgresDb;
 use crate::domain::Object;
-use crate::sekai::audit::{ObjectChange, object_diff_changes, object_diff_changes_with_snapshot};
+use crate::sekai::audit::{
+    ObjectChange, object_diff_changes, object_diff_changes_with_snapshot, stamp_operation,
+};
 use crate::sekai::object_security::ObjectSecurityPolicy;
 use std::collections::BTreeSet;
 
@@ -68,6 +70,43 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
+    /// Creates `object` with change rows stamped with `operation_id`.
+    pub fn create_object_for_operation(
+        &self,
+        object: &Object,
+        actor: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        insert_created_object_in(&mut transaction, object, actor, None, operation_id)?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// Updates `object` with change rows stamped with `operation_id`, under
+    /// the same revision check as `update_object_with_audit_if_revision`.
+    pub fn update_object_for_operation(
+        &self,
+        object: &Object,
+        actor: &str,
+        operation_id: &str,
+    ) -> Result<Option<Object>, String> {
+        // Same revision check as every other PostgreSQL object update.
+        let Some(existing) = self.get_object(&object.id)? else {
+            return Ok(None);
+        };
+        self.update_object_if_revision_inner(
+            object,
+            actor,
+            existing.updated,
+            None,
+            None,
+            operation_id,
+        )
+    }
+
     pub fn update_object_with_audit_if_revision(
         &self,
         object: &Object,
@@ -75,6 +114,25 @@ impl PostgresDb {
         expected_updated: i64,
         expected_policy_generation: Option<&str>,
         expected: Option<&Object>,
+    ) -> Result<Option<Object>, String> {
+        self.update_object_if_revision_inner(
+            object,
+            actor,
+            expected_updated,
+            expected_policy_generation,
+            expected,
+            "",
+        )
+    }
+
+    fn update_object_if_revision_inner(
+        &self,
+        object: &Object,
+        actor: &str,
+        expected_updated: i64,
+        expected_policy_generation: Option<&str>,
+        expected: Option<&Object>,
+        operation_id: &str,
     ) -> Result<Option<Object>, String> {
         validate_namespace_identity(object)?;
         let properties = crate::domain::storage_properties_json(&object.properties)?;
@@ -145,11 +203,14 @@ impl PostgresDb {
         }
         insert_changes(
             &mut transaction,
-            &object_diff_changes(
-                actor,
-                Some(&before),
-                Some(object),
-                chrono::Utc::now().timestamp_millis(),
+            &stamp_operation(
+                object_diff_changes(
+                    actor,
+                    Some(&before),
+                    Some(object),
+                    chrono::Utc::now().timestamp_millis(),
+                ),
+                operation_id,
             ),
         )?;
         transaction.commit().map_err(|error| error.to_string())?;
@@ -348,6 +409,7 @@ impl PostgresDb {
                                 new_value: row.get(4),
                                 changed_by: row.get(5),
                                 timestamp: row.get(6),
+                                operation_id: String::new(),
                             },
                             row.get::<_, i64>(9).max(0) as u64,
                             row.get(7),
@@ -369,13 +431,76 @@ impl PostgresDb {
         let offset = i64::from(offset.max(0));
         self.connection()?
             .query(
-                "SELECT id, object_id, field, old_value, new_value, changed_by, timestamp
+                "SELECT id, object_id, field, old_value, new_value, changed_by, timestamp,
+                        operation_id
                  FROM sekai_object_changes WHERE object_id = $1
                  ORDER BY timestamp DESC, audit_seq DESC LIMIT $2 OFFSET $3",
                 &[&object_id, &limit, &offset],
             )
             .map(|rows| rows.into_iter().map(row_to_change).collect())
             .map_err(|error| error.to_string())
+    }
+
+    /// Caller-visible field history: the reserved namespace and security
+    /// snapshot fields are omitted, as on SQLite.
+    pub fn list_visible_object_changes(
+        &self,
+        object_id: &str,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<ObjectChange>, String> {
+        let limit = i64::from(if limit > 0 { limit } else { 100 });
+        let offset = i64::from(offset.max(0));
+        self.connection()?
+            .query(
+                "SELECT id, object_id, field, old_value, new_value, changed_by, timestamp,
+                        operation_id
+                 FROM sekai_object_changes
+                 WHERE object_id = $1 AND field <> '_namespace'
+                   AND field NOT IN ('_security_snapshot', '_security_kind')
+                   AND field NOT LIKE '_security_property.%'
+                 ORDER BY timestamp DESC, audit_seq DESC LIMIT $2 OFFSET $3",
+                &[&object_id, &limit, &offset],
+            )
+            .map(|rows| rows.into_iter().map(row_to_change).collect())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Kind of an object from its newest create or delete marker.
+    pub fn object_change_kind(&self, object_id: &str) -> Result<Option<String>, String> {
+        let marker = self
+            .connection()?
+            .query_opt(
+                "SELECT field, old_value, new_value FROM sekai_object_changes
+                 WHERE object_id = $1 AND field IN ('_created', '_deleted')
+                 ORDER BY timestamp DESC, audit_seq DESC LIMIT 1",
+                &[&object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(marker.and_then(|row| {
+            let field: String = row.get(0);
+            let value: String = if field == "_deleted" {
+                row.get(1)
+            } else {
+                row.get(2)
+            };
+            value.split_once('/').map(|(kind, _)| kind.to_string())
+        }))
+    }
+
+    /// Namespace an object last belonged to, from its newest namespace marker.
+    pub fn object_change_namespace(&self, object_id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT old_value FROM sekai_object_changes
+                 WHERE object_id = $1 AND field = '_namespace'
+                 ORDER BY timestamp DESC, audit_seq DESC LIMIT 1",
+                &[&object_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, String>(0))
+            .filter(|namespace| !namespace.is_empty()))
     }
 }
 
@@ -430,6 +555,7 @@ pub(crate) fn insert_created_object_in(
     object: &Object,
     actor: &str,
     expected_policy_generation: Option<&str>,
+    operation_id: &str,
 ) -> Result<(), String> {
     validate_namespace_identity(object)?;
     let properties = crate::domain::storage_properties_json(&object.properties)?;
@@ -464,11 +590,14 @@ pub(crate) fn insert_created_object_in(
         .map_err(|error| error.to_string())?;
     insert_changes(
         transaction,
-        &object_diff_changes(
-            actor,
-            None,
-            Some(object),
-            chrono::Utc::now().timestamp_millis(),
+        &stamp_operation(
+            object_diff_changes(
+                actor,
+                None,
+                Some(object),
+                chrono::Utc::now().timestamp_millis(),
+            ),
+            operation_id,
         ),
     )
 }
@@ -480,6 +609,7 @@ pub(crate) fn update_object_in(
     expected: Option<&Object>,
     actor: &str,
     expected_policy_generation: Option<&str>,
+    operation_id: &str,
 ) -> Result<Option<Object>, String> {
     validate_namespace_identity(object)?;
     let properties = crate::domain::storage_properties_json(&object.properties)?;
@@ -531,11 +661,14 @@ pub(crate) fn update_object_in(
         .map_err(|error| error.to_string())?;
     insert_changes(
         transaction,
-        &object_diff_changes(
-            actor,
-            Some(&before),
-            Some(object),
-            chrono::Utc::now().timestamp_millis(),
+        &stamp_operation(
+            object_diff_changes(
+                actor,
+                Some(&before),
+                Some(object),
+                chrono::Utc::now().timestamp_millis(),
+            ),
+            operation_id,
         ),
     )?;
     Ok(Some(before))
@@ -571,8 +704,9 @@ pub(crate) fn insert_changes(
         transaction
             .execute(
                 "INSERT INTO sekai_object_changes
-                    (id, object_id, field, old_value, new_value, changed_by, timestamp)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    (id, object_id, field, old_value, new_value, changed_by, timestamp,
+                     operation_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &change.id,
                     &change.object_id,
@@ -581,6 +715,7 @@ pub(crate) fn insert_changes(
                     &change.new_value,
                     &change.changed_by,
                     &change.timestamp,
+                    &change.operation_id,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -612,6 +747,7 @@ fn row_to_change(row: postgres::Row) -> ObjectChange {
         new_value: row.get(4),
         changed_by: row.get(5),
         timestamp: row.get(6),
+        operation_id: row.get(7),
     }
 }
 

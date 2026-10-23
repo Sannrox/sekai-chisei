@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `ListObjectChanges` works on PostgreSQL with the same semantics and paging
+  as SQLite. Each change row stores the operation that produced it, and the
+  RPC returns that stored id instead of correlating by object and time
+  (docs/operation-correlation.md, `0093_object_change_operation`, GATE:mig,
+  #1689).
+
 - Enterprise-scoped credentials may call `ProposeDefinitionRollback`,
   `ExportDefinitionPackage` and `ImportDefinitionPackage`, which authorize
   the tenant's namespace and members like the other definition proposal
