@@ -15,7 +15,8 @@ found.
 The caller needs the same access as `ListObjectChanges`: namespace,
 collaboration scope, object ACL, active read policy and marking. A property
 the active policy does not grant is refused. Values are redacted as
-`ListObjectChanges` redacts them.
+`ListObjectChanges` redacts them. Guest and shared-space callers, who see
+filtered history, are refused: a write hidden from them would read as a gap.
 
 ## Chain
 

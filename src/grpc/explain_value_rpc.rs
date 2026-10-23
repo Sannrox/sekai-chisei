@@ -86,25 +86,40 @@ pub(super) async fn explain_value(
         change.new_value = shown.new_value;
         change
     };
+    // Guests and shared spaces see filtered history, which cannot explain
+    // a value: a hidden write would read as a gap in the chain.
+    if visible_collaboration_history_page(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        Some(&object),
+        1,
+        0,
+    )?
+    .is_some()
+    {
+        return Err(Status::failed_precondition(
+            "explaining a value needs the object's full history",
+        ));
+    }
+    // Pages are newest first, so a write landing between pages repeats a
+    // row rather than skipping one; ids drop the repeat. The object was read
+    // first, so its value stands in for creation only when no later row
+    // shows an edit.
     let mut changes = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     let mut offset = 0;
     loop {
-        let page = match visible_collaboration_history_page(
-            service.db.runtime(),
-            tenant_context.as_ref(),
-            Some(&object),
-            HISTORY_PAGE,
-            offset,
-        )? {
-            Some(page) => page,
-            None => service
-                .db
-                .runtime()
-                .list_visible_object_changes(&object.id, HISTORY_PAGE, offset)
-                .map_err(map_runtime_store_error)?,
-        };
+        let page = service
+            .db
+            .runtime()
+            .list_visible_object_changes(&object.id, HISTORY_PAGE, offset)
+            .map_err(map_runtime_store_error)?;
         let full = page.len() as i32 == HISTORY_PAGE;
-        changes.extend(page.into_iter().map(&redact));
+        changes.extend(
+            page.into_iter()
+                .filter(|change| seen.insert(change.id.clone()))
+                .map(&redact),
+        );
         if !full {
             break;
         }
