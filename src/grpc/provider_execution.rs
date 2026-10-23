@@ -790,6 +790,7 @@ mod tests {
             issuer: "https://issuer.test".into(),
             resource: "sekai:control-plane".into(),
             expires_at: i64::MAX,
+            device: None,
         }
     }
 

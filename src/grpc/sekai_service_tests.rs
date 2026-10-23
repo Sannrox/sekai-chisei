@@ -46,6 +46,7 @@ impl crate::enterprise::EnterpriseExtension for TestEnterpriseExtension {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: 100,
+            device: None,
         })
     }
 
@@ -113,6 +114,7 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: 100,
+            device: None,
         });
     request
         .metadata_mut()
@@ -296,6 +298,7 @@ fn test_tenant_context() -> crate::enterprise::AuthenticatedContext {
         issuer: "https://issuer.test".into(),
         resource: "https://sekai.test".into(),
         expires_at: 100,
+        device: None,
     }
 }
 
@@ -749,6 +752,7 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
         scopes: vec!["sekai.read".into()],
         expires_at: chrono::Utc::now().timestamp() + 60,
         nonce: nonce.into(),
+        device: None,
     };
     let request = |token: &str, method: &'static str| {
         let mut req = Request::new(());
@@ -5463,6 +5467,7 @@ fn discoverer_context(subject: &str) -> crate::enterprise::AuthenticatedContext 
         issuer: "https://issuer.test".into(),
         resource: "https://sekai.test".into(),
         expires_at: i64::MAX,
+        device: None,
     }
 }
 
@@ -14625,6 +14630,7 @@ async fn scoped_published_definition_read_crosses_the_server_transport() {
             scopes: vec!["sekai.read".into()],
             expires_at: chrono::Utc::now().timestamp() + 30,
             nonce: nonce.into(),
+            device: None,
         };
         let bearer = authority.sign(&claims("transport-read")).unwrap();
         let mut request = Request::new(GetPublishedDefinitionRevisionRequest {
@@ -14821,6 +14827,7 @@ async fn agent_definition_member_read_crosses_server_transport() {
         scopes: vec!["sekai.read".into()],
         expires_at: chrono::Utc::now().timestamp() + 30,
         nonce: uuid::Uuid::new_v4().to_string(),
+        device: None,
     };
     let request = |assertion: &IdentityAssertion, namespace: &str, digest: &str, id: &str| {
         let mut request = Request::new(GetDefinitionMemberRequest {
@@ -15776,6 +15783,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         scopes: vec!["sekai.read".into(), "sekai.write".into()],
         expires_at: chrono::Utc::now().timestamp() + 30,
         nonce: uuid::Uuid::new_v4().to_string(),
+        device: None,
     };
     let claims = || assertion("subject-a");
     let reviewer = || assertion("reviewer");
@@ -16389,6 +16397,7 @@ async fn scoped_transform_preview_and_reads_cross_server_transport() {
             scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
             expires_at: chrono::Utc::now().timestamp() + 30,
             nonce: uuid::Uuid::new_v4().to_string(),
+            device: None,
         };
         let mut request = Request::new(body);
         request.metadata_mut().insert(
@@ -16650,6 +16659,7 @@ async fn scoped_put_governed_transform_requires_namespace_write_and_readable_dat
             scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
             expires_at: chrono::Utc::now().timestamp() + 30,
             nonce: uuid::Uuid::new_v4().to_string(),
+            device: None,
         };
         let mut request = Request::new(body);
         request.metadata_mut().insert(
@@ -16862,6 +16872,7 @@ async fn community_human_session_put_still_requires_credential_admin() {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: 100,
+            device: None,
         });
     let denied = svc.put_governed_transform(req).await.unwrap_err();
     assert_eq!(
@@ -21895,6 +21906,7 @@ impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: i64::MAX,
+            device: None,
         })
     }
 

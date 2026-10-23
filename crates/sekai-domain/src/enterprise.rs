@@ -204,6 +204,20 @@ pub struct AuthenticatedContext {
     pub issuer: String,
     pub resource: String,
     pub expires_at: i64,
+    /// The device an identity assertion was bound to, when it carried a
+    /// device claim; requests from it can be required to prove possession
+    /// of the device key (ADR 0126).
+    pub device: Option<AuthenticatedDevice>,
+}
+
+/// A device claim of a verified identity assertion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDevice {
+    pub id: String,
+    /// The device's Ed25519 public key.
+    pub public_key: [u8; 32],
+    /// The assertion's one-use nonce, which every device proof covers.
+    pub assertion_nonce: String,
 }
 
 impl AuthenticatedContext {
@@ -221,6 +235,7 @@ impl AuthenticatedContext {
             issuer: "sekai:community".into(),
             resource: "sekai:control-plane".into(),
             expires_at: i64::MAX,
+            device: None,
         }
     }
 
@@ -974,6 +989,7 @@ mod tests {
                 issuer: "https://issuer.test".into(),
                 resource: "https://sekai.test".into(),
                 expires_at: 100,
+                device: None,
             })
         }
 
