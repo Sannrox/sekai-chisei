@@ -1413,7 +1413,7 @@
       "service": "SekaiService",
       "rpc": "ListObjectChanges",
       "storage_path": "sekai.audit, sekai.graph",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
