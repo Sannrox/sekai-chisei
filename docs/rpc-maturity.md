@@ -80,6 +80,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.TakeoverExpiredLease` | `sekai.leases` | yes | none | `experimental` |
 | `SekaiService.ApplySourceBatch` | `sekai.object-sync` | yes | example | `stable` |
 | `SekaiService.GetSourceSyncState` | `sekai.object-sync` | yes | example | `stable` |
+| `SekaiService.ListSourceBatchTransactions` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RegisterSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.InspectSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RetireSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |

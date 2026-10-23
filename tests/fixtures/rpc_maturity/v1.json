@@ -70,6 +70,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ListSourceBatchTransactions",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "RegisterSourceTypeDescriptor",
       "storage_path": "sekai.object-sync",
       "real_backend": "yes",

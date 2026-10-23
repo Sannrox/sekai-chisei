@@ -90,6 +90,19 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ListSourceBatchTransactions",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/object_sync_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "RegisterSourceTypeDescriptor",
       "kind": "persistent",
       "surfaces": [

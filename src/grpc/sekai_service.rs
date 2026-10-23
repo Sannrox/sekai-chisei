@@ -510,6 +510,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_leases::get_source_sync_state(self, req).await
     }
 
+    async fn list_source_batch_transactions(
+        &self,
+        req: Request<ListSourceBatchTransactionsRequest>,
+    ) -> Result<Response<ListSourceBatchTransactionsResponse>, Status> {
+        rpc_leases::list_source_batch_transactions(self, req).await
+    }
+
     async fn register_source_type_descriptor(
         &self,
         req: Request<RegisterSourceTypeDescriptorRequest>,
