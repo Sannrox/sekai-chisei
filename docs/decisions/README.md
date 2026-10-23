@@ -146,3 +146,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0122: Catalog entries are governed objects, registered by stable source id](0122-governed-catalog-entries.md)
 - [ADR 0123: Media uploads become governed objects](0123-governed-media-uploads.md)
 - [ADR 0125: Definition change bundles](0125-definition-change-bundles.md)
+- [ADR 0126: Device-bound identity assertions with per-request proof](0126-device-bound-assertions.md)

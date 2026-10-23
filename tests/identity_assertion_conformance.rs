@@ -41,6 +41,7 @@ impl EnterpriseExtension for FakeExtension {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: 100,
+            device: None,
         })
     }
 
@@ -102,6 +103,7 @@ fn assertion_path_matches_in_process_extension_authorization() {
             scopes: in_process.scopes.clone(),
             expires_at: in_process.expires_at,
             nonce: "parity-1".into(),
+            device: None,
         })
         .unwrap();
     let via_assertion = authority.verify(&token, 50, None).unwrap();
@@ -135,6 +137,7 @@ fn conformance_kit_names_each_failure_class() {
         scopes: vec!["sekai.read".into()],
         expires_at: 100,
         nonce: "kit-1".into(),
+        device: None,
     };
     let token = authority.sign(&claims).unwrap();
     assert_eq!(

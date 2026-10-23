@@ -190,6 +190,7 @@ impl EnterpriseExtension for FakeIdentityExtension {
             issuer: ISSUER.into(),
             resource: RESOURCE.into(),
             expires_at: 300,
+            device: None,
         };
         let token = "access-1";
         self.credentials
