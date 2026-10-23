@@ -695,6 +695,7 @@ async fn bootstrap_types(sekai: &SekaiServiceImpl) -> Result<(), String> {
                     review_threshold: 0,
                     review_pool: vec![],
                     review_agent_reviewers: vec![],
+                    last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
                 }),
                 request_id: "put-writeback-type".into(),
             },
@@ -1050,6 +1051,7 @@ async fn run_async() -> Result<Report, String> {
                 evidence_submission_ids: vec![],
                 request_id: permit.operation_id.clone(),
                 ontology_digest: String::new(),
+                offline: None,
             },
             OPERATOR,
         ))
@@ -1079,6 +1081,7 @@ async fn run_async() -> Result<Report, String> {
                 evidence_submission_ids: vec![],
                 request_id: "op-writeback-success-other".into(),
                 ontology_digest: String::new(),
+                offline: None,
             },
             OPERATOR,
         ))
@@ -1111,6 +1114,7 @@ async fn run_async() -> Result<Report, String> {
                 evidence_submission_ids: vec![],
                 request_id: "op-writeback-changed".into(),
                 ontology_digest: String::new(),
+                offline: None,
             },
             OPERATOR,
         ))

@@ -126,6 +126,9 @@ pub(super) async fn set_governed_action_type_enabled(
         r#type: Some(to_proto_governed_action_type(&stored)),
     }))
 }
+/// The gRPC path a device proof over a submit covers.
+pub(crate) const SUBMIT_ACTION_INSTANCE_PATH: &str = "/sekai.SekaiService/SubmitActionInstance";
+
 pub(super) async fn submit_action_instance(
     service: &SekaiServiceImpl,
     req: Request<SubmitActionInstanceRequest>,
@@ -143,6 +146,19 @@ pub(super) async fn submit_action_instance(
     );
     let catalog_capability = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-capability");
     let catalog_namespace = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-namespace");
+    // A device-bound credential proves possession of its device key on
+    // every submit; an offline submission requires one (#1580, ADR 0126).
+    crate::grpc::require_device_proof(
+        &req,
+        SUBMIT_ACTION_INSTANCE_PATH,
+        req.get_ref().offline.is_some(),
+    )?;
+    let device_id = req
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+        .and_then(|context| context.device.as_ref())
+        .map(|device| device.id.clone())
+        .unwrap_or_default();
     let mut inner = req.into_inner();
     let namespace = inner.namespace.trim().to_string();
     if namespace.is_empty() {
@@ -228,6 +244,10 @@ pub(super) async fn submit_action_instance(
         binding_markings: Vec::new(),
         source_object_id: String::new(),
         marking_gate: submitter_marking_gate(service, &principals, &namespace_for_gate),
+        offline: inner
+            .offline
+            .map(|offline| from_proto_offline_submission(offline, device_id))
+            .transpose()?,
     };
     let tenant = acting_tenant(tenant_context.as_ref());
     let machine_credential = freeze_machine_credential(tenant_context.as_ref());

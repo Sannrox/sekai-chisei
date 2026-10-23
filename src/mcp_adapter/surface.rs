@@ -926,6 +926,7 @@ fn submit_request(invocation: &SdkInvocation) -> Result<SubmitActionInstanceRequ
         request_id: invocation.operation_id.clone(),
         ontology_digest: json_string(&invocation.input, "ontology_digest", "ontologyDigest")
             .unwrap_or_default(),
+        offline: None,
     })
 }
 
