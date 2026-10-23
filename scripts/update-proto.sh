@@ -11,6 +11,3 @@ for name in sekai.proto chisei.proto; do
     echo "Updated crates/sekai-proto/proto/${name}"
   fi
 done
-
-# The compatibility matrix pins the proto digest; keep it in step.
-cargo run --quiet --locked --bin sekaictl -- admin compatibility generate --out compatibility.json
