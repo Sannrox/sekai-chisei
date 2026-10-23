@@ -47,6 +47,48 @@ unavailable shape. A visible failing criterion is named on preview and on
 submit `deny_reason`. Compensation is explicit `unsupported` unless a type
 already stores a supported contract.
 
+## Intents, plans and simulations
+
+Issue: [#1675](https://github.com/Sannrox/sekai-chisei/issues/1675), layer 1 of
+[#1460](https://github.com/Sannrox/sekai-chisei/issues/1460).
+
+The RPCs:
+
+- `CreatePlanIntent` stores a goal with constraints.
+- `ProposePlan` stores an ordered list of steps for it, each an Action type,
+  version, existing object and parameters. A plan is not a DAG. The preview
+  path is object-bound, so steps are updates.
+- `SimulatePlan` runs every step through the preview path above, as the
+  caller and under the caller's object read policy. It stores the result
+  with the plan. Per step, that result is:
+  - the preview outcome;
+  - the policy, approval and budget decisions;
+  - the object revision the step was simulated against;
+  - the object effect the Action would write: the properties it sets or
+    changes. An object that changes while the step is planned simulates as
+    `stale`.
+
+  A step that needs approval still shows its effect, once its parameters
+  pass the type's schema.
+- `GetPlan` reads it all back.
+
+A simulation applies nothing and writes no instance or receipt. Its digest
+covers the canonical plan and every step's prediction, including object
+revisions, but no ids or times. Re-simulating an unchanged world gives the
+same digest, and a changed precondition gives a different one. Every
+simulation is kept under its own id.
+
+Creates and simulations are idempotent by caller-supplied id. A retry
+returns the stored record, and another body under a stored id is
+`ALREADY_EXISTS`. Creating and simulating need the same submit authorization
+as admission. Reading needs namespace read. A step whose object the reader
+may not see keeps only its position and Action type, in the plan and in
+every simulation. A step the simulator may not see simulates as
+`unavailable`.
+
+Approval and execution are the next layers. Execution goes through
+`SubmitActionInstance` with idempotency key (plan id, step index).
+
 ## Admission flow
 
 1. Authenticate; require team namespace write for the target namespace.
@@ -237,7 +279,8 @@ A device that prepared an Action while disconnected submits it with `offline` ([
 ## Dual-backend
 
 SQLite migrate-on-use and PostgreSQL migration
-`0021_governed_action_instances`.
+`0021_governed_action_instances`. Plans, intents and simulations use PostgreSQL
+migration `0100_sekai_action_plans`.
 
 ## Non-goals
 
