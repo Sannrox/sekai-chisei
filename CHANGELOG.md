@@ -7,7 +7,7 @@
   mode embeds every stored spec on a schedule through its hosted catalog
   route over the OpenAI-compatible embeddings API, admitted like hosted
   execution; a changed spec is a recorded rebuild
-  (docs/embedding-index.md, `0094_embedding_specs`, GATE:mig, #1609).
+  (docs/embedding-index.md, `0095_embedding_specs`, GATE:mig, #1609).
 
 - Identity assertions (`sekai.identity-assertion/v1`) accept an optional
   `device { id, ed25519_pub }` claim, and a verified one binds the
@@ -27,6 +27,14 @@
   RPC returns that stored id instead of correlating by object and time
   (docs/operation-correlation.md, `0093_object_change_operation`, GATE:mig,
   #1689).
+
+- Experimental offline sync scopes (contract `sekai.sync/v1`):
+  `PutSyncScope` defines a kind, property filters, optional linked
+  objects up to two hops and an object quota; `ReadSyncSnapshot` pages a
+  policy-filtered snapshot, and `ReadSyncDeltas` resumes from its cursor
+  with upserts and removals. Every object passes the online read checks
+  and is projected per property, and a scope over its quota is refused
+  with the quota named (ADR 0124, #1632).
 
 - Enterprise-scoped credentials may call `ProposeDefinitionRollback`,
   `ExportDefinitionPackage` and `ImportDefinitionPackage`, which authorize

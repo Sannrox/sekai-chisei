@@ -25995,6 +25995,225 @@ async fn change_bundle_plans_declared_changes_and_reports_only_visible_consumers
 }
 
 #[tokio::test]
+async fn sync_scope_snapshot_and_deltas_follow_read_policy_links_and_quota() {
+    use crate::sekai::sync_scope::SYNC_CONTRACT;
+    let svc = service();
+    grant_source_namespace(&svc, "field", "alice", security::Role::Admin);
+    let db = svc.db.runtime();
+    let object = |id: &str, kind: &str, props: &[(&str, &str)]| domain::Object {
+        id: id.into(),
+        kind: kind.into(),
+        name: id.into(),
+        namespace: "field".into(),
+        external_id: String::new(),
+        properties: props
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        created: 0,
+        updated: 0,
+    };
+    for created in [
+        object("wo-1", "WorkOrder", &[("site", "north")]),
+        object("wo-2", "WorkOrder", &[("site", "north")]),
+        object("wo-3", "WorkOrder", &[("site", "south")]),
+        object(
+            "wo-secret",
+            "WorkOrder",
+            &[
+                ("site", "north"),
+                (markings::OBJECT_CLASSIFICATION_PROPERTY, "confidential"),
+            ],
+        ),
+        object("site-a", "Site", &[]),
+    ] {
+        db.create_object_with_audit(&created, "alice").unwrap();
+    }
+    db.create_link(&domain::Link {
+        id: "l-1".into(),
+        from_id: "wo-1".into(),
+        to_id: "site-a".into(),
+        relation: "located_at".into(),
+        created: 0,
+    })
+    .unwrap();
+    let put = |max_objects: u32| PutSyncScopeRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        kind: "WorkOrder".into(),
+        property_filters: vec![PropertyFilter {
+            key: "site".into(),
+            op: "eq".into(),
+            value: "north".into(),
+        }],
+        link: Some(SyncScopeLink {
+            relation: "located_at".into(),
+            direction: "outgoing".into(),
+            max_hops: 1,
+        }),
+        max_objects,
+    };
+    let snapshot = |token: &str| ReadSyncSnapshotRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        page_token: token.into(),
+        limit: 2,
+    };
+    let deltas = |cursor: &str| ReadSyncDeltasRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        cursor: cursor.into(),
+        limit: 0,
+    };
+
+    // Unversioned requests are refused.
+    let unversioned = svc
+        .put_sync_scope(with_named_principal(
+            PutSyncScopeRequest {
+                contract_version: String::new(),
+                ..put(10)
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(unversioned.code(), tonic::Code::InvalidArgument);
+
+    // Over its quota, the scope is refused with the quota named.
+    svc.put_sync_scope(with_named_principal(put(2), "alice"))
+        .await
+        .unwrap();
+    let over = svc
+        .read_sync_snapshot(with_named_principal(snapshot(""), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(over.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        over.message().contains("quota of 2 objects (max_objects)"),
+        "{over:?}"
+    );
+
+    // The snapshot pages by id; a resumed page continues without overlap.
+    svc.put_sync_scope(with_named_principal(put(10), "alice"))
+        .await
+        .unwrap();
+    let first = svc
+        .read_sync_snapshot(with_named_principal(snapshot(""), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.total_objects, 3);
+    assert!(first.cursor.is_empty());
+    let ids = |objects: &[Object]| objects.iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&first.objects), ["site-a", "wo-1"]);
+    // The transfer drops; the client asks for the same page again.
+    let retried = svc
+        .read_sync_snapshot(with_named_principal(
+            snapshot(&first.next_page_token),
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let last = svc
+        .read_sync_snapshot(with_named_principal(
+            snapshot(&first.next_page_token),
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&retried.objects), ids(&last.objects));
+    assert_eq!(ids(&last.objects), ["wo-2"]);
+    assert!(last.next_page_token.is_empty() && !last.cursor.is_empty());
+    // The marked object never left the server.
+    let everything = [first.objects.clone(), last.objects.clone()].concat();
+    assert!(!everything.iter().any(|o| o.id == "wo-secret"));
+
+    // Nothing changed: an empty delta keeps the cursor.
+    let quiet = svc
+        .read_sync_deltas(with_named_principal(deltas(&last.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(quiet.upserts.is_empty() && quiet.removed_object_ids.is_empty());
+
+    // wo-2 changes, wo-1 leaves the filter (and takes site-a with it), and
+    // a marked change stays hidden.
+    let mut moved = object("wo-1", "WorkOrder", &[("site", "south")]);
+    db.update_object_with_audit(&moved, "alice").unwrap();
+    db.update_object_with_audit(
+        &object(
+            "wo-2",
+            "WorkOrder",
+            &[("site", "north"), ("status", "done")],
+        ),
+        "alice",
+    )
+    .unwrap();
+    db.update_object_with_audit(
+        &object(
+            "wo-secret",
+            "WorkOrder",
+            &[
+                ("site", "north"),
+                ("status", "done"),
+                (markings::OBJECT_CLASSIFICATION_PROPERTY, "confidential"),
+            ],
+        ),
+        "alice",
+    )
+    .unwrap();
+    let delta = svc
+        .read_sync_deltas(with_named_principal(deltas(&quiet.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&delta.upserts), ["wo-2"]);
+    assert_eq!(delta.upserts[0].properties["status"], "done");
+    assert_eq!(delta.removed_object_ids, ["site-a", "wo-1"]);
+    // Retrying the same cursor is safe and gives the same answer.
+    let again = svc
+        .read_sync_deltas(with_named_principal(deltas(&quiet.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.removed_object_ids, delta.removed_object_ids);
+    assert_eq!(ids(&again.upserts), ids(&delta.upserts));
+    assert_eq!(again.cursor, delta.cursor);
+
+    // Coming back into scope sends the object whole; a delete removes it.
+    moved.properties.insert("site".into(), "north".into());
+    db.update_object_with_audit(&moved, "alice").unwrap();
+    db.delete_object_with_audit("wo-2", "alice").unwrap();
+    let back = svc
+        .read_sync_deltas(with_named_principal(deltas(&delta.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&back.upserts), ["site-a", "wo-1"]);
+    assert_eq!(back.removed_object_ids, ["wo-2"]);
+
+    // Another principal has no such scope and no cursor.
+    grant_source_namespace(&svc, "field", "bob", security::Role::Viewer);
+    let foreign = svc
+        .read_sync_deltas(with_named_principal(deltas(&back.cursor), "bob"))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::NotFound);
+    // An unknown cursor asks for a new snapshot.
+    let lost = svc
+        .read_sync_deltas(with_named_principal(deltas("pos-unknown"), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(lost.resnapshot_required);
+}
+
+#[tokio::test]
 async fn embedding_specs_need_a_credential_admin_and_a_hosted_route() {
     let svc = service();
     let (_, grants) = svc

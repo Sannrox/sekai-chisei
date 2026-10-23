@@ -1,4 +1,4 @@
-//! PostgreSQL storage for the embedding index (migrations 0086 and 0094).
+//! PostgreSQL storage for the embedding index (migrations 0086 and 0095).
 
 use crate::db::embedding_index::{
     join_classifications, join_properties, split_classifications, stored_spec,
