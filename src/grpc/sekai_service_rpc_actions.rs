@@ -1619,6 +1619,259 @@ fn credentialed_decider<T>(req: &Request<T>, principals: &[String]) -> Option<St
     }
 }
 
+// --- Intents, proposed plans and simulations (#1675) ---
+
+fn plan_status(error: crate::sekai::action_plan::PlanError) -> Status {
+    use crate::sekai::action_plan::PlanError;
+    match error {
+        PlanError::Invalid(message) => Status::invalid_argument(message),
+        PlanError::NotFound => Status::not_found("plan or intent not found"),
+        PlanError::Conflict => Status::already_exists("a different record is stored under that id"),
+        PlanError::Store(message) => Status::internal(message),
+    }
+}
+
+fn plan_intent_to_proto(intent: crate::sekai::action_plan::PlanIntent) -> PlanIntent {
+    PlanIntent {
+        namespace: intent.namespace,
+        intent_id: intent.intent_id,
+        goal: intent.goal,
+        constraints: intent.constraints,
+        planner: intent.planner,
+        created_at_ms: intent.created_at_ms,
+    }
+}
+
+fn plan_to_proto(plan: crate::sekai::action_plan::ProposedPlan) -> ProposedPlan {
+    ProposedPlan {
+        namespace: plan.namespace,
+        plan_id: plan.plan_id,
+        intent_id: plan.intent_id,
+        planner: plan.planner,
+        steps: plan
+            .steps
+            .into_iter()
+            .map(|step| PlanStep {
+                type_id: step.type_id,
+                version: step.version,
+                object_id: step.object_id,
+                parameters_json: step.parameters_json,
+            })
+            .collect(),
+        created_at_ms: plan.created_at_ms,
+    }
+}
+
+fn plan_simulation_to_proto(
+    simulation: crate::sekai::action_plan::PlanSimulation,
+) -> PlanSimulation {
+    PlanSimulation {
+        namespace: simulation.namespace,
+        plan_id: simulation.plan_id,
+        simulation_id: simulation.simulation_id,
+        digest: simulation.digest,
+        simulated_by: simulation.simulated_by,
+        simulated_at_ms: simulation.simulated_at_ms,
+        steps: simulation
+            .steps
+            .into_iter()
+            .map(|step| PlanStepSimulation {
+                index: step.index,
+                object_id: step.object_id,
+                object_revision: step.object_revision,
+                outcome: step.outcome,
+                reason_code: step.reason_code,
+                policy_decision: step.policy_decision,
+                approval_state: step.approval_state,
+                budget_decision: step.budget_decision,
+                failing_criterion: step.failing_criterion,
+                effect: step.effect.map(|effect| PlanStepEffect {
+                    object_id: effect.object_id,
+                    object_kind: effect.object_kind,
+                    mutation: effect.mutation,
+                    changed_properties: effect.changed_properties,
+                }),
+            })
+            .collect(),
+    }
+}
+
+/// Records an intent for the caller, who must be able to submit Actions in
+/// the namespace.
+pub(super) async fn create_plan_intent(
+    service: &SekaiServiceImpl,
+    req: Request<CreatePlanIntentRequest>,
+) -> Result<Response<CreatePlanIntentResponse>, Status> {
+    let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let planner = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let intent = crate::sekai::action_plan::create_intent(
+        service.db.runtime(),
+        crate::sekai::action_plan::PlanIntent {
+            namespace: inner.namespace,
+            intent_id: inner.intent_id,
+            goal: inner.goal,
+            constraints: inner.constraints,
+            planner,
+            created_at_ms: now_millis(),
+        },
+    )
+    .map_err(plan_status)?;
+    Ok(Response::new(CreatePlanIntentResponse {
+        intent: Some(plan_intent_to_proto(intent)),
+    }))
+}
+
+pub(super) async fn propose_plan(
+    service: &SekaiServiceImpl,
+    req: Request<ProposePlanRequest>,
+) -> Result<Response<ProposePlanResponse>, Status> {
+    let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let planner = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let plan = crate::sekai::action_plan::propose_plan(
+        service.db.runtime(),
+        crate::sekai::action_plan::ProposedPlan {
+            namespace: inner.namespace,
+            plan_id: inner.plan_id,
+            intent_id: inner.intent_id,
+            planner,
+            steps: inner
+                .steps
+                .into_iter()
+                .map(|step| crate::sekai::action_plan::PlanStep {
+                    type_id: step.type_id,
+                    version: step.version,
+                    object_id: step.object_id,
+                    parameters_json: step.parameters_json,
+                })
+                .collect(),
+            created_at_ms: now_millis(),
+        },
+    )
+    .map_err(plan_status)?;
+    Ok(Response::new(ProposePlanResponse {
+        plan: Some(plan_to_proto(plan)),
+    }))
+}
+
+/// Runs every step through the PreviewObjectAction path as the caller,
+/// under the caller's object read policy. Applies nothing.
+pub(super) async fn simulate_plan(
+    service: &SekaiServiceImpl,
+    req: Request<SimulatePlanRequest>,
+) -> Result<Response<SimulatePlanResponse>, Status> {
+    let principals = caller_principals(&req);
+    let policy_context = principal_policy_context(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let actor = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let clerk = service.cross_store.as_ref();
+    let fallback_proposal = crate::chisei::system_one_action::SystemOneProposal;
+    let proposal: &dyn crate::sekai::action_ports::ActionProposalPort = match clerk {
+        Some(clerk) => clerk.proposal_port(),
+        None => &fallback_proposal,
+    };
+    let visible = |object_id: &str| {
+        visible_action_object(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &policy_context,
+            &inner.namespace,
+            object_id,
+            crate::enterprise::NamespaceAction::Read,
+        )
+        .ok()
+    };
+    let simulation = crate::sekai::action_plan::simulate_plan(
+        service.db.runtime(),
+        &crate::sekai::action_plan::SimulationContext {
+            actor: &actor,
+            budget: clerk.and_then(|clerk| clerk.budget_port()),
+            proposal: Some(proposal),
+            policy_context: Some(&policy_context),
+            visible_object: &visible,
+            now_ms: now_millis(),
+        },
+        &inner.namespace,
+        &inner.plan_id,
+        &inner.simulation_id,
+    )
+    .map_err(plan_status)?;
+    Ok(Response::new(SimulatePlanResponse {
+        simulation: Some(plan_simulation_to_proto(simulation)),
+    }))
+}
+
+/// Reads a plan with its intent and simulations. A step whose object the
+/// caller may not read keeps only its position and Action type.
+pub(super) async fn get_plan(
+    service: &SekaiServiceImpl,
+    req: Request<GetPlanRequest>,
+) -> Result<Response<GetPlanResponse>, Status> {
+    let principals = caller_principals(&req);
+    let policy_context = principal_policy_context(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &inner.namespace, false)?;
+    let may_read = |object_id: &str| {
+        visible_action_object(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &policy_context,
+            &inner.namespace,
+            object_id,
+            crate::enterprise::NamespaceAction::Read,
+        )
+        .is_ok()
+    };
+    let view = crate::sekai::action_plan::read_plan(
+        service.db.runtime(),
+        &inner.namespace,
+        &inner.plan_id,
+        &may_read,
+    )
+    .map_err(plan_status)?;
+    Ok(Response::new(GetPlanResponse {
+        intent: Some(plan_intent_to_proto(view.intent)),
+        plan: Some(plan_to_proto(view.plan)),
+        simulations: view
+            .simulations
+            .into_iter()
+            .map(plan_simulation_to_proto)
+            .collect(),
+    }))
+}
+
 #[cfg(test)]
 mod credentialed_decider_tests {
     use super::credentialed_decider;

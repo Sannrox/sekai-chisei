@@ -2344,6 +2344,111 @@ message PreviewObjectActionResponse {
   // Bind + parameter-body provenance on a valid preview of a bound type.
   string system_one_fill_json = 14;
 }
+
+// --- Intents, proposed plans and simulations (#1675) ---
+
+// A goal with constraints. Created once per caller-supplied intent_id; a
+// retry returns the stored intent, another body under the id is refused.
+message PlanIntent {
+  string namespace = 1;
+  string intent_id = 2;
+  string goal = 3;
+  repeated string constraints = 4;
+  string planner = 5;
+  int64 created_at_ms = 6;
+}
+// One step: an Action type and version applied to one existing object; the
+// preview path is object-bound, so steps are updates. A step a reader may
+// not see keeps its type and loses object_id and parameters_json.
+message PlanStep {
+  string type_id = 1;
+  string version = 2;
+  string object_id = 3;
+  string parameters_json = 4;
+}
+// Ordered steps for an intent; not a DAG.
+message ProposedPlan {
+  string namespace = 1;
+  string plan_id = 2;
+  string intent_id = 3;
+  string planner = 4;
+  repeated PlanStep steps = 5;
+  int64 created_at_ms = 6;
+}
+// The object write a step's Action would make.
+message PlanStepEffect {
+  string object_id = 1;
+  string object_kind = 2;
+  // update: steps act on existing objects.
+  string mutation = 3;
+  // Properties the write sets or changes, sorted; _name for the name.
+  repeated string changed_properties = 4;
+}
+// What PreviewObjectAction predicted for one step. outcome is a preview
+// outcome, or redacted for a step the reader may not see.
+message PlanStepSimulation {
+  uint32 index = 1;
+  string object_id = 2;
+  string object_revision = 3;
+  string outcome = 4;
+  string reason_code = 5;
+  string policy_decision = 6;
+  // The approval the step needs before it may run: none or required.
+  string approval_state = 7;
+  string budget_decision = 8;
+  string failing_criterion = 9;
+  PlanStepEffect effect = 10;
+}
+// One simulation of a plan. digest covers the canonical plan and every
+// step's prediction and object revision, not ids or times.
+message PlanSimulation {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+  string digest = 4;
+  string simulated_by = 5;
+  int64 simulated_at_ms = 6;
+  repeated PlanStepSimulation steps = 7;
+}
+message CreatePlanIntentRequest {
+  string namespace = 1;
+  string intent_id = 2;
+  string goal = 3;
+  repeated string constraints = 4;
+}
+message CreatePlanIntentResponse {
+  PlanIntent intent = 1;
+}
+message ProposePlanRequest {
+  string namespace = 1;
+  string plan_id = 2;
+  string intent_id = 3;
+  repeated PlanStep steps = 4;
+}
+message ProposePlanResponse {
+  ProposedPlan plan = 1;
+}
+// Runs every step through PreviewObjectAction; applies nothing and writes
+// no Action receipt. A retry with a stored simulation_id returns it.
+message SimulatePlanRequest {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+}
+message SimulatePlanResponse {
+  PlanSimulation simulation = 1;
+}
+message GetPlanRequest {
+  string namespace = 1;
+  string plan_id = 2;
+}
+// The plan with its intent and up to 100 simulations, newest first, under
+// the caller's read policy.
+message GetPlanResponse {
+  PlanIntent intent = 1;
+  ProposedPlan plan = 2;
+  repeated PlanSimulation simulations = 3;
+}
 message GetActionInstanceRequest {
   string instance_id = 1;
   // Optional alternate lookup when instance_id empty.
@@ -4051,6 +4156,10 @@ service SekaiService {
   rpc RunFenceBinding(RunFenceBindingRequest) returns (RunFenceBindingResponse);
   rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
   rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
+  rpc CreatePlanIntent(CreatePlanIntentRequest) returns (CreatePlanIntentResponse);
+  rpc ProposePlan(ProposePlanRequest) returns (ProposePlanResponse);
+  rpc SimulatePlan(SimulatePlanRequest) returns (SimulatePlanResponse);
+  rpc GetPlan(GetPlanRequest) returns (GetPlanResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
   // Typed effects on admitted ActionInstances (#398).

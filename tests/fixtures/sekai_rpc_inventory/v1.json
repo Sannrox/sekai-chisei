@@ -2407,6 +2407,62 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "CreatePlanIntent",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/action_plan.rs",
+        "src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ProposePlan",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/action_plan.rs",
+        "src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "SimulatePlan",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/action_plan.rs",
+        "src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetPlan",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/action_plan.rs",
+        "src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [
+        "sekai.audit"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetActionInstance",
       "kind": "persistent",
       "surfaces": [

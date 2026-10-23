@@ -169,8 +169,9 @@ const SYNC_MEMBER_PROPERTIES_SCHEMA: &str =
 const OBJECT_CHANGE_WRITER_SCHEMA: &str = include_str!("postgres/0098_object_change_writer.sql");
 const DATASET_RUN_ARTIFACTS_SCHEMA: &str =
     include_str!("postgres/0099_chisei_dataset_run_artifacts.sql");
+const ACTION_PLANS_SCHEMA: &str = include_str!("postgres/0100_sekai_action_plans.sql");
 const DEFINITION_BUNDLE_APPLIES_SCHEMA: &str =
-    include_str!("postgres/0100_definition_bundle_applies.sql");
+    include_str!("postgres/0101_definition_bundle_applies.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -794,6 +795,12 @@ const MIGRATIONS: &[Migration] = &[
     ),
     mig(
         99,
+        "sekai_action_plans",
+        ACTION_PLANS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        100,
         "definition_bundle_applies",
         DEFINITION_BUNDLE_APPLIES_SCHEMA,
         MigrationOwner::Sekai,

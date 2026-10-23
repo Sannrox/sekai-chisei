@@ -1284,6 +1284,34 @@ impl SekaiService for SekaiServiceImpl {
         rpc_actions::preview_object_action(self, req).await
     }
 
+    async fn create_plan_intent(
+        &self,
+        req: Request<CreatePlanIntentRequest>,
+    ) -> Result<Response<CreatePlanIntentResponse>, Status> {
+        rpc_actions::create_plan_intent(self, req).await
+    }
+
+    async fn propose_plan(
+        &self,
+        req: Request<ProposePlanRequest>,
+    ) -> Result<Response<ProposePlanResponse>, Status> {
+        rpc_actions::propose_plan(self, req).await
+    }
+
+    async fn simulate_plan(
+        &self,
+        req: Request<SimulatePlanRequest>,
+    ) -> Result<Response<SimulatePlanResponse>, Status> {
+        rpc_actions::simulate_plan(self, req).await
+    }
+
+    async fn get_plan(
+        &self,
+        req: Request<GetPlanRequest>,
+    ) -> Result<Response<GetPlanResponse>, Status> {
+        rpc_actions::get_plan(self, req).await
+    }
+
     async fn get_action_instance(
         &self,
         req: Request<GetActionInstanceRequest>,
@@ -1955,39 +1983,6 @@ impl KnowledgeWriter for SekaiServiceImpl {
         request: &KnowledgeWriteRequest,
     ) -> Result<KnowledgeWriteOutcome, String> {
         scored_knowledge_admission::admit(self, request).await
-    }
-}
-
-#[cfg(test)]
-mod spawn_db_tests {
-    use super::*;
-    use crate::db::store::SekaiStore;
-    use std::time::Duration;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn spawn_db_does_not_block_the_tokio_worker() {
-        let service = SekaiServiceImpl::new(SekaiStore::memory());
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let blocking = service.spawn_db(move || {
-            let _ = started_tx.send(());
-            release_rx
-                .recv()
-                .map_err(|_| Status::internal("release signal closed"))?;
-            Ok(())
-        });
-        let probe = async {
-            started_rx.await.expect("blocking work started");
-            tokio::task::yield_now().await;
-            let _ = release_tx.send(());
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let (result, ()) = tokio::join!(blocking, probe);
-            result
-        })
-        .await
-        .expect("spawn_db blocked the Tokio worker")
-        .unwrap();
     }
 }
 

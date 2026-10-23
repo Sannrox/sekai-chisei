@@ -5,6 +5,8 @@ pub mod action_effect;
 pub mod action_instance;
 pub mod action_instance_admission;
 pub(crate) mod action_object_mutation;
+pub mod action_plan;
+mod action_plan_store;
 pub mod action_policy;
 pub mod action_ports;
 pub mod action_type_criteria;
