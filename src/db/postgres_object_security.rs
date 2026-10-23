@@ -137,9 +137,7 @@ impl PostgresDb {
             .into_iter()
             .map(|row| row.get::<_, String>(0))
             .collect::<Vec<_>>();
-        if instantiated.len() != policies.len()
-            || instantiated.iter().any(|kind| !policies.contains_key(kind))
-        {
+        if !crate::db::object_security::activation_covers_kinds(&instantiated, policies) {
             return Err(
                 "object_security_activation_incomplete: every instantiated kind requires exactly one revision"
                     .into(),

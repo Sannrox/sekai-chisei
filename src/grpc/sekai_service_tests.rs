@@ -25355,3 +25355,245 @@ async fn transform_replay_rpc_reproduces_and_needs_read_on_every_input() {
         )
     );
 }
+
+fn catalog_request(source_id: &str) -> RegisterCatalogEntryRequest {
+    RegisterCatalogEntryRequest {
+        namespace: "warehouse".into(),
+        entry_kind: "dataset".into(),
+        source_system: "mizuchi".into(),
+        source_id: source_id.into(),
+        display_name: "Orders".into(),
+        description: "daily orders".into(),
+        owners: vec!["alice".into()],
+        steward: "bob".into(),
+        tags: vec!["finance".into()],
+        access_marking: String::new(),
+        schema_summary: "id,total".into(),
+        freshness_ms: 1,
+        deprecated: false,
+    }
+}
+
+async fn visible_catalog_entries(svc: &SekaiServiceImpl, principal: &str) -> Vec<domain::Object> {
+    svc.list_objects(with_named_principal(
+        ListObjectsRequest {
+            filter: Some(ListFilter {
+                kind: crate::sekai::catalog::CATALOG_ENTRY_KIND.into(),
+                namespace: "warehouse".into(),
+                ..Default::default()
+            }),
+            page_token: String::new(),
+        },
+        principal,
+    ))
+    .await
+    .map(|response| {
+        response
+            .into_inner()
+            .objects
+            .iter()
+            .map(support_mapping::from_proto_obj)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn catalog_registration_is_idempotent_and_follows_namespace_access() {
+    let svc = service();
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(
+            "warehouse",
+            "warehouse-team",
+            security::Role::Admin,
+            "local",
+        )
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    let register = |principal: &str, source_id: &str| {
+        svc.register_catalog_entry(with_named_principal(catalog_request(source_id), principal))
+    };
+    let first = register("warehouse-team", "tbl-1")
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.changed);
+    let again = register("warehouse-team", "tbl-1")
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!again.changed);
+    assert_eq!(
+        again.entry.as_ref().unwrap().id,
+        first.entry.as_ref().unwrap().id
+    );
+
+    let outsider = register("outsider", "tbl-2").await.unwrap_err();
+    assert_eq!(outsider.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        visible_catalog_entries(&svc, "warehouse-team").await.len(),
+        1
+    );
+    assert!(visible_catalog_entries(&svc, "outsider").await.is_empty());
+
+    // Generic writes cannot forge or edit an entry.
+    let mut forged = first.entry.unwrap();
+    forged.id = "catalog:forged".into();
+    let refused = svc
+        .create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(forged),
+                lease_precondition: None,
+            },
+            "warehouse-team",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn publishing_an_object_type_registers_and_retires_its_catalog_entry() {
+    let svc = service();
+    let namespace = "catalog-team";
+    let parent = seed_definition_parent(&svc, namespace);
+    let ontology_entries = |svc: &SekaiServiceImpl| {
+        svc.db
+            .runtime()
+            .list_objects(&domain::ListFilter {
+                kind: Some(crate::sekai::catalog::CATALOG_ENTRY_KIND.into()),
+                namespace: Some(namespace.into()),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    let (with_ticket, _) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "cat-1",
+        "cat-cs-1",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Invoice".into(),
+            definition_json:
+                r#"{"name":"Invoice","properties":["total","due"],"access_marking":"confidential"}"#
+                    .into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    // The background reconciler keeps the catalog in line with publishes.
+    let reconcile = |svc: &SekaiServiceImpl| {
+        let failed =
+            crate::sekai::catalog::reconcile_ontology_entries(svc.db.runtime(), now_millis())
+                .unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+    };
+    reconcile(&svc);
+    let entries = ontology_entries(&svc);
+    let invoice: Vec<_> = entries
+        .iter()
+        .filter(|e| e.properties.get("source_id").map(String::as_str) == Some("Invoice"))
+        .collect();
+    assert_eq!(invoice.len(), 1, "{entries:?}");
+    assert_eq!(invoice[0].properties["entry_kind"], "object_type");
+    assert_eq!(invoice[0].properties["schema_summary"], "due,total");
+    assert_eq!(invoice[0].properties["status"], "active");
+    // The definition's marking is the entry's, so restricted metadata stays hidden.
+    assert_eq!(invoice[0].properties["access_marking"], "confidential");
+
+    // Removing the object type deprecates its entry; nothing is deleted.
+    let applied = svc
+        .create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: namespace.into(),
+                branch_id: "cat-2".into(),
+                parent_revision_digest: with_ticket.clone(),
+                idempotency_key: "cat-2-create".into(),
+            },
+            "root",
+        ))
+        .await;
+    assert!(applied.is_ok());
+    let edit = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "cat-2".into(),
+                expected_head_digest: with_ticket.clone(),
+                upserts: Vec::new(),
+                removals: vec![DefinitionMemberRef {
+                    member_kind: "object_type".into(),
+                    member_id: "Invoice".into(),
+                }],
+                idempotency_key: "cat-2-edit".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    {
+        let candidate = edit.into_inner().revision.unwrap().revision_digest;
+        for (step, result) in [
+            (
+                "propose",
+                svc.create_definition_proposal(with_named_principal(
+                    CreateDefinitionProposalRequest {
+                        namespace: namespace.into(),
+                        branch_id: "cat-2".into(),
+                        proposal_id: "cat-cs-2".into(),
+                        base_digest: with_ticket.clone(),
+                        candidate_digest: candidate,
+                        eval_plan_digests: Vec::new(),
+                        named_foreign_digests: Vec::new(),
+                        idempotency_key: "cat-2-propose".into(),
+                        major_revision: true,
+                    },
+                    "root",
+                ))
+                .await
+                .map(|_| ()),
+            ),
+            (
+                "approve",
+                svc.approve_definition_proposal(with_named_principal(
+                    ApproveDefinitionProposalRequest {
+                        namespace: namespace.into(),
+                        proposal_id: "cat-cs-2".into(),
+                        idempotency_key: "cat-2-approve".into(),
+                    },
+                    "root",
+                ))
+                .await
+                .map(|_| ()),
+            ),
+            (
+                "merge",
+                svc.merge_definition_proposal(with_named_principal(
+                    MergeDefinitionProposalRequest {
+                        namespace: namespace.into(),
+                        proposal_id: "cat-cs-2".into(),
+                        expected_published_digest: with_ticket.clone(),
+                        idempotency_key: "cat-2-merge".into(),
+                    },
+                    "root",
+                ))
+                .await
+                .map(|_| ()),
+            ),
+        ] {
+            result.unwrap_or_else(|error| panic!("{step}: {error:?}"));
+        }
+        reconcile(&svc);
+        let invoice = ontology_entries(&svc)
+            .into_iter()
+            .find(|e| e.properties.get("source_id").map(String::as_str) == Some("Invoice"))
+            .unwrap();
+        assert_eq!(invoice.properties["status"], "deprecated");
+    }
+}
