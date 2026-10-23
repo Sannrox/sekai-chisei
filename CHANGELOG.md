@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Enterprise-scoped credentials may call `ProposeDefinitionRollback`,
+  `ExportDefinitionPackage` and `ImportDefinitionPackage`, which authorize
+  the tenant's namespace and members like the other definition proposal
+  RPCs, so a composing platform can promote and roll back definitions with
+  the caller's authority (#1700).
+
 - Experimental fence bindings (ADR 0121): `PutFenceBinding` binds Ezu
   geofence events (enter, exit, inside, dwell) for one collection to a
   pinned governed Action type run as a service principal, and
