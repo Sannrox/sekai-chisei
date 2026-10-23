@@ -13,6 +13,7 @@ pub mod epistemic_descriptor;
 pub mod epistemic_eval;
 pub mod eval;
 pub mod eval_dataset;
+pub mod eval_policy;
 pub mod eval_run;
 pub mod evaluation_compare;
 pub mod evaluation_execution;

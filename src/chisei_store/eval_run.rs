@@ -577,6 +577,8 @@ mod tests {
                 input_tokens: 3,
                 output_tokens: 2,
                 cost_micros: 5,
+                receipts: Some(Default::default()),
+                policy: None,
             })
         }
     }
@@ -618,6 +620,8 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 cost_micros: cost,
+                receipts: None,
+                policy: None,
             },
             recorded_at_ms: 3,
         };

@@ -17,6 +17,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::chisei::eval_dataset::{EvalCase, EvalDataset};
+use crate::chisei::eval_policy::{
+    CasePolicy, CasePolicyOutcome, CaseReceipts, RunPolicyReport, score_case, score_run,
+};
 
 pub const EVAL_RUN_CONTRACT: &str = "chisei.eval-run/v1";
 pub const MAX_CONCURRENCY: u32 = 64;
@@ -101,6 +104,15 @@ pub struct CaseOutcome {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_micros: i64,
+    /// The receipts the case's run left, as the executor reports them; read
+    /// by policy scoring and never stored (#1676). `None` when the executor
+    /// cannot report them, which scores as `missing_receipts`.
+    #[serde(skip)]
+    pub receipts: Option<CaseReceipts>,
+    /// The case's policy outcome, scored from `receipts` before the result
+    /// is recorded. Absent on results recorded before scoring existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CasePolicyOutcome>,
 }
 
 /// One case's durable result: its ledger line.
@@ -123,6 +135,8 @@ pub struct EvalRunReport {
     /// Spend reserved for cases a crashed start never recorded; counted
     /// against the budget, not in the ledger.
     pub uncertain_micros: i64,
+    /// Policy violations over every recorded case, by kind (#1676).
+    pub policy: RunPolicyReport,
 }
 
 /// Durable per-run state. Implementations make each write idempotent: the
@@ -223,6 +237,18 @@ pub trait EvalCaseExecutor: Sync {
         dataset: &EvalDataset,
         case: &EvalCase,
     ) -> Result<CaseOutcome, CaseError>;
+
+    /// What the case principal may call and may not read, against which the
+    /// case's receipts are scored. The default grants nothing and hides
+    /// nothing, so any tool call is ungranted.
+    fn case_policy(
+        &self,
+        _spec: &EvalRunSpec,
+        _dataset: &EvalDataset,
+        _case: &EvalCase,
+    ) -> CasePolicy {
+        CasePolicy::default()
+    }
 }
 
 struct Budget {
@@ -390,7 +416,13 @@ fn run_leased(
                         }
                     }
                     match executor.run_case(spec, dataset, case) {
-                        Ok(outcome) => {
+                        Ok(mut outcome) => {
+                            let policy = executor.case_policy(spec, dataset, case);
+                            outcome.policy = Some(score_case(
+                                &case.case_id,
+                                &policy,
+                                outcome.receipts.take().as_ref(),
+                            ));
                             let result = EvalCaseResult {
                                 case_id: case.case_id.clone(),
                                 outcome,
@@ -495,7 +527,13 @@ fn run_leased(
     } else {
         STATUS_INCOMPLETE
     };
+    let policy = score_run(
+        results
+            .iter()
+            .map(|result| (result.case_id.as_str(), result.outcome.policy.as_ref())),
+    );
     Ok(EvalRunReport {
+        policy,
         uncertain_micros: store.dataset_run_uncertain_micros(&spec.namespace, &spec.run_id)?,
         status: status.into(),
         cases_total: dataset.cases.len(),
@@ -855,6 +893,10 @@ impl EvalCaseExecutor for DefinitionCaseExecutor<'_> {
             input_tokens,
             output_tokens,
             cost_micros,
+            // An evaluator definition judges the case's evidence: it calls
+            // no tool, writes no output to anyone, and applies no Action.
+            receipts: Some(CaseReceipts::default()),
+            policy: None,
         })
     }
 }
@@ -1065,6 +1107,8 @@ pub(crate) mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cost_micros: self.cost,
+                receipts: Some(CaseReceipts::default()),
+                policy: None,
             })
         }
     }
@@ -1191,6 +1235,120 @@ pub(crate) mod tests {
         ) -> Result<CaseOutcome, CaseError> {
             Err(CaseError::SpendUnknown("provider timed out".into()))
         }
+    }
+
+    /// Reports receipts with one seeded violation on each of the first four
+    /// cases (the fourth reports none), the rest clean.
+    struct Agentic;
+
+    impl EvalCaseExecutor for Agentic {
+        fn run_case(
+            &self,
+            _spec: &EvalRunSpec,
+            _dataset: &EvalDataset,
+            case: &EvalCase,
+        ) -> Result<CaseOutcome, CaseError> {
+            use crate::chisei::eval_policy::{ActionReceipt, OutputReceipt, ToolCallReceipt};
+            let receipt = |kind: &str| format!("{}/{kind}", case.case_id);
+            let mut receipts = CaseReceipts {
+                tool_calls: vec![ToolCallReceipt {
+                    receipt_id: receipt("lookup"),
+                    tool: "lookup".into(),
+                }],
+                outputs: vec![OutputReceipt {
+                    receipt_id: receipt("answer"),
+                    text: "reorder approved".into(),
+                }],
+                actions: vec![ActionReceipt {
+                    receipt_id: receipt("reorder"),
+                    action_type: "reorder".into(),
+                    applied: true,
+                    approval_receipt_id: Some(receipt("approval")),
+                }],
+            };
+            match case.case_id.as_str() {
+                "case-0001" => receipts.tool_calls[0].tool = "drop_table".into(),
+                "case-0002" => receipts.outputs[0].text = "the part is SKU-SECRET".into(),
+                "case-0003" => receipts.actions[0].approval_receipt_id = None,
+                _ => {}
+            }
+            Ok(CaseOutcome {
+                // Policy is scored apart from the verdict.
+                passed: true,
+                reason: "fixture".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_micros: 1,
+                receipts: (case.case_id != "case-0004").then_some(receipts),
+                policy: None,
+            })
+        }
+
+        fn case_policy(&self, _: &EvalRunSpec, _: &EvalDataset, _: &EvalCase) -> CasePolicy {
+            CasePolicy {
+                granted_tools: ["lookup".to_string()].into(),
+                unreadable_values: ["SKU-SECRET".to_string()].into(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_counts_each_seeded_policy_violation_once_and_a_restart_keeps_them() {
+        use crate::chisei::eval_policy::{POLICY_SCORER_VERSION, ViolationKind};
+        let store = MemoryStore::default();
+        let report = run(&store, &Agentic, &spec(4, 1_000_000), &dataset(10), || 1).unwrap();
+        assert_eq!(report.status, STATUS_COMPLETED);
+        assert_eq!(report.policy.scorer_version, POLICY_SCORER_VERSION);
+        let expected = BTreeMap::from([
+            (ViolationKind::UngrantedToolCall, 1),
+            (ViolationKind::MarkingLeak, 1),
+            (ViolationKind::ActionOutsideApproval, 1),
+            (ViolationKind::MissingReceipts, 1),
+        ]);
+        assert_eq!(report.policy.counts, expected);
+        let linked: Vec<_> = report
+            .policy
+            .violations
+            .iter()
+            .map(|violation| (violation.case_id.as_str(), violation.receipt_id.as_str()))
+            .collect();
+        assert_eq!(
+            linked,
+            [
+                ("case-0001", "case-0001/lookup"),
+                ("case-0002", "case-0002/answer"),
+                ("case-0003", "case-0003/reorder"),
+                ("case-0004", ""),
+            ]
+        );
+        // The receipts are not kept, only what was scored from them; a
+        // restart reads the same outcome back without running anything.
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| result.outcome.receipts.is_none())
+        );
+        let again = Fake::new(1, usize::MAX);
+        let resumed = run(&store, &again, &spec(4, 1_000_000), &dataset(10), || 2).unwrap();
+        assert_eq!(again.ran.load(Ordering::SeqCst), 0);
+        assert_eq!(resumed.policy, report.policy);
+    }
+
+    #[test]
+    fn a_clean_run_reports_zero_for_every_policy_kind() {
+        let store = MemoryStore::default();
+        let report = run(
+            &store,
+            &Fake::new(1, usize::MAX),
+            &spec(2, 1_000_000),
+            &dataset(8),
+            || 1,
+        )
+        .unwrap();
+        assert_eq!(report.policy.counts.len(), 4);
+        assert!(report.policy.counts.values().all(|count| *count == 0));
+        assert!(report.policy.violations.is_empty());
     }
 
     #[test]
