@@ -2818,6 +2818,96 @@ fn redigest_source_batch(batch: &mut SourceBatch) {
 }
 
 #[tokio::test]
+async fn source_batch_history_pages_newest_first_and_is_authorized_like_sync_state() {
+    let svc = service();
+    let namespace = "sync-history";
+    let producer = "connector/github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    let mut cursor = String::new();
+    let mut applied = Vec::new();
+    for n in 0..3 {
+        let next = format!("cursor:{n}");
+        let page = source_batch(namespace, producer, &cursor, &next, &format!("batch-{n}"));
+        let result = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest { batch: Some(page) },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let transaction = result.transaction.unwrap();
+        applied.push((transaction.opened_at_ms, transaction.transaction_id));
+        cursor = next;
+    }
+    // The documented order: newest first, ties broken by transaction id.
+    applied.sort_by(|a, b| b.cmp(a));
+    let applied: Vec<String> = applied.into_iter().map(|(_, id)| id).collect();
+    let request = |page_token: &str, page_size: u32| ListSourceBatchTransactionsRequest {
+        namespace: namespace.into(),
+        source_instance: "acme/ops".into(),
+        type_digest: SOURCE_TYPE_DIGEST.into(),
+        page_size,
+        page_token: page_token.into(),
+    };
+    let ids = |response: &ListSourceBatchTransactionsResponse| {
+        response
+            .transactions
+            .iter()
+            .map(|transaction| transaction.transaction_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let first = svc
+        .list_source_batch_transactions(with_named_principal(request("", 2), producer))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.found);
+    assert_eq!(ids(&first), applied[..2]);
+    assert!(!first.next_page_token.is_empty());
+    let second = svc
+        .list_source_batch_transactions(with_named_principal(
+            request(&first.next_page_token, 2),
+            producer,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&second), applied[2..]);
+    assert!(second.next_page_token.is_empty());
+
+    let malformed = svc
+        .list_source_batch_transactions(with_named_principal(request("not-a-token", 2), producer))
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+
+    // A caller GetSourceSyncState refuses is refused here with the same status.
+    let outsider = "connector/outsider";
+    let sync = svc
+        .get_source_sync_state(with_named_principal(
+            GetSourceSyncStateRequest {
+                namespace: namespace.into(),
+                source_instance: "acme/ops".into(),
+                type_digest: SOURCE_TYPE_DIGEST.into(),
+            },
+            outsider,
+        ))
+        .await
+        .unwrap_err();
+    let history = svc
+        .list_source_batch_transactions(with_named_principal(request("", 0), outsider))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (history.code(), history.message()),
+        (sync.code(), sync.message())
+    );
+}
+
+#[tokio::test]
 async fn source_sync_authorized_success_replay_and_state_are_exact() {
     let svc = service();
     let namespace = "sync-authorized";

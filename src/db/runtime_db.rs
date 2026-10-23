@@ -2095,6 +2095,36 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_source_batch_transactions(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+        type_digest: &str,
+        before: Option<&crate::db::object_sync::BatchHistoryCursor>,
+        limit: usize,
+    ) -> Result<Option<crate::db::object_sync::SourceBatchHistory>, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSyncBackend::list_source_batch_transactions(
+                db.as_ref(),
+                namespace,
+                source_instance,
+                type_digest,
+                before,
+                limit,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ObjectSyncBackend::list_source_batch_transactions(
+                    db.as_ref(),
+                    namespace,
+                    source_instance,
+                    type_digest,
+                    before,
+                    limit,
+                )
+            }),
+        }
+    }
+
     pub fn get_source_sync_state(
         &self,
         namespace: &str,
