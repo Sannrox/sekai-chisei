@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "list-object-comments-anonymous",
+  "as": "anonymous",
+  "call": {"rpc": "ListObjectComments", "include_resolved": true},
+  "expect": {"codes": ["Unauthenticated"]}
+}

@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "get-links-anonymous",
+  "as": "anonymous",
+  "call": {"rpc": "GetLinks", "direction": "outgoing"},
+  "expect": {"codes": ["Unauthenticated"]}
+}
