@@ -7,6 +7,9 @@
   receipt; the marking only rises, and later registrations keep curated
   fields (docs/catalog.md, ADR 0122 amended, #1686).
 
+- A device-bound identity assertion is refused by every RPC that does not
+  check device proofs; none does until sync adds its RPCs (ADR 0126).
+
 - Identity assertions (`sekai.identity-assertion/v1`) accept an optional
   `device { id, ed25519_pub }` claim, and a verified one binds the
   authenticated context to the device. A protected RPC can require the

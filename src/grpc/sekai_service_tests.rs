@@ -776,6 +776,27 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
             },
         )
     };
+    // A device-bound assertion is refused by every RPC that checks no
+    // device proof, so a copied one authenticates nothing there.
+    let device_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let bound = IdentityAssertion {
+        device: Some(crate::identity_assertion::DeviceClaim {
+            id: "device-7".into(),
+            ed25519_pub: base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                device_key.verifying_key().as_bytes(),
+            ),
+        }),
+        ..claims("device-bound")
+    };
+    let refused = interceptor
+        .call(request(
+            &authority.sign(&bound).unwrap(),
+            "GetPublishedDefinitionRevision",
+        ))
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+    assert!(refused.message().contains("device proofs"), "{refused:?}");
     let token = authority.sign(&claims("valid")).unwrap();
     let authenticated = interceptor
         .call(request(&token, "GetPublishedDefinitionRevision"))
