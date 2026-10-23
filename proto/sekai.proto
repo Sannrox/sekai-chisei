@@ -3530,6 +3530,39 @@ message GenerateDefinitionChangeBundleResponse {
   ReportDefinitionConsumerImpactResponse impact = 7;
 }
 
+// Run a change bundle's backfill on a dataset branch per backed object type
+// (#1692). Writes only branches named for the bundle digest, never the
+// datasets themselves; a rerun converges on the same branch rows.
+message DryRunDefinitionChangeBundleRequest {
+  string namespace = 1;
+  string from_revision_digest = 2;
+  string to_revision_digest = 3;
+  DefinitionChangeHints hints = 4;
+  // When set, the regenerated bundle must still have this digest.
+  string bundle_digest = 5;
+}
+message DefinitionBackfillSample {
+  string key = 1;
+  map<string, string> before = 2;
+  map<string, string> after = 3;
+}
+message DefinitionBackfillDryRun {
+  string object_type = 1;
+  string dataset_id = 2;
+  string branch = 3;
+  int64 rows = 4;
+  int64 rows_changed = 5;
+  repeated DefinitionBackfillSample samples = 6;
+  // True when the caller may not read the dataset's marking: counts only.
+  bool samples_withheld = 7;
+}
+message DryRunDefinitionChangeBundleResponse {
+  string bundle_digest = 1;
+  repeated DefinitionBackfillDryRun runs = 2;
+  // Object types with a backfill but no backing dataset to run it on.
+  repeated string unbacked_object_types = 3;
+}
+
 message DefinitionCompatibilityReason {
   string class = 1;
   string member_kind = 2;
@@ -3715,6 +3748,7 @@ service SekaiService {
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
+  rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   rpc GetOntologyChangelog(GetOntologyChangelogRequest) returns (GetOntologyChangelogResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);
   rpc ExecuteDefinitionFactMigration(ExecuteDefinitionFactMigrationRequest) returns (ExecuteDefinitionFactMigrationResponse);
