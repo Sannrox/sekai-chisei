@@ -378,6 +378,21 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "GenerateDefinitionChangeBundle",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/definition_change_bundle.rs",
+        "src/grpc/definition_change_bundle_rpc.rs",
+        "docs/definition-change-bundles.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.graph"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ClassifyDefinitionRevisionCompatibility",
       "kind": "persistent",
       "surfaces": [
