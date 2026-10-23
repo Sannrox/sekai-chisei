@@ -123,6 +123,7 @@ pub mod semantic;
 pub mod sentinel;
 pub mod synthetic;
 pub mod synthetic_game;
+pub mod synthetic_shape;
 pub use sekai_types::service_principal;
 pub mod skillextract;
 pub mod source_health;

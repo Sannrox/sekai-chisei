@@ -2,14 +2,11 @@
 
 ## Unreleased
 
-- Every object change row records its writer: source transaction, transform
-  run and checkpoint, Action instance or direct write, with a writer
-  reference and receipt id, on SQLite and PostgreSQL. Transform marking
-  stamps now write change rows. Older rows read as `unattributed`
-  (docs/operation-correlation.md, `0098_object_change_writer`, GATE:mig,
-  #1690).
-
-
+- Local twins: `sekai::synthetic_shape` extracts a `sekai.twin-shape/v1`
+  shape from a tenant (definitions, counts, marking shares, numeric ranges,
+  link counts; no string or individual value), and a
+  `ShapeDomain` lets the synthetic generator build a twin from it
+  deterministically (docs/local-twins.md, #1735).
 - Offline sync purges: a change in what the caller may read no longer ends
   the cursor. The next delta purges objects the caller lost whole and
   properties it lost alone (`purges`). Scopes may set `max_offline_age_ms`,
