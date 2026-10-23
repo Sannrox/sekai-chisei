@@ -12564,3 +12564,72 @@ async fn a_marked_action_receipt_reads_as_missing_without_clearance() {
     let shown = read().await.unwrap().into_inner();
     assert!(shown.receipt_json.contains("confidential"));
 }
+
+#[tokio::test]
+async fn stored_embedding_specs_resolve_hosted_routes_like_execution() {
+    // #1609: a loopback route is local, and a namespace without the route
+    // or without a policy allowing its runtime gets no embedder.
+    super::native_execution_lifecycle::HOSTED_CREDENTIAL_OVERRIDE
+        .with(|value| *value.borrow_mut() = Some("hosted-secret".into()));
+    let origin = "http://127.0.0.1:9";
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut config = config(":memory:");
+    config.routing_endpoint_allowlist =
+        crate::chisei::routing_profiles::endpoint_allowlist_from(origin);
+    config.routing_credential_refs = vec!["ACME".into()];
+    let service = Arc::new(ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        config,
+    ));
+    service
+        .put_routing_profile(Request::new(PutRoutingProfileRequest {
+            namespace: "support".into(),
+            name: "embed".into(),
+            endpoint_url: format!("{origin}/v1"),
+            model_patterns: vec!["embed-*".into()],
+            credential_ref: "ACME".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let model = "hosted.embed/embed-small";
+    // Outside the profile's model patterns, even when the policy allows it.
+    let unlisted = "hosted.embed/other";
+    assert!(service.hosted_embedder("support", model).is_err());
+    let policy = |data_class: &str| crate::chisei::policy::Policy {
+        allowed_runtimes: vec!["hosted.embed".into()],
+        allowed_models: vec![model.into(), unlisted.into()],
+        default_runtime: "hosted.embed".into(),
+        default_model: model.into(),
+        data_class: data_class.into(),
+    };
+    // Sensitive data never goes to a provider the privacy gate does not trust.
+    service
+        .policy
+        .set_namespace_policy("support", policy("sensitive"));
+    let gated = service.hosted_embedder("support", model).err().unwrap();
+    assert!(gated.message().contains("privacy gate"), "{gated:?}");
+    service
+        .policy
+        .set_namespace_policy("support", policy("unclassified"));
+    let embedder = service.hosted_embedder("support", model).unwrap();
+    assert_eq!(embedder.model(), model);
+    assert!(!embedder.external());
+    assert!(service.hosted_embedder("support", unlisted).is_err());
+    assert!(
+        service
+            .hosted_embedder("support", "hosted.embed/embed-large")
+            .is_err(),
+        "a model the policy does not list is refused"
+    );
+    assert!(service.hosted_embedder("other", model).is_err());
+    // An embedder already built is readmitted from live policy every time.
+    assert!(embedder.screen("text").is_ok());
+    service
+        .policy
+        .set_namespace_policy("support", policy("sensitive"));
+    assert!(embedder.screen("text").is_err());
+    assert!(embedder.embed(&["text".into()]).await.is_err());
+}

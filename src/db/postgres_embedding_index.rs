@@ -1,10 +1,13 @@
-//! PostgreSQL storage for the embedding index (migration 0086).
+//! PostgreSQL storage for the embedding index (migrations 0086 and 0094).
 
-use crate::db::embedding_index::{join_classifications, split_classifications};
+use crate::db::embedding_index::{
+    join_classifications, join_properties, split_classifications, stored_spec,
+};
 use crate::db::postgres::PostgresDb;
 use crate::sekai::embedding_index::{
     EMBEDDING_REVISION_CONFLICT, EmbeddingCheckpoint, EmbeddingChunk, EmbeddingRebuild,
-    EmbeddingSource, EmbeddingStore, ObjectEmbeddings, vector_bytes, vector_from_bytes,
+    EmbeddingSource, EmbeddingStore, ObjectEmbeddings, StoredEmbeddingSpec, vector_bytes,
+    vector_from_bytes,
 };
 
 fn pg_error(error: impl std::fmt::Display) -> String {
@@ -63,7 +66,7 @@ impl EmbeddingStore for PostgresDb {
         Ok(self
             .connection()?
             .query_opt(
-                "SELECT spec_digest, last_change_rowid, last_generation, revision
+                "SELECT spec_digest, last_change_rowid, last_generation, revision, updated_at_ms
                  FROM sekai_embedding_checkpoints WHERE namespace = $1 AND spec_id = $2",
                 &[&namespace, &spec_id],
             )
@@ -73,6 +76,7 @@ impl EmbeddingStore for PostgresDb {
                 last_change_rowid: row.get::<_, i64>(1).max(0) as u64,
                 last_generation: row.get::<_, i64>(2).max(0) as u64,
                 revision: row.get(3),
+                updated_at_ms: row.get(4),
             }))
     }
 
@@ -341,5 +345,120 @@ impl EmbeddingStore for PostgresDb {
                 rebuilt_at_ms: row.get(3),
             })
             .collect())
+    }
+
+    fn put_embedding_spec(&self, stored: &StoredEmbeddingSpec) -> Result<(), String> {
+        let spec = &stored.spec;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(pg_error)?;
+        // Moves the revision on (creating the row), fencing out a catch-up
+        // that listed the spec earlier, and ends any rebuild lease. The
+        // checkpoint row is locked first, in the order delete and fenced
+        // writes take it.
+        tx.execute(
+            "INSERT INTO sekai_embedding_checkpoints
+             (namespace, spec_id, spec_digest, last_change_rowid, last_generation, revision,
+              updated_at_ms)
+             VALUES ($1, $2, '', 0, 0, 1, 0)
+             ON CONFLICT (namespace, spec_id) DO UPDATE SET
+                revision = sekai_embedding_checkpoints.revision + 1, updated_at_ms = 0",
+            &[&spec.namespace, &spec.id],
+        )
+        .map_err(pg_error)?;
+        tx.execute(
+            "INSERT INTO sekai_embedding_specs
+             (namespace, spec_id, object_kind, properties, chunk_chars, dimension,
+              batch_size, model, updated_by, updated_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (namespace, spec_id) DO UPDATE SET
+                object_kind = EXCLUDED.object_kind, properties = EXCLUDED.properties,
+                chunk_chars = EXCLUDED.chunk_chars, dimension = EXCLUDED.dimension,
+                batch_size = EXCLUDED.batch_size, model = EXCLUDED.model,
+                updated_by = EXCLUDED.updated_by, updated_at_ms = EXCLUDED.updated_at_ms",
+            &[
+                &spec.namespace,
+                &spec.id,
+                &spec.object_kind,
+                &join_properties(&spec.properties),
+                &(spec.chunk_chars as i64),
+                &(spec.dimension as i64),
+                &(spec.batch_size as i64),
+                &stored.model,
+                &stored.updated_by,
+                &stored.updated_at_ms,
+            ],
+        )
+        .map_err(pg_error)?;
+        tx.commit().map_err(pg_error)
+    }
+
+    fn list_embedding_specs(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<StoredEmbeddingSpec>, String> {
+        self.connection()?
+            .query(
+                "SELECT s.namespace, s.spec_id, s.object_kind, s.properties, s.chunk_chars,
+                        s.dimension, s.batch_size, s.model, s.updated_by, s.updated_at_ms,
+                        coalesce(c.revision, 0)
+                 FROM sekai_embedding_specs s
+                 LEFT JOIN sekai_embedding_checkpoints c
+                   ON c.namespace = s.namespace AND c.spec_id = s.spec_id
+                 WHERE $1::TEXT IS NULL OR s.namespace = $1
+                 ORDER BY s.namespace, s.spec_id",
+                &[&namespace],
+            )
+            .map_err(pg_error)?
+            .iter()
+            .map(|row| {
+                stored_spec(
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                    row.get::<_, String>(3).as_str(),
+                    row.get(4),
+                    row.get(5),
+                    row.get(6),
+                    row.get(7),
+                    row.get(8),
+                    row.get(9),
+                    row.get(10),
+                )
+            })
+            .collect()
+    }
+
+    fn delete_embedding_spec(&self, namespace: &str, spec_id: &str) -> Result<bool, String> {
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(pg_error)?;
+        // The checkpoint row first (created if a first put has not made it
+        // yet), as put and fenced writes take it, so no catch-up can add
+        // vectors after the deletes below.
+        tx.execute(
+            "INSERT INTO sekai_embedding_checkpoints
+             (namespace, spec_id, spec_digest, last_change_rowid, last_generation, revision,
+              updated_at_ms)
+             VALUES ($1, $2, '', 0, 0, 1, 0)
+             ON CONFLICT (namespace, spec_id) DO UPDATE SET
+                spec_digest = '', last_change_rowid = 0, last_generation = 0,
+                revision = sekai_embedding_checkpoints.revision + 1, updated_at_ms = 0",
+            &[&namespace, &spec_id],
+        )
+        .map_err(pg_error)?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM sekai_embedding_specs WHERE namespace = $1 AND spec_id = $2",
+                &[&namespace, &spec_id],
+            )
+            .map_err(pg_error)?;
+        for table in ["sekai_embedding_chunks", "sekai_embedding_rebuilds"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE namespace = $1 AND spec_id = $2"),
+                &[&namespace, &spec_id],
+            )
+            .map_err(pg_error)?;
+        }
+        tx.commit().map_err(pg_error)?;
+        Ok(deleted == 1)
     }
 }

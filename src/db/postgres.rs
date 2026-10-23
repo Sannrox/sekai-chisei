@@ -161,6 +161,7 @@ const FENCE_BINDINGS_SCHEMA: &str = include_str!("postgres/0091_fence_bindings.s
 const MEDIA_UPLOADS_SCHEMA: &str = include_str!("postgres/0092_media_uploads.sql");
 const OBJECT_CHANGE_OPERATION_SCHEMA: &str =
     include_str!("postgres/0093_object_change_operation.sql");
+const EMBEDDING_SPECS_SCHEMA: &str = include_str!("postgres/0094_embedding_specs.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -749,6 +750,12 @@ const MIGRATIONS: &[Migration] = &[
         92,
         "object_change_operation",
         OBJECT_CHANGE_OPERATION_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        93,
+        "embedding_specs",
+        EMBEDDING_SPECS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

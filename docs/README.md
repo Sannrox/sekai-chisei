@@ -125,6 +125,8 @@ If you want to deploy or operate the control plane:
   `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
   hops/aggregates, evaluated through authorized list and traverse. A page
   is not authority.
+- [Embedding index](embedding-index.md) — stored specs embedded through a
+  hosted catalog route on a schedule, with governance tags on every vector.
 - [Permission-aware search](search.md) — experimental text search over
   objects and dataset metadata. Hits, counts, facets, and highlights come
   from the live authorized projection. A page is not authority.

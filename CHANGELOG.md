@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Embedding specs are stored per namespace and managed with experimental
+  `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined
+  mode embeds every stored spec on a schedule through its hosted catalog
+  route over the OpenAI-compatible embeddings API, admitted like hosted
+  execution; a changed spec is a recorded rebuild
+  (docs/embedding-index.md, `0094_embedding_specs`, GATE:mig, #1609).
+
 - Experimental `GenerateDefinitionChangeBundle` returns a read-only
   definition change bundle for a candidate revision: the diff, a migration
   plan from declared renames, defaults and type changes, a declarative
