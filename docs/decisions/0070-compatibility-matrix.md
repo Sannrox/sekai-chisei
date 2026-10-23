@@ -57,3 +57,11 @@ A deterministic test regenerates the matrix from Cargo, proto, and SDK
 metadata, compares it to `compatibility.json` and the proto digest, passes
 two coordinated Rust consumer pins, and fails a tampered `rev` pin and the
 vendored TypeScript copy while naming the expected revision.
+
+Amended by #1750: the matrix is generated only at release and is not
+committed. Every field is a projection of the tagged tree, and a committed
+copy made every proto change rewrite it and conflict with the next one,
+while between releases its proto revision described no shipped package.
+Tests check that generation projects the proto revision and contract and
+round-trips through `write_matrix`; the release workflow publishes the
+artifact.

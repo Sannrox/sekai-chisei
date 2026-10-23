@@ -354,8 +354,9 @@ Shared files that every lane used to touch are kept out of the way:
   changes since the last tag for the release owner to write up;
 - RPC fixture tests check the fixtures against the proto, not a hardcoded
   total, so adding an RPC touches only its fixture rows;
-- `scripts/update-proto.sh` refreshes `compatibility.json` with the proto
-  copies;
+- `compatibility.json` is release-owned: the release workflow generates it
+  from the tagged tree and attaches it to the release, so no Pull Request
+  carries the proto digest;
 - a PostgreSQL migration takes the number `scripts/next-migration.sh`
   prints, and is renumbered with it when another lane lands one first. Two
   lanes adding one both append to the migration list, so the second shows a

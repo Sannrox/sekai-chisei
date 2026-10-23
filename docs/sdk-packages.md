@@ -59,14 +59,15 @@ PyPI; the plane does not upload them.
 
 ## Compatibility matrix
 
-Each release publishes [`compatibility.json`](../compatibility.json)
-(`sekai.compatibility-matrix/v1`) as a projection of the shipped server
+Each release publishes `compatibility.json`
+(`sekai.compatibility-matrix/v1`), attached to the GitHub release, as a projection of the shipped server
 version, proto revision, `sekai-client`, `sekai-proto`, and TypeScript/Python
 package versions. Generated HTTP/JSON clients (`sdk/typescript/http.ts`,
 `sdk/python/sekai_http.py`) ship in those same packages and are reproduced
 from the maturity table in CI. See [ADR 0070](decisions/0070-compatibility-matrix.md).
-The file is not a second authority: CI regenerates it from Cargo, proto, and
-SDK metadata and fails when it drifts.
+The file is not a second authority: the release workflow generates it from
+the tagged tree's Cargo, proto, and SDK metadata, and the repository does not
+commit a copy. `generate` reproduces it for any checkout.
 
 ```text
 sekaictl admin compatibility generate --out compatibility.json
