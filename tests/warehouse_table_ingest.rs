@@ -184,6 +184,7 @@ async fn publish_object_type(
                 named_foreign_digests: Vec::new(),
                 idempotency_key: "orders-propose".into(),
                 major_revision: false,
+                migration_plan_digest: String::new(),
             },
             SCHEMA_ADMIN,
         ))

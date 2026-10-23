@@ -39,6 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[serde(default)]",
         )
         .field_attribute(
+            "sekai.CreateDefinitionProposalRequest.migration_plan_digest",
+            "#[serde(default)]",
+        )
+        .field_attribute(
             "sekai.DefinitionConsumerImpactPath.blocking",
             "#[serde(default)]",
         )

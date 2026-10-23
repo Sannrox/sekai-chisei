@@ -615,7 +615,7 @@ impl PostgresDb {
             receipt_id: String::new(),
             close_reason_code: String::new(),
             restored_from_digest: String::new(),
-            migration_plan_digest: String::new(),
+            migration_plan_digest: request.migration_plan_digest.clone(),
             major_revision: request.major_revision,
             source_package_digest: String::new(),
         };
@@ -784,6 +784,69 @@ impl PostgresDb {
             return Err(
                 "stale_published_definition_head: published head does not match pinned base".into(),
             );
+        }
+        // Each dataset's rows lock, taken in order, holds its writers off
+        // until the publish commits.
+        let mut expected = request.expected_dataset_versions.clone();
+        expected.sort();
+        for (dataset, version) in &expected {
+            crate::db::postgres::lock_dataset_rows(&mut transaction, dataset)?;
+            let latest: Option<String> = transaction
+                .query_opt(
+                    "SELECT version_id FROM sekai_dataset_versions
+                     WHERE dataset_id = $1 ORDER BY seq DESC LIMIT 1",
+                    &[dataset],
+                )
+                .map_err(|error| error.to_string())?
+                .map(|row| row.get(0));
+            if latest.unwrap_or_default() != *version {
+                return Err(format!(
+                    "{}: dataset {dataset} was written since its migration",
+                    crate::sekai::definition_proposal::MERGE_DATASET_MOVED
+                ));
+            }
+        }
+        // The binding lock, which registration takes too, holds a concurrent
+        // registration off until the publish, including for a binding that
+        // does not exist yet. Taken in kind order.
+        let mut datasources = request.expected_datasources.clone();
+        datasources.sort();
+        for (kind, fingerprint) in &datasources {
+            crate::db::postgres::lock_object_type_datasource(
+                &mut transaction,
+                &request.namespace,
+                kind,
+            )?;
+            let current = transaction
+                .query_opt(
+                    "SELECT dataset_id, key_column, property_mapping, hidden_column, edits_only
+                     FROM sekai_object_type_datasource WHERE namespace = $1 AND kind = $2",
+                    &[&request.namespace, kind],
+                )
+                .map_err(|error| error.to_string())?;
+            let actual = match current {
+                Some(row) => crate::sekai::object_type_index::datasource_fingerprint(
+                    &crate::sekai::object_type_index::ObjectTypeDatasource {
+                        contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                        namespace: request.namespace.clone(),
+                        kind: kind.clone(),
+                        definition_digest: String::new(),
+                        dataset_id: row.get(0),
+                        key_column: row.get(1),
+                        property_mapping: serde_json::from_str(&row.get::<_, String>(2))
+                            .map_err(|error| error.to_string())?,
+                        hidden_column: row.get(3),
+                        edits_only: row.get(4),
+                    },
+                ),
+                None => String::new(),
+            };
+            if actual != *fingerprint {
+                return Err(format!(
+                    "{}: object type {kind} was reconfigured since its migration",
+                    crate::sekai::definition_proposal::MERGE_DATASOURCE_CHANGED
+                ));
+            }
         }
         let candidate = load_revision_postgres(
             &mut transaction,

@@ -347,6 +347,13 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         lock_dataset_rows(&mut tx, &request.dataset_id)?;
         let branch = load_branch(&mut tx, &request.dataset_id, &request.branch, true)?;
+        if request
+            .expected_incarnation
+            .as_ref()
+            .is_some_and(|expected| *expected != branch.incarnation)
+        {
+            return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+        }
         // A branch is proposed only within the tenant that created it.
         if branch.tenant != request.tenant {
             return Err(dataset_branch::BRANCH_NOT_FOUND.into());
@@ -396,6 +403,16 @@ impl PostgresDb {
         &self,
         request: &MergeDatasetBranch,
     ) -> Result<DatasetBranchProposal, String> {
+        self.merge_dataset_branch_checked(request, &|_| Ok(()))
+    }
+
+    /// [`Self::merge_dataset_branch`], refused unless `check` accepts the
+    /// dataset's column definitions as read under the merge's dataset lock.
+    pub fn merge_dataset_branch_checked(
+        &self,
+        request: &MergeDatasetBranch,
+        check: &dyn Fn(&[crate::sekai::dataset::ColumnDef]) -> Result<(), String>,
+    ) -> Result<DatasetBranchProposal, String> {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
@@ -419,6 +436,15 @@ impl PostgresDb {
         if dataset_branch::rows_digest(&head) != proposal.branch_digest {
             return Err(dataset_branch::PROPOSAL_STALE_BRANCH.into());
         }
+        // Column metadata changes take the same dataset rows lock.
+        let columns: String = tx
+            .query_one(
+                "SELECT columns FROM sekai_datasets WHERE id = $1",
+                &[&request.dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        check(&crate::sekai::dataset::parse_columns(&columns)?)?;
         tx.execute(
             "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
             &[&request.dataset_id],

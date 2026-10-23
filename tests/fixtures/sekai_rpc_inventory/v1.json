@@ -423,6 +423,42 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ApplyDefinitionChangeBundle",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/sekai/definition_bundle_apply.rs",
+        "src/grpc/definition_bundle_apply_rpc.rs",
+        "docs/definition-change-bundles.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.datasets"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetDefinitionBundleApply",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/sekai/definition_bundle_apply.rs",
+        "src/grpc/definition_bundle_apply_rpc.rs",
+        "docs/definition-change-bundles.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.datasets"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ClassifyDefinitionRevisionCompatibility",
       "kind": "persistent",
       "surfaces": [

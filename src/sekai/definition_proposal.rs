@@ -80,6 +80,10 @@ pub struct CreateDefinitionProposal {
     pub idempotency_key: String,
     #[serde(default)]
     pub major_revision: bool,
+    /// Digest of the change bundle this proposal migrates by (#1693); part of
+    /// the approved proposal digest, so apply runs only that bundle.
+    #[serde(default)]
+    pub migration_plan_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +99,23 @@ pub struct MergeDefinitionProposal {
     pub proposal_id: String,
     pub expected_published_digest: String,
     pub idempotency_key: String,
+    /// Datasets a change bundle migrated, with the version each must still be
+    /// at when the proposal publishes (#1693). Checked in the publish
+    /// transaction; outside the request digest, so a retry still replays.
+    #[serde(default, skip_serializing)]
+    pub expected_dataset_versions: Vec<(String, String)>,
+    /// Object types a change bundle migrated, with the datasource fingerprint
+    /// (`object_type_index::datasource_fingerprint`) each must still have when
+    /// the proposal publishes. Checked like `expected_dataset_versions`.
+    #[serde(default, skip_serializing)]
+    pub expected_datasources: Vec<(String, String)>,
 }
+
+/// Merge refusal: a datasource a change bundle migrated was reconfigured.
+pub const MERGE_DATASOURCE_CHANGED: &str = "definition_bundle_apply_datasource_changed";
+
+/// Merge refusal: a dataset a change bundle migrated was written since.
+pub const MERGE_DATASET_MOVED: &str = "definition_bundle_apply_data_moved";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseDefinitionProposal {
@@ -336,6 +356,9 @@ impl CreateDefinitionProposal {
             &self.idempotency_key,
             MAX_DEFINITION_ID_BYTES,
         )?;
+        if !self.migration_plan_digest.is_empty() {
+            validate_digest("migration_plan_digest", &self.migration_plan_digest)?;
+        }
         if self.base_digest == self.candidate_digest {
             return Err("definition_proposal_no_change: candidate must differ from base".into());
         }
@@ -359,7 +382,7 @@ impl CreateDefinitionProposal {
             eval_plan_digests: &eval_plan_digests,
             named_foreign_digests: &named_foreign_digests,
             restored_from_digest: "",
-            migration_plan_digest: "",
+            migration_plan_digest: &self.migration_plan_digest,
             major_revision: self.major_revision,
             source_package_digest: "",
         })?;
@@ -374,7 +397,7 @@ impl CreateDefinitionProposal {
                 eval_plan_digests: &eval_plan_digests,
                 named_foreign_digests: &named_foreign_digests,
                 restored_from_digest: "",
-                migration_plan_digest: "",
+                migration_plan_digest: &self.migration_plan_digest,
                 major_revision: self.major_revision,
                 source_package_digest: "",
             },
@@ -936,6 +959,7 @@ mod tests {
             named_foreign_digests: vec![digest('f')],
             idempotency_key: "propose-1".into(),
             major_revision: false,
+            migration_plan_digest: String::new(),
         }
     }
 
@@ -1043,6 +1067,8 @@ mod tests {
             proposal_id: "cs-1".into(),
             expected_published_digest: String::new(),
             idempotency_key: "merge-1".into(),
+            expected_dataset_versions: Vec::new(),
+            expected_datasources: Vec::new(),
         };
         assert!(
             request

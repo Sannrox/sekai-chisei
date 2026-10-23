@@ -99,6 +99,10 @@ pub struct ProposeDatasetBranch {
     pub branch: String,
     pub actor: String,
     pub tenant: String,
+    /// When set, the branch must still be this incarnation, checked in the
+    /// transaction that captures its rows, so a branch recreated under the
+    /// same name is never proposed in its place.
+    pub expected_incarnation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

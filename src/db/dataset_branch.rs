@@ -412,6 +412,13 @@ impl SekaiDb {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let branch = load_branch(&tx, &request.dataset_id, &request.branch)?;
+        if request
+            .expected_incarnation
+            .as_ref()
+            .is_some_and(|expected| *expected != branch.incarnation)
+        {
+            return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+        }
         // A branch is proposed only within the tenant that created it.
         if branch.tenant != request.tenant {
             return Err(dataset_branch::BRANCH_NOT_FOUND.into());
@@ -463,6 +470,16 @@ impl SekaiDb {
         &self,
         request: &MergeDatasetBranch,
     ) -> Result<DatasetBranchProposal, String> {
+        self.merge_dataset_branch_checked(request, &|_| Ok(()))
+    }
+
+    /// [`Self::merge_dataset_branch`], refused unless `check` accepts the
+    /// dataset's column definitions as read in the merge's transaction.
+    pub fn merge_dataset_branch_checked(
+        &self,
+        request: &MergeDatasetBranch,
+        check: &dyn Fn(&[crate::sekai::dataset::ColumnDef]) -> Result<(), String>,
+    ) -> Result<DatasetBranchProposal, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let mut proposal = load_proposal(&tx, &request.dataset_id, &request.proposal_id)?;
@@ -483,6 +500,14 @@ impl SekaiDb {
         if dataset_branch::rows_digest(&head) != proposal.branch_digest {
             return Err(dataset_branch::PROPOSAL_STALE_BRANCH.into());
         }
+        let columns: String = tx
+            .query_row(
+                "SELECT columns FROM sekai_datasets WHERE id = ?1",
+                params![request.dataset_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        check(&crate::sekai::dataset::parse_columns(&columns)?)?;
         tx.execute(
             "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
             params![request.dataset_id],
@@ -1166,6 +1191,74 @@ mod tests {
         db.query_rows(id, &RowQuery::default()).unwrap()
     }
 
+    /// A checked merge (#1693) writes nothing when its check refuses the
+    /// dataset's column definitions, and the proposal stays open.
+    #[test]
+    fn a_checked_merge_refuses_what_its_check_refuses() {
+        let db = crate::db::runtime_db::RuntimeDb::memory();
+        let id = format!("ds-{}", uuid::Uuid::new_v4().as_simple());
+        db.create_dataset(&Dataset {
+            id: id.clone(),
+            name: id.clone(),
+            columns: ["id", "value"]
+                .map(|name| ColumnDef {
+                    name: name.into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                })
+                .to_vec(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(&id, &[row("1", "a")]).unwrap();
+        db.create_dataset_branch(&CreateDatasetBranch {
+            dataset_id: id.clone(),
+            name: "b".into(),
+            actor: "author".into(),
+            tenant: "t1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.write_dataset_branch_rows(&id, "b", &[row("1", "changed")], true)
+            .unwrap();
+        // A proposal fenced on another incarnation finds no branch.
+        let mut propose = ProposeDatasetBranch {
+            dataset_id: id.clone(),
+            branch: "b".into(),
+            actor: "author".into(),
+            tenant: "t1".into(),
+            expected_incarnation: Some("an-earlier-branch".into()),
+        };
+        assert_eq!(
+            db.propose_dataset_branch(&propose).unwrap_err(),
+            dataset_branch::BRANCH_NOT_FOUND
+        );
+        propose.expected_incarnation = None;
+        let proposal = db.propose_dataset_branch(&propose).unwrap();
+        let merge = MergeDatasetBranch {
+            dataset_id: id.clone(),
+            proposal_id: proposal.id.clone(),
+            actor: "merger".into(),
+            tenant: "t1".into(),
+            reason: String::new(),
+        };
+        let refused = db
+            .merge_dataset_branch_checked(&merge, &|columns| {
+                assert_eq!(columns.len(), 2);
+                Err("column check refused".into())
+            })
+            .unwrap_err();
+        assert_eq!(refused, "column check refused");
+        let rows = db.query_rows(&id, &RowQuery::default()).unwrap();
+        assert_eq!(rows[0]["value"], "a");
+        let merged = db
+            .merge_dataset_branch_checked(&merge, &|_| Ok(()))
+            .unwrap();
+        assert_eq!(merged.status, dataset_branch::STATUS_MERGED);
+    }
+
     /// Redaction deletes change bundle dry-run branches whole (#1692) and
     /// leaves other branches to the field redaction.
     fn exercise_bundle_branches_drop_on_redaction(db: &dyn DatasetBackend) {
@@ -1266,6 +1359,7 @@ mod tests {
         assert_eq!(db.list_dataset_versions(&id).unwrap(), versions);
 
         let propose = ProposeDatasetBranch {
+            expected_incarnation: None,
             dataset_id: id.clone(),
             branch: "fix".into(),
             actor: "dev".into(),

@@ -14,6 +14,8 @@ mod catalog_invocation;
 mod catalog_rpc;
 #[path = "computed_response.rs"]
 mod computed_response;
+#[path = "definition_bundle_apply_rpc.rs"]
+mod definition_bundle_apply_rpc;
 #[path = "definition_change_bundle_rpc.rs"]
 mod definition_change_bundle_rpc;
 #[path = "definition_consumer_impact.rs"]
@@ -692,6 +694,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DryRunDefinitionChangeBundleRequest>,
     ) -> Result<Response<DryRunDefinitionChangeBundleResponse>, Status> {
         rpc_data::dry_run_definition_change_bundle(self, req).await
+    }
+
+    async fn apply_definition_change_bundle(
+        &self,
+        req: Request<ApplyDefinitionChangeBundleRequest>,
+    ) -> Result<Response<ApplyDefinitionChangeBundleResponse>, Status> {
+        definition_bundle_apply_rpc::apply_definition_change_bundle(self, req).await
+    }
+
+    async fn get_definition_bundle_apply(
+        &self,
+        req: Request<GetDefinitionBundleApplyRequest>,
+    ) -> Result<Response<GetDefinitionBundleApplyResponse>, Status> {
+        definition_bundle_apply_rpc::get_definition_bundle_apply(self, req).await
     }
 
     async fn classify_definition_revision_compatibility(

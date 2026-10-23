@@ -416,6 +416,7 @@ mod tests {
         );
         let proposal = data
             .propose_dataset_branch(&ProposeDatasetBranch {
+                expected_incarnation: None,
                 dataset_id: output.clone(),
                 branch: latest.branch.clone(),
                 actor: "analyst".into(),

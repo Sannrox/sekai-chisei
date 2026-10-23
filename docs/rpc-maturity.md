@@ -105,6 +105,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.ReportDefinitionConsumerImpact` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GenerateDefinitionChangeBundle` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.DryRunDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ApplyDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetDefinitionBundleApply` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ClassifyDefinitionRevisionCompatibility` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ExecuteDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |

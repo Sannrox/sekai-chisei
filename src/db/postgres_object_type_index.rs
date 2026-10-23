@@ -16,7 +16,16 @@ impl PostgresDb {
         let existing = self.get_object_type_datasource(&binding.namespace, &binding.kind)?;
         let mapping =
             serde_json::to_string(&binding.property_mapping).map_err(|e| e.to_string())?;
-        self.connection()?
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        crate::db::postgres::lock_object_type_datasource(
+            &mut transaction,
+            &binding.namespace,
+            &binding.kind,
+        )?;
+        transaction
             .execute(
                 "INSERT INTO sekai_object_type_datasource
                  (namespace, kind, definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only, created_at_ms)
@@ -41,6 +50,7 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
         if existing
             .as_ref()
             .is_none_or(|previous| previous.changes_hop_generation(binding))

@@ -615,6 +615,7 @@ pub(super) async fn create_definition_proposal(
         named_foreign_digests: input.named_foreign_digests,
         idempotency_key: input.idempotency_key,
         major_revision: input.major_revision,
+        migration_plan_digest: input.migration_plan_digest,
     };
     request.prepare().map_err(Status::invalid_argument)?;
     authorize_definition_revision(
@@ -776,42 +777,24 @@ pub(super) async fn approve_definition_proposal(
         proposal: Some(to_proto_definition_proposal(&proposal)),
     }))
 }
-pub(super) async fn merge_definition_proposal(
+/// The checks before a proposal's revision is published (merge, or the last
+/// step of a change bundle apply): the actor did not create it, may read both
+/// revisions and write the changed members, an approval is still current, and
+/// agent tool approvals hold. Returns the acting principal.
+pub(super) fn authorize_definition_proposal_merge(
     service: &SekaiServiceImpl,
-    req: Request<MergeDefinitionProposalRequest>,
-) -> Result<Response<MergeDefinitionProposalResponse>, Status> {
-    let principals = caller_principals(&req);
-    require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
-    let input = req.into_inner();
-    authorize_source_sync_namespace(
-        service,
-        &principals,
-        tenant_context.as_ref(),
-        &input.namespace,
-        true,
-    )?;
-    let request = definition_proposal_domain::MergeDefinitionProposal {
-        namespace: input.namespace,
-        proposal_id: input.proposal_id,
-        expected_published_digest: input.expected_published_digest,
-        idempotency_key: input.idempotency_key,
-    };
-    request.request_digest().map_err(Status::invalid_argument)?;
-    let proposal = service
-        .db
-        .runtime()
-        .get_definition_proposal(&request.namespace, &request.proposal_id)
-        .map_err(|_| Status::internal("definition proposal unavailable"))?
-        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    proposal: &crate::sekai::definition_proposal::DefinitionProposal,
+) -> Result<String, Status> {
     let actor = principals
         .first()
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
-    refuse_proposal_creator(&proposal, actor, "merge")?;
-    authorize_proposal_revision_reads(service, &principals, &proposal)?;
+    refuse_proposal_creator(proposal, actor, "merge")?;
+    authorize_proposal_revision_reads(service, principals, proposal)?;
     authorize_proposal_member_writes(
         service,
-        &principals,
+        principals,
         &proposal.namespace,
         &proposal.base_digest,
         &proposal.candidate_digest,
@@ -821,7 +804,7 @@ pub(super) async fn merge_definition_proposal(
         authorize_source_sync_namespace(
             service,
             principals,
-            tenant_context.as_ref(),
+            tenant_context,
             &proposal.namespace,
             true,
         )
@@ -843,6 +826,46 @@ pub(super) async fn merge_definition_proposal(
     }
     agent_tool_approvals(service, &proposal.namespace, &proposal.candidate_digest)?
         .map_err(Status::failed_precondition)?;
+    Ok(actor.clone())
+}
+
+pub(super) async fn merge_definition_proposal(
+    service: &SekaiServiceImpl,
+    req: Request<MergeDefinitionProposalRequest>,
+) -> Result<Response<MergeDefinitionProposalResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    let request = definition_proposal_domain::MergeDefinitionProposal {
+        namespace: input.namespace,
+        proposal_id: input.proposal_id,
+        expected_published_digest: input.expected_published_digest,
+        idempotency_key: input.idempotency_key,
+        expected_dataset_versions: Vec::new(),
+        expected_datasources: Vec::new(),
+    };
+    request.request_digest().map_err(Status::invalid_argument)?;
+    let proposal = service
+        .db
+        .runtime()
+        .get_definition_proposal(&request.namespace, &request.proposal_id)
+        .map_err(|_| Status::internal("definition proposal unavailable"))?
+        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    let actor = authorize_definition_proposal_merge(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &proposal,
+    )?;
+    let actor = actor.as_str();
     let result = service
         .db
         .runtime()

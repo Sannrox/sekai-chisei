@@ -3379,6 +3379,9 @@ message CreateDefinitionProposalRequest {
   // Propose a new major revision. Once approved it may break blocking
   // consumer bindings; the flag is part of the approved proposal digest.
   bool major_revision = 9;
+  // The change bundle digest this proposal migrates by (#1693). Part of the
+  // approved proposal digest: ApplyDefinitionChangeBundle runs only it.
+  string migration_plan_digest = 10;
 }
 
 message CreateDefinitionProposalResponse {
@@ -3642,6 +3645,54 @@ message DryRunDefinitionChangeBundleResponse {
   repeated string unbacked_object_types = 3;
 }
 
+// Applies an approved proposal's change bundle (#1693): for each dataset
+// backing a backfilled object type, backfill its bundle branch, verify it,
+// and merge it; then publish the proposal's revision, last. A rerun resumes
+// the same apply.
+message ApplyDefinitionChangeBundleRequest {
+  string namespace = 1;
+  // The proposal pins the base and candidate revisions the bundle spans.
+  string proposal_id = 2;
+  DefinitionChangeHints hints = 3;
+  // The bundle the reviewers approved; the regenerated bundle must match.
+  string bundle_digest = 4;
+  // The published head the final publish compare-and-swaps against.
+  string expected_published_digest = 5;
+}
+message DefinitionBundleApplyStep {
+  // backfill:<dataset>, verify:<dataset>, merge:<dataset>, or publish.
+  string name = 1;
+  // pending, done, or failed.
+  string status = 2;
+  // What the step left: the branch, the dataset merge proposal (which names
+  // the merged version), the published digest; or the error.
+  string detail = 3;
+}
+message DefinitionBundleApply {
+  string contract_version = 1;
+  string namespace = 2;
+  string proposal_id = 3;
+  string bundle_digest = 4;
+  // running, failed, or completed.
+  string status = 5;
+  repeated DefinitionBundleApplyStep steps = 6;
+  string failed_step = 7;
+  string error = 8;
+  string applied_by = 9;
+  int64 created_at_ms = 10;
+  int64 updated_at_ms = 11;
+}
+message ApplyDefinitionChangeBundleResponse {
+  DefinitionBundleApply apply = 1;
+}
+message GetDefinitionBundleApplyRequest {
+  string namespace = 1;
+  string proposal_id = 2;
+}
+message GetDefinitionBundleApplyResponse {
+  DefinitionBundleApply apply = 1;
+}
+
 message DefinitionCompatibilityReason {
   string class = 1;
   string member_kind = 2;
@@ -3829,6 +3880,9 @@ service SekaiService {
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
+  // Experimental: apply an approved proposal's change bundle, resumably (#1693).
+  rpc ApplyDefinitionChangeBundle(ApplyDefinitionChangeBundleRequest) returns (ApplyDefinitionChangeBundleResponse);
+  rpc GetDefinitionBundleApply(GetDefinitionBundleApplyRequest) returns (GetDefinitionBundleApplyResponse);
   rpc GetOntologyChangelog(GetOntologyChangelogRequest) returns (GetOntologyChangelogResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);
   rpc ExecuteDefinitionFactMigration(ExecuteDefinitionFactMigrationRequest) returns (ExecuteDefinitionFactMigrationResponse);

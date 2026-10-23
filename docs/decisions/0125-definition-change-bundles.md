@@ -71,3 +71,11 @@ cannot be read from the diff alone.
 - Typed conversions in this layer: definitions carry no property types.
 - Storing generated bundles: generation stays a pure read, and the digest
   identifies a bundle for the apply record.
+
+Amended by #1693: an approved proposal's bundle is applied by
+`ApplyDefinitionChangeBundle` as a durable, resumable record of ordered,
+idempotent steps (backfill, verify and merge per backing dataset, then
+publish last), so a failed or interrupted apply never leaves a published
+revision ahead of its data. Cross-store two-phase commit and publishing
+first with a rollback were rejected. See [definition-change-bundles.md](../definition-change-bundles.md#apply).
+
