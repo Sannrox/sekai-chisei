@@ -7,6 +7,11 @@
   digest, and reports row counts and marking-aware samples; the datasets
   themselves are never written (docs/definition-change-bundles.md, #1692).
 
+- Query embedding for vector search: `embed_query` embeds a query through
+  the stored spec's admitted route and refuses a route whose model or
+  version differs from the indexed vectors, or an external route for a
+  spec with a restricted property (docs/embedding-index.md, #1681).
+
 - Embedding specs are stored per namespace and managed with experimental
   `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined
   mode embeds every stored spec on a schedule through its hosted catalog

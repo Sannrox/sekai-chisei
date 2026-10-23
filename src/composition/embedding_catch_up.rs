@@ -261,6 +261,77 @@ where
     Ok(outcomes)
 }
 
+/// Embeds a search query for the stored spec of `object_kind` in
+/// `namespace` (#1681), through the same admitted route `route` returns for
+/// indexing. The route must produce the vectors the index holds: its model
+/// and version give the indexed spec digest, or the query is refused. An
+/// external route is refused when a source property of the spec is
+/// classified restricted, as for indexing; the text then passes the route's
+/// screen before it is sent.
+pub async fn embed_query<Route, Admitted>(
+    db: &RuntimeDb,
+    namespace: &str,
+    object_kind: &str,
+    text: &str,
+    route: Route,
+) -> Result<Vec<f32>, EmbeddingError>
+where
+    Route: Fn(StoredEmbeddingSpec) -> Admitted,
+    Admitted: std::future::Future<Output = Result<Box<dyn Embedder>, EmbeddingError>>,
+{
+    let mut specs = db
+        .list_embedding_specs(Some(namespace))?
+        .into_iter()
+        .filter(|stored| stored.spec.object_kind == object_kind);
+    let stored = specs.next().ok_or_else(|| {
+        EmbeddingError::InvalidArgument(format!("no embedding spec for {object_kind}"))
+    })?;
+    if specs.next().is_some() {
+        return Err(EmbeddingError::InvalidArgument(format!(
+            "more than one embedding spec for {object_kind}; name one"
+        )));
+    }
+    let spec = stored.spec.clone();
+    let embedder = route(stored).await?;
+    let digest = spec.digest(embedder.model(), embedder.model_version());
+    match db.embedding_checkpoint(namespace, &spec.id)? {
+        Some(checkpoint) if checkpoint.spec_digest == digest => {}
+        _ => {
+            return Err(EmbeddingError::Refused(
+                "the route's model or version does not match the indexed vectors".into(),
+            ));
+        }
+    }
+    if embedder.external() {
+        let schema = db.get_object_type(object_kind)?;
+        if let Some(property) = spec.properties.iter().find(|name| {
+            schema
+                .as_ref()
+                .and_then(|schema| schema.properties.iter().find(|p| &p.name == *name))
+                .is_some_and(|p| {
+                    crate::sekai::schema::is_restricted_property_classification(&p.classification)
+                })
+        }) {
+            return Err(EmbeddingError::Refused(format!(
+                "property `{property}` may not leave the deployment; query embedding needs a self-hosted route"
+            )));
+        }
+    }
+    embedder.screen(text).map_err(EmbeddingError::Refused)?;
+    let mut vectors = tokio::time::timeout(EMBED_CALL_TIMEOUT, embedder.embed(&[text.to_string()]))
+        .await
+        .map_err(|_| EmbeddingError::Model("embedding call timed out".into()))?
+        .map_err(EmbeddingError::Model)?;
+    match vectors.pop() {
+        Some(vector) if vectors.is_empty() && vector.len() == spec.dimension => Ok(vector),
+        _ => Err(EmbeddingError::Model(format!(
+            "model {} did not return one vector of dimension {}",
+            embedder.model(),
+            spec.dimension
+        ))),
+    }
+}
+
 async fn rebuild(
     db: &RuntimeDb,
     spec: &EmbeddingSpec,
@@ -1116,5 +1187,78 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(screening.inner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn exercise_query_embedding(db: &RuntimeDb) {
+        db.upsert_object_type(&ObjectType {
+            kind: "note".into(),
+            description: String::new(),
+            properties: vec![property("body", "sensitive"), property("title", "public")],
+            is_builtin: false,
+            implements: Vec::new(),
+        })
+        .unwrap();
+        db.create_object_with_audit(&note("q1", "quarterly", "plan"), "test")
+            .unwrap();
+        let mut spec = spec();
+        // One chunk per object, so a query of the same text matches it.
+        spec.chunk_chars = 1_000;
+        db.put_embedding_spec(&StoredEmbeddingSpec {
+            spec: spec.clone(),
+            model: "embed-test".into(),
+            updated_by: "admin".into(),
+            updated_at_ms: 1,
+            revision: 0,
+        })
+        .unwrap();
+        let route = |version: &'static str, external: bool| {
+            move |_: StoredEmbeddingSpec| async move {
+                Ok(Box::new(Counting::new(version, external)) as Box<dyn Embedder>)
+            }
+        };
+        catch_up_stored_specs(db, route("v1", false), &|| 1_000)
+            .await
+            .unwrap();
+        let stored = db.embedding_chunks(NS, &spec.id).unwrap();
+        let text = "body: quarterly\ntitle: plan";
+
+        // The same route embeds the query as the index embedded the object.
+        let query = embed_query(db, NS, "note", text, route("v1", false))
+            .await
+            .unwrap();
+        assert_eq!(query, stored[0].vector);
+
+        // Another model version would compare unlike vectors.
+        let other = embed_query(db, NS, "note", text, route("v2", false)).await;
+        assert!(
+            matches!(other, Err(EmbeddingError::Refused(_))),
+            "{other:?}"
+        );
+
+        // An external route refuses a spec with a sensitive source property.
+        let external = embed_query(db, NS, "note", text, route("v1", true)).await;
+        assert!(
+            matches!(external, Err(EmbeddingError::Refused(_))),
+            "{external:?}"
+        );
+
+        let missing = embed_query(db, NS, "ticket", text, route("v1", false)).await;
+        assert!(matches!(missing, Err(EmbeddingError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn query_embedding_matches_the_index_and_refuses_other_routes() {
+        exercise_query_embedding(&RuntimeDb::memory()).await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_query_embedding_matches_the_index_and_refuses_other_routes() {
+        let (_scratch, db) = postgres_runtime();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(exercise_query_embedding(&db));
     }
 }
