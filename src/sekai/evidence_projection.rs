@@ -462,6 +462,7 @@ impl SekaiDb {
             changed_by: submission.producer_identity.clone(),
             timestamp: now_ms,
             operation_id: String::new(),
+            ..Default::default()
         }];
         insert_object_changes(&tx, &changes)?;
 

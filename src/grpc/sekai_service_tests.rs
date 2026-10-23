@@ -7116,6 +7116,7 @@ async fn noop_update_does_not_record_audit_change() {
 
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].field, "_created");
+    assert_eq!(changes[0].writer_kind, "direct");
 }
 
 #[tokio::test]
@@ -8674,6 +8675,10 @@ async fn submit_action_instance_propagates_one_operation_identity() {
         .iter()
         .find(|change| !change.operation_id.is_empty())
         .expect("object-change event");
+    // The Action instance wrote it, under its operation receipt (#1690).
+    assert_eq!(object_change.writer_kind, "action_instance");
+    assert!(!object_change.writer_ref.is_empty());
+    assert_eq!(object_change.receipt_id, operation_id);
     crate::sekai::operation_correlation::OperationCarriers {
         span: span_operation_id(&logs, operation_id),
         receipt: receipt.operation_id,
@@ -10388,6 +10393,7 @@ async fn grant_and_audit_rpcs_round_trip() {
             changed_by: "tester".into(),
             timestamp: 11,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 
@@ -17226,6 +17232,7 @@ async fn delegated_service_intersects_acl_properties_and_marking_clearance() {
             changed_by: "service-a".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     for (actor, expected_value) in [(None, "private value"), (Some("human-a"), REDACTED_VALUE)] {
@@ -18908,6 +18915,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18920,6 +18928,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 2,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18932,6 +18941,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 3,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 
@@ -18987,6 +18997,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 4,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18999,6 +19010,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 5,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let after_raise = svc
@@ -19020,6 +19032,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 6,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19032,6 +19045,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 6,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19044,6 +19058,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 6,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let same_ms = svc
@@ -19105,6 +19120,7 @@ async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
             changed_by: "owner".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19117,6 +19133,7 @@ async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
             changed_by: "owner".into(),
             timestamp: 2,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let mut req = with_named_principal(
@@ -19162,6 +19179,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             changed_by: "owner".into(),
             timestamp: 3,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let marking = format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY);
@@ -19175,6 +19193,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             changed_by: "owner".into(),
             timestamp: 4,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19187,6 +19206,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             changed_by: "owner".into(),
             timestamp: 5,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let mut req = with_named_principal(
@@ -19228,6 +19248,7 @@ async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
         changed_by: "owner".into(),
         timestamp,
         operation_id: String::new(),
+        ..Default::default()
     };
     runtime
         .record_object_change(&marking("ms-downgrade", "confidential", "internal", 1))
@@ -19245,6 +19266,7 @@ async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
             changed_by: "owner".into(),
             timestamp: 2,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -26970,4 +26992,45 @@ async fn change_bundle_dry_run_backfills_a_branch_and_leaves_the_dataset() {
         .await
         .unwrap_err();
     assert_eq!(merge.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn changes_without_a_recorded_writer_read_as_unattributed() {
+    let svc = service();
+    // A row written before writer attribution, or by an internal writer
+    // that records none, is never given an inferred writer (#1690).
+    svc.db
+        .runtime()
+        .create_object_with_audit(
+            &domain::Object {
+                id: "legacy-change".into(),
+                kind: "ticket".into(),
+                name: "legacy".into(),
+                namespace: "ns".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+            "migration",
+        )
+        .unwrap();
+    let changes = svc
+        .list_object_changes(with_principal(ListObjectChangesRequest {
+            object_id: "legacy-change".into(),
+            limit: 10,
+            offset: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert!(!changes.is_empty());
+    assert!(
+        changes
+            .iter()
+            .all(|change| change.writer_kind == "unattributed"
+                && change.writer_ref.is_empty()
+                && change.receipt_id.is_empty())
+    );
 }

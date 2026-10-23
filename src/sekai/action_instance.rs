@@ -580,7 +580,10 @@ impl SekaiDb {
                     object,
                     actor,
                     None,
-                    &granted.operation_id,
+                    &crate::sekai::audit::ChangeAttribution::action(
+                        &granted.instance_id,
+                        &granted.operation_id,
+                    ),
                 )?;
                 None
             }
@@ -591,7 +594,10 @@ impl SekaiDb {
                     None,
                     actor,
                     None,
-                    &granted.operation_id,
+                    &crate::sekai::audit::ChangeAttribution::action(
+                        &granted.instance_id,
+                        &granted.operation_id,
+                    ),
                 )?
                 .ok_or_else(|| format!("object {} not found", object.id))?,
             ),

@@ -1,6 +1,9 @@
 use crate::db::postgres::PostgresDb;
+use crate::db::postgres_audit::insert_changes;
 use crate::domain::Object;
-use crate::sekai::audit::{ObjectChange, object_diff_changes, object_diff_changes_with_snapshot};
+use crate::sekai::audit::{
+    ChangeAttribution, object_diff_changes, object_diff_changes_with_snapshot,
+};
 use crate::sekai::lease::{
     Lease, LeaseError, canonical_object_input, guarded_mutation_digest, object_state_matches,
     validate_text,
@@ -141,8 +144,14 @@ impl PostgresDb {
                 .map_err(storage)?;
                 insert_changes(
                     tx,
-                    &object_diff_changes(actor, None, Some(object), transaction_now_ms),
-                )?;
+                    &ChangeAttribution::direct().stamp(object_diff_changes(
+                        actor,
+                        None,
+                        Some(object),
+                        transaction_now_ms,
+                    )),
+                )
+                .map_err(storage)?;
                 Ok(object.clone())
             },
         )
@@ -257,8 +266,14 @@ impl PostgresDb {
                 .map_err(storage)?;
                 insert_changes(
                     tx,
-                    &object_diff_changes(actor, Some(&before), Some(object), transaction_now_ms),
-                )?;
+                    &ChangeAttribution::direct().stamp(object_diff_changes(
+                        actor,
+                        Some(&before),
+                        Some(object),
+                        transaction_now_ms,
+                    )),
+                )
+                .map_err(storage)?;
                 Ok(object.clone())
             },
         )
@@ -353,14 +368,15 @@ impl PostgresDb {
                     .map_err(storage)?;
                 insert_changes(
                     tx,
-                    &object_diff_changes_with_snapshot(
+                    &ChangeAttribution::direct().stamp(object_diff_changes_with_snapshot(
                         actor,
                         Some(&before),
                         None,
                         transaction_now_ms,
                         &snapshot_keys,
-                    ),
-                )?;
+                    )),
+                )
+                .map_err(storage)?;
                 Ok(Object {
                     id: before.id,
                     kind: String::new(),
@@ -497,30 +513,6 @@ fn lock_object(tx: &mut postgres::Transaction<'_>, object_id: &str) -> Result<()
     )
     .map(|_| ())
     .map_err(storage)
-}
-
-fn insert_changes(
-    tx: &mut postgres::Transaction<'_>,
-    changes: &[ObjectChange],
-) -> Result<(), LeaseError> {
-    for change in changes {
-        tx.execute(
-            "INSERT INTO sekai_object_changes
-                (id, object_id, field, old_value, new_value, changed_by, timestamp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            &[
-                &change.id,
-                &change.object_id,
-                &change.field,
-                &change.old_value,
-                &change.new_value,
-                &change.changed_by,
-                &change.timestamp,
-            ],
-        )
-        .map_err(storage)?;
-    }
-    Ok(())
 }
 
 fn row_to_object(row: postgres::Row) -> Result<Object, LeaseError> {

@@ -485,13 +485,16 @@ impl PostgresDb {
                     &object.updated,
                 ],
             )?;
+            // Attributed to the committed source transaction (#1690).
             insert_changes(
                 &mut transaction,
-                &object_diff_changes(
-                    authenticated_producer,
-                    before.as_ref(),
-                    Some(&object),
-                    now_ms,
+                &crate::sekai::audit::ChangeAttribution::source(&prepared.transaction_id).stamp(
+                    object_diff_changes(
+                        authenticated_producer,
+                        before.as_ref(),
+                        Some(&object),
+                        now_ms,
+                    ),
                 ),
             )
             .map_err(ApplyError::storage)?;

@@ -365,7 +365,7 @@ pub(super) fn redact_object_change_values(
         },
         changed_by: change.changed_by,
         timestamp: change.timestamp,
-        operation_id: String::new(),
+        ..Default::default()
     }
 }
 pub(super) fn to_proto_link(l: &domain::Link) -> Link {
