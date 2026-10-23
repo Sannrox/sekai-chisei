@@ -729,6 +729,23 @@ message RunEvalDatasetResponse {
   // Spend reserved for cases a crashed start never recorded: counted against
   // the budget, not in the ledger.
   int64 uncertain_micros = 6;
+  // Policy outcomes over every recorded case (#1676), independent of pass
+  // or fail: a count for every kind (ungranted_tool_call, marking_leak,
+  // action_outside_approval, missing_receipts), zero when none was found,
+  // and each violation with its case and receipt.
+  string policy_scorer_version = 7;
+  repeated EvalPolicyCount policy_counts = 8;
+  repeated EvalPolicyViolation policy_violations = 9;
+}
+message EvalPolicyCount {
+  string kind = 1;
+  uint64 count = 2;
+}
+message EvalPolicyViolation {
+  string kind = 1;
+  string case_id = 2;
+  // Empty for missing_receipts.
+  string receipt_id = 3;
 }
 message CancelEvaluationExecutionRequest {
   string namespace = 1;

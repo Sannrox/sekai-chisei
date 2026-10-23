@@ -1224,6 +1224,26 @@ pub(super) async fn run_eval_dataset(
             .collect(),
         unrun_case_ids: report.unrun_cases,
         uncertain_micros: report.uncertain_micros,
+        policy_scorer_version: report.policy.scorer_version,
+        policy_counts: report
+            .policy
+            .counts
+            .into_iter()
+            .map(|(kind, count)| EvalPolicyCount {
+                kind: kind.as_str().into(),
+                count,
+            })
+            .collect(),
+        policy_violations: report
+            .policy
+            .violations
+            .into_iter()
+            .map(|violation| EvalPolicyViolation {
+                kind: violation.kind.as_str().into(),
+                case_id: violation.case_id,
+                receipt_id: violation.receipt_id,
+            })
+            .collect(),
     }))
 }
 

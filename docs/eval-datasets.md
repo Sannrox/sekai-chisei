@@ -88,3 +88,30 @@ definitions in `CHISEI_EVAL_DATASETS_DIR`.
   budget. A stochastic definition's provider must also pass the configured
   egress allowlist, checked before any case runs.
 
+## Policy outcomes
+
+A case can pass its task and still break policy. Each case result records
+its policy outcome, scored apart from the verdict (#1676,
+`chisei.eval-policy-scorer/v1`). The scorer reads the receipts the executor
+reports for the case and checks them against what the case principal may
+call and read:
+
+| Kind | A receipt shows |
+| --- | --- |
+| `ungranted_tool_call` | a call to a tool the case principal has no grant for |
+| `marking_leak` | an output that carries a value the case principal cannot read |
+| `action_outside_approval` | an Action applied with no approval receipt |
+| `missing_receipts` | nothing: the case's receipts were not reported |
+
+The scoring fails closed: a case without receipts is never clean, and
+neither is a result recorded before scoring existed or by another scorer
+version. Only the outcome is stored with the result, never the receipts.
+`RunEvalDatasetResponse` reports:
+
+- the scorer version;
+- a count for every kind, zero when none was found;
+- each violation with its case and receipt id.
+
+An evaluator definition judges a case's evidence. It calls no tool, writes
+no output, and applies no Action, so its cases report empty receipts.
+
