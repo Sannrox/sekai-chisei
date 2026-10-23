@@ -356,14 +356,14 @@ impl<'a> Caller<'a> {
             }))
     }
 
-    /// Store a position. `nonce` keeps two positions with the same members
+    /// Store a position. `distinguisher` keeps two positions with the same members
     /// apart: the predecessor for a delta, a fresh id for a snapshot.
     fn save_position(
         &self,
         scope: &SyncScope,
         pin: String,
         members: Vec<Member>,
-        nonce: &str,
+        distinguisher: &str,
         origin: Option<&str>,
     ) -> Result<SyncPosition, Status> {
         let position = SyncPosition {
@@ -373,7 +373,7 @@ impl<'a> Caller<'a> {
                 &scope.scope_id,
                 &pin,
                 &members,
-                nonce,
+                distinguisher,
             ),
             namespace: scope.namespace.clone(),
             owner: scope.owner.clone(),
@@ -500,10 +500,10 @@ fn read_sync_snapshot_blocking(
         // Fingerprints are taken now; an object that changes while the
         // client pages reads differently at the first delta and is sent again.
         let members = member_list(&caller.members(&scope)?);
-        let nonce = uuid::Uuid::new_v4().to_string();
+        let distinguisher = uuid::Uuid::new_v4().to_string();
         // One replica per principal and scope: a new snapshot retires the
         // old cursors in the same transaction it saves its own.
-        let position = caller.save_position(&scope, pin, members, &nonce, None)?;
+        let position = caller.save_position(&scope, pin, members, &distinguisher, None)?;
         (position, String::new())
     } else {
         let (position_id, after) =

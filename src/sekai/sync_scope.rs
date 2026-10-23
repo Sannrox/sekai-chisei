@@ -293,7 +293,7 @@ pub fn fingerprint<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
 }
 
 /// The position id a cursor names: a digest of everything it holds, plus a
-/// nonce so two reads that land on the same state still get distinct
+/// distinguisher so two reads that land on the same state still get distinct
 /// cursors.
 pub fn position_id(
     namespace: &str,
@@ -301,15 +301,17 @@ pub fn position_id(
     scope_id: &str,
     pin: &str,
     members: &[Member],
-    nonce: &str,
+    distinguisher: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    let parts = [namespace, owner, scope_id, pin, nonce].into_iter().chain(
-        members
-            .iter()
-            .flat_map(|member| [member.object_id.as_str(), member.fingerprint.as_str()]),
-    );
+    let parts = [namespace, owner, scope_id, pin, distinguisher]
+        .into_iter()
+        .chain(
+            members
+                .iter()
+                .flat_map(|member| [member.object_id.as_str(), member.fingerprint.as_str()]),
+        );
     for part in parts {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
