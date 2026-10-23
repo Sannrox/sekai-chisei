@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Local twins: `sekai::synthetic_shape` extracts a `sekai.twin-shape/v1`
+  shape from a tenant (definitions, counts, marking shares, numeric ranges,
+  link counts; no string or individual value), and a
+  `ShapeDomain` lets the synthetic generator build a twin from it
+  deterministically (docs/local-twins.md, #1735).
 - Offline sync purges: a change in what the caller may read no longer ends
   the cursor. The next delta purges objects the caller lost whole and
   properties it lost alone (`purges`). Scopes may set `max_offline_age_ms`,

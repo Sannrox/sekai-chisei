@@ -440,7 +440,7 @@ fn builtin_object_types() -> Vec<ObjectType> {
     types
 }
 
-fn builtin_interfaces() -> Vec<InterfaceDef> {
+pub(crate) fn builtin_interfaces() -> Vec<InterfaceDef> {
     [
         (
             "Auditable",
