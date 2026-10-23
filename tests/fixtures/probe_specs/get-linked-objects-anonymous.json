@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "get-linked-objects-anonymous",
+  "as": "anonymous",
+  "call": {"rpc": "GetLinkedObjects", "direction": "incoming"},
+  "expect": {"codes": ["Unauthenticated"]}
+}

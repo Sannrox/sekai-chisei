@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "get-object-anonymous",
+  "as": "anonymous",
+  "call": {"rpc": "GetObject"},
+  "expect": {"codes": ["Unauthenticated"]}
+}

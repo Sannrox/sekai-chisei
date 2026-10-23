@@ -17,6 +17,11 @@
 //! flow (SECURITY.md); the runner never opens an issue or posts anything. The
 //! probed object must exist in the foreign tenant, read as that tenant, so a
 //! stale id cannot pass for a denial.
+//!
+//! Declarative probe specs (`crate::probe_spec`, #1680) run after the
+//! built-in probes, behind the same guard and into the same ledger. A spec
+//! call that succeeds is a bypass with the spec as its reproduction; one
+//! denied otherwise than the spec expects is a mismatch.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -28,6 +33,7 @@ use tonic::{Code, Request};
 
 use crate::grpc::pb::sekai::GetObjectRequest;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
+use crate::probe_spec::{ProbeSpec, SpecCall, SpecPrincipal, SpecVerdict};
 
 pub const PROBE_LEDGER_VERSION: &str = "sekai.probe-ledger/v1";
 pub const ALLOWLIST_ENV: &str = "SEKAI_PROBE_TARGET_ALLOWLIST";
@@ -148,6 +154,8 @@ pub enum ProbeOutcome {
     Bypass,
     /// Neither: the probe could not decide (transport error, other status).
     Error(String),
+    /// A spec's call was denied, but not as the spec expects: a finding.
+    Mismatch(String),
     /// The target guard refused the run before any probe.
     Refused(String),
 }
@@ -161,8 +169,11 @@ pub struct Attempt {
     pub at_ms: i64,
     pub endpoint: String,
     pub tenant: String,
-    /// `None` for a refused run.
+    /// `None` for a refused run and for a spec.
     pub probe: Option<ProbeKind>,
+    /// The spec id, for a spec's attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
     #[serde(flatten)]
     pub outcome: ProbeOutcome,
 }
@@ -192,6 +203,39 @@ fn advisory(probe: ProbeKind, target: &ProbeTarget, attempt: &Attempt) -> Adviso
              but the read succeeded.\n\n### Reproduction\n\n{steps}\n\n\
              Probe attempt `{}` at {} ms, recorded in the probe ledger.",
             probe.expected_denial(),
+            attempt.attempt_id,
+            attempt.at_ms
+        ),
+        severity: "high".into(),
+        vulnerabilities: vec![serde_json::json!({
+            "package": {"ecosystem": "other", "name": "sekai-chisei"},
+        })],
+    }
+}
+
+fn spec_advisory(spec: &ProbeSpec, target: &ProbeTarget, attempt: &Attempt) -> AdvisoryDraft {
+    let caller = match spec.principal {
+        SpecPrincipal::Tenant => format!(
+            "Authenticate as a principal of tenant namespace `{}`.",
+            target.tenant
+        ),
+        SpecPrincipal::Anonymous => "Call with no credential.".to_string(),
+    };
+    let spec_json = serde_json::to_string_pretty(spec).unwrap_or_default();
+    AdvisoryDraft {
+        summary: format!("Isolation bypass: probe spec {} was not denied", spec.id),
+        description: format!(
+            "Probe spec `{}` expected {} but the call succeeded.\n\n### Reproduction\n\n\
+             1. {caller}\n2. Call {} for object `{}` of tenant namespace `{}`.\n\
+             3. Observe that it succeeds.\n\n### Probe spec\n\n\
+             Promote it into the regression catalogue as a failing probe by adding it to \
+             `tests/fixtures/probe_specs/`.\n\n```json\n{spec_json}\n```\n\n\
+             Probe attempt `{}` at {} ms, recorded in the probe ledger.",
+            spec.id,
+            spec.expect.codes.join(" or "),
+            spec.call.rpc(),
+            target.foreign_object_id,
+            target.foreign_tenant,
             attempt.attempt_id,
             attempt.at_ms
         ),
@@ -407,25 +451,123 @@ async fn run_probe(probe: ProbeKind, target: &ProbeTarget) -> ProbeOutcome {
     }
 }
 
-/// Run every probe against `target` once. The guard runs first and a
-/// refusal is recorded as the run's only attempt. Bypasses write advisory
-/// drafts under `advisory_dir`.
+/// Call `spec` on the run's foreign object, bounded end to end.
+pub(crate) async fn call_spec(
+    mut client: Client,
+    spec: &ProbeSpec,
+    object_id: String,
+) -> Result<(), tonic::Status> {
+    use crate::grpc::pb::sekai::{
+        GetLineageRequest, GetLinkedObjectsRequest, GetLinksRequest, ListObjectCommentsRequest,
+    };
+    let call = async {
+        match &spec.call {
+            SpecCall::GetObject {} => client
+                .get_object(Request::new(GetObjectRequest { id: object_id }))
+                .await
+                .map(drop),
+            SpecCall::GetLinks {
+                relation,
+                direction,
+            } => client
+                .get_links(Request::new(GetLinksRequest {
+                    object_id,
+                    relation: relation.clone(),
+                    direction: direction.clone(),
+                }))
+                .await
+                .map(drop),
+            SpecCall::GetLinkedObjects {
+                relation,
+                direction,
+            } => client
+                .get_linked_objects(Request::new(GetLinkedObjectsRequest {
+                    object_id,
+                    relation: relation.clone(),
+                    direction: direction.clone(),
+                }))
+                .await
+                .map(drop),
+            SpecCall::ListObjectComments { include_resolved } => client
+                .list_object_comments(Request::new(ListObjectCommentsRequest {
+                    object_id,
+                    include_resolved: *include_resolved,
+                }))
+                .await
+                .map(drop),
+            SpecCall::GetLineage { max_nodes } => client
+                .get_lineage(Request::new(GetLineageRequest {
+                    object_id,
+                    max_nodes: *max_nodes,
+                }))
+                .await
+                .map(drop),
+        }
+    };
+    match tokio::time::timeout(CALL_TIMEOUT, call).await {
+        Ok(result) => result,
+        Err(_) => Err(tonic::Status::deadline_exceeded("probe call timed out")),
+    }
+}
+
+async fn run_spec(spec: &ProbeSpec, target: &ProbeTarget) -> ProbeOutcome {
+    let token = match spec.principal {
+        SpecPrincipal::Tenant => Some(target.tenant_token.as_str()),
+        SpecPrincipal::Anonymous => None,
+    };
+    let client = match client(&target.endpoint, token).await {
+        Ok(client) => client,
+        Err(error) => return ProbeOutcome::Error(error),
+    };
+    let result = call_spec(client, spec, target.foreign_object_id.clone()).await;
+    // A target that is unwell proves nothing either way.
+    if let Err(status) = &result
+        && matches!(
+            status.code(),
+            Code::Unavailable
+                | Code::DeadlineExceeded
+                | Code::Unknown
+                | Code::Cancelled
+                | Code::ResourceExhausted
+                | Code::Internal
+        )
+    {
+        return ProbeOutcome::Error(format!("unexpected status {}", status.code()));
+    }
+    match spec.judge(&result) {
+        SpecVerdict::Denied => ProbeOutcome::Denied,
+        SpecVerdict::NotDenied => ProbeOutcome::Bypass,
+        SpecVerdict::Mismatch(detail) => ProbeOutcome::Mismatch(detail),
+    }
+}
+
+/// Run every built-in probe, then every spec in `specs`, against `target`
+/// once. The specs and the guard are checked first, and a refusal (a spec
+/// set that failed to load or validate, or a guard refusal) is recorded as
+/// the run's only attempt. Bypasses write advisory drafts under
+/// `advisory_dir`.
 pub async fn run(
     guard: Result<TargetGuard, String>,
     target: &ProbeTarget,
+    specs: Result<Vec<ProbeSpec>, String>,
     ledger: &Path,
     advisory_dir: &Path,
 ) -> Result<RunReport, String> {
-    let attempt = |probe, outcome| Attempt {
+    let attempt = |probe, spec: Option<&ProbeSpec>, outcome| Attempt {
         schema: PROBE_LEDGER_VERSION.into(),
         attempt_id: uuid::Uuid::new_v4().to_string(),
         at_ms: now_ms(),
         endpoint: target.endpoint.clone(),
         tenant: target.tenant.clone(),
         probe,
+        spec: spec.map(|spec| spec.id.clone()),
         outcome,
     };
     let admitted = async {
+        // Specs are validated before the guard admits anything, so a bad one
+        // refuses the run before any call.
+        let specs = specs?;
+        crate::probe_spec::validate_set(&specs)?;
         let guard = guard?;
         guard.admit_endpoint(&target.endpoint)?;
         if target.tenant == target.foreign_tenant {
@@ -442,14 +584,18 @@ pub async fn run(
         // would pass for a denial.
         require_foreign_object(target).await?;
         // Findings need somewhere private to go before any probe runs.
-        prepare_advisory_dir(advisory_dir)
+        prepare_advisory_dir(advisory_dir)?;
+        Ok(specs)
     }
     .await;
-    if let Err(reason) = admitted {
-        let refused = attempt(None, ProbeOutcome::Refused(reason.clone()));
-        append(ledger, &refused)?;
-        return Err(reason);
-    }
+    let specs = match admitted {
+        Ok(specs) => specs,
+        Err(reason) => {
+            let refused = attempt(None, None, ProbeOutcome::Refused(reason.clone()));
+            append(ledger, &refused)?;
+            return Err(reason);
+        }
+    };
     let mut report = RunReport {
         attempts: Vec::new(),
         advisories: Vec::new(),
@@ -457,27 +603,45 @@ pub async fn run(
     };
     for probe in ProbeKind::ALL {
         let outcome = run_probe(probe, target).await;
-        let recorded = attempt(Some(probe), outcome);
-        // The draft is written before the ledger records the bypass; a crash
-        // in between only leaves a draft, and the next run detects the bypass
-        // again. A draft that cannot be written never hides the finding.
-        if recorded.outcome == ProbeOutcome::Bypass {
-            let name = format!("advisory-{}.json", recorded.attempt_id);
-            let written = serde_json::to_vec_pretty(&advisory(probe, target, &recorded))
-                .map_err(|error| error.to_string())
-                .and_then(|draft| write_private(advisory_dir, &name, &draft));
-            match written {
-                Ok(path) => report.advisories.push(path),
-                Err(error) => report.advisory_failures.push(format!(
-                    "attempt {}: advisory draft not written: {error}",
-                    recorded.attempt_id
-                )),
-            }
-        }
-        append(ledger, &recorded)?;
-        report.attempts.push(recorded);
+        let recorded = attempt(Some(probe), None, outcome);
+        let draft = || advisory(probe, target, &recorded);
+        record(&mut report, recorded.clone(), draft, ledger, advisory_dir)?;
+    }
+    for spec in &specs {
+        let outcome = run_spec(spec, target).await;
+        let recorded = attempt(None, Some(spec), outcome);
+        let draft = || spec_advisory(spec, target, &recorded);
+        record(&mut report, recorded.clone(), draft, ledger, advisory_dir)?;
     }
     Ok(report)
+}
+
+/// Ledger one attempt. A bypass writes its advisory draft first; a crash in
+/// between only leaves a draft, and the next run detects the bypass again.
+/// A draft that cannot be written never hides the finding.
+fn record(
+    report: &mut RunReport,
+    recorded: Attempt,
+    draft: impl FnOnce() -> AdvisoryDraft,
+    ledger: &Path,
+    advisory_dir: &Path,
+) -> Result<(), String> {
+    if recorded.outcome == ProbeOutcome::Bypass {
+        let name = format!("advisory-{}.json", recorded.attempt_id);
+        let written = serde_json::to_vec_pretty(&draft())
+            .map_err(|error| error.to_string())
+            .and_then(|draft| write_private(advisory_dir, &name, &draft));
+        match written {
+            Ok(path) => report.advisories.push(path),
+            Err(error) => report.advisory_failures.push(format!(
+                "attempt {}: advisory draft not written: {error}",
+                recorded.attempt_id
+            )),
+        }
+    }
+    append(ledger, &recorded)?;
+    report.attempts.push(recorded);
+    Ok(())
 }
 
 /// Attempts per probe and outcome over one week.
@@ -528,14 +692,17 @@ pub fn weekly_summary(ledger: &Path, from_ms: i64) -> Result<WeeklySummary, Stri
                 "bypass"
             }
             ProbeOutcome::Error(_) => "error",
+            ProbeOutcome::Mismatch(_) => "mismatch",
             ProbeOutcome::Refused(_) => {
                 summary.refused_runs += 1;
                 "refused"
             }
         };
-        let probe = attempt
-            .probe
-            .map_or_else(|| "guard".to_string(), |probe| format!("{probe:?}"));
+        let probe = match (&attempt.probe, &attempt.spec) {
+            (Some(probe), _) => format!("{probe:?}"),
+            (None, Some(spec)) => format!("spec:{spec}"),
+            (None, None) => "guard".to_string(),
+        };
         *summary
             .by_probe
             .entry(probe)
@@ -691,6 +858,7 @@ mod tests {
         let report = run(
             guard,
             &target(&deployment),
+            Ok(Vec::new()),
             &ledger,
             &dir.path().join("advisories"),
         )
@@ -711,6 +879,7 @@ mod tests {
         run(
             TargetGuard::parse(Some(&deployment.endpoint)),
             &target(&deployment),
+            Ok(Vec::new()),
             &ledger,
             &dir.path().join("advisories"),
         )
@@ -750,13 +919,20 @@ mod tests {
         let advisories = dir.path().join("advisories");
 
         let elsewhere = TargetGuard::parse(Some("https://elsewhere.example.test:443"));
-        let refused = run(elsewhere, &target(&deployment), &ledger, &advisories)
-            .await
-            .unwrap_err();
+        let refused = run(
+            elsewhere,
+            &target(&deployment),
+            Ok(Vec::new()),
+            &ledger,
+            &advisories,
+        )
+        .await
+        .unwrap_err();
         assert!(refused.contains("not on the allow-list"), "{refused}");
         let missing = run(
             TargetGuard::parse(None),
             &target(&deployment),
+            Ok(Vec::new()),
             &ledger,
             &advisories,
         )
@@ -770,6 +946,7 @@ mod tests {
         let refused = run(
             TargetGuard::parse(Some(&deployment.endpoint)),
             &real,
+            Ok(Vec::new()),
             &ledger,
             &advisories,
         )
@@ -782,6 +959,7 @@ mod tests {
         let refused = run(
             TargetGuard::parse(Some(&deployment.endpoint)),
             &stale,
+            Ok(Vec::new()),
             &ledger,
             &advisories,
         )
@@ -820,6 +998,7 @@ mod tests {
         let report = run(
             TargetGuard::parse(Some(&deployment.endpoint)),
             &target,
+            Ok(Vec::new()),
             &ledger,
             &advisories,
         )
@@ -844,6 +1023,7 @@ mod tests {
             let refused = run(
                 TargetGuard::parse(Some(&deployment.endpoint)),
                 &target,
+                Ok(Vec::new()),
                 &dir.path().join("ledger-2.jsonl"),
                 &shared,
             )
@@ -886,5 +1066,174 @@ mod tests {
         let next_week = weekly_summary(&dir.path().join("ledger-2.jsonl"), 0);
         assert_eq!(next_week.unwrap().attempts, 0);
         drop(deployment.db);
+    }
+
+    fn catalogue() -> Vec<ProbeSpec> {
+        crate::probe_spec::load_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe_specs"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_catalogued_spec_is_denied_by_an_isolating_target() {
+        // The regression catalogue's declarative probes: a promoted finding
+        // fails here until the bypass it reproduces is fixed.
+        let deployment = deployment(|_, _, _| {}).await;
+        let dir = tempfile::tempdir().unwrap();
+        let specs = catalogue();
+        let expected = specs.len();
+        assert!(expected >= 10);
+        let report = run(
+            TargetGuard::parse(Some(&deployment.endpoint)),
+            &target(&deployment),
+            Ok(specs),
+            &dir.path().join("ledger.jsonl"),
+            &dir.path().join("advisories"),
+        )
+        .await
+        .unwrap();
+        let spec_attempts: Vec<_> = report
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.spec.is_some())
+            .collect();
+        assert_eq!(spec_attempts.len(), expected);
+        for attempt in spec_attempts {
+            assert_eq!(attempt.outcome, ProbeOutcome::Denied, "{:?}", attempt.spec);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spec_against_a_seeded_bypass_is_a_finding_reproduced_by_the_spec() {
+        let deployment = deployment(|db, north, south| {
+            db.create_grant(&Grant {
+                id: "seeded-bypass".into(),
+                object_id: south.objects[0].id.clone(),
+                principal: viewer(north),
+                role: Role::Viewer,
+                created: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let target = target(&deployment);
+        let cross_tenant = catalogue()
+            .into_iter()
+            .find(|spec| spec.id == "get-object-cross-tenant")
+            .unwrap();
+        // Denied, but not as this spec says: a mismatch, not a pass.
+        let mut strict = catalogue()
+            .into_iter()
+            .find(|spec| spec.id == "get-object-anonymous")
+            .unwrap();
+        strict.expect.reason = Some("never this message".into());
+        let report = run(
+            TargetGuard::parse(Some(&deployment.endpoint)),
+            &target,
+            Ok(vec![cross_tenant.clone(), strict]),
+            &ledger,
+            &dir.path().join("advisories"),
+        )
+        .await
+        .unwrap();
+        let spec = |id: &str| {
+            report
+                .attempts
+                .iter()
+                .find(|attempt| attempt.spec.as_deref() == Some(id))
+                .unwrap()
+        };
+        assert_eq!(
+            spec("get-object-cross-tenant").outcome,
+            ProbeOutcome::Bypass
+        );
+        assert!(matches!(
+            spec("get-object-anonymous").outcome,
+            ProbeOutcome::Mismatch(_)
+        ));
+        // One draft for the built-in probe's bypass, one for the spec's.
+        assert_eq!(report.advisories.len(), 2);
+        let drafts: Vec<AdvisoryDraft> = report
+            .advisories
+            .iter()
+            .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+            .collect();
+        let draft = drafts
+            .iter()
+            .find(|draft| draft.summary.contains("get-object-cross-tenant"))
+            .unwrap();
+        assert!(draft.description.contains("### Probe spec"));
+        assert!(draft.description.contains("tests/fixtures/probe_specs/"));
+        let embedded = draft
+            .description
+            .split("```json\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n```").next())
+            .unwrap();
+        assert_eq!(ProbeSpec::parse(embedded).unwrap(), cross_tenant);
+        for private in [target.endpoint.as_str(), "north-token", "south-token"] {
+            assert!(!draft.description.contains(private), "{private}");
+        }
+        let summary = weekly_summary(&ledger, report.attempts[0].at_ms - 1_000).unwrap();
+        assert_eq!(
+            summary.by_probe["spec:get-object-cross-tenant"]["bypass"],
+            1
+        );
+        assert_eq!(summary.by_probe["spec:get-object-anonymous"]["mismatch"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_spec_refuses_the_run_before_any_call() {
+        let deployment = deployment(|_, _, _| {}).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let mut malformed = catalogue().remove(0);
+        malformed.expect.codes = vec!["Ok".into()];
+        let refused = run(
+            TargetGuard::parse(Some(&deployment.endpoint)),
+            &target(&deployment),
+            Ok(vec![malformed]),
+            &ledger,
+            &dir.path().join("advisories"),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.contains("not a denial code"), "{refused}");
+        let lines = ledger_lines(&ledger);
+        assert_eq!(lines.len(), 1);
+        assert!(matches!(lines[0].outcome, ProbeOutcome::Refused(_)));
+        // A spec file that names a target is refused when the set loads.
+        let specs = dir.path().join("specs");
+        fs::create_dir(&specs).unwrap();
+        fs::write(
+            specs.join("aimed.json"),
+            r#"{"schema":"sekai.probe-spec/v1","id":"aimed","as":"tenant",
+                "target":"https://prod.example.test","call":{"rpc":"GetObject"},
+                "expect":{"codes":["NotFound"]}}"#,
+        )
+        .unwrap();
+        let loaded = crate::probe_spec::load_dir(&specs);
+        assert!(loaded.is_err());
+        // As `--specs` does: the failed load is a refused run, ledgered.
+        assert!(
+            run(
+                TargetGuard::parse(Some(&deployment.endpoint)),
+                &target(&deployment),
+                loaded,
+                &ledger,
+                &dir.path().join("advisories"),
+            )
+            .await
+            .is_err()
+        );
+        let lines = ledger_lines(&ledger);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            matches!(&lines[1].outcome, ProbeOutcome::Refused(reason) if reason.contains("aimed.json"))
+        );
     }
 }

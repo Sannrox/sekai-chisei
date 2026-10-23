@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "get-linked-objects-cross-tenant",
+  "as": "tenant",
+  "call": {"rpc": "GetLinkedObjects", "direction": "incoming"},
+  "expect": {"codes": ["PermissionDenied", "NotFound"]}
+}
