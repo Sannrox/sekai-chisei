@@ -385,7 +385,7 @@ impl SekaiDb {
                     "INSERT INTO sekai_objects (id,kind,name,namespace,external_id,properties,created,updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![object.id,object.kind,object.name,object.namespace,object.external_id,props,object.created,object.updated],
                 ).map_err(storage)?;
-                crate::sekai::audit::insert_object_changes(tx, &crate::sekai::audit::object_diff_changes(actor, None, Some(object), transaction_now_ms)).map_err(LeaseError::Mutation)?;
+                crate::sekai::audit::insert_object_changes(tx, &crate::sekai::audit::ChangeAttribution::direct().stamp(crate::sekai::audit::object_diff_changes(actor, None, Some(object), transaction_now_ms))).map_err(LeaseError::Mutation)?;
                 Ok(object.clone())
             },
         )
@@ -465,7 +465,7 @@ impl SekaiDb {
                     "UPDATE sekai_objects SET kind=?2,name=?3,namespace=?4,external_id=?5,properties=?6,updated=?7 WHERE id=?1",
                     params![object.id,object.kind,object.name,object.namespace,object.external_id,props,object.updated],
                 ).map_err(storage)?;
-                crate::sekai::audit::insert_object_changes(tx, &crate::sekai::audit::object_diff_changes(actor, Some(&before), Some(object), transaction_now_ms)).map_err(LeaseError::Mutation)?;
+                crate::sekai::audit::insert_object_changes(tx, &crate::sekai::audit::ChangeAttribution::direct().stamp(crate::sekai::audit::object_diff_changes(actor, Some(&before), Some(object), transaction_now_ms))).map_err(LeaseError::Mutation)?;
                 Ok(object.clone())
             },
         )
@@ -538,13 +538,13 @@ impl SekaiDb {
                 tx.execute("DELETE FROM sekai_links WHERE from_id=?1 OR to_id=?1", params![object_id]).map_err(storage)?;
                 crate::sekai::audit::insert_object_changes(
                     tx,
-                    &crate::sekai::audit::object_diff_changes_with_snapshot(
+                    &crate::sekai::audit::ChangeAttribution::direct().stamp(crate::sekai::audit::object_diff_changes_with_snapshot(
                         actor,
                         Some(&before),
                         None,
                         transaction_now_ms,
                         &snapshot_keys,
-                    ),
+                    )),
                 )
                 .map_err(LeaseError::Mutation)?;
                 Ok(Object {

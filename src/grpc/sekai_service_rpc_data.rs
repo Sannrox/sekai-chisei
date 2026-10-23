@@ -1331,8 +1331,16 @@ pub(super) async fn list_object_changes(
     }
     .into_iter()
     .map(|change| {
-        // Each change carries the operation stored with it (#1689).
+        // Each change carries the operation (#1689) and writer (#1690)
+        // stored with it; a row without a writer reads as unattributed.
         let operation_id = change.operation_id.clone();
+        let writer_kind = if change.writer_kind.is_empty() {
+            crate::sekai::audit::WRITER_UNATTRIBUTED.to_string()
+        } else {
+            change.writer_kind.clone()
+        };
+        let writer_ref = change.writer_ref.clone();
+        let receipt_id = change.receipt_id.clone();
         let mut mapped = if let Some(kind) = object_kind.as_deref() {
             redact_object_change_values(
                 change,
@@ -1352,10 +1360,13 @@ pub(super) async fn list_object_changes(
                 new_value: change.new_value,
                 changed_by: change.changed_by,
                 timestamp: change.timestamp,
-                operation_id: String::new(),
+                ..Default::default()
             }
         };
         mapped.operation_id = operation_id;
+        mapped.writer_kind = writer_kind;
+        mapped.writer_ref = writer_ref;
+        mapped.receipt_id = receipt_id;
         mapped
     })
     .collect();

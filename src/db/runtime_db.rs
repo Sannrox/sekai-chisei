@@ -22,7 +22,7 @@ use crate::db::object_sync::ObjectSyncBackend;
 use crate::domain::{Direction, Link, ListFilter, Object};
 use crate::sekai::action_policy::ActionPolicy;
 use crate::sekai::attestation::{AttestationVerification, PolicyAttestation};
-use crate::sekai::audit::{Decision, DecisionFilter, ObjectChange};
+use crate::sekai::audit::{ChangeAttribution, Decision, DecisionFilter, ObjectChange};
 use crate::sekai::coordination::*;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
 use crate::sekai::dataset_health::{
@@ -3134,36 +3134,79 @@ impl RuntimeDb {
         }
     }
 
-    /// Creates `object` with change rows stamped with `operation_id`, for
-    /// writes made by a governed operation (#1689).
-    pub fn create_object_for_operation(
+    /// Creates `object` with change rows stamped with `attribution` (#1690).
+    pub fn create_object_attributed(
         &self,
         object: &Object,
         actor: &str,
-        operation_id: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
     ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.create_object_for_operation(object, actor, operation_id),
+            Self::Sqlite(db) => {
+                db.create_object_attributed(object, actor, expected_policy_generation, attribution)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.create_object_for_operation(object, actor, operation_id)
+                db.create_object_attributed(object, actor, expected_policy_generation, attribution)
             }),
         }
     }
 
-    /// Updates `object` with change rows stamped with `operation_id`.
-    pub fn update_object_for_operation(
+    /// Updates `object` with change rows stamped with `attribution`; with
+    /// `expected`, only if the stored object still matches it.
+    pub fn update_object_attributed(
         &self,
         object: &Object,
         expected: Option<&Object>,
         actor: &str,
-        operation_id: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
     ) -> Result<Option<Object>, String> {
         match self {
-            Self::Sqlite(db) => {
-                db.update_object_for_operation(object, expected, actor, operation_id)
-            }
+            Self::Sqlite(db) => db.update_object_attributed(
+                object,
+                expected,
+                actor,
+                expected_policy_generation,
+                attribution,
+            ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.update_object_for_operation(object, expected, actor, operation_id)
+                db.update_object_attributed(
+                    object,
+                    expected,
+                    actor,
+                    expected_policy_generation,
+                    attribution,
+                )
+            }),
+        }
+    }
+
+    /// Deletes with change rows stamped with `attribution`.
+    pub fn delete_object_attributed(
+        &self,
+        id: &str,
+        expected: Option<&Object>,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
+    ) -> Result<Option<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.delete_object_attributed(
+                id,
+                expected,
+                actor,
+                expected_policy_generation,
+                attribution,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.delete_object_attributed(
+                    id,
+                    expected,
+                    actor,
+                    expected_policy_generation,
+                    attribution,
+                )
             }),
         }
     }
