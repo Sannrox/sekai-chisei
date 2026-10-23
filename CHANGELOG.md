@@ -6,9 +6,16 @@
   run and checkpoint, Action instance or direct write, with a writer
   reference and receipt id, on SQLite and PostgreSQL. Transform marking
   stamps now write change rows. Older rows read as `unattributed`
-  (docs/operation-correlation.md, `0097_object_change_writer`, GATE:mig,
+  (docs/operation-correlation.md, `0098_object_change_writer`, GATE:mig,
   #1690).
 
+
+- Offline sync purges: a change in what the caller may read no longer ends
+  the cursor. The next delta purges objects the caller lost whole and
+  properties it lost alone (`purges`). Scopes may set `max_offline_age_ms`,
+  and snapshots and deltas return `offline_until_ms`. A reference replica
+  is in `sekai_client::sync_replica` (ADR 0128, PostgreSQL migration
+  `0097_sync_member_properties`, #1633).
 - Experimental `DryRunDefinitionChangeBundle` runs a change bundle's
   backfill on a dataset branch per backed object type, named for the bundle
   digest, and reports row counts and marking-aware samples; the datasets

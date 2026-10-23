@@ -142,12 +142,13 @@ impl PostgresDb {
         if inserted > 0 {
             for member in &position.members {
                 tx.execute(
-                    "INSERT INTO sekai_sync_members (position_id, object_id, fingerprint)
-                     VALUES ($1, $2, $3)",
+                    "INSERT INTO sekai_sync_members (position_id, object_id, fingerprint, properties)
+                     VALUES ($1, $2, $3, $4)",
                     &[
                         &position.position_id,
                         &member.object_id,
                         &member.fingerprint,
+                        &crate::db::sync_scope::properties_column(&member.properties),
                     ],
                 )
                 .map_err(storage)?;
@@ -170,7 +171,7 @@ impl PostgresDb {
         };
         let members = connection
             .query(
-                "SELECT object_id, fingerprint FROM sekai_sync_members
+                "SELECT object_id, fingerprint, properties FROM sekai_sync_members
                  WHERE position_id = $1 ORDER BY object_id",
                 &[&position_id],
             )
@@ -179,6 +180,7 @@ impl PostgresDb {
             .map(|row| Member {
                 object_id: row.get(0),
                 fingerprint: row.get(1),
+                properties: crate::db::sync_scope::parse_properties_column(row.get(2)),
             })
             .collect();
         let delivered = connection
