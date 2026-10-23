@@ -109,6 +109,40 @@ or datasets still carry, merge without a pinned `migration_plan_digest` fails
 executed fact migration; `ExecuteDefinitionFactMigration` still requires the
 TO revision to already be the published head.
 
+### Signed definition packages (#1700)
+
+`ExportDefinitionPackage` and `ImportDefinitionPackage` (experimental, behind
+`SEKAI_EXPERIMENTAL_RPCS=1`) move published definitions between namespaces or
+planes as a signed `sekai.definition-package/v1` envelope.
+
+- **Format.** Each member is `kind`, `id`, and canonical `definition_json`.
+  Its member digest covers kind, id, and those bytes, without the namespace.
+  Members are sorted, and the package digest is SHA-256 over the member list,
+  so the same definitions have the same package digest in every namespace.
+  Provenance (source namespace, source revision, export time) is signed with
+  the package digest but sits outside it. A package carries definitions only:
+  never objects, datasets, sources, credentials, or run history.
+- **Export** packages a published revision (the head when `revision_digest`
+  is empty). It needs read access to the revision, as `GetDefinitionMember`
+  does, and signs with this plane's key: `SEKAI_DEFINITION_PACKAGE_SIGNING_KEY`
+  (file with a 32-byte hex Ed25519 seed) and `SEKAI_DEFINITION_PACKAGE_SIGNER`
+  (`identity/key_id`).
+- **Import** verifies the envelope against `SEKAI_DEFINITION_PACKAGE_TRUSTED_KEYS`
+  (JSON array of `{"identity", "key_id", "public_key"}`), recomputes every
+  digest, then opens a branch and proposal whose candidate holds exactly the
+  package members. Target members absent from the package are removals. The
+  proposal records `source_package_digest`, which is part of its digest and
+  so of its merge receipt. Import never merges: compatibility, lint, and
+  Agent certification gates apply at merge as for any proposal. Auth matches
+  rollback: namespace write plus write on every member that would change.
+- **Refusals** are `FAILED_PRECONDITION` with a named reason, and nothing is
+  written: `definition_package_unverified` (unknown, unusable, or wrong
+  signature, or no trusted keys configured), `definition_package_tampered`
+  (a digest does not match its content), and
+  `definition_package_incompatible` (format, member kind, or member document).
+- Keys are read at call time, so rotating them needs no restart. Without them,
+  export and import fail closed.
+
 `CompareDefinitionRevisions` takes two revision digests in one namespace. It
 reauthorizes every member on both revisions, then reports added, removed, and
 changed members in kind-then-id order. Changed object-type properties are

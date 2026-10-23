@@ -1796,6 +1796,221 @@ async fn publish_definition_history_entry(
 }
 
 #[tokio::test]
+async fn definition_package_round_trips_between_namespaces_and_refuses_tampering() {
+    use super::rpc_definition_package::{
+        PackageSigner, export_definition_package_as, import_definition_package_with,
+        package_keyring_from_json,
+    };
+    let svc = service();
+    let signer = PackageSigner {
+        identity: "plane-a".into(),
+        key_id: "k1".into(),
+        key: ed25519_dalek::SigningKey::from_bytes(&[3; 32]),
+    };
+    let public_key = signer
+        .key
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let keyring = package_keyring_from_json(&format!(
+        r#"[{{"identity":"plane-a","key_id":"k1","public_key":"{public_key}"}}]"#
+    ))
+    .unwrap();
+    let member = |id: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: id.into(),
+        definition_json: format!(r#"{{"name":"{id}","properties":["title"]}}"#),
+        member_digest: String::new(),
+    };
+
+    // Source namespace: two definitions plus an object holding data.
+    let parent = seed_definition_parent(&svc, "pkg-a");
+    publish_definition_history_entry(
+        &svc,
+        "pkg-a",
+        &parent.revision_digest,
+        "pkg-a-1",
+        "pkg-a-cs-1",
+        vec![member("Ticket"), member("Incident")],
+    )
+    .await;
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(Object {
+            id: "ticket-1".into(),
+            kind: "Ticket".into(),
+            name: "ticket".into(),
+            namespace: "pkg-a".into(),
+            external_id: "ticket:1".into(),
+            properties: HashMap::from([("title".into(), "object-data-marker".into())]),
+            created: 0,
+            updated: 0,
+        }),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+    let export = |namespace: &str| {
+        export_definition_package_as(
+            &svc,
+            with_named_principal(
+                ExportDefinitionPackageRequest {
+                    namespace: namespace.into(),
+                    revision_digest: String::new(),
+                },
+                "root",
+            ),
+            &signer,
+        )
+        .unwrap()
+        .into_inner()
+    };
+    let exported = export("pkg-a");
+    assert!(!exported.envelope_json.contains("object-data-marker"));
+
+    // A tampered member is refused by name, and nothing is created.
+    let tampered = exported
+        .envelope_json
+        .replace(r#"\"name\":\"Ticket\""#, r#"\"name\":\"Tickey\""#);
+    assert_ne!(tampered, exported.envelope_json);
+    let import = |namespace: &str, envelope_json: &str, id: &str| {
+        import_definition_package_with(
+            &svc,
+            with_named_principal(
+                ImportDefinitionPackageRequest {
+                    namespace: namespace.into(),
+                    branch_id: format!("import-{id}"),
+                    proposal_id: format!("import-cs-{id}"),
+                    envelope_json: envelope_json.into(),
+                    idempotency_key: format!("import-{id}"),
+                },
+                "root",
+            ),
+            &keyring,
+        )
+    };
+    let refused = import("pkg-b", &tampered, "tampered").unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::sekai::definition_package::REFUSAL_TAMPERED),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_definition_branch("pkg-b", "import-tampered")
+            .unwrap()
+            .is_none()
+    );
+
+    // A signed package with a malformed member document writes nothing.
+    let malformed = crate::sekai::definition_package::sign_package(
+        crate::sekai::definition_package::build_package([(
+            "object_type".to_string(),
+            "Ticket".to_string(),
+            r#"{"name":"Ticket","properties":123}"#.to_string(),
+        )])
+        .unwrap(),
+        crate::sekai::definition_package::PackageProvenance {
+            source_namespace: "pkg-a".into(),
+            source_revision_digest: exported.package_digest.clone(),
+            exported_at_ms: 1,
+        },
+        "plane-a",
+        "k1",
+        &signer.key,
+    )
+    .unwrap();
+    let refused = import(
+        "pkg-c",
+        &serde_json::to_string(&malformed).unwrap(),
+        "malformed",
+    )
+    .unwrap_err();
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::sekai::definition_package::REFUSAL_INCOMPATIBLE),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_published_definition_revision("pkg-c")
+            .unwrap()
+            .is_none()
+    );
+
+    // The target has a definition the package lacks: it shows as a removal.
+    let parent = seed_definition_parent(&svc, "pkg-b");
+    publish_definition_history_entry(
+        &svc,
+        "pkg-b",
+        &parent.revision_digest,
+        "pkg-b-1",
+        "pkg-b-cs-1",
+        vec![member("Ticket"), member("Legacy")],
+    )
+    .await;
+    let imported = import("pkg-b", &exported.envelope_json, "ok")
+        .unwrap()
+        .into_inner();
+    let proposal = imported.proposal.unwrap();
+    assert_eq!(proposal.source_package_digest, exported.package_digest);
+    assert_eq!(imported.source_namespace, "pkg-a");
+    assert_eq!(imported.signer_identity, "plane-a");
+    let preview = imported.preview.unwrap();
+    assert!(
+        preview
+            .removed
+            .iter()
+            .any(|change| change.member_id == "Legacy")
+    );
+    assert!(
+        preview
+            .added
+            .iter()
+            .any(|change| change.member_id == "Incident")
+    );
+
+    // Reviewed and merged as usual; B then exports the same package digest.
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: "pkg-b".into(),
+            proposal_id: "import-cs-ok".into(),
+            idempotency_key: "import-ok-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "pkg-b".into(),
+            proposal_id: "import-cs-ok".into(),
+            expected_published_digest: proposal.base_digest.clone(),
+            idempotency_key: "import-ok-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(export("pkg-b").package_digest, exported.package_digest);
+    // A lost-response retry after the merge replays the original proposal.
+    let replayed = import("pkg-b", &exported.envelope_json, "ok")
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(replayed.proposal_digest, proposal.proposal_digest);
+}
+
+#[tokio::test]
 async fn propose_definition_rollback_restores_as_descendant_and_gates_live_values() {
     let svc = service();
     let namespace = "rollback-team";

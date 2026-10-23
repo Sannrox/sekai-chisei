@@ -1771,6 +1771,30 @@ impl RuntimeDb {
         }
     }
 
+    pub fn propose_definition_import(
+        &self,
+        request: &crate::sekai::definition_proposal::ProposeDefinitionImport,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::propose_definition_import(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::propose_definition_import(
+                    db.as_ref(),
+                    request,
+                    actor,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
     pub fn propose_definition_rollback(
         &self,
         request: &ProposeDefinitionRollback,
@@ -4177,6 +4201,99 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.advance_action_binding_cursor(binding, cursor, now_ms),
             Self::Postgres(_) => Err(ACTION_BINDINGS_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_fence_binding(
+        &self,
+        binding: &crate::sekai::fence_binding::FenceBinding,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::fence_binding::FenceBinding, String> {
+        match self {
+            Self::Sqlite(db) => db.put_fence_binding(binding, actor, now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_fence_binding(binding, actor, now_ms))
+            }
+        }
+    }
+
+    pub fn get_fence_binding(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+    ) -> Result<
+        Option<(
+            crate::sekai::fence_binding::FenceBinding,
+            Option<crate::sekai::fence_binding::FenceEventId>,
+        )>,
+        String,
+    > {
+        match self {
+            Self::Sqlite(db) => db.get_fence_binding(namespace, binding_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_fence_binding(namespace, binding_id))
+            }
+        }
+    }
+
+    pub fn lease_fence_run(
+        &self,
+        binding: &crate::sekai::fence_binding::FenceBinding,
+        run_id: &str,
+        renew: bool,
+        now_ms: i64,
+        until_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.lease_fence_run(binding, run_id, renew, now_ms, until_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.lease_fence_run(binding, run_id, renew, now_ms, until_ms)
+            }),
+        }
+    }
+
+    pub fn release_fence_run(
+        &self,
+        binding: &crate::sekai::fence_binding::FenceBinding,
+        run_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.release_fence_run(binding, run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.release_fence_run(binding, run_id))
+            }
+        }
+    }
+
+    pub fn advance_fence_binding(
+        &self,
+        binding: &crate::sekai::fence_binding::FenceBinding,
+        run_id: &str,
+        through: crate::sekai::fence_binding::FenceEventId,
+        receipts: &[crate::sekai::fence_binding::FenceEventReceipt],
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.advance_fence_binding(binding, run_id, through, receipts, now_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.advance_fence_binding(binding, run_id, through, receipts, now_ms)
+            }),
+        }
+    }
+
+    pub fn list_fence_binding_receipts(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+    ) -> Result<Vec<crate::sekai::fence_binding::FenceEventReceipt>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_fence_binding_receipts(namespace, binding_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_fence_binding_receipts(namespace, binding_id)
+            }),
         }
     }
 

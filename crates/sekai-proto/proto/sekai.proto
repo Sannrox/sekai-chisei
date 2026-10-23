@@ -2121,6 +2121,45 @@ message RunActionBindingResponse {
   // Always false: the subscription and the binding grant nothing.
   bool authority = 6;
 }
+// Ezu geofence-event automation binding (#1564, ADR 0121). binding_json is
+// the sekai.fence-binding/v1 document: namespace, fences, event kinds,
+// collection and object kind, pinned type and version, run_as service
+// principal, and a closed parameter mapping.
+message PutFenceBindingRequest {
+  string binding_json = 1;
+}
+message PutFenceBindingResponse {
+  string binding_json = 1;
+  uint64 revision = 2;
+}
+message RunFenceBindingRequest {
+  string namespace = 1;
+  string binding_id = 2;
+}
+// What one Ezu event became, by its id (lsn, index).
+message FenceBindingSubmission {
+  uint64 lsn = 1;
+  uint32 index = 2;
+  string fence = 3;
+  string entity = 4;
+  string kind = 5;
+  // Empty when the event was skipped.
+  string instance_id = 6;
+  string status = 7;
+  bool replay = 8;
+  string skipped_reason = 9;
+}
+message RunFenceBindingResponse {
+  uint64 binding_revision = 1;
+  repeated FenceBindingSubmission submissions = 2;
+  // The Ezu id the binding has now read through; absent before any event.
+  optional uint64 through_lsn = 3;
+  uint32 through_index = 4;
+  // Age of the oldest event this run read, 0 when there was nothing new.
+  int64 lag_ms = 5;
+  // The run read a full page; more events may be waiting.
+  bool more = 6;
+}
 
 // Observational object-bound Action describe/preview (#836).
 // Preview is not a permit. Submit remains SubmitActionInstance.
@@ -3178,6 +3217,8 @@ message DefinitionProposal {
   string migration_plan_digest = 18; // pin required when rollback would drop live properties
   // Approved as a new major revision: may break blocking consumer bindings.
   bool major_revision = 19;
+  // Package digest of the definition package this proposal imports (#1700).
+  string source_package_digest = 20;
 }
 
 message CreateDefinitionProposalRequest {
@@ -3270,6 +3311,34 @@ message ListPublishedDefinitionRevisionsRequest {
 message ListPublishedDefinitionRevisionsResponse {
   repeated PublishedDefinitionRevisionHistoryEntry entries = 1;
   string next_page_token = 2;
+}
+
+message ExportDefinitionPackageRequest {
+  string namespace = 1;
+  // A published revision; empty exports the published head.
+  string revision_digest = 2;
+}
+
+message ExportDefinitionPackageResponse {
+  // sekai.definition-package/v1 envelope: package, provenance, signature.
+  string envelope_json = 1;
+  string package_digest = 2;
+}
+
+message ImportDefinitionPackageRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string envelope_json = 4;
+  string idempotency_key = 5;
+}
+
+message ImportDefinitionPackageResponse {
+  DefinitionProposal proposal = 1;
+  DefinitionRevisionDiff preview = 2;
+  string source_namespace = 3;
+  string source_revision_digest = 4;
+  string signer_identity = 5;
 }
 
 message ProposeDefinitionRollbackRequest {
@@ -3514,6 +3583,11 @@ service SekaiService {
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc ListPublishedDefinitionRevisions(ListPublishedDefinitionRevisionsRequest) returns (ListPublishedDefinitionRevisionsResponse);
   rpc ProposeDefinitionRollback(ProposeDefinitionRollbackRequest) returns (ProposeDefinitionRollbackResponse);
+  // Signed, namespace-independent definition packages (#1700). Export signs
+  // a published revision with this plane's package key; import verifies the
+  // envelope against this plane's trusted package keys and opens a proposal.
+  rpc ExportDefinitionPackage(ExportDefinitionPackageRequest) returns (ExportDefinitionPackageResponse);
+  rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc GetOntologyChangelog(GetOntologyChangelogRequest) returns (GetOntologyChangelogResponse);
@@ -3657,6 +3731,8 @@ service SekaiService {
   rpc DecideActionInstance(DecideActionInstanceRequest) returns (DecideActionInstanceResponse);
   rpc PutActionBinding(PutActionBindingRequest) returns (PutActionBindingResponse);
   rpc RunActionBinding(RunActionBindingRequest) returns (RunActionBindingResponse);
+  rpc PutFenceBinding(PutFenceBindingRequest) returns (PutFenceBindingResponse);
+  rpc RunFenceBinding(RunFenceBindingRequest) returns (RunFenceBindingResponse);
   rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
   rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);

@@ -1398,7 +1398,10 @@ pub(super) fn definition_genesis(
 /// Seeds the genesis revision as the published head when the namespace has
 /// none. A namespace that already published anything
 /// else must branch from that head instead.
-fn seed_definition_genesis(service: &SekaiServiceImpl, namespace: &str) -> Result<(), Status> {
+pub(super) fn seed_definition_genesis(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+) -> Result<(), Status> {
     let genesis = definition_genesis(namespace).map_err(Status::invalid_argument)?;
     service
         .db

@@ -232,6 +232,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ExportDefinitionPackage",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ImportDefinitionPackage",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "CompareDefinitionRevisions",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
@@ -1423,6 +1441,24 @@
       "rpc": "RunActionBinding",
       "storage_path": "sekai.audit",
       "real_backend": "sqlite only",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PutFenceBinding",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RunFenceBinding",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
