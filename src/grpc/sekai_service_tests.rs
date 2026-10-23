@@ -26575,6 +26575,229 @@ async fn an_offline_submit_needs_a_device_bound_credential() {
 }
 
 #[tokio::test]
+async fn change_bundle_dry_run_backfills_a_branch_and_leaves_the_dataset() {
+    let svc = service();
+    let namespace = "dryrun";
+    let parent = seed_definition_parent(&svc, namespace);
+    let from = try_publish(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "dr-1",
+        "dr-cs-1",
+        r#"["title","state"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    let to = try_publish(
+        &svc,
+        namespace,
+        &from,
+        "dr-2",
+        "dr-cs-2",
+        r#"["subject","state","priority"],"required":["priority"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    // Tickets live in a dataset bound to a confidential object.
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "tickets-source".into(),
+            kind: "source_table".into(),
+            name: "tickets".into(),
+            namespace: namespace.into(),
+            external_id: String::new(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.create_dataset(with_named_principal(
+        CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "tickets".into(),
+                name: "tickets".into(),
+                columns: ["id", "title", "state"]
+                    .map(|name| ColumnDef {
+                        name: name.into(),
+                        r#type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .to_vec(),
+                object_id: "tickets-source".into(),
+                created: 1,
+                partition_keys: Vec::new(),
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let rows = vec![
+        HashMap::from([
+            ("id".to_string(), "1".to_string()),
+            ("title".to_string(), "Broken".to_string()),
+            ("state".to_string(), "open".to_string()),
+        ]),
+        HashMap::from([
+            ("id".to_string(), "2".to_string()),
+            ("title".to_string(), "Slow".to_string()),
+            ("state".to_string(), "done".to_string()),
+        ]),
+    ];
+    svc.db.runtime().append_rows("tickets", &rows).unwrap();
+    svc.db
+        .runtime()
+        .register_object_type_datasource(
+            &crate::sekai::object_type_index::ObjectTypeDatasource {
+                contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: namespace.into(),
+                kind: "Ticket".into(),
+                definition_digest: "sha256:ticket".into(),
+                dataset_id: "tickets".into(),
+                key_column: "id".into(),
+                property_mapping: BTreeMap::new(),
+                hidden_column: String::new(),
+                edits_only: false,
+            },
+            1,
+        )
+        .unwrap();
+    let request = DryRunDefinitionChangeBundleRequest {
+        namespace: namespace.into(),
+        from_revision_digest: from,
+        to_revision_digest: to,
+        hints: Some(DefinitionChangeHints {
+            renames: vec![DefinitionPropertyRename {
+                object_type: "Ticket".into(),
+                from_property: "title".into(),
+                to_property: "subject".into(),
+            }],
+            defaults: vec![DefinitionPropertyDefault {
+                object_type: "Ticket".into(),
+                property: "priority".into(),
+                value: "normal".into(),
+            }],
+            type_changes: Vec::new(),
+        }),
+        bundle_digest: String::new(),
+    };
+    let run = svc
+        .dry_run_definition_change_bundle(with_named_principal(request.clone(), "root"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(run.unbacked_object_types.is_empty());
+    let ticket = &run.runs[0];
+    assert_eq!((ticket.rows, ticket.rows_changed), (2, 2));
+    assert!(!ticket.samples_withheld);
+    let sample = ticket.samples.iter().find(|s| s.key == "1").unwrap();
+    assert_eq!(sample.before["title"], "Broken");
+    assert_eq!(sample.after["subject"], "Broken");
+    assert_eq!(sample.after["priority"], "normal");
+    assert_eq!(sample.after["title"], "Broken");
+
+    // The branch holds the backfill; the dataset itself is unchanged.
+    let branch_rows = svc
+        .db
+        .runtime()
+        .dataset_branch_rows("tickets", &ticket.branch)
+        .unwrap();
+    assert!(branch_rows.iter().all(|row| row["priority"] == "normal"));
+    let live = svc
+        .db
+        .runtime()
+        .query_rows("tickets", &crate::sekai::dataset::RowQuery::default())
+        .unwrap();
+    assert!(
+        live.iter()
+            .all(|row| row.contains_key("title") && !row.contains_key("priority"))
+    );
+    assert_eq!(
+        svc.db
+            .runtime()
+            .list_dataset_versions("tickets")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Idempotent per bundle digest, and pinned to it.
+    let again = svc
+        .dry_run_definition_change_bundle(with_named_principal(
+            DryRunDefinitionChangeBundleRequest {
+                bundle_digest: run.bundle_digest.clone(),
+                ..request.clone()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.runs, run.runs);
+    let stale = svc
+        .dry_run_definition_change_bundle(with_named_principal(
+            DryRunDefinitionChangeBundleRequest {
+                bundle_digest: "sha256:other".into(),
+                ..request.clone()
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+
+    // A writer without clearance for the input's marking gets counts only.
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(namespace, "alice", security::Role::Admin, "local")
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    let withheld = svc
+        .dry_run_definition_change_bundle(with_named_principal(request, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(withheld.runs[0].samples_withheld);
+    assert!(withheld.runs[0].samples.is_empty());
+    assert_eq!(withheld.runs[0].rows_changed, 2);
+    // Only the dry run creates bundle branches.
+    let reserved = svc
+        .create_dataset_branch(with_named_principal(
+            CreateDatasetBranchRequest {
+                dataset_id: "tickets".into(),
+                name: "bundle-forged".into(),
+                from_version_id: String::new(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(reserved.code(), tonic::Code::InvalidArgument);
+    // A dry run is a preview: its branch is never proposed for merge.
+    let merge = svc
+        .propose_dataset_branch_merge(with_named_principal(
+            ProposeDatasetBranchMergeRequest {
+                dataset_id: "tickets".into(),
+                name: ticket.branch.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(merge.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
 async fn changes_without_a_recorded_writer_read_as_unattributed() {
     let svc = service();
     // A row written before writer attribution, or by an internal writer

@@ -125,6 +125,58 @@ impl SekaiDb {
         Ok(written)
     }
 
+    /// Fill branch `name` from its base version with `compute` if it has not
+    /// been written, only while it is still `incarnation`: the check, the
+    /// base read and the write share one immediate transaction, so a
+    /// recreated branch is never overwritten. A written branch is returned
+    /// as it stands. Returns the base rows and the branch rows.
+    pub fn fill_dataset_branch_from_base(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        incarnation: &str,
+        compute: &crate::sekai::dataset_branch::BranchCompute<'_>,
+    ) -> Result<
+        (
+            crate::sekai::dataset_branch::BranchRows,
+            crate::sekai::dataset_branch::BranchRows,
+        ),
+        String,
+    > {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let branch = load_branch(&tx, dataset_id, name)
+            .map_err(|_| dataset_branch::BRANCH_CHANGED.to_string())?;
+        if branch.incarnation != incarnation {
+            return Err(dataset_branch::BRANCH_CHANGED.into());
+        }
+        let base = if branch.base_version_id.is_empty() {
+            Vec::new()
+        } else {
+            query_dataset_version_rows_tx(&tx, dataset_id, &branch.base_version_id)?
+        };
+        // Written once: a written branch is the result, so a redaction
+        // applied to it since is never undone by recomputing.
+        let expected = if branch.written {
+            branch_rows_tx(&tx, &branch)?
+        } else {
+            let columns: String = tx
+                .query_row(
+                    "SELECT columns FROM sekai_datasets WHERE id = ?1",
+                    params![dataset_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let expected = compute(&crate::sekai::dataset::parse_columns(&columns)?, &base)?;
+            write_branch_rows_tx(&tx, dataset_id, name, &expected, true)?;
+            expected
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((base, expected))
+    }
+
     /// Run a transform on `branch`: each input reads its branch head when
     /// that dataset has the branch, else the parent's live rows; the output
     /// is written to the output dataset's branch only, created on demand.
@@ -290,6 +342,34 @@ impl SekaiDb {
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
+    }
+
+    /// Every object type binding of `dataset_id`, in any namespace, as
+    /// (namespace, kind).
+    pub fn dataset_bindings(&self, dataset_id: &str) -> Result<Vec<(String, String)>, String> {
+        let conn = self.conn();
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table'
+                 AND name = 'sekai_object_type_datasource'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if exists.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT namespace, kind FROM sekai_object_type_datasource
+                 WHERE dataset_id = ?1 ORDER BY namespace, kind",
+            )
+            .map_err(|error| error.to_string())?;
+        stmt.query_map(params![dataset_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     /// Compare the caller's branch; another tenant's reads as missing.
@@ -1018,6 +1098,20 @@ pub(crate) fn edit_branch_rows_tx(
     if exists.is_none() {
         return Ok(());
     }
+    // Change bundle dry-run branches are previews whose copies carry no
+    // classification: redaction and erasure drop them whole, and a rerun
+    // refills from the edited base (#1692).
+    // Case-sensitive, as the reservation is: SQLite's LIKE is not.
+    let prefix = dataset_branch::BUNDLE_BRANCH_PREFIX;
+    for table in ["sekai_dataset_branch_rows", "sekai_dataset_branches"] {
+        tx.execute(
+            &format!(
+                "DELETE FROM {table} WHERE dataset_id = ?1 AND substr(name, 1, length(?2)) = ?2"
+            ),
+            params![dataset_id, prefix],
+        )
+        .map_err(|error| error.to_string())?;
+    }
     let rows: Vec<(String, i64, String)> = {
         let mut stmt = tx
             .prepare(
@@ -1072,6 +1166,48 @@ mod tests {
         db.query_rows(id, &RowQuery::default()).unwrap()
     }
 
+    /// Redaction deletes change bundle dry-run branches whole (#1692) and
+    /// leaves other branches to the field redaction.
+    fn exercise_bundle_branches_drop_on_redaction(db: &dyn DatasetBackend) {
+        let id = format!("ds-{}", uuid::Uuid::new_v4().as_simple());
+        db.create_dataset(&Dataset {
+            id: id.clone(),
+            name: id.clone(),
+            columns: ["id", "value"]
+                .map(|name| ColumnDef {
+                    name: name.into(),
+                    col_type: "string".into(),
+                    classification: "internal".into(),
+                })
+                .to_vec(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(&id, &[row("1", "a")]).unwrap();
+        for name in ["bundle-preview", "Bundle-keep", "keep"] {
+            db.create_dataset_branch(&CreateDatasetBranch {
+                dataset_id: id.clone(),
+                name: name.into(),
+                actor: "dev".into(),
+                tenant: "t1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            db.write_dataset_branch_rows(&id, name, &[row("1", "copy")], true)
+                .unwrap();
+        }
+        db.redact_dataset_fields(&id, "internal", &[]).unwrap();
+        let names = db
+            .list_dataset_branches(&id)
+            .unwrap()
+            .into_iter()
+            .map(|branch| branch.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Bundle-keep", "keep"]);
+    }
+
     /// The #1444 acceptance on one backend: a branch never changes the parent,
     /// a merge makes exactly one version with a receipt, deleting a branch
     /// frees its working copy, and retention keeps an open branch's base.
@@ -1107,6 +1243,12 @@ mod tests {
         let branch = db.create_dataset_branch(&create("fix")).unwrap();
         assert_eq!(branch.base_version_id, base);
         assert!(!branch.written);
+        // A write fenced on another incarnation is refused and writes nothing.
+        assert_eq!(
+            db.fill_dataset_branch_from_base(&id, "fix", "stale", &|_, _| Ok(vec![row("9", "z")]))
+                .unwrap_err(),
+            dataset_branch::BRANCH_CHANGED
+        );
         assert_eq!(
             db.create_dataset_branch(&create("fix")).unwrap_err(),
             dataset_branch::BRANCH_EXISTS
@@ -1344,7 +1486,9 @@ mod tests {
 
     #[test]
     fn sqlite_branches_isolate_merge_once_and_free_on_delete() {
-        exercise(&crate::db::sekai::SekaiDb::new(":memory:").unwrap());
+        let db = crate::db::sekai::SekaiDb::new(":memory:").unwrap();
+        exercise(&db);
+        exercise_bundle_branches_drop_on_redaction(&db);
     }
 
     #[test]
@@ -1362,6 +1506,7 @@ mod tests {
         };
         let db = db.unwrap();
         exercise(&db);
+        exercise_bundle_branches_drop_on_redaction(&db);
         exercise_branch_run(&db, &|transform| {
             db.put_governed_transform(transform, 10).unwrap();
         });

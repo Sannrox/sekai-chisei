@@ -4500,11 +4500,23 @@ fn to_proto_proposal(
     }
 }
 
+use crate::sekai::dataset_branch::BUNDLE_BRANCH_PREFIX;
+
+fn refuse_reserved_branch_name(name: &str) -> Result<(), Status> {
+    if name.starts_with(BUNDLE_BRANCH_PREFIX) {
+        return Err(Status::invalid_argument(format!(
+            "dataset branch names starting with {BUNDLE_BRANCH_PREFIX} are reserved for change bundle dry runs"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) async fn create_dataset_branch(
     service: &SekaiServiceImpl,
     req: Request<CreateDatasetBranchRequest>,
 ) -> Result<Response<CreateDatasetBranchResponse>, Status> {
     let dataset_id = req.get_ref().dataset_id.clone();
+    refuse_reserved_branch_name(&req.get_ref().name)?;
     let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
     let inner = req.into_inner();
     let branch = service
@@ -4583,6 +4595,13 @@ pub(super) async fn propose_dataset_branch_merge(
     req: Request<ProposeDatasetBranchMergeRequest>,
 ) -> Result<Response<ProposeDatasetBranchMergeResponse>, Status> {
     let dataset_id = req.get_ref().dataset_id.clone();
+    // A dry-run branch is a preview: applying a bundle is a later, governed
+    // step, and its copied fields carry no classification to merge under.
+    if req.get_ref().name.starts_with(BUNDLE_BRANCH_PREFIX) {
+        return Err(Status::failed_precondition(
+            "definition change bundle dry-run branches are not merged",
+        ));
+    }
     let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
     let proposal = service
         .db
@@ -4635,6 +4654,7 @@ pub(super) async fn run_governed_transform_on_branch(
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let actor = principals.first().cloned().unwrap_or_default();
     let input = req.into_inner();
+    refuse_reserved_branch_name(&input.branch)?;
     if let Some(context) = tenant_context.as_ref() {
         enforce_namespace_tenant_context(
             service.db.runtime(),
@@ -4923,4 +4943,292 @@ fn to_proto_replay(replay: crate::sekai::transform_replay::TransformReplay) -> T
         actor: replay.actor,
         created_at_ms: replay.created_at_ms,
     }
+}
+
+/// Dry run of a definition change bundle's backfill (#1692, ADR 0125): per
+/// object type with a backfill and a backing dataset, the backfill runs on a
+/// branch named for the bundle digest, forked from the dataset's latest
+/// version, never on the dataset itself. The branch rows are a pure function
+/// of the bundle and the fork, so a rerun, a retry after a crash, or a
+/// concurrent call converges on the same rows.
+pub(super) async fn dry_run_definition_change_bundle(
+    service: &SekaiServiceImpl,
+    req: Request<DryRunDefinitionChangeBundleRequest>,
+) -> Result<Response<DryRunDefinitionChangeBundleResponse>, Status> {
+    use crate::sekai::definition_change_bundle::{apply_backfill, generate_change_bundle};
+    const MAX_SAMPLES: usize = 5;
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let purpose = request_purpose_presentation(&req, &principals);
+    let input = req.get_ref().clone();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    let (from, from_members, to, to_members) = load_authorized_definition_revisions(
+        service,
+        &principals,
+        &input.namespace,
+        &input.from_revision_digest,
+        &input.to_revision_digest,
+    )?;
+    let bundle = generate_change_bundle(
+        &from,
+        &from_members,
+        &to,
+        &to_members,
+        &super::definition_change_bundle_rpc::hints_from_proto(input.hints.clone()),
+    )
+    .map_err(Status::invalid_argument)?;
+    if !input.bundle_digest.is_empty() && input.bundle_digest != bundle.bundle_digest {
+        return Err(Status::failed_precondition(
+            "definition_change_bundle_changed: the regenerated bundle has another digest",
+        ));
+    }
+    let digest_hex = bundle
+        .bundle_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&bundle.bundle_digest);
+    let branch_name = format!(
+        "{BUNDLE_BRANCH_PREFIX}{}",
+        &digest_hex[..digest_hex.len().min(24)]
+    );
+    let object_types_with_backfill = bundle
+        .backfill
+        .iter()
+        .map(|assignment| assignment.object_type.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    // The full registered bindings: property mapping, hidden column and
+    // whether the type is edits-only.
+    let mut datasources = Vec::new();
+    for object_type in &object_types_with_backfill {
+        if let Some(source) = service
+            .db
+            .runtime()
+            .get_object_type_datasource(&input.namespace, object_type)
+            .map_err(Status::internal)?
+        {
+            datasources.push(source);
+        }
+    }
+    let object_types = object_types_with_backfill;
+    let mut runs = Vec::new();
+    let mut unbacked = Vec::new();
+    // An edits-only registration has no dataset to run on.
+    let backing = |object_type: &str| {
+        datasources.iter().find(|source| {
+            source.kind == object_type && !source.edits_only && !source.dataset_id.is_empty()
+        })
+    };
+    // A dataset backing any other object type, in any namespace, is
+    // refused: one branch holds one object type's backfill, and a rename
+    // could drop a column another binding reads.
+    for object_type in &object_types {
+        if let Some(source) = backing(object_type) {
+            let bindings = service
+                .db
+                .runtime()
+                .dataset_bindings(&source.dataset_id)
+                .map_err(Status::internal)?;
+            if bindings
+                .iter()
+                .any(|(namespace, kind)| namespace != &input.namespace || kind != object_type)
+            {
+                return Err(Status::failed_precondition(
+                    "definition_change_bundle_shared_dataset: another object type is backed by the same dataset",
+                ));
+            }
+        }
+    }
+    for object_type in object_types {
+        let Some(source) = backing(&object_type) else {
+            unbacked.push(object_type);
+            continue;
+        };
+        let dataset_id = source.dataset_id.as_str();
+        let (actor, tenant) = branch_caller(service, &req, dataset_id, true)?;
+        let dataset = service
+            .db
+            .runtime()
+            .get_dataset(dataset_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("dataset not found"))?;
+        // Samples carry whole rows; property read grants are not applied to
+        // them, so a dataset under enforced grants is refused, as for replays.
+        if preview_column_allowlist(service, &dataset)?.is_some() {
+            return Err(Status::failed_precondition(
+                crate::sekai::transform_replay::REPLAY_PROPERTY_RESTRICTED,
+            ));
+        }
+        let find = || {
+            service
+                .db
+                .runtime()
+                .list_dataset_branches(dataset_id)
+                .map(|branches| {
+                    branches
+                        .into_iter()
+                        .find(|branch| branch.name == branch_name && branch.tenant == tenant)
+                })
+                .map_err(branch_status)
+        };
+        let branch = match find()? {
+            Some(branch) => branch,
+            None => match service.db.runtime().create_dataset_branch(
+                &crate::sekai::dataset_branch::CreateDatasetBranch {
+                    dataset_id: dataset_id.into(),
+                    name: branch_name.clone(),
+                    from_version_id: String::new(),
+                    actor: actor.clone(),
+                    tenant: tenant.clone(),
+                },
+            ) {
+                Ok(branch) => branch,
+                Err(error) if error == crate::sekai::dataset_branch::BRANCH_EXISTS => find()?
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "the bundle's branch name is held by another tenant",
+                        )
+                    })?,
+                Err(error) => return Err(branch_status(error)),
+            },
+        };
+        let column = |property: &str| {
+            source
+                .property_mapping
+                .get(property)
+                .cloned()
+                .unwrap_or_else(|| property.to_string())
+        };
+        // Base read, backfill and write in one storage transaction, fenced
+        // on the incarnation read above and serialized with redaction.
+        let (base, expected) = service
+            .db
+            .runtime()
+            .fill_dataset_branch_from_base(
+                dataset_id,
+                &branch_name,
+                &branch.incarnation,
+                &|columns, base| {
+                    // Checked against the column definitions read in the
+                    // fill's transaction, so a concurrent reclassification
+                    // cannot slip in between.
+                    check_backfill_columns(
+                        &bundle,
+                        &object_type,
+                        columns,
+                        &source.key_column,
+                        column,
+                    )?;
+                    Ok(apply_backfill(&bundle, &object_type, base, column))
+                },
+            )
+            .map_err(|error| {
+                if error == crate::sekai::dataset_branch::BRANCH_CHANGED {
+                    Status::aborted(error)
+                } else if error.starts_with("definition_change_bundle_") {
+                    Status::failed_precondition(error)
+                } else {
+                    branch_status(error)
+                }
+            })?;
+        let changed = base
+            .iter()
+            .zip(&expected)
+            .filter(|(before, after)| before != after)
+            .collect::<Vec<_>>();
+        // The rows are governed by the dataset's bound object: samples only
+        // for a caller who may read it under the full object read policy
+        // (namespace, ACL, marking, active security policy with the
+        // request's purpose).
+        let readable = match dataset.object_id.as_str() {
+            "" => true,
+            object_id => service
+                .db
+                .runtime()
+                .get_object(object_id)
+                .map_err(Status::internal)?
+                .is_some_and(|object| {
+                    object_is_visible_for_purpose(
+                        service.db.runtime(),
+                        &service.security,
+                        &object,
+                        &principals,
+                        tenant_context.as_ref(),
+                        crate::sekai::object_security::ObjectSecurityOperation::Read,
+                        purpose.as_ref(),
+                    )
+                }),
+        };
+        runs.push(DefinitionBackfillDryRun {
+            object_type: object_type.clone(),
+            dataset_id: dataset_id.into(),
+            branch: branch_name.clone(),
+            rows: expected.len() as i64,
+            rows_changed: changed.len() as i64,
+            samples: if readable {
+                changed
+                    .iter()
+                    .take(MAX_SAMPLES)
+                    .map(|(before, after)| DefinitionBackfillSample {
+                        key: before.get(&source.key_column).cloned().unwrap_or_default(),
+                        before: (*before).clone().into_iter().collect(),
+                        after: (*after).clone().into_iter().collect(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            samples_withheld: !readable,
+        });
+    }
+    Ok(Response::new(DryRunDefinitionChangeBundleResponse {
+        bundle_digest: bundle.bundle_digest,
+        runs,
+        unbacked_object_types: unbacked,
+    }))
+}
+
+/// Checks a backfill against the dataset's column definitions as stored in
+/// the fill's transaction (#1692). It only writes columns the dataset does
+/// not define (so never the key): a changed identifier or field, even an
+/// empty one filled in, would let filtered redaction or erasure miss the
+/// row. It copies only from columns classified public: redaction finds
+/// values by column definition, and a copy under a new name would escape it.
+fn check_backfill_columns(
+    bundle: &crate::sekai::definition_change_bundle::DefinitionChangeBundle,
+    object_type: &str,
+    columns: &[crate::sekai::dataset::ColumnDef],
+    key_column: &str,
+    column: impl Fn(&str) -> String,
+) -> Result<(), String> {
+    let definition = |name: &str| columns.iter().find(|definition| definition.name == name);
+    for assignment in bundle
+        .backfill
+        .iter()
+        .filter(|a| a.object_type == object_type)
+    {
+        let target = column(&assignment.property);
+        if target == key_column || definition(&target).is_some() {
+            return Err(format!(
+                "definition_change_bundle_overwrites_column: {target} already holds data"
+            ));
+        }
+        if assignment.mode == "copy" {
+            let source = column(&assignment.source);
+            let classification = definition(&source)
+                .map(|definition| definition.classification.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(classification.as_str(), "" | "public") {
+                return Err(format!(
+                    "definition_change_bundle_classified_copy: column {source} is classified {classification}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }

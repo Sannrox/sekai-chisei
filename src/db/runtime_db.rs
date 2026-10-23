@@ -5711,6 +5711,40 @@ impl RuntimeDb {
         }
     }
 
+    /// Every object type binding of `dataset_id`, as (namespace, kind).
+    pub fn dataset_bindings(&self, dataset_id: &str) -> Result<Vec<(String, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.dataset_bindings(dataset_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.dataset_bindings(dataset_id))
+            }
+        }
+    }
+
+    /// Fill an unwritten branch from its base version; see the backend docs.
+    pub fn fill_dataset_branch_from_base(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        incarnation: &str,
+        compute: &crate::sekai::dataset_branch::BranchCompute<'_>,
+    ) -> Result<
+        (
+            crate::sekai::dataset_branch::BranchRows,
+            crate::sekai::dataset_branch::BranchRows,
+        ),
+        String,
+    > {
+        match self {
+            Self::Sqlite(db) => {
+                db.fill_dataset_branch_from_base(dataset_id, name, incarnation, compute)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.fill_dataset_branch_from_base(dataset_id, name, incarnation, compute)
+            }),
+        }
+    }
+
     pub fn compare_dataset_branch(
         &self,
         dataset_id: &str,

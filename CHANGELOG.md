@@ -9,6 +9,11 @@
   (docs/operation-correlation.md, `0097_object_change_writer`, GATE:mig,
   #1690).
 
+- Experimental `DryRunDefinitionChangeBundle` runs a change bundle's
+  backfill on a dataset branch per backed object type, named for the bundle
+  digest, and reports row counts and marking-aware samples; the datasets
+  themselves are never written (docs/definition-change-bundles.md, #1692).
+
 - Query embedding for vector search: `embed_query` embeds a query through
   the stored spec's admitted route and refuses a route whose model or
   version differs from the indexed vectors, or an external route for a
