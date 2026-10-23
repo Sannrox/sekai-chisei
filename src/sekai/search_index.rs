@@ -865,6 +865,112 @@ mod tests {
         assert_eq!(trusted[0].id, "note-bare");
     }
 
+    /// Vector candidates follow the read policy before ranking and before
+    /// the limit, the same on every backend (#1582, #1682).
+    fn exercise_vector_candidates_follow_the_read_policy(db: &RuntimeDb) {
+        use crate::sekai::embedding_index::{
+            EmbeddingSource, EmbeddingSpec, EmbeddingStore, ObjectEmbeddings, StoredEmbeddingSpec,
+        };
+        for (id, properties) in [
+            ("near", vec![("body", "near")]),
+            ("far", vec![("body", "far")]),
+            ("owned", vec![("body", "owned"), ("owner", "alice")]),
+            (
+                "marked",
+                vec![("body", "marked"), ("access_marking", "confidential")],
+            ),
+        ] {
+            db.create_object_with_audit(&object(id, "acme", id, &properties), "root")
+                .unwrap();
+        }
+        db.put_embedding_spec(&StoredEmbeddingSpec {
+            spec: EmbeddingSpec {
+                id: "notes".into(),
+                namespace: "acme".into(),
+                object_kind: "note".into(),
+                properties: vec!["body".into()],
+                chunk_chars: 1_000,
+                dimension: 2,
+                batch_size: 8,
+            },
+            model: "m".into(),
+            updated_by: "admin".into(),
+            updated_at_ms: 1,
+            revision: 0,
+        })
+        .unwrap();
+        let mut revision = db
+            .embedding_checkpoint("acme", "notes")
+            .unwrap()
+            .map_or(0, |checkpoint| checkpoint.revision);
+        // The owned and marked notes are nearest the query.
+        for (id, marking, vector) in [
+            ("owned", None, [1.0, 0.0]),
+            ("marked", Some("confidential"), [1.0, 0.0]),
+            ("near", None, [0.9, 0.1]),
+            ("far", None, [0.0, 1.0]),
+        ] {
+            let source = EmbeddingSource {
+                source_digest: format!("digest-{id}"),
+                model: "m".into(),
+                model_version: "v".into(),
+                marking: marking.map(Into::into),
+                classifications: Vec::new(),
+            };
+            revision = db
+                .write_embedding_object(
+                    "acme",
+                    "notes",
+                    &ObjectEmbeddings {
+                        object_id: id,
+                        source: &source,
+                        chunks: &[(0, format!("chunk-{id}"), vector.to_vec())],
+                        keep: 1,
+                    },
+                    revision,
+                    10,
+                )
+                .unwrap();
+        }
+        let ranked = |subject: &str, limit: usize| {
+            db.vector_candidates(
+                &VectorCandidateQuery {
+                    spec_id: "notes".into(),
+                    vector: vec![1.0, 0.0],
+                    policy: SearchPolicyFilter {
+                        namespace: "acme".into(),
+                        namespace_authorized: true,
+                        subjects: vec![subject.into()],
+                        ..SearchPolicyFilter::default()
+                    },
+                    limit,
+                },
+                &mut |_| Ok(true),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.object_id)
+            .collect::<Vec<_>>()
+        };
+        // No vector hit for another owner's note or above the caller's
+        // clearance, and neither takes a place within the limit.
+        assert_eq!(ranked("editor", 10), vec!["near", "far"]);
+        assert_eq!(ranked("editor", 1), vec!["near"]);
+        assert_eq!(ranked("alice", 1), vec!["owned"]);
+    }
+
+    #[test]
+    fn vector_candidates_follow_the_read_policy() {
+        exercise_vector_candidates_follow_the_read_policy(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_vector_candidates_follow_the_read_policy() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_vector_candidates_follow_the_read_policy(&db);
+    }
+
     #[test]
     fn deny_unmarked_hides_unmarked_search_candidates() {
         exercise_deny_unmarked_hides_unmarked_search_candidates(&RuntimeDb::memory());

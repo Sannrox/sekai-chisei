@@ -47,7 +47,7 @@ combined mode only; elsewhere it fails with `FAILED_PRECONDITION`. A spec
 whose kind's active policy withholds any of its source properties is not
 searched.
 
-The search is exact over the chunk table. Chunks whose marking the caller's
+The search is exact over the chunk table, on SQLite and PostgreSQL alike (#1682). Chunks whose marking the caller's
 clearance denies are dropped before scoring, and objects rank by their best
 chunk across all searched specs. Before a candidate counts toward the cap
 it must pass the same per-object read policy as text candidates (ACL,
