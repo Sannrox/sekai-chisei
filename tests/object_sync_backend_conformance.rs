@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 
 use rusqlite::params;
-use sekai_chisei::db::object_sync::ObjectSyncBackend;
+use sekai_chisei::db::object_sync::{BatchHistoryCursor, ObjectSyncBackend};
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::domain::Object;
 use sekai_chisei::sekai::object_lineage::{
@@ -608,10 +608,66 @@ fn exercise_ordered_feed(db: &dyn ObjectSyncBackend, prefix: &str) {
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:recovered"));
 }
 
+/// #1699: 250 committed batches page as 100, 100 and 50, newest first, and
+/// a batch applied between pages neither repeats nor shifts a later page.
+fn exercise_batch_history(db: &dyn ObjectSyncBackend, prefix: &str) {
+    let producer = format!("connector/{prefix}");
+    let namespace = format!("{prefix}-namespace");
+    let list = |before: Option<&BatchHistoryCursor>| {
+        db.list_source_batch_transactions(&namespace, SOURCE_INSTANCE, TYPE_DIGEST, before, 100)
+            .unwrap()
+            .unwrap()
+            .transactions
+    };
+    assert!(
+        db.list_source_batch_transactions(&namespace, SOURCE_INSTANCE, TYPE_DIGEST, None, 100)
+            .unwrap()
+            .is_none(),
+        "no binding yet"
+    );
+    let mut cursor = String::new();
+    let mut applied = Vec::new();
+    for n in 0..250_i64 {
+        let next = format!("cursor:{n}");
+        let page = batch(prefix, &cursor, &next, &format!("history-{n}"));
+        let result = db.apply_source_batch(&page, &producer, 1_000 + n).unwrap();
+        assert_eq!(result.transaction.status, SourceBatchStatus::Committed);
+        applied.push(result.transaction.transaction_id);
+        cursor = next;
+    }
+    applied.reverse();
+    let after = |page: &[sekai_chisei::sekai::object_sync::SourceBatchTransaction]| {
+        page.last().map(|last| BatchHistoryCursor {
+            opened_at_ms: last.opened_at_ms,
+            transaction_id: last.transaction_id.clone(),
+        })
+    };
+    let ids = |page: &[sekai_chisei::sekai::object_sync::SourceBatchTransaction]| {
+        page.iter()
+            .map(|transaction| transaction.transaction_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let first = list(None);
+    assert_eq!(ids(&first), applied[..100]);
+    // A new batch lands between pages; it is newer than every page read so far.
+    let newest = batch(prefix, &cursor, "cursor:new", "history-new");
+    let newest = db.apply_source_batch(&newest, &producer, 5_000).unwrap();
+    let second = list(after(&first).as_ref());
+    assert_eq!(ids(&second), applied[100..200]);
+    let third = list(after(&second).as_ref());
+    assert_eq!(ids(&third), applied[200..]);
+    assert!(list(after(&third).as_ref()).is_empty());
+    assert_eq!(
+        list(None)[0].transaction_id,
+        newest.transaction.transaction_id
+    );
+}
+
 #[test]
 fn sqlite_object_sync_backend_conformance() {
     exercise_object_sync(&SekaiDb::new(":memory:").unwrap(), "sqlite");
     exercise_ordered_feed(&SekaiDb::new(":memory:").unwrap(), "sqlite-ordered");
+    exercise_batch_history(&SekaiDb::new(":memory:").unwrap(), "sqlite-history");
 }
 
 #[test]
@@ -724,6 +780,8 @@ fn postgres_object_sync_backend_conformance() {
     exercise_object_sync(&scratch.connect(8), &prefix);
     let ordered = ScratchDatabase::create();
     exercise_ordered_feed(&ordered.connect(8), &format!("{prefix}-ordered"));
+    let history = ScratchDatabase::create();
+    exercise_batch_history(&history.connect(8), &format!("{prefix}-history"));
 }
 
 #[test]

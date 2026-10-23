@@ -3100,6 +3100,22 @@ message GetSourceSyncStateResponse {
   bool found = 1;
   SourceSyncState state = 2;
 }
+// A binding's batch transactions, newest first by (opened_at_ms,
+// transaction_id) (#1699). Metadata only, never the batch payload. The page
+// token is an opaque keyset cursor, so batches applied between pages neither
+// repeat nor are skipped.
+message ListSourceBatchTransactionsRequest {
+  string namespace = 1;
+  string source_instance = 2;
+  string type_digest = 3;
+  uint32 page_size = 4; // 0, or anything above 100, returns at most 100
+  string page_token = 5;
+}
+message ListSourceBatchTransactionsResponse {
+  bool found = 1;
+  repeated SourceBatchTransaction transactions = 2;
+  string next_page_token = 3; // empty on the last page
+}
 
 // Additive registered source-type descriptors (ADR 0060 / #818). Inspection
 // returns bounded identity fields only. GitHub Issue/PullRequest stays the
@@ -3783,6 +3799,7 @@ service SekaiService {
   rpc TakeoverExpiredLease(TakeoverExpiredLeaseRequest) returns (TakeoverExpiredLeaseResponse);
   rpc ApplySourceBatch(ApplySourceBatchRequest) returns (ApplySourceBatchResponse);
   rpc GetSourceSyncState(GetSourceSyncStateRequest) returns (GetSourceSyncStateResponse);
+  rpc ListSourceBatchTransactions(ListSourceBatchTransactionsRequest) returns (ListSourceBatchTransactionsResponse);
   rpc RegisterSourceTypeDescriptor(RegisterSourceTypeDescriptorRequest) returns (RegisterSourceTypeDescriptorResponse);
   rpc InspectSourceTypeDescriptor(InspectSourceTypeDescriptorRequest) returns (InspectSourceTypeDescriptorResponse);
   rpc RetireSourceTypeDescriptor(RetireSourceTypeDescriptorRequest) returns (RetireSourceTypeDescriptorResponse);

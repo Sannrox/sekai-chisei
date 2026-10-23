@@ -745,6 +745,67 @@ impl PostgresDb {
         )
     }
 
+    pub fn list_source_batch_transactions(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+        type_digest: &str,
+        before: Option<&crate::db::object_sync::BatchHistoryCursor>,
+        limit: usize,
+    ) -> Result<Option<crate::db::object_sync::SourceBatchHistory>, String> {
+        let mut connection = self.connection()?;
+        let Some(binding_id) = connection
+            .query_opt(
+                "SELECT binding_id FROM sekai_source_bindings
+                 WHERE namespace = $1 AND source_instance = $2 AND type_digest = $3
+                 ORDER BY binding_id LIMIT 1",
+                &[&namespace, &source_instance, &type_digest],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, String>(0))
+        else {
+            return Ok(None);
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match before {
+            None => connection.query(
+                &format!(
+                    "{BATCH_SELECT}
+                     WHERE binding_id = $1
+                     ORDER BY opened_at_ms DESC, transaction_id DESC
+                     LIMIT $2"
+                ),
+                &[&binding_id, &limit],
+            ),
+            Some(cursor) => connection.query(
+                &format!(
+                    "{BATCH_SELECT}
+                     WHERE binding_id = $1
+                       AND (opened_at_ms < $2
+                            OR (opened_at_ms = $2 AND transaction_id < $3))
+                     ORDER BY opened_at_ms DESC, transaction_id DESC
+                     LIMIT $4"
+                ),
+                &[
+                    &binding_id,
+                    &cursor.opened_at_ms,
+                    &cursor.transaction_id,
+                    &limit,
+                ],
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        let transactions = rows
+            .into_iter()
+            .map(|row| stored_batch_from_row(row).map(|stored| stored.transaction))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Some(crate::db::object_sync::SourceBatchHistory {
+            binding_id,
+            transactions,
+        }))
+    }
+
     pub fn get_source_sync_state(
         &self,
         namespace: &str,

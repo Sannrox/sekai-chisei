@@ -93,6 +93,33 @@ pub trait ObjectSyncBackend: Send + Sync {
         source_instance: &str,
         type_digest: &str,
     ) -> Result<Option<SourceSyncState>, String>;
+
+    /// One page of a binding's batch transactions, newest first by
+    /// (`opened_at_ms`, `transaction_id`). `before` is the last row of the
+    /// previous page, so batches applied between pages neither repeat nor
+    /// shift a page. `None` when the binding does not exist.
+    fn list_source_batch_transactions(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+        type_digest: &str,
+        before: Option<&BatchHistoryCursor>,
+        limit: usize,
+    ) -> Result<Option<SourceBatchHistory>, String>;
+}
+
+/// The keyset position after which a batch-history page resumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchHistoryCursor {
+    pub opened_at_ms: i64,
+    pub transaction_id: String,
+}
+
+/// One page of a binding's batch transactions, metadata only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceBatchHistory {
+    pub binding_id: String,
+    pub transactions: Vec<SourceBatchTransaction>,
 }
 
 impl ObjectSyncBackend for SekaiDb {
@@ -121,6 +148,24 @@ impl ObjectSyncBackend for SekaiDb {
     ) -> Result<Option<SourceSyncState>, String> {
         SekaiDb::get_source_sync_state(self, namespace, source_instance, type_digest)
     }
+
+    fn list_source_batch_transactions(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+        type_digest: &str,
+        before: Option<&BatchHistoryCursor>,
+        limit: usize,
+    ) -> Result<Option<SourceBatchHistory>, String> {
+        SekaiDb::list_source_batch_transactions(
+            self,
+            namespace,
+            source_instance,
+            type_digest,
+            before,
+            limit,
+        )
+    }
 }
 
 impl ObjectSyncBackend for PostgresDb {
@@ -148,6 +193,24 @@ impl ObjectSyncBackend for PostgresDb {
         type_digest: &str,
     ) -> Result<Option<SourceSyncState>, String> {
         PostgresDb::get_source_sync_state(self, namespace, source_instance, type_digest)
+    }
+
+    fn list_source_batch_transactions(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+        type_digest: &str,
+        before: Option<&BatchHistoryCursor>,
+        limit: usize,
+    ) -> Result<Option<SourceBatchHistory>, String> {
+        PostgresDb::list_source_batch_transactions(
+            self,
+            namespace,
+            source_instance,
+            type_digest,
+            before,
+            limit,
+        )
     }
 }
 
@@ -1563,6 +1626,72 @@ impl SekaiDb {
             current_generation,
             latest_transaction,
             updated_at_ms,
+        }))
+    }
+
+    pub fn list_source_batch_transactions(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+        type_digest: &str,
+        before: Option<&BatchHistoryCursor>,
+        limit: usize,
+    ) -> Result<Option<SourceBatchHistory>, String> {
+        let conn = self.conn();
+        let Some(binding_id) = conn
+            .query_row(
+                "SELECT binding_id FROM sekai_source_bindings
+                 WHERE namespace=?1 AND source_instance=?2 AND type_digest=?3
+                 ORDER BY binding_id LIMIT 1",
+                params![namespace, source_instance, type_digest],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match before {
+            None => {
+                let sql = format!(
+                    "{BATCH_SELECT} WHERE binding_id=?1
+                     ORDER BY opened_at_ms DESC, transaction_id DESC LIMIT ?2"
+                );
+                let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+                statement
+                    .query_map(params![binding_id, limit], raw_batch_from_row)
+                    .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            }
+            Some(cursor) => {
+                let sql = format!(
+                    "{BATCH_SELECT} WHERE binding_id=?1
+                       AND (opened_at_ms < ?2 OR (opened_at_ms = ?2 AND transaction_id < ?3))
+                     ORDER BY opened_at_ms DESC, transaction_id DESC LIMIT ?4"
+                );
+                let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+                statement
+                    .query_map(
+                        params![
+                            binding_id,
+                            cursor.opened_at_ms,
+                            cursor.transaction_id,
+                            limit
+                        ],
+                        raw_batch_from_row,
+                    )
+                    .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        let transactions = rows
+            .into_iter()
+            .map(|raw| stored_batch_from_raw(raw).map(|stored| stored.transaction))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Some(SourceBatchHistory {
+            binding_id,
+            transactions,
         }))
     }
 }

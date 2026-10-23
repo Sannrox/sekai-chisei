@@ -293,6 +293,119 @@ pub(super) async fn get_source_sync_state(
         state: state.as_ref().map(to_proto_source_sync_state),
     }))
 }
+/// Most batch transactions one page returns.
+const MAX_BATCH_HISTORY_PAGE: usize = 100;
+
+/// A page token for batch history: the binding and the last row returned,
+/// opaque to callers.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BatchHistoryToken {
+    binding: String,
+    opened_at_ms: i64,
+    transaction_id: String,
+}
+
+fn encode_batch_history_token(token: &BatchHistoryToken) -> Result<String, Status> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    serde_json::to_vec(token)
+        .map(|json| URL_SAFE_NO_PAD.encode(json))
+        .map_err(|_| Status::internal("page token unavailable"))
+}
+
+fn decode_batch_history_token(token: &str) -> Result<BatchHistoryToken, Status> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD
+        .decode(token)
+        .ok()
+        .and_then(|json| serde_json::from_slice(&json).ok())
+        .ok_or_else(|| Status::invalid_argument("invalid page_token"))
+}
+
+/// A binding's batch transactions, newest first (#1699). Authorized exactly
+/// as `GetSourceSyncState`, so a caller it refuses is refused here the same
+/// way.
+pub(super) async fn list_source_batch_transactions(
+    service: &SekaiServiceImpl,
+    req: Request<ListSourceBatchTransactionsRequest>,
+) -> Result<Response<ListSourceBatchTransactionsResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_single_source_principal(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    validate_source_sync_lookup(&GetSourceSyncStateRequest {
+        namespace: input.namespace.clone(),
+        source_instance: input.source_instance.clone(),
+        type_digest: input.type_digest.clone(),
+    })?;
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    require_admitted_source_type(service.db.runtime(), &input.namespace, &input.type_digest)?;
+    let page_size = match input.page_size as usize {
+        0 => MAX_BATCH_HISTORY_PAGE,
+        size => size.min(MAX_BATCH_HISTORY_PAGE),
+    };
+    let token = (!input.page_token.is_empty())
+        .then(|| decode_batch_history_token(&input.page_token))
+        .transpose()?;
+    let before = token
+        .as_ref()
+        .map(|token| crate::db::object_sync::BatchHistoryCursor {
+            opened_at_ms: token.opened_at_ms,
+            transaction_id: token.transaction_id.clone(),
+        });
+    // One extra row tells whether another page follows.
+    let history = service
+        .db
+        .runtime()
+        .list_source_batch_transactions(
+            &input.namespace,
+            &input.source_instance,
+            &input.type_digest,
+            before.as_ref(),
+            page_size + 1,
+        )
+        .map_err(|_| Status::internal("source batch history unavailable"))?;
+    let Some(mut history) = history else {
+        return Ok(Response::new(ListSourceBatchTransactionsResponse {
+            found: false,
+            transactions: Vec::new(),
+            next_page_token: String::new(),
+        }));
+    };
+    if token
+        .as_ref()
+        .is_some_and(|token| token.binding != history.binding_id)
+    {
+        return Err(Status::invalid_argument(
+            "page_token belongs to another source binding",
+        ));
+    }
+    let more = history.transactions.len() > page_size;
+    history.transactions.truncate(page_size);
+    let next_page_token = match (more, history.transactions.last()) {
+        (true, Some(last)) => encode_batch_history_token(&BatchHistoryToken {
+            binding: history.binding_id.clone(),
+            opened_at_ms: last.opened_at_ms,
+            transaction_id: last.transaction_id.clone(),
+        })?,
+        _ => String::new(),
+    };
+    Ok(Response::new(ListSourceBatchTransactionsResponse {
+        found: true,
+        transactions: history
+            .transactions
+            .iter()
+            .map(to_proto_source_transaction)
+            .collect(),
+        next_page_token,
+    }))
+}
+
 pub(super) async fn register_source_type_descriptor(
     service: &SekaiServiceImpl,
     req: Request<RegisterSourceTypeDescriptorRequest>,
