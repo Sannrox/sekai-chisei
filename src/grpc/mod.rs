@@ -171,7 +171,40 @@ fn assertion_reject_status(reject: crate::identity_assertion::AssertionReject) -
         crate::identity_assertion::AssertionReject::ScopeEscalation => {
             Status::permission_denied("assertion scope escalation")
         }
+        crate::identity_assertion::AssertionReject::Device => {
+            Status::unauthenticated("invalid assertion device claim")
+        }
     }
+}
+
+/// Request metadata carrying a device proof (ADR 0126).
+pub(crate) const DEVICE_PROOF_HEADER: &str = "x-sekai-device-proof";
+
+/// The device-proof hook for a protected RPC: a request authenticated by a
+/// device-bound assertion must carry the device's proof over this request
+/// (`method` and the encoded message) in [`DEVICE_PROOF_HEADER`]. With
+/// `device_required`, an unbound context is refused too.
+#[allow(dead_code)] // The first protected RPCs arrive with #1634.
+pub(crate) fn require_device_proof<T: prost::Message>(
+    request: &tonic::Request<T>,
+    method: &str,
+    device_required: bool,
+) -> Result<(), Status> {
+    let context = request
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+        .ok_or_else(|| Status::unauthenticated("missing authenticated context"))?;
+    let digest =
+        crate::identity_assertion::request_digest(method, &request.get_ref().encode_to_vec());
+    let proof = request
+        .metadata()
+        .get(DEVICE_PROOF_HEADER)
+        .map(|value| value.to_str().unwrap_or_default());
+    crate::identity_assertion::verify_device_proof(context, &digest, proof, device_required)
+        .map_err(|reject| {
+            reject_unauthorized();
+            Status::unauthenticated(format!("device proof refused: {}", reject.as_str()))
+        })
 }
 
 /// Catalog metadata RPCs a discover-only space role may call.
@@ -1829,6 +1862,7 @@ mod tests {
             scopes: vec!["sekai.read".into(), "sekai.write".into()],
             expires_at,
             nonce: nonce.into(),
+            device: None,
         }
     }
 
@@ -2210,6 +2244,7 @@ mod tests {
                     issuer: "https://issuer.test".into(),
                     resource: "https://sekai.test".into(),
                     expires_at: self.expires_at,
+                    device: None,
                 })
             }
 
@@ -2703,5 +2738,72 @@ mod tests {
             "SubmitActionInstance",
         ));
         assert!(interceptor.call(after).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod device_proof_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::Signer as _;
+    use prost::Message as _;
+
+    const METHOD: &str = "/sekai.v1.Sekai/GetObject";
+
+    fn request(
+        device: Option<&ed25519_dalek::SigningKey>,
+        proof: Option<String>,
+    ) -> tonic::Request<sekai_proto::sekai::GetObjectRequest> {
+        let mut context = crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "device-user".into(),
+                credential_id: "credential".into(),
+            },
+        );
+        context.device = device.map(|key| crate::enterprise::AuthenticatedDevice {
+            id: "device-7".into(),
+            public_key: key.verifying_key().to_bytes(),
+            assertion_nonce: "nonce-1".into(),
+        });
+        let mut request = tonic::Request::new(sekai_proto::sekai::GetObjectRequest {
+            id: "object-1".into(),
+        });
+        request.extensions_mut().insert(context);
+        if let Some(proof) = proof {
+            request
+                .metadata_mut()
+                .insert(DEVICE_PROOF_HEADER, proof.parse().unwrap());
+        }
+        request
+    }
+
+    fn proof(
+        key: &ed25519_dalek::SigningKey,
+        message: &sekai_proto::sekai::GetObjectRequest,
+    ) -> String {
+        let digest = crate::identity_assertion::request_digest(METHOD, &message.encode_to_vec());
+        let input = crate::identity_assertion::device_proof_input("nonce-1", &digest);
+        URL_SAFE_NO_PAD.encode(key.sign(&input).to_bytes())
+    }
+
+    #[test]
+    fn the_hook_checks_the_proof_over_the_request_it_guards() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let message = request(None, None).into_inner();
+        let valid = request(Some(&key), Some(proof(&key, &message)));
+        assert!(require_device_proof(&valid, METHOD, true).is_ok());
+        let other = sekai_proto::sekai::GetObjectRequest {
+            id: "object-2".into(),
+        };
+        let mismatched = request(Some(&key), Some(proof(&key, &other)));
+        assert_eq!(
+            require_device_proof(&mismatched, METHOD, false)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert!(require_device_proof(&request(Some(&key), None), METHOD, false).is_err());
+        assert!(require_device_proof(&request(None, None), METHOD, false).is_ok());
+        assert!(require_device_proof(&request(None, None), METHOD, true).is_err());
     }
 }
