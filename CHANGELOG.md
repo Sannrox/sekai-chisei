@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The guarded isolation probe runner executes declarative probe specs
+  (`sekai.probe-spec/v1`): a read-only object-scoped RPC, the principal to
+  call as and the expected denial, with no endpoint, credential, tenant or
+  object of their own. `sekaictl admin assurance probes run --specs <dir>`
+  validates them before any call; a spec not denied as expected is a
+  finding with the spec as reproduction, and `tests/fixtures/probe_specs/`
+  runs promoted specs in the regression suite (docs/isolation-probes.md,
+  #1680).
+
 - Experimental fence bindings (ADR 0121): `PutFenceBinding` binds Ezu
   geofence events (enter, exit, inside, dwell) for one collection to a
   pinned governed Action type run as a service principal, and

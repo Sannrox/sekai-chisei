@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "list-object-comments-cross-tenant",
+  "as": "tenant",
+  "call": {"rpc": "ListObjectComments", "include_resolved": true},
+  "expect": {"codes": ["PermissionDenied", "NotFound"]}
+}
