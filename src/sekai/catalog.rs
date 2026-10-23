@@ -6,7 +6,7 @@
 //! Generic object writes refuse the kind; entries change only through
 //! registration, which is idempotent by the source's stable id (ADR 0122).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -244,6 +244,111 @@ pub fn raised_marking(
     }
 }
 
+/// Fields owners and stewards curate (#1686). Once curated, registration
+/// keeps the curated value instead of the source's.
+pub const CURATED_FIELDS: &[&str] = &["description", "owners", "tags"];
+/// Comma-separated curated fields on an entry.
+const CURATED_PROPERTY: &str = "curated";
+
+fn list_property(entry: &Object, key: &str) -> Vec<String> {
+    entry
+        .properties
+        .get(key)
+        .map(|value| {
+            value
+                .split(',')
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply a curation edit by `curator` to `entry`: only an owner or the
+/// steward may curate, only [`CURATED_FIELDS`] and the marking change, and
+/// the marking only rises. Lowering goes through the audited declassify path.
+pub fn curate(
+    entry: &Object,
+    curator: &str,
+    edits: HashMap<String, String>,
+    lattice: Option<&crate::sekai::classification_lattice::ClassificationLattice>,
+) -> Result<Object, CatalogError> {
+    if entry.kind != CATALOG_ENTRY_KIND {
+        return Err(CatalogError::Invalid("not a catalog entry".into()));
+    }
+    let owners = list_property(entry, "owners");
+    let steward = entry.properties.get("steward").map(String::as_str);
+    if curator.is_empty()
+        || !(owners.iter().any(|owner| owner == curator) || steward == Some(curator))
+    {
+        return Err(CatalogError::Denied(
+            "only an owner or the steward curates a catalog entry".into(),
+        ));
+    }
+    let mut curated = entry.clone();
+    let mut fields: Vec<String> = list_property(entry, CURATED_PROPERTY);
+    for (key, value) in edits {
+        let value = match key.as_str() {
+            "description" if value.len() > MAX_CATALOG_TEXT_BYTES => {
+                return Err(CatalogError::Invalid(format!(
+                    "description must be at most {MAX_CATALOG_TEXT_BYTES} bytes"
+                )));
+            }
+            "description" => value,
+            "owners" | "tags" => {
+                let items: Vec<String> = value
+                    .split(',')
+                    .filter(|item| !item.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let list = normalized_list(&key, &items)?;
+                if key == "owners" && list.is_empty() {
+                    return Err(CatalogError::Invalid(
+                        "a curated entry keeps at least one owner".into(),
+                    ));
+                }
+                list.join(",")
+            }
+            OBJECT_CLASSIFICATION_PROPERTY => {
+                let stored = entry
+                    .properties
+                    .get(OBJECT_CLASSIFICATION_PROPERTY)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                if value.is_empty() || raised_marking(stored, &value, lattice)? != value {
+                    return Err(CatalogError::Denied(
+                        "curation only raises a marking; lowering is the audited declassify path"
+                            .into(),
+                    ));
+                }
+                curated.properties.insert(key, value);
+                continue;
+            }
+            other => {
+                return Err(CatalogError::Invalid(format!(
+                    "{other} is not curated; curation edits {}",
+                    CURATED_FIELDS.join(", ")
+                )));
+            }
+        };
+        if !fields.contains(&key) {
+            fields.push(key.clone());
+        }
+        if value.is_empty() {
+            curated.properties.remove(&key);
+        } else {
+            curated.properties.insert(key, value);
+        }
+    }
+    fields.sort();
+    if !fields.is_empty() {
+        curated
+            .properties
+            .insert(CURATED_PROPERTY.into(), fields.join(","));
+    }
+    Ok(curated)
+}
+
 /// What registration did.
 #[derive(Debug, Clone)]
 pub struct Registered {
@@ -311,6 +416,24 @@ pub fn register(
             .as_ref()
             .map_or(now_ms, |object| now_ms.max(object.updated + 1)),
     };
+    // Curated fields belong to the curators now, not the source.
+    if let Some(existing) = &existing {
+        let curated = list_property(existing, CURATED_PROPERTY);
+        for field in curated
+            .iter()
+            .filter(|field| CURATED_FIELDS.contains(&field.as_str()))
+        {
+            match existing.properties.get(field) {
+                Some(value) => entry.properties.insert(field.clone(), value.clone()),
+                None => entry.properties.remove(field),
+            };
+        }
+        if !curated.is_empty() {
+            entry
+                .properties
+                .insert(CURATED_PROPERTY.into(), curated.join(","));
+        }
+    }
     authorize(existing.as_ref(), &mut entry)?;
     // Grant checks may keep a stored value; the result must still carry at
     // least the marking the source asked for.
@@ -778,5 +901,46 @@ mod tests {
         let long = schema_summary(&serde_json::json!({ "properties": many }).to_string());
         assert!(long.len() <= MAX_CATALOG_TEXT_BYTES, "{}", long.len());
         assert!(long.ends_with("more"), "{long}");
+    }
+
+    #[test]
+    fn curation_edits_only_curated_fields_and_keeps_an_owner() {
+        let entry = Object {
+            id: "catalog:1".into(),
+            kind: CATALOG_ENTRY_KIND.into(),
+            name: "Orders".into(),
+            namespace: "ns".into(),
+            external_id: "catalog:1".into(),
+            properties: HashMap::from([
+                ("owners".into(), "alice".into()),
+                ("steward".into(), "bob".into()),
+                ("source_id".into(), "orders".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        };
+        let edit = |curator: &str, key: &str, value: &str| {
+            curate(
+                &entry,
+                curator,
+                HashMap::from([(key.to_string(), value.to_string())]),
+                None,
+            )
+        };
+        assert!(matches!(
+            edit("carol", "tags", "x"),
+            Err(CatalogError::Denied(_))
+        ));
+        assert!(matches!(
+            edit("alice", "source_id", "other"),
+            Err(CatalogError::Invalid(_))
+        ));
+        assert!(matches!(
+            edit("bob", "owners", ""),
+            Err(CatalogError::Invalid(_))
+        ));
+        let curated = edit("bob", "owners", "dana, alice").unwrap();
+        assert_eq!(curated.properties["owners"], "alice,dana");
+        assert_eq!(curated.properties["curated"], "owners");
     }
 }

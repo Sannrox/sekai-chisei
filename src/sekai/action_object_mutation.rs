@@ -45,7 +45,6 @@ const RESERVED_OBJECT_KINDS: &[&str] = &[
     governed_facts::WAIVER_KIND,
     crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
     crate::sekai::object_comment::OBJECT_COMMENT_KIND,
-    crate::sekai::catalog::CATALOG_ENTRY_KIND,
     crate::sekai::media_upload::MEDIA_KIND,
 ];
 
@@ -78,7 +77,9 @@ impl PlannedObjectMutation {
     }
 }
 
-/// Plans the object an admitted Action writes. `marking` is the instance's
+/// Plans the object an admitted Action writes. `submitter` is the principal
+/// that submitted the instance, `None` where there is none (a streaming
+/// transform). `marking` is the instance's
 /// marking (#1706), `None` where no instance is admitted (previews,
 /// transforms that stamp their own): the written object carries the least
 /// upper bound of it, the object's current marking and any marking the
@@ -90,6 +91,7 @@ pub(crate) fn plan(
     type_def: &GovernedActionType,
     namespace: &str,
     parameters_json: &str,
+    submitter: Option<&str>,
     marking: Option<&str>,
     now_ms: i64,
 ) -> Result<Option<PlannedObjectMutation>, ActionObjectMutationError> {
@@ -97,6 +99,18 @@ pub(crate) fn plan(
     let mutation = type_def.object_mutation.trim();
     if object_kind.is_empty() && mutation.is_empty() {
         return Ok(None);
+    }
+    if object_kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
+        return plan_catalog_curation(
+            db,
+            mutation,
+            namespace,
+            parameters_json,
+            submitter,
+            marking,
+            now_ms,
+        )
+        .map(Some);
     }
     if RESERVED_OBJECT_KINDS.contains(&object_kind) {
         return Err(ActionObjectMutationError::FailedPrecondition(format!(
@@ -222,6 +236,103 @@ pub(crate) fn plan(
             "unknown object_mutation {other:?}"
         ))),
     }
+}
+
+/// Catalog curation (#1686, ADR 0122): an Action may only update a catalog
+/// entry's curated fields, submitted by an owner or the steward, and may
+/// only raise its marking. Registration still writes everything else.
+fn plan_catalog_curation(
+    db: &RuntimeDb,
+    mutation: &str,
+    namespace: &str,
+    parameters_json: &str,
+    submitter: Option<&str>,
+    marking: Option<&str>,
+    now_ms: i64,
+) -> Result<PlannedObjectMutation, ActionObjectMutationError> {
+    use crate::sekai::catalog::{CatalogError, curate};
+    if mutation != OBJECT_MUTATION_UPDATE {
+        return Err(ActionObjectMutationError::FailedPrecondition(
+            "catalog entries are registered, and Actions only curate them".into(),
+        ));
+    }
+    let parameters: serde_json::Value = serde_json::from_str(parameters_json)
+        .map_err(|error| ActionObjectMutationError::InvalidArgument(error.to_string()))?;
+    if parameters.get(PARAM_NAME).is_some() {
+        return Err(ActionObjectMutationError::InvalidArgument(
+            "a catalog entry's name comes from its source".into(),
+        ));
+    }
+    let object_id = parameters
+        .get(PARAM_OBJECT_ID)
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            ActionObjectMutationError::InvalidArgument("object_id parameter required".into())
+        })?;
+    let existing = db
+        .get_object(object_id)
+        .map_err(ActionObjectMutationError::Internal)?
+        .filter(|object| {
+            object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND
+                && object.namespace == namespace
+        })
+        .ok_or_else(|| {
+            ActionObjectMutationError::FailedPrecondition(format!(
+                "catalog entry {object_id} not found in namespace {namespace}"
+            ))
+        })?;
+    let lattice = db
+        .get_classification_lattice(namespace)
+        .map_err(ActionObjectMutationError::Internal)?;
+    let edits = object_properties(&parameters)?;
+    let mut planned = curate(
+        &existing,
+        submitter.unwrap_or_default(),
+        edits,
+        lattice.as_ref(),
+    )
+    .map_err(|error| match error {
+        CatalogError::Invalid(message) => ActionObjectMutationError::InvalidArgument(message),
+        CatalogError::Denied(message) => ActionObjectMutationError::FailedPrecondition(message),
+        CatalogError::Storage(message) => ActionObjectMutationError::Internal(message),
+        CatalogError::Conflict | CatalogError::Superseded => {
+            ActionObjectMutationError::FailedPrecondition("catalog entry changed".into())
+        }
+    })?;
+    // The admission check runs on the entry as stored: a curated raise is
+    // above the instance's marking by design, and `curate` allowed it only
+    // because it does not lower the stored one.
+    let existing_marking =
+        crate::sekai::markings::object_marking_token(&existing).map(str::to_string);
+    let mut admitted = existing.clone();
+    inherit_marking(
+        db,
+        namespace,
+        &mut admitted,
+        existing_marking.as_deref(),
+        marking,
+    )?;
+    // The written entry carries at least what the Action was admitted under
+    // (a binding may be marked above the entry), joined with the curated
+    // marking.
+    if let Some(joined) = crate::sekai::markings::object_marking_token(&admitted) {
+        let joined = joined.to_string();
+        let raised = crate::sekai::catalog::raised_marking(
+            crate::sekai::markings::object_marking_token(&planned).unwrap_or_default(),
+            &joined,
+            lattice.as_ref(),
+        )
+        .map_err(|error| {
+            ActionObjectMutationError::FailedPrecondition(format!("marking: {error:?}"))
+        })?;
+        planned.properties.insert(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+            raised,
+        );
+    }
+    validate_object_write(db, &mut planned, now_ms)?;
+    Ok(PlannedObjectMutation::Update(planned, Box::new(existing)))
 }
 
 /// Applies an admitted Action's object write. Its change rows carry the
@@ -555,6 +666,7 @@ mod tests {
             "acme",
             r#"{"object_id":" rec-1 "}"#,
             None,
+            None,
             10,
         )
         .unwrap_err();
@@ -610,6 +722,7 @@ mod tests {
             "acme",
             r#"{"object_id":"rec-schema"}"#,
             None,
+            None,
             10,
         )
         .unwrap_err();
@@ -655,6 +768,7 @@ mod tests {
             "acme",
             r#"{"object_id":"rec-abort"}"#,
             None,
+            None,
             10,
         )
         .unwrap()
@@ -666,6 +780,7 @@ mod tests {
             &type_def,
             "acme",
             r#"{"object_id":"rec-abort"}"#,
+            None,
             None,
             20,
         )
@@ -713,6 +828,7 @@ mod tests {
             "acme",
             r#"{"object_id":"rec-restore","city":"oslo"}"#,
             None,
+            None,
             10,
         )
         .unwrap()
@@ -728,6 +844,7 @@ mod tests {
             &update,
             "acme",
             r#"{"object_id":"rec-restore","city":"bergen"}"#,
+            None,
             None,
             20,
         )
@@ -790,6 +907,7 @@ mod tests {
             &create,
             "acme",
             r#"{"object_id":"rec-marked"}"#,
+            None,
             Some("confidential"),
             10,
         )
@@ -808,6 +926,7 @@ mod tests {
             &update,
             "acme",
             r#"{"object_id":"rec-marked","access_marking":"public"}"#,
+            None,
             Some("confidential"),
             20,
         )
@@ -820,6 +939,7 @@ mod tests {
                 &update,
                 "acme",
                 r#"{"object_id":"rec-marked"}"#,
+                None,
                 Some("CONFIDENTIAL"),
                 22,
             )
@@ -833,6 +953,7 @@ mod tests {
                 &update,
                 "acme",
                 r#"{"object_id":"rec-marked"}"#,
+                None,
                 Some("internal"),
                 25,
             ),
@@ -845,6 +966,7 @@ mod tests {
                 &update,
                 "acme",
                 r#"{"object_id":"rec-marked"}"#,
+                None,
                 Some("ultra-secret"),
                 30,
             ),

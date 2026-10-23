@@ -1163,6 +1163,29 @@ message PutClassificationLatticeRequest { ClassificationLattice lattice = 1; }
 message PutClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 message GetClassificationLatticeRequest { string namespace = 1; }
 message GetClassificationLatticeResponse { ClassificationLattice lattice = 1; }
+// What embedding catch-up embeds in a namespace, and the hosted catalog
+// model route (`hosted.<name>/<model>`) that embeds it (#1609).
+message EmbeddingSpecDefinition {
+  string namespace = 1;
+  string spec_id = 2;
+  string object_kind = 3;
+  repeated string properties = 4;
+  uint32 chunk_chars = 5;
+  uint32 dimension = 6;
+  uint32 batch_size = 7;
+  string model = 8;
+  string updated_by = 9;
+  int64 updated_at_ms = 10;
+}
+message PutEmbeddingSpecRequest { EmbeddingSpecDefinition spec = 1; }
+message PutEmbeddingSpecResponse { EmbeddingSpecDefinition spec = 1; }
+message ListEmbeddingSpecsRequest { string namespace = 1; }
+message ListEmbeddingSpecsResponse { repeated EmbeddingSpecDefinition specs = 1; }
+message DeleteEmbeddingSpecRequest {
+  string namespace = 1;
+  string spec_id = 2;
+}
+message DeleteEmbeddingSpecResponse { bool deleted = 1; }
 message PolicySimulationDifference {
   string principal = 1;
   string object_id = 2;
@@ -3706,6 +3729,9 @@ service SekaiService {
   rpc RevokePurposeAuthorization(RevokePurposeAuthorizationRequest) returns (RevokePurposeAuthorizationResponse);
   rpc PutClassificationLattice(PutClassificationLatticeRequest) returns (PutClassificationLatticeResponse);
   rpc GetClassificationLattice(GetClassificationLatticeRequest) returns (GetClassificationLatticeResponse);
+  rpc PutEmbeddingSpec(PutEmbeddingSpecRequest) returns (PutEmbeddingSpecResponse);
+  rpc ListEmbeddingSpecs(ListEmbeddingSpecsRequest) returns (ListEmbeddingSpecsResponse);
+  rpc DeleteEmbeddingSpec(DeleteEmbeddingSpecRequest) returns (DeleteEmbeddingSpecResponse);
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
   rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);

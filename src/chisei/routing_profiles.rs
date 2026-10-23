@@ -406,7 +406,7 @@ pub fn mode_for_runtime(registry: &ProviderRegistry, runtime: &str) -> &'static 
     }
 }
 
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let authority = authority

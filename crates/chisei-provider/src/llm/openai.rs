@@ -606,6 +606,115 @@ fn outbound_model_name(model: &str) -> &str {
     model.strip_prefix("ollama/").unwrap_or(model)
 }
 
+/// Embedder over an OpenAI-compatible `/v1/embeddings` route (#1609).
+/// `model` is the catalog id that tags stored vectors; `upstream_model` is
+/// the name the route serves it under.
+pub struct OpenAiEmbedder {
+    api_key: String,
+    base_url: String,
+    model: String,
+    upstream_model: String,
+    model_version: String,
+    external: bool,
+    client: Client,
+    timeouts: HttpTimeouts,
+}
+
+impl OpenAiEmbedder {
+    pub fn new(
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        upstream_model: &str,
+        model_version: &str,
+        external: bool,
+    ) -> Self {
+        let timeouts = HttpTimeouts::from_env();
+        Self {
+            api_key: api_key.into(),
+            base_url: base_url.trim_end_matches('/').into(),
+            model: model.into(),
+            upstream_model: upstream_model.into(),
+            model_version: model_version.into(),
+            external,
+            client: timeouts.client(),
+            timeouts,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::embedding::Embedder for OpenAiEmbedder {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn model_version(&self) -> &str {
+        &self.model_version
+    }
+
+    fn external(&self) -> bool {
+        self.external
+    }
+
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut request = self
+            .client
+            .post(format!("{}/v1/embeddings", self.base_url))
+            .header("content-type", "application/json");
+        if !self.api_key.is_empty() {
+            request = request.header("authorization", format!("Bearer {}", self.api_key));
+        }
+        let response = request
+            .timeout(self.timeouts.request_timeout)
+            .json(&json!({ "model": self.upstream_model, "input": texts }))
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error("openai embeddings request", err))?;
+        let status = response.status();
+        let body = read_bounded_response(response, "openai embeddings response").await?;
+        let text = String::from_utf8_lossy(&body);
+        if !status.is_success() {
+            return Err(format!("openai embeddings {status}: {text}"));
+        }
+        parse_embeddings(&text, texts.len())
+    }
+}
+
+/// `data[*].embedding` in input order, by `data[*].index`; exactly one
+/// vector per input.
+fn parse_embeddings(body: &str, inputs: usize) -> Result<Vec<Vec<f32>>, String> {
+    let value: Value = serde_json::from_str(body).map_err(|error| error.to_string())?;
+    let data = value["data"]
+        .as_array()
+        .ok_or("openai embeddings response has no data")?;
+    let mut vectors: Vec<Option<Vec<f32>>> = vec![None; inputs];
+    for item in data {
+        let index = item["index"]
+            .as_u64()
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < inputs)
+            .ok_or("openai embeddings response has an invalid index")?;
+        let vector = item["embedding"]
+            .as_array()
+            .ok_or("openai embeddings response has no embedding")?
+            .iter()
+            .map(|component| component.as_f64().map(|component| component as f32))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("openai embeddings response has a non-numeric component")?;
+        if vectors[index].replace(vector).is_some() {
+            return Err("openai embeddings response repeats an index".into());
+        }
+    }
+    vectors
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "openai embeddings response is missing an input".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -967,5 +1076,60 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn embeddings_follow_index_order_and_cover_every_input() {
+        let body = r#"{"data":[{"index":1,"embedding":[0.5,1]},{"index":0,"embedding":[0.25,0]}]}"#;
+        assert_eq!(
+            super::parse_embeddings(body, 2).unwrap(),
+            vec![vec![0.25, 0.0], vec![0.5, 1.0]]
+        );
+        assert!(super::parse_embeddings(body, 3).is_err());
+        let repeated = r#"{"data":[{"index":0,"embedding":[1]},{"index":0,"embedding":[2]}]}"#;
+        assert!(super::parse_embeddings(repeated, 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn embedder_posts_the_upstream_model_with_the_route_credential() {
+        use super::OpenAiEmbedder;
+        use crate::embedding::Embedder;
+        use axum::Json;
+        use serde_json::Value;
+        let app = Router::new().route(
+            "/v1/embeddings",
+            post(
+                |headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer route-secret");
+                    assert_eq!(body["model"], "embed-small");
+                    let data = body["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| json!({"index": index, "embedding": [index as f64, 1.0]}))
+                        .collect::<Vec<_>>();
+                    Json(json!({ "data": data }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let embedder = OpenAiEmbedder::new(
+            "route-secret",
+            &url,
+            "hosted.local/embed-small",
+            "embed-small",
+            "",
+            false,
+        );
+        let vectors = embedder
+            .embed(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(vectors, vec![vec![0.0, 1.0], vec![1.0, 1.0]]);
     }
 }

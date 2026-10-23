@@ -6,8 +6,20 @@
   run and checkpoint, Action instance or direct write, with a writer
   reference and receipt id, on SQLite and PostgreSQL. Transform marking
   stamps now write change rows. Older rows read as `unattributed`
-  (docs/operation-correlation.md, `0095_object_change_writer`, GATE:mig,
+  (docs/operation-correlation.md, `0096_object_change_writer`, GATE:mig,
   #1690).
+
+- Embedding specs are stored per namespace and managed with experimental
+  `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined
+  mode embeds every stored spec on a schedule through its hosted catalog
+  route over the OpenAI-compatible embeddings API, admitted like hosted
+  execution; a changed spec is a recorded rebuild
+  (docs/embedding-index.md, `0095_embedding_specs`, GATE:mig, #1609).
+
+- Catalog entry owners and stewards curate `description`, `tags` and
+  `owners` through a governed Action on `catalog_entry`, with the Action's
+  receipt; the marking only rises, and later registrations keep curated
+  fields (docs/catalog.md, ADR 0122 amended, #1686).
 
 - A device-bound identity assertion is refused by every RPC that does not
   check device proofs; none does until sync adds its RPCs (ADR 0126).

@@ -54,6 +54,7 @@ use crate::sekai::markings;
 mod budget_identity;
 mod content_execution;
 mod context_expansion;
+pub(crate) mod embedding_route;
 mod evaluation_execution_lifecycle;
 mod evaluation_manifest_resolution;
 mod execution_planning;
