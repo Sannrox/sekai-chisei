@@ -2,6 +2,13 @@
 //!
 //! A signed, revocable verification record after one connector passes
 //! authority and failure conformance. Certification is not a runtime grant.
+//!
+//! A certification binds a connector to a source type: the built-in GitHub
+//! object-sync profile, or a source type descriptor registered and live in
+//! the certification's namespace (#1698, ADR 0060). A descriptor-bound
+//! certification is re-checked on every verify, so retiring the descriptor
+//! makes verify unavailable without changing the record. Unknown, retired and
+//! foreign descriptors all answer [`CONNECTOR_UNAVAILABLE`].
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -132,7 +139,7 @@ pub fn certify_connector(
 ) -> Result<ConnectorCertification, String> {
     required("actor", actor)?;
     require_positive_timestamp("certify", now_ms)?;
-    let validated = validate_certification(certification, actor, now_ms)?;
+    let validated = validate_certification(db, certification, actor, now_ms)?;
     if let Some(existing) =
         db.get_connector_certification(&validated.namespace, &validated.certification_id)?
     {
@@ -178,6 +185,9 @@ pub fn verify_connector(
     if certified.revocation == REVOCATION_REVOKED || !certified.superseded_by.is_empty() {
         return Err(CONNECTOR_UNAVAILABLE.into());
     }
+    // The bound type must still be certifiable: a retired descriptor ends
+    // every certification bound to it.
+    require_certifiable_type(db, &certified)?;
     if submitted.namespace != namespace
         || submitted.certification_id != certification_id
         || submitted.connector_id != certified.connector_id
@@ -241,6 +251,7 @@ pub fn revoke_connector(
 }
 
 fn validate_certification(
+    db: &RuntimeDb,
     certification: &ConnectorCertification,
     actor: &str,
     now_ms: i64,
@@ -261,12 +272,11 @@ fn validate_certification(
     if certification.owner != actor {
         return Err(CONNECTOR_UNAVAILABLE.into());
     }
-    if certification.connector_id != ADAPTER_GITHUB_OBJECT_SYNC
-        || certification.connector_version != ADAPTER_GITHUB_OBJECT_SYNC_VERSION
-        || certification.type_digest != GITHUB_OBJECT_SYNC_TYPE_DIGEST
-    {
-        return Err(CONNECTOR_UNAVAILABLE.into());
-    }
+    required("connector id", &certification.connector_id)?;
+    required("connector version", &certification.connector_version)?;
+    reject_secret(&certification.connector_id)?;
+    reject_secret(&certification.connector_version)?;
+    require_certifiable_type(db, certification)?;
     if !digest_token(&certification.signer_digest)
         || !digest_token(&certification.test_suite_digest)
         || !digest_token(&certification.test_result_digest)
@@ -315,6 +325,39 @@ fn validate_certification(
         superseded_by: String::new(),
         ..certification.clone()
     })
+}
+
+/// Whether `certification` binds a type that may be certified: exactly the
+/// built-in GitHub profile, or a descriptor registered and live in its
+/// namespace under the producer's own connector id. The GitHub connector id
+/// is reserved for its profile.
+fn require_certifiable_type(
+    db: &RuntimeDb,
+    certification: &ConnectorCertification,
+) -> Result<(), String> {
+    let github_id = certification.connector_id == ADAPTER_GITHUB_OBJECT_SYNC;
+    let github_type = certification.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST;
+    if github_id || github_type {
+        return if github_id
+            && github_type
+            && certification.connector_version == ADAPTER_GITHUB_OBJECT_SYNC_VERSION
+        {
+            Ok(())
+        } else {
+            Err(CONNECTOR_UNAVAILABLE.into())
+        };
+    }
+    if !digest_token(&certification.type_digest) {
+        return Err(CONNECTOR_UNAVAILABLE.into());
+    }
+    match db.get_source_type_descriptor(&certification.namespace, &certification.type_digest)? {
+        Some(descriptor)
+            if descriptor.status == crate::sekai::source_type_descriptor::STATUS_LIVE =>
+        {
+            Ok(())
+        }
+        _ => Err(CONNECTOR_UNAVAILABLE.into()),
+    }
 }
 
 fn replay_or_conflict(
@@ -535,6 +578,36 @@ mod tests {
 
     fn certify(runtime: &RuntimeDb) -> ConnectorCertification {
         certify_connector(runtime, "reviewer", &certification(), 1_000).unwrap()
+    }
+
+    #[test]
+    fn the_github_connector_id_is_reserved_for_its_profile() {
+        let runtime = db();
+        let descriptor = crate::sekai::source_type_descriptor::synthetic_pager_alert_v1();
+        crate::sekai::source_type_descriptor::register_source_type_descriptor(
+            &runtime,
+            "registrar",
+            "ops",
+            &descriptor,
+            1_000,
+        )
+        .unwrap();
+        let type_digest =
+            crate::sekai::source_type_descriptor::descriptor_digest(&descriptor).unwrap();
+        // The GitHub id over a registered descriptor, and another id over the
+        // GitHub type, are both refused.
+        let mut borrowed_id = certification();
+        borrowed_id.type_digest = type_digest;
+        sign(&mut borrowed_id);
+        let mut borrowed_type = certification();
+        borrowed_type.connector_id = "connector/pager".into();
+        sign(&mut borrowed_type);
+        for refused in [borrowed_id, borrowed_type] {
+            assert_eq!(
+                certify_connector(&runtime, "reviewer", &refused, 2_000).unwrap_err(),
+                CONNECTOR_UNAVAILABLE
+            );
+        }
     }
 
     #[test]
