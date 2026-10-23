@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "get-lineage-anonymous",
+  "as": "anonymous",
+  "call": {"rpc": "GetLineage", "max_nodes": 10},
+  "expect": {"codes": ["Unauthenticated"]}
+}
