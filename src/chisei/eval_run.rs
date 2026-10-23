@@ -1154,6 +1154,91 @@ pub(crate) mod tests {
         }
     }
 
+    /// Fails every case `Fake` passes whose id ends in `3`, as a release
+    /// that broke a tenth of the cases would.
+    struct Regressed(Fake);
+
+    impl EvalCaseExecutor for Regressed {
+        fn run_case(
+            &self,
+            spec: &EvalRunSpec,
+            dataset: &EvalDataset,
+            case: &EvalCase,
+        ) -> Result<CaseOutcome, CaseError> {
+            let mut outcome = self.0.run_case(spec, dataset, case)?;
+            outcome.passed &= !case.case_id.ends_with('3');
+            Ok(outcome)
+        }
+    }
+
+    /// The eval-at-scale acceptance (#1584): 1,000 cases run in parallel
+    /// within a set budget, policy violations are counted per run, and a
+    /// comparison flags a seeded regression while an unchanged release
+    /// passes.
+    #[test]
+    fn a_thousand_cases_run_within_budget_and_a_seeded_regression_is_flagged() {
+        use crate::chisei::eval_compare::{
+            ComparedRun, ComparisonGate, VERDICT_FAIL, VERDICT_PASS, compare_runs,
+        };
+        let store = MemoryStore::default();
+        let dataset = dataset(1_000);
+        let run_spec = |run_id: &str| EvalRunSpec {
+            run_id: run_id.into(),
+            ..spec(16, 20_000)
+        };
+        let (baseline, unchanged, regressed) = (
+            run_spec("release-1"),
+            run_spec("release-2"),
+            run_spec("release-3"),
+        );
+        let parallel = Fake::new(10, usize::MAX);
+        let first = run(&store, &parallel, &baseline, &dataset, || 1).unwrap();
+        assert_eq!(first.status, STATUS_COMPLETED);
+        assert_eq!(first.results.len(), 1_000);
+        assert!(first.spent_micros <= baseline.budget_micros);
+        assert!(
+            parallel.peak.load(Ordering::SeqCst) > 1,
+            "cases ran in parallel"
+        );
+        assert!(first.policy.counts.values().all(|count| *count == 0));
+        let same = run(
+            &store,
+            &Fake::new(10, usize::MAX),
+            &unchanged,
+            &dataset,
+            || 2,
+        )
+        .unwrap();
+        let worse = run(
+            &store,
+            &Regressed(Fake::new(10, usize::MAX)),
+            &regressed,
+            &dataset,
+            || 3,
+        )
+        .unwrap();
+        let compare = |candidate: &EvalRunSpec, results: &[EvalCaseResult]| {
+            compare_runs(
+                &dataset,
+                ComparedRun {
+                    spec: &baseline,
+                    results: &first.results,
+                },
+                ComparedRun {
+                    spec: candidate,
+                    results,
+                },
+                ComparisonGate::default(),
+            )
+            .unwrap()
+        };
+        assert_eq!(compare(&unchanged, &same.results).verdict, VERDICT_PASS);
+        let flagged = compare(&regressed, &worse.results);
+        assert_eq!(flagged.verdict, VERDICT_FAIL);
+        assert!(flagged.significant_regression);
+        assert_eq!(flagged.regressions, 100);
+    }
+
     #[test]
     fn never_more_than_the_concurrency_limit_is_in_flight() {
         let store = MemoryStore::default();
