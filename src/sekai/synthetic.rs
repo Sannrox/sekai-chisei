@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::runtime_db::RuntimeDb;
@@ -36,7 +36,7 @@ const BASE_TIME: i64 = 1_700_000_000_000;
 
 /// How large a generated tenant is. The counts are the preset's contract:
 /// the load-test preset reaches exactly these object and link counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SizePreset {
     Demo,
@@ -1182,6 +1182,28 @@ pub fn apply(db: &RuntimeDb, plan: &SyntheticPlan) -> Result<(), String> {
 /// `object` as `action` leaves it: the governed update merges the
 /// properties it derives from the parameters, and a `name` parameter
 /// renames.
+impl SyntheticPlan {
+    /// The plan's objects as they stand once [`apply`] has run every
+    /// declared action, derived the way the governed mutation path derives
+    /// them, without touching a store.
+    pub fn final_objects(&self) -> Result<Vec<Object>, String> {
+        let mut objects = self.objects.clone();
+        for action in &self.actions {
+            let target = objects
+                .iter_mut()
+                .find(|object| object.id == action.object_id)
+                .ok_or_else(|| {
+                    format!(
+                        "plan action {:?} targets an object outside the plan",
+                        action.request_id
+                    )
+                })?;
+            *target = after_action(target, action)?;
+        }
+        Ok(objects)
+    }
+}
+
 fn after_action(object: &Object, action: &SyntheticAction) -> Result<Object, String> {
     let parameters = serde_json::from_str::<serde_json::Value>(&action.parameters_json)
         .map_err(|error| error.to_string())?;
@@ -1378,6 +1400,24 @@ mod tests {
         assert!(db.get_object_type("synthetic_part").unwrap().is_some());
         // Reapplying the same plan is a no-op, not a uniqueness failure.
         apply(&db, &plan).unwrap();
+    }
+
+    #[test]
+    fn final_objects_are_what_apply_leaves() {
+        let db = RuntimeDb::memory();
+        let plan = generate(&SupplyChain, &spec(SizePreset::Demo)).unwrap();
+        apply(&db, &plan).unwrap();
+        let finals = plan.final_objects().unwrap();
+        assert!(!plan.actions.is_empty());
+        for action in &plan.actions {
+            let stored = db.get_object(&action.object_id).unwrap().unwrap();
+            let derived = finals
+                .iter()
+                .find(|object| object.id == action.object_id)
+                .unwrap();
+            assert_eq!(stored.properties, derived.properties, "{}", stored.id);
+            assert_eq!(stored.name, derived.name);
+        }
     }
 
     #[test]
