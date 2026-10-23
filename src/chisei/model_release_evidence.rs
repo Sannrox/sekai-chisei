@@ -986,6 +986,124 @@ pub fn export_evaluation_from_compare(
     Ok(evidence)
 }
 
+/// Signs evaluation evidence from a comparison of eval dataset runs
+/// (#1677): the outcome is the comparison's gate verdict, and the decision
+/// ledger keeps the whole comparison, so the exported release evidence
+/// carries the counts, the p-value and the policy deltas it was decided on.
+/// Whether `model` (`provider/model` or `model`) names the released model.
+pub fn model_matches(model: &str, identity: &ModelReleaseIdentity) -> bool {
+    model == format!("{}/{}", identity.provider, identity.model) || model == identity.model
+}
+
+/// A valid evidence identifier for `parts`: `<prefix>.<32 hex of SHA-256>`.
+fn evidence_id(prefix: &str, parts: &[&str]) -> String {
+    let digest = Sha256::digest(parts.join("\n").as_bytes());
+    let hex: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{prefix}.{hex}")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn export_evaluation_from_dataset_comparison(
+    db: &ChiseiStore,
+    identity: ModelReleaseIdentity,
+    comparison: &crate::chisei::eval_compare::RunComparison,
+    candidate: &crate::chisei::eval_run::EvalRunSpec,
+    candidate_artifact: Option<&str>,
+    evaluator_model: Option<&str>,
+    key: &SigningKey,
+    now_ms: i64,
+    actor: &str,
+) -> Result<ModelEvaluationEvidence, String> {
+    identity.validate()?;
+    // Only an evaluator that ran on the released model exercised it; a
+    // deterministic evaluator judges the dataset alone, whatever the run's
+    // model label says.
+    if !evaluator_model.is_some_and(|model| model_matches(model, &identity)) {
+        return Err("release evidence needs a run whose evaluator ran the released model".into());
+    }
+    if candidate.run_id != comparison.candidate_run_id {
+        return Err("the comparison is not of this candidate run".into());
+    }
+    // Only a run pinned to the released artifact is evidence for it.
+    if candidate_artifact != Some(identity.artifact_digest.as_str()) {
+        return Err("candidate eval run must be pinned to the release artifact digest".into());
+    }
+    if !model_matches(&candidate.model, &identity) {
+        return Err("candidate eval run must run the released model".into());
+    }
+    let outcome = if comparison.verdict == crate::chisei::eval_compare::VERDICT_PASS {
+        EvaluationOutcome::Passed
+    } else {
+        EvaluationOutcome::Failed
+    };
+    let evidence = sign_evaluation_evidence(
+        EvaluationEvidenceDraft {
+            identity,
+            // Evidence ids are narrower than dataset and run ids, so they
+            // are derived; the ledger below keeps the ids themselves.
+            eval_suite_id: evidence_id(
+                "dataset",
+                &[&comparison.dataset, &comparison.dataset_version],
+            ),
+            eval_run_id: evidence_id(
+                "run",
+                &[&comparison.namespace, &comparison.candidate_run_id],
+            ),
+            outcome,
+            observed_at: now_ms,
+            expires_at: now_ms.saturating_add(RUNTIME_EVIDENCE_TTL_MS),
+        },
+        key,
+    )?;
+    db.put_model_evaluation_export(&evidence, now_ms)?;
+    let comparison_json = serde_json::to_string(comparison).map_err(|error| error.to_string())?;
+    let ledger = HashMap::from([
+        (
+            "contract_version".into(),
+            MODEL_RELEASE_EVIDENCE_CONTRACT.into(),
+        ),
+        ("provider".into(), evidence.identity.provider.clone()),
+        ("model".into(), evidence.identity.model.clone()),
+        (
+            "artifact_digest".into(),
+            evidence.identity.artifact_digest.clone(),
+        ),
+        ("eval_suite_id".into(), evidence.eval_suite_id.clone()),
+        ("eval_run_id".into(), evidence.eval_run_id.clone()),
+        ("dataset".into(), comparison.dataset.clone()),
+        ("dataset_version".into(), comparison.dataset_version.clone()),
+        ("baseline_run_id".into(), comparison.baseline_run_id.clone()),
+        (
+            "candidate_run_id".into(),
+            comparison.candidate_run_id.clone(),
+        ),
+        ("verdict".into(), comparison.verdict.clone()),
+        ("comparison".into(), comparison_json),
+    ]);
+    let reason = if comparison.reasons.is_empty() {
+        "no significant regression and no new policy violation".to_string()
+    } else {
+        comparison.reasons.join("; ")
+    };
+    db.record_decision(&Decision {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now_ms,
+        actor: actor.into(),
+        action: ACTION_EVAL_EXPORT.into(),
+        reason,
+        evidence: ledger,
+        target_id: format!(
+            "model-release-eval:{}:{}:{}",
+            evidence.identity.provider, evidence.identity.model, evidence.eval_run_id
+        ),
+        outcome: comparison.verdict.clone(),
+    })?;
+    Ok(evidence)
+}
+
 pub fn record_model_release_feedback(
     db: &ChiseiStore,
     record: ModelReleaseFeedback,
@@ -1324,6 +1442,117 @@ mod tests {
         .unwrap();
         assert_eq!(evidence.outcome, EvaluationOutcome::Failed);
         assert_eq!(evidence.schema, EVALUATION_EVIDENCE_SCHEMA);
+    }
+
+    #[test]
+    fn a_dataset_comparison_decides_the_outcome_and_is_kept_with_the_export() {
+        use crate::chisei::decision_ledger::DecisionFilter;
+        use crate::chisei::eval_compare::{RunComparison, VERDICT_FAIL, VERDICT_PASS};
+        use crate::chisei_store::{ChiseiDecisionStore, ChiseiStore};
+        let db = ChiseiStore::memory();
+        let (key, _) = signing_pair();
+        let comparison = |verdict: &str, candidate: &str| RunComparison {
+            contract_version: crate::chisei::eval_compare::EVAL_COMPARISON_CONTRACT.into(),
+            namespace: "acme".into(),
+            dataset: "triage".into(),
+            dataset_version: "v0123456789abcdef".into(),
+            baseline_run_id: "release-1.3.0".into(),
+            candidate_run_id: candidate.into(),
+            cases: 40,
+            both_passed: 30,
+            both_failed: 0,
+            regressions: 10,
+            improvements: 0,
+            p_value: 0.001,
+            alpha: 0.05,
+            significant_regression: verdict == VERDICT_FAIL,
+            policy: Vec::new(),
+            policy_increased: Vec::new(),
+            verdict: verdict.into(),
+            reasons: Vec::new(),
+        };
+        let candidate = |run_id: &str, model: &str| crate::chisei::eval_run::EvalRunSpec {
+            run_id: run_id.into(),
+            model: model.into(),
+            ..crate::chisei::eval_run::tests::spec(4, 1_000)
+        };
+        let model = "huggingface/qwen-coder";
+        let blocked = export_evaluation_from_dataset_comparison(
+            &db,
+            identity(),
+            &comparison(VERDICT_FAIL, "release-1.4.0"),
+            &candidate("release-1.4.0", model),
+            Some(DIGEST),
+            Some(model),
+            &key,
+            NOW_MS,
+            "root",
+        )
+        .unwrap();
+        assert_eq!(blocked.outcome, EvaluationOutcome::Failed);
+        assert!(blocked.eval_suite_id.starts_with("dataset."));
+        let passed = export_evaluation_from_dataset_comparison(
+            &db,
+            identity(),
+            &comparison(VERDICT_PASS, "release-1.4.1"),
+            &candidate("release-1.4.1", model),
+            Some(DIGEST),
+            Some(model),
+            &key,
+            NOW_MS,
+            "root",
+        )
+        .unwrap();
+        assert_eq!(passed.outcome, EvaluationOutcome::Passed);
+        // The comparison it was decided on is in the export's ledger record.
+        let recorded = db
+            .list_decisions(&DecisionFilter {
+                action: Some(ACTION_EVAL_EXPORT.into()),
+                ..DecisionFilter::default()
+            })
+            .unwrap();
+        let kept: RunComparison = serde_json::from_str(
+            &recorded
+                .iter()
+                .find(|decision| decision.evidence["candidate_run_id"] == "release-1.4.0")
+                .unwrap()
+                .evidence["comparison"],
+        )
+        .unwrap();
+        assert_eq!(kept, comparison(VERDICT_FAIL, "release-1.4.0"));
+        // A run of another artifact or model, or one never pinned to an
+        // artifact, is not evidence for this release.
+        let other = format!("sha256:{}", "ab".repeat(32));
+        // A deterministic evaluator (no evaluator model) never ran it either.
+        for (unbound, artifact, evaluator) in [
+            (
+                candidate("release-1.4.2", model),
+                Some(other.as_str()),
+                Some(model),
+            ),
+            (candidate("release-1.4.2", model), None, Some(model)),
+            (
+                candidate("release-1.4.2", "openai/other"),
+                Some(DIGEST),
+                Some(model),
+            ),
+            (candidate("release-1.4.2", model), Some(DIGEST), None),
+        ] {
+            assert!(
+                export_evaluation_from_dataset_comparison(
+                    &db,
+                    identity(),
+                    &comparison(VERDICT_PASS, "release-1.4.2"),
+                    &unbound,
+                    artifact,
+                    evaluator,
+                    &key,
+                    NOW_MS,
+                    "root",
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

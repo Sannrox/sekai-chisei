@@ -115,3 +115,40 @@ version. Only the outcome is stored with the result, never the receipts.
 An evaluator definition judges a case's evidence. It calls no tool, writes
 no output, and applies no Action, so its cases report empty receipts.
 
+
+## Baseline comparison
+
+`ChiseiService.CompareEvalDatasetRuns` (experimental, #1677) compares a
+candidate run with a baseline run of the same dataset version, case by case.
+Both runs must have a result for every case. A partial run is refused,
+never compared.
+
+- **Significance.** An exact one-sided McNemar test runs on the discordant
+  pairs: `regressions` (baseline passed, candidate failed) against
+  `improvements`. The p-value is `P(X >= regressions)` for
+  `X ~ Binomial(regressions + improvements, 1/2)`. A regression is
+  significant when there are more regressions than improvements and the
+  p-value is below `alpha` (default 0.05).
+- **Policy.** Violation counts are compared kind by kind, and every kind
+  whose count rose is listed in `policy_increased`.
+- **Gate.** The verdict is `fail` on a significant regression, or on a
+  policy increase unless `allow_policy_increase` is set. `reasons` names
+  why.
+
+`ExportModelEvaluationEvidence` with `dataset_namespace` set signs the release
+evaluation evidence from this comparison. The outcome is the gate's verdict.
+The candidate run must run the released model and be bound to its artifact.
+`RunEvalDataset` with `artifact_digest` binds a new run once
+(`chisei_dataset_run_artifacts`). Binding is an attestation that the run is
+that release's evaluation, so it takes the same credential-administration
+authority as the export. Only a run whose evaluator runs on the released
+model can be bound or exported. A deterministic evaluator judges the
+dataset alone, whatever the run's model label says. The evidence's
+`eval_suite_id` and `eval_run_id` are derived from the dataset and run ids,
+which the ledger record keeps as they are. A run started without one cannot be bound
+later, and a bound run cannot be rebound. The comparison is kept in the
+export's decision ledger record and returned as `comparison_json`.
+
+`ChiseiService.ListEvalDatasetRunTrend` lists every run of a dataset in a
+namespace, oldest first. Each run has its agent, model, tool version, start
+time, cases recorded and passed, and policy counts, for trend views.

@@ -709,6 +709,9 @@ message RunEvalDatasetRequest {
   // The run's spending limit and the most one case may cost, in USD micros.
   int64 budget_micros = 10;
   int64 max_case_cost_micros = 11;
+  // The released artifact the run evaluates, required for the run to serve
+  // as release evaluation evidence (#1677).
+  string artifact_digest = 12;
 }
 message EvalRunCaseLine {
   string case_id = 1;
@@ -736,6 +739,62 @@ message RunEvalDatasetResponse {
   string policy_scorer_version = 7;
   repeated EvalPolicyCount policy_counts = 8;
   repeated EvalPolicyViolation policy_violations = 9;
+}
+// A candidate eval run compared with a baseline run of the same dataset
+// version (#1677): paired per case, an exact one-sided McNemar test on the
+// discordant pairs, and policy violation counts compared kind by kind. Both
+// runs must have a result for every case.
+message CompareEvalDatasetRunsRequest {
+  string namespace = 1;
+  string baseline_run_id = 2;
+  string candidate_run_id = 3;
+  // A regression with a p-value below alpha is significant; 0 uses 0.05.
+  double alpha = 4;
+  // Report an increase in policy violations without failing the gate.
+  bool allow_policy_increase = 5;
+}
+message EvalPolicyDelta {
+  string kind = 1;
+  uint64 baseline = 2;
+  uint64 candidate = 3;
+}
+message CompareEvalDatasetRunsResponse {
+  string dataset = 1;
+  string dataset_version = 2;
+  uint64 cases = 3;
+  uint64 both_passed = 4;
+  uint64 both_failed = 5;
+  // The baseline passed and the candidate failed.
+  uint64 regressions = 6;
+  // The baseline failed and the candidate passed.
+  uint64 improvements = 7;
+  double p_value = 8;
+  double alpha = 9;
+  bool significant_regression = 10;
+  repeated EvalPolicyDelta policy = 11;
+  repeated string policy_increased = 12;
+  // pass or fail.
+  string verdict = 13;
+  repeated string reasons = 14;
+}
+// Every run of a dataset in a namespace, oldest first, for trend views.
+message ListEvalDatasetRunTrendRequest {
+  string namespace = 1;
+  string dataset = 2;
+}
+message EvalRunTrendPoint {
+  string run_id = 1;
+  string agent = 2;
+  string model = 3;
+  string tool_version = 4;
+  string dataset_version = 5;
+  int64 started_at_ms = 6;
+  uint64 cases_recorded = 7;
+  uint64 cases_passed = 8;
+  repeated EvalPolicyCount policy = 9;
+}
+message ListEvalDatasetRunTrendResponse {
+  repeated EvalRunTrendPoint runs = 1;
 }
 message EvalPolicyCount {
   string kind = 1;
@@ -1212,8 +1271,18 @@ message ExportModelEvaluationEvidenceRequest {
   string baseline_run_id = 3;
   string candidate_run_id = 4;
   string eval_run_id = 5;
+  // When set, baseline_run_id and candidate_run_id are eval dataset runs in
+  // this namespace, and the outcome is their comparison's gate (#1677);
+  // eval_suite_id and eval_run_id are then unused.
+  string dataset_namespace = 6;
+  double alpha = 7;
+  bool allow_policy_increase = 8;
 }
-message ExportModelEvaluationEvidenceResponse { string evidence_json = 1; }
+message ExportModelEvaluationEvidenceResponse {
+  string evidence_json = 1;
+  // The dataset-run comparison the outcome was decided on, when used.
+  string comparison_json = 2;
+}
 message PutModelReleaseFeedbackRequest {
   string namespace = 1;
   ModelReleaseIdentity identity = 2;
@@ -1808,6 +1877,8 @@ service ChiseiService {
   rpc ExportGovernedSubjectProvenance(ExportGovernedSubjectProvenanceRequest) returns (ExportGovernedSubjectProvenanceResponse);
   rpc ExecuteEvaluationManifest(ExecuteEvaluationManifestRequest) returns (ExecuteEvaluationManifestResponse);
   rpc RunEvalDataset(RunEvalDatasetRequest) returns (RunEvalDatasetResponse);
+  rpc CompareEvalDatasetRuns(CompareEvalDatasetRunsRequest) returns (CompareEvalDatasetRunsResponse);
+  rpc ListEvalDatasetRunTrend(ListEvalDatasetRunTrendRequest) returns (ListEvalDatasetRunTrendResponse);
   rpc CancelEvaluationExecution(CancelEvaluationExecutionRequest) returns (CancelEvaluationExecutionResponse);
   rpc AuthorizeExternalAction(AuthorizeExternalActionRequest) returns (AuthorizeExternalActionResponse);
   rpc TransitionExternalAction(TransitionExternalActionRequest) returns (TransitionExternalActionResponse);
