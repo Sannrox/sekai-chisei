@@ -1965,6 +1965,49 @@ message ListDecisionsResponse { repeated Decision decisions = 1; }
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
 message ListObjectChangesResponse { repeated ObjectChange changes = 1; }
 
+// Why one property value is what it is (#1452).
+message ExplainValueRequest {
+  string object_id = 1;
+  // An object property, or `name`.
+  string property = 2;
+  // Explain the value at this time (milliseconds); 0 explains the current value.
+  int64 as_of_ms = 3;
+}
+// One write in the chain.
+message ValueExplanationStep {
+  string change_id = 1;
+  int64 timestamp = 2;
+  string field = 3;
+  // The value this write set, redacted as ListObjectChanges redacts it.
+  string value = 4;
+  // source_transaction, transform_run, action_instance, direct, or unattributed.
+  string writer_kind = 5;
+  // The caller may not read the writer's record. A hidden step carries only
+  // its time, field, value and writer kind.
+  bool hidden = 6;
+  // Source transaction, `run@checkpoint`, or Action instance.
+  string writer_ref = 7;
+  string receipt_id = 8;
+  string changed_by = 9;
+  // The writer's record: source batch and record result, transform run, or
+  // Action instance with its decisions.
+  map<string, string> details = 10;
+}
+message ExplainValueResponse {
+  string object_id = 1;
+  string property = 2;
+  string value = 3;
+  // The object's access marking at the same time.
+  string marking = 4;
+  // Oldest first. The first step of a value set at creation is the creation.
+  repeated ValueExplanationStep steps = 5;
+  repeated ValueExplanationStep marking_steps = 6;
+  // No step is hidden or unattributed, and both values were recorded. The
+  // value an earlier incarnation was created with is not recorded when no
+  // edit followed; it then reads empty and incomplete.
+  bool complete = 7;
+}
+
 message PolicyAttestation {
   string id = 1;
   string decision_id = 2;       // the audit decision this attestation authorizes
@@ -3932,6 +3975,8 @@ service SekaiService {
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
+  // Experimental: the chain of writes behind one property value (#1452).
+  rpc ExplainValue(ExplainValueRequest) returns (ExplainValueResponse);
   rpc GetAttestation(GetAttestationRequest) returns (GetAttestationResponse);
   rpc ListAttestations(ListAttestationsRequest) returns (ListAttestationsResponse);
   rpc VerifyAttestation(VerifyAttestationRequest) returns (VerifyAttestationResponse);

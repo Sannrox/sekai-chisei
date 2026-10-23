@@ -20,6 +20,8 @@ mod definition_change_bundle_rpc;
 mod definition_consumer_impact;
 #[path = "embedding_spec_rpc.rs"]
 mod embedding_spec_rpc;
+#[path = "explain_value_rpc.rs"]
+mod explain_value_rpc;
 #[path = "fence_binding.rs"]
 mod fence_binding;
 #[path = "graph_explore_rpc.rs"]
@@ -1827,6 +1829,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListObjectChangesRequest>,
     ) -> Result<Response<ListObjectChangesResponse>, Status> {
         rpc_data::list_object_changes(self, req).await
+    }
+
+    async fn explain_value(
+        &self,
+        req: Request<ExplainValueRequest>,
+    ) -> Result<Response<ExplainValueResponse>, Status> {
+        explain_value_rpc::explain_value(self, req).await
     }
 
     async fn get_attestation(

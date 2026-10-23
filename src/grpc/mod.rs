@@ -788,6 +788,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExpandNeighborhood"
             | "FindPaths"
             | "ListObjectChanges"
+            | "ExplainValue"
             | "GetPublishedDefinitionRevision"
             | "ListPublishedDefinitionRevisions"
             | "GetDefinitionMember"

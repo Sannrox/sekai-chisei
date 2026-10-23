@@ -437,6 +437,15 @@ struct StoredIdentity {
     payload_digest: String,
 }
 
+const SOURCE_WRITE_RECORD_SQLITE: &str = "SELECT t.transaction_id, t.binding_id, t.namespace,
+        t.producer_identity, t.status, t.outcome, COALESCE(t.closed_at_ms, t.opened_at_ms),
+        COALESCE(r.source_id, ''), COALESCE(r.source_version, ''), COALESCE(r.outcome, '')
+     FROM sekai_source_batch_transactions t
+     LEFT JOIN sekai_source_identities i ON i.object_id = ?2
+     LEFT JOIN sekai_source_record_results r
+       ON r.transaction_id = t.transaction_id AND r.source_id = i.source_id
+     WHERE t.transaction_id = ?1";
+
 impl SekaiDb {
     pub(crate) fn migrate_object_sync(&self) -> Result<(), String> {
         self.conn()
@@ -1511,6 +1520,36 @@ impl SekaiDb {
                     .map_err(|_| "stored source identity lineage is invalid".to_string())
             })
             .transpose()
+    }
+
+    /// The source transaction that wrote `object_id`, with the object's
+    /// record result in it (#1452).
+    pub fn get_source_write_record(
+        &self,
+        transaction_id: &str,
+        object_id: &str,
+    ) -> Result<Option<crate::sekai::value_explanation::SourceWriteRecord>, String> {
+        self.conn()
+            .query_row(
+                SOURCE_WRITE_RECORD_SQLITE,
+                params![transaction_id, object_id],
+                |row| {
+                    Ok(crate::sekai::value_explanation::SourceWriteRecord {
+                        transaction_id: row.get(0)?,
+                        binding_id: row.get(1)?,
+                        namespace: row.get(2)?,
+                        producer_identity: row.get(3)?,
+                        status: row.get(4)?,
+                        outcome: row.get(5)?,
+                        closed_at_ms: row.get(6)?,
+                        source_id: row.get(7)?,
+                        source_version: row.get(8)?,
+                        record_outcome: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
     }
 
     pub fn get_source_sync_state(

@@ -2171,6 +2171,19 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ExplainValue",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit",
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/explain_value_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetAttestation",
       "kind": "persistent",
       "surfaces": [
