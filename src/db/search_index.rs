@@ -1426,17 +1426,20 @@ impl SearchIndex for SekaiDb {
     fn vector_candidates(
         &self,
         query: &VectorCandidateQuery,
+        keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
     ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
         use crate::sekai::embedding_index::EmbeddingStore;
         let namespace = &query.policy.namespace;
         let chunks = self.embedding_chunks(namespace, &query.spec_id)?;
         let lattice = self.get_classification_lattice(namespace)?;
         let policy = query.policy_query();
-        exact_vector_candidates(chunks, query, lattice.as_ref(), |id| {
+        exact_vector_candidates(chunks, query, lattice.as_ref(), |candidate| {
+            let id = candidate.object_id.as_str();
             Ok(self.grant_allows(id, &query.policy.subjects)?
                 && self
                     .compiled_object_security_allows(namespace, id, "", &BTreeSet::new(), &policy)?
-                    .is_some())
+                    .is_some()
+                && keep(candidate)?)
         })
     }
 }
@@ -1489,10 +1492,13 @@ impl SearchIndex for RuntimeDb {
     fn vector_candidates(
         &self,
         query: &VectorCandidateQuery,
+        keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
     ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
         match self {
-            Self::Sqlite(db) => db.vector_candidates(query),
-            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.vector_candidates(query)),
+            Self::Sqlite(db) => db.vector_candidates(query, keep),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.vector_candidates(query, keep))
+            }
         }
     }
 }

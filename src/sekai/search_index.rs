@@ -134,6 +134,10 @@ impl VectorCandidateQuery {
 pub struct VectorCandidate {
     pub object_id: String,
     pub score: f32,
+    /// Digest of the source text the vectors were embedded from. A caller
+    /// compares it with the live object: a stale vector may carry a value
+    /// the caller can no longer read.
+    pub source_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -202,11 +206,14 @@ pub trait SearchIndex {
         now_ms: i64,
     ) -> Result<SearchRebuildReport, SearchIndexError>;
     fn status(&self, namespace: &str, now_ms: i64) -> Result<SearchIndexStatus, SearchIndexError>;
-    /// Objects nearest to the query vector, best first. Exact today; an ANN
-    /// index may back this later behind the same contract.
+    /// Objects nearest to the query vector, best first: the first
+    /// `query.limit` that pass the index's read policy and then `keep`, the
+    /// caller's live check. Exact today; an ANN index may back this later
+    /// behind the same contract.
     fn vector_candidates(
         &self,
         query: &VectorCandidateQuery,
+        keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
     ) -> Result<Vec<VectorCandidate>, SearchIndexError>;
 }
 
@@ -255,9 +262,9 @@ pub fn exact_vector_candidates(
     chunks: Vec<EmbeddingChunk>,
     query: &VectorCandidateQuery,
     lattice: Option<&ClassificationLattice>,
-    mut allows: impl FnMut(&str) -> Result<bool, SearchIndexError>,
+    mut allows: impl FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
 ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
-    let mut best = BTreeMap::<String, f32>::new();
+    let mut best = BTreeMap::<String, (f32, String)>::new();
     // Few distinct markings: decide each once.
     let mut marking_allowed = BTreeMap::<String, bool>::new();
     for chunk in chunks {
@@ -276,13 +283,18 @@ pub fn exact_vector_candidates(
         let Some(score) = cosine(&chunk.vector, &query.vector) else {
             continue;
         };
+        let digest = chunk.source.source_digest;
         best.entry(chunk.object_id)
-            .and_modify(|current| *current = current.max(score))
-            .or_insert(score);
+            .and_modify(|current: &mut (f32, String)| current.0 = current.0.max(score))
+            .or_insert((score, digest));
     }
     let mut ranked = best
         .into_iter()
-        .map(|(object_id, score)| VectorCandidate { object_id, score })
+        .map(|(object_id, (score, source_digest))| VectorCandidate {
+            object_id,
+            score,
+            source_digest,
+        })
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| {
         b.score
@@ -294,7 +306,7 @@ pub fn exact_vector_candidates(
         if allowed.len() >= query.limit {
             break;
         }
-        if allows(&candidate.object_id)? {
+        if allows(&candidate)? {
             allowed.push(candidate);
         }
     }
@@ -2242,7 +2254,10 @@ mod tests {
         // The per-object policy applies before the limit: a denied object
         // never takes the place of an allowed one.
         let query = vector_query(&[1.0, 0.0], Some("internal"), 1);
-        let top = exact_vector_candidates(chunks, &query, None, |id| Ok(id != "near")).unwrap();
+        let top = exact_vector_candidates(chunks, &query, None, |candidate| {
+            Ok(candidate.object_id != "near")
+        })
+        .unwrap();
         assert_eq!(
             top.iter().map(|c| c.object_id.as_str()).collect::<Vec<_>>(),
             vec!["split"]

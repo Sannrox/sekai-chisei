@@ -1471,17 +1471,20 @@ impl SearchIndex for PostgresDb {
     fn vector_candidates(
         &self,
         query: &VectorCandidateQuery,
+        keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
     ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
         use crate::sekai::embedding_index::EmbeddingStore;
         // Exact over the chunk table, as on SQLite; Postgres has no lattice.
         let namespace = &query.policy.namespace;
         let chunks = self.embedding_chunks(namespace, &query.spec_id)?;
         let policy = query.policy_query();
-        exact_vector_candidates(chunks, query, None, |id| {
+        exact_vector_candidates(chunks, query, None, |candidate| {
+            let id = candidate.object_id.as_str();
             Ok(self.grant_allows(id, &query.policy.subjects)?
                 && self
                     .compiled_object_security_allows(namespace, id, "", &BTreeSet::new(), &policy)?
-                    .is_some())
+                    .is_some()
+                && keep(candidate)?)
         })
     }
 }

@@ -40,20 +40,25 @@ break by source and id, so a fixed index returns a fixed order. The
 response names the profile in `fusion_profile`. Hybrid search needs text.
 
 Vector candidates come from the embedding index
-([embedding-index.md](embedding-index.md)) of every requested kind that has
-a stored spec. The query text is embedded through the spec's admitted
-route, so hybrid search runs in combined mode only; elsewhere it fails with
-`FAILED_PRECONDITION`. The search is exact over the chunk table: chunks
-whose marking the caller's clearance denies are dropped before scoring,
-objects are ranked by their best chunk, and the same per-object read policy
-as text candidates (ACL, purpose, compiled object policy) applies before
-the candidate cap, so recall is 1.0 over what the caller may read. A kind
-whose active policy withholds any of the spec's source properties is not
-searched, and a vector hit is dropped when the live projection hides one of
-its source properties. Vector hits then pass the same live recheck as text
-hits; one that does not match the text has no highlights.
-`vector_lag_ms` is the age of the oldest object change the searched vectors
-have not consumed.
+([embedding-index.md](embedding-index.md)): every stored spec of the
+requested kinds, or of all kinds when none are named. The query text is
+embedded once per spec through its admitted route, so hybrid search runs in
+combined mode only; elsewhere it fails with `FAILED_PRECONDITION`. A spec
+whose kind's active policy withholds any of its source properties is not
+searched.
+
+The search is exact over the chunk table. Chunks whose marking the caller's
+clearance denies are dropped before scoring, and objects rank by their best
+chunk across all searched specs. Before a candidate counts toward the cap
+it must pass the same per-object read policy as text candidates (ACL,
+purpose, compiled object policy) and the live recheck. A vector hit is also
+dropped when the live projection hides one of its source properties, or
+when the object's kind or source text changed since it was embedded: a stale
+vector may carry a value the caller can no longer read. Hidden objects
+therefore never use up the cap, recall is 1.0 over what the caller may
+read, and a filled cap marks the count as a lower bound. A vector hit that
+does not match the text has no highlights. `vector_lag_ms` is the age of the
+oldest object change the searched vectors have not consumed.
 
 ## Status
 
