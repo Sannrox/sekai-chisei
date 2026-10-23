@@ -224,6 +224,16 @@ came from, and its `run_as` needs that clearance.
   object's marking. An update applies only if the object is unchanged since
   the Action planned it; otherwise the submit fails and can be retried.
 
+## Offline submissions
+
+A device that prepared an Action while disconnected submits it with `offline` ([ADR 0127](decisions/0127-offline-governed-actions.md), #1580).
+
+- **What it carries:** `prepared_at_ms`, `base_updated_ms` (the object's `updated` when the device read it), `base_properties` and an optional `lease_id`. `base_properties` lists each field the Action writes as the device saw it: its properties, and `name` when it renames. Every written field needs its base under every rule, and an unset value means the field was absent. It is a list rather than a map, so the request re-encodes to exactly the bytes the device proof signed.
+- **Type:** the Action type must update an object.
+- **Device:** the request must come with a device-bound assertion and the device's proof over it, in `x-sekai-device-proof` ([ADR 0126](decisions/0126-device-bound-assertions.md)). The plane records the device id from the assertion.
+- **Decision:** criteria, policy and budget are decided at arrival. If the object changed past the base, the type's `offline_conflict` rule decides. A conflict denies the instance with `deny_reason` `offline_conflict` and sets `conflict` to the object, its base and current versions, and the differing properties. If the object changes again between that check and the write, the submit fails and can be sent again.
+- **Retry and receipt:** `offline` is part of the request digest, so a retry with the same idempotency key returns the stored outcome. The receipt's intent event records `offline`, `offline_prepared_at_ms`, `offline_base_updated_ms`, `offline_device_id`, `offline_lease_id`, and any conflict.
+
 ## Dual-backend
 
 SQLite migrate-on-use and PostgreSQL migration

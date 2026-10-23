@@ -71,6 +71,10 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     /// Whether the submitter is cleared for the instance's marking; the
     /// transport adapter supplies it, since it owns principal resolution.
     pub marking_gate: MarkingGate,
+    /// What the device saw when it prepared this Action offline (#1580).
+    /// The transport adapter fills the device id from the device-bound
+    /// assertion after checking the device's proof.
+    pub offline: Option<crate::sekai::offline_action::OfflineSubmission>,
 }
 
 /// Clearance check admission runs against the marking it derives (#1706).
@@ -216,6 +220,11 @@ impl<'a> ActionInstanceAdmission<'a> {
             &envelope_id,
         )
         .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        // An offline submission is part of what a retry must repeat exactly.
+        let request_digest = match &request.offline {
+            Some(offline) => offline_request_digest(&request_digest, offline)?,
+            None => request_digest,
+        };
 
         let ontology_digest = parse_ontology_digest(&request.ontology_digest)?;
 
@@ -355,6 +364,15 @@ impl<'a> ActionInstanceAdmission<'a> {
                 "action parameters invalid: {error}"
             ))
         })?;
+        let offline_touched = match &request.offline {
+            Some(offline) => Some(validate_offline(
+                &type_def,
+                offline,
+                &request.parameters_json,
+                now,
+            )?),
+            None => None,
+        };
 
         let criterion_object =
             load_criterion_object(self.db, &namespace, &type_def, &request.parameters_json)?;
@@ -493,6 +511,33 @@ impl<'a> ActionInstanceAdmission<'a> {
             budget_decision = "budget_exceeded".into();
         }
 
+        // Policy above was decided now, at arrival. An offline base that the
+        // object has moved past is then judged by the type's conflict rule.
+        let mut conflict = None;
+        let mut offline_checked: Option<crate::domain::Object> = None;
+        if let (Some(offline), Some(touched)) = (&request.offline, &offline_touched)
+            && status != STATUS_DENIED
+        {
+            let current = load_offline_object(
+                self.db,
+                &namespace,
+                &type_def.object_kind,
+                &request.parameters_json,
+            )?;
+            conflict = offline.conflict(
+                &type_def.offline_conflict,
+                &type_def.last_writer_wins_properties,
+                &current,
+                touched,
+            );
+            if conflict.is_some() {
+                status = STATUS_DENIED.into();
+                deny_reason = crate::sekai::offline_action::CONFLICT_REASON.into();
+            } else {
+                offline_checked = Some(current);
+            }
+        }
+
         let system_one_fill_json = match self.proposal {
             Some(proposal) => proposal
                 .fill_provenance_json(&type_def, &request.parameters_json)
@@ -500,7 +545,13 @@ impl<'a> ActionInstanceAdmission<'a> {
             None => String::new(),
         };
         let parked_object_digest = if status == STATUS_PARKED {
-            target_object_digest(self.db, &request.parameters_json)?
+            match &offline_checked {
+                // A parked offline Action is bound to the object version its
+                // conflict check passed, not to a later read.
+                Some(checked) => crate::sekai::action_instance::object_state_digest(Some(checked))
+                    .map_err(ActionInstanceAdmissionError::Internal)?,
+                None => target_object_digest(self.db, &request.parameters_json)?,
+            }
         } else {
             String::new()
         };
@@ -546,6 +597,8 @@ impl<'a> ActionInstanceAdmission<'a> {
             admission_tenant: tenant.as_ref().to_string(),
             resource_tenant: request.resource_tenant.clone(),
             marking,
+            offline: request.offline.clone(),
+            conflict,
         };
         let planned_effects = if status == STATUS_ADMITTED {
             let force_notify_fail =
@@ -605,6 +658,19 @@ impl<'a> ActionInstanceAdmission<'a> {
                 now,
             ) {
                 Ok(None) => None,
+                // The conflict check passed against one version; a write
+                // that landed since is judged afresh by a new submit.
+                Ok(Some(action_object_mutation::PlannedObjectMutation::Update(_, snapshot)))
+                    if offline_checked
+                        .as_ref()
+                        .is_some_and(|checked| !snapshot.persisted_state_matches(checked)) =>
+                {
+                    let _ = self.db.delete_action_instance(&stored.instance_id);
+                    return Err(ActionInstanceAdmissionError::FailedPrecondition(
+                        "the object changed while the offline Action was admitted; submit it again"
+                            .into(),
+                    ));
+                }
                 Ok(Some(planned)) => {
                     match action_object_mutation::apply(
                         self.db,
@@ -1375,6 +1441,33 @@ impl<'a> ActionInstanceAdmission<'a> {
         if !stored.marking.is_empty() {
             intent_attributes.insert(RECEIPT_MARKING_ATTRIBUTE.into(), stored.marking.clone());
         }
+        // Offline provenance (#1580): when and on which device it was
+        // prepared, under which lease, and any conflict it met.
+        if let Some(offline) = &stored.offline {
+            intent_attributes.insert("offline".into(), "true".into());
+            intent_attributes.insert(
+                "offline_prepared_at_ms".into(),
+                offline.prepared_at_ms.to_string(),
+            );
+            intent_attributes.insert(
+                "offline_base_updated_ms".into(),
+                offline.base_updated_ms.to_string(),
+            );
+            intent_attributes.insert("offline_device_id".into(), offline.device_id.clone());
+            if !offline.lease_id.is_empty() {
+                intent_attributes.insert("offline_lease_id".into(), offline.lease_id.clone());
+            }
+        }
+        if let Some(conflict) = &stored.conflict {
+            intent_attributes.insert(
+                "offline_conflict_current_updated_ms".into(),
+                conflict.current_updated_ms.to_string(),
+            );
+            intent_attributes.insert(
+                "offline_conflict_properties".into(),
+                conflict.properties.join(","),
+            );
+        }
         if let Some(applied) = applied_object {
             intent_attributes.insert("object_id".into(), applied.object_id.clone());
             intent_attributes.insert("object_kind".into(), applied.object_kind.clone());
@@ -1903,6 +1996,82 @@ fn parse_ontology_digest(raw: &str) -> Result<Option<String>, ActionInstanceAdmi
     Ok(Some(raw.to_string()))
 }
 
+/// The request digest of an offline submission: the online digest and the
+/// submission, so a retry must repeat both.
+fn offline_request_digest(
+    online: &str,
+    offline: &crate::sekai::offline_action::OfflineSubmission,
+) -> Result<String, ActionInstanceAdmissionError> {
+    use sha2::Digest as _;
+    let body = serde_json::to_string(&serde_json::json!({
+        "request_digest": online,
+        "offline": offline,
+    }))
+    .map_err(|error| ActionInstanceAdmissionError::Internal(error.to_string()))?;
+    Ok(format!("{:x}", sha2::Sha256::digest(body.as_bytes())))
+}
+
+/// Check an offline submission against its type, and return the
+/// properties the Action writes.
+fn validate_offline(
+    type_def: &crate::sekai::governed_action_type::GovernedActionType,
+    offline: &crate::sekai::offline_action::OfflineSubmission,
+    parameters_json: &str,
+    now: i64,
+) -> Result<std::collections::BTreeSet<String>, ActionInstanceAdmissionError> {
+    if type_def.object_mutation.trim() != crate::sekai::governed_action_type::OBJECT_MUTATION_UPDATE
+    {
+        return Err(ActionInstanceAdmissionError::InvalidArgument(
+            "an offline Action needs a type that updates an object".into(),
+        ));
+    }
+    if offline.device_id.trim().is_empty() {
+        return Err(ActionInstanceAdmissionError::PermissionDenied(
+            "an offline Action needs a device-bound credential".into(),
+        ));
+    }
+    let parameters: serde_json::Value = serde_json::from_str(parameters_json)
+        .map_err(|error| ActionInstanceAdmissionError::InvalidArgument(error.to_string()))?;
+    let mut touched: std::collections::BTreeSet<String> =
+        action_object_mutation::object_properties(&parameters)
+            .map_err(map_object_mutation_error)?
+            .into_keys()
+            .collect();
+    // A rename writes the object's name, which is compared like a property.
+    if parameters.get("name").is_some() {
+        touched.insert(crate::sekai::offline_action::NAME_FIELD.into());
+    }
+    offline
+        .validate(&touched, now)
+        .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+    Ok(touched)
+}
+
+/// The object an offline Action updates, as it is now.
+/// One outside the submission's namespace or of another kind is not found,
+/// so a conflict never reports on it.
+fn load_offline_object(
+    db: &RuntimeDb,
+    namespace: &str,
+    object_kind: &str,
+    parameters_json: &str,
+) -> Result<crate::domain::Object, ActionInstanceAdmissionError> {
+    let object_id = serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()
+        .and_then(|value| value.get("object_id")?.as_str().map(str::to_string))
+        .ok_or_else(|| {
+            ActionInstanceAdmissionError::InvalidArgument("object_id parameter required".into())
+        })?;
+    db.get_object(&object_id)
+        .map_err(ActionInstanceAdmissionError::Internal)?
+        .filter(|object| object.namespace == namespace && object.kind == object_kind.trim())
+        .ok_or_else(|| {
+            ActionInstanceAdmissionError::FailedPrecondition(format!(
+                "object {object_id} not found"
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1977,6 +2146,7 @@ mod tests {
             binding_markings: Vec::new(),
             source_object_id: String::new(),
             marking_gate: Default::default(),
+            offline: None,
         }
     }
 
@@ -2874,6 +3044,7 @@ mod tests {
             binding_markings: Vec::new(),
             source_object_id: String::new(),
             marking_gate: Default::default(),
+                    offline: None,
                 },
                 "alice",
                 10,
@@ -3048,7 +3219,243 @@ mod tests {
             binding_markings: Vec::new(),
             source_object_id: String::new(),
             marking_gate: Default::default(),
+            offline: None,
         }
+    }
+
+    /// An offline submission from device-7, prepared at 5 against `base`.
+    fn offline_request(
+        type_id: &str,
+        version: &str,
+        key: &str,
+        parameters_json: &str,
+        base_updated_ms: i64,
+        base_properties: &[(&str, &str)],
+    ) -> ActionInstanceAdmissionRequest {
+        let mut request = record_request(type_id, parameters_json);
+        request.version = version.into();
+        request.idempotency_key = key.into();
+        request.request_id = format!("operation-{key}");
+        request.offline = Some(crate::sekai::offline_action::OfflineSubmission {
+            prepared_at_ms: 5,
+            base_updated_ms,
+            base_properties: base_properties
+                .iter()
+                .map(|(key, value)| (key.to_string(), Some(value.to_string())))
+                .collect(),
+            lease_id: "lease-1".into(),
+            device_id: "device-7".into(),
+        });
+        request
+    }
+
+    #[test]
+    fn offline_actions_meet_conflict_rules_policy_at_arrival_and_replay() {
+        use crate::sekai::offline_action::{CONFLICT_REASON, CONFLICT_REJECT_TOUCHED};
+        let db = setup();
+        ensure_record_kind(&db);
+        // Records with two written properties, title and note.
+        let with_note = |mutation: &str| {
+            GovernedActionType {
+            parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"note":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+            ..record_type(mutation)
+        }
+        };
+        db.put_governed_action_type(with_note("create"), "operator", 1)
+            .unwrap();
+        db.put_governed_action_type(with_note("update"), "operator", 1)
+            .unwrap();
+        db.put_governed_action_type(
+            GovernedActionType {
+                version: "2".into(),
+                offline_conflict: CONFLICT_REJECT_TOUCHED.into(),
+                ..with_note("update")
+            },
+            "operator",
+            1,
+        )
+        .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut create = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-1","name":"Acme","title":"draft","note":"a"}"#,
+        );
+        create.idempotency_key = "create-1".into();
+        create.request_id = "operation-create-1".into();
+        admission.admit(create, "alice", 10).unwrap();
+        let base = db.get_object("rec-1").unwrap().unwrap().updated;
+        // Someone changes another property online after the device read it.
+        let mut online = record_request(
+            "customer.record.update",
+            r#"{"object_id":"rec-1","note":"b"}"#,
+        );
+        online.idempotency_key = "online-1".into();
+        online.request_id = "operation-online-1".into();
+        admission.admit(online, "bob", 20).unwrap();
+        let current = db.get_object("rec-1").unwrap().unwrap().updated;
+        assert_ne!(current, base);
+
+        // Strict rule: any change since the base is a conflict, stored with
+        // both versions, and a retry returns the same outcome.
+        let strict = offline_request(
+            "customer.record.update",
+            "1",
+            "offline-strict",
+            r#"{"object_id":"rec-1","title":"final"}"#,
+            base,
+            &[("title", "draft")],
+        );
+        let conflict = admission.admit(strict.clone(), "alice", 30).unwrap();
+        assert_eq!(conflict.instance.status, STATUS_DENIED);
+        assert_eq!(conflict.instance.deny_reason, CONFLICT_REASON);
+        let detail = conflict.instance.conflict.clone().unwrap();
+        assert_eq!(
+            (detail.base_updated_ms, detail.current_updated_ms),
+            (base, current)
+        );
+        let again = admission.admit(strict, "alice", 40).unwrap();
+        assert!(again.replay);
+        assert_eq!(again.instance.instance_id, conflict.instance.instance_id);
+        assert_eq!(again.instance.conflict, conflict.instance.conflict);
+        assert_eq!(
+            db.get_object("rec-1").unwrap().unwrap().properties["title"],
+            "draft"
+        );
+
+        // Touched-properties rule: the change was to another property, so
+        // it applies; the receipt records the offline provenance.
+        let touched = offline_request(
+            "customer.record.update",
+            "2",
+            "offline-touched",
+            r#"{"object_id":"rec-1","title":"final"}"#,
+            base,
+            &[("title", "draft")],
+        );
+        let applied = admission.admit(touched, "alice", 50).unwrap();
+        assert_eq!(
+            applied.instance.status, STATUS_ADMITTED,
+            "{:?}",
+            applied.instance
+        );
+        assert_eq!(
+            db.get_object("rec-1").unwrap().unwrap().properties["title"],
+            "final"
+        );
+        let receipt = db
+            .get_operation_receipt("operation-offline-touched")
+            .unwrap()
+            .unwrap();
+        let intent = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .unwrap();
+        for (key, value) in [
+            ("offline", "true"),
+            ("offline_prepared_at_ms", "5"),
+            ("offline_device_id", "device-7"),
+            ("offline_lease_id", "lease-1"),
+        ] {
+            assert_eq!(
+                intent.attributes.get(key).map(String::as_str),
+                Some(value),
+                "{key}"
+            );
+        }
+        // Under the same rule, a changed written property conflicts.
+        let stale = offline_request(
+            "customer.record.update",
+            "2",
+            "offline-touched-stale",
+            r#"{"object_id":"rec-1","title":"other"}"#,
+            base,
+            &[("title", "draft")],
+        );
+        let refused = admission.admit(stale, "alice", 60).unwrap();
+        assert_eq!(refused.instance.conflict.unwrap().properties, ["title"]);
+
+        // Policy is decided at arrival: a deny set after the device prepared
+        // the Action refuses it, though its base is current.
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        db.upsert_action_policy(&policy).unwrap();
+        let fresh = db.get_object("rec-1").unwrap().unwrap();
+        let late = offline_request(
+            "customer.record.update",
+            "1",
+            "offline-policy",
+            r#"{"object_id":"rec-1","title":"late"}"#,
+            fresh.updated,
+            &[("title", "final")],
+        );
+        let denied = admission.admit(late, "alice", 70).unwrap();
+        assert_eq!(denied.instance.status, STATUS_DENIED);
+        assert_ne!(denied.instance.deny_reason, CONFLICT_REASON);
+        assert!(denied.instance.conflict.is_none());
+    }
+
+    #[test]
+    fn an_offline_action_needs_a_device_and_an_update_type() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let create = offline_request(
+            "customer.record.create",
+            "1",
+            "offline-create",
+            r#"{"object_id":"rec-2","name":"x"}"#,
+            1,
+            &[],
+        );
+        assert!(matches!(
+            admission.admit(create.clone(), "alice", 10),
+            Err(ActionInstanceAdmissionError::InvalidArgument(_))
+        ));
+        let mut deviceless = create;
+        deviceless.offline.as_mut().unwrap().device_id.clear();
+        deviceless.type_id = "customer.record.update".into();
+        db.put_governed_action_type(record_type("update"), "operator", 1)
+            .unwrap();
+        assert!(matches!(
+            admission.admit(deviceless, "alice", 10),
+            Err(ActionInstanceAdmissionError::PermissionDenied(_))
+        ));
+
+        // An object in another namespace is not found, so no conflict
+        // reports on it.
+        let mut foreign = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-foreign","name":"x"}"#,
+        );
+        foreign.namespace = "other".into();
+        foreign.idempotency_key = "foreign-create".into();
+        foreign.request_id = "operation-foreign-create".into();
+        db.put_governed_action_type(
+            GovernedActionType {
+                namespace: "other".into(),
+                ..record_type("create")
+            },
+            "operator",
+            1,
+        )
+        .unwrap();
+        admission.admit(foreign, "alice", 10).unwrap();
+        let probe = offline_request(
+            "customer.record.update",
+            "1",
+            "offline-foreign",
+            r#"{"object_id":"rec-foreign","title":"x"}"#,
+            1,
+            &[("title", "x")],
+        );
+        let refused = admission.admit(probe, "alice", 20).unwrap_err();
+        assert!(
+            matches!(&refused, ActionInstanceAdmissionError::FailedPrecondition(message) if message.contains("not found")),
+            "{refused:?}"
+        );
     }
 
     #[test]
@@ -4299,6 +4706,8 @@ mod tests {
             admission_tenant: String::new(),
             resource_tenant: String::new(),
             marking: String::new(),
+            conflict: None,
+            offline: None,
         };
         db.put_action_instance(&reserved).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);

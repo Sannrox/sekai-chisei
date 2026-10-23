@@ -183,8 +183,11 @@ pub(crate) const DEVICE_PROOF_HEADER: &str = "x-sekai-device-proof";
 /// RPCs (`Service/Method`) that check device proofs with
 /// [`require_device_proof`]. Every other RPC refuses a device-bound
 /// assertion outright, so a copied one never authenticates where no proof
-/// is checked. Sync (#1634) adds the first entries.
-const DEVICE_PROOF_RPCS: &[&str] = &[];
+/// is checked. Each entry calls the hook over its own request.
+const DEVICE_PROOF_RPCS: &[&str] = &[
+    // Offline governed Actions (#1580).
+    "sekai.SekaiService/SubmitActionInstance",
+];
 
 /// Whether `rpc` (`Service/Method`) checks device proofs.
 fn checks_device_proof(rpc: &str) -> bool {
@@ -195,16 +198,26 @@ fn checks_device_proof(rpc: &str) -> bool {
 /// device-bound assertion must carry the device's proof over this request
 /// (`method` and the encoded message) in [`DEVICE_PROOF_HEADER`]. With
 /// `device_required`, an unbound context is refused too.
-#[allow(dead_code)] // The first protected RPCs arrive with #1634.
 pub(crate) fn require_device_proof<T: prost::Message>(
     request: &tonic::Request<T>,
     method: &str,
     device_required: bool,
 ) -> Result<(), Status> {
-    let context = request
+    // No authenticated context is an unbound one: it passes unless the RPC
+    // requires a device.
+    let Some(context) = request
         .extensions()
         .get::<crate::enterprise::AuthenticatedContext>()
-        .ok_or_else(|| Status::unauthenticated("missing authenticated context"))?;
+    else {
+        return if device_required {
+            reject_unauthorized();
+            Err(Status::unauthenticated(
+                "device proof refused: device_unbound",
+            ))
+        } else {
+            Ok(())
+        };
+    };
     let digest =
         crate::identity_assertion::request_digest(method, &request.get_ref().encode_to_vec());
     let proof = request

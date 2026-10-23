@@ -1051,6 +1051,8 @@ mod tests {
             admission_tenant: String::new(),
             resource_tenant: String::new(),
             marking: String::new(),
+            conflict: None,
+            offline: None,
         })
         .unwrap();
     }
@@ -1187,6 +1189,8 @@ mod tests {
             admission_tenant: String::new(),
             resource_tenant: String::new(),
             marking: String::new(),
+            conflict: None,
+            offline: None,
         })
         .unwrap();
         let claimed = ActionWorkLifecycle::new(&db)
@@ -1269,6 +1273,8 @@ mod tests {
             admission_tenant: String::new(),
             resource_tenant: String::new(),
             marking: String::new(),
+            conflict: None,
+            offline: None,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);
@@ -1407,6 +1413,8 @@ mod tests {
             admission_tenant: String::new(),
             resource_tenant: "tenant-test".into(),
             marking: String::new(),
+            conflict: None,
+            offline: None,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);
@@ -1467,6 +1475,8 @@ mod tests {
             admission_tenant: "acme-tenant".into(),
             resource_tenant: String::new(),
             marking: String::new(),
+            conflict: None,
+            offline: None,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);

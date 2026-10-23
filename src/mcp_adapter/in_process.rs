@@ -235,6 +235,7 @@ impl InProcessSurface {
                         review_threshold: 0,
                         review_pool: vec![],
                         review_agent_reviewers: vec![],
+                        last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
                     }),
                     request_id: "put-mcp-action".into(),
                 },
