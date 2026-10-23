@@ -4,13 +4,21 @@
 //! Responses carry `authority: false`. Losing the tables loses no facts.
 
 use crate::domain::Object;
+use crate::sekai::classification_lattice::{ClassificationLattice, evaluate_lattice_access};
 use crate::sekai::dataset::Dataset;
-use crate::sekai::markings::object_marking_token;
+use crate::sekai::embedding_index::EmbeddingChunk;
+use crate::sekai::markings::{
+    MarkingDecision, PrincipalAuthority, is_trusted_service_principal, object_marking_token,
+    parse_optional_classification, trusted_service_authority,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ANALYZER_VERSION: &str = "search.text/v1";
+/// The one hybrid fusion profile: reciprocal rank fusion with k = 60.
+pub const FUSION_PROFILE: &str = "late_fusion.rrf/v1";
+pub const RRF_K: f64 = 60.0;
 pub const SEARCH_INDEX_UNAVAILABLE: &str = "search index is unavailable on this runtime";
 
 pub const POLICY_ATTRIBUTE_KEYS: &[&str] = &["owner", "acl", "access_marking", "purpose"];
@@ -98,6 +106,40 @@ pub struct SearchCandidate {
     pub authority: bool,
 }
 
+/// Exact nearest-neighbour query over one embedding spec's chunks, under
+/// the same compiled read policy as text candidates (ADR 0108).
+#[derive(Debug, Clone)]
+pub struct VectorCandidateQuery {
+    pub spec_id: String,
+    pub vector: Vec<f32>,
+    pub policy: SearchPolicyFilter,
+    pub limit: usize,
+}
+
+impl VectorCandidateQuery {
+    /// The object-candidate query the backends' per-object policy check takes.
+    pub fn policy_query(&self) -> SearchCandidateQuery {
+        SearchCandidateQuery {
+            mode: SearchQueryMode::Text,
+            text: String::new(),
+            source: Some(SearchSourceKind::Object),
+            policy: self.policy.clone(),
+            limit: self.limit,
+        }
+    }
+}
+
+/// An object ranked by the best cosine similarity of any of its chunks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorCandidate {
+    pub object_id: String,
+    pub score: f32,
+    /// Digest of the source text the vectors were embedded from. A caller
+    /// compares it with the live object: a stale vector may carry a value
+    /// the caller can no longer read.
+    pub source_digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchIndexStatus {
     pub namespace: String,
@@ -164,6 +206,141 @@ pub trait SearchIndex {
         now_ms: i64,
     ) -> Result<SearchRebuildReport, SearchIndexError>;
     fn status(&self, namespace: &str, now_ms: i64) -> Result<SearchIndexStatus, SearchIndexError>;
+    /// Objects nearest to the query vector, best first: the first
+    /// `query.limit` that pass the index's read policy and then `keep`, the
+    /// caller's live check. Exact today; an ANN index may back this later
+    /// behind the same contract.
+    fn vector_candidates(
+        &self,
+        query: &VectorCandidateQuery,
+        keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
+    ) -> Result<Vec<VectorCandidate>, SearchIndexError>;
+}
+
+/// The marking authority a search policy carries: a trusted service
+/// principal's, or the caller's clearance.
+fn search_authority(policy: &SearchPolicyFilter) -> PrincipalAuthority {
+    let subject = policy
+        .subjects
+        .iter()
+        .find(|subject| is_trusted_service_principal(subject))
+        .cloned()
+        .or_else(|| policy.subjects.first().cloned())
+        .unwrap_or_default();
+    if let Some(trusted) = trusted_service_authority(&subject) {
+        return trusted;
+    }
+    PrincipalAuthority {
+        principal: subject,
+        classification_ceiling: policy
+            .clearance
+            .as_deref()
+            .and_then(|token| parse_optional_classification(token).ok().flatten()),
+        classification_token: policy.clearance.clone(),
+        allowed_purposes: BTreeSet::new(),
+        declassify_markings: BTreeSet::new(),
+    }
+}
+
+/// Whether the policy's authority may see a document with `marking`.
+pub fn policy_marking_allows(
+    marking: &str,
+    policy: &SearchPolicyFilter,
+    lattice: Option<&ClassificationLattice>,
+) -> bool {
+    let token = (!marking.is_empty()).then_some(marking);
+    evaluate_lattice_access("search", token, &search_authority(policy), lattice).decision
+        != MarkingDecision::Deny
+}
+
+/// Exact search shared by every backend: drop chunks the policy's marking
+/// check denies, score the rest by cosine similarity, rank objects by their
+/// best chunk (then id), and keep the first `limit` that `allows`, the
+/// backend's per-object read policy check. Policy applies before the limit,
+/// so recall is exact over what the caller may see.
+pub fn exact_vector_candidates(
+    chunks: Vec<EmbeddingChunk>,
+    query: &VectorCandidateQuery,
+    lattice: Option<&ClassificationLattice>,
+    mut allows: impl FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
+) -> Result<Vec<VectorCandidate>, SearchIndexError> {
+    let mut best = BTreeMap::<String, (f32, String)>::new();
+    // Few distinct markings: decide each once.
+    let mut marking_allowed = BTreeMap::<String, bool>::new();
+    for chunk in chunks {
+        let marking = chunk.source.marking.unwrap_or_default();
+        let allowed = match marking_allowed.get(&marking) {
+            Some(allowed) => *allowed,
+            None => {
+                let allowed = policy_marking_allows(&marking, &query.policy, lattice);
+                marking_allowed.insert(marking, allowed);
+                allowed
+            }
+        };
+        if !allowed {
+            continue;
+        }
+        let Some(score) = cosine(&chunk.vector, &query.vector) else {
+            continue;
+        };
+        let digest = chunk.source.source_digest;
+        best.entry(chunk.object_id)
+            .and_modify(|current: &mut (f32, String)| current.0 = current.0.max(score))
+            .or_insert((score, digest));
+    }
+    let mut ranked = best
+        .into_iter()
+        .map(|(object_id, (score, source_digest))| VectorCandidate {
+            object_id,
+            score,
+            source_digest,
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.object_id.cmp(&b.object_id))
+    });
+    let mut allowed = Vec::new();
+    for candidate in ranked {
+        if allowed.len() >= query.limit {
+            break;
+        }
+        if allows(&candidate)? {
+            allowed.push(candidate);
+        }
+    }
+    Ok(allowed)
+}
+
+/// Cosine similarity; none for a dimension mismatch or a zero vector.
+fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let (mut dot, mut aa, mut bb) = (0f32, 0f32, 0f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    (aa > 0.0 && bb > 0.0).then(|| dot / (aa.sqrt() * bb.sqrt()))
+}
+
+/// Reciprocal rank fusion of ranked lists under [`FUSION_PROFILE`]: each
+/// list adds `weight / (RRF_K + rank)` (rank from 1) to its keys; a list
+/// weighted 0 contributes no keys. Ties break by key, so a fixed input
+/// fuses to a fixed order.
+pub fn rrf_fuse<K: Ord + Clone>(lists: &[(&[K], f64)]) -> Vec<K> {
+    let mut scores = BTreeMap::<K, f64>::new();
+    for (list, weight) in lists.iter().filter(|(_, weight)| *weight > 0.0) {
+        for (rank, key) in list.iter().enumerate() {
+            *scores.entry(key.clone()).or_default() += weight / (RRF_K + rank as f64 + 1.0);
+        }
+    }
+    let mut fused = scores.into_iter().collect::<Vec<_>>();
+    fused.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    fused.into_iter().map(|(key, _)| key).collect()
 }
 
 pub fn policy_attributes(object: &Object) -> BTreeMap<String, String> {
@@ -2019,5 +2196,116 @@ mod tests {
     fn postgres_list_filter_keeps_namespace_isolation() {
         let (_scratch, db) = postgres_runtime();
         exercise_list_filter_keeps_namespace_isolation(&db);
+    }
+
+    fn chunk(object_id: &str, marking: Option<&str>, vector: &[f32]) -> EmbeddingChunk {
+        EmbeddingChunk {
+            object_id: object_id.into(),
+            chunk_index: 0,
+            chunk_digest: String::new(),
+            vector: vector.to_vec(),
+            source: crate::sekai::embedding_index::EmbeddingSource {
+                source_digest: String::new(),
+                model: "m".into(),
+                model_version: "v".into(),
+                marking: marking.map(Into::into),
+                classifications: Vec::new(),
+            },
+            embedded_at_ms: 0,
+        }
+    }
+
+    fn vector_query(vector: &[f32], clearance: Option<&str>, limit: usize) -> VectorCandidateQuery {
+        VectorCandidateQuery {
+            spec_id: "notes".into(),
+            vector: vector.to_vec(),
+            policy: SearchPolicyFilter {
+                namespace: "acme".into(),
+                subjects: vec!["tester".into()],
+                clearance: clearance.map(Into::into),
+                ..Default::default()
+            },
+            limit,
+        }
+    }
+
+    #[test]
+    fn exact_vector_candidates_rank_best_chunk_and_drop_denied_markings_first() {
+        let chunks = vec![
+            chunk("near", Some("public"), &[1.0, 0.1]),
+            chunk("far", None, &[0.0, 1.0]),
+            // The object's best chunk ranks it.
+            chunk("split", None, &[0.0, 1.0]),
+            chunk("split", None, &[0.9, 0.1]),
+            // Above the caller's clearance: never scored, never displaces.
+            chunk("secret", Some("restricted"), &[1.0, 0.0]),
+            // Another dimension cannot be compared.
+            chunk("odd", None, &[1.0, 0.0, 0.0]),
+        ];
+        let query = vector_query(&[1.0, 0.0], Some("internal"), 10);
+        let ranked = exact_vector_candidates(chunks.clone(), &query, None, |_| Ok(true)).unwrap();
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|c| c.object_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["near", "split", "far"]
+        );
+        // The per-object policy applies before the limit: a denied object
+        // never takes the place of an allowed one.
+        let query = vector_query(&[1.0, 0.0], Some("internal"), 1);
+        let top = exact_vector_candidates(chunks, &query, None, |candidate| {
+            Ok(candidate.object_id != "near")
+        })
+        .unwrap();
+        assert_eq!(
+            top.iter().map(|c| c.object_id.as_str()).collect::<Vec<_>>(),
+            vec!["split"]
+        );
+    }
+
+    #[test]
+    fn rrf_fuses_deterministically_and_a_zero_weight_list_adds_nothing() {
+        let text = ["a", "b", "c"];
+        let vector = ["c", "d", "a"];
+        let fused = rrf_fuse(&[(&text[..], 1.0), (&vector[..], 1.0)]);
+        // a: 1/61 + 1/63, c: 1/63 + 1/61 tie, broken by key; then b and d tie.
+        assert_eq!(fused, vec!["a", "c", "b", "d"]);
+        assert_eq!(fused, rrf_fuse(&[(&text[..], 1.0), (&vector[..], 1.0)]));
+        assert_eq!(
+            rrf_fuse(&[(&text[..], 0.0), (&vector[..], 1.0)]),
+            vec!["c", "d", "a"]
+        );
+        assert_eq!(rrf_fuse(&[(&text[..], 1.0), (&vector[..], 3.0)])[0], "c");
+    }
+
+    /// The exact path's latency budget at 10^6 vectors (#1582): an ANN index
+    /// is added behind `SearchIndex::vector_candidates` only if this fails.
+    /// Run with `cargo test --release -- --ignored exact_vector_latency`.
+    #[test]
+    #[ignore = "latency budget at 10^6 vectors; run in release"]
+    fn exact_vector_latency_budget_at_one_million_vectors() {
+        const DIMENSION: usize = 64;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 2_000) as f32 / 1_000.0 - 1.0
+        };
+        let chunks = (0..1_000_000)
+            .map(|index| {
+                let vector = (0..DIMENSION).map(|_| next()).collect::<Vec<_>>();
+                chunk(&format!("o{index:07}"), None, &vector)
+            })
+            .collect::<Vec<_>>();
+        let query = (0..DIMENSION).map(|_| next()).collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let ranked =
+            exact_vector_candidates(chunks, &vector_query(&query, None, 256), None, |_| Ok(true))
+                .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(ranked.len(), 256);
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
 }

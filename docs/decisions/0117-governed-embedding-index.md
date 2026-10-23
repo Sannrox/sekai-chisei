@@ -72,3 +72,13 @@ and name a hosted catalog route as their model. Combined mode runs catch-up
 on a schedule over every stored spec, admitting each route as hosted
 execution does; the route is external unless its origin is loopback. See
 [embedding-index.md](../embedding-index.md).
+
+Amended by #1582: vector search is exact over the chunk table, filtered by
+the compiled read policy before the candidate cap, so recall is 1.0. The
+10^6-vector check is a latency budget; an ANN index is added behind
+`SearchIndex::vector_candidates` only if measured latency fails it. Hybrid
+`Search` fuses text and vector candidates under one named profile,
+`late_fusion.rrf/v1` (reciprocal rank fusion, k = 60). An embedded HNSW index
+was rejected for now (no measured need), and so were PostgreSQL-only vectors
+(they leave SQLite without vector search). See
+[search.md](../search.md#hybrid-search).

@@ -201,6 +201,8 @@ pub struct SekaiServiceImpl {
     pub(super) dry_run_host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
     /// User grants intersect the agent ceiling at claim and apply (#1563).
     pub(super) enforce_agent_ceiling: bool,
+    /// Embeds hybrid Search queries (#1582); none refuses hybrid mode.
+    pub(super) embedding_route: Option<crate::composition::embedding_catch_up::EmbeddingRoute>,
 }
 
 fn db_work_limiter(db: &crate::db::store::SekaiStore) -> Arc<tokio::sync::Semaphore> {
@@ -261,6 +263,7 @@ impl SekaiServiceImpl {
             cross_store: None,
             runtime_token_authority: None,
             dry_run_host: None,
+            embedding_route: None,
             enforce_agent_ceiling: false,
         }
     }
@@ -286,6 +289,7 @@ impl SekaiServiceImpl {
             cross_store: None,
             runtime_token_authority: None,
             dry_run_host: None,
+            embedding_route: None,
             enforce_agent_ceiling: false,
         }
     }
@@ -310,6 +314,14 @@ impl SekaiServiceImpl {
         host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
     ) -> Self {
         self.dry_run_host = host;
+        self
+    }
+
+    pub fn with_embedding_route(
+        mut self,
+        route: crate::composition::embedding_catch_up::EmbeddingRoute,
+    ) -> Self {
+        self.embedding_route = Some(route);
         self
     }
 
