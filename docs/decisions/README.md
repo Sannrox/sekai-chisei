@@ -145,4 +145,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0121: Bind Ezu geofence events to governed Actions](0121-fence-event-bindings.md)
 - [ADR 0122: Catalog entries are governed objects, registered by stable source id](0122-governed-catalog-entries.md)
 - [ADR 0123: Media uploads become governed objects](0123-governed-media-uploads.md)
-- [ADR 0124: Offline sync scopes diff stored members per cursor](0124-offline-sync-scopes.md)
+- [ADR 0125: Definition change bundles](0125-definition-change-bundles.md)
