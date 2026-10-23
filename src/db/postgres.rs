@@ -164,6 +164,8 @@ const OBJECT_CHANGE_OPERATION_SCHEMA: &str =
 const SYNC_SCOPES_SCHEMA: &str = include_str!("postgres/0094_sync_scopes.sql");
 const EMBEDDING_SPECS_SCHEMA: &str = include_str!("postgres/0095_embedding_specs.sql");
 const DATASET_RUNS_SCHEMA: &str = include_str!("postgres/0096_chisei_dataset_runs.sql");
+const SYNC_MEMBER_PROPERTIES_SCHEMA: &str =
+    include_str!("postgres/0097_sync_member_properties.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -766,6 +768,12 @@ const MIGRATIONS: &[Migration] = &[
         "chisei_dataset_runs",
         DATASET_RUNS_SCHEMA,
         MigrationOwner::Chisei,
+    ),
+    mig(
+        96,
+        "sync_member_properties",
+        SYNC_MEMBER_PROPERTIES_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 

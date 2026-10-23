@@ -40,14 +40,40 @@ fn fingerprint(object: &domain::Object) -> String {
     )
 }
 
+/// A member as the caller reads `object`: its fingerprint and the property
+/// names it shows.
+fn member(object: &domain::Object) -> Member {
+    let mut properties: Vec<String> = object.properties.keys().cloned().collect();
+    properties.sort();
+    Member {
+        object_id: object.id.clone(),
+        fingerprint: fingerprint(object),
+        properties,
+    }
+}
+
 fn member_list(members: &BTreeMap<String, domain::Object>) -> Vec<Member> {
-    members
-        .iter()
-        .map(|(object_id, object)| Member {
-            object_id: object_id.clone(),
-            fingerprint: fingerprint(object),
-        })
-        .collect()
+    members.values().map(member).collect()
+}
+
+/// Whether a stored position pin was taken under the scope definition the
+/// current pin names. A pin is `<definition>.<authorization>`; a changed
+/// authorization keeps the cursor and arrives as purges (#1633), a changed
+/// definition does not. A pin from before the split never matches.
+fn same_definition(stored: &str, pin: &str) -> bool {
+    match (stored.split_once('.'), pin.split_once('.')) {
+        (Some((stored, _)), Some((current, _))) => stored == current,
+        _ => false,
+    }
+}
+
+/// When the client must sync again before showing data: now plus the
+/// scope's maximum offline age, or 0 for no limit.
+fn offline_until(scope: &SyncScope) -> i64 {
+    match scope.definition.max_offline_age_ms {
+        0 => 0,
+        age => now_millis().saturating_add(age),
+    }
 }
 
 struct Caller<'a> {
@@ -132,10 +158,11 @@ impl<'a> Caller<'a> {
             authorization_pin(&activation, &self.principals).map_err(Status::internal)?;
         let definition =
             crate::db::sync_scope::definition_json(&scope.definition).map_err(sync_status)?;
-        Ok(sync_scope::fingerprint([
-            authorization.as_str(),
-            definition.as_str(),
-        ]))
+        Ok(format!(
+            "{}.{}",
+            sync_scope::fingerprint([definition.as_str()]),
+            sync_scope::fingerprint([authorization.as_str()])
+        ))
     }
 
     fn visible(&self, object: &domain::Object) -> bool {
@@ -466,6 +493,7 @@ fn put_sync_scope_blocking(
             .collect(),
         link,
         max_objects: input.max_objects,
+        max_offline_age_ms: input.max_offline_age_ms,
     };
     definition.validate().map_err(Status::invalid_argument)?;
     caller.check_filters(&input.namespace, &definition)?;
@@ -484,6 +512,7 @@ fn put_sync_scope_blocking(
         namespace: scope.namespace,
         scope_id: scope.scope_id,
         max_objects: scope.definition.max_objects,
+        max_offline_age_ms: scope.definition.max_offline_age_ms,
     }))
 }
 
@@ -541,6 +570,7 @@ fn read_sync_snapshot_blocking(
             String::new()
         },
         total_objects: position.members.len() as u32,
+        offline_until_ms: if last_page { offline_until(&scope) } else { 0 },
     }))
 }
 
@@ -563,12 +593,20 @@ fn read_sync_deltas_blocking(
     let pin = caller.pin(&scope)?;
     let Some(position) = caller
         .position(&scope, &input.cursor)?
-        .filter(|position| position.authorization_pin == pin)
+        .filter(|position| same_definition(&position.authorization_pin, &pin))
     else {
         return Ok(resnapshot());
     };
     let db = caller.db();
-    let mut current = caller.members(&scope)?;
+    // A filter the caller may no longer query ends the cursor: the client
+    // discards its replica and its next snapshot is checked afresh.
+    let mut current = match caller.members(&scope) {
+        Ok(current) => current,
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            return Ok(resnapshot());
+        }
+        Err(status) => return Err(status),
+    };
     let now = member_list(&current);
     let limit = page_limit(input.limit);
     let baseline = position.baseline();
@@ -623,22 +661,17 @@ fn read_sync_deltas_blocking(
     // The answer gets its own cursor, holding exactly what it sent: the
     // transition's members with the bodies actually sent and without the
     // ones that could not be. Two answers with the same bodies share it.
-    let mut answered: BTreeMap<String, String> = transition
+    let mut answered: BTreeMap<String, Member> = transition
         .members
         .iter()
         .filter(|member| !unsent.contains(&member.object_id))
-        .map(|member| (member.object_id.clone(), member.fingerprint.clone()))
+        .map(|member| (member.object_id.clone(), member.clone()))
         .collect();
     for object in &upserts {
-        answered.insert(object.id.clone(), fingerprint(object));
+        answered.insert(object.id.clone(), member(object));
     }
-    let answered: Vec<Member> = answered
-        .into_iter()
-        .map(|(object_id, fingerprint)| Member {
-            object_id,
-            fingerprint,
-        })
-        .collect();
+    let answered: Vec<Member> = answered.into_values().collect();
+    let purges = purges(&caller, &scope, &baseline, &diff.removes, &upserts)?;
     let next = caller.save_position(
         &scope,
         pin,
@@ -657,5 +690,77 @@ fn read_sync_deltas_blocking(
         cursor: next.position_id,
         more: !pending.upserts.is_empty() || !pending.removes.is_empty(),
         resnapshot_required: false,
+        purges,
+        // Only a read that leaves nothing pending renews the deadline, so a
+        // replica still holding data it must drop gains no time.
+        offline_until_ms: if pending.upserts.is_empty() && pending.removes.is_empty() {
+            offline_until(&scope)
+        } else {
+            0
+        },
     }))
+}
+
+/// What the client must delete because the caller may no longer read it
+/// (#1633). A removed object that still exists in the namespace but is
+/// hidden from the caller is purged whole. An upserted object that no
+/// longer shows a property the client read, while the property still
+/// exists, purges that property: the names are ones the client already
+/// held, so no hidden name is disclosed.
+fn purges(
+    caller: &Caller<'_>,
+    scope: &SyncScope,
+    baseline: &[Member],
+    removes: &[String],
+    upserts: &[domain::Object],
+) -> Result<Vec<SyncPurge>, Status> {
+    let db = caller.db();
+    let stored = |id: &str| {
+        db.get_object(id)
+            .map(|object| object.filter(|object| object.namespace == scope.namespace))
+            .map_err(Status::internal)
+    };
+    let mut purges = Vec::new();
+    for id in removes {
+        if let Some(object) = stored(id)?
+            && !caller.visible(&object)
+        {
+            purges.push(SyncPurge {
+                object_id: id.clone(),
+                properties: Vec::new(),
+            });
+        }
+    }
+    let held: BTreeMap<&str, &[String]> = baseline
+        .iter()
+        .map(|member| (member.object_id.as_str(), member.properties.as_slice()))
+        .collect();
+    for object in upserts {
+        let Some(read) = held.get(object.id.as_str()).filter(|read| !read.is_empty()) else {
+            continue;
+        };
+        let lost: Vec<&String> = read
+            .iter()
+            .filter(|property| !object.properties.contains_key(*property))
+            .collect();
+        if lost.is_empty() {
+            continue;
+        }
+        let Some(raw) = stored(&object.id)? else {
+            continue;
+        };
+        let hidden: Vec<String> = lost
+            .into_iter()
+            .filter(|property| raw.properties.contains_key(*property))
+            .cloned()
+            .collect();
+        if !hidden.is_empty() {
+            purges.push(SyncPurge {
+                object_id: object.id.clone(),
+                properties: hidden,
+            });
+        }
+    }
+    purges.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+    Ok(purges)
 }

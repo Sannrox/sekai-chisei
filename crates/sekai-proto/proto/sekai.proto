@@ -4045,6 +4045,9 @@ message PutSyncScopeRequest {
   SyncScopeLink link = 6;
   // The scope's quota of visible objects, at most 5000.
   uint32 max_objects = 7;
+  // How long a client may show synced data without syncing again (#1633):
+  // 0 for no limit, otherwise one minute to 366 days.
+  int64 max_offline_age_ms = 8;
 }
 
 message SyncScopeResponse {
@@ -4052,6 +4055,7 @@ message SyncScopeResponse {
   string namespace = 2;
   string scope_id = 3;
   uint32 max_objects = 4;
+  int64 max_offline_age_ms = 5;
 }
 
 message ReadSyncSnapshotRequest {
@@ -4073,6 +4077,9 @@ message ReadSyncSnapshotResponse {
   string cursor = 4;
   // Members in the snapshot, including any no longer readable when sent.
   uint32 total_objects = 5;
+  // Set on the last page when the scope has a maximum offline age: the
+  // client must sync again before showing the data after this time.
+  int64 offline_until_ms = 6;
 }
 
 message ReadSyncDeltasRequest {
@@ -4096,7 +4103,22 @@ message ReadSyncDeltasResponse {
   string cursor = 4;
   // More changes are waiting.
   bool more = 5;
-  // The cursor cannot continue (expired, authorization or scope changed):
-  // take a new snapshot.
+  // The cursor cannot continue (expired, scope changed, or a filter the
+  // caller may no longer query): discard the replica and take a new
+  // snapshot. A change in what the caller may read does not end a cursor;
+  // it arrives as purges.
   bool resnapshot_required = 6;
+  // Data the caller may no longer read (#1633): delete it. An entry without
+  // properties is a whole object (also in removed_object_ids); one with
+  // properties names those the object, upserted here, no longer shows.
+  repeated SyncPurge purges = 7;
+  // As in the snapshot: sync again before showing data after this time.
+  // Set only when this read leaves nothing pending (`more` false); until
+  // then the previous deadline holds.
+  int64 offline_until_ms = 8;
+}
+
+message SyncPurge {
+  string object_id = 1;
+  repeated string properties = 2;
 }
