@@ -6,6 +6,7 @@
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
+use crate::sekai::audit::ChangeAttribution;
 use crate::sekai::lease::LeaseError;
 
 pub(crate) struct LeasePrecondition<'a> {
@@ -93,10 +94,11 @@ impl<'a> ObjectMutation<'a> {
                 .map_err(MutationPersistenceError::Lease)
         } else {
             self.db
-                .create_object_with_authorized_policy(
+                .create_object_attributed(
                     object,
                     actor,
                     self.expected_policy_generation,
+                    &ChangeAttribution::direct(),
                 )
                 .map_err(MutationPersistenceError::Graph)?;
             Ok(object.clone())
@@ -127,11 +129,12 @@ impl<'a> ObjectMutation<'a> {
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
-            match self.db.update_object_with_authorized_snapshot(
+            match self.db.update_object_attributed(
                 object,
                 expected,
                 actor,
                 self.expected_policy_generation,
+                &ChangeAttribution::direct(),
             ) {
                 Ok(Some(_)) => Ok(object.clone()),
                 Ok(None) => Err(MutationPersistenceError::NotFound),
@@ -165,11 +168,12 @@ impl<'a> ObjectMutation<'a> {
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
-            match self.db.delete_object_with_authorized_snapshot(
+            match self.db.delete_object_attributed(
                 id,
                 expected,
                 actor,
                 self.expected_policy_generation,
+                &ChangeAttribution::direct(),
             ) {
                 Ok(None) if expected.is_some() => Err(MutationPersistenceError::NotFound),
                 Ok(_) => Ok(()),

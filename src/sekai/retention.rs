@@ -3885,6 +3885,7 @@ mod tests {
             changed_by: "actor".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.set_retention_policy(&RetentionPolicy {
@@ -3938,6 +3939,7 @@ mod tests {
             changed_by: "actor".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.create_dataset(&Dataset {
@@ -4751,6 +4753,7 @@ mod tests {
             changed_by: "erase-agent".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.record_object_change(&crate::sekai::audit::ObjectChange {
@@ -4762,6 +4765,7 @@ mod tests {
             changed_by: "privacy-admin".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.record_object_change(&crate::sekai::audit::ObjectChange {
@@ -4773,6 +4777,7 @@ mod tests {
             changed_by: "privacy-admin".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.record_object_change(&crate::sekai::audit::ObjectChange {
@@ -4784,6 +4789,7 @@ mod tests {
             changed_by: "privacy-admin".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.record_object_change(&crate::sekai::audit::ObjectChange {
@@ -4795,6 +4801,7 @@ mod tests {
             changed_by: "privacy-admin".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 
@@ -5073,6 +5080,7 @@ mod tests {
             changed_by: "agent10".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.create_object(&crate::domain::Object {
@@ -5450,6 +5458,7 @@ mod tests {
             changed_by: "project:default/agent:bot".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 

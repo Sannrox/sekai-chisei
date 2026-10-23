@@ -1434,6 +1434,7 @@ mod policy_decision_rpc_tests {
             changed_by: "writer".into(),
             timestamp: at,
             operation_id: String::new(),
+            ..Default::default()
         }
     }
 

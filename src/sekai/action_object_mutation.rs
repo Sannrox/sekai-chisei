@@ -225,12 +225,13 @@ pub(crate) fn plan(
 }
 
 /// Applies an admitted Action's object write. Its change rows carry the
-/// Action's `operation_id`, so history links to the operation by stored id.
+/// Action's attribution (operation, instance and receipt), so history links
+/// to the operation by stored id.
 pub(crate) fn apply(
     db: &RuntimeDb,
     planned: PlannedObjectMutation,
     actor: &str,
-    operation_id: &str,
+    attribution: &crate::sekai::audit::ChangeAttribution,
     now_ms: i64,
 ) -> Result<AppliedObjectMutation, ActionObjectMutationError> {
     let mutation = planned.mutation().to_string();
@@ -248,7 +249,7 @@ pub(crate) fn apply(
     let object_external_id = object.external_id.clone();
     let applied_updated = object.updated;
     let previous = if created {
-        db.create_object_for_operation(&object, actor, operation_id)
+        db.create_object_attributed(&object, actor, None, attribution)
             .map_err(|error| {
                 if object_kind == KIND_OBSERVATION && unique_constraint_failed(&error) {
                     ActionObjectMutationError::FailedPrecondition(format!(
@@ -261,7 +262,7 @@ pub(crate) fn apply(
         None
     } else {
         Some(
-            db.update_object_for_operation(&object, snapshot.as_deref(), actor, operation_id)
+            db.update_object_attributed(&object, snapshot.as_deref(), actor, None, attribution)
                 .map_err(|error| {
                     if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION {
                         ActionObjectMutationError::FailedPrecondition(format!(
@@ -658,7 +659,7 @@ mod tests {
         )
         .unwrap()
         .expect("planned");
-        let applied = apply(&db, planned, "alice", "", 10).unwrap();
+        let applied = apply(&db, planned, "alice", &Default::default(), 10).unwrap();
         compensate(&db, &applied, "alice");
         let planned = plan(
             &db,
@@ -670,7 +671,7 @@ mod tests {
         )
         .unwrap()
         .expect("planned after abort");
-        apply(&db, planned, "alice", "", 20).unwrap();
+        apply(&db, planned, "alice", &Default::default(), 20).unwrap();
         assert_eq!(
             db.get_object("rec-abort").unwrap().unwrap().kind,
             "customer_record"
@@ -716,7 +717,7 @@ mod tests {
         )
         .unwrap()
         .expect("planned");
-        apply(&db, planned, "alice", "", 10).unwrap();
+        apply(&db, planned, "alice", &Default::default(), 10).unwrap();
         let update = GovernedActionType {
             object_mutation: OBJECT_MUTATION_UPDATE.into(),
             type_id: "customer.record.update".into(),
@@ -732,7 +733,7 @@ mod tests {
         )
         .unwrap()
         .expect("planned");
-        let applied = apply(&db, planned, "alice", "", 20).unwrap();
+        let applied = apply(&db, planned, "alice", &Default::default(), 20).unwrap();
         assert_eq!(
             db.get_object("rec-restore")
                 .unwrap()
@@ -794,7 +795,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(marking(&created).as_deref(), Some("confidential"));
-        apply(&db, created.unwrap(), "alice", "", 10).unwrap();
+        apply(&db, created.unwrap(), "alice", &Default::default(), 10).unwrap();
         // An update cannot lower the object's marking through a parameter,
         // and keeps the stricter of the object's and the Action's.
         let update = GovernedActionType {

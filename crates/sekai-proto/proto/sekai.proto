@@ -307,6 +307,14 @@ message ObjectChange {
   // Plane-stamped operation identity when the change was produced by a
   // governed action. Empty for mutations that have no bound operation.
   string operation_id = 8;
+  // Who wrote the change (#1690): source_transaction, transform_run,
+  // action_instance, direct, or unattributed when the row records none.
+  string writer_kind = 9;
+  // The source transaction, `run@checkpoint`, or Action instance.
+  string writer_ref = 10;
+  // The writer's durable receipt: source transaction, transform run, or the
+  // Action's operation receipt.
+  string receipt_id = 11;
 }
 
 // A versioned description of an existing native query or retrieval surface.

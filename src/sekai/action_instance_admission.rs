@@ -609,7 +609,10 @@ impl<'a> ActionInstanceAdmission<'a> {
                         self.db,
                         planned,
                         actor,
-                        &stored.operation_id,
+                        &crate::sekai::audit::ChangeAttribution::action(
+                            &stored.instance_id,
+                            &stored.operation_id,
+                        ),
                         now,
                     ) {
                         Ok(applied) => Some(applied),

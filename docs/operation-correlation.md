@@ -38,6 +38,26 @@ value. `ListObjectChanges` has the same semantics and paging on SQLite and
 PostgreSQL; it is experimental and needs `SEKAI_EXPERIMENTAL_RPCS=1` or the
 `experimental-rpcs` build feature.
 
+### Writer attribution
+
+Each change row also records who wrote it (#1690): `writer_kind`,
+`writer_ref`, and `receipt_id`.
+
+| `writer_kind` | `writer_ref` | `receipt_id` |
+| --- | --- | --- |
+| `source_transaction` | the committed source batch transaction | the same transaction record |
+| `transform_run` | `run_id@checkpoint` (streaming apply checkpoint, or the run's last input row) | the transform run |
+| `action_instance` | the Action instance | the Action's operation receipt |
+| `direct` | empty | empty |
+| `unattributed` | empty | empty |
+
+A transform that stamps an output marking records the stamp as a change of
+`properties.access_marking`, attributed to the run. Direct object RPC writes
+record `direct`. Rows written before the columns existed, by a version
+without them during a rolling deploy, or by internal writers that record no
+writer read as `unattributed`; the writer is never inferred. The columns are
+nullable on both backends (PostgreSQL `0095_object_change_writer`).
+
 ## Client propagation
 
 SDK callers set the header through the existing operation context:

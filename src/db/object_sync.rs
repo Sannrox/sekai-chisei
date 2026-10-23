@@ -1235,12 +1235,14 @@ impl SekaiDb {
                     object.updated,
                 ],
             )?;
-            let changes = object_diff_changes(
-                authenticated_producer,
-                before.as_ref(),
-                Some(&object),
-                now_ms,
-            );
+            // Attributed to the committed source transaction (#1690).
+            let changes = crate::sekai::audit::ChangeAttribution::source(&prepared.transaction_id)
+                .stamp(object_diff_changes(
+                    authenticated_producer,
+                    before.as_ref(),
+                    Some(&object),
+                    now_ms,
+                ));
             insert_object_changes(&transaction, &changes).map_err(ApplyError::Storage)?;
 
             let reason = match prepared_record.decision {
@@ -2832,11 +2834,15 @@ mod tests {
         assert_eq!(object.external_id, "github:acme/ops#12");
         assert_eq!(object.properties["sync_type_digest"], TYPE_DIGEST);
         assert_eq!(object.properties["sync_tombstoned"], "false");
-        assert!(
-            !db.list_object_changes(&object_id, 100, 0)
-                .unwrap()
-                .is_empty()
-        );
+        let changes = db.list_object_changes(&object_id, 100, 0).unwrap();
+        assert!(!changes.is_empty());
+        // Every row names the source transaction that wrote it (#1690).
+        let transaction_id = &result.transaction.transaction_id;
+        assert!(changes.iter().all(|change| {
+            change.writer_kind == crate::sekai::audit::WRITER_SOURCE_TRANSACTION
+                && &change.writer_ref == transaction_id
+                && &change.receipt_id == transaction_id
+        }));
 
         let identity_count: i64 = db
             .conn()

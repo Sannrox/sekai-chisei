@@ -301,7 +301,7 @@ impl PostgresDb {
             &output_rows,
             &mut run,
         )?;
-        stamp_object_marking(&mut tx, &output_object_id, &run.markings_out, now_ms)?;
+        stamp_object_marking(&mut tx, &output_object_id, &run, now_ms)?;
         insert_transform_run(&mut tx, &run)?;
         tx.execute(
             "INSERT INTO sekai_governed_transform_checkpoint
@@ -1416,10 +1416,15 @@ fn apply_streaming_transform_batch_pg(
     for object_id in object_ids {
         lock_object_lifecycle(tx, object_id).map_err(map_persist_error)?;
     }
+    // Each edit is attributed to the run at this checkpoint (#1690).
+    let attribution = crate::sekai::audit::ChangeAttribution::transform(
+        &batch.run_id,
+        &batch.checkpoint.to_string(),
+    );
     let policy_generation = Some(batch.policy_generation.as_str());
     for edit in &batch.edits {
         if edit.create {
-            insert_created_object_in(tx, &edit.object, actor, policy_generation, "")
+            insert_created_object_in(tx, &edit.object, actor, policy_generation, &attribution)
                 .map_err(map_persist_error)?;
         } else {
             let previous = update_object_in(
@@ -1428,7 +1433,7 @@ fn apply_streaming_transform_batch_pg(
                 edit.expected.as_ref(),
                 actor,
                 policy_generation,
-                "",
+                &attribution,
             )
             .map_err(map_persist_error)?;
             if previous.is_none() {
@@ -1840,12 +1845,15 @@ pub(crate) fn load_object_marking_token(
         .filter(|value| !value.is_empty()))
 }
 
+/// Stamps the run's output marking on the object, with a change row
+/// attributed to the run when the marking changes (#1690).
 fn stamp_object_marking(
     tx: &mut postgres::Transaction<'_>,
     object_id: &str,
-    token: &str,
+    run: &TransformRun,
     now_ms: i64,
 ) -> Result<(), String> {
+    let token = run.markings_out.as_str();
     if object_id.trim().is_empty() {
         return Ok(());
     }
@@ -1859,6 +1867,7 @@ fn stamp_object_marking(
         .ok_or_else(|| format!("output markings unresolvable: object {object_id} not found"))?;
     let mut map: HashMap<String, String> =
         serde_json::from_str(&properties).map_err(|error| error.to_string())?;
+    let before = map.get(OBJECT_CLASSIFICATION_PROPERTY).cloned();
     if token.trim().is_empty() {
         map.remove(OBJECT_CLASSIFICATION_PROPERTY);
     } else {
@@ -1878,6 +1887,15 @@ fn stamp_object_marking(
         return Err(format!(
             "output markings unresolvable: object {object_id} not found"
         ));
+    }
+    if let Some(change) = crate::sekai::audit::transform_marking_change(
+        object_id,
+        before.as_deref(),
+        map.get(OBJECT_CLASSIFICATION_PROPERTY).map(String::as_str),
+        run,
+        now_ms,
+    ) {
+        crate::db::postgres_audit::insert_changes(tx, &[change])?;
     }
     Ok(())
 }
@@ -2324,7 +2342,7 @@ fn write_transform_run_pg(
     run.dispatch_status = TRANSFORM_WORK_COMPLETED.into();
     run.engine = work.engine.clone();
     run.runtime_image = work.runtime_image.clone();
-    stamp_object_marking(tx, &output_object_id, &run.markings_out, now_ms)?;
+    stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
     persist_transform_run_pg(tx, &run)?;
     tx.execute(
         "INSERT INTO sekai_governed_transform_checkpoint
@@ -3784,7 +3802,7 @@ fn run_in_process_pg(
         &output_rows,
         &mut run,
     )?;
-    stamp_object_marking(tx, &output_object_id, &run.markings_out, now_ms)?;
+    stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
     insert_transform_run(tx, &run)?;
     tx.execute(
         "INSERT INTO sekai_governed_transform_checkpoint
@@ -4145,6 +4163,15 @@ mod tests {
             output_object.properties.get(OBJECT_CLASSIFICATION_PROPERTY),
             Some(&"confidential".to_string())
         );
+        // The stamp is a change row attributed to the run (#1690).
+        let stamp = db
+            .list_object_changes("out-obj", 100, 0)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.field == format!("properties.{OBJECT_CLASSIFICATION_PROPERTY}"))
+            .expect("marking stamp change row");
+        assert_eq!(stamp.writer_kind, crate::sekai::audit::WRITER_TRANSFORM_RUN);
+        assert_eq!(stamp.receipt_id, run.run_id);
     }
 
     #[test]

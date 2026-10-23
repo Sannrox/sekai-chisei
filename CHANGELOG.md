@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Every object change row records its writer: source transaction, transform
+  run and checkpoint, Action instance or direct write, with a writer
+  reference and receipt id, on SQLite and PostgreSQL. Transform marking
+  stamps now write change rows. Older rows read as `unattributed`
+  (docs/operation-correlation.md, `0095_object_change_writer`, GATE:mig,
+  #1690).
+
 - A device-bound identity assertion is refused by every RPC that does not
   check device proofs; none does until sync adds its RPCs (ADR 0126).
 
