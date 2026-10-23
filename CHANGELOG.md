@@ -21,6 +21,14 @@
   (docs/operation-correlation.md, `0093_object_change_operation`, GATE:mig,
   #1689).
 
+- Experimental offline sync scopes (contract `sekai.sync/v1`):
+  `PutSyncScope` defines a kind, property filters, optional linked
+  objects up to two hops and an object quota; `ReadSyncSnapshot` pages a
+  policy-filtered snapshot, and `ReadSyncDeltas` resumes from its cursor
+  with upserts and removals. Every object passes the online read checks
+  and is projected per property, and a scope over its quota is refused
+  with the quota named (ADR 0124, #1632).
+
 - Enterprise-scoped credentials may call `ProposeDefinitionRollback`,
   `ExportDefinitionPackage` and `ImportDefinitionPackage`, which authorize
   the tenant's namespace and members like the other definition proposal
