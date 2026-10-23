@@ -10,7 +10,9 @@
 //! - after `offline_until_ms` the data is not shown until the client syncs
 //!   again; a delta renews that time only when it leaves nothing pending;
 //! - nothing is shown until a snapshot is complete, and a resnapshot
-//!   discards the data.
+//!   discards the data;
+//! - a wipe instruction (a revoked device, #1634) deletes everything for
+//!   good.
 
 use sekai_proto::sekai::{Object, ReadSyncDeltasResponse, ReadSyncSnapshotResponse};
 use std::collections::BTreeMap;
@@ -24,6 +26,8 @@ pub enum ReplicaError {
     ResnapshotRequired,
     /// A snapshot is still being read.
     SnapshotIncomplete,
+    /// The device was revoked and wiped its data.
+    Wiped,
 }
 
 /// The objects of one scope as the client holds them, and its cursor.
@@ -34,12 +38,17 @@ pub struct SyncReplica {
     offline_until_ms: i64,
     resnapshot: bool,
     complete: bool,
+    wiped: bool,
 }
 
 impl SyncReplica {
     /// Apply one snapshot page. The first page of a new snapshot starts the
     /// replica over.
     pub fn apply_snapshot_page(&mut self, page: &ReadSyncSnapshotResponse, first: bool) {
+        if self.wiped || page.wipe_required {
+            self.wipe();
+            return;
+        }
         if first {
             *self = Self::default();
         }
@@ -55,6 +64,10 @@ impl SyncReplica {
 
     /// Apply one delta read.
     pub fn apply_deltas(&mut self, deltas: &ReadSyncDeltasResponse) {
+        if self.wiped || deltas.wipe_required {
+            self.wipe();
+            return;
+        }
         if deltas.resnapshot_required {
             // The data may include what the caller can no longer read.
             *self = Self {
@@ -84,6 +97,14 @@ impl SyncReplica {
         }
     }
 
+    /// Delete every object and the cursor; nothing is shown again.
+    fn wipe(&mut self) {
+        *self = Self {
+            wiped: true,
+            ..Self::default()
+        };
+    }
+
     /// The cursor to read the next deltas from.
     pub fn cursor(&self) -> &str {
         &self.cursor
@@ -91,6 +112,9 @@ impl SyncReplica {
 
     /// The data to show at `now_ms`, unless the replica must sync first.
     pub fn view(&self, now_ms: i64) -> Result<&BTreeMap<String, Object>, ReplicaError> {
+        if self.wiped {
+            return Err(ReplicaError::Wiped);
+        }
         if self.resnapshot {
             return Err(ReplicaError::ResnapshotRequired);
         }
@@ -202,5 +226,22 @@ mod tests {
             true,
         );
         assert!(replica.view(0).unwrap().is_empty());
+
+        // A revoked device wipes for good.
+        replica.apply_deltas(&ReadSyncDeltasResponse {
+            wipe_required: true,
+            ..Default::default()
+        });
+        assert_eq!(replica.view(0).unwrap_err(), ReplicaError::Wiped);
+        replica.apply_snapshot_page(
+            &ReadSyncSnapshotResponse {
+                objects: vec![object("wo-1", &[])],
+                cursor: "pos-10".into(),
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(replica.view(0).unwrap_err(), ReplicaError::Wiped);
+        assert!(replica.cursor().is_empty());
     }
 }

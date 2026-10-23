@@ -1,16 +1,20 @@
 //! Shared SQLite/PostgreSQL conformance for object change history with a
-//! stored operation id per change (#1689).
+//! stored operation id (#1689) and writer attribution (#1690) per change.
 
 use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::Object;
-use sekai_chisei::sekai::audit::ObjectChange;
+use sekai_chisei::sekai::audit::{ChangeAttribution, ObjectChange};
 use std::collections::HashMap;
 
 trait ChangeHarness {
-    fn create(&self, object: &Object, operation_id: &str) -> Result<(), String>;
-    fn update(&self, object: &Object, operation_id: &str) -> Result<Option<Object>, String>;
-    fn delete(&self, id: &str) -> Result<Option<Object>, String>;
+    fn create(&self, object: &Object, attribution: &ChangeAttribution) -> Result<(), String>;
+    fn update(
+        &self,
+        object: &Object,
+        attribution: &ChangeAttribution,
+    ) -> Result<Option<Object>, String>;
+    fn delete(&self, id: &str, attribution: &ChangeAttribution) -> Result<Option<Object>, String>;
     fn visible(&self, id: &str, limit: i32, offset: i32) -> Result<Vec<ObjectChange>, String>;
     fn all(&self, id: &str) -> Result<Vec<ObjectChange>, String>;
     fn kind(&self, id: &str) -> Result<Option<String>, String>;
@@ -20,18 +24,26 @@ trait ChangeHarness {
 macro_rules! harness {
     ($db:ty) => {
         impl ChangeHarness for $db {
-            fn create(&self, object: &Object, operation_id: &str) -> Result<(), String> {
-                self.create_object_for_operation(object, "conformance", operation_id)
+            fn create(
+                &self,
+                object: &Object,
+                attribution: &ChangeAttribution,
+            ) -> Result<(), String> {
+                self.create_object_attributed(object, "conformance", None, attribution)
             }
             fn update(
                 &self,
                 object: &Object,
-                operation_id: &str,
+                attribution: &ChangeAttribution,
             ) -> Result<Option<Object>, String> {
-                self.update_object_for_operation(object, None, "conformance", operation_id)
+                self.update_object_attributed(object, None, "conformance", None, attribution)
             }
-            fn delete(&self, id: &str) -> Result<Option<Object>, String> {
-                self.delete_object_with_audit(id, "conformance")
+            fn delete(
+                &self,
+                id: &str,
+                attribution: &ChangeAttribution,
+            ) -> Result<Option<Object>, String> {
+                self.delete_object_attributed(id, None, "conformance", None, attribution)
             }
             fn visible(
                 &self,
@@ -71,12 +83,22 @@ fn ticket(prefix: &str, title: &str, updated: i64) -> Object {
 
 fn exercise(db: &dyn ChangeHarness, prefix: &str) {
     let id = format!("{prefix}-ticket");
-    db.create(&ticket(prefix, "draft", 10), "op-create")
+    db.create(
+        &ticket(prefix, "draft", 10),
+        &ChangeAttribution::action("instance-1", "op-create"),
+    )
+    .unwrap();
+    // Written back to back, usually in the same millisecond, by another writer.
+    db.update(
+        &ticket(prefix, "final", 11),
+        &ChangeAttribution {
+            operation_id: "op-update".into(),
+            ..ChangeAttribution::transform("run-1", "7")
+        },
+    )
+    .unwrap();
+    db.update(&ticket(prefix, "edited", 12), &ChangeAttribution::default())
         .unwrap();
-    // Written back to back, usually in the same millisecond, by another operation.
-    db.update(&ticket(prefix, "final", 11), "op-update")
-        .unwrap();
-    db.update(&ticket(prefix, "edited", 12), "").unwrap();
 
     let all = db.all(&id).unwrap();
     let titles = all
@@ -85,11 +107,35 @@ fn exercise(db: &dyn ChangeHarness, prefix: &str) {
         .map(|change| (change.new_value.as_str(), change.operation_id.as_str()))
         .collect::<Vec<_>>();
     assert_eq!(titles, vec![("edited", ""), ("final", "op-update")]);
+    let writers = all
+        .iter()
+        .filter(|change| change.field == "properties.title")
+        .map(|change| {
+            (
+                change.writer_kind.as_str(),
+                change.writer_ref.as_str(),
+                change.receipt_id.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // A row with no writer reads back empty (unattributed), never inferred.
+    assert_eq!(
+        writers,
+        vec![("", "", ""), ("transform_run", "run-1@7", "run-1")]
+    );
     let created = all
         .iter()
         .find(|change| change.field == "_created")
         .unwrap();
     assert_eq!(created.operation_id, "op-create");
+    assert_eq!(
+        (
+            created.writer_kind.as_str(),
+            created.writer_ref.as_str(),
+            created.receipt_id.as_str()
+        ),
+        ("action_instance", "instance-1", "op-create")
+    );
 
     // Visible history hides the reserved namespace field and pages like SQLite.
     let visible = db.visible(&id, 100, 0).unwrap();
@@ -101,7 +147,14 @@ fn exercise(db: &dyn ChangeHarness, prefix: &str) {
     assert_eq!(first[0].id, visible[0].id);
     assert_eq!(second[0].id, visible[1].id);
 
-    db.delete(&id).unwrap();
+    db.delete(&id, &ChangeAttribution::direct()).unwrap();
+    let deleted = db.all(&id).unwrap();
+    assert!(
+        deleted
+            .iter()
+            .any(|change| change.field == "_deleted" && change.writer_kind == "direct"),
+        "{deleted:?}"
+    );
     assert_eq!(db.kind(&id).unwrap().as_deref(), Some("ticket"));
     assert_eq!(db.namespace(&id).unwrap(), Some(format!("{prefix}-ns")));
     assert_eq!(db.kind("never-existed").unwrap(), None);

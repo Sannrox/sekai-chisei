@@ -218,6 +218,9 @@ pub struct AuthenticatedDevice {
     pub public_key: [u8; 32],
     /// The assertion's one-use nonce, which every device proof covers.
     pub assertion_nonce: String,
+    /// The issuer revoked the device: sync answers only with a wipe
+    /// instruction, and every other RPC refuses it (#1634).
+    pub wipe: bool,
 }
 
 impl AuthenticatedContext {

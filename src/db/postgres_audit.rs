@@ -1,7 +1,7 @@
 use crate::db::postgres::PostgresDb;
 use crate::domain::Object;
 use crate::sekai::audit::{
-    ObjectChange, object_diff_changes, object_diff_changes_with_snapshot, stamp_operation,
+    ChangeAttribution, ObjectChange, object_diff_changes, object_diff_changes_with_snapshot,
 };
 use crate::sekai::object_security::ObjectSecurityPolicy;
 use std::collections::BTreeSet;
@@ -19,81 +19,46 @@ impl PostgresDb {
         actor: &str,
         expected_policy_generation: Option<&str>,
     ) -> Result<(), String> {
-        validate_namespace_identity(object)?;
-        let properties = crate::domain::storage_properties_json(&object.properties)?;
-        let mut connection = self.connection()?;
-        let mut transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        lock_object_lifecycle(&mut transaction, &object.id)?;
-        require_postgres_policy_generation(
-            &mut transaction,
-            &object.namespace,
+        self.create_object_attributed(
+            object,
+            actor,
             expected_policy_generation,
-        )?;
-        let historical: i64 = transaction
-            .query_one(
-                "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = $1",
-                &[&object.id],
-            )
-            .map_err(|error| error.to_string())?
-            .get(0);
-        if historical > 0 {
-            return Err("object IDs with audit history cannot be reused".into());
-        }
-        transaction
-            .execute(
-                "INSERT INTO sekai_objects
-                    (id, kind, name, namespace, external_id, properties, created, updated)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[
-                    &object.id,
-                    &object.kind,
-                    &object.name,
-                    &object.namespace,
-                    &object.external_id,
-                    &properties,
-                    &object.created,
-                    &object.updated,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        insert_changes(
-            &mut transaction,
-            &object_diff_changes(
-                actor,
-                None,
-                Some(object),
-                chrono::Utc::now().timestamp_millis(),
-            ),
-        )?;
-        transaction.commit().map_err(|error| error.to_string())
+            &ChangeAttribution::default(),
+        )
     }
 
-    /// Creates `object` with change rows stamped with `operation_id`.
-    pub fn create_object_for_operation(
+    /// Creates `object` with change rows stamped with `attribution` (#1690).
+    pub fn create_object_attributed(
         &self,
         object: &Object,
         actor: &str,
-        operation_id: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
     ) -> Result<(), String> {
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        insert_created_object_in(&mut transaction, object, actor, None, operation_id)?;
+        insert_created_object_in(
+            &mut transaction,
+            object,
+            actor,
+            expected_policy_generation,
+            attribution,
+        )?;
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    /// Updates `object` with change rows stamped with `operation_id`, under
+    /// Updates `object` with change rows stamped with `attribution`, under
     /// the same revision check as `update_object_with_audit_if_revision`;
     /// with `expected`, only if the stored object still matches it.
-    pub fn update_object_for_operation(
+    pub fn update_object_attributed(
         &self,
         object: &Object,
         expected: Option<&Object>,
         actor: &str,
-        operation_id: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
     ) -> Result<Option<Object>, String> {
         // Same revision check as every other PostgreSQL object update.
         let Some(existing) = self.get_object(&object.id)? else {
@@ -108,9 +73,9 @@ impl PostgresDb {
             object,
             actor,
             existing.updated,
-            None,
+            expected_policy_generation,
             expected,
-            operation_id,
+            attribution,
         )
     }
 
@@ -128,7 +93,7 @@ impl PostgresDb {
             expected_updated,
             expected_policy_generation,
             expected,
-            "",
+            &ChangeAttribution::default(),
         )
     }
 
@@ -139,7 +104,7 @@ impl PostgresDb {
         expected_updated: i64,
         expected_policy_generation: Option<&str>,
         expected: Option<&Object>,
-        operation_id: &str,
+        attribution: &ChangeAttribution,
     ) -> Result<Option<Object>, String> {
         validate_namespace_identity(object)?;
         let properties = crate::domain::storage_properties_json(&object.properties)?;
@@ -210,15 +175,12 @@ impl PostgresDb {
         }
         insert_changes(
             &mut transaction,
-            &stamp_operation(
-                object_diff_changes(
-                    actor,
-                    Some(&before),
-                    Some(object),
-                    chrono::Utc::now().timestamp_millis(),
-                ),
-                operation_id,
-            ),
+            &attribution.stamp(object_diff_changes(
+                actor,
+                Some(&before),
+                Some(object),
+                chrono::Utc::now().timestamp_millis(),
+            )),
         )?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(Some(before))
@@ -255,6 +217,24 @@ impl PostgresDb {
         expected: Option<&Object>,
         actor: &str,
         expected_policy_generation: Option<&str>,
+    ) -> Result<Option<Object>, String> {
+        self.delete_object_attributed(
+            id,
+            expected,
+            actor,
+            expected_policy_generation,
+            &ChangeAttribution::default(),
+        )
+    }
+
+    /// Deletes with change rows stamped with `attribution` (#1690).
+    pub fn delete_object_attributed(
+        &self,
+        id: &str,
+        expected: Option<&Object>,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
     ) -> Result<Option<Object>, String> {
         let snapshot_keys = expected
             .map(|object| postgres_security_snapshot_property_keys(self, object))
@@ -312,13 +292,13 @@ impl PostgresDb {
         if let Some(before) = &before {
             insert_changes(
                 &mut transaction,
-                &object_diff_changes_with_snapshot(
+                &attribution.stamp(object_diff_changes_with_snapshot(
                     actor,
                     Some(before),
                     None,
                     chrono::Utc::now().timestamp_millis(),
                     &snapshot_keys,
-                ),
+                )),
             )?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
@@ -417,6 +397,7 @@ impl PostgresDb {
                                 changed_by: row.get(5),
                                 timestamp: row.get(6),
                                 operation_id: String::new(),
+                                ..Default::default()
                             },
                             row.get::<_, i64>(9).max(0) as u64,
                             row.get(7),
@@ -439,7 +420,8 @@ impl PostgresDb {
         self.connection()?
             .query(
                 "SELECT id, object_id, field, old_value, new_value, changed_by, timestamp,
-                        operation_id
+                        operation_id, coalesce(writer_kind, ''), coalesce(writer_ref, ''),
+                        coalesce(receipt_id, '')
                  FROM sekai_object_changes WHERE object_id = $1
                  ORDER BY timestamp DESC, audit_seq DESC LIMIT $2 OFFSET $3",
                 &[&object_id, &limit, &offset],
@@ -461,7 +443,8 @@ impl PostgresDb {
         self.connection()?
             .query(
                 "SELECT id, object_id, field, old_value, new_value, changed_by, timestamp,
-                        operation_id
+                        operation_id, coalesce(writer_kind, ''), coalesce(writer_ref, ''),
+                        coalesce(receipt_id, '')
                  FROM sekai_object_changes
                  WHERE object_id = $1 AND field <> '_namespace'
                    AND field NOT IN ('_security_snapshot', '_security_kind')
@@ -562,7 +545,7 @@ pub(crate) fn insert_created_object_in(
     object: &Object,
     actor: &str,
     expected_policy_generation: Option<&str>,
-    operation_id: &str,
+    attribution: &ChangeAttribution,
 ) -> Result<(), String> {
     validate_namespace_identity(object)?;
     let properties = crate::domain::storage_properties_json(&object.properties)?;
@@ -597,15 +580,12 @@ pub(crate) fn insert_created_object_in(
         .map_err(|error| error.to_string())?;
     insert_changes(
         transaction,
-        &stamp_operation(
-            object_diff_changes(
-                actor,
-                None,
-                Some(object),
-                chrono::Utc::now().timestamp_millis(),
-            ),
-            operation_id,
-        ),
+        &attribution.stamp(object_diff_changes(
+            actor,
+            None,
+            Some(object),
+            chrono::Utc::now().timestamp_millis(),
+        )),
     )
 }
 
@@ -616,7 +596,7 @@ pub(crate) fn update_object_in(
     expected: Option<&Object>,
     actor: &str,
     expected_policy_generation: Option<&str>,
-    operation_id: &str,
+    attribution: &ChangeAttribution,
 ) -> Result<Option<Object>, String> {
     validate_namespace_identity(object)?;
     let properties = crate::domain::storage_properties_json(&object.properties)?;
@@ -668,15 +648,12 @@ pub(crate) fn update_object_in(
         .map_err(|error| error.to_string())?;
     insert_changes(
         transaction,
-        &stamp_operation(
-            object_diff_changes(
-                actor,
-                Some(&before),
-                Some(object),
-                chrono::Utc::now().timestamp_millis(),
-            ),
-            operation_id,
-        ),
+        &attribution.stamp(object_diff_changes(
+            actor,
+            Some(&before),
+            Some(object),
+            chrono::Utc::now().timestamp_millis(),
+        )),
     )?;
     Ok(Some(before))
 }
@@ -712,8 +689,9 @@ pub(crate) fn insert_changes(
             .execute(
                 "INSERT INTO sekai_object_changes
                     (id, object_id, field, old_value, new_value, changed_by, timestamp,
-                     operation_id)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                     operation_id, writer_kind, writer_ref, receipt_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                         NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''))",
                 &[
                     &change.id,
                     &change.object_id,
@@ -723,6 +701,9 @@ pub(crate) fn insert_changes(
                     &change.changed_by,
                     &change.timestamp,
                     &change.operation_id,
+                    &change.writer_kind,
+                    &change.writer_ref,
+                    &change.receipt_id,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -755,6 +736,9 @@ fn row_to_change(row: postgres::Row) -> ObjectChange {
         changed_by: row.get(5),
         timestamp: row.get(6),
         operation_id: row.get(7),
+        writer_kind: row.get(8),
+        writer_ref: row.get(9),
+        receipt_id: row.get(10),
     }
 }
 

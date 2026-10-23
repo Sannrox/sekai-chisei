@@ -307,6 +307,14 @@ message ObjectChange {
   // Plane-stamped operation identity when the change was produced by a
   // governed action. Empty for mutations that have no bound operation.
   string operation_id = 8;
+  // Who wrote the change (#1690): source_transaction, transform_run,
+  // action_instance, direct, or unattributed when the row records none.
+  string writer_kind = 9;
+  // The source transaction, `run@checkpoint`, or Action instance.
+  string writer_ref = 10;
+  // The writer's durable receipt: source transaction, transform run, or the
+  // Action's operation receipt.
+  string receipt_id = 11;
 }
 
 // A versioned description of an existing native query or retrieval surface.
@@ -4090,6 +4098,9 @@ message ReadSyncSnapshotResponse {
   // Set on the last page when the scope has a maximum offline age: the
   // client must sync again before showing the data after this time.
   int64 offline_until_ms = 6;
+  // The device was revoked (#1634): delete every synced object and the
+  // cursor. No data comes with it.
+  bool wipe_required = 7;
 }
 
 message ReadSyncDeltasRequest {
@@ -4126,6 +4137,8 @@ message ReadSyncDeltasResponse {
   // Set only when this read leaves nothing pending (`more` false); until
   // then the previous deadline holds.
   int64 offline_until_ms = 8;
+  // As in the snapshot: the device was revoked; wipe, with no data.
+  bool wipe_required = 9;
 }
 
 message SyncPurge {

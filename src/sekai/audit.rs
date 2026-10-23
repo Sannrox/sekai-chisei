@@ -6,7 +6,10 @@ use crate::sekai::security::{Grant, Role};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeSet, HashMap};
 
-pub use sekai_types::object_change::ObjectChange;
+pub use sekai_types::object_change::{
+    ChangeAttribution, ObjectChange, WRITER_ACTION_INSTANCE, WRITER_DIRECT,
+    WRITER_SOURCE_TRANSACTION, WRITER_TRANSFORM_RUN, WRITER_UNATTRIBUTED,
+};
 
 pub(crate) fn validate_decision(decision: &Decision) -> Result<(), String> {
     if decision.id.trim().is_empty() {
@@ -116,15 +119,37 @@ pub(crate) fn object_diff_changes(
     object_diff_changes_with_snapshot(actor, before, after, timestamp, &Default::default())
 }
 
-/// Marks every change with the operation that produced it (#1689).
-pub(crate) fn stamp_operation(
-    mut changes: Vec<ObjectChange>,
-    operation_id: &str,
-) -> Vec<ObjectChange> {
-    for change in &mut changes {
-        change.operation_id = operation_id.to_string();
-    }
-    changes
+/// The change row for a transform stamping an output marking (#1690),
+/// attributed to the run at its checkpoint; `None` when the marking is
+/// unchanged. Stamps update the object directly, so this is their only
+/// history.
+pub(crate) fn transform_marking_change(
+    object_id: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+    run: &crate::sekai::governed_transform::TransformRun,
+    timestamp: i64,
+) -> Option<ObjectChange> {
+    let (before, after) = (before.unwrap_or_default(), after.unwrap_or_default());
+    (before != after).then(|| {
+        let mut change =
+            ChangeAttribution::transform(&run.run_id, &run.last_input_row_id.to_string()).stamp(
+                vec![ObjectChange {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    object_id: object_id.into(),
+                    field: format!(
+                        "properties.{}",
+                        crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY
+                    ),
+                    old_value: before.into(),
+                    new_value: after.into(),
+                    changed_by: format!("transform:{}", run.transform_id),
+                    timestamp,
+                    ..Default::default()
+                }],
+            );
+        change.remove(0)
+    })
 }
 
 pub(crate) fn object_diff_changes_with_snapshot(
@@ -146,6 +171,7 @@ pub(crate) fn object_diff_changes_with_snapshot(
             changed_by: actor.into(),
             timestamp,
             operation_id: String::new(),
+            ..Default::default()
         }),
         (Some(before), None) => {
             changes.push(ObjectChange {
@@ -157,6 +183,7 @@ pub(crate) fn object_diff_changes_with_snapshot(
                 changed_by: actor.into(),
                 timestamp,
                 operation_id: String::new(),
+                ..Default::default()
             });
             changes.push(ObjectChange {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -167,6 +194,7 @@ pub(crate) fn object_diff_changes_with_snapshot(
                 changed_by: actor.into(),
                 timestamp,
                 operation_id: String::new(),
+                ..Default::default()
             });
             if !snapshot_property_keys.is_empty() {
                 // Marker only: do not copy policy-driving values into audit.
@@ -180,6 +208,7 @@ pub(crate) fn object_diff_changes_with_snapshot(
                     changed_by: actor.into(),
                     timestamp,
                     operation_id: String::new(),
+                    ..Default::default()
                 });
             }
         }
@@ -267,6 +296,7 @@ fn push_if_changed(
         changed_by: actor.into(),
         timestamp,
         operation_id: String::new(),
+        ..Default::default()
     });
 }
 
@@ -517,6 +547,25 @@ impl SekaiDb {
                 [],
             )
             .map_err(|e| e.to_string())?;
+        }
+        // Writer attribution (#1690): nullable, so rows written before or by
+        // an older version read as unattributed.
+        for column in ["writer_kind", "writer_ref", "receipt_id"] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('sekai_object_changes')
+                     WHERE name = ?1",
+                    [column],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !present {
+                conn.execute(
+                    &format!("ALTER TABLE sekai_object_changes ADD COLUMN {column} TEXT"),
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+            }
         }
         let added_lifecycle_column = Self::add_decision_lifecycle_columns(&conn)?;
         conn.execute_batch(
@@ -969,17 +1018,23 @@ impl SekaiDb {
         actor: &str,
         expected_policy_generation: Option<&str>,
     ) -> Result<(), String> {
-        self.create_object_inner(object, actor, expected_policy_generation, "")
+        self.create_object_attributed(
+            object,
+            actor,
+            expected_policy_generation,
+            &ChangeAttribution::default(),
+        )
     }
 
-    /// Creates `object` with change rows stamped with `operation_id`.
-    pub fn create_object_for_operation(
+    /// Creates `object` with change rows stamped with `attribution` (#1690).
+    pub fn create_object_attributed(
         &self,
         object: &Object,
         actor: &str,
-        operation_id: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
     ) -> Result<(), String> {
-        self.create_object_inner(object, actor, None, operation_id)
+        self.create_object_inner(object, actor, expected_policy_generation, attribution)
     }
 
     fn create_object_inner(
@@ -987,7 +1042,7 @@ impl SekaiDb {
         object: &Object,
         actor: &str,
         expected_policy_generation: Option<&str>,
-        operation_id: &str,
+        attribution: &ChangeAttribution,
     ) -> Result<(), String> {
         if object.id.starts_with("namespace:") && object.kind != "namespace" {
             return Err("namespace:* object IDs are reserved for namespace boundaries".into());
@@ -999,7 +1054,7 @@ impl SekaiDb {
             object,
             actor,
             expected_policy_generation,
-            operation_id,
+            attribution,
             TransactionBehavior::Deferred,
         ) {
             Ok(()) => Ok(()),
@@ -1007,7 +1062,7 @@ impl SekaiDb {
                 object,
                 actor,
                 expected_policy_generation,
-                operation_id,
+                attribution,
                 TransactionBehavior::Immediate,
             ),
             Err(error) => Err(error),
@@ -1019,14 +1074,14 @@ impl SekaiDb {
         object: &Object,
         actor: &str,
         expected_policy_generation: Option<&str>,
-        operation_id: &str,
+        attribution: &ChangeAttribution,
         behavior: TransactionBehavior,
     ) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(behavior)
             .map_err(|e| e.to_string())?;
-        insert_created_object_in(&tx, object, actor, expected_policy_generation, operation_id)?;
+        insert_created_object_in(&tx, object, actor, expected_policy_generation, attribution)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -1046,19 +1101,32 @@ impl SekaiDb {
         actor: &str,
         expected_policy_generation: Option<&str>,
     ) -> Result<Option<Object>, String> {
-        self.update_object_inner(object, expected, actor, expected_policy_generation, "")
+        self.update_object_attributed(
+            object,
+            expected,
+            actor,
+            expected_policy_generation,
+            &ChangeAttribution::default(),
+        )
     }
 
-    /// Updates `object` with change rows stamped with `operation_id`; with
+    /// Updates `object` with change rows stamped with `attribution`; with
     /// `expected`, only if the stored object still matches it.
-    pub fn update_object_for_operation(
+    pub fn update_object_attributed(
         &self,
         object: &Object,
         expected: Option<&Object>,
         actor: &str,
-        operation_id: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
     ) -> Result<Option<Object>, String> {
-        self.update_object_inner(object, expected, actor, None, operation_id)
+        self.update_object_inner(
+            object,
+            expected,
+            actor,
+            expected_policy_generation,
+            attribution,
+        )
     }
 
     fn update_object_inner(
@@ -1067,7 +1135,7 @@ impl SekaiDb {
         expected: Option<&Object>,
         actor: &str,
         expected_policy_generation: Option<&str>,
-        operation_id: &str,
+        attribution: &ChangeAttribution,
     ) -> Result<Option<Object>, String> {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
             return Err("namespace:* external IDs are reserved for namespace boundaries".into());
@@ -1080,7 +1148,7 @@ impl SekaiDb {
             expected,
             actor,
             expected_policy_generation,
-            operation_id,
+            attribution,
         )?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(before)
@@ -1100,6 +1168,24 @@ impl SekaiDb {
         expected: Option<&Object>,
         actor: &str,
         expected_policy_generation: Option<&str>,
+    ) -> Result<Option<Object>, String> {
+        self.delete_object_attributed(
+            id,
+            expected,
+            actor,
+            expected_policy_generation,
+            &ChangeAttribution::default(),
+        )
+    }
+
+    /// Deletes with change rows stamped with `attribution` (#1690).
+    pub fn delete_object_attributed(
+        &self,
+        id: &str,
+        expected: Option<&Object>,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+        attribution: &ChangeAttribution,
     ) -> Result<Option<Object>, String> {
         let snapshot_keys = expected
             .map(|object| sqlite_security_snapshot_property_keys(self, object))
@@ -1149,7 +1235,13 @@ impl SekaiDb {
             let now = chrono::Utc::now().timestamp_millis();
             insert_object_changes(
                 &tx,
-                &object_diff_changes_with_snapshot(actor, Some(before), None, now, &snapshot_keys),
+                &attribution.stamp(object_diff_changes_with_snapshot(
+                    actor,
+                    Some(before),
+                    None,
+                    now,
+                    &snapshot_keys,
+                )),
             )?;
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -1164,7 +1256,7 @@ impl SekaiDb {
     ) -> Result<Vec<ObjectChange>, String> {
         let conn = self.conn();
         let effective_limit = if limit > 0 { limit } else { 100 };
-        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp,operation_id FROM sekai_object_changes WHERE object_id=?1 ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
+        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp,operation_id,coalesce(writer_kind,''),coalesce(writer_ref,''),coalesce(receipt_id,'') FROM sekai_object_changes WHERE object_id=?1 ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let mut results = Vec::new();
         let mut rows = stmt
@@ -1180,6 +1272,9 @@ impl SekaiDb {
                 changed_by: row.get(5).map_err(|e| e.to_string())?,
                 timestamp: row.get(6).map_err(|e| e.to_string())?,
                 operation_id: row.get(7).map_err(|e| e.to_string())?,
+                writer_kind: row.get(8).map_err(|e| e.to_string())?,
+                writer_ref: row.get(9).map_err(|e| e.to_string())?,
+                receipt_id: row.get(10).map_err(|e| e.to_string())?,
             });
         }
         Ok(results)
@@ -1193,7 +1288,7 @@ impl SekaiDb {
     ) -> Result<Vec<ObjectChange>, String> {
         let conn = self.conn();
         let effective_limit = if limit > 0 { limit } else { 100 };
-        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp,operation_id FROM sekai_object_changes WHERE object_id=?1 AND field <> '_namespace' AND field NOT IN ('_security_snapshot', '_security_kind') AND field NOT LIKE '_security_property.%' ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
+        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp,operation_id,coalesce(writer_kind,''),coalesce(writer_ref,''),coalesce(receipt_id,'') FROM sekai_object_changes WHERE object_id=?1 AND field <> '_namespace' AND field NOT IN ('_security_snapshot', '_security_kind') AND field NOT LIKE '_security_property.%' ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![object_id, effective_limit, offset], |row| {
@@ -1206,6 +1301,9 @@ impl SekaiDb {
                     changed_by: row.get(5)?,
                     timestamp: row.get(6)?,
                     operation_id: row.get(7)?,
+                    writer_kind: row.get(8)?,
+                    writer_ref: row.get(9)?,
+                    receipt_id: row.get(10)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1309,6 +1407,7 @@ impl SekaiDb {
                             changed_by: row.get(5)?,
                             timestamp: row.get(6)?,
                             operation_id: String::new(),
+                            ..Default::default()
                         },
                         row.get::<_, i64>(9)?.max(0) as u64,
                         row.get(7)?,
@@ -1416,7 +1515,7 @@ pub(crate) fn insert_object_changes(
     changes: &[ObjectChange],
 ) -> Result<(), String> {
     let mut stmt = conn
-        .prepare("INSERT INTO sekai_object_changes (id,object_id,field,old_value,new_value,changed_by,timestamp,operation_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")
+        .prepare("INSERT INTO sekai_object_changes (id,object_id,field,old_value,new_value,changed_by,timestamp,operation_id,writer_kind,writer_ref,receipt_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULLIF(?9,''),NULLIF(?10,''),NULLIF(?11,''))")
         .map_err(|e| e.to_string())?;
     for change in changes {
         stmt.execute(params![
@@ -1427,7 +1526,10 @@ pub(crate) fn insert_object_changes(
             change.new_value,
             change.changed_by,
             change.timestamp,
-            change.operation_id
+            change.operation_id,
+            change.writer_kind,
+            change.writer_ref,
+            change.receipt_id
         ])
         .map_err(|e| e.to_string())?;
     }
@@ -1440,7 +1542,7 @@ pub(crate) fn insert_created_object_in(
     object: &Object,
     actor: &str,
     expected_policy_generation: Option<&str>,
-    operation_id: &str,
+    attribution: &ChangeAttribution,
 ) -> Result<(), String> {
     require_sqlite_policy_generation(tx, &object.namespace, expected_policy_generation)?;
     let historical_changes: i64 = tx
@@ -1469,10 +1571,7 @@ pub(crate) fn insert_created_object_in(
     )
     .map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp_millis();
-    let changes = stamp_operation(
-        object_diff_changes(actor, None, Some(object), now),
-        operation_id,
-    );
+    let changes = attribution.stamp(object_diff_changes(actor, None, Some(object), now));
     insert_object_changes(tx, &changes)?;
     Ok(())
 }
@@ -1485,7 +1584,7 @@ pub(crate) fn update_object_in(
     expected: Option<&Object>,
     actor: &str,
     expected_policy_generation: Option<&str>,
-    operation_id: &str,
+    attribution: &ChangeAttribution,
 ) -> Result<Option<Object>, String> {
     let before = tx
         .query_row(
@@ -1525,10 +1624,12 @@ pub(crate) fn update_object_in(
     )
     .map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp_millis();
-    let changes = stamp_operation(
-        object_diff_changes(actor, Some(&before_object), Some(object), now),
-        operation_id,
-    );
+    let changes = attribution.stamp(object_diff_changes(
+        actor,
+        Some(&before_object),
+        Some(object),
+        now,
+    ));
     insert_object_changes(tx, &changes)?;
     Ok(Some(before_object))
 }
@@ -1861,6 +1962,7 @@ mod tests {
             changed_by: "user".into(),
             timestamp: 50,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.record_object_change(&ObjectChange {
@@ -1872,6 +1974,7 @@ mod tests {
             changed_by: "user".into(),
             timestamp: 150,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 
@@ -2036,6 +2139,7 @@ mod tests {
             changed_by: "alice".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
         db.record_object_change(&ObjectChange {
@@ -2047,6 +2151,7 @@ mod tests {
             changed_by: "alice".into(),
             timestamp: 2,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 

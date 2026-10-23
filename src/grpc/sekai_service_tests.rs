@@ -786,6 +786,7 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD,
                 device_key.verifying_key().as_bytes(),
             ),
+            wipe: false,
         }),
         ..claims("device-bound")
     };
@@ -808,6 +809,42 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
         "SubmitActionInstance",
     ));
     assert!(passed.is_ok(), "{:?}", passed.err());
+    // A revoked device's wipe assertion reaches only the sync reads.
+    let wipe = IdentityAssertion {
+        nonce: "device-wipe".into(),
+        device: bound_submit
+            .device
+            .clone()
+            .map(|device| crate::identity_assertion::DeviceClaim {
+                wipe: true,
+                ..device
+            }),
+        ..bound_submit.clone()
+    };
+    let refused = interceptor
+        .call(request(
+            &authority.sign(&wipe).unwrap(),
+            "SubmitActionInstance",
+        ))
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{refused:?}");
+    let wipe_sync = IdentityAssertion {
+        nonce: "device-wipe-sync".into(),
+        ..wipe.clone()
+    };
+    // The wipe gate passes it on. (Enterprise-scoped credentials do not
+    // reach sync at all yet; that exposure is a separate decision.)
+    let sync = interceptor.call(request(
+        &authority.sign(&wipe_sync).unwrap(),
+        "ReadSyncDeltas",
+    ));
+    assert!(
+        !sync
+            .as_ref()
+            .is_err_and(|status| status.message().contains("must wipe")),
+        "{:?}",
+        sync.err()
+    );
     let token = authority.sign(&claims("valid")).unwrap();
     let authenticated = interceptor
         .call(request(&token, "GetPublishedDefinitionRevision"))
@@ -7116,6 +7153,7 @@ async fn noop_update_does_not_record_audit_change() {
 
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].field, "_created");
+    assert_eq!(changes[0].writer_kind, "direct");
 }
 
 #[tokio::test]
@@ -8674,6 +8712,10 @@ async fn submit_action_instance_propagates_one_operation_identity() {
         .iter()
         .find(|change| !change.operation_id.is_empty())
         .expect("object-change event");
+    // The Action instance wrote it, under its operation receipt (#1690).
+    assert_eq!(object_change.writer_kind, "action_instance");
+    assert!(!object_change.writer_ref.is_empty());
+    assert_eq!(object_change.receipt_id, operation_id);
     crate::sekai::operation_correlation::OperationCarriers {
         span: span_operation_id(&logs, operation_id),
         receipt: receipt.operation_id,
@@ -10388,6 +10430,7 @@ async fn grant_and_audit_rpcs_round_trip() {
             changed_by: "tester".into(),
             timestamp: 11,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 
@@ -17226,6 +17269,7 @@ async fn delegated_service_intersects_acl_properties_and_marking_clearance() {
             changed_by: "service-a".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     for (actor, expected_value) in [(None, "private value"), (Some("human-a"), REDACTED_VALUE)] {
@@ -18908,6 +18952,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18920,6 +18965,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 2,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18932,6 +18978,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 3,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 
@@ -18987,6 +19034,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 4,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18999,6 +19047,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 5,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let after_raise = svc
@@ -19020,6 +19069,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 6,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19032,6 +19082,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 6,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19044,6 +19095,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             changed_by: "owner".into(),
             timestamp: 6,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let same_ms = svc
@@ -19105,6 +19157,7 @@ async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
             changed_by: "owner".into(),
             timestamp: 1,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19117,6 +19170,7 @@ async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
             changed_by: "owner".into(),
             timestamp: 2,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let mut req = with_named_principal(
@@ -19162,6 +19216,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             changed_by: "owner".into(),
             timestamp: 3,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let marking = format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY);
@@ -19175,6 +19230,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             changed_by: "owner".into(),
             timestamp: 4,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19187,6 +19243,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             changed_by: "owner".into(),
             timestamp: 5,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let mut req = with_named_principal(
@@ -19228,6 +19285,7 @@ async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
         changed_by: "owner".into(),
         timestamp,
         operation_id: String::new(),
+        ..Default::default()
     };
     runtime
         .record_object_change(&marking("ms-downgrade", "confidential", "internal", 1))
@@ -19245,6 +19303,7 @@ async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
             changed_by: "owner".into(),
             timestamp: 2,
             operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -26971,4 +27030,221 @@ async fn change_bundle_dry_run_backfills_a_branch_and_leaves_the_dataset() {
         .await
         .unwrap_err();
     assert_eq!(merge.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn changes_without_a_recorded_writer_read_as_unattributed() {
+    let svc = service();
+    // A row written before writer attribution, or by an internal writer
+    // that records none, is never given an inferred writer (#1690).
+    svc.db
+        .runtime()
+        .create_object_with_audit(
+            &domain::Object {
+                id: "legacy-change".into(),
+                kind: "ticket".into(),
+                name: "legacy".into(),
+                namespace: "ns".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+            "migration",
+        )
+        .unwrap();
+    let changes = svc
+        .list_object_changes(with_principal(ListObjectChangesRequest {
+            object_id: "legacy-change".into(),
+            limit: 10,
+            offset: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert!(!changes.is_empty());
+    assert!(
+        changes
+            .iter()
+            .all(|change| change.writer_kind == "unattributed"
+                && change.writer_ref.is_empty()
+                && change.receipt_id.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn sync_needs_the_device_proof_and_a_revoked_device_gets_only_wipe() {
+    // #1634: a device-bound credential syncs only with its device's proof
+    // over each request, and a revoked device's wipe assertion gets a wipe
+    // instruction and no data.
+    use crate::sekai::sync_scope::SYNC_CONTRACT;
+    use base64::Engine as _;
+    use ed25519_dalek::Signer as _;
+    let svc = service();
+    grant_source_namespace(&svc, "field", "alice", security::Role::Admin);
+    svc.db
+        .runtime()
+        .create_object_with_audit(
+            &domain::Object {
+                id: "wo-1".into(),
+                kind: "WorkOrder".into(),
+                name: "wo-1".into(),
+                namespace: "field".into(),
+                external_id: String::new(),
+                properties: HashMap::from([("site".to_string(), "north".to_string())]),
+                created: 0,
+                updated: 0,
+            },
+            "alice",
+        )
+        .unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let context = |nonce: &str, wipe: bool| {
+        let mut context = crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "alice".into(),
+                credential_id: "device:7".into(),
+            },
+        );
+        context.device = Some(crate::enterprise::AuthenticatedDevice {
+            id: "device-7".into(),
+            public_key: key.verifying_key().to_bytes(),
+            assertion_nonce: nonce.into(),
+            wipe,
+        });
+        context
+    };
+    // A request from the device, with its proof when `signer` is given.
+    fn from_device<T: prost::Message>(
+        message: T,
+        method: &str,
+        context: crate::enterprise::AuthenticatedContext,
+        signer: Option<&ed25519_dalek::SigningKey>,
+    ) -> Request<T> {
+        let digest = crate::identity_assertion::request_digest(
+            &format!("/sekai.SekaiService/{method}"),
+            &message.encode_to_vec(),
+        );
+        let nonce = context.device.as_ref().unwrap().assertion_nonce.clone();
+        let mut request = with_named_principal(message, "alice");
+        if let Some(signer) = signer {
+            let proof = signer.sign(&crate::identity_assertion::device_proof_input(
+                &nonce, &digest,
+            ));
+            request.metadata_mut().insert(
+                "x-sekai-device-proof",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(proof.to_bytes())
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        request.extensions_mut().insert(context);
+        request
+    }
+    let put = PutSyncScopeRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        kind: "WorkOrder".into(),
+        property_filters: vec![],
+        link: None,
+        max_objects: 10,
+        max_offline_age_ms: 0,
+    };
+    svc.put_sync_scope(from_device(
+        put.clone(),
+        "PutSyncScope",
+        context("n-0", false),
+        Some(&key),
+    ))
+    .await
+    .unwrap();
+    let snapshot = ReadSyncSnapshotRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        page_token: String::new(),
+        limit: 0,
+    };
+
+    // A copied token without the device key is refused.
+    let copied = svc
+        .read_sync_snapshot(from_device(
+            snapshot.clone(),
+            "ReadSyncSnapshot",
+            context("n-1", false),
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(copied.code(), tonic::Code::Unauthenticated, "{copied:?}");
+    let stolen = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+    let forged = svc
+        .read_sync_snapshot(from_device(
+            snapshot.clone(),
+            "ReadSyncSnapshot",
+            context("n-2", false),
+            Some(&stolen),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(forged.code(), tonic::Code::Unauthenticated);
+    // The device itself syncs.
+    let synced = svc
+        .read_sync_snapshot(from_device(
+            snapshot.clone(),
+            "ReadSyncSnapshot",
+            context("n-3", false),
+            Some(&key),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(synced.objects.len(), 1);
+    assert!(!synced.wipe_required);
+
+    // Revoked: the wipe assertion gets the instruction and no data, on the
+    // snapshot and on deltas, and cannot change its scope.
+    let wiped = svc
+        .read_sync_snapshot(from_device(
+            snapshot,
+            "ReadSyncSnapshot",
+            context("n-4", true),
+            Some(&key),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(wiped.wipe_required);
+    assert!(wiped.objects.is_empty() && wiped.cursor.is_empty());
+    let wiped_deltas = svc
+        .read_sync_deltas(from_device(
+            ReadSyncDeltasRequest {
+                contract_version: SYNC_CONTRACT.into(),
+                namespace: "field".into(),
+                scope_id: "north".into(),
+                cursor: synced.cursor.clone(),
+                limit: 0,
+            },
+            "ReadSyncDeltas",
+            context("n-5", true),
+            Some(&key),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(wiped_deltas.wipe_required);
+    assert!(wiped_deltas.upserts.is_empty() && wiped_deltas.cursor.is_empty());
+    let refused = svc
+        .put_sync_scope(from_device(
+            put,
+            "PutSyncScope",
+            context("n-6", true),
+            Some(&key),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 }

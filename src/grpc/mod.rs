@@ -187,6 +187,17 @@ pub(crate) const DEVICE_PROOF_HEADER: &str = "x-sekai-device-proof";
 const DEVICE_PROOF_RPCS: &[&str] = &[
     // Offline governed Actions (#1580).
     "sekai.SekaiService/SubmitActionInstance",
+    // Offline sync (#1634).
+    "sekai.SekaiService/PutSyncScope",
+    "sekai.SekaiService/ReadSyncSnapshot",
+    "sekai.SekaiService/ReadSyncDeltas",
+];
+
+/// RPCs a device the issuer revoked may still call: the sync reads, which
+/// answer it only with a wipe instruction (#1634).
+const DEVICE_WIPE_RPCS: &[&str] = &[
+    "sekai.SekaiService/ReadSyncSnapshot",
+    "sekai.SekaiService/ReadSyncDeltas",
 ];
 
 /// Whether `rpc` (`Service/Method`) checks device proofs.
@@ -631,6 +642,17 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                             reject_unauthorized();
                             return Err(Status::unauthenticated(
                                 "device-bound assertions are accepted only by RPCs that check device proofs",
+                            ));
+                        }
+                        if authenticated_context
+                            .device
+                            .as_ref()
+                            .is_some_and(|device| device.wipe)
+                            && !DEVICE_WIPE_RPCS.contains(&rpc.as_str())
+                        {
+                            reject_unauthorized();
+                            return Err(Status::permission_denied(
+                                "the device was revoked and must wipe",
                             ));
                         }
                     }
@@ -2863,6 +2885,7 @@ mod device_proof_tests {
             id: "device-7".into(),
             public_key: key.verifying_key().to_bytes(),
             assertion_nonce: "nonce-1".into(),
+            wipe: false,
         });
         let mut request = tonic::Request::new(sekai_proto::sekai::GetObjectRequest {
             id: "object-1".into(),
