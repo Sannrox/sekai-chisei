@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Catalog entry owners and stewards curate `description`, `tags` and
+  `owners` through a governed Action on `catalog_entry`, with the Action's
+  receipt; the marking only rises, and later registrations keep curated
+  fields (docs/catalog.md, ADR 0122 amended, #1686).
+
 - Experimental `GenerateDefinitionChangeBundle` returns a read-only
   definition change bundle for a candidate revision: the diff, a migration
   plan from declared renames, defaults and type changes, a declarative

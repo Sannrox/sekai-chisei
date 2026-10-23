@@ -39,7 +39,13 @@ catalog must not become a second metadata store with its own policy.
    security policy, policy-driving properties), and a write freeze stops it.
 3. **Only registration writes entries.** Generic object create, update and
    delete, and Action-written mutations, refuse the kind. Curation by owners
-   (#1686) will be a governed Action, not a generic write.
+   (#1686) is a governed Action, not a generic write.
+
+   Amended by #1686: an Action type may update a catalog entry, and only
+   its `description`, `tags`, `owners` and `access_marking`, when the
+   submitter is an owner or the steward. The marking only rises. Curated
+   fields are listed in `curated`, and registration keeps their curated
+   values.
 4. **Markings only rise.** A registration keeps the least marking that
    dominates both the stored and the requested one, under the namespace's
    classification lattice when it has one; markings with no common bound

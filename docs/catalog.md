@@ -36,6 +36,27 @@ Generic object writes refuse the kind, and `source_system: sekai.ontology`
 is reserved. Object security activation does not require a `catalog_entry`
 policy; in an activated namespace without one, entries are unreadable.
 
+## Curation
+
+Owners and the steward curate an entry's `description`, `tags` and `owners`
+through a governed Action (#1686): an Action type with `object_kind:
+catalog_entry` and `object_mutation: update`, whose parameters are the
+entry's `object_id` and the fields to set (`tags` and `owners` as
+comma-separated lists). The Action is admitted, receipted and audited like
+any other; the write is an object update carrying the Action's operation id.
+
+- Only a principal listed in `owners`, or the `steward`, may curate; anyone
+  else is refused. The submitter must still pass the Action type's submit
+  policy.
+- Only those fields and `access_marking` change; names, source identity and
+  status stay with registration. An entry always keeps an owner.
+- The marking only rises. A curation that would lower it is refused;
+  lowering is the audited declassify path.
+- A curated field stays curated: the entry lists it in `curated`, and later
+  registrations keep the curated value instead of the source's.
+- Search follows the edit once the index catches up, under the same read
+  policy.
+
 ## Object types
 
 Object types register themselves: every 60 seconds on each Sekai instance,
@@ -44,5 +65,5 @@ object type, with its `access_marking` and property names, and deprecates
 entries for object types no longer published. Namespaces under a write
 freeze catch up after it lifts.
 
-Not yet covered: lineage on entries (#1685), owner curation (#1686), and
-service, release and environment entries (#1688).
+Not yet covered: lineage on entries (#1685), and service, release and
+environment entries (#1688).
