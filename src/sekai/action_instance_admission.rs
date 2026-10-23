@@ -600,6 +600,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &type_def,
                 &stored.namespace,
                 &stored.parameters_json,
+                Some(&stored.principal),
                 Some(&stored.marking),
                 now,
             ) {
@@ -957,6 +958,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             &type_def,
             &instance.namespace,
             &instance.parameters_json,
+            Some(&instance.principal),
             Some(&instance.marking),
             now,
         )

@@ -26233,3 +26233,179 @@ async fn sync_scope_snapshot_and_deltas_follow_read_policy_links_and_quota() {
         .into_inner();
     assert!(lost.resnapshot_required);
 }
+
+#[tokio::test]
+async fn catalog_owners_curate_through_actions_and_markings_only_rise() {
+    let svc = service();
+    for principal in ["tester", "alice", "bob", "carol"] {
+        let (_, grants) = svc
+            .db
+            .runtime()
+            .ensure_team_namespace("warehouse", principal, security::Role::Admin, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        let grant = security::Grant {
+            id: format!("action-admin-{principal}"),
+            object_id: "action".into(),
+            principal: principal.into(),
+            role: security::Role::Admin,
+            created: 0,
+            ..Default::default()
+        };
+        svc.db.runtime().create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+    }
+    // Owner and steward are cleared to the marking they curate.
+    for principal in ["alice", "bob"] {
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: format!("principal-{principal}-curate"),
+                kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: principal.into(),
+                namespace: "warehouse".into(),
+                external_id: markings::principal_profile_external_id(principal),
+                properties: HashMap::from([
+                    (
+                        markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                        "confidential".into(),
+                    ),
+                    (
+                        markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                        "true".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        grant_object_role(
+            &svc,
+            &format!("principal-{principal}-curate"),
+            "root",
+            security::Role::Admin,
+        );
+    }
+    let mut registration = catalog_request("tbl-curate");
+    let entry_id = svc
+        .register_catalog_entry(with_named_principal(registration.clone(), "tester"))
+        .await
+        .unwrap()
+        .into_inner()
+        .entry
+        .unwrap()
+        .id;
+    svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            namespace: "warehouse".into(),
+            type_id: "catalog.curate".into(),
+            version: "1".into(),
+            description: "Curate a catalog entry".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"description":{"type":"string"},"tags":{"type":"string"},"owners":{"type":"string"},"access_marking":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            enabled: true,
+            object_kind: crate::sekai::catalog::CATALOG_ENTRY_KIND.into(),
+            object_mutation: "update".into(),
+            ..Default::default()
+        }),
+        request_id: "put-curate".into(),
+    }))
+    .await
+    .unwrap();
+    let submit = |principal: &str, key: &str, parameters: serde_json::Value| {
+        let mut parameters = parameters;
+        parameters["object_id"] = serde_json::json!(entry_id.clone());
+        svc.submit_action_instance(with_named_principal(
+            SubmitActionInstanceRequest {
+                namespace: "warehouse".into(),
+                type_id: "catalog.curate".into(),
+                version: "1".into(),
+                parameters_json: parameters.to_string(),
+                idempotency_key: key.into(),
+                evidence_submission_ids: Vec::new(),
+                request_id: format!("req-{key}"),
+                ontology_digest: String::new(),
+            },
+            principal,
+        ))
+    };
+    let entry = || svc.db.runtime().get_object(&entry_id).unwrap().unwrap();
+
+    // A non-owner, non-steward edit fails closed and changes nothing.
+    let refused = submit("carol", "carol-1", serde_json::json!({"tags": "spam"})).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(entry().properties["tags"], "finance");
+
+    // An owner edit is an admitted Action with a receipt.
+    let curated = submit(
+        "alice",
+        "alice-1",
+        serde_json::json!({"description": "curated orders", "tags": "finance,ledger"}),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .instance
+    .unwrap();
+    assert_eq!(
+        curated.status,
+        crate::sekai::action_instance::STATUS_ADMITTED
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_operation_receipt(&curated.operation_id)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(entry().properties["description"], "curated orders");
+    assert_eq!(entry().properties["tags"], "finance,ledger");
+
+    // The source registering again keeps the curated fields.
+    registration.description = "daily orders v2".into();
+    svc.register_catalog_entry(with_named_principal(registration, "tester"))
+        .await
+        .unwrap();
+    assert_eq!(entry().properties["description"], "curated orders");
+    assert_eq!(entry().properties["tags"], "finance,ledger");
+
+    // Search sees the edit once the index catches up.
+    let hits = svc
+        .search(with_named_principal(
+            SearchRequest {
+                namespace: "warehouse".into(),
+                text: "ledger".into(),
+                kinds: vec![crate::sekai::catalog::CATALOG_ENTRY_KIND.into()],
+                property_filters: Vec::new(),
+                facets: Vec::new(),
+                page_token: String::new(),
+                page_size: 10,
+                source: "object".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert!(hits.iter().any(|hit| hit.id == entry_id), "{hits:?}");
+    // The marking only rises, by an owner or the steward.
+    submit(
+        "alice",
+        "alice-2",
+        serde_json::json!({"access_marking": "internal"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(entry().properties["access_marking"], "internal");
+    let lowered = submit(
+        "bob",
+        "bob-1",
+        serde_json::json!({"access_marking": "public"}),
+    )
+    .await;
+    assert!(lowered.is_err(), "{lowered:?}");
+    assert_eq!(entry().properties["access_marking"], "internal");
+}

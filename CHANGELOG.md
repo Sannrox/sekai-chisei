@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Catalog entry owners and stewards curate `description`, `tags` and
+  `owners` through a governed Action on `catalog_entry`, with the Action's
+  receipt; the marking only rises, and later registrations keep curated
+  fields (docs/catalog.md, ADR 0122 amended, #1686).
+
 - A device-bound identity assertion is refused by every RPC that does not
   check device proofs; none does until sync adds its RPCs (ADR 0126).
 
