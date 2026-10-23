@@ -1275,6 +1275,76 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "BeginMediaUpload",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "UploadMediaChunk",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "CompleteMediaUpload",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetMediaUpload",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReadMedia",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExpandNeighborhood",
       "kind": "persistent",
       "surfaces": [

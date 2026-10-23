@@ -144,3 +144,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0120: Transform replays run on a fresh branch over pinned versions](0120-transform-replays.md)
 - [ADR 0121: Bind Ezu geofence events to governed Actions](0121-fence-event-bindings.md)
 - [ADR 0122: Catalog entries are governed objects, registered by stable source id](0122-governed-catalog-entries.md)
+- [ADR 0123: Media uploads become governed objects](0123-governed-media-uploads.md)

@@ -46,6 +46,7 @@ const RESERVED_OBJECT_KINDS: &[&str] = &[
     crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
     crate::sekai::object_comment::OBJECT_COMMENT_KIND,
     crate::sekai::catalog::CATALOG_ENTRY_KIND,
+    crate::sekai::media_upload::MEDIA_KIND,
 ];
 
 #[derive(Debug, Clone)]

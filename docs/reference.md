@@ -131,6 +131,8 @@ lives in the separate [research index](research/README.md).
 - [Data catalog](catalog.md) — experimental `RegisterCatalogEntry`.
 - [Ontology changelog](ontology-changelog.md) — experimental
   `GetOntologyChangelog` for a reader and a window of at most 31 days.
+- [Media uploads](media-uploads.md) — experimental `BeginMediaUpload`,
+  `UploadMediaChunk`, `CompleteMediaUpload`, `GetMediaUpload` and `ReadMedia`.
 - [Object comments](object-comments.md) — experimental
   `CreateObjectComment`, `UpdateObjectComment`, `ListObjectComments` and
   `ListCommentMentions` under the target's read policy.

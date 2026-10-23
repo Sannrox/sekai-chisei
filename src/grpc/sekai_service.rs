@@ -20,6 +20,8 @@ mod definition_consumer_impact;
 mod fence_binding;
 #[path = "graph_explore_rpc.rs"]
 mod graph_explore_rpc;
+#[path = "media_upload_rpc.rs"]
+mod media_upload_rpc;
 #[path = "object_change_subscription.rs"]
 mod object_change_subscription;
 #[path = "object_comment_rpc.rs"]
@@ -430,6 +432,7 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     governed_fact_domain::WAIVER_KIND,
     crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
     crate::sekai::object_comment::OBJECT_COMMENT_KIND,
+    crate::sekai::media_upload::MEDIA_KIND,
 ];
 
 const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
@@ -856,6 +859,41 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ScoreObjectTrustRequest>,
     ) -> Result<Response<ScoreObjectTrustResponse>, Status> {
         trust_score_rpc::score_object_trust(self, req).await
+    }
+
+    async fn begin_media_upload(
+        &self,
+        req: Request<BeginMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        media_upload_rpc::begin_media_upload(self, req).await
+    }
+
+    async fn upload_media_chunk(
+        &self,
+        req: Request<UploadMediaChunkRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        media_upload_rpc::upload_media_chunk(self, req).await
+    }
+
+    async fn complete_media_upload(
+        &self,
+        req: Request<CompleteMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        media_upload_rpc::complete_media_upload(self, req).await
+    }
+
+    async fn get_media_upload(
+        &self,
+        req: Request<GetMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        media_upload_rpc::get_media_upload(self, req).await
+    }
+
+    async fn read_media(
+        &self,
+        req: Request<ReadMediaRequest>,
+    ) -> Result<Response<ReadMediaResponse>, Status> {
+        media_upload_rpc::read_media(self, req).await
     }
 
     async fn create_object_comment(

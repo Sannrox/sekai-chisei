@@ -8,6 +8,13 @@
   RPCs, so a composing platform can promote and roll back definitions with
   the caller's authority (#1700).
 
+- Experimental governed media uploads: `BeginMediaUpload`,
+  `UploadMediaChunk` and `CompleteMediaUpload` take a file in resumable
+  chunks, check its SHA-256, and return a `sekai-media:` reference to a
+  `media_attachment` object carrying the upload's marking. `ReadMedia`
+  reads it under the object read checks, and the same idempotency key
+  returns the same reference (ADR 0123, #1623).
+
 - Experimental fence bindings (ADR 0121): `PutFenceBinding` binds Ezu
   geofence events (enter, exit, inside, dwell) for one collection to a
   pinned governed Action type run as a service principal, and
