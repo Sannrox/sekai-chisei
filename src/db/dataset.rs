@@ -89,6 +89,19 @@ pub trait DatasetBackend: Send + Sync {
         rows: &[HashMap<String, String>],
         replace: bool,
     ) -> Result<i64, String>;
+    fn fill_dataset_branch_from_base(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        incarnation: &str,
+        compute: &crate::sekai::dataset_branch::BranchCompute<'_>,
+    ) -> Result<
+        (
+            crate::sekai::dataset_branch::BranchRows,
+            crate::sekai::dataset_branch::BranchRows,
+        ),
+        String,
+    >;
     fn compare_dataset_branch(
         &self,
         dataset_id: &str,
@@ -159,6 +172,21 @@ impl DatasetBackend for SekaiDb {
     sqlite_forward!(list_dataset_branches(dataset_id: &str) -> Result<Vec<DatasetBranch>, String>);
     sqlite_forward!(dataset_branch_rows(dataset_id: &str, name: &str) -> Result<Vec<HashMap<String, String>>, String>);
     sqlite_forward!(write_dataset_branch_rows(dataset_id: &str, name: &str, rows: &[HashMap<String, String>], replace: bool) -> Result<i64, String>);
+    fn fill_dataset_branch_from_base(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        incarnation: &str,
+        compute: &crate::sekai::dataset_branch::BranchCompute<'_>,
+    ) -> Result<
+        (
+            crate::sekai::dataset_branch::BranchRows,
+            crate::sekai::dataset_branch::BranchRows,
+        ),
+        String,
+    > {
+        SekaiDb::fill_dataset_branch_from_base(self, dataset_id, name, incarnation, compute)
+    }
     sqlite_forward!(compare_dataset_branch(dataset_id: &str, name: &str, tenant: &str) -> Result<DatasetBranchDiff, String>);
     sqlite_forward!(delete_dataset_branch(dataset_id: &str, name: &str, tenant: &str) -> Result<(), String>);
     sqlite_forward!(propose_dataset_branch(request: &ProposeDatasetBranch) -> Result<DatasetBranchProposal, String>);
@@ -293,6 +321,21 @@ impl DatasetBackend for PostgresDb {
         replace: bool,
     ) -> Result<i64, String> {
         PostgresDb::write_dataset_branch_rows(self, dataset_id, name, rows, replace)
+    }
+    fn fill_dataset_branch_from_base(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        incarnation: &str,
+        compute: &crate::sekai::dataset_branch::BranchCompute<'_>,
+    ) -> Result<
+        (
+            crate::sekai::dataset_branch::BranchRows,
+            crate::sekai::dataset_branch::BranchRows,
+        ),
+        String,
+    > {
+        PostgresDb::fill_dataset_branch_from_base(self, dataset_id, name, incarnation, compute)
     }
     fn compare_dataset_branch(
         &self,
