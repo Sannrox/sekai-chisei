@@ -172,6 +172,11 @@ impl SekaiServiceImpl {
                 "reserved governance kind; use the dedicated action RPCs",
             ));
         }
+        if domain_object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
+            return Err(Status::permission_denied(
+                "catalog entries change only through RegisterCatalogEntry",
+            ));
+        }
         let mut domain_object = domain_object;
         if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
             require_credential_admin(&principals)?;
@@ -436,6 +441,10 @@ impl SekaiServiceImpl {
             || existing
                 .as_ref()
                 .is_some_and(|existing| is_reserved_governance_kind(&existing.kind))
+            || domain_object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND
+            || existing
+                .as_ref()
+                .is_some_and(|existing| existing.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND)
         {
             return Err(Status::permission_denied(
                 "reserved governance kind; use the dedicated action RPCs",
@@ -686,7 +695,9 @@ impl SekaiServiceImpl {
                     ));
                 }
             }
-            if is_reserved_governance_kind(&existing.kind) {
+            if is_reserved_governance_kind(&existing.kind)
+                || existing.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND
+            {
                 return Err(Status::permission_denied(
                     "object cannot be deleted through the guarded object API",
                 ));
