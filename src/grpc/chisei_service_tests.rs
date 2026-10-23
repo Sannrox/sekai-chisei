@@ -12702,6 +12702,7 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
                         concurrency: 4,
                         budget_micros: 1_000,
                         max_case_cost_micros: 10,
+                        artifact_digest: String::new(),
                     })
                 };
                 let first = svc
@@ -12734,6 +12735,65 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
                     .await
                     .unwrap_err();
                 assert_eq!(missing.code(), tonic::Code::NotFound);
+
+                // A second run of the same version compares with the first
+                // (#1677): the deterministic evaluator answers the same, so
+                // nothing regresses, and both runs are in the trend.
+                svc.run_eval_dataset(Request::new(RunEvalDatasetRequest {
+                    run_id: "release-3".into(),
+                    ..request("deterministic").into_inner()
+                }))
+                .await
+                .unwrap();
+                let compared = svc
+                    .compare_eval_dataset_runs(Request::new(CompareEvalDatasetRunsRequest {
+                        namespace: "acme".into(),
+                        baseline_run_id: "release-1".into(),
+                        candidate_run_id: "release-3".into(),
+                        alpha: 0.0,
+                        allow_policy_increase: false,
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(compared.verdict, "pass", "{compared:?}");
+                assert_eq!(compared.cases as usize, version.cases.len());
+                assert_eq!(compared.regressions, 0);
+                assert_eq!(compared.alpha, 0.05);
+                let unknown = svc
+                    .compare_eval_dataset_runs(Request::new(CompareEvalDatasetRunsRequest {
+                        namespace: "acme".into(),
+                        baseline_run_id: "release-1".into(),
+                        candidate_run_id: "release-9".into(),
+                        alpha: 0.0,
+                        allow_policy_increase: false,
+                    }))
+                    .await
+                    .unwrap_err();
+                assert_eq!(unknown.code(), tonic::Code::NotFound);
+                let trend = svc
+                    .list_eval_dataset_run_trend(Request::new(ListEvalDatasetRunTrendRequest {
+                        namespace: "acme".into(),
+                        dataset: "demo-shipments".into(),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let runs: Vec<_> = trend.runs.iter().map(|run| run.run_id.as_str()).collect();
+                assert_eq!(runs, ["release-1", "release-3"]);
+                // A deterministic evaluator never runs the model, so its run
+                // cannot be bound to a release artifact.
+                let refused = svc
+                    .run_eval_dataset(Request::new(RunEvalDatasetRequest {
+                        run_id: "release-4".into(),
+                        artifact_digest: format!("sha256:{}", "ab".repeat(32)),
+                        ..request("deterministic").into_inner()
+                    }))
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+                assert_eq!(trend.runs[0].cases_recorded as usize, version.cases.len());
+                assert_eq!(trend.runs[0].policy.len(), 4);
             })
         },
     );

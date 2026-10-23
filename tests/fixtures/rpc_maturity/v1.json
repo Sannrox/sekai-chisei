@@ -2050,6 +2050,24 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "CompareEvalDatasetRuns",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ListEvalDatasetRunTrend",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "CancelEvaluationExecution",
       "storage_path": "chisei.evaluation",
       "real_backend": "yes",

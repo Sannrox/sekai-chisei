@@ -122,6 +122,32 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "CompareEvalDatasetRuns",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/chisei_store/eval_run.rs",
+        "src/chisei/eval_compare.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListEvalDatasetRunTrend",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/chisei_store/eval_run.rs",
+        "src/chisei/eval_compare.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExecutePlanStream",
       "kind": "persistent",
       "surfaces": [

@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS chisei_dataset_runs (
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (namespace, run_id)
 );
+CREATE TABLE IF NOT EXISTS chisei_dataset_run_artifacts (
+    namespace TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL,
+    PRIMARY KEY (namespace, run_id)
+);
 CREATE TABLE IF NOT EXISTS chisei_dataset_run_cases (
     namespace TEXT NOT NULL,
     run_id TEXT NOT NULL,
@@ -251,6 +257,96 @@ impl SekaiDb {
         rows.map(|row| result_from(&row.map_err(|error| error.to_string())?))
             .collect()
     }
+
+    /// Records the run bound to the released artifact it evaluates, in one
+    /// transaction: a new run is created with its binding, and an existing
+    /// run keeps whatever binding it was created with (none, if it was
+    /// started without one). Returns the stored spec and binding (#1677).
+    /// The binding is kept apart from the spec so readers of the spec format
+    /// are unchanged.
+    pub fn put_bound_dataset_run(
+        &self,
+        spec: &EvalRunSpec,
+        artifact_digest: &str,
+        now_ms: i64,
+    ) -> Result<(EvalRunSpec, Option<String>), String> {
+        use rusqlite::OptionalExtension;
+        let json = serde_json::to_string(spec).map_err(|error| error.to_string())?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let created = tx
+            .execute(
+                "INSERT INTO chisei_dataset_runs (namespace, run_id, spec_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+                rusqlite::params![spec.namespace, spec.run_id, json, now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        if created == 1 {
+            tx.execute(
+                "INSERT INTO chisei_dataset_run_artifacts (namespace, run_id, artifact_digest)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![spec.namespace, spec.run_id, artifact_digest],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let stored: String = tx
+            .query_row(
+                "SELECT spec_json FROM chisei_dataset_runs WHERE namespace = ?1 AND run_id = ?2",
+                rusqlite::params![spec.namespace, spec.run_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let bound: Option<String> = tx
+            .query_row(
+                "SELECT artifact_digest FROM chisei_dataset_run_artifacts
+                 WHERE namespace = ?1 AND run_id = ?2",
+                rusqlite::params![spec.namespace, spec.run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((spec_from(&stored)?, bound))
+    }
+
+    pub fn dataset_run_artifact(
+        &self,
+        namespace: &str,
+        run_id: &str,
+    ) -> Result<Option<String>, String> {
+        use rusqlite::OptionalExtension;
+        self.conn()
+            .query_row(
+                "SELECT artifact_digest FROM chisei_dataset_run_artifacts
+                 WHERE namespace = ?1 AND run_id = ?2",
+                rusqlite::params![namespace, run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Every run of `namespace` with when it was first started, oldest
+    /// first (#1677).
+    pub fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT spec_json, created_at_ms FROM chisei_dataset_runs
+                 WHERE namespace = ?1 ORDER BY created_at_ms, run_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params![namespace], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (json, created) = row.map_err(|error| error.to_string())?;
+            Ok((spec_from(&json)?, created))
+        })
+        .collect()
+    }
 }
 
 impl PostgresDb {
@@ -458,6 +554,123 @@ impl PostgresDb {
             .map(|row| result_from(row.get(0)))
             .collect()
     }
+
+    pub fn put_bound_dataset_run(
+        &self,
+        spec: &EvalRunSpec,
+        artifact_digest: &str,
+        now_ms: i64,
+    ) -> Result<(EvalRunSpec, Option<String>), String> {
+        let json = serde_json::to_string(spec).map_err(|error| error.to_string())?;
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let created = tx
+            .execute(
+                "INSERT INTO chisei_dataset_runs (namespace, run_id, spec_json, created_at_ms)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                &[&spec.namespace, &spec.run_id, &json, &now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        if created == 1 {
+            tx.execute(
+                "INSERT INTO chisei_dataset_run_artifacts (namespace, run_id, artifact_digest)
+                 VALUES ($1, $2, $3)",
+                &[&spec.namespace, &spec.run_id, &artifact_digest],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let stored: String = tx
+            .query_one(
+                "SELECT spec_json FROM chisei_dataset_runs WHERE namespace = $1 AND run_id = $2",
+                &[&spec.namespace, &spec.run_id],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        let bound: Option<String> = tx
+            .query_opt(
+                "SELECT artifact_digest FROM chisei_dataset_run_artifacts
+                 WHERE namespace = $1 AND run_id = $2",
+                &[&spec.namespace, &spec.run_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((spec_from(&stored)?, bound))
+    }
+
+    pub fn dataset_run_artifact(
+        &self,
+        namespace: &str,
+        run_id: &str,
+    ) -> Result<Option<String>, String> {
+        let mut connection = self.connection()?;
+        connection
+            .query_opt(
+                "SELECT artifact_digest FROM chisei_dataset_run_artifacts
+                 WHERE namespace = $1 AND run_id = $2",
+                &[&namespace, &run_id],
+            )
+            .map(|row| row.map(|row| row.get(0)))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
+        let mut connection = self.connection()?;
+        connection
+            .query(
+                "SELECT spec_json, created_at_ms FROM chisei_dataset_runs
+                 WHERE namespace = $1 ORDER BY created_at_ms, run_id",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| Ok((spec_from(row.get(0))?, row.get::<_, i64>(1))))
+            .collect()
+    }
+}
+
+impl crate::db::runtime_db::RuntimeDb {
+    /// Records a run with its artifact binding in one write; see
+    /// `SekaiDb::put_bound_dataset_run`.
+    pub fn put_bound_dataset_run(
+        &self,
+        spec: &EvalRunSpec,
+        artifact_digest: &str,
+        now_ms: i64,
+    ) -> Result<(EvalRunSpec, Option<String>), String> {
+        match self {
+            Self::Sqlite(db) => db.put_bound_dataset_run(spec, artifact_digest, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_bound_dataset_run(spec, artifact_digest, now_ms)
+            }),
+        }
+    }
+
+    /// The artifact a run is bound to, if any.
+    pub fn dataset_run_artifact(
+        &self,
+        namespace: &str,
+        run_id: &str,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.dataset_run_artifact(namespace, run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.dataset_run_artifact(namespace, run_id))
+            }
+        }
+    }
+
+    /// Every eval run of `namespace` with when it was first started.
+    pub fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_dataset_runs(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_dataset_runs(namespace))
+            }
+        }
+    }
 }
 
 /// Dispatches to the backend the plane runs on; PostgreSQL off the async
@@ -581,6 +794,43 @@ mod tests {
                 policy: None,
             })
         }
+    }
+
+    /// A run is bound to an artifact only as it is created; an existing run
+    /// keeps its binding, or its lack of one (#1677).
+    #[test]
+    fn a_run_is_bound_to_an_artifact_only_when_created() {
+        use crate::chisei::eval_run::tests::spec;
+        let db = crate::db::runtime_db::RuntimeDb::memory();
+        let bound = EvalRunSpec {
+            run_id: "bound".into(),
+            ..spec(1, 1_000)
+        };
+        let digest = |tag: &str| format!("sha256:{}", tag.repeat(32));
+        assert_eq!(
+            db.put_bound_dataset_run(&bound, &digest("ab"), 1)
+                .unwrap()
+                .1,
+            Some(digest("ab"))
+        );
+        assert_eq!(
+            db.put_bound_dataset_run(&bound, &digest("cd"), 2)
+                .unwrap()
+                .1,
+            Some(digest("ab"))
+        );
+        let unbound = EvalRunSpec {
+            run_id: "unbound".into(),
+            ..spec(1, 1_000)
+        };
+        crate::chisei::eval_run::EvalRunStore::put_dataset_run(&db, &unbound, 3).unwrap();
+        assert_eq!(
+            db.put_bound_dataset_run(&unbound, &digest("ab"), 4)
+                .unwrap()
+                .1,
+            None
+        );
+        assert_eq!(db.dataset_run_artifact("acme", "unbound").unwrap(), None);
     }
 
     /// The first spec wins, a case is reserved and recorded only under the
