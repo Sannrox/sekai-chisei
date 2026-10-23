@@ -6,7 +6,7 @@ use crate::sekai::definition_change_bundle::{
     ChangeHints, PropertyDefault, PropertyRef, PropertyRename, generate_change_bundle,
 };
 
-fn hints_from_proto(hints: Option<DefinitionChangeHints>) -> ChangeHints {
+pub(super) fn hints_from_proto(hints: Option<DefinitionChangeHints>) -> ChangeHints {
     let hints = hints.unwrap_or_default();
     ChangeHints {
         renames: hints

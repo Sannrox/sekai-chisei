@@ -49,6 +49,14 @@ cannot be read from the diff alone.
    finished is not run again. Manual steps must be acknowledged on the
    record before apply continues past them.
 
+7. **Dry runs use dataset branches** (#1692). The backfill runs on a branch
+   of each backing dataset, named for the bundle digest and forked from the
+   latest version, never on the dataset, and written once; reruns return
+   it. A backfill writes only columns the dataset does not define and copies
+   only from public columns. Dry-run branches are never proposed for
+   merge, and redaction or erasure of the dataset deletes them.
+   Samples follow the dataset's bound object read policy.
+
 ## Consequences
 
 - Reviewers see the diff, the data plan, and the impact in one response.

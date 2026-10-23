@@ -54,3 +54,54 @@ covers the diff, steps, and backfill. The `impact` report is evaluated as a
 direct `ReportDefinitionConsumerImpact` call by the same caller: hidden
 consumers are not named, and blocking bindings are disclosed. Because it
 depends on the caller, it is not part of the digest.
+
+## Dry run
+
+`DryRunDefinitionChangeBundle` (#1692) takes the same request, plus an
+optional `bundle_digest` the regenerated bundle must still match, and runs
+the backfill for every object type with a backing dataset (its object type
+datasource) on a dataset branch. It needs write on the namespace and on each
+dataset, like creating a branch, and is experimental like the bundle RPC.
+
+- The branch is named `bundle-` plus the start of the bundle digest and
+  forks from the dataset's latest version. The dataset itself is never
+  written, and a dry-run branch is never proposed for merge: applying a
+  bundle is a later, governed step.
+- Copies run first, then defaults fill properties that are still empty.
+  No column is dropped: a renamed source column stays beside its copy, so
+  dataset redaction still finds the rows by their original fields; dropping
+  it is the apply step's. Columns follow the datasource's property mapping.
+- The branch is written once, from the bundle and the fork; a rerun returns
+  it as it stands (including any redaction applied since), and a retry
+  after a crash or a concurrent call fills it once. Delete the branch to
+  dry-run against newer data.
+- Each run reports the row count, the changed rows, and up to five
+  before/after samples keyed by the datasource key column. Samples follow
+  the dataset's bound object: a caller who may not read it under the full
+  object read policy (namespace, grants, marking, security policy and
+  purpose) gets counts only (`samples_withheld`). A dataset under enforced
+  property grants is refused, as for transform replays.
+- Copies and defaults may only write columns the dataset does not define
+  (`definition_change_bundle_overwrites_column`): a changed identifier or
+  field, even an empty one filled in, would let filtered redaction or
+  erasure miss the row. A default for an existing property that becomes
+  required is therefore not dry-run yet.
+- Branch names starting with `bundle-` are reserved: `CreateDatasetBranch`
+  and transform runs on a branch refuse them, so an existing one is a
+  bundle's dry run.
+- Any redaction or subject erasure of the dataset deletes its dry-run
+  branches: their copies carry no classification of their own, so they go
+  whole, and a rerun refills from the edited base.
+- A rename that copies from a column classified above `public` is refused
+  (`definition_change_bundle_classified_copy`): dataset redaction finds
+  values by column definition, and a copied value under a new name would
+  escape it.
+- Object types with a backfill but no backing dataset (none registered, or
+  an edits-only datasource) are listed in `unbacked_object_types`. A
+  dataset that also backs another object type, in any namespace, is refused
+  (`definition_change_bundle_shared_dataset`): a rename could drop a column
+  the other binding reads.
+- The base read, backfill and branch write share one storage transaction
+  under the lock dataset redaction takes, fenced on the branch incarnation:
+  a branch recreated meanwhile fails with `ABORTED` (retry).
+

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Experimental `DryRunDefinitionChangeBundle` runs a change bundle's
+  backfill on a dataset branch per backed object type, named for the bundle
+  digest, and reports row counts and marking-aware samples; the datasets
+  themselves are never written (docs/definition-change-bundles.md, #1692).
+
 - Catalog entry owners and stewards curate `description`, `tags` and
   `owners` through a governed Action on `catalog_entry`, with the Action's
   receipt; the marking only rises, and later registrations keep curated

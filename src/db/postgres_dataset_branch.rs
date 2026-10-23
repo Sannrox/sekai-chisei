@@ -81,6 +81,60 @@ impl PostgresDb {
         Ok(written)
     }
 
+    /// PostgreSQL twin of the SQLite fill: under the dataset rows lock that
+    /// redaction and every branch mutation take, check the incarnation, read
+    /// the base version, and compute and write only an unwritten branch.
+    pub fn fill_dataset_branch_from_base(
+        &self,
+        dataset_id: &str,
+        name: &str,
+        incarnation: &str,
+        compute: &crate::sekai::dataset_branch::BranchCompute<'_>,
+    ) -> Result<
+        (
+            crate::sekai::dataset_branch::BranchRows,
+            crate::sekai::dataset_branch::BranchRows,
+        ),
+        String,
+    > {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_dataset_rows(&mut tx, dataset_id)?;
+        let branch = load_branch(&mut tx, dataset_id, name, true)
+            .map_err(|_| dataset_branch::BRANCH_CHANGED.to_string())?;
+        if branch.incarnation != incarnation {
+            return Err(dataset_branch::BRANCH_CHANGED.into());
+        }
+        let base = branch_rows(
+            &mut tx,
+            &DatasetBranch {
+                written: false,
+                ..branch.clone()
+            },
+        )?;
+        // Written once: a written branch is the result, so a redaction
+        // applied to it since is never undone by recomputing.
+        let expected = if branch.written {
+            branch_rows(&mut tx, &branch)?
+        } else {
+            // Column metadata changes take the same dataset rows lock.
+            let columns: String = tx
+                .query_one(
+                    "SELECT columns FROM sekai_datasets WHERE id = $1",
+                    &[&dataset_id],
+                )
+                .map_err(|error| error.to_string())?
+                .get(0);
+            let expected = compute(&crate::sekai::dataset::parse_columns(&columns)?, &base)?;
+            write_branch_rows_pg(&mut tx, dataset_id, name, &expected, true)?;
+            expected
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((base, expected))
+    }
+
     /// PostgreSQL twin of the SQLite branch run (`src/db/dataset_branch.rs`).
     pub fn run_governed_transform_on_branch(
         &self,
@@ -205,6 +259,21 @@ impl PostgresDb {
             serde_json::from_str(&row.get::<_, String>(0)).map_err(|error| error.to_string())
         })
         .transpose()
+    }
+
+    /// Every object type binding of `dataset_id`, in any namespace.
+    pub fn dataset_bindings(&self, dataset_id: &str) -> Result<Vec<(String, String)>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT namespace, kind FROM sekai_object_type_datasource
+                 WHERE dataset_id = $1 ORDER BY namespace, kind",
+                &[&dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
     }
 
     pub fn list_object_type_datasources(
@@ -890,6 +959,18 @@ pub(crate) fn edit_branch_rows_pg(
             ])],
         )
         .map_err(|error| error.to_string())?;
+    // Change bundle dry-run branches are previews whose copies carry no
+    // classification: redaction and erasure drop them whole, and a rerun
+    // refills from the edited base (#1692).
+    let bundle_names = format!("{}%", dataset_branch::BUNDLE_BRANCH_PREFIX);
+    for table in ["sekai_dataset_branch_rows", "sekai_dataset_branches"] {
+        client
+            .execute(
+                &format!("DELETE FROM {table} WHERE dataset_id = $1 AND name LIKE $2"),
+                &[&dataset_id, &bundle_names],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     let rows = client
         .query(
             "SELECT name, row_id, data FROM sekai_dataset_branch_rows
