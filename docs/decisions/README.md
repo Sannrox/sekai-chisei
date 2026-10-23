@@ -142,3 +142,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0118: One change-capture contract for relational sources beyond PostgreSQL](0118-relational-change-capture-contract.md)
 - [ADR 0119: Dataset branches are one working copy, merged as one version](0119-dataset-branches.md)
 - [ADR 0120: Transform replays run on a fresh branch over pinned versions](0120-transform-replays.md)
+- [ADR 0121: Bind Ezu geofence events to governed Actions](0121-fence-event-bindings.md)
