@@ -630,6 +630,8 @@ message SearchHit {
   string kind = 3;
   repeated SearchHighlight highlights = 4;
   bool authority = 5;
+  // Hybrid mode: the late_fusion.rrf/v1 score the hit ranked by. 0 in text mode.
+  double score = 6;
 }
 message SearchFacetValue {
   string value = 1;

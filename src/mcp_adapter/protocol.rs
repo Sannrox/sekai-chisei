@@ -26,6 +26,9 @@ pub const EDIT_DEFINITION_BRANCH_TOOL: &str = "sekai.definitions.branch.edit";
 pub const DIFF_DEFINITIONS_TOOL: &str = "sekai.definitions.diff";
 pub const IMPACT_DEFINITIONS_TOOL: &str = "sekai.definitions.impact";
 pub const CREATE_DEFINITION_PROPOSAL_TOOL: &str = "sekai.definitions.proposal.create";
+/// Hybrid search (#1683): object references under the Search RPC's read
+/// policy and fusion profile, never vectors. The backing RPC is experimental.
+pub const SEARCH_TOOL: &str = "sekai.search.query";
 
 const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "authorization",
@@ -39,7 +42,7 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 15] {
+pub fn well_known_tools() -> [&'static str; 16] {
     [
         GET_OBJECT_TOOL,
         EVALUATE_SET_TOOL,
@@ -56,6 +59,7 @@ pub fn well_known_tools() -> [&'static str; 15] {
         DIFF_DEFINITIONS_TOOL,
         IMPACT_DEFINITIONS_TOOL,
         CREATE_DEFINITION_PROPOSAL_TOOL,
+        SEARCH_TOOL,
     ]
 }
 
@@ -76,6 +80,7 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         DIFF_DEFINITIONS_TOOL => Some(NativeRpc::CompareDefinitionRevisions),
         IMPACT_DEFINITIONS_TOOL => Some(NativeRpc::ReportDefinitionConsumerImpact),
         CREATE_DEFINITION_PROPOSAL_TOOL => Some(NativeRpc::CreateDefinitionProposal),
+        SEARCH_TOOL => Some(NativeRpc::Search),
         _ => None,
     }
 }
@@ -127,7 +132,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, ResolveEvaluationPlan, ExecuteEvaluationManifest, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
     }))
 }
 
@@ -271,6 +276,51 @@ fn bind_session_input(
             if !has_operation && !has_request {
                 object.insert("operation_id".into(), json!(operation_id));
             }
+        }
+        NativeRpc::Search => {
+            // Only these fields cross the adapter. The session fixes the
+            // namespace; the tool always searches objects, hybrid by default.
+            if let Some(namespace) = session_string(object, "namespace")?
+                && namespace != context.namespace
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"search namespace must match the authenticated adapter session"
+                }));
+            }
+            let text = session_string(object, "text")?
+                .ok_or_else(|| json!({"code":-32602,"message":"search requires input.text"}))?;
+            let mode = session_string(object, "mode")?.unwrap_or_else(|| "hybrid".into());
+            if !matches!(mode.as_str(), "hybrid" | "text") {
+                return Err(json!({"code":-32602,"message":"input.mode must be hybrid or text"}));
+            }
+            // Every SearchRequest field (its JSON names are camelCase),
+            // defaulted, then the allowed ones in either spelling.
+            let mut bound = serde_json::Map::from_iter([
+                ("namespace".into(), json!(context.namespace)),
+                ("source".into(), json!("object")),
+                ("mode".into(), json!(mode)),
+                ("text".into(), json!(text)),
+                ("kinds".into(), json!([])),
+                ("propertyFilters".into(), json!([])),
+                ("facets".into(), json!([])),
+                ("pageToken".into(), json!("")),
+                ("pageSize".into(), json!(0)),
+                ("textWeight".into(), json!(0.0)),
+                ("vectorWeight".into(), json!(0.0)),
+            ]);
+            for (snake, camel) in [
+                ("kinds", "kinds"),
+                ("page_size", "pageSize"),
+                ("page_token", "pageToken"),
+                ("text_weight", "textWeight"),
+                ("vector_weight", "vectorWeight"),
+            ] {
+                if let Some(value) = object.get(snake).or_else(|| object.get(camel)) {
+                    bound.insert(camel.into(), value.clone());
+                }
+            }
+            *object = bound;
         }
         NativeRpc::EvaluateObjectSet => {
             if let Some(descriptor) = object.get("descriptor").and_then(Value::as_object)
@@ -517,6 +567,14 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "sekai.CreateDefinitionProposalResponse",
             "write",
         ),
+        capability_entry(
+            SEARCH_TOOL,
+            "Search objects by text and meaning; returns references the caller may read, never vectors.",
+            "query",
+            "sekai.SearchRequest",
+            "sekai.SearchResponse",
+            "read",
+        ),
     ]
 }
 
@@ -689,6 +747,7 @@ mod tests {
                 DIFF_DEFINITIONS_TOOL,
                 IMPACT_DEFINITIONS_TOOL,
                 CREATE_DEFINITION_PROPOSAL_TOOL,
+                SEARCH_TOOL,
             ]
         );
         assert_eq!(

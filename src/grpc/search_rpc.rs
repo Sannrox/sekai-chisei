@@ -436,7 +436,7 @@ fn vector_specs(
 }
 
 /// Fuse the visible text and vector hits under the RRF profile. A hit in
-/// both lists keeps its text highlights.
+/// both lists keeps its text highlights; every hit carries its fused score.
 fn fuse_hits(
     text: Vec<VisibleHit>,
     vector: Vec<VisibleHit>,
@@ -452,7 +452,11 @@ fn fuse_hits(
     }
     rrf_fuse(&[(&text_keys, text_weight), (&vector_keys, vector_weight)])
         .into_iter()
-        .filter_map(|key| hits.remove(&key))
+        .filter_map(|(key, score)| {
+            let mut hit = hits.remove(&key)?;
+            hit.hit.score = score;
+            Some(hit)
+        })
         .collect()
 }
 
@@ -764,6 +768,7 @@ fn live_object_hit(
             kind: live.kind.clone(),
             highlights: highlights_for_object(&live, &matched),
             authority: false,
+            score: 0.0,
         },
         facet_values: object_facet_values(&live, &input.facets),
     }))
@@ -835,6 +840,7 @@ fn live_dataset_hit(
                 })
                 .collect(),
             authority: false,
+            score: 0.0,
         },
         facet_values,
     }))

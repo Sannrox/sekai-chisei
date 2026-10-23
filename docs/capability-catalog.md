@@ -467,6 +467,17 @@ different one. Approve and merge stay off MCP. The server still refuses
 principal that created the proposal, including when that principal holds
 changed-member admin.
 
+### Hybrid search tool
+
+`tools/list` also returns `sekai.search.query` → `Search` (#1683), whose RPC
+stays `experimental` and gated by `SEKAI_EXPERIMENTAL_RPCS`. The call binds the
+session namespace, searches objects only, and runs hybrid unless `input.mode`
+is `text`. Only `text`, `kinds`, `page_size`, `page_token`, `text_weight` and
+`vector_weight` cross the adapter. It returns object references (type, id,
+fused score, and the highlighted fields of the caller's live projection) in
+the RPC's order and paging, under the same read policy and the
+`late_fusion.rrf/v1` profile, and never vectors. See [search.md](search.md).
+
 The SDK bindings under `sdk/` consume the same serialized projection. TypeScript
 `getQualityTrend` and Python `get_quality_trend` send `chisei.quality.read` and
 call `GetQualityTrend`; they do not reimplement the reducer. Every binding fails
