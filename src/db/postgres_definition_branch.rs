@@ -410,6 +410,20 @@ impl PostgresDb {
         Ok(result)
     }
 
+    /// Namespaces that have a published definition revision, sorted.
+    pub fn list_published_definition_namespaces(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT namespace FROM sekai_definition_published_heads ORDER BY namespace",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect())
+    }
+
     pub fn propose_definition_rollback(
         &self,
         request: &ProposeDefinitionRollback,
