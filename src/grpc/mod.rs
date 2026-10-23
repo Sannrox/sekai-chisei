@@ -180,6 +180,17 @@ fn assertion_reject_status(reject: crate::identity_assertion::AssertionReject) -
 /// Request metadata carrying a device proof (ADR 0126).
 pub(crate) const DEVICE_PROOF_HEADER: &str = "x-sekai-device-proof";
 
+/// RPCs (`Service/Method`) that check device proofs with
+/// [`require_device_proof`]. Every other RPC refuses a device-bound
+/// assertion outright, so a copied one never authenticates where no proof
+/// is checked. Sync (#1634) adds the first entries.
+const DEVICE_PROOF_RPCS: &[&str] = &[];
+
+/// Whether `rpc` (`Service/Method`) checks device proofs.
+fn checks_device_proof(rpc: &str) -> bool {
+    DEVICE_PROOF_RPCS.contains(&rpc)
+}
+
 /// The device-proof hook for a protected RPC: a request authenticated by a
 /// device-bound assertion must carry the device's proof over this request
 /// (`method` and the encoded message) in [`DEVICE_PROOF_HEADER`]. With
@@ -599,6 +610,17 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                             reject_unauthorized();
                             assertion_reject_status(reject)
                         })?;
+                    if authenticated_context.device.is_some() {
+                        let rpc = rpc_identity::request_rpc_method(&req)
+                            .map(|(service, method)| format!("{service}/{method}"))
+                            .unwrap_or_default();
+                        if !checks_device_proof(&rpc) {
+                            reject_unauthorized();
+                            return Err(Status::unauthenticated(
+                                "device-bound assertions are accepted only by RPCs that check device proofs",
+                            ));
+                        }
+                    }
                     let enterprise_scoped = self.db.runtime().enterprise_extension().is_some()
                         || authenticated_context.tenant.is_some();
                     return finish_authenticated_audited(
