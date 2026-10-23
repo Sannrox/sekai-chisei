@@ -91,6 +91,10 @@ pub struct DeviceClaim {
     pub id: String,
     /// The device's Ed25519 public key, base64url without padding.
     pub ed25519_pub: String,
+    /// The issuer revoked the device and asks it to wipe (#1634): the
+    /// assertion is then good only for learning that, on sync.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wipe: bool,
 }
 
 impl DeviceClaim {
@@ -318,6 +322,7 @@ impl AssertionAuthority {
                     id: claim.id.clone(),
                     public_key: claim.public_key()?,
                     assertion_nonce: assertion.nonce.clone(),
+                    wipe: claim.wipe,
                 })
             })
             .transpose()?;
@@ -575,6 +580,7 @@ mod tests {
             device: Some(DeviceClaim {
                 id: "device-7".into(),
                 ed25519_pub: URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+                wipe: false,
             }),
             ..claims(nonce, 100)
         }
@@ -651,6 +657,22 @@ mod tests {
     }
 
     #[test]
+    fn a_wipe_claim_reaches_the_context() {
+        let authority = authority();
+        let key = device_key(7);
+        let mut assertion = bound(&fresh_nonce(), &key);
+        assertion.device.as_mut().unwrap().wipe = true;
+        let context = authority
+            .verify(&authority.sign(&assertion).unwrap(), 50, None)
+            .unwrap();
+        assert!(context.device.unwrap().wipe);
+        // An assertion without the flag is not a wipe, and omits it on the wire.
+        let plain = authority.sign(&bound(&fresh_nonce(), &key)).unwrap();
+        let payload = authority.open(ASSERTION_TOKEN_PREFIX, &plain).unwrap();
+        assert!(!String::from_utf8(payload).unwrap().contains("wipe"));
+    }
+
+    #[test]
     fn a_malformed_device_claim_is_refused() {
         let authority = authority();
         let key = device_key(7);
@@ -672,6 +694,7 @@ mod tests {
             assertion.device = Some(DeviceClaim {
                 id: id.into(),
                 ed25519_pub: public_key,
+                wipe: false,
             });
             let token = authority.sign(&assertion).unwrap();
             assert_eq!(

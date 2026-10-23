@@ -37,3 +37,9 @@ Only a changed scope definition, or a filter the caller may no longer query, req
 With `max_offline_age_ms`, the last snapshot page and every delta read that leaves nothing pending (`more` false) return `offline_until_ms`. Until then the previous deadline holds. The client must not show the data after that time until it syncs again.
 
 `sekai_client::sync_replica::SyncReplica` is a reference replica that applies snapshots, deltas and purges, and shows nothing until a snapshot completes, discards its data on `resnapshot_required`, and refuses to show data past `offline_until_ms`.
+
+## Devices (#1634, [ADR 0126](decisions/0126-device-bound-assertions.md))
+
+A device-bound credential must prove possession of its device key on every sync call, with the proof in `x-sekai-device-proof`. A copied credential without the key is refused.
+
+A device the issuer revoked receives a wipe-only assertion. On `ReadSyncSnapshot` and `ReadSyncDeltas` it gets `wipe_required` and no data. The client must then delete every synced object and the cursor. Every other call with that assertion, `PutSyncScope` included, is refused. The reference replica wipes for good on that instruction.

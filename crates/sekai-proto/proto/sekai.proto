@@ -4088,6 +4088,9 @@ message ReadSyncSnapshotResponse {
   // Set on the last page when the scope has a maximum offline age: the
   // client must sync again before showing the data after this time.
   int64 offline_until_ms = 6;
+  // The device was revoked (#1634): delete every synced object and the
+  // cursor. No data comes with it.
+  bool wipe_required = 7;
 }
 
 message ReadSyncDeltasRequest {
@@ -4124,6 +4127,8 @@ message ReadSyncDeltasResponse {
   // Set only when this read leaves nothing pending (`more` false); until
   // then the previous deadline holds.
   int64 offline_until_ms = 8;
+  // As in the snapshot: the device was revoked; wipe, with no data.
+  bool wipe_required = 9;
 }
 
 message SyncPurge {

@@ -6,6 +6,12 @@ pull request body, which becomes the squash commit; at release,
 
 ## Unreleased
 
+- Sync and devices: a device-bound credential must send the device's proof
+  on `PutSyncScope`, `ReadSyncSnapshot` and `ReadSyncDeltas`, so a copied
+  credential without the key is refused. A revoked device's wipe-only
+  assertion (`device.wipe`) gets `wipe_required` and no data on sync reads,
+  and is refused everywhere else (ADR 0126, #1634).
+
 - Local twins: `sekai::synthetic_shape` extracts a `sekai.twin-shape/v1`
   shape from a tenant (definitions, counts, marking shares, numeric ranges,
   link counts; no string or individual value), and a
