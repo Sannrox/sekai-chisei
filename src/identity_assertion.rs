@@ -4,6 +4,12 @@
 //! fields already on `AuthenticatedContext`, plus a one-use nonce. No authority
 //! configured remains community, tenant-free behavior. Caller-selected tenant
 //! headers never construct or widen context.
+//!
+//! An assertion may bind a device (#1697 / ADR 0126): the optional `device`
+//! claim names the device and its Ed25519 key. A protected RPC then requires
+//! a per-request proof, the device's signature over the assertion's nonce
+//! and the request digest ([`verify_device_proof`]). The assertion is one-use,
+//! so the proof needs no nonce store of its own.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
@@ -15,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::enterprise::{
-    AuthenticatedContext, AuthenticatedPrincipal, CredentialKind, IDENTITY_EXTENSION_VERSION,
-    SpaceRole, TenantContext,
+    AuthenticatedContext, AuthenticatedDevice, AuthenticatedPrincipal, CredentialKind,
+    IDENTITY_EXTENSION_VERSION, SpaceRole, TenantContext,
 };
 
 pub const IDENTITY_ASSERTION_VERSION: &str = "sekai.identity-assertion/v1";
@@ -34,6 +40,8 @@ pub enum AssertionReject {
     Replay,
     ScopeEscalation,
     CallerTenantHeader,
+    /// A device claim without a usable id or Ed25519 key.
+    Device,
 }
 
 impl AssertionReject {
@@ -46,6 +54,7 @@ impl AssertionReject {
             Self::Replay => "replay",
             Self::ScopeEscalation => "scope_escalation",
             Self::CallerTenantHeader => "caller_tenant_header",
+            Self::Device => "device",
         }
     }
 }
@@ -69,6 +78,108 @@ pub struct IdentityAssertion {
     pub scopes: Vec<String>,
     pub expires_at: i64,
     pub nonce: String,
+    /// The device this assertion is bound to. Absent, the assertion
+    /// authenticates exactly as before the claim existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceClaim>,
+}
+
+/// The device claim of an assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceClaim {
+    pub id: String,
+    /// The device's Ed25519 public key, base64url without padding.
+    pub ed25519_pub: String,
+}
+
+impl DeviceClaim {
+    fn public_key(&self) -> Result<[u8; 32], AssertionReject> {
+        if self.id.is_empty() || self.id.len() > 256 {
+            return Err(AssertionReject::Device);
+        }
+        let bytes: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&self.ed25519_pub)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(AssertionReject::Device)?;
+        ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| AssertionReject::Device)?;
+        Ok(bytes)
+    }
+}
+
+/// What a device signs for one request.
+pub const DEVICE_PROOF_VERSION: &str = "sekai.device-proof/v1";
+
+/// Why a device proof was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceProofReject {
+    /// The RPC requires a device-bound assertion and this one binds none.
+    Unbound,
+    /// The assertion binds a device and the request carries no proof.
+    Missing,
+    /// The proof is not the bound device's signature over this request.
+    Invalid,
+}
+
+impl DeviceProofReject {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unbound => "device_unbound",
+            Self::Missing => "device_proof_missing",
+            Self::Invalid => "device_proof_invalid",
+        }
+    }
+}
+
+/// The digest of one request: SHA-256 over the length-prefixed method path
+/// and the encoded request message, as `sha256:<hex>`.
+pub fn request_digest(method: &str, message: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = Sha256::new();
+    for part in [method.as_bytes(), message] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// The bytes a device signs: the proof version, the assertion's nonce and
+/// the request digest, one per line.
+pub fn device_proof_input(assertion_nonce: &str, request_digest: &str) -> Vec<u8> {
+    format!("{DEVICE_PROOF_VERSION}\n{assertion_nonce}\n{request_digest}").into_bytes()
+}
+
+/// The device-proof check a protected RPC runs. A device-bound context
+/// needs `proof`, base64url without padding of the bound device's Ed25519
+/// signature over [`device_proof_input`] for `request_digest`. An unbound
+/// context passes unless `device_required`.
+pub fn verify_device_proof(
+    context: &AuthenticatedContext,
+    request_digest: &str,
+    proof: Option<&str>,
+    device_required: bool,
+) -> Result<(), DeviceProofReject> {
+    let Some(device) = &context.device else {
+        return if device_required {
+            Err(DeviceProofReject::Unbound)
+        } else {
+            Ok(())
+        };
+    };
+    let proof = proof.ok_or(DeviceProofReject::Missing)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(proof)
+        .ok()
+        .and_then(|bytes| ed25519_dalek::Signature::from_slice(&bytes).ok())
+        .ok_or(DeviceProofReject::Invalid)?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&device.public_key)
+        .map_err(|_| DeviceProofReject::Invalid)?;
+    key.verify_strict(
+        &device_proof_input(&device.assertion_nonce, request_digest),
+        &signature,
+    )
+    .map_err(|_| DeviceProofReject::Invalid)
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +310,17 @@ impl AssertionAuthority {
         if assertion.nonce.is_empty() {
             return Err(AssertionReject::Replay);
         }
+        let device = assertion
+            .device
+            .as_ref()
+            .map(|claim| {
+                Ok::<_, AssertionReject>(AuthenticatedDevice {
+                    id: claim.id.clone(),
+                    public_key: claim.public_key()?,
+                    assertion_nonce: assertion.nonce.clone(),
+                })
+            })
+            .transpose()?;
         {
             let mut seen = self.replayed.lock().expect("assertion replay lock");
             let retain_until = assertion.expires_at.saturating_add(self.clock_skew_secs);
@@ -239,6 +361,7 @@ impl AssertionAuthority {
             issuer: assertion.issuer,
             resource: assertion.audience,
             expires_at: assertion.expires_at,
+            device,
         };
         context
             .authorize_space(crate::enterprise::NamespaceAction::Discover)
@@ -278,6 +401,7 @@ mod tests {
             scopes: vec!["sekai.read".into(), "sekai.write".into()],
             expires_at,
             nonce: nonce.into(),
+            device: None,
         }
     }
 
@@ -440,6 +564,121 @@ mod tests {
             authority.verify(&token, 2_000, None).unwrap_err(),
             AssertionReject::Replay
         );
+    }
+
+    fn device_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn bound(nonce: &str, key: &ed25519_dalek::SigningKey) -> IdentityAssertion {
+        IdentityAssertion {
+            device: Some(DeviceClaim {
+                id: "device-7".into(),
+                ed25519_pub: URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+            }),
+            ..claims(nonce, 100)
+        }
+    }
+
+    fn prove(key: &ed25519_dalek::SigningKey, nonce: &str, digest: &str) -> String {
+        use ed25519_dalek::Signer as _;
+        URL_SAFE_NO_PAD.encode(key.sign(&device_proof_input(nonce, digest)).to_bytes())
+    }
+
+    #[test]
+    fn an_assertion_without_a_device_claim_authenticates_as_before() {
+        let authority = authority();
+        let token = authority.sign(&claims(&fresh_nonce(), 100)).unwrap();
+        // The claim is omitted from the wire form, so an assertion signed by
+        // an issuer that predates it is byte-for-byte the same.
+        let payload = authority.open(ASSERTION_TOKEN_PREFIX, &token).unwrap();
+        assert!(!String::from_utf8(payload).unwrap().contains("device"));
+        let context = authority.verify(&token, 50, None).unwrap();
+        assert_eq!(context.device, None);
+        let digest = request_digest("/sekai.v1.Sekai/ReadSyncDeltas", b"request");
+        assert_eq!(verify_device_proof(&context, &digest, None, false), Ok(()));
+        assert_eq!(
+            verify_device_proof(&context, &digest, None, true),
+            Err(DeviceProofReject::Unbound)
+        );
+    }
+
+    #[test]
+    fn a_device_bound_assertion_needs_the_device_proof_for_this_request() {
+        let authority = authority();
+        let key = device_key(7);
+        let nonce = fresh_nonce();
+        let token = authority.sign(&bound(&nonce, &key)).unwrap();
+        let context = authority.verify(&token, 50, None).unwrap();
+        let device = context.device.as_ref().unwrap();
+        assert_eq!(device.id, "device-7");
+        assert_eq!(device.assertion_nonce, nonce);
+
+        let digest = request_digest("/sekai.v1.Sekai/ReadSyncDeltas", b"request");
+        let proof = prove(&key, &nonce, &digest);
+        assert_eq!(
+            verify_device_proof(&context, &digest, Some(&proof), true),
+            Ok(())
+        );
+        let other_request = request_digest("/sekai.v1.Sekai/ReadSyncDeltas", b"other");
+        assert_eq!(
+            verify_device_proof(&context, &other_request, Some(&proof), false),
+            Err(DeviceProofReject::Invalid)
+        );
+        let other_method = request_digest("/sekai.v1.Sekai/ReadSyncSnapshot", b"request");
+        assert_eq!(
+            verify_device_proof(&context, &other_method, Some(&proof), false),
+            Err(DeviceProofReject::Invalid)
+        );
+        let stolen = prove(&device_key(8), &nonce, &digest);
+        assert_eq!(
+            verify_device_proof(&context, &digest, Some(&stolen), false),
+            Err(DeviceProofReject::Invalid)
+        );
+        assert_eq!(
+            verify_device_proof(&context, &digest, None, false),
+            Err(DeviceProofReject::Missing)
+        );
+        assert_eq!(
+            verify_device_proof(&context, &digest, Some("not base64!"), false),
+            Err(DeviceProofReject::Invalid)
+        );
+        // The assertion stays one-use with the claim.
+        assert_eq!(
+            authority.verify(&token, 50, None).unwrap_err(),
+            AssertionReject::Replay
+        );
+    }
+
+    #[test]
+    fn a_malformed_device_claim_is_refused() {
+        let authority = authority();
+        let key = device_key(7);
+        let mut claim = serde_json::to_value(bound(&fresh_nonce(), &key)).unwrap();
+        claim["device"]["platform"] = "ios".into();
+        let token = authority
+            .seal(ASSERTION_TOKEN_PREFIX, &serde_json::to_vec(&claim).unwrap())
+            .unwrap();
+        assert_eq!(
+            authority.verify(&token, 50, None).unwrap_err(),
+            AssertionReject::Signature
+        );
+        for (id, public_key) in [
+            ("", URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())),
+            ("device-7", URL_SAFE_NO_PAD.encode([1u8; 31])),
+            ("device-7", "%%".into()),
+        ] {
+            let mut assertion = bound(&fresh_nonce(), &key);
+            assertion.device = Some(DeviceClaim {
+                id: id.into(),
+                ed25519_pub: public_key,
+            });
+            let token = authority.sign(&assertion).unwrap();
+            assert_eq!(
+                authority.verify(&token, 50, None).unwrap_err(),
+                AssertionReject::Device
+            );
+        }
     }
 
     #[test]

@@ -131,6 +131,7 @@ impl ServiceTokenClaims {
             issuer: self.issuer.clone(),
             resource: self.audience.clone(),
             expires_at: self.expires_at_ms.div_euclid(1_000),
+            device: None,
         }
     }
 }
