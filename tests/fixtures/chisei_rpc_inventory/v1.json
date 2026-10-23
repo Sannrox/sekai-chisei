@@ -109,6 +109,19 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "RunEvalDataset",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/chisei_store/eval_run.rs",
+        "src/chisei/eval_run.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExecutePlanStream",
       "kind": "persistent",
       "surfaces": [
