@@ -133,6 +133,7 @@ fn seed_effect(db: &RuntimeDb, suffix: &str) {
         agent_action: false,
         admission_tenant: String::new(),
         resource_tenant: String::new(),
+        marking: String::new(),
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();

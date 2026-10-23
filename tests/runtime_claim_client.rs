@@ -138,6 +138,7 @@ fn seed_action_with_act(db: &RuntimeDb, prefix: &str, delegating_actor: Option<&
         agent_action: false,
         admission_tenant: String::new(),
         resource_tenant: String::new(),
+        marking: String::new(),
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();

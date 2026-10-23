@@ -120,6 +120,7 @@ impl SekaiServiceImpl {
             &binding.run_as,
             &binding.parameters.keys().cloned().collect::<Vec<_>>(),
         )?;
+        self.check_binding_markings(&binding.namespace, &binding.markings)?;
         let stored = self
             .db
             .runtime()
@@ -395,9 +396,13 @@ impl SekaiServiceImpl {
                 }
             }
         };
+        let markings =
+            super::action_binding::snapshot_markings(&binding.markings, visible.get(&event.entity));
         match self.admit_bound_action(
             BoundAction {
                 namespace: &binding.namespace,
+                markings: &markings,
+                source_object_id: &event.entity,
                 type_id: &type_id,
                 version: &version,
                 run_as: &binding.run_as,
@@ -613,6 +618,7 @@ mod tests {
                     ("event".into(), FenceParameterSource::EventKind),
                 ]),
                 max_events_per_run: 3,
+                markings: Vec::new(),
                 enabled: true,
                 revision: 0,
                 created_by: String::new(),
@@ -757,5 +763,119 @@ mod tests {
             assert_eq!(run.submissions[0].status, "parked");
             assert!(!run.more);
         });
+    }
+
+    /// A sealed clearance profile for `principal`, as markings read it.
+    fn clear(db: &RuntimeDb, principal: &str, ceiling: &str) {
+        use crate::sekai::markings;
+        let id = format!("principal-{principal}");
+        db.create_object(&domain::Object {
+            id: id.clone(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: principal.into(),
+            namespace: "fleet".into(),
+            external_id: markings::principal_profile_external_id(principal),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    ceiling.into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_grant(&security::Grant {
+            id: format!("profile-admin-{principal}"),
+            object_id: id,
+            principal: "root".into(),
+            role: security::Role::Admin,
+            created: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_marked_object_marks_its_action_and_hides_it_from_the_uncleared() {
+        crate::provider_credentials::with_test_env("EZU_TOKEN", "ezu-fleet-token", || {
+            let (db, svc) = setup(ActionDecision::Allow);
+            let mut truck = db.get_object("truck-1").unwrap().unwrap();
+            truck.properties.insert(
+                crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            );
+            db.update_object_with_audit(&truck, "local").unwrap();
+            // The service principal must be able to read what it acts on.
+            clear(&db, "svc-dispatch", "confidential");
+            let (mut binding, _) = db.get_fence_binding("fleet", "depot").unwrap().unwrap();
+            binding.markings = vec!["internal".into()];
+            db.put_fence_binding(&binding, "local", 3).unwrap();
+            let ezu = FakeEzu {
+                events: vec![event(1, "truck-1", 1)],
+                redeliver: false,
+                reads: Mutex::default(),
+                during_read: None,
+            };
+            let run = block_on(svc.run_fence_binding_with(run_request(), &ezu))
+                .unwrap()
+                .into_inner();
+            let instance_id = run.submissions[0].instance_id.clone();
+            assert!(!instance_id.is_empty(), "{:?}", run.submissions[0]);
+            // The join of the object's confidential and the binding's internal.
+            let instance = db.get_action_instance(&instance_id).unwrap().unwrap();
+            assert_eq!(instance.marking, "confidential");
+
+            // A namespace admin entitled to the instance, but not cleared.
+            let (_, grants) = db
+                .ensure_team_namespace("fleet", "auditor", security::Role::Admin, "local")
+                .unwrap();
+            for grant in grants {
+                svc.security.add_grant(&grant);
+            }
+            svc.security.add_grant(&security::Grant {
+                id: "auditor-actions".into(),
+                object_id: "action:governed_action:fleet".into(),
+                principal: "auditor".into(),
+                role: security::Role::Admin,
+                created: 1,
+                ..Default::default()
+            });
+            let read = |principal: &'static str| {
+                let mut request = Request::new(GetActionInstanceRequest {
+                    instance_id: instance_id.clone(),
+                    ..Default::default()
+                });
+                request
+                    .metadata_mut()
+                    .insert("x-principal", MetadataValue::from_static(principal));
+                block_on(svc.get_action_instance(request))
+            };
+            let hidden = read("auditor").unwrap_err();
+            assert_eq!(hidden.code(), tonic::Code::NotFound, "{hidden:?}");
+            clear(&db, "auditor", "confidential");
+            let shown = read("auditor").unwrap().into_inner().instance.unwrap();
+            assert_eq!(shown.marking, "confidential");
+        });
+    }
+
+    #[test]
+    fn a_binding_with_markings_the_lattice_does_not_know_is_refused() {
+        let (db, svc) = setup(ActionDecision::Allow);
+        assert!(
+            svc.check_binding_markings("fleet", &["internal".into()])
+                .is_ok()
+        );
+        assert_eq!(
+            svc.check_binding_markings("fleet", &["ultra-secret".into()])
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        drop(db);
     }
 }

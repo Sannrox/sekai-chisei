@@ -1050,6 +1050,7 @@ mod tests {
             agent_action: false,
             admission_tenant: String::new(),
             resource_tenant: String::new(),
+            marking: String::new(),
         })
         .unwrap();
     }
@@ -1185,6 +1186,7 @@ mod tests {
             agent_action: true,
             admission_tenant: String::new(),
             resource_tenant: String::new(),
+            marking: String::new(),
         })
         .unwrap();
         let claimed = ActionWorkLifecycle::new(&db)
@@ -1266,6 +1268,7 @@ mod tests {
             agent_action: false,
             admission_tenant: String::new(),
             resource_tenant: String::new(),
+            marking: String::new(),
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);
@@ -1403,6 +1406,7 @@ mod tests {
             agent_action: false,
             admission_tenant: String::new(),
             resource_tenant: "tenant-test".into(),
+            marking: String::new(),
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);
@@ -1462,6 +1466,7 @@ mod tests {
             agent_action: false,
             admission_tenant: "acme-tenant".into(),
             resource_tenant: String::new(),
+            marking: String::new(),
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);

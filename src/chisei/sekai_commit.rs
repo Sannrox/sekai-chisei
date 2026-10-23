@@ -16,7 +16,13 @@ pub struct SekaiCommitRef {
     pub namespace: String,
     pub instance_id: String,
     pub status: String,
+    /// The committed instance's marking (#1706); receipts that project the
+    /// commit carry it, so reading them needs the same clearance.
+    pub marking: String,
 }
+
+/// Receipt attribute naming the marking reading the receipt needs (#1706).
+pub use crate::sekai::action_instance_admission::RECEIPT_MARKING_ATTRIBUTE;
 
 pub trait SekaiCommitLookup: Send + Sync {
     fn lookup_commit(&self, operation_id: &str) -> Result<Option<SekaiCommitRef>, String>;
@@ -63,5 +69,10 @@ pub fn project_commit_handles(receipt: &mut OperationReceipt, commit: &SekaiComm
         event
             .attributes
             .insert("sekai_commit_status".into(), commit.status.clone());
+        if !commit.marking.is_empty() {
+            event
+                .attributes
+                .insert(RECEIPT_MARKING_ATTRIBUTE.into(), commit.marking.clone());
+        }
     }
 }

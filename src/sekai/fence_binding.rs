@@ -75,6 +75,10 @@ pub struct FenceBinding {
     /// Service principal the binding submits as.
     pub run_as: String,
     pub parameters: BTreeMap<String, FenceParameterSource>,
+    /// Markings every Action the binding submits carries, joined with the
+    /// bound object's (#1706).
+    #[serde(default)]
+    pub markings: Vec<String>,
     /// Most events one run reads; [`DEFAULT_EVENTS_PER_RUN`] when 0.
     #[serde(default)]
     pub max_events_per_run: u32,
@@ -198,10 +202,13 @@ impl FenceBinding {
             if name.trim().is_empty() || name.chars().any(char::is_whitespace) {
                 return Err("parameter names must be non-empty without whitespace".into());
             }
-            if let FenceParameterSource::Property(property) = source
-                && !crate::domain::is_valid_property_key(property)
-            {
-                return Err(format!("invalid property source {property:?}"));
+            if let FenceParameterSource::Property(property) = source {
+                if property == crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY {
+                    return Err("the marking property cannot be mapped into parameters".into());
+                }
+                if !crate::domain::is_valid_property_key(property) {
+                    return Err(format!("invalid property source {property:?}"));
+                }
             }
         }
         Ok(())
@@ -563,6 +570,7 @@ pub(crate) mod tests {
                 ),
             ]),
             max_events_per_run: 0,
+            markings: Vec::new(),
             enabled: true,
             revision: 1,
             created_by: String::new(),
@@ -595,6 +603,13 @@ pub(crate) mod tests {
         greedy.max_events_per_run = MAX_EVENTS_PER_RUN + 1;
         assert!(greedy.validate().is_err());
         assert_eq!(binding().events_per_run(), DEFAULT_EVENTS_PER_RUN);
+        // The marking travels with the Action, never as a parameter (#1706).
+        let mut marking = binding();
+        marking.parameters.insert(
+            "level".into(),
+            FenceParameterSource::Property("access_marking".into()),
+        );
+        assert!(marking.validate().unwrap_err().contains("marking"));
     }
 
     #[test]

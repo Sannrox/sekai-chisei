@@ -63,23 +63,34 @@ pub(crate) struct AppliedObjectMutation {
 #[derive(Debug, Clone)]
 pub(crate) enum PlannedObjectMutation {
     Create(Object),
-    Update(Object),
+    /// The object to write and the object as planning read it; the write
+    /// applies only if it is unchanged, so a concurrent change (a raised
+    /// marking among them) is never overwritten by a stale plan.
+    Update(Object, Box<Object>),
 }
 
 impl PlannedObjectMutation {
     fn mutation(&self) -> &'static str {
         match self {
             Self::Create(_) => OBJECT_MUTATION_CREATE,
-            Self::Update(_) => OBJECT_MUTATION_UPDATE,
+            Self::Update(..) => OBJECT_MUTATION_UPDATE,
         }
     }
 }
 
+/// Plans the object an admitted Action writes. `marking` is the instance's
+/// marking (#1706), `None` where no instance is admitted (previews,
+/// transforms that stamp their own): the written object carries the least
+/// upper bound of it, the object's current marking and any marking the
+/// parameters set, so an Action can neither write below what it was derived
+/// from nor lower an object's marking. An object now marked above the
+/// instance changed after admission derived the marking, and is refused.
 pub(crate) fn plan(
     db: &RuntimeDb,
     type_def: &GovernedActionType,
     namespace: &str,
     parameters_json: &str,
+    marking: Option<&str>,
     now_ms: i64,
 ) -> Result<Option<PlannedObjectMutation>, ActionObjectMutationError> {
     let object_kind = type_def.object_kind.trim();
@@ -155,6 +166,7 @@ pub(crate) fn plan(
                 created: 0,
                 updated: 0,
             };
+            inherit_marking(db, namespace, &mut planned, None, marking)?;
             validate_object_schema(db, &planned)?;
             validate_object_write(db, &mut planned, now_ms)?;
             Ok(Some(PlannedObjectMutation::Create(planned)))
@@ -176,6 +188,9 @@ pub(crate) fn plan(
                     "object {object_id} is not in namespace {namespace}"
                 )));
             }
+            let existing_marking =
+                crate::sekai::markings::object_marking_token(&existing).map(str::to_string);
+            let snapshot = Box::new(existing.clone());
             let mut merged = existing.properties;
             merged.extend(properties);
             let mut planned = Object {
@@ -192,9 +207,16 @@ pub(crate) fn plan(
                 created: existing.created,
                 updated: existing.updated,
             };
+            inherit_marking(
+                db,
+                namespace,
+                &mut planned,
+                existing_marking.as_deref(),
+                marking,
+            )?;
             validate_object_schema(db, &planned)?;
             validate_object_write(db, &mut planned, now_ms)?;
-            Ok(Some(PlannedObjectMutation::Update(planned)))
+            Ok(Some(PlannedObjectMutation::Update(planned, snapshot)))
         }
         other => Err(ActionObjectMutationError::FailedPrecondition(format!(
             "unknown object_mutation {other:?}"
@@ -212,9 +234,9 @@ pub(crate) fn apply(
     now_ms: i64,
 ) -> Result<AppliedObjectMutation, ActionObjectMutationError> {
     let mutation = planned.mutation().to_string();
-    let mut object = match planned {
-        PlannedObjectMutation::Create(object) => object,
-        PlannedObjectMutation::Update(object) => object,
+    let (mut object, snapshot) = match planned {
+        PlannedObjectMutation::Create(object) => (object, None),
+        PlannedObjectMutation::Update(object, snapshot) => (object, Some(snapshot)),
     };
     let created = mutation == OBJECT_MUTATION_CREATE;
     if created {
@@ -239,8 +261,16 @@ pub(crate) fn apply(
         None
     } else {
         Some(
-            db.update_object_for_operation(&object, actor, operation_id)
-                .map_err(ActionObjectMutationError::Internal)?
+            db.update_object_for_operation(&object, snapshot.as_deref(), actor, operation_id)
+                .map_err(|error| {
+                    if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION {
+                        ActionObjectMutationError::FailedPrecondition(format!(
+                            "object {object_id} changed since the Action was planned; submit again"
+                        ))
+                    } else {
+                        ActionObjectMutationError::Internal(error)
+                    }
+                })?
                 .ok_or_else(|| {
                     ActionObjectMutationError::FailedPrecondition(format!(
                         "object {object_id} not found"
@@ -283,7 +313,9 @@ pub(crate) fn grant_parked(
         let mutation = planned.mutation().to_string();
         let created = mutation == OBJECT_MUTATION_CREATE;
         let mut object = match planned {
-            PlannedObjectMutation::Create(object) | PlannedObjectMutation::Update(object) => object,
+            PlannedObjectMutation::Create(object) | PlannedObjectMutation::Update(object, _) => {
+                object
+            }
         };
         if created {
             object.created = now_ms;
@@ -387,6 +419,60 @@ fn validate_object_schema(
         .map_err(ActionObjectMutationError::FailedPrecondition)
 }
 
+/// Stamps `object` with the least upper bound of its planned marking, the
+/// marking it had before (`existing`) and the Action's. Unknown or
+/// incomparable tokens refuse the write.
+fn inherit_marking(
+    db: &RuntimeDb,
+    namespace: &str,
+    object: &mut Object,
+    existing: Option<&str>,
+    instance_marking: Option<&str>,
+) -> Result<(), ActionObjectMutationError> {
+    let planned = crate::sekai::markings::object_marking_token(object).map(str::to_string);
+    let marking = instance_marking.filter(|token| !token.trim().is_empty());
+    if existing.is_none() && marking.is_none() {
+        return Ok(());
+    }
+    let lattice = db
+        .get_classification_lattice(namespace)
+        .map_err(ActionObjectMutationError::Internal)?;
+    let (_, joined) = crate::sekai::classification_lattice::union_input_marking_tokens(
+        lattice.as_ref(),
+        [planned.as_deref(), existing, marking],
+    )
+    .map_err(|error| ActionObjectMutationError::FailedPrecondition(format!("marking: {error}")))?;
+    // Admission derived the instance marking from this object; one now
+    // marked above it changed since, and the Action would act below it.
+    // Compared as markings, not spellings: the instance's must equal its own
+    // join with everything the object carries. Joining it with itself puts
+    // both sides in the same canonical form.
+    let canonical = |tokens: &[Option<&str>]| {
+        crate::sekai::classification_lattice::union_input_marking_tokens(
+            lattice.as_ref(),
+            tokens.iter().copied(),
+        )
+        .map(|(_, joined)| joined)
+        .map_err(|error| ActionObjectMutationError::FailedPrecondition(format!("marking: {error}")))
+    };
+    if let Some(instance_marking) = instance_marking
+        && canonical(&[Some(instance_marking), Some(instance_marking)])?
+            != canonical(&[Some(instance_marking), joined.as_deref()])?
+    {
+        return Err(ActionObjectMutationError::FailedPrecondition(format!(
+            "object {} marking changed since the Action was admitted; submit again",
+            object.id
+        )));
+    }
+    if let Some(joined) = joined {
+        object.properties.insert(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+            joined,
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn object_properties(
     parameters: &serde_json::Value,
 ) -> Result<HashMap<String, String>, ActionObjectMutationError> {
@@ -462,7 +548,15 @@ mod tests {
             disabled_at_ms: 0,
             ..Default::default()
         };
-        let error = plan(&db, &type_def, "acme", r#"{"object_id":" rec-1 "}"#, 10).unwrap_err();
+        let error = plan(
+            &db,
+            &type_def,
+            "acme",
+            r#"{"object_id":" rec-1 "}"#,
+            None,
+            10,
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ActionObjectMutationError::InvalidArgument(_)
@@ -509,7 +603,15 @@ mod tests {
             disabled_at_ms: 0,
             ..Default::default()
         };
-        let error = plan(&db, &type_def, "acme", r#"{"object_id":"rec-schema"}"#, 10).unwrap_err();
+        let error = plan(
+            &db,
+            &type_def,
+            "acme",
+            r#"{"object_id":"rec-schema"}"#,
+            None,
+            10,
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ActionObjectMutationError::FailedPrecondition(_)
@@ -546,14 +648,28 @@ mod tests {
             disabled_at_ms: 0,
             ..Default::default()
         };
-        let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#, 10)
-            .unwrap()
-            .expect("planned");
+        let planned = plan(
+            &db,
+            &type_def,
+            "acme",
+            r#"{"object_id":"rec-abort"}"#,
+            None,
+            10,
+        )
+        .unwrap()
+        .expect("planned");
         let applied = apply(&db, planned, "alice", "", 10).unwrap();
         compensate(&db, &applied, "alice");
-        let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#, 20)
-            .unwrap()
-            .expect("planned after abort");
+        let planned = plan(
+            &db,
+            &type_def,
+            "acme",
+            r#"{"object_id":"rec-abort"}"#,
+            None,
+            20,
+        )
+        .unwrap()
+        .expect("planned after abort");
         apply(&db, planned, "alice", "", 20).unwrap();
         assert_eq!(
             db.get_object("rec-abort").unwrap().unwrap().kind,
@@ -595,6 +711,7 @@ mod tests {
             &create,
             "acme",
             r#"{"object_id":"rec-restore","city":"oslo"}"#,
+            None,
             10,
         )
         .unwrap()
@@ -610,6 +727,7 @@ mod tests {
             &update,
             "acme",
             r#"{"object_id":"rec-restore","city":"bergen"}"#,
+            None,
             20,
         )
         .unwrap()
@@ -634,5 +752,102 @@ mod tests {
                 .map(String::as_str),
             Some("oslo")
         );
+    }
+
+    #[test]
+    fn written_objects_inherit_the_action_marking_and_never_drop_their_own() {
+        let db = RuntimeDb::memory();
+        db.upsert_object_type(&ObjectType {
+            kind: "customer_record".into(),
+            description: "fixture".into(),
+            properties: vec![],
+            is_builtin: false,
+            implements: vec![],
+        })
+        .unwrap();
+        let create = GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "customer.record.create".into(),
+            version: "1".into(),
+            description: "create".into(),
+            parameter_schema_json: r#"{"type":"object"}"#.into(),
+            allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+            object_kind: "customer_record".into(),
+            object_mutation: OBJECT_MUTATION_CREATE.into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let marking = |planned: &Option<PlannedObjectMutation>| match planned {
+            Some(
+                PlannedObjectMutation::Create(object) | PlannedObjectMutation::Update(object, _),
+            ) => crate::sekai::markings::object_marking_token(object).map(str::to_string),
+            None => None,
+        };
+        // A created object carries the Action's marking.
+        let created = plan(
+            &db,
+            &create,
+            "acme",
+            r#"{"object_id":"rec-marked"}"#,
+            Some("confidential"),
+            10,
+        )
+        .unwrap();
+        assert_eq!(marking(&created).as_deref(), Some("confidential"));
+        apply(&db, created.unwrap(), "alice", "", 10).unwrap();
+        // An update cannot lower the object's marking through a parameter,
+        // and keeps the stricter of the object's and the Action's.
+        let update = GovernedActionType {
+            object_mutation: OBJECT_MUTATION_UPDATE.into(),
+            type_id: "customer.record.update".into(),
+            ..create
+        };
+        let lowered = plan(
+            &db,
+            &update,
+            "acme",
+            r#"{"object_id":"rec-marked","access_marking":"public"}"#,
+            Some("confidential"),
+            20,
+        )
+        .unwrap();
+        assert_eq!(marking(&lowered).as_deref(), Some("confidential"));
+        // The same marking spelled differently is the same marking.
+        assert!(
+            plan(
+                &db,
+                &update,
+                "acme",
+                r#"{"object_id":"rec-marked"}"#,
+                Some("CONFIDENTIAL"),
+                22,
+            )
+            .is_ok()
+        );
+        // An object marked above the instance changed after admission
+        // derived the marking; the Action would act below it.
+        assert!(matches!(
+            plan(
+                &db,
+                &update,
+                "acme",
+                r#"{"object_id":"rec-marked"}"#,
+                Some("internal"),
+                25,
+            ),
+            Err(ActionObjectMutationError::FailedPrecondition(message)) if message.contains("changed")
+        ));
+        // An unknown marking refuses the write.
+        assert!(matches!(
+            plan(
+                &db,
+                &update,
+                "acme",
+                r#"{"object_id":"rec-marked"}"#,
+                Some("ultra-secret"),
+                30,
+            ),
+            Err(ActionObjectMutationError::FailedPrecondition(_))
+        ));
     }
 }
