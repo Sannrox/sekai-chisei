@@ -25,6 +25,22 @@ pub(crate) struct EvaluationExecutionLifecycle {
 }
 
 impl EvaluationExecutionLifecycle {
+    /// The evaluator registries and budget executions run on, for eval
+    /// dataset runs.
+    pub(crate) fn registries(
+        &self,
+    ) -> (
+        Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
+        Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
+        Arc<BudgetTracker>,
+    ) {
+        (
+            self.evaluator_registry.clone(),
+            self.stochastic_evaluator_registry.clone(),
+            self.budget.clone(),
+        )
+    }
+
     pub(super) fn new(
         db: impl Into<crate::chisei_store::ChiseiStore>,
         budget: Arc<BudgetTracker>,
@@ -343,6 +359,16 @@ impl EvaluationExecutionLifecycle {
         })
         .await
         .map_err(|error| Status::internal(format!("evaluation worker failed: {error}")))?
+    }
+
+    /// Whether a stochastic policy may send to its provider under the
+    /// configured egress allowlist; eval dataset runs check it before any case.
+    pub(crate) fn stochastic_egress_allowed(
+        &self,
+        policy: &crate::chisei::evaluation_plan::StochasticEvaluatorPolicy,
+    ) -> bool {
+        policy.egress_policy != evaluation_plan_domain::STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL
+            || crate::chisei::privacy::provider_safe_to_send(&policy.provider, &self.safe_providers)
     }
 
     fn stochastic_egress_reasons(

@@ -692,6 +692,44 @@ message ExecuteEvaluationManifestRequest {
 message ExecuteEvaluationManifestResponse {
   EvaluationExecutionProjection execution = 1;
 }
+// One run of an eval dataset version (#1674) through a registered evaluator
+// definition, against a named agent, model and tool version. Started (and
+// restarted) by CI or the delivery plane per release; a restart with the
+// same run_id resumes, running only cases without a result.
+message RunEvalDatasetRequest {
+  string namespace = 1;
+  string run_id = 2;
+  string dataset = 3;
+  string dataset_version = 4;
+  string agent = 5;
+  string model = 6;
+  string tool_version = 7;
+  string evaluator_definition_id = 8;
+  uint32 concurrency = 9;
+  // The run's spending limit and the most one case may cost, in USD micros.
+  int64 budget_micros = 10;
+  int64 max_case_cost_micros = 11;
+}
+message EvalRunCaseLine {
+  string case_id = 1;
+  bool passed = 2;
+  string reason = 3;
+  uint64 input_tokens = 4;
+  uint64 output_tokens = 5;
+  int64 cost_micros = 6;
+}
+message RunEvalDatasetResponse {
+  // completed, budget_exhausted, or incomplete (some cases failed to run).
+  string status = 1;
+  uint32 cases_total = 2;
+  int64 spent_micros = 3;
+  // The cost ledger: one line per case with a result, from every start.
+  repeated EvalRunCaseLine ledger = 4;
+  repeated string unrun_case_ids = 5;
+  // Spend reserved for cases a crashed start never recorded: counted against
+  // the budget, not in the ledger.
+  int64 uncertain_micros = 6;
+}
 message CancelEvaluationExecutionRequest {
   string namespace = 1;
   string manifest_digest = 2;
@@ -1752,6 +1790,7 @@ service ChiseiService {
   rpc EvaluateGovernedSubject(EvaluateGovernedSubjectRequest) returns (EvaluateGovernedSubjectResponse);
   rpc ExportGovernedSubjectProvenance(ExportGovernedSubjectProvenanceRequest) returns (ExportGovernedSubjectProvenanceResponse);
   rpc ExecuteEvaluationManifest(ExecuteEvaluationManifestRequest) returns (ExecuteEvaluationManifestResponse);
+  rpc RunEvalDataset(RunEvalDatasetRequest) returns (RunEvalDatasetResponse);
   rpc CancelEvaluationExecution(CancelEvaluationExecutionRequest) returns (CancelEvaluationExecutionResponse);
   rpc AuthorizeExternalAction(AuthorizeExternalActionRequest) returns (AuthorizeExternalActionResponse);
   rpc TransitionExternalAction(TransitionExternalActionRequest) returns (TransitionExternalActionResponse);
