@@ -49,6 +49,7 @@ mod peer_import_store;
 pub mod postgres;
 pub(crate) mod postgres_receipt_chain;
 pub(crate) mod receipt_chain;
+pub mod sync_scope;
 pub mod transform_replay;
 #[cfg(test)]
 pub(crate) use postgres::ScratchDatabase;
@@ -99,6 +100,7 @@ mod postgres_schema;
 mod postgres_search_index;
 mod postgres_service_principal;
 mod postgres_source_registry;
+mod postgres_sync_scope;
 mod postgres_team_namespace;
 mod postgres_workflow_action;
 mod postgres_write_freeze;

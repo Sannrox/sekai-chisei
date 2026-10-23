@@ -133,6 +133,8 @@ lives in the separate [research index](research/README.md).
   `GetOntologyChangelog` for a reader and a window of at most 31 days.
 - [Media uploads](media-uploads.md) — experimental `BeginMediaUpload`,
   `UploadMediaChunk`, `CompleteMediaUpload`, `GetMediaUpload` and `ReadMedia`.
+- [Offline sync](offline-sync.md) — experimental `PutSyncScope`,
+  `ReadSyncSnapshot` and `ReadSyncDeltas`, contract `sekai.sync/v1`.
 - [Object comments](object-comments.md) — experimental
   `CreateObjectComment`, `UpdateObjectComment`, `ListObjectComments` and
   `ListCommentMentions` under the target's read policy.

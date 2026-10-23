@@ -42,6 +42,8 @@ mod schema_definition_lifecycle;
 mod scored_knowledge_admission;
 #[path = "search_rpc.rs"]
 mod search_rpc;
+#[path = "sync_scope_rpc.rs"]
+mod sync_scope_rpc;
 #[cfg(test)]
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
@@ -903,6 +905,27 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ReadMediaRequest>,
     ) -> Result<Response<ReadMediaResponse>, Status> {
         media_upload_rpc::read_media(self, req).await
+    }
+
+    async fn put_sync_scope(
+        &self,
+        req: Request<PutSyncScopeRequest>,
+    ) -> Result<Response<SyncScopeResponse>, Status> {
+        sync_scope_rpc::put_sync_scope(self, req).await
+    }
+
+    async fn read_sync_snapshot(
+        &self,
+        req: Request<ReadSyncSnapshotRequest>,
+    ) -> Result<Response<ReadSyncSnapshotResponse>, Status> {
+        sync_scope_rpc::read_sync_snapshot(self, req).await
+    }
+
+    async fn read_sync_deltas(
+        &self,
+        req: Request<ReadSyncDeltasRequest>,
+    ) -> Result<Response<ReadSyncDeltasResponse>, Status> {
+        sync_scope_rpc::read_sync_deltas(self, req).await
     }
 
     async fn create_object_comment(

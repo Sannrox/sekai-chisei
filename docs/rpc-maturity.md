@@ -173,6 +173,9 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.CompleteMediaUpload` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetMediaUpload` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ReadMedia` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.PutSyncScope` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ReadSyncSnapshot` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ReadSyncDeltas` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.FindPaths` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
