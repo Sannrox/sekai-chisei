@@ -347,7 +347,7 @@ mod tests {
                 .entry("GetGovernedSubjectProvenanceTrustRoot")
                 .is_none()
         );
-        assert_eq!(inventory.by_kind()["persistent"], 36);
+        assert_eq!(inventory.by_kind()["persistent"], 38);
         assert!(inventory.entry("PlanContentExecution").is_some());
         assert!(inventory.entry("ExecuteContentPlanStream").is_some());
         assert!(inventory.entry("GetOperationReceipt").is_some());

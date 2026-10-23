@@ -167,6 +167,8 @@ const DATASET_RUNS_SCHEMA: &str = include_str!("postgres/0096_chisei_dataset_run
 const SYNC_MEMBER_PROPERTIES_SCHEMA: &str =
     include_str!("postgres/0097_sync_member_properties.sql");
 const OBJECT_CHANGE_WRITER_SCHEMA: &str = include_str!("postgres/0098_object_change_writer.sql");
+const DATASET_RUN_ARTIFACTS_SCHEMA: &str =
+    include_str!("postgres/0099_chisei_dataset_run_artifacts.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -781,6 +783,12 @@ const MIGRATIONS: &[Migration] = &[
         "object_change_writer",
         OBJECT_CHANGE_WRITER_SCHEMA,
         MigrationOwner::Sekai,
+    ),
+    mig(
+        98,
+        "chisei_dataset_run_artifacts",
+        DATASET_RUN_ARTIFACTS_SCHEMA,
+        MigrationOwner::Chisei,
     ),
 ];
 

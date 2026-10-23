@@ -2,9 +2,12 @@ use super::*;
 use crate::chisei::model_release_evidence::{
     self, EvaluationTrustRoots, ModelReleaseFeedback, ModelReleaseIdentity, ModelRuntimeEvidence,
 };
+use crate::chisei_store::ChiseiEvaluationStore;
 use ed25519_dalek::SigningKey;
 
-fn require_release_admin(
+/// Release evidence, and binding an eval run to a release artifact, are
+/// credential administration.
+pub(super) fn require_release_admin(
     _service: &ChiseiServiceImpl,
     actor: &str,
     context: Option<&crate::enterprise::AuthenticatedContext>,
@@ -148,6 +151,45 @@ pub(super) async fn export_model_evaluation_evidence(
     let request = req.into_inner();
     let identity = parse_identity(request.identity)?;
     let key = evaluation_signing_key()?;
+    if !request.dataset_namespace.is_empty() {
+        let (comparison, candidate, artifact) = super::rpc_execution::compare_dataset_runs_bound(
+            service,
+            &request.dataset_namespace,
+            &request.baseline_run_id,
+            &request.candidate_run_id,
+            super::rpc_execution::comparison_gate(request.alpha, request.allow_policy_increase),
+        )
+        .await?;
+        // The model the candidate's evaluator ran on, if it ran on one.
+        let evaluator_model = service
+            .db
+            .get_evaluator_definition(&candidate.evaluator_definition_id)
+            .map_err(Status::internal)?
+            .filter(|definition| {
+                definition.namespace == candidate.namespace
+                    && definition.content_digest == candidate.evaluator_digest
+            })
+            .and_then(|definition| definition.stochastic_policy)
+            .map(|policy| format!("{}/{}", policy.provider, policy.model));
+        let evidence = model_release_evidence::export_evaluation_from_dataset_comparison(
+            &service.db,
+            identity,
+            &comparison,
+            &candidate,
+            artifact.as_deref(),
+            evaluator_model.as_deref(),
+            &key,
+            chrono::Utc::now().timestamp_millis(),
+            &actor,
+        )
+        .map_err(status_from)?;
+        return Ok(Response::new(ExportModelEvaluationEvidenceResponse {
+            evidence_json: serde_json::to_string(&evidence)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            comparison_json: serde_json::to_string(&comparison)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }));
+    }
     let evidence = model_release_evidence::export_evaluation_from_compare(
         &service.db,
         identity,
@@ -163,6 +205,7 @@ pub(super) async fn export_model_evaluation_evidence(
     Ok(Response::new(ExportModelEvaluationEvidenceResponse {
         evidence_json: serde_json::to_string(&evidence)
             .map_err(|error| Status::internal(error.to_string()))?,
+        comparison_json: String::new(),
     }))
 }
 
