@@ -159,6 +159,7 @@ const TRANSFORM_REPLAYS_SCHEMA: &str = include_str!("postgres/0089_transform_rep
 const CHISEI_POLICY_SHADOW_SCHEMA: &str = include_str!("postgres/0090_chisei_policy_shadow.sql");
 const FENCE_BINDINGS_SCHEMA: &str = include_str!("postgres/0091_fence_bindings.sql");
 const MEDIA_UPLOADS_SCHEMA: &str = include_str!("postgres/0092_media_uploads.sql");
+const SYNC_SCOPES_SCHEMA: &str = include_str!("postgres/0093_sync_scopes.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -743,6 +744,7 @@ const MIGRATIONS: &[Migration] = &[
         MEDIA_UPLOADS_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(92, "sync_scopes", SYNC_SCOPES_SCHEMA, MigrationOwner::Sekai),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;

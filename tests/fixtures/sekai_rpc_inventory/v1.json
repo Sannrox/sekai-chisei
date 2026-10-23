@@ -1345,6 +1345,48 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutSyncScope",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/sync_scope.rs",
+        "src/grpc/sync_scope_rpc.rs",
+        "docs/decisions/0124-offline-sync-scopes.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReadSyncSnapshot",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/sync_scope.rs",
+        "src/grpc/sync_scope_rpc.rs",
+        "docs/decisions/0124-offline-sync-scopes.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReadSyncDeltas",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/sekai/sync_scope.rs",
+        "src/grpc/sync_scope_rpc.rs",
+        "docs/decisions/0124-offline-sync-scopes.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExpandNeighborhood",
       "kind": "persistent",
       "surfaces": [

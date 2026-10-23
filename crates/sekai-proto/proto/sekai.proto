@@ -3668,6 +3668,13 @@ service SekaiService {
   rpc CompleteMediaUpload(CompleteMediaUploadRequest) returns (MediaUploadStatus);
   rpc GetMediaUpload(GetMediaUploadRequest) returns (MediaUploadStatus);
   rpc ReadMedia(ReadMediaRequest) returns (ReadMediaResponse);
+  // Offline sync scopes (#1632, ADR 0124), contract `sekai.sync/v1`.
+  // Experimental. A principal defines a scope, takes a snapshot of it, then
+  // reads deltas from the cursor the snapshot ends with. Every object passes
+  // the online read checks and is projected per property.
+  rpc PutSyncScope(PutSyncScopeRequest) returns (SyncScopeResponse);
+  rpc ReadSyncSnapshot(ReadSyncSnapshotRequest) returns (ReadSyncSnapshotResponse);
+  rpc ReadSyncDeltas(ReadSyncDeltasRequest) returns (ReadSyncDeltasResponse);
   rpc ExpandNeighborhood(ExpandNeighborhoodRequest) returns (ExpandNeighborhoodResponse);
   rpc FindPaths(FindPathsRequest) returns (FindPathsResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
@@ -3854,4 +3861,80 @@ message ReadMediaResponse {
   string media_type = 4;
   string file_name = 5;
   string access_marking = 6;
+}
+
+message SyncScopeLink {
+  string relation = 1;
+  // `outgoing` (default) or `incoming`.
+  string direction = 2;
+  // 1 or 2.
+  uint32 max_hops = 3;
+}
+
+message PutSyncScopeRequest {
+  // `sekai.sync/v1`.
+  string contract_version = 1;
+  string namespace = 2;
+  string scope_id = 3;
+  string kind = 4;
+  // At most 4; eq, gt, gte, lt or lte.
+  repeated PropertyFilter property_filters = 5;
+  // Also sync the objects linked to the matches by one relation.
+  SyncScopeLink link = 6;
+  // The scope's quota of visible objects, at most 5000.
+  uint32 max_objects = 7;
+}
+
+message SyncScopeResponse {
+  string contract_version = 1;
+  string namespace = 2;
+  string scope_id = 3;
+  uint32 max_objects = 4;
+}
+
+message ReadSyncSnapshotRequest {
+  string contract_version = 1;
+  string namespace = 2;
+  string scope_id = 3;
+  // Empty to start a snapshot; otherwise the previous next_page_token.
+  string page_token = 4;
+  // Default 50, at most 100.
+  uint32 limit = 5;
+}
+
+message ReadSyncSnapshotResponse {
+  string contract_version = 1;
+  repeated Object objects = 2;
+  // Empty on the last page.
+  string next_page_token = 3;
+  // Set on the last page: read deltas from here.
+  string cursor = 4;
+  // Members in the snapshot, including any no longer readable when sent.
+  uint32 total_objects = 5;
+}
+
+message ReadSyncDeltasRequest {
+  string contract_version = 1;
+  string namespace = 2;
+  string scope_id = 3;
+  string cursor = 4;
+  // Most object changes (upserts and removals) in this read: default 50,
+  // at most 100.
+  uint32 limit = 5;
+}
+
+message ReadSyncDeltasResponse {
+  string contract_version = 1;
+  // Objects to store or replace, as an online read shows them.
+  repeated Object upserts = 2;
+  // Objects to drop: deleted, hidden, or out of the scope.
+  repeated string removed_object_ids = 3;
+  // Read the next deltas from here. The previous cursor stays valid until
+  // this one is used.
+  string cursor = 4;
+  // More changes are waiting.
+  bool more = 5;
+  // The cursor cannot continue (expired, authorization or scope changed):
+  // take a new snapshot.
+  bool resnapshot_required = 6;
 }
