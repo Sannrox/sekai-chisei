@@ -1,4 +1,4 @@
-# ADR 0121: Catalog entries are governed objects, registered by stable source id
+# ADR 0122: Catalog entries are governed objects, registered by stable source id
 
 - Status: accepted
 - Date: 2026-10-22

@@ -1517,7 +1517,7 @@ fn spawn_admission_reconciler(
 }
 
 /// Keep object-type catalog entries in line with each published ontology
-/// (ADR 0121). Safe on every instance at once.
+/// (ADR 0122). Safe on every instance at once.
 fn spawn_catalog_reconciler(db: Arc<RuntimeDb>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));

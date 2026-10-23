@@ -1,4 +1,4 @@
-//! RegisterCatalogEntry (#1559, ADR 0121).
+//! RegisterCatalogEntry (#1559, ADR 0122).
 
 use super::*;
 use crate::sekai::catalog::{self, CatalogError, CatalogRegistration, EntryKind};

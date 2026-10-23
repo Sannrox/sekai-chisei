@@ -4,7 +4,7 @@
 //! describes, so reads, search, facets, markings and ACLs follow the ordinary
 //! object read policy and every write is in the audited object change log.
 //! Generic object writes refuse the kind; entries change only through
-//! registration, which is idempotent by the source's stable id (ADR 0121).
+//! registration, which is idempotent by the source's stable id (ADR 0122).
 
 use std::collections::BTreeMap;
 

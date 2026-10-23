@@ -1101,7 +1101,7 @@ fn validate_write(actor: &str, key: &str, now_ms: i64) -> Result<(), String> {
 }
 
 /// Whether `policies` names exactly the namespace's instantiated kinds.
-/// Catalog entries (ADR 0121) appear by themselves after a publish, so they
+/// Catalog entries (ADR 0122) appear by themselves after a publish, so they
 /// are not required; without a policy they stay unreadable in an activated
 /// namespace, which fails closed.
 pub(crate) fn activation_covers_kinds<V>(

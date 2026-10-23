@@ -1269,7 +1269,7 @@
       "evidence": [
         "src/sekai/catalog.rs",
         "src/grpc/catalog_rpc.rs",
-        "docs/decisions/0121-governed-catalog-entries.md"
+        "docs/decisions/0122-governed-catalog-entries.md"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"

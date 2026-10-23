@@ -4,7 +4,7 @@ Catalog entries describe datasets, object types and pipelines: owners,
 steward, tags, marking, schema summary, freshness and status. They are
 experimental; `RegisterCatalogEntry` needs `SEKAI_EXPERIMENTAL_RPCS=1` or the
 `experimental-rpcs` Cargo feature (see [rpc-maturity.md](rpc-maturity.md)).
-The design is [ADR 0121](decisions/0121-governed-catalog-entries.md).
+The design is [ADR 0122](decisions/0122-governed-catalog-entries.md).
 
 ## Reading
 
