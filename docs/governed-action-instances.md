@@ -190,6 +190,40 @@ receipt's `approval_decided` event after `DecideActionInstance`. A denied
 approval ends `denied` with `denied_by_approver`. The old denial is not
 emitted anymore.
 
+## Markings
+
+An instance carries the marking it was derived from (#1706): the least upper
+bound, under the namespace lattice, of the markings of the object its
+`object_id` parameter names, the object a binding submitted it for, and the
+binding's own `markings` (action and fence bindings). Admission reads them;
+an unknown or incomparable token refuses the submit. A binding's source
+object that no longer exists (a delete event) can no longer show its
+marking, so it counts as the namespace lattice's top (`restricted` without a
+lattice): a delete-triggered Action is never marked below the object it
+came from, and its `run_as` needs that clearance.
+
+- A submitter, or a binding's `run_as`, must be cleared for the marking the
+  instance would carry; otherwise the submit is refused (`access denied`, or
+  the binding's `access_denied` skip) before anything is admitted.
+- `GetActionInstance`, `ListActionInstances`, `SubmitActionInstance`
+  responses, the instance's effects, `ClaimActionWork` (and its heartbeat and
+  acknowledgement, so a revoked clearance stops a held claim) and
+  `DecideActionInstance` need clearance for the marking. Without it the
+  instance reads as missing (a decision is refused as `access denied`), and
+  an idempotent replay of a marked submit returns `NotFound`.
+- The receipt records the marking on its intent (`access_marking`), and so
+  do the distinct-store reservation receipt once it names the committed
+  instance and the commit projection Chisei builds from a lookup.
+  `GetOperationReceipt` asks Sekai whether the caller is cleared for any
+  receipt carrying a marking; a denial reads as missing. A Chisei plane that reaches Sekai over the remote fact
+  port cannot ask, so marked Action receipts are unreadable there until
+  remote clearance evaluation exists; unmarked receipts are unaffected.
+- An object the Action creates or updates carries the least upper bound of
+  its own marking, the marking a parameter sets, and the instance's, so an
+  Action can neither write below what it was derived from nor lower an
+  object's marking. An update applies only if the object is unchanged since
+  the Action planned it; otherwise the submit fails and can be retried.
+
 ## Dual-backend
 
 SQLite migrate-on-use and PostgreSQL migration

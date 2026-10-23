@@ -208,6 +208,7 @@ pub(super) async fn submit_action_instance(
         crate::enterprise::NamespaceAction::Write,
     )
     .unwrap_or_default();
+    let namespace_for_gate = namespace.clone();
     let admission_request = ActionInstanceAdmissionRequest {
         namespace,
         type_id: inner.type_id,
@@ -224,6 +225,9 @@ pub(super) async fn submit_action_instance(
             .and_then(|context| context.act.clone()),
         budget_already_reserved: false,
         resource_tenant,
+        binding_markings: Vec::new(),
+        source_object_id: String::new(),
+        marking_gate: submitter_marking_gate(service, &principals, &namespace_for_gate),
     };
     let tenant = acting_tenant(tenant_context.as_ref());
     let machine_credential = freeze_machine_credential(tenant_context.as_ref());
@@ -257,6 +261,11 @@ pub(super) async fn submit_action_instance(
             ActionInstanceAdmissionError::Internal(message) => Status::internal(message),
         })
     })?;
+    // The response carries the stored instance, which on a replay another
+    // principal may have submitted; a marked one needs clearance (#1706).
+    if !action_instance_passes_marking(service, &principals, &outcome.instance)? {
+        return Err(Status::not_found("action instance not found"));
+    }
     Ok(Response::new(SubmitActionInstanceResponse {
         instance: Some(to_proto_action_instance(&outcome.instance)),
         replay: outcome.replay,
@@ -302,6 +311,11 @@ pub(super) async fn decide_action_instance(
         false,
     )
     .map_err(|_| access_denied())?;
+    // A decider must be cleared for a marked instance (#1706); otherwise it
+    // is refused like any other, disclosing nothing.
+    if !action_instance_passes_marking(service, &principals, &instance)? {
+        return Err(access_denied());
+    }
     // ADR 0089: a named approver decides on authentication, tenant, and
     // entitlement alone; namespace Write is not required (#1146). The
     // namespace-admin fallback checks its own standing below.
@@ -752,6 +766,69 @@ pub(super) async fn list_action_instances(
     Ok(Response::new(ListActionInstancesResponse { instances }))
 }
 
+/// Whether `principals` are cleared for `instance`'s marking; unmarked
+/// instances always are.
+pub(super) fn action_instance_passes_marking(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    instance: &crate::sekai::action_instance::ActionInstance,
+) -> Result<bool, Status> {
+    cleared_for_marking(service, principals, &instance.namespace, &instance.marking)
+}
+
+/// Whether `principals` are cleared for `marking` in `namespace`, judged as
+/// an object carrying it there, so the lattice, clearances and trusted
+/// principals apply unchanged. An empty marking always is.
+pub(super) fn cleared_for_marking(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    marking: &str,
+) -> Result<bool, Status> {
+    cleared_for_marking_in(service.db.runtime(), principals, namespace, marking)
+}
+
+fn cleared_for_marking_in(
+    db: &RuntimeDb,
+    principals: &[String],
+    namespace: &str,
+    marking: &str,
+) -> Result<bool, Status> {
+    if marking.trim().is_empty() {
+        return Ok(true);
+    }
+    let carrier = domain::Object {
+        id: "action-instance-marking".into(),
+        kind: "action_instance".into(),
+        name: "action-instance-marking".into(),
+        namespace: namespace.to_string(),
+        external_id: String::new(),
+        properties: std::collections::HashMap::from([(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+            marking.to_string(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    object_passes_marking(db, &carrier, principals)
+}
+
+/// The clearance gate admission checks against the marking it derives
+/// (#1706): one cannot act on what one may not read.
+pub(super) fn submitter_marking_gate(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+) -> crate::sekai::action_instance_admission::MarkingGate {
+    let db = service.db.runtime_arc();
+    let principals = principals.to_vec();
+    let namespace = namespace.to_string();
+    crate::sekai::action_instance_admission::MarkingGate::new(move |marking| {
+        cleared_for_marking_in(&db, &principals, &namespace, marking)
+            .map_err(|status| status.message().to_string())
+    })
+}
+
 fn authorize_action_instance_visibility(
     service: &SekaiServiceImpl,
     principals: &[String],
@@ -774,6 +851,11 @@ fn authorize_action_instance_visibility(
         });
     if !entitled {
         return Err(denied());
+    }
+    // A marked instance (#1706) needs clearance for its marking, exactly as a
+    // marked object would; without it the instance reads as missing.
+    if !action_instance_passes_marking(service, principals, instance)? {
+        return Err(Status::not_found("action instance not found"));
     }
     if let Some(object_id) = action_instance_target_object_id(&instance.parameters_json) {
         let target_exists = service
@@ -1113,7 +1195,28 @@ fn authorize_claimed_work_call(
         &effect.namespace,
         true,
     )?;
-    enforce_service_principal_effect_type(service, tenant_context, effect)
+    enforce_service_principal_effect_type(service, tenant_context, effect)?;
+    require_cleared_for_effect(service, principals, effect)
+}
+
+/// Work of a marked instance is claimed, renewed and acknowledged only by
+/// hosts cleared for its marking (#1706), so a revoked clearance also stops
+/// a held claim; to others the effect is missing.
+fn require_cleared_for_effect(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    effect: &crate::sekai::action_effect::ActionEffect,
+) -> Result<(), Status> {
+    if let Some(instance) = service
+        .db
+        .runtime()
+        .get_action_instance(&effect.instance_id)
+        .map_err(Status::internal)?
+        && !action_instance_passes_marking(service, principals, &instance)?
+    {
+        return Err(Status::not_found("action effect not found"));
+    }
+    Ok(())
 }
 
 pub(super) async fn claim_action_work(
@@ -1148,6 +1251,7 @@ pub(super) async fn claim_action_work(
         true,
     )?;
     enforce_service_principal_effect_type(service, tenant_context.as_ref(), &existing)?;
+    require_cleared_for_effect(service, &principals, &existing)?;
     let actor = principals.first().cloned().unwrap_or_default();
     let now = now_millis();
     let claimed = ActionWorkLifecycle::new(service.db.runtime())

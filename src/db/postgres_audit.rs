@@ -86,10 +86,12 @@ impl PostgresDb {
     }
 
     /// Updates `object` with change rows stamped with `operation_id`, under
-    /// the same revision check as `update_object_with_audit_if_revision`.
+    /// the same revision check as `update_object_with_audit_if_revision`;
+    /// with `expected`, only if the stored object still matches it.
     pub fn update_object_for_operation(
         &self,
         object: &Object,
+        expected: Option<&Object>,
         actor: &str,
         operation_id: &str,
     ) -> Result<Option<Object>, String> {
@@ -97,12 +99,17 @@ impl PostgresDb {
         let Some(existing) = self.get_object(&object.id)? else {
             return Ok(None);
         };
+        if let Some(expected) = expected
+            && !existing.persisted_state_matches(expected)
+        {
+            return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+        }
         self.update_object_if_revision_inner(
             object,
             actor,
             existing.updated,
             None,
-            None,
+            expected,
             operation_id,
         )
     }

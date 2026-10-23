@@ -2052,6 +2052,9 @@ message ActionInstance {
   int64 review_sla_deadline_ms = 22;
   bool review_escalated = 23;
   bool agent_decision = 24;
+  // Derived at admission from the bound object and the binding; reading the
+  // instance needs clearance for it. Empty when unmarked.
+  string marking = 25;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;

@@ -693,6 +693,35 @@ pub(super) async fn get_operation_receipt(
             "operation receipt is not visible to this principal",
         ));
     }
+    // A marked governed Action's receipt needs clearance for the marking, as
+    // the instance does (#1706); Sekai decides it, and a denial reads as
+    // missing. Administrative inspection is judged like anyone else.
+    if let Some(marking) = receipt_marking(&receipt) {
+        let carrier = crate::domain::Object {
+            id: format!("operation-receipt:{}", receipt.operation_id),
+            kind: "operation_receipt".into(),
+            name: receipt.operation_id.clone(),
+            namespace: receipt.namespace.clone(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([(
+                crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+                marking.to_string(),
+            )]),
+            created: receipt.started_at_ms,
+            updated: receipt.started_at_ms,
+        };
+        let cleared =
+            service
+                .sekai_facts
+                .reader()
+                .marking_clearance(&receipt.operation_id, &carrier, &actor);
+        if !matches!(
+            cleared,
+            Ok(crate::chisei::principal::MarkingClearance::Cleared)
+        ) {
+            return Err(Status::not_found("operation receipt not found"));
+        }
+    }
     let completeness = receipt.completeness();
     let receipt_json =
         serde_json::to_string(&receipt).map_err(|error| Status::internal(error.to_string()))?;
@@ -706,6 +735,21 @@ pub(super) async fn get_operation_receipt(
             .collect(),
     }))
 }
+/// The marking a receipt records (#1706): a governed Action's on its intent,
+/// or a reservation or commit projection's for the instance it names.
+fn receipt_marking(receipt: &crate::chisei::receipt::OperationReceipt) -> Option<&str> {
+    receipt
+        .events
+        .iter()
+        .find_map(|event| {
+            event
+                .attributes
+                .get(crate::chisei::sekai_commit::RECEIPT_MARKING_ATTRIBUTE)
+        })
+        .map(String::as_str)
+        .filter(|marking| !marking.trim().is_empty())
+}
+
 pub(super) async fn get_quality_trend(
     service: &ChiseiServiceImpl,
     req: Request<GetQualityTrendRequest>,

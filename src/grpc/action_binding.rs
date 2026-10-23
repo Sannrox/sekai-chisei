@@ -39,6 +39,7 @@ impl SekaiServiceImpl {
             &binding.run_as,
             &binding.parameters.keys().cloned().collect::<Vec<_>>(),
         )?;
+        self.check_binding_markings(&binding.namespace, &binding.markings)?;
         let stored = self
             .db
             .runtime()
@@ -365,6 +366,35 @@ impl SekaiServiceImpl {
         Ok(Response::new(response))
     }
 
+    /// A binding's markings must be known to the namespace lattice and
+    /// comparable, so every Action it submits can carry their join (#1706).
+    pub(super) fn check_binding_markings(
+        &self,
+        namespace: &str,
+        markings: &[String],
+    ) -> Result<(), Status> {
+        const MAX_BINDING_MARKINGS: usize = 16;
+        if markings.is_empty() {
+            return Ok(());
+        }
+        if markings.len() > MAX_BINDING_MARKINGS {
+            return Err(Status::invalid_argument(format!(
+                "at most {MAX_BINDING_MARKINGS} binding markings are allowed"
+            )));
+        }
+        let lattice = self
+            .db
+            .runtime()
+            .get_classification_lattice(namespace)
+            .map_err(|_| Status::unavailable("classification lattice unavailable"))?;
+        crate::sekai::classification_lattice::union_input_marking_tokens(
+            lattice.as_ref(),
+            markings.iter().map(|token| Some(token.as_str())),
+        )
+        .map_err(|error| Status::invalid_argument(format!("binding markings: {error}")))?;
+        Ok(())
+    }
+
     /// Checks a binding's service principal before any event is read: its
     /// grants decide both what it reads and what it may submit, and a write
     /// freeze on its tenant or the resource tenant stops the run. Returns
@@ -446,9 +476,12 @@ impl SekaiServiceImpl {
                 return submission;
             }
         };
+        let markings = snapshot_markings(&binding.markings, object);
         match self.admit_bound_action(
             BoundAction {
                 namespace: &binding.namespace,
+                markings: &markings,
+                source_object_id: &event.object_id,
                 type_id: &binding.type_id,
                 version: &binding.version,
                 run_as: &binding.run_as,
@@ -492,6 +525,15 @@ impl SekaiServiceImpl {
             delegating_actor: None,
             budget_already_reserved: false,
             resource_tenant: resource_tenant.to_string(),
+            binding_markings: action.markings.to_vec(),
+            source_object_id: action.source_object_id.to_string(),
+            // The service principal must be cleared for what the instance
+            // carries (#1706), as any submitter is.
+            marking_gate: super::rpc_actions::submitter_marking_gate(
+                self,
+                &[action.run_as.to_string()],
+                action.namespace,
+            ),
         };
         let result = if let Some(clerk) = &self.cross_store {
             clerk.admit(request, action.run_as, now_millis(), tenant, true)
@@ -525,9 +567,27 @@ impl SekaiServiceImpl {
     }
 }
 
+/// The binding's markings and the marking of the object snapshot its
+/// parameters were read from (#1706), so the instance is never marked below
+/// the values it carries even if the object is declassified meanwhile.
+pub(super) fn snapshot_markings(
+    binding: &[String],
+    snapshot: Option<&domain::Object>,
+) -> Vec<String> {
+    let mut markings = binding.to_vec();
+    if let Some(token) = snapshot.and_then(crate::sekai::markings::object_marking_token) {
+        markings.push(token.to_string());
+    }
+    markings
+}
+
 /// One Action a binding submits for one event.
 pub(super) struct BoundAction<'a> {
     pub namespace: &'a str,
+    /// The binding's markings, joined into the instance's at admission.
+    pub markings: &'a [String],
+    /// The object the event concerns; admission reads its marking.
+    pub source_object_id: &'a str,
     pub type_id: &'a str,
     pub version: &'a str,
     pub run_as: &'a str,
@@ -569,6 +629,9 @@ pub(super) fn load_bound_objects(
         {
             continue;
         }
+        // Taken before projection, which may hide it from `principals`.
+        let snapshot_marking =
+            crate::sekai::markings::object_marking_token(&object).map(str::to_string);
         let mut object = service
             .db
             .runtime()
@@ -585,6 +648,15 @@ pub(super) fn load_bound_objects(
         object.properties.retain(|key, _| {
             property_keys.contains(key) && (reads_restricted || !restricted.contains(key))
         });
+        // The marking stays with the snapshot, so an Action built from it
+        // carries it (#1706). Bindings cannot map it, so it never reaches
+        // parameters.
+        if let Some(marking) = snapshot_marking {
+            object.properties.insert(
+                crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+                marking,
+            );
+        }
         visible.push(object);
     }
     Ok(visible)
@@ -682,6 +754,7 @@ mod tests {
                             ParameterSource::Property("severity".into()),
                         ),
                     ]),
+                    markings: Vec::new(),
                     enabled: true,
                     revision: 0,
                     created_by: String::new(),
@@ -811,6 +884,7 @@ mod tests {
                             ParameterSource::Property("severity".into()),
                         ),
                     ]),
+                    markings: Vec::new(),
                     enabled: true,
                     revision: 0,
                     created_by: String::new(),
