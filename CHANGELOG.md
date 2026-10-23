@@ -2,14 +2,22 @@
 
 ## Unreleased
 
-- Experimental governed catalog entries for datasets, object types and
-  pipelines: `RegisterCatalogEntry` records owners, steward, tags,
-  markings, schema summary, freshness and status, idempotently by the
-  source's stable id. Entries are `catalog_entry` objects, so reads and
-  search follow the ordinary read policy; only registration writes them,
-  markings only rise, and deregistration deprecates. A background
-  reconciler registers and retires entries for published object types
-  (ADR 0121, #1559).
+- Experimental fence bindings (ADR 0121): `PutFenceBinding` binds Ezu
+  geofence events (enter, exit, inside, dwell) for one collection to a
+  pinned governed Action type run as a service principal, and
+  `RunFenceBinding` submits one Action per bound event from a bounded page
+  after the binding's durable cursor. Submits are idempotent by Ezu event
+  id, approval policies park them, every event keeps a receipt with its id,
+  and `sekai_fence_binding_lag_ms` reports lag. Configure `SEKAI_EZU_URL`
+  and `EZU_TOKEN` (#1564).
+
+- Experimental signed definition packages: `ExportDefinitionPackage` signs a
+  published revision as a namespace-independent `sekai.definition-package/v1`
+  envelope, and `ImportDefinitionPackage` verifies it against the plane's
+  trusted package keys and opens a proposal holding exactly its members, with
+  `source_package_digest` recorded. Import never merges; tampered,
+  unverified, or incompatible packages are refused by name and write nothing
+  (docs/definition-branches.md, #1700).
 
 - Experimental live policy shadow: `StartPolicyShadow` evaluates a candidate
   namespace route policy beside the active one on every live resolution,
