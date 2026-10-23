@@ -125,6 +125,34 @@ pub(super) async fn explain_value(
         }
         offset += HISTORY_PAGE;
     }
+    // Authorization saw the object as read above. A write since may have
+    // raised its marking over rows read here: refuse rather than return them
+    // under the old check.
+    let unchanged = service
+        .db
+        .runtime()
+        .get_object(&object.id)
+        .map_err(Status::internal)?
+        .is_some_and(|now| {
+            (
+                now.updated,
+                &now.kind,
+                &now.name,
+                &now.namespace,
+                &now.properties,
+            ) == (
+                object.updated,
+                &object.kind,
+                &object.name,
+                &object.namespace,
+                &object.properties,
+            )
+        });
+    if !unchanged {
+        return Err(Status::aborted(
+            "the object changed while it was explained; retry",
+        ));
+    }
     // The store lists newest first; write order is the reverse.
     changes.reverse();
 

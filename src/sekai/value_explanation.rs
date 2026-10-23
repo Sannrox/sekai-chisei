@@ -90,6 +90,8 @@ pub fn field_history(
     let created_value = match edits.first() {
         Some(first) => Some(first.old_value.as_str()),
         None if current => Some(latest),
+        // The creation marker records `kind/name`, so a name is never lost.
+        None if field == "name" => created.new_value.split_once('/').map(|(_, name)| name),
         None => None,
     };
     let mut steps = Vec::new();
@@ -355,6 +357,10 @@ mod tests {
         // No row recorded the first incarnation's value, and the current
         // value is not it: unknown, not empty.
         assert_eq!(at(&rows, "properties.body", "third", 15), (None, 0));
+        // The creation marker keeps the first incarnation's name.
+        let history = field_history(&rows, "name", "n1", 15).unwrap();
+        assert_eq!(history.value.as_deref(), Some("n1"));
+        assert_eq!(history.steps.len(), 1);
         // Between the deletion and the re-creation there was no object.
         assert!(field_history(&rows, "properties.body", "third", 25).is_none());
     }

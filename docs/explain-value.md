@@ -15,7 +15,9 @@ found.
 The caller needs the same access as `ListObjectChanges`: namespace,
 collaboration scope, object ACL, active read policy and marking. A property
 the active policy does not grant is refused. Values are redacted as
-`ListObjectChanges` redacts them. Guest and shared-space callers, who see
+`ListObjectChanges` redacts them. A write between the access check and the
+history read aborts the request, to be retried, so no row escapes the check
+that admitted it. Guest and shared-space callers, who see
 filtered history, are refused: a write hidden from them would read as a gap.
 
 ## Chain
@@ -40,7 +42,7 @@ A step whose record the caller may not read, or whose record is gone, is
 reported as `hidden`. It keeps its time, field, value and writer kind, but no
 reference, receipt, actor or details. `complete` is true only when no step is
 hidden or unattributed and the value was recorded. Creation rows do not
-copy property values, so the value an earlier incarnation of a deleted and
+copy property values (they do record the name), so the value an earlier incarnation of a deleted and
 re-created object was created with is not recorded when no edit followed it;
 it reads empty and incomplete.
 
