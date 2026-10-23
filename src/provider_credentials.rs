@@ -102,6 +102,8 @@ fn env_name_for_provider(provider: &str) -> Option<&'static str> {
         "openai" => Some("OPENAI_API_KEY"),
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         "xai" => Some("XAI_API_KEY"),
+        // Bearer for the Ezu spatial engine that fence bindings read (#1564).
+        "ezu" => Some("EZU_TOKEN"),
         _ => None,
     }
 }

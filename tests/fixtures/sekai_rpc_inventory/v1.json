@@ -2075,6 +2075,30 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "PutFenceBinding",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/fence_binding.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "RunFenceBinding",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/fence_binding.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "DecideActionInstance",
       "kind": "persistent",
       "surfaces": [

@@ -8,6 +8,15 @@
   RPCs, so a composing platform can promote and roll back definitions with
   the caller's authority (#1700).
 
+- Experimental fence bindings (ADR 0121): `PutFenceBinding` binds Ezu
+  geofence events (enter, exit, inside, dwell) for one collection to a
+  pinned governed Action type run as a service principal, and
+  `RunFenceBinding` submits one Action per bound event from a bounded page
+  after the binding's durable cursor. Submits are idempotent by Ezu event
+  id, approval policies park them, every event keeps a receipt with its id,
+  and `sekai_fence_binding_lag_ms` reports lag. Configure `SEKAI_EZU_URL`
+  and `EZU_TOKEN` (#1564).
+
 - Experimental signed definition packages: `ExportDefinitionPackage` signs a
   published revision as a namespace-independent `sekai.definition-package/v1`
   envelope, and `ImportDefinitionPackage` verifies it against the plane's

@@ -75,6 +75,7 @@ mod postgres_embedding_index;
 mod postgres_event_stream;
 mod postgres_evidence;
 mod postgres_federation;
+pub(crate) mod postgres_fence_binding;
 mod postgres_function;
 mod postgres_governed_action_type;
 mod postgres_governed_subject_provenance;

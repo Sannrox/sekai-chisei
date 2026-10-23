@@ -56,6 +56,7 @@ pub mod federation_network;
 pub mod federation_profile;
 pub mod federation_revocation;
 pub mod feedback_package;
+pub mod fence_binding;
 pub mod function;
 pub mod function_document;
 pub mod geospatial;
