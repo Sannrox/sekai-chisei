@@ -393,6 +393,7 @@ impl SekaiDb {
         self.migrate_model_review()?;
         self.migrate_policy_shadow()?;
         self.migrate_eval_runs()?;
+        self.migrate_action_plans()?;
         self.migrate_model_release_evidence()?;
         self.migrate_usage_ledger()?;
         self.ensure_external_permit_tables()?;

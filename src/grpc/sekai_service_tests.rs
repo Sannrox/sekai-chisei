@@ -27338,3 +27338,173 @@ async fn sync_needs_the_device_proof_and_a_revoked_device_gets_only_wipe() {
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 }
+
+#[tokio::test]
+async fn plans_are_stored_simulated_through_preview_and_read_back() {
+    let svc = service();
+    grant_action_admin(&svc);
+    let db = svc.db.runtime();
+    db.upsert_object_type(&crate::sekai::schema::ObjectType {
+        kind: "customer_record".into(),
+        description: "fixture".into(),
+        properties: vec![],
+        is_builtin: false,
+        implements: vec![],
+    })
+    .unwrap();
+    db.create_object(&crate::domain::Object {
+        id: "cust-plan".into(),
+        kind: "customer_record".into(),
+        name: "Northwind".into(),
+        namespace: "acme".into(),
+        external_id: String::new(),
+        properties: HashMap::from([("title".into(), "account".into())]),
+        created: 10,
+        updated: 20,
+    })
+    .unwrap();
+    db.put_governed_action_type(
+        crate::sekai::governed_action_type::GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "customer.retitle".into(),
+            version: "1".into(),
+            description: "Retitle one customer".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"title":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            object_kind: "customer_record".into(),
+            object_mutation: "update".into(),
+            enabled: true,
+            ..Default::default()
+        },
+        "operator",
+        1,
+    )
+    .unwrap();
+
+    let intent_request = || CreatePlanIntentRequest {
+        namespace: "acme".into(),
+        intent_id: "intent-1".into(),
+        goal: "Retitle Northwind".into(),
+        constraints: vec![],
+    };
+    let intent = svc
+        .create_plan_intent(with_principal(intent_request()))
+        .await
+        .unwrap()
+        .into_inner()
+        .intent
+        .unwrap();
+    let retried = svc
+        .create_plan_intent(with_principal(intent_request()))
+        .await
+        .unwrap()
+        .into_inner()
+        .intent
+        .unwrap();
+    assert_eq!(retried, intent);
+    let conflict = svc
+        .create_plan_intent(with_principal(CreatePlanIntentRequest {
+            goal: "something else".into(),
+            ..intent_request()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+    svc.propose_plan(with_principal(ProposePlanRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-1".into(),
+        intent_id: "intent-1".into(),
+        steps: vec![PlanStep {
+            type_id: "customer.retitle".into(),
+            version: "1".into(),
+            object_id: "cust-plan".into(),
+            parameters_json: r#"{"object_id":"cust-plan","title":"vip"}"#.into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let simulation = svc
+        .simulate_plan(with_principal(SimulatePlanRequest {
+            namespace: "acme".into(),
+            plan_id: "plan-1".into(),
+            simulation_id: "sim-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .simulation
+        .unwrap();
+    assert!(simulation.digest.starts_with("sha256:"));
+    assert_eq!(simulation.steps[0].outcome, "valid");
+    assert_eq!(
+        simulation.steps[0]
+            .effect
+            .as_ref()
+            .unwrap()
+            .changed_properties,
+        ["title"]
+    );
+    // Nothing applied: no instance, the object keeps its title.
+    assert!(
+        db.list_action_instances("acme", None, None, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.get_object("cust-plan").unwrap().unwrap().properties["title"],
+        "account"
+    );
+
+    let read = svc
+        .get_plan(with_principal(GetPlanRequest {
+            namespace: "acme".into(),
+            plan_id: "plan-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.intent.unwrap(), intent);
+    assert_eq!(read.plan.unwrap().steps[0].object_id, "cust-plan");
+    assert_eq!(read.simulations, [simulation]);
+    let missing = svc
+        .get_plan(with_principal(GetPlanRequest {
+            namespace: "acme".into(),
+            plan_id: "nope".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+mod spawn_db_tests {
+    use super::*;
+    use crate::db::store::SekaiStore;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_db_does_not_block_the_tokio_worker() {
+        let service = SekaiServiceImpl::new(SekaiStore::memory());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = service.spawn_db(move || {
+            let _ = started_tx.send(());
+            release_rx
+                .recv()
+                .map_err(|_| Status::internal("release signal closed"))?;
+            Ok(())
+        });
+        let probe = async {
+            started_rx.await.expect("blocking work started");
+            tokio::task::yield_now().await;
+            let _ = release_tx.send(());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(blocking, probe);
+            result
+        })
+        .await
+        .expect("spawn_db blocked the Tokio worker")
+        .unwrap();
+    }
+}

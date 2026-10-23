@@ -1618,6 +1618,42 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "CreatePlanIntent",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ProposePlan",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "SimulatePlan",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetPlan",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GetActionInstance",
       "storage_path": "sekai.audit",
       "real_backend": "yes",

@@ -252,6 +252,10 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.RunFenceBinding` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
+| `SekaiService.CreatePlanIntent` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ProposePlan` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.SimulatePlan` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetPlan` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionInstances` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.GetActionEffect` | `sekai.audit` | yes | example | `stable` |
