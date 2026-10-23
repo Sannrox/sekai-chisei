@@ -26488,6 +26488,7 @@ async fn catalog_owners_curate_through_actions_and_markings_only_rise() {
                 page_token: String::new(),
                 page_size: 10,
                 source: "object".into(),
+                ..Default::default()
             },
             "tester",
         ))

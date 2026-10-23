@@ -1,21 +1,20 @@
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_object_security::load_active_policy_postgres;
 use crate::domain::Object;
-use crate::sekai::classification_lattice::{ClassificationLattice, evaluate_lattice_access};
+use crate::sekai::classification_lattice::ClassificationLattice;
 use crate::sekai::dataset::Dataset;
 use crate::sekai::markings::{
-    MarkingDecision, PrincipalAuthority, deny_unmarked_enabled, env_deny_unmarked,
-    is_trusted_service_principal, namespace_deny_unmarked, object_is_unmarked,
-    object_marking_token, parse_optional_classification, trusted_service_authority,
-    unmarked_access_decision,
+    MarkingDecision, deny_unmarked_enabled, env_deny_unmarked, is_trusted_service_principal,
+    namespace_deny_unmarked, object_is_unmarked, object_marking_token, unmarked_access_decision,
 };
 use crate::sekai::search_index::{
     ANALYZER_VERSION, SearchCandidate, SearchCandidateQuery, SearchCatchUpReport,
     SearchDatasetDump, SearchDocument, SearchDocumentKey, SearchIndex, SearchIndexDump,
     SearchIndexError, SearchIndexStatus, SearchObjectDump, SearchQueryMode, SearchRebuildReport,
-    SearchSourceKind, acl_allows, dataset_catalog_digest, dataset_classification_allows,
-    dataset_content_digest, live_object_match_fields, object_content_digest,
-    object_text_properties, policy_attributes, purpose_allows, search_tokens, text_matches_query,
+    SearchSourceKind, VectorCandidate, VectorCandidateQuery, acl_allows, dataset_catalog_digest,
+    dataset_classification_allows, dataset_content_digest, exact_vector_candidates,
+    live_object_match_fields, object_content_digest, object_text_properties, policy_attributes,
+    policy_marking_allows, purpose_allows, search_tokens, text_matches_query,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::MutexGuard;
@@ -28,39 +27,12 @@ fn query_uses_oversize_lexeme(text: &str) -> bool {
         .any(|token| token.len() > PG_MAX_LEXEME_BYTES)
 }
 
-fn search_authority(query: &SearchCandidateQuery) -> PrincipalAuthority {
-    let subject = query
-        .policy
-        .subjects
-        .iter()
-        .find(|subject| is_trusted_service_principal(subject))
-        .cloned()
-        .or_else(|| query.policy.subjects.first().cloned())
-        .unwrap_or_default();
-    if let Some(trusted) = trusted_service_authority(&subject) {
-        return trusted;
-    }
-    PrincipalAuthority {
-        principal: subject,
-        classification_ceiling: query
-            .policy
-            .clearance
-            .as_deref()
-            .and_then(|token| parse_optional_classification(token).ok().flatten()),
-        classification_token: query.policy.clearance.clone(),
-        allowed_purposes: BTreeSet::new(),
-        declassify_markings: BTreeSet::new(),
-    }
-}
-
 fn lattice_marking_allows(
     marking: &str,
     query: &SearchCandidateQuery,
     lattice: Option<&ClassificationLattice>,
 ) -> bool {
-    let token = (!marking.is_empty()).then_some(marking);
-    evaluate_lattice_access("search", token, &search_authority(query), lattice).decision
-        != MarkingDecision::Deny
+    policy_marking_allows(marking, &query.policy, lattice)
 }
 
 fn feed_covers_generation(
@@ -1494,6 +1466,26 @@ impl SearchIndex for PostgresDb {
 
     fn status(&self, namespace: &str, now_ms: i64) -> Result<SearchIndexStatus, SearchIndexError> {
         self.search_status(namespace, now_ms)
+    }
+
+    fn vector_candidates(
+        &self,
+        query: &VectorCandidateQuery,
+        keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
+    ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
+        use crate::sekai::embedding_index::EmbeddingStore;
+        // Exact over the chunk table, as on SQLite; Postgres has no lattice.
+        let namespace = &query.policy.namespace;
+        let chunks = self.embedding_chunks(namespace, &query.spec_id)?;
+        let policy = query.policy_query();
+        exact_vector_candidates(chunks, query, None, |candidate| {
+            let id = candidate.object_id.as_str();
+            Ok(self.grant_allows(id, &query.policy.subjects)?
+                && self
+                    .compiled_object_security_allows(namespace, id, "", &BTreeSet::new(), &policy)?
+                    .is_some()
+                && keep(candidate)?)
+        })
     }
 }
 
