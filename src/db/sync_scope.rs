@@ -54,11 +54,31 @@ pub(crate) fn parse_definition(raw: &str) -> Result<ScopeDefinition, SyncError> 
     serde_json::from_str(raw).map_err(storage)
 }
 
+/// A member's property names as stored: a JSON array, empty when unknown.
+pub(crate) fn properties_column(properties: &[String]) -> String {
+    if properties.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(properties).unwrap_or_default()
+    }
+}
+
+/// Stored property names; empty or unreadable is unknown.
+pub(crate) fn parse_properties_column(raw: &str) -> Vec<String> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
 impl SekaiDb {
     pub(crate) fn migrate_sync_scopes(&self) -> Result<(), String> {
         self.conn()
             .execute_batch(SCHEMA)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // Added for purges (#1633); stores created before it gain the column.
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_sync_members ADD COLUMN properties TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        Ok(())
     }
 
     fn put_sync_scope(&self, scope: &SyncScope) -> Result<SyncScope, SyncError> {
@@ -170,9 +190,14 @@ impl SekaiDb {
         if inserted > 0 {
             for member in &position.members {
                 tx.execute(
-                    "INSERT INTO sekai_sync_members (position_id, object_id, fingerprint)
-                     VALUES (?1, ?2, ?3)",
-                    params![position.position_id, member.object_id, member.fingerprint],
+                    "INSERT INTO sekai_sync_members (position_id, object_id, fingerprint, properties)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        position.position_id,
+                        member.object_id,
+                        member.fingerprint,
+                        properties_column(&member.properties)
+                    ],
                 )
                 .map_err(storage)?;
             }
@@ -206,7 +231,7 @@ impl SekaiDb {
         };
         let mut statement = conn
             .prepare(
-                "SELECT object_id, fingerprint FROM sekai_sync_members
+                "SELECT object_id, fingerprint, properties FROM sekai_sync_members
                  WHERE position_id = ?1 ORDER BY object_id",
             )
             .map_err(storage)?;
@@ -215,6 +240,7 @@ impl SekaiDb {
                 Ok(Member {
                     object_id: row.get(0)?,
                     fingerprint: row.get(1)?,
+                    properties: parse_properties_column(&row.get::<_, String>(2)?),
                 })
             })
             .map_err(storage)?
@@ -478,6 +504,7 @@ mod tests {
             members: vec![Member {
                 object_id: "a".into(),
                 fingerprint: "f1".into(),
+                properties: Vec::new(),
             }],
             successor: None,
             origin: None,
