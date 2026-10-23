@@ -83,6 +83,13 @@ pub struct ActionInstance {
     /// it, and objects it writes inherit it. Empty when unmarked.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub marking: String,
+    /// Set when the Action was prepared offline (#1580).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<crate::sekai::offline_action::OfflineSubmission>,
+    /// Set when an offline Action met an object changed past its base; the
+    /// instance is then denied with `offline_conflict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<crate::sekai::offline_action::ActionConflict>,
 }
 
 impl ActionInstance {
@@ -714,6 +721,8 @@ mod tests {
             decided_at_ms: 10,
             system_one_fill_json: String::new(),
             marking: String::new(),
+            conflict: None,
+            offline: None,
         }
     }
 

@@ -622,6 +622,7 @@ fn park_extraction(
                 binding_markings: Vec::new(),
                 source_object_id: String::new(),
                 marking_gate: Default::default(),
+                offline: None,
             },
             actor,
             now_ms,
@@ -1326,6 +1327,8 @@ mod tests {
                     admission_tenant: String::new(),
                     resource_tenant: String::new(),
                     marking: String::new(),
+                    conflict: None,
+                    offline: None,
                 })
                 .unwrap();
         }

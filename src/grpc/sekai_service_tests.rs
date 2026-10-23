@@ -797,6 +797,17 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::Unauthenticated);
     assert!(refused.message().contains("device proofs"), "{refused:?}");
+    // An RPC that checks the proof itself lets it through to its handler.
+    let bound_submit = IdentityAssertion {
+        nonce: "device-bound-submit".into(),
+        scopes: vec!["sekai.read".into(), "sekai.write".into()],
+        ..bound.clone()
+    };
+    let passed = interceptor.call(request(
+        &authority.sign(&bound_submit).unwrap(),
+        "SubmitActionInstance",
+    ));
+    assert!(passed.is_ok(), "{:?}", passed.err());
     let token = authority.sign(&claims("valid")).unwrap();
     let authenticated = interceptor
         .call(request(&token, "GetPublishedDefinitionRevision"))
@@ -7768,6 +7779,8 @@ async fn governed_action_type_registry_put_get_list_disable() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+        last_writer_wins_properties: Vec::new(),
+        offline_conflict: String::new(),
     };
     let put = svc
         .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
@@ -7912,6 +7925,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+        last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
     };
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(type_def),
@@ -7931,6 +7945,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec!["ev-1".into()],
             request_id: "req-1".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -7965,6 +7980,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec!["ev-1".into()],
             request_id: "req-1".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -7983,6 +7999,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec![],
             request_id: "req-1".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();
@@ -8027,6 +8044,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec![],
             request_id: "req-budget".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();
@@ -8062,6 +8080,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec![],
             request_id: "req-policy".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -8120,6 +8139,8 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             review_threshold: 0,
             review_pool: vec![],
             review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(),
+            offline_conflict: String::new(),
         }),
         request_id: "put-validated-action".into(),
     }))
@@ -8169,6 +8190,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
                 evidence_submission_ids: vec![],
                 request_id: format!("request-{key}"),
                 ontology_digest: String::new(),
+                offline: None,
             }))
             .await
             .unwrap_err();
@@ -8197,6 +8219,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             evidence_submission_ids: vec![],
             request_id: "request-duplicate-key".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();
@@ -8221,6 +8244,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             evidence_submission_ids: vec![],
             request_id: "request-valid".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -8273,6 +8297,7 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-nul".into(),
     }))
@@ -8289,6 +8314,7 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
             evidence_submission_ids: vec![],
             request_id: "req-nul".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();
@@ -8508,6 +8534,7 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-record".into(),
     }))
@@ -8526,6 +8553,7 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
             evidence_submission_ids: Vec::new(),
             request_id: "operation-record-grpc".into(),
             ontology_digest: digest.into(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -8594,6 +8622,7 @@ async fn submit_action_instance_propagates_one_operation_identity() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-record-corr".into(),
     }))
@@ -8613,6 +8642,7 @@ async fn submit_action_instance_propagates_one_operation_identity() {
                 evidence_submission_ids: Vec::new(),
                 request_id: operation_id.into(),
                 ontology_digest: digest.into(),
+                offline: None,
             },
             operation_id,
         ))
@@ -8673,6 +8703,7 @@ async fn submit_action_instance_rejects_mismatched_operation_header() {
                 evidence_submission_ids: Vec::new(),
                 request_id: "op-a".into(),
                 ontology_digest: String::new(),
+                offline: None,
             },
             "op-b",
         ))
@@ -8740,6 +8771,7 @@ async fn describe_and_preview_object_action_are_observational() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-update".into(),
     }))
@@ -8918,6 +8950,7 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-triage".into(),
     }))
@@ -9049,6 +9082,7 @@ async fn preview_records_typesafe_egress_after_admission() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-triage-fill".into(),
     }))
@@ -9179,6 +9213,7 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
             review_threshold: 0,
             review_pool: vec![],
             review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-triage-invalid-fill".into(),
     }))
@@ -13928,6 +13963,8 @@ fn intake_action_type(object_kind: &str) -> GovernedActionType {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+        last_writer_wins_properties: Vec::new(),
+        offline_conflict: String::new(),
     }
 }
 
@@ -14126,6 +14163,7 @@ async fn capability_discovery_omits_denied_action_and_catalog_submit_fails_close
         evidence_submission_ids: vec![],
         request_id: "req-catalog".into(),
         ontology_digest: String::new(),
+        offline: None,
     };
     let stale_version = svc
         .submit_action_instance(with_catalog_action(
@@ -14335,6 +14373,7 @@ async fn capability_discovery_rechecks_native_submit_type_id() {
         evidence_submission_ids: vec![],
         request_id: "req-native-submit".into(),
         ontology_digest: String::new(),
+        offline: None,
     };
     let admitted = svc
         .submit_action_instance(with_catalog_action(
@@ -17039,6 +17078,8 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         admission_tenant: String::new(),
         resource_tenant: String::new(),
         marking: String::new(),
+        conflict: None,
+        offline: None,
     }
 }
 
@@ -24085,6 +24126,7 @@ async fn write_freeze_blocks_machine_action_submit() {
             review_threshold: 0,
             review_pool: vec![],
             review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-freeze-dispatch".into(),
     }))
@@ -24115,6 +24157,7 @@ async fn write_freeze_blocks_machine_action_submit() {
         evidence_submission_ids: Vec::new(),
         request_id: "req-freeze-human".into(),
         ontology_digest: String::new(),
+        offline: None,
     }))
     .await
     .unwrap();
@@ -24129,6 +24172,7 @@ async fn write_freeze_blocks_machine_action_submit() {
             evidence_submission_ids: Vec::new(),
             request_id: "req-freeze-machine".into(),
             ontology_digest: String::new(),
+            offline: None,
         },
         "tester",
     );
@@ -26349,6 +26393,7 @@ async fn catalog_owners_curate_through_actions_and_markings_only_rise() {
                 evidence_submission_ids: Vec::new(),
                 request_id: format!("req-{key}"),
                 ontology_digest: String::new(),
+                offline: None,
             },
             principal,
         ))
@@ -26500,6 +26545,33 @@ async fn embedding_specs_need_a_credential_admin_and_a_hosted_route() {
     };
     assert!(delete().await.unwrap().into_inner().deleted);
     assert!(!delete().await.unwrap().into_inner().deleted);
+}
+
+#[tokio::test]
+async fn an_offline_submit_needs_a_device_bound_credential() {
+    // #1580: an Action prepared offline is accepted only with the device's
+    // proof, so a request without a device-bound credential is refused
+    // before admission.
+    let svc = service();
+    let mut request = Request::new(crate::grpc::pb::sekai::SubmitActionInstanceRequest {
+        namespace: "acme".into(),
+        type_id: "customer.record.update".into(),
+        version: "1".into(),
+        parameters_json: r#"{"object_id":"rec-1","title":"final"}"#.into(),
+        idempotency_key: "offline-1".into(),
+        offline: Some(crate::grpc::pb::sekai::OfflineSubmission {
+            prepared_at_ms: 1,
+            base_updated_ms: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    request
+        .metadata_mut()
+        .insert("x-principal", MetadataValue::from_static("alice"));
+    let refused = svc.submit_action_instance(request).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated, "{refused:?}");
+    assert!(refused.message().contains("device"), "{refused:?}");
 }
 
 #[tokio::test]

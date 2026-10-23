@@ -534,6 +534,7 @@ impl SekaiServiceImpl {
                 &[action.run_as.to_string()],
                 action.namespace,
             ),
+            offline: None,
         };
         let result = if let Some(clerk) = &self.cross_store {
             clerk.admit(request, action.run_as, now_millis(), tenant, true)

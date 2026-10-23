@@ -58,6 +58,13 @@ pub struct GovernedActionType {
     /// Optional review queue for parked instances (#1455).
     #[serde(default)]
     pub review_queue: crate::sekai::review_queue::ReviewQueueSpec,
+    /// How an Action prepared offline meets a changed object (#1580):
+    /// `reject_any` (empty), `reject_touched` or `last_writer_wins`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub offline_conflict: String,
+    /// The properties `last_writer_wins` may overwrite.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_writer_wins_properties: Vec<String>,
     pub enabled: bool,
     pub created_by: String,
     pub created_at_ms: i64,
@@ -67,6 +74,10 @@ pub struct GovernedActionType {
 
 impl GovernedActionType {
     pub fn validate(&self) -> Result<(), String> {
+        crate::sekai::offline_action::validate_rule(
+            &self.offline_conflict,
+            &self.last_writer_wins_properties,
+        )?;
         if self.namespace.trim().is_empty() {
             return Err("namespace required".into());
         }
@@ -225,6 +236,17 @@ pub(crate) fn body_fingerprint(t: &GovernedActionType) -> Result<String, String>
         "system_one": t.system_one,
         "review_queue": t.review_queue,
     });
+    // Added after types were stored: only a set rule enters the
+    // fingerprint, so every stored type keeps its fingerprint.
+    let mut body = body;
+    if !t.offline_conflict.is_empty() || !t.last_writer_wins_properties.is_empty() {
+        let object = body.as_object_mut().expect("fingerprint body is an object");
+        object.insert("offline_conflict".into(), t.offline_conflict.clone().into());
+        object.insert(
+            "last_writer_wins_properties".into(),
+            t.last_writer_wins_properties.clone().into(),
+        );
+    }
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }
 

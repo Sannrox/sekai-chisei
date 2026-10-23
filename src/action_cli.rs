@@ -98,6 +98,11 @@ struct TypeFile {
     /// Principals who may decide a parked instance (#1084).
     #[serde(default)]
     approvers: Vec<String>,
+    /// Conflict rule for Actions prepared offline (#1580).
+    #[serde(default)]
+    offline_conflict: String,
+    #[serde(default)]
+    last_writer_wins_properties: Vec<String>,
     #[serde(default)]
     review_queue_id: String,
     #[serde(default)]
@@ -229,6 +234,8 @@ fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxE
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            last_writer_wins_properties: parsed.last_writer_wins_properties,
+            offline_conflict: parsed.offline_conflict,
         },
         request_id,
     ))

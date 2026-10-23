@@ -545,6 +545,7 @@ mod tests {
             binding_markings: Vec::new(),
             source_object_id: String::new(),
             marking_gate: Default::default(),
+            offline: None,
         }
     }
 
