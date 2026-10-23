@@ -26,6 +26,7 @@ use sekai_domain::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -39,6 +40,10 @@ thread_local! {
 pub(crate) fn fail_next_record_admission() {
     FAIL_NEXT_RECORD_ADMISSION.with(|flag| flag.set(true));
 }
+
+/// Receipt attribute naming the marking reading the receipt needs (#1706):
+/// a governed Action's intent, and the Chisei receipts that project it.
+pub const RECEIPT_MARKING_ATTRIBUTE: &str = "access_marking";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ActionInstanceAdmissionRequest {
@@ -57,6 +62,47 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     /// Shared-space owner tenant for freeze matching. Empty when the write
     /// is not through a named space.
     pub resource_tenant: String,
+    /// Markings of the binding that submits (#1706); joined with the bound
+    /// object's marking into the instance's. Empty for direct submits.
+    pub binding_markings: Vec<String>,
+    /// The object a binding submitted for, when its parameters need not
+    /// name it; admission reads its marking (#1706). Empty otherwise.
+    pub source_object_id: String,
+    /// Whether the submitter is cleared for the instance's marking; the
+    /// transport adapter supplies it, since it owns principal resolution.
+    pub marking_gate: MarkingGate,
+}
+
+/// Clearance check admission runs against the marking it derives (#1706).
+/// The default admits every marking, for internal admissions that act for
+/// no caller (synthetic apply, workflows).
+#[derive(Clone, Default)]
+pub(crate) struct MarkingGate(Option<Arc<MarkingCheck>>);
+
+type MarkingCheck = dyn Fn(&str) -> Result<bool, String> + Send + Sync;
+
+impl MarkingGate {
+    pub(crate) fn new(
+        check: impl Fn(&str) -> Result<bool, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Some(Arc::new(check)))
+    }
+
+    fn allows(&self, marking: &str) -> Result<bool, String> {
+        match &self.0 {
+            Some(check) if !marking.trim().is_empty() => check(marking),
+            _ => Ok(true),
+        }
+    }
+}
+
+impl std::fmt::Debug for MarkingGate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("MarkingGate")
+            .field(&self.0.is_some())
+            .finish()
+    }
 }
 
 /// Grant or deny of a parked instance (#1084). The transport adapter
@@ -184,6 +230,26 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ));
             }
             return self.completed_replay(existing, now);
+        }
+
+        // The marking the instance will carry (#1706), derived here, the one
+        // place it is authoritative, and the submitter must be cleared for
+        // it before anything is reserved, charged or written.
+        let marking = derive_instance_marking(
+            self.db,
+            &namespace,
+            &request.parameters_json,
+            &request.source_object_id,
+            &request.binding_markings,
+        )?;
+        if !request
+            .marking_gate
+            .allows(&marking)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+        {
+            return Err(ActionInstanceAdmissionError::PermissionDenied(
+                "access denied".into(),
+            ));
         }
 
         let agent_action = crate::sekai::write_freeze::actor_is_agent(
@@ -479,6 +545,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             agent_action,
             admission_tenant: tenant.as_ref().to_string(),
             resource_tenant: request.resource_tenant.clone(),
+            marking,
         };
         let planned_effects = if status == STATUS_ADMITTED {
             let force_notify_fail =
@@ -533,6 +600,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &type_def,
                 &stored.namespace,
                 &stored.parameters_json,
+                Some(&stored.marking),
                 now,
             ) {
                 Ok(None) => None,
@@ -889,6 +957,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             &type_def,
             &instance.namespace,
             &instance.parameters_json,
+            Some(&instance.marking),
             now,
         )
         .map_err(map_object_mutation_error)?;
@@ -1299,6 +1368,11 @@ impl<'a> ActionInstanceAdmission<'a> {
         if !evidence_ids.is_empty() {
             intent_attributes.insert("evidence_submission_ids".into(), evidence_ids.join(","));
         }
+        // The receipt carries the instance's marking, so reading it needs the
+        // same clearance as reading the instance (#1706).
+        if !stored.marking.is_empty() {
+            intent_attributes.insert(RECEIPT_MARKING_ATTRIBUTE.into(), stored.marking.clone());
+        }
         if let Some(applied) = applied_object {
             intent_attributes.insert("object_id".into(), applied.object_id.clone());
             intent_attributes.insert("object_kind".into(), applied.object_kind.clone());
@@ -1565,6 +1639,98 @@ fn object_for_admitted_instance(
         .map_err(ActionInstanceAdmissionError::Internal)
 }
 
+/// The instance's marking (#1706): the least upper bound of the markings of
+/// the object its parameters name, the object a binding submitted for, and
+/// the binding's own, under the namespace lattice, all read here at
+/// admission, together with any marking the parameters set on the object
+/// they write. A binding's source object that no longer exists (a delete
+/// event) can no longer show its marking, so it counts as the lattice's top
+/// rather than as unmarked. Unknown or incomparable tokens refuse the
+/// admission rather than drop a marking.
+pub(crate) fn derive_instance_marking(
+    db: &RuntimeDb,
+    namespace: &str,
+    parameters_json: &str,
+    source_object_id: &str,
+    binding_markings: &[String],
+) -> Result<String, ActionInstanceAdmissionError> {
+    let lattice = db
+        .get_classification_lattice(namespace)
+        .map_err(ActionInstanceAdmissionError::Internal)?;
+    let mut tokens = Vec::new();
+    for (object_id, is_source) in [
+        (target_object_id(parameters_json), false),
+        (source_object_id.to_string(), true),
+    ] {
+        if object_id.trim().is_empty() {
+            continue;
+        }
+        match db
+            .get_object(&object_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+        {
+            Some(object) => {
+                if let Some(token) = crate::sekai::markings::object_marking_token(&object) {
+                    tokens.push(token.to_string());
+                }
+            }
+            None if is_source => tokens.push(top_marking(lattice.as_ref())?),
+            None => {}
+        }
+    }
+    // A marking the parameters set on the object they write (document
+    // extraction carries the document's) is part of what the Action holds.
+    if let Some(token) = serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get(crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY))
+        // As the object write stores it: numbers and booleans as text.
+        .and_then(|value| match value {
+            serde_json::Value::String(text) => Some(text.trim().to_string()),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            serde_json::Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        })
+        .filter(|token| !token.is_empty())
+    {
+        tokens.push(token);
+    }
+    tokens.extend(binding_markings.iter().cloned());
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let (_, joined) = crate::sekai::classification_lattice::union_input_marking_tokens(
+        lattice.as_ref(),
+        tokens.iter().map(|token| Some(token.as_str())),
+    )
+    .map_err(|error| {
+        ActionInstanceAdmissionError::FailedPrecondition(format!("action marking: {error}"))
+    })?;
+    Ok(joined.unwrap_or_default())
+}
+
+/// The highest marking of the namespace: the join of every lattice token, or
+/// `restricted` without a lattice. Refuses when the tokens have no single
+/// upper bound.
+fn top_marking(
+    lattice: Option<&crate::sekai::classification_lattice::ClassificationLattice>,
+) -> Result<String, ActionInstanceAdmissionError> {
+    let unknown = || {
+        ActionInstanceAdmissionError::FailedPrecondition(
+            "action marking: the deleted source's marking is unknown".into(),
+        )
+    };
+    let Some(lattice) = lattice else {
+        return Ok("restricted".into());
+    };
+    let (_, top) = crate::sekai::classification_lattice::union_input_marking_tokens(
+        Some(lattice),
+        lattice.tokens.iter().map(|token| Some(token.as_str())),
+    )
+    .map_err(|_| unknown())?;
+    top.ok_or_else(unknown)
+}
+
 /// Digest of the object named by `object_id` in the parameters, taken when an
 /// instance parks. Any change to that object before a grant denies the
 /// instance instead of applying against state the submitter never saw.
@@ -1806,6 +1972,9 @@ mod tests {
             delegating_actor: Some("origin-user".into()),
             budget_already_reserved: false,
             resource_tenant: String::new(),
+            binding_markings: Vec::new(),
+            source_object_id: String::new(),
+            marking_gate: Default::default(),
         }
     }
 
@@ -2700,6 +2869,9 @@ mod tests {
                     delegating_actor: None,
                     budget_already_reserved: false,
             resource_tenant: String::new(),
+            binding_markings: Vec::new(),
+            source_object_id: String::new(),
+            marking_gate: Default::default(),
                 },
                 "alice",
                 10,
@@ -2871,6 +3043,9 @@ mod tests {
             delegating_actor: None,
             budget_already_reserved: false,
             resource_tenant: String::new(),
+            binding_markings: Vec::new(),
+            source_object_id: String::new(),
+            marking_gate: Default::default(),
         }
     }
 
@@ -4121,6 +4296,7 @@ mod tests {
             agent_action: false,
             admission_tenant: String::new(),
             resource_tenant: String::new(),
+            marking: String::new(),
         };
         db.put_action_instance(&reserved).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);

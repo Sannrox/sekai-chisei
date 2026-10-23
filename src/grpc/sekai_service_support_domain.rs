@@ -504,6 +504,7 @@ pub(super) fn to_proto_action_instance(
         review_sla_deadline_ms: domain.review.sla_deadline_ms,
         review_escalated: domain.review.escalated,
         agent_decision: domain.review.agent_decision,
+        marking: domain.marking.clone(),
     }
 }
 pub(super) fn to_proto_action_effect(

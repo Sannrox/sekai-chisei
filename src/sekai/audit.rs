@@ -1049,14 +1049,16 @@ impl SekaiDb {
         self.update_object_inner(object, expected, actor, expected_policy_generation, "")
     }
 
-    /// Updates `object` with change rows stamped with `operation_id`.
+    /// Updates `object` with change rows stamped with `operation_id`; with
+    /// `expected`, only if the stored object still matches it.
     pub fn update_object_for_operation(
         &self,
         object: &Object,
+        expected: Option<&Object>,
         actor: &str,
         operation_id: &str,
     ) -> Result<Option<Object>, String> {
-        self.update_object_inner(object, None, actor, None, operation_id)
+        self.update_object_inner(object, expected, actor, None, operation_id)
     }
 
     fn update_object_inner(

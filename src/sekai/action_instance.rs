@@ -77,6 +77,12 @@ pub struct ActionInstance {
     /// acting tenant. Parked grant and ack keep checking it.
     #[serde(default)]
     pub resource_tenant: String,
+    /// The marking derived at admission (#1706): the least upper bound of
+    /// the bound object's marking and the submitting binding's markings.
+    /// Reading the instance, its effects or its receipt needs clearance for
+    /// it, and objects it writes inherit it. Empty when unmarked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub marking: String,
 }
 
 impl ActionInstance {
@@ -701,6 +707,7 @@ mod tests {
             created_at_ms: 10,
             decided_at_ms: 10,
             system_one_fill_json: String::new(),
+            marking: String::new(),
         }
     }
 

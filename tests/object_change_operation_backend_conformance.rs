@@ -28,7 +28,7 @@ macro_rules! harness {
                 object: &Object,
                 operation_id: &str,
             ) -> Result<Option<Object>, String> {
-                self.update_object_for_operation(object, "conformance", operation_id)
+                self.update_object_for_operation(object, None, "conformance", operation_id)
             }
             fn delete(&self, id: &str) -> Result<Option<Object>, String> {
                 self.delete_object_with_audit(id, "conformance")

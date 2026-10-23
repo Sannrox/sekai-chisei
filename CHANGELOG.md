@@ -64,6 +64,14 @@
   are recorded as decisions (docs/policy-dry-run.md,
   `0090_chisei_policy_shadow`, GATE:mig, #1630).
 
+- Governed Action instances carry the marking they were derived from: the
+  least upper bound of the bound object's marking and the submitting
+  binding's `markings` (action and fence bindings), read at admission and
+  failing closed on unknown tokens. Reading the instance, its effects or its
+  operation receipt needs clearance for it, and a caller without it sees the
+  instance as missing. Objects an Action writes inherit the marking, and an
+  Action parameter can no longer lower an object's marking (#1706).
+
 - Versioned eval datasets (`chisei.eval-dataset/v1`) generated
   deterministically from synthetic tenant seeds and checked-in case
   templates: the version follows the digest, so the same seed gives the same
