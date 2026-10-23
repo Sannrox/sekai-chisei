@@ -582,6 +582,54 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutEmbeddingSpec",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/embedding_spec_rpc.rs",
+        "src/db/embedding_index.rs",
+        "src/db/postgres_embedding_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListEmbeddingSpecs",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/embedding_spec_rpc.rs",
+        "src/db/embedding_index.rs",
+        "src/db/postgres_embedding_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DeleteEmbeddingSpec",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/embedding_spec_rpc.rs",
+        "src/db/embedding_index.rs",
+        "src/db/postgres_embedding_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutObjectTypeIndexEdit",
       "kind": "persistent",
       "surfaces": [

@@ -1542,13 +1542,65 @@ fn spawn_service_background_tasks(
     }
     if plane.serves_sekai() {
         spawn_catalog_reconciler(db.clone());
-        spawn_execution_evidence_reconciler(db);
+        spawn_execution_evidence_reconciler(db.clone());
     }
     if plane == ProcessPlane::Combined
         && let Some(clerk) = &sekai_svc.cross_store
     {
         spawn_admission_reconciler(clerk.clone());
     }
+    if plane == ProcessPlane::Combined {
+        spawn_embedding_catch_up(db.clone(), chisei_svc.clone());
+    }
+}
+
+/// Embed every stored spec on a schedule (#1609). Combined mode only: it
+/// needs the Sekai change feed and the Chisei route catalog. Safe on every
+/// instance at once; catch-up writes are fenced per spec.
+fn spawn_embedding_catch_up(db: Arc<RuntimeDb>, chisei: Arc<chisei_service::ChiseiServiceImpl>) {
+    use crate::composition::embedding_catch_up::catch_up_stored_specs;
+    use crate::sekai::embedding_index::EmbeddingError;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let route = |stored: crate::sekai::embedding_index::StoredEmbeddingSpec| {
+                let chisei = chisei.clone();
+                async move {
+                    chisei
+                        .hosted_embedder(&stored.spec.namespace, &stored.model)
+                        .map_err(|status| EmbeddingError::Refused(status.message().to_string()))
+                }
+            };
+            let now = || chrono::Utc::now().timestamp_millis();
+            // Another pass while any spec has more pending, up to a bound.
+            for _ in 0..8 {
+                let outcomes = match catch_up_stored_specs(&db, &route, &now).await {
+                    Ok(outcomes) => outcomes,
+                    Err(error) => {
+                        tracing::error!(%error, "embedding specs unavailable");
+                        break;
+                    }
+                };
+                let mut more = false;
+                for (stored, outcome) in outcomes {
+                    match outcome {
+                        Ok(report) => more |= report.more,
+                        Err(EmbeddingError::Conflict(_)) => {}
+                        Err(error) => tracing::warn!(
+                            namespace = %stored.spec.namespace,
+                            spec = %stored.spec.id,
+                            %error,
+                            "embedding catch-up failed; retrying next pass"
+                        ),
+                    }
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn spawn_admission_reconciler(

@@ -65,5 +65,10 @@ to be computed, and it outlives the text it came from unless it follows edits.
 ## Consequences
 
 Both community backends store the same three tables (chunks, checkpoints,
-rebuilds). A route-backed embedder, a spec registry and the search API over
-vectors are separate changes.
+rebuilds). The search API over vectors is a separate change.
+
+Amended by #1609: specs are stored per namespace (`sekai_embedding_specs`)
+and name a hosted catalog route as their model. Combined mode runs catch-up
+on a schedule over every stored spec, admitting each route as hosted
+execution does; the route is external unless its origin is loopback. See
+[embedding-index.md](../embedding-index.md).

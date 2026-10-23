@@ -4,7 +4,8 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::embedding_index::{
     EMBEDDING_REVISION_CONFLICT, EmbeddingCheckpoint, EmbeddingChunk, EmbeddingRebuild,
-    EmbeddingSource, EmbeddingStore, ObjectEmbeddings, vector_bytes, vector_from_bytes,
+    EmbeddingSource, EmbeddingSpec, EmbeddingStore, ObjectEmbeddings, StoredEmbeddingSpec,
+    vector_bytes, vector_from_bytes,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -34,6 +35,19 @@ CREATE TABLE IF NOT EXISTS sekai_embedding_checkpoints (
     updated_at_ms INTEGER NOT NULL,
     PRIMARY KEY (namespace, spec_id)
 );
+CREATE TABLE IF NOT EXISTS sekai_embedding_specs (
+    namespace TEXT NOT NULL,
+    spec_id TEXT NOT NULL,
+    object_kind TEXT NOT NULL,
+    properties TEXT NOT NULL,
+    chunk_chars INTEGER NOT NULL,
+    dimension INTEGER NOT NULL,
+    batch_size INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (namespace, spec_id)
+);
 CREATE TABLE IF NOT EXISTS sekai_embedding_rebuilds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     namespace TEXT NOT NULL,
@@ -44,6 +58,57 @@ CREATE TABLE IF NOT EXISTS sekai_embedding_rebuilds (
     rebuilt_at_ms INTEGER NOT NULL
 );
 ";
+
+/// Put moves the spec's checkpoint revision on (creating the row), so a
+/// catch-up that listed the spec earlier is fenced out; see
+/// [`StoredEmbeddingSpec::revision`]. It also ends any rebuild lease.
+const BUMP_SPEC_CHECKPOINT_SQLITE: &str = "INSERT INTO sekai_embedding_checkpoints
+     (namespace, spec_id, spec_digest, last_change_rowid, last_generation, revision,
+      updated_at_ms)
+     VALUES (?1, ?2, '', 0, 0, 1, 0)
+     ON CONFLICT(namespace, spec_id) DO UPDATE SET revision = revision + 1, updated_at_ms = 0";
+
+/// Source properties are stored as a JSON array.
+pub(crate) fn join_properties(properties: &[String]) -> String {
+    serde_json::to_string(properties).unwrap_or_else(|_| "[]".into())
+}
+
+pub(crate) fn split_properties(stored: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str(stored).map_err(|error| error.to_string())
+}
+
+/// A spec row: namespace, id, kind, properties, chunk_chars, dimension,
+/// batch_size, model, updated_by, updated_at_ms, checkpoint revision.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stored_spec(
+    namespace: String,
+    id: String,
+    object_kind: String,
+    properties: &str,
+    chunk_chars: i64,
+    dimension: i64,
+    batch_size: i64,
+    model: String,
+    updated_by: String,
+    updated_at_ms: i64,
+    revision: i64,
+) -> Result<StoredEmbeddingSpec, String> {
+    Ok(StoredEmbeddingSpec {
+        spec: EmbeddingSpec {
+            id,
+            namespace,
+            object_kind,
+            properties: split_properties(properties)?,
+            chunk_chars: chunk_chars.max(0) as usize,
+            dimension: dimension.max(0) as usize,
+            batch_size: batch_size.max(0) as usize,
+        },
+        model,
+        updated_by,
+        updated_at_ms,
+        revision,
+    })
+}
 
 /// Classifications are stored one `property=classification` per line.
 pub(crate) fn join_classifications(classifications: &[String]) -> String {
@@ -117,7 +182,7 @@ impl EmbeddingStore for SekaiDb {
     ) -> Result<Option<EmbeddingCheckpoint>, String> {
         self.conn()
             .query_row(
-                "SELECT spec_digest, last_change_rowid, last_generation, revision
+                "SELECT spec_digest, last_change_rowid, last_generation, revision, updated_at_ms
                  FROM sekai_embedding_checkpoints WHERE namespace = ?1 AND spec_id = ?2",
                 params![namespace, spec_id],
                 |row| {
@@ -126,6 +191,7 @@ impl EmbeddingStore for SekaiDb {
                         last_change_rowid: row.get::<_, i64>(1)?.max(0) as u64,
                         last_generation: row.get::<_, i64>(2)?.max(0) as u64,
                         revision: row.get(3)?,
+                        updated_at_ms: row.get(4)?,
                     })
                 },
             )
@@ -403,6 +469,137 @@ impl EmbeddingStore for SekaiDb {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
     }
+
+    fn put_embedding_spec(&self, stored: &StoredEmbeddingSpec) -> Result<(), String> {
+        let spec = &stored.spec;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            BUMP_SPEC_CHECKPOINT_SQLITE,
+            params![spec.namespace, spec.id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_embedding_specs
+             (namespace, spec_id, object_kind, properties, chunk_chars, dimension,
+              batch_size, model, updated_by, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(namespace, spec_id) DO UPDATE SET
+                object_kind = excluded.object_kind, properties = excluded.properties,
+                chunk_chars = excluded.chunk_chars, dimension = excluded.dimension,
+                batch_size = excluded.batch_size, model = excluded.model,
+                updated_by = excluded.updated_by, updated_at_ms = excluded.updated_at_ms",
+            params![
+                spec.namespace,
+                spec.id,
+                spec.object_kind,
+                join_properties(&spec.properties),
+                spec.chunk_chars as i64,
+                spec.dimension as i64,
+                spec.batch_size as i64,
+                stored.model,
+                stored.updated_by,
+                stored.updated_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    fn list_embedding_specs(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<StoredEmbeddingSpec>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.namespace, s.spec_id, s.object_kind, s.properties, s.chunk_chars,
+                        s.dimension, s.batch_size, s.model, s.updated_by, s.updated_at_ms,
+                        coalesce(c.revision, 0)
+                 FROM sekai_embedding_specs s
+                 LEFT JOIN sekai_embedding_checkpoints c
+                   ON c.namespace = s.namespace AND c.spec_id = s.spec_id
+                 WHERE ?1 IS NULL OR s.namespace = ?1
+                 ORDER BY s.namespace, s.spec_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .map(
+                |(ns, id, kind, properties, chunk, dim, batch, model, by, at, revision)| {
+                    stored_spec(
+                        ns,
+                        id,
+                        kind,
+                        &properties,
+                        chunk,
+                        dim,
+                        batch,
+                        model,
+                        by,
+                        at,
+                        revision,
+                    )
+                },
+            )
+            .collect()
+    }
+
+    fn delete_embedding_spec(&self, namespace: &str, spec_id: &str) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        // The checkpoint row first (created if a first put has not made it
+        // yet), as put and fenced writes take it, so no catch-up can add
+        // vectors after the deletes below.
+        tx.execute(
+            "INSERT INTO sekai_embedding_checkpoints
+             (namespace, spec_id, spec_digest, last_change_rowid, last_generation, revision,
+              updated_at_ms)
+             VALUES (?1, ?2, '', 0, 0, 1, 0)
+             ON CONFLICT(namespace, spec_id) DO UPDATE SET
+                spec_digest = '', last_change_rowid = 0, last_generation = 0,
+                revision = revision + 1, updated_at_ms = 0",
+            params![namespace, spec_id],
+        )
+        .map_err(|error| error.to_string())?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM sekai_embedding_specs WHERE namespace = ?1 AND spec_id = ?2",
+                params![namespace, spec_id],
+            )
+            .map_err(|error| error.to_string())?;
+        for table in ["sekai_embedding_chunks", "sekai_embedding_rebuilds"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE namespace = ?1 AND spec_id = ?2"),
+                params![namespace, spec_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(deleted == 1)
+    }
 }
 
 /// Run `$call` on whichever backend holds the runtime.
@@ -512,5 +709,20 @@ impl EmbeddingStore for RuntimeDb {
         spec_id: &str,
     ) -> Result<Vec<EmbeddingRebuild>, String> {
         dispatch!(self, db => db.embedding_rebuilds(namespace, spec_id))
+    }
+
+    fn put_embedding_spec(&self, stored: &StoredEmbeddingSpec) -> Result<(), String> {
+        dispatch!(self, db => db.put_embedding_spec(stored))
+    }
+
+    fn list_embedding_specs(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<StoredEmbeddingSpec>, String> {
+        dispatch!(self, db => db.list_embedding_specs(namespace))
+    }
+
+    fn delete_embedding_spec(&self, namespace: &str, spec_id: &str) -> Result<bool, String> {
+        dispatch!(self, db => db.delete_embedding_spec(namespace, spec_id))
     }
 }

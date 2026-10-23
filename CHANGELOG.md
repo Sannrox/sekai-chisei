@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Embedding specs are stored per namespace and managed with experimental
+  `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined
+  mode embeds every stored spec on a schedule through its hosted catalog
+  route over the OpenAI-compatible embeddings API, admitted like hosted
+  execution; a changed spec is a recorded rebuild
+  (docs/embedding-index.md, `0095_embedding_specs`, GATE:mig, #1609).
+
 - Catalog entry owners and stewards curate `description`, `tags` and
   `owners` through a governed Action on `catalog_entry`, with the Action's
   receipt; the marking only rises, and later registrations keep curated

@@ -9,8 +9,8 @@ use crate::domain::Object;
 use crate::sekai::classification_lattice::{ClassificationLattice, union_input_marking_tokens};
 use crate::sekai::embedding_index::{
     CHANGE_PAGE, EmbeddingCatchUpReport, EmbeddingCheckpoint, EmbeddingError, EmbeddingRebuild,
-    EmbeddingSource, EmbeddingSpec, EmbeddingStore, ObjectEmbeddings, chunk_text, sha_hex,
-    source_text,
+    EmbeddingSource, EmbeddingSpec, EmbeddingStore, ObjectEmbeddings, StoredEmbeddingSpec,
+    chunk_text, sha_hex, source_text,
 };
 use crate::sekai::markings::object_marking_token;
 use crate::sekai::object_change_subscription::CommittedObjectMutation;
@@ -18,6 +18,16 @@ use chisei_provider::embedding::Embedder;
 use std::collections::BTreeSet;
 
 const REBUILD_PAGE: i64 = 500;
+
+/// How long a rebuild's last write holds off scheduled catch-up on other
+/// instances. A rebuild refreshes it with every object it writes; one that
+/// stopped is taken over after it lapses.
+pub const REBUILD_LEASE_MS: i64 = 5 * 60 * 1000;
+
+/// One model call never outlives half a lease, whatever the route's own
+/// timeout, so a rebuild renews its lease before it can lapse.
+const EMBED_CALL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(REBUILD_LEASE_MS as u64 / 2);
 
 /// Policy an object is embedded under: its kind's schema (property
 /// classifications for egress) and the namespace marking lattice.
@@ -37,14 +47,50 @@ pub async fn catch_up_embeddings(
     db: &RuntimeDb,
     spec: &EmbeddingSpec,
     embedder: &dyn Embedder,
-    admit: &dyn Fn(&str) -> Result<(), String>,
+    admit: &(dyn Fn(&str) -> Result<(), String> + Sync),
     now_ms: i64,
+) -> Result<EmbeddingCatchUpReport, EmbeddingError> {
+    catch_up_from(db, spec, embedder, admit, now_ms, None).await
+}
+
+/// [`catch_up_embeddings`], refused when `listed_revision` is set and the
+/// checkpoint has moved past it: the spec was put or deleted since it was
+/// listed. Every later write is fenced on the revision read here.
+pub async fn catch_up_from(
+    db: &RuntimeDb,
+    spec: &EmbeddingSpec,
+    embedder: &dyn Embedder,
+    admit: &(dyn Fn(&str) -> Result<(), String> + Sync),
+    now_ms: i64,
+    listed_revision: Option<i64>,
 ) -> Result<EmbeddingCatchUpReport, EmbeddingError> {
     spec.validate()?;
     admit(embedder.model()).map_err(EmbeddingError::Refused)?;
     let digest = spec.digest(embedder.model(), embedder.model_version());
     let namespace = spec.namespace.as_str();
     let checkpoint = db.embedding_checkpoint(namespace, &spec.id)?;
+    if let Some(listed) = listed_revision {
+        if listed
+            != checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.revision)
+        {
+            return Err(EmbeddingError::Conflict(
+                "embedding spec changed since it was listed".into(),
+            ));
+        }
+        // A rebuild clears the digest until it completes. While its lease
+        // holds, another instance leaves it alone instead of restarting it.
+        if checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.spec_digest.is_empty()
+                && checkpoint.updated_at_ms > 0
+                && now_ms.saturating_sub(checkpoint.updated_at_ms) < REBUILD_LEASE_MS
+        }) {
+            return Err(EmbeddingError::Conflict(
+                "embedding rebuild in progress on another instance".into(),
+            ));
+        }
+    }
     let checkpoint = match checkpoint {
         Some(checkpoint) if checkpoint.spec_digest == digest => checkpoint,
         previous => {
@@ -144,7 +190,8 @@ pub async fn catch_up_embeddings(
                     &governance,
                     &object,
                     &mut revision,
-                    now_ms,
+                    &|| now_ms,
+                    false,
                 )
                 .await?;
                 report.objects += 1;
@@ -163,11 +210,55 @@ pub async fn catch_up_embeddings(
             last_change_rowid: last_rowid,
             last_generation: acknowledged,
             revision,
+            updated_at_ms: 0,
         },
         now_ms,
     )?;
     crate::obs::metrics::set_embedding_index_lag_ms(report.lag_ms.max(0) as u64);
     Ok(report)
+}
+
+/// One stored spec and how its catch-up in a pass ended.
+pub type StoredSpecOutcome = (
+    StoredEmbeddingSpec,
+    Result<EmbeddingCatchUpReport, EmbeddingError>,
+);
+
+/// One pass over every stored spec (#1609): one catch-up call each, fenced
+/// on the revision the spec was listed at. `route` admits each spec's
+/// catalog route and returns its embedder; admission is its job, so catch-up
+/// gets no second gate. A spec that fails is reported and retried on the
+/// next pass; it does not stop the others. Replicas may run passes at once,
+/// and a spec put or deleted during a pass is fenced out: the loser sees
+/// [`EmbeddingError::Conflict`]. Run another pass while a report has `more`.
+pub async fn catch_up_stored_specs<Route, Admitted>(
+    db: &RuntimeDb,
+    route: Route,
+    now_ms: &(dyn Fn() -> i64 + Sync),
+) -> Result<Vec<StoredSpecOutcome>, String>
+where
+    Route: Fn(StoredEmbeddingSpec) -> Admitted,
+    Admitted: std::future::Future<Output = Result<Box<dyn Embedder>, EmbeddingError>>,
+{
+    let mut outcomes = Vec::new();
+    for stored in db.list_embedding_specs(None)? {
+        let outcome = match route(stored.clone()).await {
+            Ok(embedder) => {
+                catch_up_from(
+                    db,
+                    &stored.spec,
+                    embedder.as_ref(),
+                    &|_| Ok(()),
+                    now_ms(),
+                    Some(stored.revision),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        outcomes.push((stored, outcome));
+    }
+    Ok(outcomes)
 }
 
 async fn rebuild(
@@ -186,6 +277,9 @@ async fn rebuild(
     // during the rebuild are replayed after it.
     let generation = db.namespace_object_generation(namespace)?;
     let watermark = db.object_change_watermark(namespace)?;
+    // Writes are stamped with elapsed time, so each one renews the lease.
+    let started = std::time::Instant::now();
+    let clock = move || now_ms.saturating_add(started.elapsed().as_millis() as i64);
     let mut revision = db.reset_embedding_spec(namespace, &spec.id, revision, now_ms)?;
     let schema = db.get_object_type(&spec.object_kind)?;
     let lattice = db.get_classification_lattice(namespace)?;
@@ -216,7 +310,8 @@ async fn rebuild(
                     &governance,
                     &object,
                     &mut revision,
-                    now_ms,
+                    &clock,
+                    true,
                 )
                 .await?;
                 report.objects += 1;
@@ -241,6 +336,7 @@ async fn rebuild(
             last_change_rowid: watermark,
             last_generation: generation,
             revision,
+            updated_at_ms: 0,
         },
         now_ms,
     )?;
@@ -249,6 +345,7 @@ async fn rebuild(
 
 /// Embed the chunks of `object` whose text changed. Returns how many were
 /// sent to the model.
+#[allow(clippy::too_many_arguments)]
 async fn embed_object(
     db: &RuntimeDb,
     spec: &EmbeddingSpec,
@@ -256,7 +353,8 @@ async fn embed_object(
     governance: &Governance<'_>,
     object: &Object,
     revision: &mut i64,
-    now_ms: i64,
+    clock: &(dyn Fn() -> i64 + Sync),
+    renew_lease: bool,
 ) -> Result<i64, EmbeddingError> {
     if embedder.external() {
         // Same rule as other model context: a property leaves the deployment
@@ -298,12 +396,28 @@ async fn embed_object(
         .map(|(index, chunk)| (index as u32, sha_hex(chunk), chunk.clone()))
         .filter(|(index, digest, _)| stored.get(*index as usize) != Some(digest))
         .collect();
+    if !changed.is_empty() {
+        embedder.screen(&text).map_err(EmbeddingError::Refused)?;
+    }
     let mut embedded = Vec::with_capacity(changed.len());
-    for batch in changed.chunks(spec.batch_size) {
+    for (index, batch) in changed.chunks(spec.batch_size).enumerate() {
+        // A rebuild renews its lease before every further model call, so a
+        // large object never outlives it.
+        if renew_lease && index > 0 {
+            *revision = db.store_embedding_checkpoint(
+                &spec.namespace,
+                &spec.id,
+                &EmbeddingCheckpoint {
+                    revision: *revision,
+                    ..EmbeddingCheckpoint::default()
+                },
+                clock(),
+            )?;
+        }
         let texts: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
-        let vectors = embedder
-            .embed(&texts)
+        let vectors = tokio::time::timeout(EMBED_CALL_TIMEOUT, embedder.embed(&texts))
             .await
+            .map_err(|_| EmbeddingError::Model("embedding call timed out".into()))?
             .map_err(EmbeddingError::Model)?;
         if vectors.len() != batch.len() || vectors.iter().any(|v| v.len() != spec.dimension) {
             return Err(EmbeddingError::Model(format!(
@@ -349,7 +463,7 @@ async fn embed_object(
             keep: chunks.len() as u32,
         },
         *revision,
-        now_ms,
+        clock(),
     )?;
     Ok(embedded.len() as i64)
 }
@@ -768,5 +882,239 @@ mod tests {
             .build()
             .unwrap()
             .block_on(exercise(&db));
+    }
+
+    /// An OpenAI-compatible embeddings endpoint on a loopback port that
+    /// counts the texts it embeds.
+    async fn embeddings_route(hits: std::sync::Arc<AtomicUsize>) -> String {
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route(
+            "/v1/embeddings",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let hits = hits.clone();
+                async move {
+                    let inputs = body["input"].as_array().cloned().unwrap_or_default();
+                    hits.fetch_add(inputs.len(), Ordering::SeqCst);
+                    let data = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            serde_json::json!({"index": index, "embedding": [0.1, 0.2, 0.3, 0.4]})
+                        })
+                        .collect::<Vec<_>>();
+                    Json(serde_json::json!({ "data": data }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        origin
+    }
+
+    async fn exercise_stored_specs(db: &RuntimeDb) {
+        use chisei_provider::llm::openai::OpenAiEmbedder;
+        db.upsert_object_type(&ObjectType {
+            kind: "note".into(),
+            description: String::new(),
+            properties: vec![property("body", "sensitive"), property("title", "public")],
+            is_builtin: false,
+            implements: Vec::new(),
+        })
+        .unwrap();
+        db.create_object_with_audit(&note("s1", "stored spec body", "draft"), "test")
+            .unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let origin = embeddings_route(hits.clone()).await;
+        let model = "hosted.local/embed-small";
+        let mut stored = StoredEmbeddingSpec {
+            spec: spec(),
+            model: model.into(),
+            updated_by: "admin".into(),
+            updated_at_ms: 1,
+            revision: 0,
+        };
+        db.put_embedding_spec(&stored).unwrap();
+        let route = |external: bool| {
+            let origin = origin.clone();
+            move |stored: StoredEmbeddingSpec| {
+                let embedder = Box::new(OpenAiEmbedder::new(
+                    "",
+                    &origin,
+                    &stored.model,
+                    "embed-small",
+                    "",
+                    external,
+                )) as Box<dyn Embedder>;
+                async move { Ok(embedder) }
+            }
+        };
+        let local = route(false);
+        let now = || 1_000;
+
+        // A local route embeds the namespace from the stored spec.
+        let outcomes = catch_up_stored_specs(db, &local, &now).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].1.as_ref().unwrap().rebuilt, "{outcomes:?}");
+        let chunks = db.embedding_chunks(NS, "notes").unwrap();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.source.model == model));
+
+        // Changing the stored spec is a recorded rebuild.
+        stored.spec.chunk_chars = 16;
+        db.put_embedding_spec(&stored).unwrap();
+        catch_up_stored_specs(db, &local, &now).await.unwrap()[0]
+            .1
+            .as_ref()
+            .unwrap();
+        let rebuilds = db.embedding_rebuilds(NS, "notes").unwrap();
+        assert_eq!(rebuilds.len(), 2);
+        assert_eq!(rebuilds[1].to_digest, stored.spec.digest(model, ""));
+
+        // An external route refuses the sensitive body before any call.
+        retitle(db, "s1", "final");
+        let before = hits.load(Ordering::SeqCst);
+        let external = route(true);
+        let refused = catch_up_stored_specs(db, &external, &now).await.unwrap();
+        assert!(
+            matches!(refused[0].1, Err(EmbeddingError::Refused(_))),
+            "{refused:?}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), before);
+
+        // Deleting the spec removes its vectors and history.
+        assert!(db.delete_embedding_spec(NS, "notes").unwrap());
+        assert!(db.list_embedding_specs(Some(NS)).unwrap().is_empty());
+        assert!(db.embedding_chunks(NS, "notes").unwrap().is_empty());
+        assert!(db.embedding_rebuilds(NS, "notes").unwrap().is_empty());
+        assert_eq!(
+            db.embedding_checkpoint(NS, "notes")
+                .unwrap()
+                .unwrap()
+                .spec_digest,
+            ""
+        );
+
+        // A catch-up for a listing taken before a delete or a put writes
+        // nothing; the next listing catches up.
+        db.put_embedding_spec(&stored).unwrap();
+        let listed = db.list_embedding_specs(Some(NS)).unwrap().remove(0);
+        let hash = HashEmbedder::new(model, "", 4);
+        let late = |listed: StoredEmbeddingSpec| {
+            let hash = hash.clone();
+            async move {
+                catch_up_from(
+                    db,
+                    &listed.spec,
+                    &hash,
+                    &admit_all,
+                    7_000,
+                    Some(listed.revision),
+                )
+                .await
+            }
+        };
+        assert!(db.delete_embedding_spec(NS, "notes").unwrap());
+        let deleted = late(listed.clone()).await;
+        assert!(
+            matches!(deleted, Err(EmbeddingError::Conflict(_))),
+            "{deleted:?}"
+        );
+        assert!(db.embedding_chunks(NS, "notes").unwrap().is_empty());
+        db.put_embedding_spec(&stored).unwrap();
+        let replaced = late(listed).await;
+        assert!(
+            matches!(replaced, Err(EmbeddingError::Conflict(_))),
+            "{replaced:?}"
+        );
+        assert!(db.embedding_chunks(NS, "notes").unwrap().is_empty());
+        let revived = catch_up_stored_specs(db, &local, &now).await.unwrap();
+        assert!(revived[0].1.as_ref().unwrap().rebuilt);
+
+        // A rebuild another instance is running holds off scheduled
+        // catch-up until its lease lapses; then this instance takes over.
+        let current = db.embedding_checkpoint(NS, "notes").unwrap().unwrap();
+        db.reset_embedding_spec(NS, "notes", current.revision, 50_000)
+            .unwrap();
+        let listed = db.list_embedding_specs(Some(NS)).unwrap().remove(0);
+        let scheduled = |now_ms| {
+            catch_up_from(
+                db,
+                &listed.spec,
+                &hash,
+                &admit_all,
+                now_ms,
+                Some(listed.revision),
+            )
+        };
+        let held = scheduled(51_000).await;
+        assert!(matches!(held, Err(EmbeddingError::Conflict(_))), "{held:?}");
+        let taken = scheduled(50_000 + REBUILD_LEASE_MS).await.unwrap();
+        assert!(taken.rebuilt);
+    }
+
+    #[tokio::test]
+    async fn stored_specs_embed_through_a_route_and_rebuild_on_change() {
+        exercise_stored_specs(&RuntimeDb::memory()).await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_stored_specs_embed_through_a_route_and_rebuild_on_change() {
+        let (_scratch, db) = postgres_runtime();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(exercise_stored_specs(&db));
+    }
+
+    /// Refuses any source text holding `needle`, like a payload leak rule.
+    struct Screening {
+        inner: Counting,
+        needle: &'static str,
+    }
+
+    #[async_trait]
+    impl Embedder for Screening {
+        fn model(&self) -> &str {
+            self.inner.model()
+        }
+        fn model_version(&self) -> &str {
+            self.inner.model_version()
+        }
+        fn external(&self) -> bool {
+            false
+        }
+        fn screen(&self, text: &str) -> Result<(), String> {
+            if text.contains(self.needle) {
+                Err("blocked by payload rule".into())
+            } else {
+                Ok(())
+            }
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.inner.embed(texts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_source_text_is_screened_before_any_chunk_is_sent() {
+        let db = RuntimeDb::memory();
+        // 8-character chunks split "body: tok-secret-42" across chunk boundaries.
+        db.create_object_with_audit(&note("leak", "tok-secret-42", "t"), "test")
+            .unwrap();
+        let screening = Screening {
+            inner: Counting::new("v1", false),
+            needle: "tok-secret-42",
+        };
+        let refused = catch_up_embeddings(&db, &spec(), &screening, &admit_all, 1_000).await;
+        assert!(
+            matches!(refused, Err(EmbeddingError::Refused(_))),
+            "{refused:?}"
+        );
+        assert_eq!(screening.inner.calls.load(Ordering::SeqCst), 0);
     }
 }

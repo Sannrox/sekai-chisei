@@ -225,6 +225,14 @@ where
     REQUEST_PROVIDER_REGISTRY.scope(registry, future).await
 }
 
+/// [`with_provider_registry_snapshot`] for synchronous work.
+pub fn with_provider_registry_snapshot_sync<T>(
+    registry: ProviderRegistry,
+    work: impl FnOnce() -> T,
+) -> T {
+    REQUEST_PROVIDER_REGISTRY.sync_scope(registry, work)
+}
+
 pub async fn with_canary_admission<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T>,
