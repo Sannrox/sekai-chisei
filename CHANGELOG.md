@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Local twins: `sekai::synthetic_shape` extracts a `sekai.twin-shape/v1`
+  shape from a tenant (definitions, counts, marking shares, numeric ranges,
+  link counts; no string or individual value), and a
+  `ShapeDomain` lets the synthetic generator build a twin from it
+  deterministically (docs/local-twins.md, #1735).
 - Experimental `DryRunDefinitionChangeBundle` runs a change bundle's
   backfill on a dataset branch per backed object type, named for the bundle
   digest, and reports row counts and marking-aware samples; the datasets
