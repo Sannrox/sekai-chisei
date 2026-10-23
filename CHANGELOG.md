@@ -7,7 +7,7 @@
   properties it lost alone (`purges`). Scopes may set `max_offline_age_ms`,
   and snapshots and deltas return `offline_until_ms`. A reference replica
   is in `sekai_client::sync_replica` (ADR 0128, PostgreSQL migration
-  `0096_sync_member_properties`, #1633).
+  `0097_sync_member_properties`, #1633).
 
 - Embedding specs are stored per namespace and managed with experimental
   `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined
@@ -123,6 +123,12 @@
   operation receipt needs clearance for it, and a caller without it sees the
   instance as missing. Objects an Action writes inherit the marking, and an
   Action parameter can no longer lower an object's marking (#1706).
+
+- Experimental `RunEvalDataset` runs an eval dataset version through a
+  registered evaluator against a named agent, model and tool version, with a
+  concurrency limit, a run budget enforced before each case, a per-case cost
+  ledger, and results durable per (run, case), so a restarted run resumes
+  without rerunning or double-counting a case (docs/eval-datasets.md, #1674).
 
 - Versioned eval datasets (`chisei.eval-dataset/v1`) generated
   deterministically from synthetic tenant seeds and checked-in case

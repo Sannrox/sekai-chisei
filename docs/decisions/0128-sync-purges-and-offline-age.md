@@ -30,7 +30,7 @@ ADR 0124 ends a cursor whenever the caller's authorization changes. That covers 
 
 ## Consequences
 
-The members table gains a `properties` column: SQLite adds it on use, and PostgreSQL migration `0096` adds it. Property purges are only as exact as the property names stored for the baseline. Where a retry delivered a member differently, the names are unknown and the upsert's whole replacement is the only purge.
+The members table gains a `properties` column: SQLite adds it on use, and PostgreSQL migration `0097` adds it. Property purges are only as exact as the property names stored for the baseline. Where a retry delivered a member differently, the names are unknown and the upsert's whole replacement is the only purge.
 
 ## Validation
 
