@@ -297,6 +297,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `ChiseiService.EvaluateGovernedSubject` | `chisei.execution` | yes | none | `experimental` |
 | `ChiseiService.ExportGovernedSubjectProvenance` | `chisei.execution` | yes | none | `experimental` |
 | `ChiseiService.ExecuteEvaluationManifest` | `chisei.evaluation` | yes | cli | `stable` |
+| `ChiseiService.RunEvalDataset` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.CancelEvaluationExecution` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.AuthorizeExternalAction` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.TransitionExternalAction` | `chisei.approvals` | yes | example | `stable` |

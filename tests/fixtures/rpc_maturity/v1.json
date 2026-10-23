@@ -2023,6 +2023,15 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "RunEvalDataset",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "CancelEvaluationExecution",
       "storage_path": "chisei.evaluation",
       "real_backend": "yes",

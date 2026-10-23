@@ -47,3 +47,44 @@ template may not use its expected property as input.
 
 Datasets built from recorded traces and model-graded rubrics are out of
 scope.
+
+## Runs
+
+`ChiseiService.RunEvalDataset` (experimental, #1674) runs every case of one
+dataset version through a registered evaluator definition that accepts
+`chisei.eval-case/v1`, against a named agent, model and tool version, and is
+started by CI or the delivery plane per release. It is rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. Datasets resolve from the
+definitions in `CHISEI_EVAL_DATASETS_DIR`.
+
+- At most `concurrency` cases (1 to 64) run at once, and one start of a run
+  at a time: a start holds the run's lease (two minutes, renewed before every
+  case), another start meanwhile is refused `ABORTED`, and a crashed start's
+  lease lapses for the next.
+- Every case reserves `max_case_cost_micros` before it starts and starts only
+  while the spent cost, the reservations of cases in flight and its own fit
+  `budget_micros`; then the run ends `budget_exhausted` with the unrun cases.
+  A stochastic definition must run on the run's model, must have a price in
+  `CHISEI_GATEWAY_PRICING`, and must not be able to cost more per case (its
+  `max_total_tokens` at the higher token price) than `max_case_cost_micros`,
+  all checked before any case runs.
+- Before a case is dispatched its cap moves durably into the run's
+  uncertain spend, and recording its result moves it back out in the same
+  write, both only while the start holds the lease. A start that crashed
+  after an evaluator charged therefore leaves that spend counted against the
+  budget (`uncertain_micros`), never lost.
+- Each case result is durable per (run, case) and written once
+  (`chisei_dataset_runs`, `chisei_dataset_run_cases`). Starting the run again
+  with the same `run_id` resumes: only cases without a result run, and the
+  ledger (tokens and cost per case) and its total cover every start. A
+  `run_id` is bound to its first spec, including the evaluator definition and
+  its digest; another spec under it is refused.
+- Only a pass or fail verdict is a result. A case that failed to run stays
+  unrun and the run is `incomplete`, to be resumed. If nothing was
+  dispatched (a deterministic evaluator unavailable) its reservation is
+  given back; if a model may have charged (a stochastic call that timed out
+  or failed) the reservation stays counted, so retries cannot outspend the
+  budget. A stochastic definition's provider must also pass the configured
+  egress allowlist, checked before any case runs.
+
