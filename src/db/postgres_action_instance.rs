@@ -278,12 +278,25 @@ impl PostgresDb {
         }
         let previous = match write {
             Some(ParkedGrantWrite::Create(object)) => {
-                insert_created_object_in(&mut transaction, object, actor, None)?;
+                insert_created_object_in(
+                    &mut transaction,
+                    object,
+                    actor,
+                    None,
+                    &granted.operation_id,
+                )?;
                 None
             }
             Some(ParkedGrantWrite::Update(object)) => Some(
-                update_object_in(&mut transaction, object, None, actor, None)?
-                    .ok_or_else(|| format!("object {} not found", object.id))?,
+                update_object_in(
+                    &mut transaction,
+                    object,
+                    None,
+                    actor,
+                    None,
+                    &granted.operation_id,
+                )?
+                .ok_or_else(|| format!("object {} not found", object.id))?,
             ),
             None => None,
         };

@@ -10326,6 +10326,7 @@ async fn grant_and_audit_rpcs_round_trip() {
             new_value: "b".into(),
             changed_by: "tester".into(),
             timestamp: 11,
+            operation_id: String::new(),
         })
         .unwrap();
 
@@ -17150,6 +17151,7 @@ async fn delegated_service_intersects_acl_properties_and_marking_clearance() {
             new_value: "private value".into(),
             changed_by: "service-a".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
     for (actor, expected_value) in [(None, "private value"), (Some("human-a"), REDACTED_VALUE)] {
@@ -18831,6 +18833,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "classified note".into(),
             changed_by: "owner".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
     runtime
@@ -18842,6 +18845,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "internal".into(),
             changed_by: "owner".into(),
             timestamp: 2,
+            operation_id: String::new(),
         })
         .unwrap();
     runtime
@@ -18853,6 +18857,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "public note".into(),
             changed_by: "owner".into(),
             timestamp: 3,
+            operation_id: String::new(),
         })
         .unwrap();
 
@@ -18907,6 +18912,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "confidential".into(),
             changed_by: "owner".into(),
             timestamp: 4,
+            operation_id: String::new(),
         })
         .unwrap();
     runtime
@@ -18918,6 +18924,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "later classified".into(),
             changed_by: "owner".into(),
             timestamp: 5,
+            operation_id: String::new(),
         })
         .unwrap();
     let after_raise = svc
@@ -18938,6 +18945,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "confidential".into(),
             changed_by: "owner".into(),
             timestamp: 6,
+            operation_id: String::new(),
         })
         .unwrap();
     runtime
@@ -18949,6 +18957,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "same-ms classified".into(),
             changed_by: "owner".into(),
             timestamp: 6,
+            operation_id: String::new(),
         })
         .unwrap();
     runtime
@@ -18960,6 +18969,7 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "internal".into(),
             changed_by: "owner".into(),
             timestamp: 6,
+            operation_id: String::new(),
         })
         .unwrap();
     let same_ms = svc
@@ -19020,6 +19030,7 @@ async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
             new_value: "internal".into(),
             changed_by: "owner".into(),
             timestamp: 1,
+            operation_id: String::new(),
         })
         .unwrap();
     runtime
@@ -19031,6 +19042,7 @@ async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
             new_value: "public note".into(),
             changed_by: "owner".into(),
             timestamp: 2,
+            operation_id: String::new(),
         })
         .unwrap();
     let mut req = with_named_principal(
@@ -19075,6 +19087,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             new_value: "public note".into(),
             changed_by: "owner".into(),
             timestamp: 3,
+            operation_id: String::new(),
         })
         .unwrap();
     let marking = format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY);
@@ -19087,6 +19100,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             new_value: "confidential".into(),
             changed_by: "owner".into(),
             timestamp: 4,
+            operation_id: String::new(),
         })
         .unwrap();
     runtime
@@ -19098,6 +19112,7 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             new_value: "internal".into(),
             changed_by: "owner".into(),
             timestamp: 5,
+            operation_id: String::new(),
         })
         .unwrap();
     let mut req = with_named_principal(
@@ -19138,6 +19153,7 @@ async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
         new_value: new.into(),
         changed_by: "owner".into(),
         timestamp,
+        operation_id: String::new(),
     };
     runtime
         .record_object_change(&marking("ms-downgrade", "confidential", "internal", 1))
@@ -19154,6 +19170,7 @@ async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
             new_value: "secret after raise".into(),
             changed_by: "owner".into(),
             timestamp: 2,
+            operation_id: String::new(),
         })
         .unwrap();
     runtime

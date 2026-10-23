@@ -158,6 +158,8 @@ const DATASET_BRANCHES_SCHEMA: &str = include_str!("postgres/0088_dataset_branch
 const TRANSFORM_REPLAYS_SCHEMA: &str = include_str!("postgres/0089_transform_replays.sql");
 const CHISEI_POLICY_SHADOW_SCHEMA: &str = include_str!("postgres/0090_chisei_policy_shadow.sql");
 const FENCE_BINDINGS_SCHEMA: &str = include_str!("postgres/0091_fence_bindings.sql");
+const OBJECT_CHANGE_OPERATION_SCHEMA: &str =
+    include_str!("postgres/0092_object_change_operation.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -734,6 +736,12 @@ const MIGRATIONS: &[Migration] = &[
         90,
         "fence_bindings",
         FENCE_BINDINGS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        91,
+        "object_change_operation",
+        OBJECT_CHANGE_OPERATION_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

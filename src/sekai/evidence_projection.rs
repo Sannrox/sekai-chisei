@@ -461,6 +461,7 @@ impl SekaiDb {
             new_value: format!("{KIND_EXTERNAL_EVIDENCE}/{}", envelope.evidence_type),
             changed_by: submission.producer_identity.clone(),
             timestamp: now_ms,
+            operation_id: String::new(),
         }];
         insert_object_changes(&tx, &changes)?;
 
