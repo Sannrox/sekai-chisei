@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Enterprise-scoped credentials may call `ProposeDefinitionRollback`,
+  `ExportDefinitionPackage` and `ImportDefinitionPackage`, which authorize
+  the tenant's namespace and members like the other definition proposal
+  RPCs, so a composing platform can promote and roll back definitions with
+  the caller's authority (#1700).
+
 - Experimental signed definition packages: `ExportDefinitionPackage` signs a
   published revision as a namespace-independent `sekai.definition-package/v1`
   envelope, and `ImportDefinitionPackage` verifies it against the plane's

@@ -711,6 +711,11 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "CreateDefinitionProposal"
             | "ApproveDefinitionProposal"
             | "MergeDefinitionProposal"
+            // Rollback and package import open proposals under the same
+            // namespace and member grants; export reads like a member read.
+            | "ProposeDefinitionRollback"
+            | "ExportDefinitionPackage"
+            | "ImportDefinitionPackage"
             | "GetGovernedFactVersion"
             | "ResolveInvariantSet"
             | "SubmitActionInstance"
@@ -2295,6 +2300,9 @@ mod tests {
             "GetDefinitionBranch",
             "CreateDefinitionBranch",
             "ApplyDefinitionBranchEdit",
+            "ProposeDefinitionRollback",
+            "ExportDefinitionPackage",
+            "ImportDefinitionPackage",
         ] {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
