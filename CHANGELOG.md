@@ -8,6 +8,10 @@
   and snapshots and deltas return `offline_until_ms`. A reference replica
   is in `sekai_client::sync_replica` (ADR 0128, PostgreSQL migration
   `0097_sync_member_properties`, #1633).
+- Query embedding for vector search: `embed_query` embeds a query through
+  the stored spec's admitted route and refuses a route whose model or
+  version differs from the indexed vectors, or an external route for a
+  spec with a restricted property (docs/embedding-index.md, #1681).
 
 - Embedding specs are stored per namespace and managed with experimental
   `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined

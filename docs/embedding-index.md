@@ -49,3 +49,20 @@ the weights digest the profile pins, if any. A changed spec, model, or pinned
 digest changes the spec digest, and the next pass replaces the vectors as a
 recorded rebuild. `sekai_embedding_index_lag_ms` reports the age of the
 oldest change a pass consumed.
+
+## Query embedding
+
+`embed_query` (#1681) embeds the text of a vector search query for the
+stored spec of an object kind, through the same admitted route catch-up
+uses (in combined mode, the hosted route admitted and readmitted as above).
+It refuses when:
+
+- the namespace has no stored spec for the kind, or more than one;
+- the route's model and version do not give the spec digest the index was
+  built with, so the query would be compared with unlike vectors;
+- the route is external and a source property of the spec is classified
+  restricted, as indexing refuses;
+- the route's payload screen refuses the text.
+
+The vector search API that calls it is separate work.
+
