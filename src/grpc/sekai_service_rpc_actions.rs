@@ -849,7 +849,7 @@ pub(super) fn submitter_marking_gate(
     })
 }
 
-fn authorize_action_instance_visibility(
+pub(super) fn authorize_action_instance_visibility(
     service: &SekaiServiceImpl,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,

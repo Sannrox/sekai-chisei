@@ -2095,6 +2095,19 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_source_write_record(
+        &self,
+        transaction_id: &str,
+        object_id: &str,
+    ) -> Result<Option<crate::sekai::value_explanation::SourceWriteRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_source_write_record(transaction_id, object_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_source_write_record(transaction_id, object_id)
+            }),
+        }
+    }
+
     pub fn get_source_sync_state(
         &self,
         namespace: &str,

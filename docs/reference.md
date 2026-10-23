@@ -128,6 +128,9 @@ lives in the separate [research index](research/README.md).
   objects and dataset metadata under the live read policy.
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   `ExpandNeighborhood` and `FindPaths` under the live read policy at every hop.
+- [Explaining a property value](explain-value.md) — experimental
+  `ExplainValue`: the writes behind one value, each joined to its writer and
+  receipt, with hidden steps reported.
 - [Data catalog](catalog.md) — experimental `RegisterCatalogEntry`.
 - [Ontology changelog](ontology-changelog.md) — experimental
   `GetOntologyChangelog` for a reader and a window of at most 31 days.

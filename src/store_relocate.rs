@@ -1596,6 +1596,7 @@ pub fn is_mutating_rpc(method: &str) -> bool {
         || name.starts_with("Watch")
         || name == "ExpandNeighborhood"
         || name == "FindPaths"
+        || name == "ExplainValue"
         || name == "CompareDatasetBranch"
         || name == "Check"
         || name == "CheckAccess"

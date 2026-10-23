@@ -1465,6 +1465,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ExplainValue",
+      "storage_path": "sekai.audit, sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GetAttestation",
       "storage_path": "sekai.attestations, sekai.audit",
       "real_backend": "yes",

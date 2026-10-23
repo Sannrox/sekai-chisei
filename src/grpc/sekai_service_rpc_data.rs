@@ -1207,6 +1207,51 @@ pub(super) async fn list_decisions(
     .collect();
     Ok(Response::new(ListDecisionsResponse { decisions }))
 }
+/// Read access to a live object's change history: its namespace and
+/// collaboration scope, active read policy and marking. A denial reads as
+/// missing. `operation` names the marking audit entry.
+pub(super) fn authorize_live_object_history(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: &crate::domain::Object,
+    operation: &str,
+) -> Result<(), Status> {
+    enforce_collaboration_namespace(
+        service.db.runtime(),
+        tenant_context,
+        &object.namespace,
+        false,
+    )
+    .map_err(|_| Status::not_found("not found"))?;
+    if !collaboration_object_permitted(
+        service.db.runtime(),
+        tenant_context,
+        object,
+        crate::enterprise::NamespaceAction::Read,
+    )? {
+        return Err(Status::not_found("not found"));
+    }
+    if evaluate_active_object_policy(
+        service.db.runtime(),
+        object,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+        None,
+    )? == Some(false)
+    {
+        return Err(Status::not_found("not found"));
+    }
+    enforce_object_marking_access(
+        service.db.runtime(),
+        object,
+        principals,
+        &format!("{operation}:{}", object.id),
+    )?;
+    Ok(())
+}
+
 pub(super) async fn list_object_changes(
     service: &SekaiServiceImpl,
     req: Request<ListObjectChangesRequest>,
@@ -1231,40 +1276,13 @@ pub(super) async fn list_object_changes(
         {
             return Err(Status::not_found("not found"));
         }
-        Some(object) => {
-            enforce_collaboration_namespace(
-                service.db.runtime(),
-                tenant_context.as_ref(),
-                &object.namespace,
-                false,
-            )
-            .map_err(|_| Status::not_found("not found"))?;
-            if !collaboration_object_permitted(
-                service.db.runtime(),
-                tenant_context.as_ref(),
-                object,
-                crate::enterprise::NamespaceAction::Read,
-            )? {
-                return Err(Status::not_found("not found"));
-            }
-            if evaluate_active_object_policy(
-                service.db.runtime(),
-                object,
-                &principals,
-                tenant_context.as_ref(),
-                crate::sekai::object_security::ObjectSecurityOperation::Read,
-                None,
-            )? == Some(false)
-            {
-                return Err(Status::not_found("not found"));
-            }
-            enforce_object_marking_access(
-                service.db.runtime(),
-                object,
-                &principals,
-                &format!("list_object_changes:{}", object.id),
-            )?;
-        }
+        Some(object) => authorize_live_object_history(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            object,
+            "list_object_changes",
+        )?,
         None if tenant_context.is_some() => {
             return Err(Status::not_found("not found"));
         }
@@ -3791,7 +3809,7 @@ fn from_proto_isolated(
     })
 }
 
-fn caller_can_read_run_datasets(
+pub(super) fn caller_can_read_run_datasets(
     service: &SekaiServiceImpl,
     principals: &[String],
     run: &crate::sekai::governed_transform::TransformRun,

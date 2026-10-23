@@ -1,0 +1,44 @@
+# Explaining a property value
+
+`ExplainValue` is an experimental RPC that answers "why is this value here?"
+for one object property. It is classified `experimental`
+([rpc-maturity.md](rpc-maturity.md)) and is rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
+
+## Request
+
+`object_id`, `property` (an object property or `name`), and `as_of_ms`. With
+`as_of_ms` 0 the current value is explained; otherwise the value at that time.
+An object that did not exist then reads as not found.
+
+The caller needs the same access as `ListObjectChanges`: namespace,
+collaboration scope, object ACL, active read policy and marking. A property
+the active policy does not grant is refused. Values are redacted as
+`ListObjectChanges` redacts them.
+
+## Chain
+
+The chain is the history of the writes that set the property, oldest first,
+read from the object's change rows. Every row carries the writer recorded with
+it: a source transaction, a transform run at a checkpoint, an Action
+instance, a direct write, or nothing. A row without a writer reads as
+`unattributed` and is never inferred. Creation writes no property rows, so a
+value set at creation starts with the creation row.
+
+Each step names its writer kind, reference and receipt and joins the writer's
+record into `details`:
+
+| Writer | Details | Who may read them |
+| --- | --- | --- |
+| `source_transaction` | source binding, producer, batch status and outcome, and the object's source record (id, version, outcome) | the source's producer with namespace access, or a credential admin |
+| `transform_run` | transform, definition digest, checkpoint, trigger, input and output markings | readers of the run's datasets, as `GetGovernedTransformRun` |
+| `action_instance` | type and version, principal and delegating actor, status, policy and approval decisions | readers of the instance, as `GetActionInstance` |
+
+A step whose record the caller may not read, or whose record is gone, is
+reported as `hidden`. It keeps its time, field, value and writer kind, but no
+reference, receipt, actor or details. `complete` is true only when no step is
+hidden or unattributed.
+
+`marking` and `marking_steps` explain the object's access marking at the same
+time in the same way. Transform marking stamps are change rows attributed to
+their run, so a stamped marking explains as the run that stamped it.
