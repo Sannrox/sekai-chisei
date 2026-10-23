@@ -9,7 +9,7 @@
 //! object type, becomes a manual step instead of a guess. Generation writes,
 //! publishes, and runs nothing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -368,6 +368,42 @@ pub fn generate_change_bundle(
     Ok(bundle)
 }
 
+/// Applies `bundle`'s backfill for `object_type` to its dataset rows
+/// (#1692): copies first, then defaults where the property is still empty.
+/// No column is dropped: a renamed source column stays beside its copy, so
+/// dataset redaction still finds the rows by their original fields; dropping
+/// it is the apply step's. `column` maps a property to its dataset column.
+/// Deterministic, so a dry run rerun yields the same rows.
+pub fn apply_backfill(
+    bundle: &DefinitionChangeBundle,
+    object_type: &str,
+    rows: &[HashMap<String, String>],
+    column: impl Fn(&str) -> String,
+) -> Vec<HashMap<String, String>> {
+    let assignments = bundle
+        .backfill
+        .iter()
+        .filter(|assignment| assignment.object_type == object_type)
+        .collect::<Vec<_>>();
+    rows.iter()
+        .map(|row| {
+            let mut out = row.clone();
+            for assignment in assignments.iter().filter(|a| a.mode == "copy") {
+                if let Some(value) = row.get(&column(&assignment.source)) {
+                    out.insert(column(&assignment.property), value.clone());
+                }
+            }
+            for assignment in assignments.iter().filter(|a| a.mode == "default") {
+                let target = column(&assignment.property);
+                if out.get(&target).is_none_or(|value| value.is_empty()) {
+                    out.insert(target, assignment.source.clone());
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +627,71 @@ mod tests {
             ..ChangeHints::default()
         };
         assert!(bundle(&unknown).is_err());
+    }
+
+    #[test]
+    fn backfill_renames_then_defaults_on_dataset_rows() {
+        let generated = bundle(&ChangeHints {
+            renames: vec![PropertyRename {
+                object_type: "Ticket".into(),
+                from: "title".into(),
+                to: "subject".into(),
+            }],
+            defaults: vec![PropertyDefault {
+                object_type: "Ticket".into(),
+                property: "priority".into(),
+                value: "normal".into(),
+            }],
+            type_changes: vec![],
+        })
+        .unwrap();
+        let rows = vec![
+            HashMap::from([
+                ("id".to_string(), "1".to_string()),
+                ("title".to_string(), "Broken".to_string()),
+            ]),
+            HashMap::from([
+                ("id".to_string(), "2".to_string()),
+                ("title".to_string(), "Slow".to_string()),
+                ("priority".to_string(), "high".to_string()),
+            ]),
+        ];
+        let after = apply_backfill(&generated, "Ticket", &rows, str::to_owned);
+        assert_eq!(after[0]["subject"], "Broken");
+        // The source column stays for redaction; the apply step drops it.
+        assert_eq!(after[0]["title"], "Broken");
+        assert_eq!(after[0]["priority"], "normal");
+        // A value already present is kept.
+        assert_eq!(after[1]["priority"], "high");
+        assert_eq!(
+            after,
+            apply_backfill(&generated, "Ticket", &rows, str::to_owned)
+        );
+    }
+
+    #[test]
+    fn a_rename_onto_its_own_mapped_column_keeps_the_values() {
+        let generated = bundle(&ChangeHints {
+            renames: vec![PropertyRename {
+                object_type: "Ticket".into(),
+                from: "title".into(),
+                to: "subject".into(),
+            }],
+            defaults: vec![PropertyDefault {
+                object_type: "Ticket".into(),
+                property: "priority".into(),
+                value: "normal".into(),
+            }],
+            type_changes: vec![],
+        })
+        .unwrap();
+        // Both properties map to the same column.
+        let column = |property: &str| match property {
+            "title" | "subject" => "subject".to_string(),
+            other => other.to_string(),
+        };
+        let rows = vec![HashMap::from([("subject".to_string(), "Kept".to_string())])];
+        let after = apply_backfill(&generated, "Ticket", &rows, column);
+        assert_eq!(after[0]["subject"], "Kept");
     }
 }

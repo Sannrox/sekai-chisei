@@ -666,6 +666,13 @@ impl SekaiService for SekaiServiceImpl {
         self.generate_visible_definition_change_bundle(req).await
     }
 
+    async fn dry_run_definition_change_bundle(
+        &self,
+        req: Request<DryRunDefinitionChangeBundleRequest>,
+    ) -> Result<Response<DryRunDefinitionChangeBundleResponse>, Status> {
+        rpc_data::dry_run_definition_change_bundle(self, req).await
+    }
+
     async fn classify_definition_revision_compatibility(
         &self,
         req: Request<ClassifyDefinitionRevisionCompatibilityRequest>,
