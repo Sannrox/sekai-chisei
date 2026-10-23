@@ -1481,6 +1481,7 @@ fn spawn_service_background_tasks(
         );
     }
     if plane.serves_sekai() {
+        spawn_catalog_reconciler(db.clone());
         spawn_execution_evidence_reconciler(db);
     }
     if plane == ProcessPlane::Combined
@@ -1510,6 +1511,33 @@ fn spawn_admission_reconciler(
                 Err(error) => {
                     tracing::error!(%error, "admission reservation reconciliation task failed")
                 }
+            }
+        }
+    });
+}
+
+/// Keep object-type catalog entries in line with each published ontology
+/// (ADR 0122). Safe on every instance at once.
+fn spawn_catalog_reconciler(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::sekai::catalog::reconcile_ontology_entries(
+                    &db,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(failed)) if failed.is_empty() => {}
+                Ok(Ok(failed)) => {
+                    tracing::warn!(?failed, "catalog reconciliation failed for namespaces")
+                }
+                Ok(Err(error)) => tracing::error!(%error, "catalog reconciliation failed"),
+                Err(error) => tracing::error!(%error, "catalog reconciliation task failed"),
             }
         }
     });

@@ -353,9 +353,7 @@ impl SekaiDb {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
         drop(statement);
-        if instantiated.len() != policies.len()
-            || instantiated.iter().any(|kind| !policies.contains_key(kind))
-        {
+        if !activation_covers_kinds(&instantiated, policies) {
             return Err(
                 "object_security_activation_incomplete: every instantiated kind requires exactly one revision"
                     .into(),
@@ -1100,4 +1098,21 @@ fn validate_write(actor: &str, key: &str, now_ms: i64) -> Result<(), String> {
         return Err("invalid object-security write context".into());
     }
     Ok(())
+}
+
+/// Whether `policies` names exactly the namespace's instantiated kinds.
+/// Catalog entries (ADR 0122) appear by themselves after a publish, so they
+/// are not required; without a policy they stay unreadable in an activated
+/// namespace, which fails closed.
+pub(crate) fn activation_covers_kinds<V>(
+    instantiated: &[String],
+    policies: &std::collections::BTreeMap<String, V>,
+) -> bool {
+    let optional = crate::sekai::catalog::CATALOG_ENTRY_KIND;
+    instantiated
+        .iter()
+        .all(|kind| kind == optional || policies.contains_key(kind))
+        && policies
+            .keys()
+            .all(|kind| kind == optional || instantiated.contains(kind))
 }

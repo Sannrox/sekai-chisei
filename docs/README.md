@@ -128,6 +128,8 @@ If you want to deploy or operate the control plane:
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   bounded expansion and shortest paths over links, with read policy at
   every hop. Hidden objects are omitted, not placeholders.
+- [Data catalog](catalog.md) — experimental catalog entries for datasets,
+  object types and pipelines, registered by stable source id.
 - [Ontology changelog](ontology-changelog.md) — experimental changelog and
   team digest of definition revisions and policy activations, as the reader.
 - [Object comments](object-comments.md) — experimental comment threads and
