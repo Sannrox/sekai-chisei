@@ -346,6 +346,25 @@ Parallel lanes must not collide. Collision surfaces in this repository are
 and the same crate or ownership boundary. Lanes that would both change one of
 these surfaces run in sequence, not in parallel.
 
+Shared files that every lane used to touch are kept out of the way:
+
+- `CHANGELOG.md` is release-owned. Pull Requests do not edit it; the
+  release-note context goes in the Pull Request body, which becomes the
+  squash commit. At release, `scripts/changelog-draft.sh` lists the merged
+  changes since the last tag for the release owner to write up;
+- RPC fixture tests check the fixtures against the proto, not a hardcoded
+  total, so adding an RPC touches only its fixture rows;
+- `scripts/update-proto.sh` refreshes `compatibility.json` with the proto
+  copies;
+- a PostgreSQL migration takes the number `scripts/next-migration.sh`
+  prints, and is renumbered with it when another lane lands one first. Two
+  lanes adding one both append to the migration list, so the second shows a
+  conflict instead of merging a duplicate number.
+
+`main` does not require a branch to be up to date before it merges: the
+required checks must pass on the Pull Request head, and a lane refreshes only
+for a conflict or a failing gate.
+
 A lane publishes its first Verified commit to the claim branch as a draft Pull
 Request that closes the Issue and may list public lane fields only: claim
 branch, repo-relative worktree (for example `.worktrees/issue-N`), base SHA,
