@@ -44,7 +44,8 @@ reference, receipt, actor or details. `complete` is true only when no step is
 hidden or unattributed and the value was recorded. Creation rows do not
 copy property values (they do record the name), so the value an earlier incarnation of a deleted and
 re-created object was created with is not recorded when no edit followed it;
-it reads empty and incomplete.
+it reads empty and incomplete. When retention has purged the creation row,
+the chain starts at the oldest row kept and is incomplete.
 
 `marking` and `marking_steps` explain the object's access marking at the same
 time in the same way. Transform marking stamps are change rows attributed to

@@ -49,6 +49,8 @@ pub struct FieldHistory {
     /// created with, when no edit followed.
     pub value: Option<String>,
     pub steps: Vec<ObjectChange>,
+    /// No creation row was kept, so the value's origin is not explained.
+    pub truncated: bool,
 }
 
 /// The history of `field` as of `as_of_ms` (0: now). `changes` are the
@@ -57,8 +59,10 @@ pub struct FieldHistory {
 /// rows, so the `_created` row of the latest creation stands for the value
 /// the object was created with: the first later row's old value, or, for the
 /// current incarnation, the latest value when no row changed it. That row is
-/// a step only when the value is known and set. `None` when the object did
-/// not exist at `as_of_ms`: before its first creation, or deleted then.
+/// a step only when the value is known and set. Without any creation row
+/// (purged by retention, or never written) the history starts at the oldest
+/// row kept and is truncated. `None` when the object did not exist at
+/// `as_of_ms`: before its creation, or deleted then.
 pub fn field_history(
     changes: &[ObjectChange],
     field: &str,
@@ -67,11 +71,18 @@ pub fn field_history(
 ) -> Option<FieldHistory> {
     let within = |change: &&ObjectChange| as_of_ms <= 0 || change.timestamp <= as_of_ms;
     // The latest creation: a deleted and re-created object starts over.
-    let start = changes
+    let created_at = changes
         .iter()
-        .rposition(|change| change.field == "_created" && within(&change))?;
-    let created = &changes[start];
-    let incarnation = changes[start + 1..]
+        .rposition(|change| change.field == "_created" && within(&change));
+    let (begin, created) = match created_at {
+        Some(index) => (index + 1, Some(&changes[index])),
+        // Created only after `as_of_ms`.
+        None if changes.iter().any(|change| change.field == "_created") => return None,
+        // Retention purged the creation row, or no audited write created
+        // the object: explain from the oldest row kept.
+        None => (0, None),
+    };
+    let incarnation = changes[begin..]
         .iter()
         .take_while(|change| change.field != "_created")
         .collect::<Vec<_>>();
@@ -81,7 +92,7 @@ pub fn field_history(
     {
         return None;
     }
-    let current = start + 1 + incarnation.len() == changes.len()
+    let current = begin + incarnation.len() == changes.len()
         && incarnation.iter().all(|change| change.field != "_deleted");
     let edits = incarnation
         .into_iter()
@@ -91,11 +102,13 @@ pub fn field_history(
         Some(first) => Some(first.old_value.as_str()),
         None if current => Some(latest),
         // The creation marker records `kind/name`, so a name is never lost.
-        None if field == "name" => created.new_value.split_once('/').map(|(_, name)| name),
+        None if field == "name" => created
+            .and_then(|created| created.new_value.split_once('/'))
+            .map(|(_, name)| name),
         None => None,
     };
     let mut steps = Vec::new();
-    if let Some(value) = created_value.filter(|value| !value.is_empty()) {
+    if let Some((created, value)) = created.zip(created_value.filter(|value| !value.is_empty())) {
         steps.push(ObjectChange {
             field: field.into(),
             old_value: String::new(),
@@ -113,7 +126,11 @@ pub fn field_history(
         None => created_value.map(str::to_string),
     };
     steps.extend(edits);
-    Some(FieldHistory { value, steps })
+    Some(FieldHistory {
+        value,
+        steps,
+        truncated: created.is_none(),
+    })
 }
 
 /// What the caller may see of a step's writer.
@@ -363,6 +380,26 @@ mod tests {
         assert_eq!(history.steps.len(), 1);
         // Between the deletion and the re-creation there was no object.
         assert!(field_history(&rows, "properties.body", "third", 25).is_none());
+    }
+
+    #[test]
+    fn a_purged_creation_row_explains_the_kept_rows_as_truncated() {
+        let rows = chain()[1..].to_vec();
+        let history = field_history(&rows, "properties.body", "edited", 0).unwrap();
+        assert!(history.truncated);
+        assert_eq!(history.value.as_deref(), Some("edited"));
+        assert_eq!(history.steps.len(), 3);
+        // Before the oldest kept row: the value it replaced, unexplained.
+        let history = field_history(&rows, "properties.body", "edited", 15).unwrap();
+        assert_eq!(
+            (history.value.as_deref(), history.steps.len()),
+            (Some("raw"), 0)
+        );
+        assert!(
+            !field_history(&chain(), "properties.body", "edited", 0)
+                .unwrap()
+                .truncated
+        );
     }
 
     #[test]

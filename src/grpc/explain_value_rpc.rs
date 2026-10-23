@@ -201,9 +201,12 @@ pub(super) async fn explain_value(
     };
     let steps = explain_steps(history.steps, &mut resolve)?;
     let marking_steps = explain_steps(marking.steps, &mut resolve)?;
-    // A value no row recorded cannot be explained.
+    // A value no row recorded, or whose origin retention purged, cannot be
+    // explained in full.
     let complete = history.value.is_some()
         && marking.value.is_some()
+        && !history.truncated
+        && !marking.truncated
         && chain_complete(&steps)
         && chain_complete(&marking_steps);
     Ok(Response::new(ExplainValueResponse {
