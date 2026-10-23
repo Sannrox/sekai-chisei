@@ -31,9 +31,10 @@ Offline sync (#1634) needs requests bound to a device: a stolen assertion alone 
    - It refuses a device-bound context whose proof is missing or does not verify for this request.
    - It passes an unbound context, unless the RPC requires a device.
    - Strict Ed25519 verification is used.
-5. **No nonce store.** `sia1.` assertions are short-lived and one-use, so the proof needs no nonce store of its own. A replayed assertion is refused by the existing one-use check before any proof is looked at. A captured proof is useless without its assertion, and it only covers the request it was made for.
-6. **Revocation stays with the issuer.** For a revoked device, the issuer stops minting normal assertions and mints only a wipe-only assertion. The core keeps no device registry and no revocation list.
-7. **Rollout order.** Servers ship the claim first, then issuers start emitting it. An issuer that emits it before every server it talks to accepts it gets those requests refused, which fails closed.
+5. **Fail closed elsewhere.** Every RPC that does not check device proofs refuses a device-bound assertion outright. RPCs that do check them are listed explicitly, and the list is empty until sync (#1634) adds its RPCs. A copied assertion therefore authenticates nowhere a proof is not checked.
+6. **No nonce store.** `sia1.` assertions are short-lived and one-use, so the proof needs no nonce store of its own. A replayed assertion is refused by the existing one-use check before any proof is looked at. A captured proof is useless without its assertion, and it only covers the request it was made for.
+7. **Revocation stays with the issuer.** For a revoked device, the issuer stops minting normal assertions and mints only a wipe-only assertion. The core keeps no device registry and no revocation list.
+8. **Rollout order.** Servers ship the claim first, then issuers start emitting it. An issuer that emits it before every server it talks to accepts it gets those requests refused, which fails closed.
 
 ## Alternatives considered
 
