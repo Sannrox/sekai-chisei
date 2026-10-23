@@ -1134,8 +1134,18 @@ pub(super) async fn run_eval_dataset(
         DefinitionCaseExecutor, EVAL_RUN_CONTRACT, EvalRunSpec, RUN_CONFLICT, RUN_IN_PROGRESS, run,
     };
     let actor = authenticated_actor(&req);
+    let context = enterprise_authenticated_context(&req)?.cloned();
     let request = req.into_inner();
     require_namespace_write_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
+    // Binding a run to a release artifact attests that its results are that
+    // release's evaluation, so it takes the authority that exports them.
+    if !request.artifact_digest.is_empty() {
+        super::rpc_model_release_evidence::require_release_admin(
+            service,
+            &actor,
+            context.as_ref(),
+        )?;
+    }
     let definition = service
         .db
         .get_evaluator_definition(&request.evaluator_definition_id)
@@ -1158,6 +1168,16 @@ pub(super) async fn run_eval_dataset(
         max_case_cost_micros: request.max_case_cost_micros,
     };
     spec.validate().map_err(Status::invalid_argument)?;
+    let artifact_digest = request.artifact_digest;
+    if !artifact_digest.is_empty()
+        && !artifact_digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(Status::invalid_argument(
+            "artifact_digest must be sha256:<64 hex>",
+        ));
+    }
     let definitions = std::env::var(EVAL_DATASETS_DIR_ENV)
         .ok()
         .filter(|dir| !dir.trim().is_empty())
@@ -1191,6 +1211,15 @@ pub(super) async fn run_eval_dataset(
             budget: &budget,
         };
         executor.check(&spec).map_err(Status::failed_precondition)?;
+        // Only a run whose evaluator runs on the model can stand for it.
+        if !artifact_digest.is_empty() && definition.stochastic_policy.is_none() {
+            return Err(Status::failed_precondition(
+                "only a run whose evaluator runs on the model can be bound to a release artifact",
+            ));
+        }
+        if !artifact_digest.is_empty() {
+            bind_artifact(store.as_ref(), &spec, &artifact_digest)?;
+        }
         run(store.as_ref(), &executor, &spec, &dataset, || {
             chrono::Utc::now().timestamp_millis()
         })
@@ -1245,6 +1274,226 @@ pub(super) async fn run_eval_dataset(
             })
             .collect(),
     }))
+}
+
+/// Records a new run bound to the released artifact it evaluates (#1677),
+/// atomically with the run itself. A run started without an artifact, by
+/// this or an older version, can never be bound later, so its results never
+/// become evidence for an artifact; a bound run keeps its artifact.
+fn bind_artifact(
+    store: &crate::db::runtime_db::RuntimeDb,
+    spec: &crate::chisei::eval_run::EvalRunSpec,
+    artifact_digest: &str,
+) -> Result<(), Status> {
+    let (stored, bound) = store
+        .put_bound_dataset_run(spec, artifact_digest, chrono::Utc::now().timestamp_millis())
+        .map_err(Status::internal)?;
+    if stored != *spec {
+        return Err(Status::already_exists(
+            crate::chisei::eval_run::RUN_CONFLICT,
+        ));
+    }
+    if bound.as_deref() == Some(artifact_digest) {
+        Ok(())
+    } else {
+        Err(Status::already_exists(
+            "eval run id is already used without this artifact",
+        ))
+    }
+}
+
+/// Loads two recorded eval dataset runs of `namespace` and compares them
+/// (#1677). Returns the comparison and the candidate's spec.
+pub(super) async fn compare_dataset_runs(
+    service: &ChiseiServiceImpl,
+    namespace: &str,
+    baseline_run_id: &str,
+    candidate_run_id: &str,
+    gate: crate::chisei::eval_compare::ComparisonGate,
+) -> Result<
+    (
+        crate::chisei::eval_compare::RunComparison,
+        crate::chisei::eval_run::EvalRunSpec,
+    ),
+    Status,
+> {
+    let (comparison, candidate, _) =
+        compare_dataset_runs_bound(service, namespace, baseline_run_id, candidate_run_id, gate)
+            .await?;
+    Ok((comparison, candidate))
+}
+
+/// Like [`compare_dataset_runs`], also returning the artifact the candidate
+/// is bound to.
+pub(super) async fn compare_dataset_runs_bound(
+    service: &ChiseiServiceImpl,
+    namespace: &str,
+    baseline_run_id: &str,
+    candidate_run_id: &str,
+    gate: crate::chisei::eval_compare::ComparisonGate,
+) -> Result<
+    (
+        crate::chisei::eval_compare::RunComparison,
+        crate::chisei::eval_run::EvalRunSpec,
+        Option<String>,
+    ),
+    Status,
+> {
+    use crate::chisei::eval_compare::{ComparedRun, compare_runs};
+    use crate::chisei::eval_run::EvalRunStore;
+    let definitions = std::env::var(EVAL_DATASETS_DIR_ENV)
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .ok_or_else(|| Status::failed_precondition("eval datasets are not configured"))?;
+    let store = service.db.runtime_arc();
+    let (namespace, baseline_run_id, candidate_run_id) = (
+        namespace.to_string(),
+        baseline_run_id.to_string(),
+        candidate_run_id.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        let runs = store
+            .list_dataset_runs(&namespace)
+            .map_err(Status::internal)?;
+        let spec_of = |run_id: &str| {
+            runs.iter()
+                .find(|(spec, _)| spec.run_id == run_id)
+                .map(|(spec, _)| spec.clone())
+                .ok_or_else(|| Status::not_found("eval run not found"))
+        };
+        let (baseline, candidate) = (spec_of(&baseline_run_id)?, spec_of(&candidate_run_id)?);
+        let dataset = crate::chisei::eval_dataset::resolve(
+            std::path::Path::new(&definitions),
+            &candidate.dataset,
+            &candidate.dataset_version,
+        )
+        .map_err(Status::not_found)?;
+        let results = |spec: &crate::chisei::eval_run::EvalRunSpec| {
+            store
+                .list_dataset_run_cases(&spec.namespace, &spec.run_id)
+                .map_err(Status::internal)
+        };
+        let (before, after) = (results(&baseline)?, results(&candidate)?);
+        let comparison = compare_runs(
+            &dataset,
+            ComparedRun {
+                spec: &baseline,
+                results: &before,
+            },
+            ComparedRun {
+                spec: &candidate,
+                results: &after,
+            },
+            gate,
+        )
+        .map_err(Status::failed_precondition)?;
+        let artifact = store
+            .dataset_run_artifact(&candidate.namespace, &candidate.run_id)
+            .map_err(Status::internal)?;
+        Ok((comparison, candidate, artifact))
+    })
+    .await
+    .map_err(|_| Status::internal("eval comparison task failed"))?
+}
+
+/// The gate a request asks for: `alpha` 0 is the default.
+pub(super) fn comparison_gate(
+    alpha: f64,
+    allow_policy_increase: bool,
+) -> crate::chisei::eval_compare::ComparisonGate {
+    crate::chisei::eval_compare::ComparisonGate {
+        alpha: if alpha == 0.0 {
+            crate::chisei::eval_compare::DEFAULT_ALPHA
+        } else {
+            alpha
+        },
+        block_on_policy_increase: !allow_policy_increase,
+    }
+}
+
+pub(super) async fn compare_eval_dataset_runs(
+    service: &ChiseiServiceImpl,
+    req: Request<CompareEvalDatasetRunsRequest>,
+) -> Result<Response<CompareEvalDatasetRunsResponse>, Status> {
+    let actor = authenticated_actor(&req);
+    let request = req.into_inner();
+    require_namespace_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
+    let (comparison, _) = compare_dataset_runs(
+        service,
+        &request.namespace,
+        &request.baseline_run_id,
+        &request.candidate_run_id,
+        comparison_gate(request.alpha, request.allow_policy_increase),
+    )
+    .await?;
+    Ok(Response::new(CompareEvalDatasetRunsResponse {
+        dataset: comparison.dataset,
+        dataset_version: comparison.dataset_version,
+        cases: comparison.cases,
+        both_passed: comparison.both_passed,
+        both_failed: comparison.both_failed,
+        regressions: comparison.regressions,
+        improvements: comparison.improvements,
+        p_value: comparison.p_value,
+        alpha: comparison.alpha,
+        significant_regression: comparison.significant_regression,
+        policy: comparison
+            .policy
+            .into_iter()
+            .map(|delta| EvalPolicyDelta {
+                kind: delta.kind,
+                baseline: delta.baseline,
+                candidate: delta.candidate,
+            })
+            .collect(),
+        policy_increased: comparison.policy_increased,
+        verdict: comparison.verdict,
+        reasons: comparison.reasons,
+    }))
+}
+
+pub(super) async fn list_eval_dataset_run_trend(
+    service: &ChiseiServiceImpl,
+    req: Request<ListEvalDatasetRunTrendRequest>,
+) -> Result<Response<ListEvalDatasetRunTrendResponse>, Status> {
+    use crate::chisei::eval_run::EvalRunStore;
+    let actor = authenticated_actor(&req);
+    let request = req.into_inner();
+    require_namespace_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
+    let store = service.db.runtime_arc();
+    let runs = tokio::task::spawn_blocking(move || {
+        store
+            .list_dataset_runs(&request.namespace)
+            .map_err(Status::internal)?
+            .into_iter()
+            .filter(|(spec, _)| spec.dataset == request.dataset)
+            .map(|(spec, started_at_ms)| {
+                let results = store
+                    .list_dataset_run_cases(&spec.namespace, &spec.run_id)
+                    .map_err(Status::internal)?;
+                let point =
+                    crate::chisei::eval_compare::trend_point(&spec, started_at_ms, &results);
+                Ok(EvalRunTrendPoint {
+                    run_id: point.run_id,
+                    agent: point.agent,
+                    model: point.model,
+                    tool_version: point.tool_version,
+                    dataset_version: point.dataset_version,
+                    started_at_ms: point.started_at_ms,
+                    cases_recorded: point.cases_recorded,
+                    cases_passed: point.cases_passed,
+                    policy: point
+                        .policy
+                        .into_iter()
+                        .map(|(kind, count)| EvalPolicyCount { kind, count })
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()
+    })
+    .await
+    .map_err(|_| Status::internal("eval trend task failed"))??;
+    Ok(Response::new(ListEvalDatasetRunTrendResponse { runs }))
 }
 
 pub(super) async fn cancel_evaluation_execution(

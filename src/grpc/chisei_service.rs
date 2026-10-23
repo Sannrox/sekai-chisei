@@ -973,6 +973,20 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_execution::run_eval_dataset(self, req).await
     }
 
+    async fn compare_eval_dataset_runs(
+        &self,
+        req: Request<CompareEvalDatasetRunsRequest>,
+    ) -> Result<Response<CompareEvalDatasetRunsResponse>, Status> {
+        rpc_execution::compare_eval_dataset_runs(self, req).await
+    }
+
+    async fn list_eval_dataset_run_trend(
+        &self,
+        req: Request<ListEvalDatasetRunTrendRequest>,
+    ) -> Result<Response<ListEvalDatasetRunTrendResponse>, Status> {
+        rpc_execution::list_eval_dataset_run_trend(self, req).await
+    }
+
     async fn cancel_evaluation_execution(
         &self,
         req: Request<CancelEvaluationExecutionRequest>,
