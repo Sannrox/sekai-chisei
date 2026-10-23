@@ -26118,6 +26118,7 @@ async fn sync_scope_snapshot_and_deltas_follow_read_policy_links_and_quota() {
             max_hops: 1,
         }),
         max_objects,
+        max_offline_age_ms: 0,
     };
     let snapshot = |token: &str| ReadSyncSnapshotRequest {
         contract_version: SYNC_CONTRACT.into(),
@@ -26550,4 +26551,200 @@ async fn an_offline_submit_needs_a_device_bound_credential() {
     let refused = svc.submit_action_instance(request).await.unwrap_err();
     assert_eq!(refused.code(), tonic::Code::Unauthenticated, "{refused:?}");
     assert!(refused.message().contains("device"), "{refused:?}");
+}
+
+#[tokio::test]
+async fn sync_deltas_purge_what_the_caller_may_no_longer_read() {
+    // #1633: a change in what the caller may read keeps the cursor and
+    // arrives as purges: a hidden property alone, or a hidden object whole.
+    use crate::sekai::object_security::{
+        OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+        ObjectSecurityPredicate, ObjectSecurityRule, PropertyGrant, PropertyGrantAccess,
+    };
+    use crate::sekai::sync_scope::SYNC_CONTRACT;
+    let svc = service();
+    grant_source_namespace(&svc, "field", "alice", security::Role::Admin);
+    let db = svc.db.runtime();
+    let object = |id: &str, props: &[(&str, &str)]| domain::Object {
+        id: id.into(),
+        kind: "WorkOrder".into(),
+        name: id.into(),
+        namespace: "field".into(),
+        external_id: String::new(),
+        properties: props
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        created: 0,
+        updated: 0,
+    };
+    for created in [
+        object("wo-1", &[("site", "north"), ("notes", "gate code 1234")]),
+        object("wo-2", &[("site", "north"), ("notes", "dog on site")]),
+    ] {
+        db.create_object_with_audit(&created, "alice").unwrap();
+    }
+    let hour = 3_600_000;
+    let scope = svc
+        .put_sync_scope(with_named_principal(
+            PutSyncScopeRequest {
+                contract_version: SYNC_CONTRACT.into(),
+                namespace: "field".into(),
+                scope_id: "north".into(),
+                kind: "WorkOrder".into(),
+                property_filters: vec![PropertyFilter {
+                    key: "site".into(),
+                    op: "eq".into(),
+                    value: "north".into(),
+                }],
+                link: None,
+                max_objects: 10,
+                max_offline_age_ms: hour,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(scope.max_offline_age_ms, hour);
+    let before = now_millis();
+    let snapshot = svc
+        .read_sync_snapshot(with_named_principal(
+            ReadSyncSnapshotRequest {
+                contract_version: SYNC_CONTRACT.into(),
+                namespace: "field".into(),
+                scope_id: "north".into(),
+                page_token: String::new(),
+                limit: 0,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(snapshot.objects.len(), 2);
+    // The client must sync again within the scope's maximum offline age.
+    assert!(
+        (before + hour..=now_millis() + hour).contains(&snapshot.offline_until_ms),
+        "{}",
+        snapshot.offline_until_ms
+    );
+    let deltas = |cursor: &str| ReadSyncDeltasRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        cursor: cursor.into(),
+        limit: 0,
+    };
+
+    // A property grant now leaves out `notes`: both objects are sent again
+    // without it, and only that property is purged. The cursor continues.
+    let policy = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "field".into(),
+        kind: "WorkOrder".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![PropertyGrant {
+            property: "site".into(),
+            access: PropertyGrantAccess::Read,
+        }]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-field-grants", 1)
+        .unwrap();
+    // Activation covers every kind in the namespace; the others allow all.
+    let mut revisions = BTreeMap::from([("WorkOrder".to_string(), revision.revision_digest)]);
+    let kinds: std::collections::BTreeSet<String> = db
+        .list_objects(&domain::ListFilter {
+            namespace: Some("field".into()),
+            limit: 1000,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|object| object.kind)
+        .filter(|kind| kind != "WorkOrder")
+        .collect();
+    for kind in kinds {
+        let other = ObjectSecurityPolicy {
+            kind: kind.clone(),
+            property_grants: None,
+            ..policy.clone()
+        };
+        let digest = db
+            .put_object_security_policy(&other, "root", &format!("put-field-{kind}"), 1)
+            .unwrap()
+            .revision_digest;
+        revisions.insert(kind, digest);
+    }
+    db.activate_object_security_policies("field", &revisions, "root", "activate-field-grants", 2)
+        .unwrap();
+    let narrowed = svc
+        .read_sync_deltas(with_named_principal(deltas(&snapshot.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!narrowed.resnapshot_required);
+    assert!(narrowed.removed_object_ids.is_empty());
+    assert_eq!(narrowed.upserts.len(), 2);
+    assert!(
+        narrowed
+            .upserts
+            .iter()
+            .all(|object| !object.properties.contains_key("notes"))
+    );
+    let purged: Vec<(String, Vec<String>)> = narrowed
+        .purges
+        .iter()
+        .map(|purge| (purge.object_id.clone(), purge.properties.clone()))
+        .collect();
+    assert_eq!(
+        purged,
+        [
+            ("wo-1".to_string(), vec!["notes".to_string()]),
+            ("wo-2".to_string(), vec!["notes".to_string()]),
+        ]
+    );
+    assert!(narrowed.offline_until_ms > 0);
+
+    // Marking wo-2 confidential hides it: it is removed and purged whole.
+    db.update_object_with_audit(
+        &object(
+            "wo-2",
+            &[
+                ("site", "north"),
+                ("notes", "dog on site"),
+                (markings::OBJECT_CLASSIFICATION_PROPERTY, "confidential"),
+            ],
+        ),
+        "alice",
+    )
+    .unwrap();
+    let hidden = svc
+        .read_sync_deltas(with_named_principal(deltas(&narrowed.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(hidden.removed_object_ids, ["wo-2"]);
+    assert_eq!(hidden.purges.len(), 1);
+    assert_eq!(hidden.purges[0].object_id, "wo-2");
+    assert!(hidden.purges[0].properties.is_empty());
+    // Leaving the filter is an ordinary removal, not a purge.
+    db.update_object_with_audit(
+        &object("wo-1", &[("site", "south"), ("notes", "gate code 1234")]),
+        "alice",
+    )
+    .unwrap();
+    let left = svc
+        .read_sync_deltas(with_named_principal(deltas(&hidden.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(left.removed_object_ids, ["wo-1"]);
+    assert!(left.purges.is_empty());
 }

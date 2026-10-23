@@ -62,7 +62,20 @@ pub struct ScopeDefinition {
     /// The scope's own quota: snapshots and deltas refuse a scope with more
     /// visible members than this.
     pub max_objects: u32,
+    /// How long a client may show synced data without syncing again (#1633).
+    /// 0 for no limit; omitted from the stored definition when 0, so scopes
+    /// defined before it keep their pins.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_offline_age_ms: i64,
 }
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+/// Shortest and longest maximum offline age.
+pub const MIN_OFFLINE_AGE_MS: i64 = 60_000;
+pub const MAX_OFFLINE_AGE_MS: i64 = 366 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncScope {
@@ -79,6 +92,9 @@ pub struct Member {
     pub object_id: String,
     /// Digest of the object as the caller read it.
     pub fingerprint: String,
+    /// The property names the caller read, sorted; a later read without one
+    /// of them purges it (#1633). Empty when not known.
+    pub properties: Vec<String>,
 }
 
 /// A stored point a cursor names.
@@ -112,9 +128,13 @@ impl SyncPosition {
             .filter_map(|member| match self.delivered.get(&member.object_id) {
                 None => Some(member.clone()),
                 Some(fingerprint) if fingerprint.is_empty() => None,
+                // Delivered as the member was read: its property names hold.
+                Some(fingerprint) if *fingerprint == member.fingerprint => Some(member.clone()),
+                // Delivered differently: the names it was sent with are unknown.
                 Some(fingerprint) => Some(Member {
                     object_id: member.object_id.clone(),
                     fingerprint: fingerprint.clone(),
+                    properties: Vec::new(),
                 }),
             })
             .chain(
@@ -127,6 +147,7 @@ impl SyncPosition {
                     .map(|(id, fingerprint)| Member {
                         object_id: id.clone(),
                         fingerprint: fingerprint.clone(),
+                        properties: Vec::new(),
                     }),
             )
             .collect::<BTreeSet<_>>()
@@ -180,6 +201,11 @@ impl ScopeDefinition {
             return Err(format!(
                 "max_objects must be between 1 and {MAX_SCOPE_OBJECTS}"
             ));
+        }
+        if self.max_offline_age_ms != 0
+            && !(MIN_OFFLINE_AGE_MS..=MAX_OFFLINE_AGE_MS).contains(&self.max_offline_age_ms)
+        {
+            return Err("max_offline_age_ms must be 0, or one minute to 366 days".into());
         }
         Ok(())
     }
@@ -244,23 +270,18 @@ pub fn page(diff: &MemberDiff, limit: usize) -> MemberDiff {
 pub fn advance(before: &[Member], after: &[Member], sent: &MemberDiff) -> Vec<Member> {
     let removed: BTreeSet<&str> = sent.removes.iter().map(String::as_str).collect();
     let sent: BTreeSet<&String> = sent.upserts.iter().collect();
-    let mut held: BTreeMap<String, String> = before
+    let mut held: BTreeMap<String, Member> = before
         .iter()
         .filter(|member| !removed.contains(member.object_id.as_str()))
-        .map(|member| (member.object_id.clone(), member.fingerprint.clone()))
+        .map(|member| (member.object_id.clone(), member.clone()))
         .collect();
     for member in after
         .iter()
         .filter(|member| sent.contains(&member.object_id))
     {
-        held.insert(member.object_id.clone(), member.fingerprint.clone());
+        held.insert(member.object_id.clone(), member.clone());
     }
-    held.into_iter()
-        .map(|(object_id, fingerprint)| Member {
-            object_id,
-            fingerprint,
-        })
-        .collect()
+    held.into_values().collect()
 }
 
 /// Snapshot page token: the position and the last member sent.
@@ -337,13 +358,30 @@ mod tests {
                 max_hops: 1,
             }),
             max_objects: 100,
+            max_offline_age_ms: 0,
         }
     }
 
     #[test]
     fn definitions_are_bounded() {
         assert!(definition().validate().is_ok());
+        assert!(
+            ScopeDefinition {
+                max_offline_age_ms: MIN_OFFLINE_AGE_MS,
+                ..definition()
+            }
+            .validate()
+            .is_ok()
+        );
         let cases = [
+            ScopeDefinition {
+                max_offline_age_ms: 1_000,
+                ..definition()
+            },
+            ScopeDefinition {
+                max_offline_age_ms: MAX_OFFLINE_AGE_MS + 1,
+                ..definition()
+            },
             ScopeDefinition {
                 kind: String::new(),
                 ..definition()
@@ -384,6 +422,7 @@ mod tests {
             .map(|(object_id, fingerprint)| Member {
                 object_id: object_id.to_string(),
                 fingerprint: fingerprint.to_string(),
+                properties: Vec::new(),
             })
             .collect()
     }

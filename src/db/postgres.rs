@@ -163,6 +163,8 @@ const OBJECT_CHANGE_OPERATION_SCHEMA: &str =
     include_str!("postgres/0093_object_change_operation.sql");
 const SYNC_SCOPES_SCHEMA: &str = include_str!("postgres/0094_sync_scopes.sql");
 const EMBEDDING_SPECS_SCHEMA: &str = include_str!("postgres/0095_embedding_specs.sql");
+const SYNC_MEMBER_PROPERTIES_SCHEMA: &str =
+    include_str!("postgres/0096_sync_member_properties.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -758,6 +760,12 @@ const MIGRATIONS: &[Migration] = &[
         94,
         "embedding_specs",
         EMBEDDING_SPECS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        95,
+        "sync_member_properties",
+        SYNC_MEMBER_PROPERTIES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

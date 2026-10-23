@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Offline sync purges: a change in what the caller may read no longer ends
+  the cursor. The next delta purges objects the caller lost whole and
+  properties it lost alone (`purges`). Scopes may set `max_offline_age_ms`,
+  and snapshots and deltas return `offline_until_ms`. A reference replica
+  is in `sekai_client::sync_replica` (ADR 0128, PostgreSQL migration
+  `0096_sync_member_properties`, #1633).
+
 - Embedding specs are stored per namespace and managed with experimental
   `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined
   mode embeds every stored spec on a schedule through its hosted catalog
