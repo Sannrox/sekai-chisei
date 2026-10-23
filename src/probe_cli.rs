@@ -1,8 +1,10 @@
 //! sekaictl admin assurance probes run/summary commands (#1621).
 //!
 //! `run` is what a scheduler calls: it executes the remote isolation probes
-//! once against one allow-listed target and appends to the ledger. Tokens
-//! are read from files so they never appear in arguments or logs.
+//! once against one allow-listed target and appends to the ledger, then any
+//! declarative probe specs from `--specs <dir>` (#1680), all validated before
+//! the first call. Tokens are read from files so they never appear in
+//! arguments or logs.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +14,8 @@ type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
     "sekaictl admin assurance probes run --target <endpoint> --tenant <ns> --tenant-token-file <file> \
-     --foreign-tenant <ns> --foreign-token-file <file> --foreign-object <id> --ledger <file> --advisories <dir>\n  \
+     --foreign-tenant <ns> --foreign-token-file <file> --foreign-object <id> --ledger <file> --advisories <dir> \
+     [--specs <dir>]\n  \
      sekaictl admin assurance probes summary --ledger <file> --week-start-ms <ms>\n  \
      (targets must be listed in SEKAI_PROBE_TARGET_ALLOWLIST; both tenants must be synthetic)"
 }
@@ -51,9 +54,23 @@ pub async fn run_probes_command(args: Vec<String>) -> Result<(), BoxErr> {
             };
             let ledger = PathBuf::from(flag(rest, "--ledger")?);
             let advisories = PathBuf::from(flag(rest, "--advisories")?);
-            let report = run(TargetGuard::from_env(), &target, &ledger, &advisories)
-                .await
-                .map_err(std::io::Error::other)?;
+            // Given without a directory is an error, never a run without
+            // specs. A set that fails to load is a refused run, ledgered.
+            let specs = if rest.iter().any(|arg| arg == "--specs") {
+                let dir = flag(rest, "--specs")?;
+                crate::probe_spec::load_dir(Path::new(&dir))
+            } else {
+                Ok(Vec::new())
+            };
+            let report = run(
+                TargetGuard::from_env(),
+                &target,
+                specs,
+                &ledger,
+                &advisories,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
             for attempt in &report.attempts {
                 println!(
                     "{}",
@@ -70,6 +87,16 @@ pub async fn run_probes_command(args: Vec<String>) -> Result<(), BoxErr> {
             for failure in &report.advisory_failures {
                 eprintln!("{failure}");
             }
+            let mismatches = report
+                .attempts
+                .iter()
+                .filter(|attempt| {
+                    matches!(
+                        attempt.outcome,
+                        crate::probe_runner::ProbeOutcome::Mismatch(_)
+                    )
+                })
+                .count();
             let bypasses = report
                 .attempts
                 .iter()
@@ -80,6 +107,13 @@ pub async fn run_probes_command(args: Vec<String>) -> Result<(), BoxErr> {
                 return Err(std::io::Error::other(format!(
                     "{bypasses} isolation bypass(es); private advisory drafts in {}",
                     advisories.display()
+                ))
+                .into());
+            }
+            if mismatches > 0 {
+                // Denied, but not as specified: a finding to inspect.
+                return Err(std::io::Error::other(format!(
+                    "{mismatches} probe spec(s) were denied otherwise than expected; see the ledger"
                 ))
                 .into());
             }

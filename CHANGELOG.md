@@ -40,6 +40,15 @@
   reconciler registers and retires entries for published object types
   (ADR 0122, #1559).
 
+- The guarded isolation probe runner executes declarative probe specs
+  (`sekai.probe-spec/v1`): a read-only object-scoped RPC, the principal to
+  call as and the expected denial, with no endpoint, credential, tenant or
+  object of their own. `sekaictl admin assurance probes run --specs <dir>`
+  validates them before any call; a spec not denied as expected is a
+  finding with the spec as reproduction, and `tests/fixtures/probe_specs/`
+  runs promoted specs in the regression suite (docs/isolation-probes.md,
+  #1680).
+
 - Experimental live policy shadow: `StartPolicyShadow` evaluates a candidate
   namespace route policy beside the active one on every live resolution,
   without changing the decision. `GetPolicyShadowReport` shows the match

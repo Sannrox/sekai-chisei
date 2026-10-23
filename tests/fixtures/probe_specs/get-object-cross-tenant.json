@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "get-object-cross-tenant",
+  "as": "tenant",
+  "call": {"rpc": "GetObject"},
+  "expect": {"codes": ["PermissionDenied", "NotFound"]}
+}
