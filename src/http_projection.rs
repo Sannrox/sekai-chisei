@@ -852,7 +852,14 @@ impl NativeSurface for HttpMcpSurface {
         rpc: crate::mcp_adapter::NativeRpc,
         invocation: crate::capability_projection::SdkInvocation,
     ) -> Result<Value, crate::mcp_adapter::AdapterError> {
-        crate::mcp_adapter::dispatch_native(&self.sekai, &self.chisei, rpc, invocation).await
+        crate::mcp_adapter::dispatch_native(
+            &self.sekai,
+            &self.chisei,
+            rpc,
+            invocation,
+            experimental_rpcs_enabled(),
+        )
+        .await
     }
 }
 

@@ -215,8 +215,10 @@ fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
         "sekai.definitions.impact",
         "sekai.definitions.proposal.create",
     ];
+    // Tools whose backing RPC is experimental have their own catalog sections.
+    let search_tool = "sekai.search.query";
     for tool in &projected {
-        if definition_tools.contains(tool) {
+        if definition_tools.contains(tool) || *tool == search_tool {
             continue;
         }
         assert!(
@@ -224,6 +226,17 @@ fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
             "capability catalog MCP allowlist must list projected tool {tool}"
         );
     }
+
+    let search = catalog
+        .split("### Hybrid search tool")
+        .nth(1)
+        .expect("hybrid search tool heading");
+    assert!(projected.contains(&search_tool));
+    assert!(
+        !capability_is_stable(search_tool),
+        "Search stays experimental"
+    );
+    assert!(search.contains(search_tool) && search.contains("`Search`"));
 
     let definition = definition_branch_tools_paragraph(&catalog);
     for tool in definition_tools {

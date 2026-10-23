@@ -330,8 +330,8 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
 /// Reciprocal rank fusion of ranked lists under [`FUSION_PROFILE`]: each
 /// list adds `weight / (RRF_K + rank)` (rank from 1) to its keys; a list
 /// weighted 0 contributes no keys. Ties break by key, so a fixed input
-/// fuses to a fixed order.
-pub fn rrf_fuse<K: Ord + Clone>(lists: &[(&[K], f64)]) -> Vec<K> {
+/// fuses to a fixed order. Each key comes with its fused score.
+pub fn rrf_fuse<K: Ord + Clone>(lists: &[(&[K], f64)]) -> Vec<(K, f64)> {
     let mut scores = BTreeMap::<K, f64>::new();
     for (list, weight) in lists.iter().filter(|(_, weight)| *weight > 0.0) {
         for (rank, key) in list.iter().enumerate() {
@@ -340,7 +340,7 @@ pub fn rrf_fuse<K: Ord + Clone>(lists: &[(&[K], f64)]) -> Vec<K> {
     }
     let mut fused = scores.into_iter().collect::<Vec<_>>();
     fused.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    fused.into_iter().map(|(key, _)| key).collect()
+    fused
 }
 
 pub fn policy_attributes(object: &Object) -> BTreeMap<String, String> {
@@ -2374,15 +2374,19 @@ mod tests {
     fn rrf_fuses_deterministically_and_a_zero_weight_list_adds_nothing() {
         let text = ["a", "b", "c"];
         let vector = ["c", "d", "a"];
+        let keys = |fused: Vec<(&'static str, f64)>| {
+            fused.into_iter().map(|(key, _)| key).collect::<Vec<_>>()
+        };
         let fused = rrf_fuse(&[(&text[..], 1.0), (&vector[..], 1.0)]);
         // a: 1/61 + 1/63, c: 1/63 + 1/61 tie, broken by key; then b and d tie.
-        assert_eq!(fused, vec!["a", "c", "b", "d"]);
+        assert_eq!(keys(fused.clone()), vec!["a", "c", "b", "d"]);
+        assert!((fused[0].1 - (1.0 / 61.0 + 1.0 / 63.0)).abs() < 1e-12);
         assert_eq!(fused, rrf_fuse(&[(&text[..], 1.0), (&vector[..], 1.0)]));
         assert_eq!(
-            rrf_fuse(&[(&text[..], 0.0), (&vector[..], 1.0)]),
+            keys(rrf_fuse(&[(&text[..], 0.0), (&vector[..], 1.0)])),
             vec!["c", "d", "a"]
         );
-        assert_eq!(rrf_fuse(&[(&text[..], 1.0), (&vector[..], 3.0)])[0], "c");
+        assert_eq!(rrf_fuse(&[(&text[..], 1.0), (&vector[..], 3.0)])[0].0, "c");
     }
 
     /// The exact path's latency budget at 10^6 vectors (#1582): an ANN index

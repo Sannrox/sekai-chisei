@@ -30,7 +30,8 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.definitions.branch.edit",
             "sekai.definitions.diff",
             "sekai.definitions.impact",
-            "sekai.definitions.proposal.create"
+            "sekai.definitions.proposal.create",
+            "sekai.search.query"
         ]
     );
     assert_eq!(report.object_id, "widget-1");

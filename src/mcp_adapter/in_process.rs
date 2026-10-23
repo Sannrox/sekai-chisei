@@ -49,10 +49,24 @@ pub struct InProcessSurface {
     pub sekai: SekaiServiceImpl,
     chisei: ChiseiServiceImpl,
     catalog: Mutex<Option<CatalogSnapshot>>,
+    /// Whether experimental tools may run. The synthetic plane enables them;
+    /// a deployed host passes the operator setting.
+    pub experimental_rpcs: bool,
+    /// The plane's store, for tests that seed it directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    db: Arc<RuntimeDb>,
 }
 
 impl InProcessSurface {
     pub async fn synthetic() -> Result<Self, String> {
+        Self::synthetic_with(None).await
+    }
+
+    /// The synthetic plane, with an embedding route for hybrid search when
+    /// given (as combined mode wires one).
+    pub async fn synthetic_with(
+        embedding_route: Option<crate::composition::embedding_catch_up::EmbeddingRoute>,
+    ) -> Result<Self, String> {
         let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
             SekaiDb::new(":memory:").map_err(|error| error.to_string())?,
         )));
@@ -79,15 +93,18 @@ impl InProcessSurface {
             .map_err(|error| error.to_string())?;
         }
         let sekai_store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
-        let chisei_store = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
+        let chisei_store = crate::chisei_store::ChiseiStore::from_shared_runtime(db.clone());
         let budget = Arc::new(BudgetTracker::new(chisei_store.clone()));
         let clerk = crate::composition::cross_store_admission::CrossStoreAdmission::new(
             chisei_store.clone(),
             sekai_store.clone(),
             Some(budget),
         );
-        let sekai =
+        let mut sekai =
             SekaiServiceImpl::new(sekai_store.clone()).with_cross_store_admission(Arc::new(clerk));
+        if let Some(route) = embedding_route {
+            sekai = sekai.with_embedding_route(route);
+        }
         let chisei = ChiseiServiceImpl::new(chisei_store, fixture_config())
             .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
                 sekai_store.clone(),
@@ -106,6 +123,8 @@ impl InProcessSurface {
             sekai,
             chisei,
             catalog: Mutex::new(None),
+            experimental_rpcs: true,
+            db,
         };
         surface.seed().await?;
         Ok(surface)
@@ -295,7 +314,14 @@ impl NativeSurface for InProcessSurface {
         rpc: NativeRpc,
         invocation: SdkInvocation,
     ) -> Result<Value, AdapterError> {
-        super::surface::dispatch_native(&self.sekai, &self.chisei, rpc, invocation).await
+        super::surface::dispatch_native(
+            &self.sekai,
+            &self.chisei,
+            rpc,
+            invocation,
+            self.experimental_rpcs,
+        )
+        .await
     }
 }
 
@@ -518,4 +544,233 @@ fn call_output(message: Value) -> Result<Value, String> {
         return Err(message["result"]["structuredContent"].to_string());
     }
     Ok(message["result"]["structuredContent"].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grpc::pb::sekai::SearchRequest;
+    use crate::mcp_adapter::handle_message;
+    use crate::sekai::embedding_index::{EmbeddingSpec, EmbeddingStore, StoredEmbeddingSpec};
+    use chisei_provider::embedding::Embedder;
+
+    /// One axis for cats, one for dogs: "kitten" is near "cat" without
+    /// sharing a word with it.
+    struct Topic;
+
+    #[async_trait]
+    impl Embedder for Topic {
+        fn model(&self) -> &str {
+            "topic"
+        }
+        fn model_version(&self) -> &str {
+            "v1"
+        }
+        fn external(&self) -> bool {
+            false
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            let axis = |text: &str, words: &[&str]| {
+                f32::from(u8::from(words.iter().any(|word| text.contains(word))))
+            };
+            Ok(texts
+                .iter()
+                .map(|text| vec![axis(text, &["cat", "kitten"]), axis(text, &["dog"]), 0.01])
+                .collect())
+        }
+    }
+
+    fn topic_route() -> crate::composition::embedding_catch_up::EmbeddingRoute {
+        Arc::new(|_| Box::pin(async { Ok(Box::new(Topic) as Box<dyn Embedder>) }))
+    }
+
+    /// Notes the session principal may read, plus one another owner holds.
+    async fn indexed_surface() -> InProcessSurface {
+        let surface = InProcessSurface::synthetic_with(Some(topic_route()))
+            .await
+            .unwrap();
+        for (id, body, owner) in [
+            ("note-cat", "cat sleeps", ""),
+            ("note-kitten", "kitten naps", ""),
+            ("note-hidden", "kitten secret", "someone-else"),
+        ] {
+            let mut properties = HashMap::from([("body".to_string(), body.to_string())]);
+            if !owner.is_empty() {
+                properties.insert("owner".into(), owner.into());
+            }
+            surface
+                .db
+                .create_object_with_audit(
+                    &crate::domain::Object {
+                        id: id.into(),
+                        kind: "note".into(),
+                        name: "note".into(),
+                        namespace: NAMESPACE.into(),
+                        external_id: String::new(),
+                        properties,
+                        created: 1,
+                        updated: 1,
+                    },
+                    if owner.is_empty() { PRINCIPAL } else { owner },
+                )
+                .unwrap();
+        }
+        surface
+            .db
+            .put_embedding_spec(&StoredEmbeddingSpec {
+                spec: EmbeddingSpec {
+                    id: "notes".into(),
+                    namespace: NAMESPACE.into(),
+                    object_kind: "note".into(),
+                    properties: vec!["body".into()],
+                    chunk_chars: 1_000,
+                    dimension: 3,
+                    batch_size: 8,
+                },
+                model: "topic".into(),
+                updated_by: "admin".into(),
+                updated_at_ms: 1,
+                revision: 0,
+            })
+            .unwrap();
+        let route = topic_route();
+        crate::composition::embedding_catch_up::catch_up_stored_specs(
+            &surface.db,
+            |stored| route(stored),
+            &|| 1_000,
+        )
+        .await
+        .unwrap();
+        surface
+    }
+
+    /// Fails when any object key names a vector or embedding, or any array
+    /// is all numbers.
+    fn assert_no_vectors(value: &Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, inner) in map {
+                    assert!(
+                        !matches!(
+                            key.as_str(),
+                            "vector" | "vectors" | "embedding" | "embeddings"
+                        ),
+                        "{key} in {value}"
+                    );
+                    assert_no_vectors(inner);
+                }
+            }
+            Value::Array(items) => {
+                assert!(
+                    items.is_empty() || !items.iter().all(Value::is_number),
+                    "numeric array in {value}"
+                );
+                items.iter().for_each(assert_no_vectors);
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn search_tool_returns_the_rpc_hits_as_references_without_vectors() {
+        let surface = indexed_surface().await;
+        let called = handle_message(
+            &surface,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": crate::mcp_adapter::protocol::SEARCH_TOOL,
+                    "arguments": {"operation_id": "op-search-1", "input": {"text": "cat"}}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let output = call_output(called).unwrap()["output"].clone();
+        let rpc = surface
+            .sekai
+            .search(with_identity(
+                SearchRequest {
+                    namespace: NAMESPACE.into(),
+                    text: "cat".into(),
+                    source: "object".into(),
+                    mode: "hybrid".into(),
+                    ..Default::default()
+                },
+                PRINCIPAL,
+                NAMESPACE,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let references = output["references"].as_array().unwrap();
+        let ids = references
+            .iter()
+            .map(|reference| reference["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        // The same hits in the same order as the RPC for this principal; the
+        // note another owner holds is absent though its vector is as near.
+        assert_eq!(
+            ids,
+            rpc.hits
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ids, vec!["note-cat", "note-kitten"]);
+        assert_eq!(references[0]["type"], "note");
+        assert!(references[0]["score"].as_f64().unwrap() > 0.0);
+        assert_eq!(output["fusion_profile"], "late_fusion.rrf/v1");
+        assert_no_vectors(&output);
+    }
+
+    #[tokio::test]
+    async fn search_tool_stays_off_while_experimental_rpcs_are_disabled() {
+        let mut surface = indexed_surface().await;
+        surface.experimental_rpcs = false;
+        let called = handle_message(
+            &surface,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": crate::mcp_adapter::protocol::SEARCH_TOOL,
+                    "arguments": {"operation_id": "op-search-3", "input": {"text": "cat"}}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            called["result"]["structuredContent"]["code"], "failed_precondition",
+            "{called}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tool_keeps_the_session_namespace() {
+        let surface = indexed_surface().await;
+        let called = handle_message(
+            &surface,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": crate::mcp_adapter::protocol::SEARCH_TOOL,
+                    "arguments": {
+                        "operation_id": "op-search-2",
+                        "input": {"text": "cat", "namespace": FOREIGN_NAMESPACE}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(called["error"]["code"], -32602, "{called}");
+    }
 }

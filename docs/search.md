@@ -60,6 +60,16 @@ read, and a filled cap marks the count as a lower bound. A vector hit that
 does not match the text has no highlights. `vector_lag_ms` is the age of the
 oldest object change the searched vectors have not consumed.
 
+Agents reach hybrid search through the MCP tool `sekai.search.query`
+([capability-catalog.md](capability-catalog.md#hybrid-search-tool)), which
+returns object references, never vectors. Each hybrid hit carries its fused
+`score`; text-mode hits carry 0.
+
+Agents reach hybrid search through the MCP tool `sekai.search.query`
+([capability-catalog.md](capability-catalog.md#hybrid-search-tool)), which
+returns object references, never vectors. Each hybrid hit carries its fused
+`score`; text-mode hits carry 0.
+
 ## Status
 
 `GetSearchIndexStatus` is a namespace read. It returns analyzer version,
