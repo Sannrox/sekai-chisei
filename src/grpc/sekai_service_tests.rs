@@ -25614,3 +25614,190 @@ async fn publishing_an_object_type_registers_and_retires_its_catalog_entry() {
         assert_eq!(invoice.properties["status"], "deprecated");
     }
 }
+
+#[tokio::test]
+async fn media_upload_resumes_checks_its_checksum_and_reads_under_object_policy() {
+    use sha2::{Digest, Sha256};
+    let svc = service();
+    grant_source_namespace(&svc, "field", "alice", security::Role::Admin);
+    grant_source_namespace(&svc, "field", "carol", security::Role::Viewer);
+    let file: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
+    let sha = crate::sekai::media_upload::hex(&Sha256::digest(&file));
+    let begin = |key: &str, sha: &str| BeginMediaUploadRequest {
+        namespace: "field".into(),
+        idempotency_key: key.into(),
+        size_bytes: file.len() as u64,
+        sha256: sha.into(),
+        media_type: "image/jpeg".into(),
+        file_name: "site.jpg".into(),
+        access_marking: String::new(),
+    };
+    let chunk = |upload_id: &str, offset: usize, end: usize| UploadMediaChunkRequest {
+        upload_id: upload_id.into(),
+        offset: offset as u64,
+        data: file[offset..end].to_vec(),
+    };
+
+    // A viewer may not upload into the namespace.
+    let denied = svc
+        .begin_media_upload(with_named_principal(begin("p-1", &sha), "carol"))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+    let started = svc
+        .begin_media_upload(with_named_principal(begin("p-1", &sha), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    let id = started.upload_id.clone();
+    svc.upload_media_chunk(with_named_principal(chunk(&id, 0, 1000), "alice"))
+        .await
+        .unwrap();
+    // The connection drops; the client asks where to continue, and a resent
+    // first chunk is a harmless retry.
+    let status = svc
+        .get_media_upload(with_named_principal(
+            GetMediaUploadRequest {
+                upload_id: id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((status.received_bytes, status.complete), (1000, false));
+    let retried = svc
+        .upload_media_chunk(with_named_principal(chunk(&id, 0, 1000), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retried.received_bytes, 1000);
+    let gap = svc
+        .upload_media_chunk(with_named_principal(chunk(&id, 2000, 2500), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(gap.code(), tonic::Code::FailedPrecondition);
+    assert!(gap.message().contains("offset 1000"), "{gap:?}");
+    // Nobody else sees or continues the session.
+    let foreign = svc
+        .upload_media_chunk(with_named_principal(chunk(&id, 1000, 2000), "carol"))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::NotFound);
+    svc.upload_media_chunk(with_named_principal(chunk(&id, 1000, 2500), "alice"))
+        .await
+        .unwrap();
+    let done = svc
+        .complete_media_upload(with_named_principal(
+            CompleteMediaUploadRequest {
+                upload_id: id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(done.complete);
+    assert!(
+        done.media_reference.starts_with("sekai-media:media-"),
+        "{done:?}"
+    );
+
+    // The same key returns the same reference, and completing is idempotent.
+    let again = svc
+        .begin_media_upload(with_named_principal(begin("p-1", &sha), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.media_reference, done.media_reference);
+    let completed_again = svc
+        .complete_media_upload(with_named_principal(
+            CompleteMediaUploadRequest {
+                upload_id: id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(completed_again.media_reference, done.media_reference);
+    let changed = svc
+        .begin_media_upload(with_named_principal(begin("p-1", &"0".repeat(64)), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(changed.code(), tonic::Code::AlreadyExists);
+
+    // A namespace reader reads the file; a caller without access cannot.
+    let read = |principal: &str| {
+        svc.read_media(with_named_principal(
+            ReadMediaRequest {
+                media_reference: done.media_reference.clone(),
+                offset: 0,
+                limit: 0,
+            },
+            principal,
+        ))
+    };
+    let body = read("carol").await.unwrap().into_inner();
+    assert_eq!(body.data, file);
+    assert_eq!(
+        (body.sha256.as_str(), body.media_type.as_str()),
+        (sha.as_str(), "image/jpeg")
+    );
+    assert_eq!(
+        read("mallory").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    // Generic object reads never expose the media object.
+    let object_id = done.media_reference.trim_start_matches("sekai-media:");
+    let generic = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: object_id.into(),
+            },
+            "alice",
+        ))
+        .await;
+    assert!(generic.is_err(), "{generic:?}");
+
+    // A checksum mismatch is refused, and the upload can be sent again.
+    let wrong = svc
+        .begin_media_upload(with_named_principal(begin("p-2", &"a".repeat(64)), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    for (start, end) in [(0, 1000), (1000, 2000), (2000, 2500)] {
+        svc.upload_media_chunk(with_named_principal(
+            chunk(&wrong.upload_id, start, end),
+            "alice",
+        ))
+        .await
+        .unwrap();
+    }
+    let mismatch = svc
+        .complete_media_upload(with_named_principal(
+            CompleteMediaUploadRequest {
+                upload_id: wrong.upload_id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(mismatch.code(), tonic::Code::InvalidArgument);
+    assert!(
+        mismatch.message().contains("checksum mismatch"),
+        "{mismatch:?}"
+    );
+    let reset = svc
+        .get_media_upload(with_named_principal(
+            GetMediaUploadRequest {
+                upload_id: wrong.upload_id,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((reset.received_bytes, reset.complete), (0, false));
+}

@@ -5,7 +5,7 @@
 - `ListObjectChanges` works on PostgreSQL with the same semantics and paging
   as SQLite. Each change row stores the operation that produced it, and the
   RPC returns that stored id instead of correlating by object and time
-  (docs/operation-correlation.md, `0092_object_change_operation`, GATE:mig,
+  (docs/operation-correlation.md, `0093_object_change_operation`, GATE:mig,
   #1689).
 
 - Enterprise-scoped credentials may call `ProposeDefinitionRollback`,
@@ -13,6 +13,13 @@
   the tenant's namespace and members like the other definition proposal
   RPCs, so a composing platform can promote and roll back definitions with
   the caller's authority (#1700).
+
+- Experimental governed media uploads: `BeginMediaUpload`,
+  `UploadMediaChunk` and `CompleteMediaUpload` take a file in resumable
+  chunks, check its SHA-256, and return a `sekai-media:` reference to a
+  `media_attachment` object carrying the upload's marking. `ReadMedia`
+  reads it under the object read checks, and the same idempotency key
+  returns the same reference (ADR 0123, #1623).
 
 - Experimental fence bindings (ADR 0121): `PutFenceBinding` binds Ezu
   geofence events (enter, exit, inside, dwell) for one collection to a

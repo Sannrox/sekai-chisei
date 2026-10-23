@@ -853,6 +853,51 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "BeginMediaUpload",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "UploadMediaChunk",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CompleteMediaUpload",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetMediaUpload",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ReadMedia",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ExpandNeighborhood",
       "storage_path": "sekai.graph",
       "real_backend": "yes",

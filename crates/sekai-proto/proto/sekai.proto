@@ -3657,6 +3657,17 @@ service SekaiService {
   rpc GetLinkedObjects(GetLinkedObjectsRequest) returns (GetLinkedObjectsResponse);
 
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
+  // Governed media uploads (#1623, ADR 0123). Experimental. A client
+  // begins an upload with the file's size and SHA-256, sends it in chunks
+  // (resuming from `received_bytes` after an interruption), and completes
+  // it. Completing checks the SHA-256 and returns a `sekai-media:`
+  // reference to a governed `media_attachment` object; reading the file is
+  // a read of that object. The same idempotency key returns the same upload.
+  rpc BeginMediaUpload(BeginMediaUploadRequest) returns (MediaUploadStatus);
+  rpc UploadMediaChunk(UploadMediaChunkRequest) returns (MediaUploadStatus);
+  rpc CompleteMediaUpload(CompleteMediaUploadRequest) returns (MediaUploadStatus);
+  rpc GetMediaUpload(GetMediaUploadRequest) returns (MediaUploadStatus);
+  rpc ReadMedia(ReadMediaRequest) returns (ReadMediaResponse);
   rpc ExpandNeighborhood(ExpandNeighborhoodRequest) returns (ExpandNeighborhoodResponse);
   rpc FindPaths(FindPathsRequest) returns (FindPathsResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
@@ -3784,4 +3795,63 @@ service SekaiService {
   rpc ListEvidenceSubmissions(ListEvidenceSubmissionsRequest) returns (ListEvidenceSubmissionsResponse);
   rpc CreateHandoff(CreateHandoffRequest) returns (CreateHandoffResponse);
   rpc RevokeHandoff(RevokeHandoffRequest) returns (RevokeHandoffResponse);
+}
+
+message BeginMediaUploadRequest {
+  string namespace = 1;
+  // Scoped to the namespace and the uploader. Repeating a begin with the
+  // same key and declaration returns the same upload.
+  string idempotency_key = 2;
+  // At most 64 MiB.
+  uint64 size_bytes = 3;
+  // Lowercase hex SHA-256 of the whole file.
+  string sha256 = 4;
+  // type/subtype, for example image/jpeg.
+  string media_type = 5;
+  string file_name = 6;
+  // Classification marking of the file; empty for unmarked.
+  string access_marking = 7;
+}
+
+message MediaUploadStatus {
+  string upload_id = 1;
+  uint64 size_bytes = 2;
+  // Send the next chunk from here.
+  uint64 received_bytes = 3;
+  bool complete = 4;
+  // `sekai-media:<object id>` once complete.
+  string media_reference = 5;
+}
+
+message UploadMediaChunkRequest {
+  string upload_id = 1;
+  // Must equal the upload's received_bytes. A chunk the upload already holds
+  // is accepted as a retry and changes nothing.
+  uint64 offset = 2;
+  // At most 1 MiB.
+  bytes data = 3;
+}
+
+message CompleteMediaUploadRequest {
+  string upload_id = 1;
+}
+
+message GetMediaUploadRequest {
+  string upload_id = 1;
+}
+
+message ReadMediaRequest {
+  string media_reference = 1;
+  uint64 offset = 2;
+  // Default and maximum 1 MiB.
+  uint32 limit = 3;
+}
+
+message ReadMediaResponse {
+  bytes data = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+  string media_type = 4;
+  string file_name = 5;
+  string access_marking = 6;
 }
