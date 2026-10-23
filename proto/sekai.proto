@@ -3409,6 +3409,63 @@ message ReportDefinitionConsumerImpactResponse {
   repeated DefinitionConsumerImpactPath impacts = 4;
 }
 
+// Author-declared intent a definition diff cannot show (ADR 0125).
+message DefinitionPropertyRename {
+  string object_type = 1;
+  string from_property = 2;
+  string to_property = 3;
+}
+message DefinitionPropertyDefault {
+  string object_type = 1;
+  string property = 2;
+  // Value existing objects get for a new required property.
+  string value = 3;
+}
+message DefinitionPropertyRef {
+  string object_type = 1;
+  string property = 2;
+}
+message DefinitionChangeHints {
+  repeated DefinitionPropertyRename renames = 1;
+  repeated DefinitionPropertyDefault defaults = 2;
+  repeated DefinitionPropertyRef type_changes = 3;
+}
+// kind: rename_property, default_required_property, drop_property,
+// type_change, or remove_object_type. Manual steps carry a reason code.
+message DefinitionMigrationStep {
+  string kind = 1;
+  string object_type = 2;
+  string property = 3;
+  string from_property = 4;
+  string default_value = 5;
+  bool manual = 6;
+  string reason = 7;
+}
+// mode: copy from the source property, or default to the source literal.
+message DefinitionBackfillAssignment {
+  string object_type = 1;
+  string property = 2;
+  string mode = 3;
+  string source = 4;
+}
+message GenerateDefinitionChangeBundleRequest {
+  string namespace = 1;
+  string from_revision_digest = 2;
+  string to_revision_digest = 3;
+  DefinitionChangeHints hints = 4;
+}
+// Read-only: generation publishes, writes, and runs nothing.
+message GenerateDefinitionChangeBundleResponse {
+  string contract_version = 1;
+  string bundle_digest = 2;
+  DefinitionRevisionDiff diff = 3;
+  repeated DefinitionMigrationStep steps = 4;
+  string backfill_contract = 5;
+  repeated DefinitionBackfillAssignment backfill = 6;
+  // Caller-scoped; outside bundle_digest.
+  ReportDefinitionConsumerImpactResponse impact = 7;
+}
+
 message DefinitionCompatibilityReason {
   string class = 1;
   string member_kind = 2;
@@ -3593,6 +3650,7 @@ service SekaiService {
   rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
+  rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc GetOntologyChangelog(GetOntologyChangelogRequest) returns (GetOntologyChangelogResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);
   rpc ExecuteDefinitionFactMigration(ExecuteDefinitionFactMigrationRequest) returns (ExecuteDefinitionFactMigrationResponse);

@@ -118,6 +118,9 @@ If you want to deploy or operate the control plane:
 - [Authorized consumer impact](definition-consumer-impact.md) —
   registered definition-consumer bindings joined to revision comparison.
   Zero visible dependents is not proof of zero impact.
+- [Definition change bundles](definition-change-bundles.md) — revision
+  diff, migration plan, backfill, and consumer impact in one read-only
+  bundle.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
   `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
   hops/aggregates, evaluated through authorized list and traverse. A page

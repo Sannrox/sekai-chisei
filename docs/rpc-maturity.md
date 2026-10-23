@@ -102,6 +102,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.ImportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.CompareDefinitionRevisions` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ReportDefinitionConsumerImpact` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GenerateDefinitionChangeBundle` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ClassifyDefinitionRevisionCompatibility` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ExecuteDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |
