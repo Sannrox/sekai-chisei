@@ -56,7 +56,7 @@ A transform that stamps an output marking records the stamp as a change of
 record `direct`. Rows written before the columns existed, by a version
 without them during a rolling deploy, or by internal writers that record no
 writer read as `unattributed`; the writer is never inferred. The columns are
-nullable on both backends (PostgreSQL `0096_object_change_writer`).
+nullable on both backends (PostgreSQL `0097_object_change_writer`).
 
 ## Client propagation
 

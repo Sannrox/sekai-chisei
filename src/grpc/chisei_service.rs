@@ -966,6 +966,13 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_execution::execute_evaluation_manifest(self, req).await
     }
 
+    async fn run_eval_dataset(
+        &self,
+        req: Request<RunEvalDatasetRequest>,
+    ) -> Result<Response<RunEvalDatasetResponse>, Status> {
+        rpc_execution::run_eval_dataset(self, req).await
+    }
+
     async fn cancel_evaluation_execution(
         &self,
         req: Request<CancelEvaluationExecutionRequest>,

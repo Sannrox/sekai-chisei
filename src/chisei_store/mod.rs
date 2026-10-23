@@ -15,6 +15,7 @@ pub mod chisei_portfolio;
 pub mod chisei_portfolio_backend;
 pub mod chisei_routing_profile;
 mod data_quality_store;
+pub mod eval_run;
 mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;

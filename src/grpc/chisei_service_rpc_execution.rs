@@ -1123,6 +1123,110 @@ pub(super) async fn execute_evaluation_manifest(
         execution: Some(to_proto_evaluation_execution_projection(&projection)),
     }))
 }
+/// Directory of checked-in eval dataset definitions runs resolve from.
+pub(crate) const EVAL_DATASETS_DIR_ENV: &str = "CHISEI_EVAL_DATASETS_DIR";
+
+pub(super) async fn run_eval_dataset(
+    service: &ChiseiServiceImpl,
+    req: Request<RunEvalDatasetRequest>,
+) -> Result<Response<RunEvalDatasetResponse>, Status> {
+    use crate::chisei::eval_run::{
+        DefinitionCaseExecutor, EVAL_RUN_CONTRACT, EvalRunSpec, RUN_CONFLICT, RUN_IN_PROGRESS, run,
+    };
+    let actor = authenticated_actor(&req);
+    let request = req.into_inner();
+    require_namespace_write_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
+    let definition = service
+        .db
+        .get_evaluator_definition(&request.evaluator_definition_id)
+        .map_err(Status::internal)?
+        .filter(|definition| definition.namespace == request.namespace)
+        .ok_or_else(|| Status::not_found("evaluator definition not found"))?;
+    let spec = EvalRunSpec {
+        contract_version: EVAL_RUN_CONTRACT.into(),
+        namespace: request.namespace,
+        run_id: request.run_id,
+        dataset: request.dataset,
+        dataset_version: request.dataset_version,
+        agent: request.agent,
+        model: request.model,
+        tool_version: request.tool_version,
+        evaluator_definition_id: definition.definition_id.clone(),
+        evaluator_digest: definition.content_digest.clone(),
+        concurrency: request.concurrency,
+        budget_micros: request.budget_micros,
+        max_case_cost_micros: request.max_case_cost_micros,
+    };
+    spec.validate().map_err(Status::invalid_argument)?;
+    let definitions = std::env::var(EVAL_DATASETS_DIR_ENV)
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .ok_or_else(|| Status::failed_precondition("eval datasets are not configured"))?;
+    let dataset = crate::chisei::eval_dataset::resolve(
+        std::path::Path::new(&definitions),
+        &spec.dataset,
+        &spec.dataset_version,
+    )
+    .map_err(Status::not_found)?;
+    let pricing = crate::cost_estimate::pricing_from_env()
+        .map_err(|_| Status::failed_precondition("model pricing is misconfigured"))?
+        .remove(&spec.model);
+    if let Some(policy) = &definition.stochastic_policy
+        && !service
+            .evaluation_execution_lifecycle
+            .stochastic_egress_allowed(policy)
+    {
+        return Err(Status::failed_precondition(
+            evaluation_execution_domain::REASON_STOCHASTIC_EGRESS_DENIED,
+        ));
+    }
+    let (deterministic, stochastic, budget) = service.evaluation_execution_lifecycle.registries();
+    let store = service.db.runtime_arc();
+    let report = tokio::task::spawn_blocking(move || {
+        let executor = DefinitionCaseExecutor {
+            definition: &definition,
+            deterministic: &deterministic,
+            stochastic: &stochastic,
+            pricing,
+            budget: &budget,
+        };
+        executor.check(&spec).map_err(Status::failed_precondition)?;
+        run(store.as_ref(), &executor, &spec, &dataset, || {
+            chrono::Utc::now().timestamp_millis()
+        })
+        .map_err(|error| {
+            if error == RUN_CONFLICT {
+                Status::already_exists(error)
+            } else if error == RUN_IN_PROGRESS {
+                Status::aborted(error)
+            } else {
+                Status::internal(error)
+            }
+        })
+    })
+    .await
+    .map_err(|_| Status::internal("eval run task failed"))??;
+    Ok(Response::new(RunEvalDatasetResponse {
+        status: report.status,
+        cases_total: report.cases_total as u32,
+        spent_micros: report.spent_micros,
+        ledger: report
+            .results
+            .into_iter()
+            .map(|result| EvalRunCaseLine {
+                case_id: result.case_id,
+                passed: result.outcome.passed,
+                reason: result.outcome.reason,
+                input_tokens: result.outcome.input_tokens,
+                output_tokens: result.outcome.output_tokens,
+                cost_micros: result.outcome.cost_micros,
+            })
+            .collect(),
+        unrun_case_ids: report.unrun_cases,
+        uncertain_micros: report.uncertain_micros,
+    }))
+}
+
 pub(super) async fn cancel_evaluation_execution(
     service: &ChiseiServiceImpl,
     req: Request<CancelEvaluationExecutionRequest>,

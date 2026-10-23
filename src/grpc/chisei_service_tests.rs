@@ -12634,3 +12634,107 @@ async fn stored_embedding_specs_resolve_hosted_routes_like_execution() {
     assert!(embedder.screen("text").is_err());
     assert!(embedder.embed(&["text".into()]).await.is_err());
 }
+
+#[test]
+fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("demo-shipments.json"),
+        r#"{
+            "contract_version": "chisei.eval-dataset-definition/v1",
+            "name": "demo-shipments",
+            "generator": "supply_chain",
+            "namespace": "eval-demo",
+            "seed": 7,
+            "preset": "demo",
+            "templates": [{
+                "id": "shipment-status",
+                "kind": "synthetic_shipment",
+                "input_properties": ["tracking"],
+                "expected_property": "status"
+            }]
+        }"#,
+    )
+    .unwrap();
+    let definition: crate::chisei::eval_dataset::EvalDatasetDefinition = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("demo-shipments.json")).unwrap(),
+    )
+    .unwrap();
+    let version = definition.generate().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir_path = dir.path().to_string_lossy().into_owned();
+    crate::provider_credentials::with_test_env(
+        crate::grpc::chisei_service::rpc_execution::EVAL_DATASETS_DIR_ENV,
+        &dir_path,
+        || {
+            runtime.block_on(async {
+                let svc = evaluation_execution_service(0);
+                let mut definition = evaluator_definition_request("acme");
+                definition
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .supported_input_schemas
+                    .push(crate::chisei::eval_dataset::EVAL_CASE_SCHEMA.into());
+                let definition_id = svc
+                    .put_evaluator_definition(Request::new(definition))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .record
+                    .unwrap()
+                    .definition
+                    .unwrap()
+                    .definition_id;
+                let request = |model: &str| {
+                    Request::new(RunEvalDatasetRequest {
+                        namespace: "acme".into(),
+                        run_id: "release-1".into(),
+                        dataset: "demo-shipments".into(),
+                        dataset_version: version.version.clone(),
+                        agent: "triage@1".into(),
+                        model: model.into(),
+                        tool_version: "tools@1".into(),
+                        evaluator_definition_id: definition_id.clone(),
+                        concurrency: 4,
+                        budget_micros: 1_000,
+                        max_case_cost_micros: 10,
+                    })
+                };
+                let first = svc
+                    .run_eval_dataset(request("deterministic"))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(first.status, "completed", "{first:?}");
+                assert_eq!(first.cases_total as usize, version.cases.len());
+                assert_eq!(first.ledger.len(), version.cases.len());
+                assert!(first.unrun_case_ids.is_empty());
+                // A restart runs nothing new and reports the same ledger.
+                let again = svc
+                    .run_eval_dataset(request("deterministic"))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(again.ledger, first.ledger);
+                let conflict = svc
+                    .run_eval_dataset(request("other-model"))
+                    .await
+                    .unwrap_err();
+                assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+                let missing = svc
+                    .run_eval_dataset(Request::new(RunEvalDatasetRequest {
+                        run_id: "release-2".into(),
+                        dataset_version: "v0000000000000000".into(),
+                        ..request("deterministic").into_inner()
+                    }))
+                    .await
+                    .unwrap_err();
+                assert_eq!(missing.code(), tonic::Code::NotFound);
+            })
+        },
+    );
+}

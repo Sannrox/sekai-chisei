@@ -6,7 +6,7 @@
   run and checkpoint, Action instance or direct write, with a writer
   reference and receipt id, on SQLite and PostgreSQL. Transform marking
   stamps now write change rows. Older rows read as `unattributed`
-  (docs/operation-correlation.md, `0096_object_change_writer`, GATE:mig,
+  (docs/operation-correlation.md, `0097_object_change_writer`, GATE:mig,
   #1690).
 
 - Embedding specs are stored per namespace and managed with experimental
@@ -123,6 +123,12 @@
   operation receipt needs clearance for it, and a caller without it sees the
   instance as missing. Objects an Action writes inherit the marking, and an
   Action parameter can no longer lower an object's marking (#1706).
+
+- Experimental `RunEvalDataset` runs an eval dataset version through a
+  registered evaluator against a named agent, model and tool version, with a
+  concurrency limit, a run budget enforced before each case, a per-case cost
+  ledger, and results durable per (run, case), so a restarted run resumes
+  without rerunning or double-counting a case (docs/eval-datasets.md, #1674).
 
 - Versioned eval datasets (`chisei.eval-dataset/v1`) generated
   deterministically from synthetic tenant seeds and checked-in case

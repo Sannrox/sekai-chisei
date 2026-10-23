@@ -163,7 +163,8 @@ const OBJECT_CHANGE_OPERATION_SCHEMA: &str =
     include_str!("postgres/0093_object_change_operation.sql");
 const SYNC_SCOPES_SCHEMA: &str = include_str!("postgres/0094_sync_scopes.sql");
 const EMBEDDING_SPECS_SCHEMA: &str = include_str!("postgres/0095_embedding_specs.sql");
-const OBJECT_CHANGE_WRITER_SCHEMA: &str = include_str!("postgres/0096_object_change_writer.sql");
+const DATASET_RUNS_SCHEMA: &str = include_str!("postgres/0096_chisei_dataset_runs.sql");
+const OBJECT_CHANGE_WRITER_SCHEMA: &str = include_str!("postgres/0097_object_change_writer.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -763,6 +764,12 @@ const MIGRATIONS: &[Migration] = &[
     ),
     mig(
         95,
+        "chisei_dataset_runs",
+        DATASET_RUNS_SCHEMA,
+        MigrationOwner::Chisei,
+    ),
+    mig(
+        96,
         "object_change_writer",
         OBJECT_CHANGE_WRITER_SCHEMA,
         MigrationOwner::Sekai,
