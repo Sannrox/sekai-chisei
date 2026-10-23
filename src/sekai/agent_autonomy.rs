@@ -656,6 +656,7 @@ mod tests {
             agent_action: false,
             admission_tenant: String::new(),
             resource_tenant: String::new(),
+            marking: String::new(),
         };
         db.put_action_instance(&instance).unwrap();
     }
@@ -783,6 +784,7 @@ mod tests {
             agent_action: false,
             admission_tenant: String::new(),
             resource_tenant: String::new(),
+            marking: String::new(),
         };
         db.put_action_instance(&failed).unwrap();
         let snapshot = offer(&db, "acme", "agent:fixture", "dispatch", test_threshold()).unwrap();
@@ -1120,6 +1122,9 @@ mod tests {
             delegating_actor: None,
             budget_already_reserved: false,
             resource_tenant: String::new(),
+            binding_markings: Vec::new(),
+            source_object_id: String::new(),
+            marking_gate: Default::default(),
         };
         let human = admission
             .admit(req("dispatch", "human-1"), "alice", 5)

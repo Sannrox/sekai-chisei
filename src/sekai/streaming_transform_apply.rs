@@ -306,6 +306,8 @@ pub fn apply(
             &type_def,
             &run.namespace,
             &parameters_json,
+            // The run stamps its own admitted marking on the output below.
+            None,
             now_ms,
         ) {
             Ok(Some(planned)) => planned,
@@ -325,7 +327,7 @@ pub fn apply(
         };
         let (create, mut object) = match planned_mutation {
             PlannedObjectMutation::Create(object) => (true, object),
-            PlannedObjectMutation::Update(object) => (false, object),
+            PlannedObjectMutation::Update(object, _) => (false, object),
         };
         if object.id != authorized_id {
             return Err(StreamingApplyError::InvalidArgument(

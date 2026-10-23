@@ -12482,3 +12482,85 @@ async fn unreviewed_hosted_route_is_refused_at_planning() {
         error.message()
     );
 }
+
+#[tokio::test]
+async fn a_marked_action_receipt_reads_as_missing_without_clearance() {
+    use crate::sekai::markings;
+    let svc = memory_service();
+    let operation_id = "marked-action-operation";
+    let receipt = OperationReceipt {
+        version: OPERATION_RECEIPT_VERSION.into(),
+        operation_id: operation_id.into(),
+        parent_operation_id: None,
+        namespace: "acme".into(),
+        operation_class: "governed_action_instance".into(),
+        initiating_actor: "agent:caller".into(),
+        schema_version: "action-instance/v1".into(),
+        policy_version: "implicit-allow".into(),
+        started_at_ms: 1,
+        completed_at_ms: Some(2),
+        events: vec![receipt_event(
+            operation_id,
+            "intent",
+            None,
+            1,
+            ReceiptEventKind::IntentRecorded,
+            "agent:caller",
+            BTreeMap::from([(
+                crate::sekai::action_instance_admission::RECEIPT_MARKING_ATTRIBUTE.into(),
+                "confidential".into(),
+            )]),
+        )],
+        uncovered_surfaces: Vec::new(),
+        reporter_grants: Vec::new(),
+        ontology_digest: None,
+        artifact: None,
+    };
+    svc.db.put_operation_receipt(&receipt).unwrap();
+    let read = || {
+        let mut request = Request::new(GetOperationReceiptRequest {
+            operation_id: operation_id.into(),
+            ..Default::default()
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "agent:caller".parse().unwrap());
+        svc.get_operation_receipt(request)
+    };
+    // Its own initiator, but not cleared for the instance's marking.
+    assert_eq!(read().await.unwrap_err().code(), tonic::Code::NotFound);
+    let runtime = svc.db.runtime_arc();
+    runtime
+        .create_object(&Object {
+            id: "principal-agent-caller".into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: "agent:caller".into(),
+            namespace: "acme".into(),
+            external_id: markings::principal_profile_external_id("agent:caller"),
+            properties: std::collections::HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    runtime
+        .create_grant(&Grant {
+            id: "profile-admin".into(),
+            object_id: "principal-agent-caller".into(),
+            principal: "root".into(),
+            role: Role::Admin,
+            created: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let shown = read().await.unwrap().into_inner();
+    assert!(shown.receipt_json.contains("confidential"));
+}

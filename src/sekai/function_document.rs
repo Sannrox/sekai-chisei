@@ -619,6 +619,9 @@ fn park_extraction(
                 delegating_actor: None,
                 budget_already_reserved: false,
                 resource_tenant: String::new(),
+                binding_markings: Vec::new(),
+                source_object_id: String::new(),
+                marking_gate: Default::default(),
             },
             actor,
             now_ms,
@@ -1322,6 +1325,7 @@ mod tests {
                     agent_action: false,
                     admission_tenant: String::new(),
                     resource_tenant: String::new(),
+                    marking: String::new(),
                 })
                 .unwrap();
         }

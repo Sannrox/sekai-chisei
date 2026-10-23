@@ -446,6 +446,7 @@ async fn lookup_on_channel(
             .map(|instance| SekaiCommitRef {
                 namespace: instance.namespace,
                 instance_id: instance.instance_id,
+                marking: instance.marking,
                 status: instance.status,
             })),
         Err(status) if status.code() == tonic::Code::NotFound => Ok(None),

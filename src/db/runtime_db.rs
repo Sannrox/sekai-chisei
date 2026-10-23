@@ -3154,13 +3154,16 @@ impl RuntimeDb {
     pub fn update_object_for_operation(
         &self,
         object: &Object,
+        expected: Option<&Object>,
         actor: &str,
         operation_id: &str,
     ) -> Result<Option<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.update_object_for_operation(object, actor, operation_id),
+            Self::Sqlite(db) => {
+                db.update_object_for_operation(object, expected, actor, operation_id)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.update_object_for_operation(object, actor, operation_id)
+                db.update_object_for_operation(object, expected, actor, operation_id)
             }),
         }
     }

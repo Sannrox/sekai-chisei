@@ -542,6 +542,9 @@ mod tests {
             delegating_actor: None,
             budget_already_reserved: false,
             resource_tenant: String::new(),
+            binding_markings: Vec::new(),
+            source_object_id: String::new(),
+            marking_gate: Default::default(),
         }
     }
 

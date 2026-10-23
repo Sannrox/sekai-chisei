@@ -206,6 +206,8 @@ pub fn preview_object_action(
         &type_def,
         &object.namespace,
         parameters_json,
+        // A preview admits nothing, so nothing is derived to inherit.
+        None,
         chrono::Utc::now().timestamp_millis(),
     ) {
         return Ok(invalid_preview(
