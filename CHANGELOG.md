@@ -2,11 +2,11 @@
 
 ## Unreleased
 
-- Versioned eval datasets (`chisei.eval-dataset/v1`) generated
-  deterministically from synthetic tenant seeds and checked-in case
-  templates: the version follows the digest, so the same seed gives the same
-  dataset and a changed one a new version, and cases feed the existing
-  evaluation executor as evidence (docs/eval-datasets.md, #1673).
+- Enterprise-scoped credentials may call `ProposeDefinitionRollback`,
+  `ExportDefinitionPackage` and `ImportDefinitionPackage`, which authorize
+  the tenant's namespace and members like the other definition proposal
+  RPCs, so a composing platform can promote and roll back definitions with
+  the caller's authority (#1700).
 
 - Experimental fence bindings (ADR 0121): `PutFenceBinding` binds Ezu
   geofence events (enter, exit, inside, dwell) for one collection to a
@@ -41,6 +41,12 @@
   refuses the shadowed candidate until the report passes. Start and stop
   are recorded as decisions (docs/policy-dry-run.md,
   `0090_chisei_policy_shadow`, GATE:mig, #1630).
+
+- Versioned eval datasets (`chisei.eval-dataset/v1`) generated
+  deterministically from synthetic tenant seeds and checked-in case
+  templates: the version follows the digest, so the same seed gives the same
+  dataset and a changed one a new version, and cases feed the existing
+  evaluation executor as evidence (docs/eval-datasets.md, #1673).
 
 - Experimental `GetOntologyChangelog` lists what changed in a reader's
   namespaces over a window: each published definition revision with a
