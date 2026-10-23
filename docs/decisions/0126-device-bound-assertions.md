@@ -31,10 +31,14 @@ Offline sync (#1634) needs requests bound to a device: a stolen assertion alone 
    - It refuses a device-bound context whose proof is missing or does not verify for this request.
    - It passes an unbound context, unless the RPC requires a device.
    - Strict Ed25519 verification is used.
-5. **Fail closed elsewhere.** Every RPC that does not check device proofs refuses a device-bound assertion outright. RPCs that do check them are listed explicitly: `SubmitActionInstance` for offline Actions (ADR 0127), with sync (#1634) to follow. A copied assertion therefore authenticates nowhere a proof is not checked.
+5. **Fail closed elsewhere.** Every RPC that does not check device proofs refuses a device-bound assertion outright. RPCs that do check them are listed explicitly: `SubmitActionInstance` for offline Actions (ADR 0127), and `PutSyncScope`, `ReadSyncSnapshot` and `ReadSyncDeltas` for sync (#1634). A copied assertion therefore authenticates nowhere a proof is not checked.
 6. **No nonce store.** `sia1.` assertions are short-lived and one-use, so the proof needs no nonce store of its own. A replayed assertion is refused by the existing one-use check before any proof is looked at. A captured proof is useless without its assertion, and it only covers the request it was made for.
-7. **Revocation stays with the issuer.** For a revoked device, the issuer stops minting normal assertions and mints only a wipe-only assertion. The core keeps no device registry and no revocation list.
-8. **Rollout order.** Servers ship the claim first, then issuers start emitting it. An issuer that emits it before every server it talks to accepts it gets those requests refused, which fails closed.
+7. **Wipe.** The device claim may carry `wipe: true` (#1634). This is the wipe-only assertion an issuer mints for a revoked device.
+   - On `ReadSyncSnapshot` and `ReadSyncDeltas`, with the device's proof, the plane answers `wipe_required` and sends no data.
+   - Every other RPC refuses it.
+   - The flag is omitted when false, so other assertions are unchanged. A server that does not know the flag refuses the whole assertion, which fails closed.
+8. **Revocation stays with the issuer.** For a revoked device, the issuer stops minting normal assertions and mints only a wipe-only assertion. The core keeps no device registry and no revocation list.
+9. **Rollout order.** Servers ship the claim first, then issuers start emitting it. An issuer that emits it before every server it talks to accepts it gets those requests refused, which fails closed.
 
 ## Alternatives considered
 
@@ -44,7 +48,7 @@ Offline sync (#1634) needs requests bound to a device: a stolen assertion alone 
 
 ## Consequences
 
-#1634 wires the hook into sync and adds wipe on revoked devices.
+#1634 wires the hook into sync and adds wipe on revoked devices. Sync is not yet among the RPCs that enterprise-scoped credentials may call; exposing it to them is a separate decision.
 
 The proof is only as fresh as the assertion's one-use check. That check is the replay cache from ADR 0078, held per instance. An assertion accepted by one instance can still be presented once to another within its lifetime, so issuers keep device-bound assertions short-lived.
 

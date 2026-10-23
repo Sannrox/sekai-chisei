@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Sync and devices: a device-bound credential must send the device's proof
+  on `PutSyncScope`, `ReadSyncSnapshot` and `ReadSyncDeltas`, so a copied
+  credential without the key is refused. A revoked device's wipe-only
+  assertion (`device.wipe`) gets `wipe_required` and no data on sync reads,
+  and is refused everywhere else (ADR 0126, #1634).
+
 - Offline sync purges: a change in what the caller may read no longer ends
   the cursor. The next delta purges objects the caller lost whole and
   properties it lost alone (`purges`). Scopes may set `max_offline_age_ms`,

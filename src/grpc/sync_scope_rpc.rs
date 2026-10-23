@@ -421,10 +421,31 @@ impl<'a> Caller<'a> {
 
 // Every handler runs on the bounded database worker pool: membership reads
 // the object store and the link graph.
+/// The device-proof check every sync RPC runs (#1634, ADR 0126): a
+/// device-bound credential proves possession of its key over this request.
+fn check_device<T: prost::Message>(req: &Request<T>, method: &str) -> Result<(), Status> {
+    crate::grpc::require_device_proof(req, &format!("/sekai.SekaiService/{method}"), false)
+}
+
+/// Whether the caller is a device its issuer revoked: sync then answers
+/// only with a wipe instruction.
+fn device_must_wipe<T>(req: &Request<T>) -> bool {
+    req.extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+        .and_then(|context| context.device.as_ref())
+        .is_some_and(|device| device.wipe)
+}
+
 pub(super) async fn put_sync_scope(
     service: &SekaiServiceImpl,
     req: Request<PutSyncScopeRequest>,
 ) -> Result<Response<SyncScopeResponse>, Status> {
+    check_device(&req, "PutSyncScope")?;
+    if device_must_wipe(&req) {
+        return Err(Status::permission_denied(
+            "the device was revoked and must wipe",
+        ));
+    }
     let owned = service.clone();
     service
         .spawn_db(move || put_sync_scope_blocking(&owned, req))
@@ -435,6 +456,14 @@ pub(super) async fn read_sync_snapshot(
     service: &SekaiServiceImpl,
     req: Request<ReadSyncSnapshotRequest>,
 ) -> Result<Response<ReadSyncSnapshotResponse>, Status> {
+    check_device(&req, "ReadSyncSnapshot")?;
+    if device_must_wipe(&req) {
+        return Ok(Response::new(ReadSyncSnapshotResponse {
+            contract_version: sync_scope::SYNC_CONTRACT.into(),
+            wipe_required: true,
+            ..Default::default()
+        }));
+    }
     let owned = service.clone();
     service
         .spawn_db(move || read_sync_snapshot_blocking(&owned, req))
@@ -445,6 +474,14 @@ pub(super) async fn read_sync_deltas(
     service: &SekaiServiceImpl,
     req: Request<ReadSyncDeltasRequest>,
 ) -> Result<Response<ReadSyncDeltasResponse>, Status> {
+    check_device(&req, "ReadSyncDeltas")?;
+    if device_must_wipe(&req) {
+        return Ok(Response::new(ReadSyncDeltasResponse {
+            contract_version: sync_scope::SYNC_CONTRACT.into(),
+            wipe_required: true,
+            ..Default::default()
+        }));
+    }
     let owned = service.clone();
     service
         .spawn_db(move || read_sync_deltas_blocking(&owned, req))
@@ -571,6 +608,7 @@ fn read_sync_snapshot_blocking(
         },
         total_objects: position.members.len() as u32,
         offline_until_ms: if last_page { offline_until(&scope) } else { 0 },
+        wipe_required: false,
     }))
 }
 
@@ -698,6 +736,7 @@ fn read_sync_deltas_blocking(
         } else {
             0
         },
+        wipe_required: false,
     }))
 }
 
