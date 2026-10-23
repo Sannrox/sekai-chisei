@@ -132,6 +132,8 @@ If you want to deploy or operate the control plane:
   object types and pipelines, registered by stable source id.
 - [Ontology changelog](ontology-changelog.md) — experimental changelog and
   team digest of definition revisions and policy activations, as the reader.
+- [Media uploads](media-uploads.md) — experimental resumable, checksummed
+  uploads that return a governed media reference.
 - [Object comments](object-comments.md) — experimental comment threads and
   mentions on objects, visible only to readers of the object.
 - [Trust scores](trust-scores.md) — experimental per-object confidence

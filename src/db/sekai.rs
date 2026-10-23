@@ -364,6 +364,7 @@ impl SekaiDb {
         self.migrate_object_type_index()?;
         self.migrate_search_index()?;
         self.migrate_embedding_index()?;
+        self.migrate_media_uploads()?;
         self.migrate_governed_transforms()?;
         self.migrate_functions()?;
         self.migrate_handoffs()?;
