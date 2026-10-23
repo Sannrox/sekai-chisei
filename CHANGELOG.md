@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Experimental `GenerateDefinitionChangeBundle` returns a read-only
+  definition change bundle for a candidate revision: the diff, a migration
+  plan from declared renames, defaults and type changes, a declarative
+  backfill, and the caller's consumer impact report. Undeclared changes
+  become manual steps (docs/definition-change-bundles.md, ADR 0125, #1691).
+
 - `ListObjectChanges` works on PostgreSQL with the same semantics and paging
   as SQLite. Each change row stores the operation that produced it, and the
   RPC returns that stored id instead of correlating by object and time

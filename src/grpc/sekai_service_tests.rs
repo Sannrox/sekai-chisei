@@ -25802,3 +25802,182 @@ async fn media_upload_resumes_checks_its_checksum_and_reads_under_object_policy(
         .into_inner();
     assert_eq!((reset.received_bytes, reset.complete), (0, false));
 }
+
+fn bundle_binding(namespace: &str, id: &str, owner: &str) -> domain::Object {
+    use crate::sekai::definition_consumer_impact::{
+        BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+    };
+    let mut binding = DefinitionConsumerBinding {
+        contract_version: BINDING_CONTRACT.into(),
+        owner: owner.into(),
+        resource_identity: format!("app:{id}"),
+        namespace: namespace.into(),
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        property: "title".into(),
+        declaration_digest: String::new(),
+        source_locator: format!("{id}/src/ticket.rs"),
+        blocking: false,
+    };
+    binding.declaration_digest = binding_digest(&binding);
+    domain::Object {
+        id: format!("binding-{id}"),
+        kind: BINDING_KIND.into(),
+        name: format!("binding-{id}"),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:binding-{id}"),
+        properties: HashMap::from([
+            ("contract_version".into(), binding.contract_version),
+            ("owner".into(), binding.owner),
+            ("resource_identity".into(), binding.resource_identity),
+            ("member_kind".into(), binding.member_kind),
+            ("member_id".into(), binding.member_id),
+            ("property".into(), binding.property),
+            ("declaration_digest".into(), binding.declaration_digest),
+            ("source_locator".into(), binding.source_locator),
+        ]),
+        created: 1,
+        updated: 1,
+    }
+}
+
+#[tokio::test]
+async fn change_bundle_plans_declared_changes_and_reports_only_visible_consumers() {
+    let svc = service();
+    let namespace = "bundles";
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(namespace, "alice", security::Role::Admin, "local")
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    let parent = seed_definition_parent(&svc, namespace);
+    let from = try_publish(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "cb-1",
+        "cb-cs-1",
+        r#"["title","state"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    // `title` is renamed to `subject`, and `priority` is new and required.
+    let to = try_publish(
+        &svc,
+        namespace,
+        &from,
+        "cb-2",
+        "cb-cs-2",
+        r#"["subject","state","priority"],"required":["priority"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    // Unmarked objects need an explicit grant: alice sees one binding only.
+    let mut namespace_object = svc
+        .db
+        .runtime()
+        .find_by_external_id(&format!("namespace:{namespace}"))
+        .unwrap()
+        .unwrap();
+    namespace_object
+        .properties
+        .insert(markings::DENY_UNMARKED_PROPERTY.into(), "true".into());
+    svc.db.runtime().update_object(&namespace_object).unwrap();
+    for (id, owner) in [("visible", "billing-team"), ("hidden", "secret-team")] {
+        svc.db
+            .runtime()
+            .create_object(&bundle_binding(namespace, id, owner))
+            .unwrap();
+    }
+    grant_object_role(&svc, "binding-visible", "alice", security::Role::Viewer);
+
+    let generate = |hints: DefinitionChangeHints| {
+        svc.generate_definition_change_bundle(with_named_principal(
+            GenerateDefinitionChangeBundleRequest {
+                namespace: namespace.into(),
+                from_revision_digest: from.clone(),
+                to_revision_digest: to.clone(),
+                hints: Some(hints),
+            },
+            "alice",
+        ))
+    };
+    let declared = DefinitionChangeHints {
+        renames: vec![DefinitionPropertyRename {
+            object_type: "Ticket".into(),
+            from_property: "title".into(),
+            to_property: "subject".into(),
+        }],
+        defaults: vec![DefinitionPropertyDefault {
+            object_type: "Ticket".into(),
+            property: "priority".into(),
+            value: "normal".into(),
+        }],
+        type_changes: Vec::new(),
+    };
+    let bundle = generate(declared.clone()).await.unwrap().into_inner();
+    assert_eq!(bundle.contract_version, "sekai.definition-change-bundle/v1");
+    assert!(bundle.bundle_digest.starts_with("sha256:"));
+    assert!(bundle.steps.iter().all(|step| !step.manual), "{bundle:?}");
+    let backfill = bundle
+        .backfill
+        .iter()
+        .map(|a| (a.property.as_str(), a.mode.as_str(), a.source.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backfill,
+        [
+            ("priority", "default", "normal"),
+            ("subject", "copy", "title")
+        ]
+    );
+    let impact = bundle.impact.unwrap();
+    let consumers = impact
+        .impacts
+        .iter()
+        .map(|path| (path.resource_identity.as_str(), path.property.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(consumers, [("app:visible", "title")]);
+    let rendered = format!("{impact:?}");
+    assert!(!rendered.contains("hidden") && !rendered.contains("secret-team"));
+    // Generation is a read: the same inputs give the same bundle.
+    assert_eq!(
+        generate(declared.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .bundle_digest,
+        bundle.bundle_digest
+    );
+
+    let mut with_type_change = declared;
+    with_type_change.type_changes.push(DefinitionPropertyRef {
+        object_type: "Ticket".into(),
+        property: "state".into(),
+    });
+    let flagged = generate(with_type_change).await.unwrap().into_inner();
+    let manual = flagged
+        .steps
+        .iter()
+        .filter(|step| step.manual)
+        .map(|step| (step.property.as_str(), step.reason.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(manual, [("state", "type_change_not_convertible")]);
+
+    let mismatched = generate(DefinitionChangeHints {
+        renames: vec![DefinitionPropertyRename {
+            object_type: "Ticket".into(),
+            from_property: "state".into(),
+            to_property: "subject".into(),
+        }],
+        ..DefinitionChangeHints::default()
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(mismatched.code(), tonic::Code::InvalidArgument);
+}
