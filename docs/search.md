@@ -30,6 +30,31 @@ An ungranted property filter or facet fails closed. Dataset metadata
 `ListDatasets` is. Object hits require read. Column classifications the
 caller cannot cover are not matched or returned.
 
+## Hybrid search
+
+`mode: "hybrid"` adds vector candidates to the text candidates and fuses the
+two lists under the one named profile `late_fusion.rrf/v1`: reciprocal rank
+fusion with k = 60, each list weighted by `text_weight` and
+`vector_weight` (both 0 means 1 each; a list weighted 0 adds nothing). Ties
+break by source and id, so a fixed index returns a fixed order. The
+response names the profile in `fusion_profile`. Hybrid search needs text.
+
+Vector candidates come from the embedding index
+([embedding-index.md](embedding-index.md)) of every requested kind that has
+a stored spec. The query text is embedded through the spec's admitted
+route, so hybrid search runs in combined mode only; elsewhere it fails with
+`FAILED_PRECONDITION`. The search is exact over the chunk table: chunks
+whose marking the caller's clearance denies are dropped before scoring,
+objects are ranked by their best chunk, and the same per-object read policy
+as text candidates (ACL, purpose, compiled object policy) applies before
+the candidate cap, so recall is 1.0 over what the caller may read. A kind
+whose active policy withholds any of the spec's source properties is not
+searched, and a vector hit is dropped when the live projection hides one of
+its source properties. Vector hits then pass the same live recheck as text
+hits; one that does not match the text has no highlights.
+`vector_lag_ms` is the age of the oldest object change the searched vectors
+have not consumed.
+
 ## Status
 
 `GetSearchIndexStatus` is a namespace read. It returns analyzer version,

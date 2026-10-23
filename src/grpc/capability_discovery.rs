@@ -821,7 +821,7 @@ fn kioku_candidates_capability() -> CapabilityEntry {
 fn search_query_capability(enabled: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         super::search_rpc::SEARCH_CAPABILITY.into(),
-        "Permission-aware full-text search over objects and dataset metadata. Discovery is not a grant.".into(),
+        "Permission-aware text and hybrid (text plus vector) search over objects and dataset metadata. Discovery is not a grant.".into(),
         "query",
         "sekai.SearchRequest",
         "sekai.SearchResponse",

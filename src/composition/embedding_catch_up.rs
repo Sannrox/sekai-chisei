@@ -15,6 +15,7 @@ use crate::sekai::embedding_index::{
 use crate::sekai::markings::object_marking_token;
 use crate::sekai::object_change_subscription::CommittedObjectMutation;
 use chisei_provider::embedding::Embedder;
+use futures_util::future::BoxFuture;
 use std::collections::BTreeSet;
 
 const REBUILD_PAGE: i64 = 500;
@@ -261,6 +262,27 @@ where
     Ok(outcomes)
 }
 
+/// Admits a stored spec's model route and returns its embedder. Combined
+/// mode builds one from the Chisei route catalog; scheduled catch-up and
+/// query embedding share it.
+pub type EmbeddingRoute = std::sync::Arc<
+    dyn Fn(StoredEmbeddingSpec) -> BoxFuture<'static, Result<Box<dyn Embedder>, EmbeddingError>>
+        + Send
+        + Sync,
+>;
+
+/// A query embedded for one stored spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryVector {
+    /// The spec whose chunks the vector is compared with.
+    pub spec_id: String,
+    pub vector: Vec<f32>,
+    /// Age of the oldest namespace object change the spec's index has not
+    /// consumed; 0 when caught up. Changes to other kinds count too, so it
+    /// can only overstate.
+    pub lag_ms: i64,
+}
+
 /// Embeds a search query for the stored spec of `object_kind` in
 /// `namespace` (#1681), through the same admitted route `route` returns for
 /// indexing. The route must produce the vectors the index holds: its model
@@ -274,7 +296,8 @@ pub async fn embed_query<Route, Admitted>(
     object_kind: &str,
     text: &str,
     route: Route,
-) -> Result<Vec<f32>, EmbeddingError>
+    now_ms: i64,
+) -> Result<QueryVector, EmbeddingError>
 where
     Route: Fn(StoredEmbeddingSpec) -> Admitted,
     Admitted: std::future::Future<Output = Result<Box<dyn Embedder>, EmbeddingError>>,
@@ -294,14 +317,14 @@ where
     let spec = stored.spec.clone();
     let embedder = route(stored).await?;
     let digest = spec.digest(embedder.model(), embedder.model_version());
-    match db.embedding_checkpoint(namespace, &spec.id)? {
-        Some(checkpoint) if checkpoint.spec_digest == digest => {}
+    let checkpoint = match db.embedding_checkpoint(namespace, &spec.id)? {
+        Some(checkpoint) if checkpoint.spec_digest == digest => checkpoint,
         _ => {
             return Err(EmbeddingError::Refused(
                 "the route's model or version does not match the indexed vectors".into(),
             ));
         }
-    }
+    };
     if embedder.external() {
         let schema = db.get_object_type(object_kind)?;
         if let Some(property) = spec.properties.iter().find(|name| {
@@ -322,8 +345,18 @@ where
         .await
         .map_err(|_| EmbeddingError::Model("embedding call timed out".into()))?
         .map_err(EmbeddingError::Model)?;
+    let lag_ms = db
+        .list_committed_object_mutations_after(namespace, checkpoint.last_change_rowid, 1)?
+        .first()
+        .map_or(0, |mutation| {
+            now_ms.saturating_sub(mutation.change.timestamp)
+        });
     match vectors.pop() {
-        Some(vector) if vectors.is_empty() && vector.len() == spec.dimension => Ok(vector),
+        Some(vector) if vectors.is_empty() && vector.len() == spec.dimension => Ok(QueryVector {
+            spec_id: spec.id,
+            vector,
+            lag_ms,
+        }),
         _ => Err(EmbeddingError::Model(format!(
             "model {} did not return one vector of dimension {}",
             embedder.model(),
@@ -1223,26 +1256,30 @@ mod tests {
         let text = "body: quarterly\ntitle: plan";
 
         // The same route embeds the query as the index embedded the object.
-        let query = embed_query(db, NS, "note", text, route("v1", false))
+        let query = embed_query(db, NS, "note", text, route("v1", false), 2_000)
             .await
             .unwrap();
-        assert_eq!(query, stored[0].vector);
+        assert_eq!(query.vector, stored[0].vector);
+        assert_eq!(
+            (query.spec_id.as_str(), query.lag_ms),
+            (spec.id.as_str(), 0)
+        );
 
         // Another model version would compare unlike vectors.
-        let other = embed_query(db, NS, "note", text, route("v2", false)).await;
+        let other = embed_query(db, NS, "note", text, route("v2", false), 2_000).await;
         assert!(
             matches!(other, Err(EmbeddingError::Refused(_))),
             "{other:?}"
         );
 
         // An external route refuses a spec with a sensitive source property.
-        let external = embed_query(db, NS, "note", text, route("v1", true)).await;
+        let external = embed_query(db, NS, "note", text, route("v1", true), 2_000).await;
         assert!(
             matches!(external, Err(EmbeddingError::Refused(_))),
             "{external:?}"
         );
 
-        let missing = embed_query(db, NS, "ticket", text, route("v1", false)).await;
+        let missing = embed_query(db, NS, "ticket", text, route("v1", false), 2_000).await;
         assert!(matches!(missing, Err(EmbeddingError::InvalidArgument(_))));
     }
 

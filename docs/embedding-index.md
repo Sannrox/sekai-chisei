@@ -64,5 +64,5 @@ It refuses when:
   restricted, as indexing refuses;
 - the route's payload screen refuses the text.
 
-The vector search API that calls it is separate work.
+Hybrid `Search` (#1582) calls it; see [search.md](search.md#hybrid-search).
 

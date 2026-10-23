@@ -2,10 +2,11 @@
 
 use super::*;
 use crate::db::search_index::SearchIndexStore;
+use crate::sekai::embedding_index::{EmbeddingError, EmbeddingStore};
 use crate::sekai::search_index::{
-    POLICY_ATTRIBUTE_KEYS, SearchCandidate, SearchCandidateQuery, SearchIndex, SearchIndexError,
-    SearchPolicyFilter, SearchQueryMode, SearchSourceKind, dataset_classification_allows,
-    live_object_match_fields, text_matches_query,
+    FUSION_PROFILE, POLICY_ATTRIBUTE_KEYS, SearchCandidate, SearchCandidateQuery, SearchIndex,
+    SearchIndexError, SearchPolicyFilter, SearchQueryMode, SearchSourceKind, VectorCandidateQuery,
+    dataset_classification_allows, live_object_match_fields, rrf_fuse, text_matches_query,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,6 +54,7 @@ pub(super) async fn search(
                 next_page_token: String::new(),
                 authority: false,
                 lag_ms: 0,
+                ..Default::default()
             }));
         }
         None if !namespace_read => Some(SearchSourceKind::Dataset),
@@ -60,6 +62,7 @@ pub(super) async fn search(
     };
     let page_size = normalize_page_size(input.page_size);
     let offset = parse_page_offset(&input.page_token)?;
+    let weights = parse_hybrid_weights(&input)?;
     require_granted_search_properties(
         service.db.runtime(),
         namespace,
@@ -150,11 +153,12 @@ pub(super) async fn search(
             SearchSourceKind::Object => {
                 if let Some(hit) = live_object_hit(
                     service,
-                    &candidate,
+                    &candidate.id,
                     &input,
                     &principals,
                     tenant_context.as_ref(),
                     purpose.as_ref(),
+                    None,
                 )? {
                     visible.push(hit);
                 }
@@ -174,8 +178,71 @@ pub(super) async fn search(
             }
         }
     }
-    let capped = visible.len() >= CANDIDATE_CAP
+    let mut capped = visible.len() >= CANDIDATE_CAP
         || (!source_exhausted && (!visible.is_empty() || !input.property_filters.is_empty()));
+    let mut vector_lag_ms = 0;
+    if let Some((text_weight, vector_weight)) = weights
+        && vector_weight > 0.0
+        && namespace_read
+        && source != Some(SearchSourceKind::Dataset)
+    {
+        let route = service.embedding_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition("hybrid search needs an embedding route (combined mode)")
+        })?;
+        let mut vector_hits = Vec::new();
+        for kind in vector_kinds(service.db.runtime(), namespace, &input.kinds)? {
+            let mut policy = base_policy.clone();
+            policy.kinds = vec![kind.object_kind.clone()];
+            policy.purpose_authorized = purpose_is_authorized(
+                service.db.runtime(),
+                namespace,
+                &policy.kinds,
+                purpose.as_ref(),
+            )?;
+            if policy.purpose_authorized {
+                policy.purpose = presented_purpose.clone();
+            }
+            let query = crate::composition::embedding_catch_up::embed_query(
+                service.db.runtime(),
+                namespace,
+                &kind.object_kind,
+                &input.text,
+                |stored| route(stored),
+                now_ms,
+            )
+            .await
+            .map_err(embedding_status)?;
+            vector_lag_ms = vector_lag_ms.max(query.lag_ms);
+            let ranked = service
+                .db
+                .runtime()
+                .vector_candidates(&VectorCandidateQuery {
+                    spec_id: query.spec_id,
+                    vector: query.vector,
+                    policy,
+                    limit: INDEX_OVERSCAN,
+                })
+                .map_err(search_status)?;
+            for candidate in ranked {
+                if vector_hits.len() >= CANDIDATE_CAP {
+                    break;
+                }
+                if let Some(hit) = live_object_hit(
+                    service,
+                    &candidate.object_id,
+                    &input,
+                    &principals,
+                    tenant_context.as_ref(),
+                    purpose.as_ref(),
+                    Some(&kind.properties),
+                )? {
+                    vector_hits.push(hit);
+                }
+            }
+        }
+        capped |= vector_hits.len() >= CANDIDATE_CAP;
+        visible = fuse_hits(visible, vector_hits, text_weight, vector_weight);
+    }
     let count = visible.len() as i64;
     let page = visible
         .iter()
@@ -198,6 +265,12 @@ pub(super) async fn search(
         next_page_token,
         authority: false,
         lag_ms: status.lag_ms,
+        fusion_profile: if weights.is_some() {
+            FUSION_PROFILE.into()
+        } else {
+            String::new()
+        },
+        vector_lag_ms,
     }))
 }
 
@@ -249,6 +322,118 @@ fn parse_search_source(source: &str) -> Result<Option<SearchSourceKind>, Status>
         _ => Err(Status::invalid_argument(
             "source must be empty, object, or dataset",
         )),
+    }
+}
+
+/// Hybrid weights `(text, vector)`, or none in text mode.
+fn parse_hybrid_weights(input: &SearchRequest) -> Result<Option<(f64, f64)>, Status> {
+    match input.mode.trim() {
+        "" | "text" => return Ok(None),
+        "hybrid" => {}
+        _ => {
+            return Err(Status::invalid_argument(
+                "mode must be empty, text, or hybrid",
+            ));
+        }
+    }
+    if input.text.trim().is_empty() {
+        return Err(Status::invalid_argument("hybrid search needs text"));
+    }
+    let weights = (input.text_weight, input.vector_weight);
+    if [weights.0, weights.1]
+        .iter()
+        .any(|weight| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(Status::invalid_argument(
+            "hybrid weights must be finite and not negative",
+        ));
+    }
+    Ok(Some(if weights == (0.0, 0.0) {
+        (1.0, 1.0)
+    } else {
+        weights
+    }))
+}
+
+/// An object kind searched by vector, with its spec's source properties.
+struct VectorKind {
+    object_kind: String,
+    properties: Vec<String>,
+}
+
+/// Kinds with a stored embedding spec, among `kinds` or all when empty.
+/// A kind whose active policy withholds a source property is not searched:
+/// its vectors carry text the caller may not read.
+fn vector_kinds(
+    db: &RuntimeDb,
+    namespace: &str,
+    kinds: &[String],
+) -> Result<Vec<VectorKind>, Status> {
+    let mut specs = BTreeMap::<String, Vec<String>>::new();
+    for stored in db
+        .list_embedding_specs(Some(namespace))
+        .map_err(Status::internal)?
+    {
+        if kinds.is_empty() || kinds.contains(&stored.spec.object_kind) {
+            specs
+                .entry(stored.spec.object_kind)
+                .or_insert(stored.spec.properties);
+        }
+    }
+    let mut searched = Vec::new();
+    for (object_kind, properties) in specs {
+        let policy = db
+            .active_object_policy(namespace, &object_kind)
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+        if policy.is_some_and(|policy| {
+            policy.property_grants_enforced()
+                && properties.iter().any(|name| {
+                    !policy.allows_property_access(
+                        name,
+                        crate::sekai::object_security::PropertyGrantAccess::Read,
+                    )
+                })
+        }) {
+            continue;
+        }
+        searched.push(VectorKind {
+            object_kind,
+            properties,
+        });
+    }
+    Ok(searched)
+}
+
+/// Fuse the visible text and vector hits under the RRF profile. A hit in
+/// both lists keeps its text highlights.
+fn fuse_hits(
+    text: Vec<VisibleHit>,
+    vector: Vec<VisibleHit>,
+    text_weight: f64,
+    vector_weight: f64,
+) -> Vec<VisibleHit> {
+    let key = |hit: &VisibleHit| (hit.hit.source.clone(), hit.hit.id.clone());
+    let text_keys = text.iter().map(key).collect::<Vec<_>>();
+    let vector_keys = vector.iter().map(key).collect::<Vec<_>>();
+    let mut hits = BTreeMap::new();
+    for hit in vector.into_iter().chain(text) {
+        hits.insert(key(&hit), hit);
+    }
+    rrf_fuse(&[(&text_keys, text_weight), (&vector_keys, vector_weight)])
+        .into_iter()
+        .filter_map(|key| hits.remove(&key))
+        .collect()
+}
+
+fn embedding_status(error: EmbeddingError) -> Status {
+    match error {
+        EmbeddingError::InvalidArgument(message) | EmbeddingError::Refused(message) => {
+            Status::failed_precondition(message)
+        }
+        EmbeddingError::Model(message) | EmbeddingError::Conflict(message) => {
+            Status::unavailable(message)
+        }
+        EmbeddingError::Storage(message) => Status::internal(message),
     }
 }
 
@@ -430,18 +615,23 @@ fn object_is_searchable(
         .unwrap_or(false)
 }
 
+/// The live, policy-checked hit for an object candidate. A text candidate
+/// must still match the query text. A vector candidate (`vector_sources`,
+/// the spec's source properties) need not, but every source property the
+/// object has must survive the caller's property projection.
 fn live_object_hit(
     service: &SekaiServiceImpl,
-    candidate: &SearchCandidate,
+    object_id: &str,
     input: &SearchRequest,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    vector_sources: Option<&[String]>,
 ) -> Result<Option<VisibleHit>, Status> {
     let Some(object) = service
         .db
         .runtime()
-        .get_object(&candidate.id)
+        .get_object(object_id)
         .map_err(Status::internal)?
     else {
         return Ok(None);
@@ -516,12 +706,19 @@ fn live_object_hit(
     if !live_object_matches_filters(&live, &input.property_filters) {
         return Ok(None);
     }
+    if vector_sources.is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|name| object.properties.contains_key(name) && !live.properties.contains_key(name))
+    }) {
+        return Ok(None);
+    }
     let matched = if input.text.trim().is_empty() {
         BTreeSet::new()
     } else {
         live_object_match_fields(&live, &input.text)
     };
-    if !input.text.trim().is_empty() && matched.is_empty() {
+    if vector_sources.is_none() && !input.text.trim().is_empty() && matched.is_empty() {
         return Ok(None);
     }
     Ok(Some(VisibleHit {
@@ -832,6 +1029,7 @@ mod tests {
             page_token: String::new(),
             page_size: 20,
             source: "object".into(),
+            ..Default::default()
         }
     }
 
@@ -1205,5 +1403,172 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// A topic embedder: one axis for cats, one for dogs, so "kitten" is
+    /// near "cat" without sharing a word with it.
+    struct Topic;
+
+    #[async_trait::async_trait]
+    impl chisei_provider::embedding::Embedder for Topic {
+        fn model(&self) -> &str {
+            "topic"
+        }
+        fn model_version(&self) -> &str {
+            "v1"
+        }
+        fn external(&self) -> bool {
+            false
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            let axis = |text: &str, words: &[&str]| {
+                f32::from(u8::from(words.iter().any(|word| text.contains(word))))
+            };
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    vec![
+                        axis(text, &["cat", "kitten"]),
+                        axis(text, &["dog", "puppy"]),
+                        0.01,
+                    ]
+                })
+                .collect())
+        }
+    }
+
+    fn topic_route() -> crate::composition::embedding_catch_up::EmbeddingRoute {
+        Arc::new(|_| {
+            Box::pin(async { Ok(Box::new(Topic) as Box<dyn chisei_provider::embedding::Embedder>) })
+        })
+    }
+
+    async fn hybrid_service(db: RuntimeDb) -> SekaiServiceImpl {
+        // Names share no word with the queries, so text matches only bodies.
+        for (id, body, owner) in [
+            ("cat-1", "cat sleeps", "tester"),
+            ("kitten-1", "kitten naps", "tester"),
+            ("puppy-1", "puppy runs", "tester"),
+            ("kitten-hidden", "kitten secret", "alice"),
+        ] {
+            let mut properties = vec![("body", body)];
+            if owner == "alice" {
+                properties.push(("owner", owner));
+            }
+            db.create_object_with_audit(&object(id, "acme", "note", &properties), owner)
+                .unwrap();
+        }
+        db.put_embedding_spec(&crate::sekai::embedding_index::StoredEmbeddingSpec {
+            spec: crate::sekai::embedding_index::EmbeddingSpec {
+                id: "notes".into(),
+                namespace: "acme".into(),
+                object_kind: "note".into(),
+                properties: vec!["body".into()],
+                chunk_chars: 1_000,
+                dimension: 3,
+                batch_size: 8,
+            },
+            model: "topic".into(),
+            updated_by: "admin".into(),
+            updated_at_ms: 1,
+            revision: 0,
+        })
+        .unwrap();
+        let route = topic_route();
+        crate::composition::embedding_catch_up::catch_up_stored_specs(
+            &db,
+            |stored| route(stored),
+            &|| 1_000,
+        )
+        .await
+        .unwrap();
+        service_from(db).with_embedding_route(route)
+    }
+
+    fn hybrid_req(text: &str) -> SearchRequest {
+        SearchRequest {
+            mode: "hybrid".into(),
+            ..search_req(text)
+        }
+    }
+
+    fn hit_ids(response: &SearchResponse) -> Vec<&str> {
+        response.hits.iter().map(|hit| hit.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_fuses_vector_hits_the_caller_may_read() {
+        let svc = hybrid_service(RuntimeDb::memory()).await;
+        let text = search(&svc, with_named_principal(search_req("cat"), "tester"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hit_ids(&text), vec!["cat-1"]);
+        assert!(text.fusion_profile.is_empty());
+
+        let hybrid = search(&svc, with_named_principal(hybrid_req("cat"), "tester"))
+            .await
+            .unwrap()
+            .into_inner();
+        // In both lists first; the kitten only by meaning; the hidden kitten
+        // never, though its vector is as near as the visible one.
+        assert_eq!(hit_ids(&hybrid), vec!["cat-1", "kitten-1", "puppy-1"]);
+        assert_eq!(hybrid.count, 3);
+        assert_eq!(hybrid.fusion_profile, FUSION_PROFILE);
+        assert_eq!(hybrid.vector_lag_ms, 0);
+        let again = search(&svc, with_named_principal(hybrid_req("cat"), "tester"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hit_ids(&again), hit_ids(&hybrid));
+
+        let owner = search(&svc, with_named_principal(hybrid_req("cat"), "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(hit_ids(&owner).contains(&"kitten-hidden"), "{owner:?}");
+
+        let mut vector_only = hybrid_req("cat");
+        vector_only.text_weight = 0.0;
+        vector_only.vector_weight = 1.0;
+        let vector_only = search(&svc, with_named_principal(vector_only, "tester"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(&hit_ids(&vector_only)[..2], ["cat-1", "kitten-1"]);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_skips_vectors_of_properties_the_caller_may_not_read() {
+        let db = RuntimeDb::memory();
+        let svc = hybrid_service(db.clone()).await;
+        activate_property_grants(&db, &["name"]);
+        let hybrid = search(&svc, with_named_principal(hybrid_req("kitten"), "tester"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(hybrid.hits.is_empty(), "{hybrid:?}");
+        assert_eq!(hybrid.count, 0);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_without_an_embedding_route_fails_closed() {
+        let db = RuntimeDb::memory();
+        db.create_object_with_audit(
+            &object("cat-1", "acme", "cat", &[("body", "cat")]),
+            "tester",
+        )
+        .unwrap();
+        let svc = service_from(db);
+        let status = search(&svc, with_named_principal(hybrid_req("cat"), "tester"))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let mut negative = hybrid_req("cat");
+        negative.vector_weight = -1.0;
+        let status = search(&svc, with_named_principal(negative, "tester"))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 }

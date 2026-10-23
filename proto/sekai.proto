@@ -605,6 +605,12 @@ message SearchRequest {
   string page_token = 6;
   int32 page_size = 7;
   string source = 8;
+  // "" or "text": text candidates only. "hybrid": text and exact vector
+  // candidates, fused by late_fusion.rrf/v1 (reciprocal rank fusion, k=60).
+  string mode = 9;
+  // Hybrid weights per candidate list; both 0 means 1 each.
+  double text_weight = 10;
+  double vector_weight = 11;
 }
 message SearchHighlight {
   string field = 1;
@@ -633,6 +639,10 @@ message SearchResponse {
   string next_page_token = 5;
   bool authority = 6;
   int64 lag_ms = 7;
+  // Set in hybrid mode.
+  string fusion_profile = 8;
+  // Age of the oldest object change the searched vectors have not consumed.
+  int64 vector_lag_ms = 9;
 }
 message GetSearchIndexStatusRequest {
   string namespace = 1;

@@ -1529,7 +1529,25 @@ pub fn build_services_for_plane(
         ProcessPlane::Sekai => {}
     }
 
-    Ok((Arc::new(sekai_svc), Arc::new(chisei_svc)))
+    let chisei_svc = Arc::new(chisei_svc);
+    if plane == ProcessPlane::Combined {
+        sekai_svc = sekai_svc.with_embedding_route(hosted_embedding_route(chisei_svc.clone()));
+    }
+    Ok((Arc::new(sekai_svc), chisei_svc))
+}
+
+/// The hosted catalog route of a stored embedding spec, admitted as hosted
+/// execution admits it. Combined mode only: it needs the Chisei catalog.
+fn hosted_embedding_route(
+    chisei: Arc<chisei_service::ChiseiServiceImpl>,
+) -> crate::composition::embedding_catch_up::EmbeddingRoute {
+    use crate::sekai::embedding_index::EmbeddingError;
+    Arc::new(move |stored| {
+        let admitted = chisei
+            .hosted_embedder(&stored.spec.namespace, &stored.model)
+            .map_err(|status| EmbeddingError::Refused(status.message().to_string()));
+        Box::pin(async move { admitted })
+    })
 }
 
 fn spawn_service_background_tasks(
@@ -1573,18 +1591,12 @@ fn spawn_service_background_tasks(
 fn spawn_embedding_catch_up(db: Arc<RuntimeDb>, chisei: Arc<chisei_service::ChiseiServiceImpl>) {
     use crate::composition::embedding_catch_up::catch_up_stored_specs;
     use crate::sekai::embedding_index::EmbeddingError;
+    let hosted = hosted_embedding_route(chisei);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let route = |stored: crate::sekai::embedding_index::StoredEmbeddingSpec| {
-                let chisei = chisei.clone();
-                async move {
-                    chisei
-                        .hosted_embedder(&stored.spec.namespace, &stored.model)
-                        .map_err(|status| EmbeddingError::Refused(status.message().to_string()))
-                }
-            };
+            let route = |stored| hosted(stored);
             let now = || chrono::Utc::now().timestamp_millis();
             // Another pass while any spec has more pending, up to a bound.
             for _ in 0..8 {
