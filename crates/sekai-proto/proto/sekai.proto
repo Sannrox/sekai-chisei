@@ -2002,7 +2002,9 @@ message ExplainValueResponse {
   // Oldest first. The first step of a value set at creation is the creation.
   repeated ValueExplanationStep steps = 5;
   repeated ValueExplanationStep marking_steps = 6;
-  // No step is hidden or unattributed.
+  // No step is hidden or unattributed, and both values were recorded. The
+  // value an earlier incarnation was created with is not recorded when no
+  // edit followed; it then reads empty and incomplete.
   bool complete = 7;
 }
 

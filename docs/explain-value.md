@@ -9,7 +9,8 @@ for one object property. It is classified `experimental`
 
 `object_id`, `property` (an object property or `name`), and `as_of_ms`. With
 `as_of_ms` 0 the current value is explained; otherwise the value at that time.
-An object that did not exist then reads as not found.
+A time before the object was created, or while it was deleted, reads as not
+found.
 
 The caller needs the same access as `ListObjectChanges`: namespace,
 collaboration scope, object ACL, active read policy and marking. A property
@@ -37,7 +38,10 @@ record into `details`:
 A step whose record the caller may not read, or whose record is gone, is
 reported as `hidden`. It keeps its time, field, value and writer kind, but no
 reference, receipt, actor or details. `complete` is true only when no step is
-hidden or unattributed.
+hidden or unattributed and the value was recorded. Creation rows do not
+copy property values, so the value an earlier incarnation of a deleted and
+re-created object was created with is not recorded when no edit followed it;
+it reads empty and incomplete.
 
 `marking` and `marking_steps` explain the object's access marking at the same
 time in the same way. Transform marking stamps are change rows attributed to

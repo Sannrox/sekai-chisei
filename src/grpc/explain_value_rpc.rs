@@ -128,7 +128,7 @@ pub(super) async fn explain_value(
     } else {
         object.properties.get(property).cloned().unwrap_or_default()
     };
-    let (value, rows) = field_history(
+    let history = field_history(
         &changes,
         &field,
         &latest(field.clone(), current),
@@ -138,7 +138,7 @@ pub(super) async fn explain_value(
     let marking_current = crate::sekai::markings::object_marking_token(&object)
         .unwrap_or_default()
         .to_string();
-    let (marking, marking_rows) = field_history(
+    let marking = field_history(
         &changes,
         &marking_field(),
         &latest(marking_field(), marking_current),
@@ -156,14 +156,18 @@ pub(super) async fn explain_value(
             row,
         )
     };
-    let steps = explain_steps(rows, &mut resolve)?;
-    let marking_steps = explain_steps(marking_rows, &mut resolve)?;
-    let complete = chain_complete(&steps) && chain_complete(&marking_steps);
+    let steps = explain_steps(history.steps, &mut resolve)?;
+    let marking_steps = explain_steps(marking.steps, &mut resolve)?;
+    // A value no row recorded cannot be explained.
+    let complete = history.value.is_some()
+        && marking.value.is_some()
+        && chain_complete(&steps)
+        && chain_complete(&marking_steps);
     Ok(Response::new(ExplainValueResponse {
         object_id: object.id.clone(),
         property: property.to_string(),
-        value,
-        marking,
+        value: history.value.unwrap_or_default(),
+        marking: marking.value.unwrap_or_default(),
         steps: steps.into_iter().map(to_proto_step).collect(),
         marking_steps: marking_steps.into_iter().map(to_proto_step).collect(),
         complete,
