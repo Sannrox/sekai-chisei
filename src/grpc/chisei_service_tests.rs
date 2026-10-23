@@ -1615,6 +1615,7 @@ fn managed_execution_context_for_tenant(
         issuer: "https://issuer.test".into(),
         resource: resource.into(),
         expires_at,
+        device: None,
     }
 }
 

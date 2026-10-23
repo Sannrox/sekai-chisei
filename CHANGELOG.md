@@ -9,6 +9,13 @@
   execution; a changed spec is a recorded rebuild
   (docs/embedding-index.md, `0094_embedding_specs`, GATE:mig, #1609).
 
+- Identity assertions (`sekai.identity-assertion/v1`) accept an optional
+  `device { id, ed25519_pub }` claim, and a verified one binds the
+  authenticated context to the device. A protected RPC can require the
+  device's Ed25519 proof over the assertion nonce and the request digest
+  (`x-sekai-device-proof`). Assertions without the claim are unchanged.
+  Servers accept the claim before issuers emit it (ADR 0126, #1697).
+
 - Experimental `GenerateDefinitionChangeBundle` returns a read-only
   definition change bundle for a candidate revision: the diff, a migration
   plan from declared renames, defaults and type changes, a declarative

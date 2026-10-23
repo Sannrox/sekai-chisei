@@ -319,7 +319,9 @@ see [ADR 0078](decisions/0078-audience-bound-assertions.md). The live
 `SEKAI_ASSERTION_ISSUER`, `SEKAI_ASSERTION_AUDIENCE`, and
 `SEKAI_ASSERTION_HMAC_KEY` are set together. Partial config is refused.
 No authority configured stays community behavior. Caller-selected tenant
-headers fail closed.
+headers fail closed. An assertion may bind a device with an optional
+`device` claim; protected RPCs then require the device's per-request proof
+(`x-sekai-device-proof`, [ADR 0126](decisions/0126-device-bound-assertions.md)).
 
 - Namespace and object access control apply when data is read or mutated.
 - Gateway virtual keys and control-plane credentials identify principals; raw
