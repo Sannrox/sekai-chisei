@@ -14,6 +14,12 @@ pub trait Embedder: Send + Sync {
     fn model(&self) -> &str;
     fn model_version(&self) -> &str;
     fn external(&self) -> bool;
+    /// Refuse a whole source text before it is chunked and sent; a route
+    /// with payload rules checks them here, where no chunk boundary can split
+    /// a match. Allows everything by default.
+    fn screen(&self, _text: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// One vector per input text, in order.
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
 }

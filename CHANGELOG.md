@@ -7,10 +7,26 @@
   digest, and reports row counts and marking-aware samples; the datasets
   themselves are never written (docs/definition-change-bundles.md, #1692).
 
+- Embedding specs are stored per namespace and managed with experimental
+  `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined
+  mode embeds every stored spec on a schedule through its hosted catalog
+  route over the OpenAI-compatible embeddings API, admitted like hosted
+  execution; a changed spec is a recorded rebuild
+  (docs/embedding-index.md, `0095_embedding_specs`, GATE:mig, #1609).
+
 - Catalog entry owners and stewards curate `description`, `tags` and
   `owners` through a governed Action on `catalog_entry`, with the Action's
   receipt; the marking only rises, and later registrations keep curated
   fields (docs/catalog.md, ADR 0122 amended, #1686).
+
+- Governed Actions prepared offline: `SubmitActionInstance` accepts an
+  `offline` record (prepare time, base version, base values of the written
+  properties, optional lease) with a device-bound assertion and the
+  device's proof. Policy is decided at arrival. A base the object moved
+  past is judged by the type's new `offline_conflict` rule (`reject_any`,
+  `reject_touched`, `last_writer_wins`), and a conflict is stored on the
+  denied instance and replayed on retry. Receipts record the offline
+  provenance (ADR 0127, #1580).
 
 - A device-bound identity assertion is refused by every RPC that does not
   check device proofs; none does until sync adds its RPCs (ADR 0126).

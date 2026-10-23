@@ -2517,6 +2517,8 @@ mod tests {
                 decided_at_ms: 1,
                 system_one_fill_json: String::new(),
                 marking: String::new(),
+                conflict: None,
+                offline: None,
             })
             .unwrap();
     }

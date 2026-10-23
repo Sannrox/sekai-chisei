@@ -283,6 +283,7 @@ async fn isolation_probe_1140_only_one_credentialed_subject_decides() {
                 binding_markings: Vec::new(),
                 source_object_id: String::new(),
                 marking_gate: Default::default(),
+                offline: None,
             },
             &editor,
             2_000_000_000_000,

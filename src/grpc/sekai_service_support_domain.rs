@@ -406,6 +406,8 @@ pub(super) fn from_proto_governed_action_type(
             pool: proto.review_pool,
             agent_reviewers: proto.review_agent_reviewers,
         },
+        offline_conflict: proto.offline_conflict,
+        last_writer_wins_properties: proto.last_writer_wins_properties,
         enabled: proto.enabled,
         created_by: proto.created_by,
         created_at_ms: proto.created_at_ms,
@@ -449,6 +451,8 @@ pub(super) fn to_proto_governed_action_type(
         review_threshold: domain.review_queue.threshold,
         review_pool: domain.review_queue.pool.clone(),
         review_agent_reviewers: domain.review_queue.agent_reviewers.clone(),
+        offline_conflict: domain.offline_conflict.clone(),
+        last_writer_wins_properties: domain.last_writer_wins_properties.clone(),
         enabled: domain.enabled,
         created_by: domain.created_by.clone(),
         created_at_ms: domain.created_at_ms,
@@ -505,7 +509,61 @@ pub(super) fn to_proto_action_instance(
         review_escalated: domain.review.escalated,
         agent_decision: domain.review.agent_decision,
         marking: domain.marking.clone(),
+        offline: domain.offline.as_ref().map(to_proto_offline_submission),
+        conflict: domain
+            .conflict
+            .as_ref()
+            .map(|conflict| crate::grpc::pb::sekai::ActionConflict {
+                object_id: conflict.object_id.clone(),
+                base_updated_ms: conflict.base_updated_ms,
+                current_updated_ms: conflict.current_updated_ms,
+                properties: conflict.properties.clone(),
+            }),
     }
+}
+fn to_proto_offline_submission(
+    domain: &crate::sekai::offline_action::OfflineSubmission,
+) -> crate::grpc::pb::sekai::OfflineSubmission {
+    crate::grpc::pb::sekai::OfflineSubmission {
+        prepared_at_ms: domain.prepared_at_ms,
+        base_updated_ms: domain.base_updated_ms,
+        base_properties: domain
+            .base_properties
+            .iter()
+            .map(|(name, value)| crate::grpc::pb::sekai::BaseProperty {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        lease_id: domain.lease_id.clone(),
+        device_id: domain.device_id.clone(),
+    }
+}
+/// The offline submission a request carries; the device id comes from the
+/// device-bound assertion, never from the request.
+pub(super) fn from_proto_offline_submission(
+    proto: crate::grpc::pb::sekai::OfflineSubmission,
+    device_id: String,
+) -> Result<crate::sekai::offline_action::OfflineSubmission, Status> {
+    let mut base_properties = std::collections::BTreeMap::new();
+    for property in proto.base_properties {
+        if base_properties
+            .insert(property.name.clone(), property.value)
+            .is_some()
+        {
+            return Err(Status::invalid_argument(format!(
+                "offline base_properties names {} twice",
+                property.name
+            )));
+        }
+    }
+    Ok(crate::sekai::offline_action::OfflineSubmission {
+        prepared_at_ms: proto.prepared_at_ms,
+        base_updated_ms: proto.base_updated_ms,
+        base_properties,
+        lease_id: proto.lease_id,
+        device_id,
+    })
 }
 pub(super) fn to_proto_action_effect(
     domain: &crate::sekai::action_effect::ActionEffect,

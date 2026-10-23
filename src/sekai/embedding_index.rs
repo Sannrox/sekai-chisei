@@ -104,6 +104,20 @@ impl EmbeddingSpec {
     }
 }
 
+/// A spec an operator stored for a namespace (#1609), with the catalog
+/// model route that embeds it. Catch-up runs every stored spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEmbeddingSpec {
+    pub spec: EmbeddingSpec,
+    pub model: String,
+    pub updated_by: String,
+    pub updated_at_ms: i64,
+    /// The spec's checkpoint revision when it was listed. Put and delete
+    /// move it on, so a catch-up for this listing is refused once the spec
+    /// changed or went away. Ignored on put.
+    pub revision: i64,
+}
+
 /// Stored progress for one spec in one namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EmbeddingCheckpoint {
@@ -113,6 +127,9 @@ pub struct EmbeddingCheckpoint {
     /// Bumped by every write to the spec's index. Writers pass the revision
     /// they last saw; a mismatch is [`EMBEDDING_REVISION_CONFLICT`].
     pub revision: i64,
+    /// Time of the last fenced write, read back only; 0 after a stored spec
+    /// is put or deleted. A rebuild keeps it fresh as its lease.
+    pub updated_at_ms: i64,
 }
 
 /// Governance tags shared by every chunk of one object.
@@ -254,6 +271,17 @@ pub trait EmbeddingStore {
         namespace: &str,
         spec_id: &str,
     ) -> Result<Vec<EmbeddingRebuild>, String>;
+    /// Insert or replace a stored spec and move its checkpoint revision on.
+    fn put_embedding_spec(&self, stored: &StoredEmbeddingSpec) -> Result<(), String>;
+    /// Stored specs of one namespace, or of every namespace, by namespace and id.
+    fn list_embedding_specs(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<StoredEmbeddingSpec>, String>;
+    /// Remove a stored spec with its vectors and rebuild history, and reset
+    /// its checkpoint with the revision moved on (never back), in one
+    /// transaction. Returns whether the spec existed.
+    fn delete_embedding_spec(&self, namespace: &str, spec_id: &str) -> Result<bool, String>;
 }
 
 /// The text embedded for an object: `name: value` lines for each present

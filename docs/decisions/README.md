@@ -148,3 +148,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0124: Offline sync scopes diff stored members per cursor](0124-offline-sync-scopes.md)
 - [ADR 0125: Definition change bundles](0125-definition-change-bundles.md)
 - [ADR 0126: Device-bound identity assertions with per-request proof](0126-device-bound-assertions.md)
+- [ADR 0127: Offline governed Actions decide at arrival against a base version](0127-offline-governed-actions.md)

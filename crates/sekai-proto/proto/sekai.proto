@@ -1155,6 +1155,29 @@ message PutClassificationLatticeRequest { ClassificationLattice lattice = 1; }
 message PutClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 message GetClassificationLatticeRequest { string namespace = 1; }
 message GetClassificationLatticeResponse { ClassificationLattice lattice = 1; }
+// What embedding catch-up embeds in a namespace, and the hosted catalog
+// model route (`hosted.<name>/<model>`) that embeds it (#1609).
+message EmbeddingSpecDefinition {
+  string namespace = 1;
+  string spec_id = 2;
+  string object_kind = 3;
+  repeated string properties = 4;
+  uint32 chunk_chars = 5;
+  uint32 dimension = 6;
+  uint32 batch_size = 7;
+  string model = 8;
+  string updated_by = 9;
+  int64 updated_at_ms = 10;
+}
+message PutEmbeddingSpecRequest { EmbeddingSpecDefinition spec = 1; }
+message PutEmbeddingSpecResponse { EmbeddingSpecDefinition spec = 1; }
+message ListEmbeddingSpecsRequest { string namespace = 1; }
+message ListEmbeddingSpecsResponse { repeated EmbeddingSpecDefinition specs = 1; }
+message DeleteEmbeddingSpecRequest {
+  string namespace = 1;
+  string spec_id = 2;
+}
+message DeleteEmbeddingSpecResponse { bool deleted = 1; }
 message PolicySimulationDifference {
   string principal = 1;
   string object_id = 2;
@@ -2000,6 +2023,39 @@ message GovernedActionType {
   int64 review_threshold = 25;
   repeated string review_pool = 26;
   repeated string review_agent_reviewers = 27;
+  // How an Action prepared offline (#1580) meets a bound object that changed
+  // since the device read it: reject_any (empty means this), reject_touched,
+  // or last_writer_wins for last_writer_wins_properties.
+  string offline_conflict = 28;
+  repeated string last_writer_wins_properties = 29;
+}
+// What a device saw when it prepared an Action offline (#1580, ADR 0127).
+message OfflineSubmission {
+  int64 prepared_at_ms = 1;
+  // The bound object's updated time when the device read it.
+  int64 base_updated_ms = 2;
+  // What the device saw for each field the Action writes: its properties,
+  // and `name` when the Action renames. A list, not a map, so the request
+  // re-encodes to the bytes the device proof signed.
+  repeated BaseProperty base_properties = 3;
+  // The offline lease the device prepared under, if any.
+  string lease_id = 4;
+  // Set by the plane from the device-bound assertion; ignored on submit.
+  string device_id = 5;
+}
+// One field as the device saw it. An unset value means it was absent.
+message BaseProperty {
+  string name = 1;
+  optional string value = 2;
+}
+// Why an offline Action was not applied: its object changed past the base.
+message ActionConflict {
+  string object_id = 1;
+  int64 base_updated_ms = 2;
+  int64 current_updated_ms = 3;
+  // Written properties whose current values differ from the base. Empty
+  // under reject_any, which compares versions only.
+  repeated string properties = 4;
 }
 message PutGovernedActionTypeRequest { GovernedActionType type = 1; string request_id = 2; }
 message PutGovernedActionTypeResponse { GovernedActionType type = 1; }
@@ -2055,6 +2111,11 @@ message ActionInstance {
   // Derived at admission from the bound object and the binding; reading the
   // instance needs clearance for it. Empty when unmarked.
   string marking = 25;
+  // Set when the Action was prepared offline (#1580).
+  OfflineSubmission offline = 26;
+  // Set when an offline Action met a changed object; the instance is denied
+  // with deny_reason offline_conflict.
+  ActionConflict conflict = 27;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;
@@ -2067,6 +2128,9 @@ message SubmitActionInstanceRequest {
   string request_id = 7;
   // Optional ontology binding copied onto operation.receipt/v1. Not parameter data.
   string ontology_digest = 8;
+  // An Action prepared offline (#1580). Needs a device-bound assertion and
+  // the device's proof over this request.
+  OfflineSubmission offline = 9;
 }
 message SubmitActionInstanceResponse {
   ActionInstance instance = 1;
@@ -3732,6 +3796,9 @@ service SekaiService {
   rpc RevokePurposeAuthorization(RevokePurposeAuthorizationRequest) returns (RevokePurposeAuthorizationResponse);
   rpc PutClassificationLattice(PutClassificationLatticeRequest) returns (PutClassificationLatticeResponse);
   rpc GetClassificationLattice(GetClassificationLatticeRequest) returns (GetClassificationLatticeResponse);
+  rpc PutEmbeddingSpec(PutEmbeddingSpecRequest) returns (PutEmbeddingSpecResponse);
+  rpc ListEmbeddingSpecs(ListEmbeddingSpecsRequest) returns (ListEmbeddingSpecsResponse);
+  rpc DeleteEmbeddingSpec(DeleteEmbeddingSpecRequest) returns (DeleteEmbeddingSpecResponse);
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
   rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);

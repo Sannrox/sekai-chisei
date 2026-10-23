@@ -18,6 +18,8 @@ mod computed_response;
 mod definition_change_bundle_rpc;
 #[path = "definition_consumer_impact.rs"]
 mod definition_consumer_impact;
+#[path = "embedding_spec_rpc.rs"]
+mod embedding_spec_rpc;
 #[path = "fence_binding.rs"]
 mod fence_binding;
 #[path = "graph_explore_rpc.rs"]
@@ -842,6 +844,27 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetClassificationLatticeRequest>,
     ) -> Result<Response<GetClassificationLatticeResponse>, Status> {
         rpc_objects::get_classification_lattice(self, req).await
+    }
+
+    async fn put_embedding_spec(
+        &self,
+        req: Request<PutEmbeddingSpecRequest>,
+    ) -> Result<Response<PutEmbeddingSpecResponse>, Status> {
+        embedding_spec_rpc::put_embedding_spec(self, req).await
+    }
+
+    async fn list_embedding_specs(
+        &self,
+        req: Request<ListEmbeddingSpecsRequest>,
+    ) -> Result<Response<ListEmbeddingSpecsResponse>, Status> {
+        embedding_spec_rpc::list_embedding_specs(self, req).await
+    }
+
+    async fn delete_embedding_spec(
+        &self,
+        req: Request<DeleteEmbeddingSpecRequest>,
+    ) -> Result<Response<DeleteEmbeddingSpecResponse>, Status> {
+        embedding_spec_rpc::delete_embedding_spec(self, req).await
     }
 
     async fn simulate_object_policy_change(

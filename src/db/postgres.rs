@@ -162,6 +162,7 @@ const MEDIA_UPLOADS_SCHEMA: &str = include_str!("postgres/0092_media_uploads.sql
 const OBJECT_CHANGE_OPERATION_SCHEMA: &str =
     include_str!("postgres/0093_object_change_operation.sql");
 const SYNC_SCOPES_SCHEMA: &str = include_str!("postgres/0094_sync_scopes.sql");
+const EMBEDDING_SPECS_SCHEMA: &str = include_str!("postgres/0095_embedding_specs.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -753,6 +754,12 @@ const MIGRATIONS: &[Migration] = &[
         MigrationOwner::Sekai,
     ),
     mig(93, "sync_scopes", SYNC_SCOPES_SCHEMA, MigrationOwner::Sekai),
+    mig(
+        94,
+        "embedding_specs",
+        EMBEDDING_SPECS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;

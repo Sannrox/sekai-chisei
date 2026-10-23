@@ -118,6 +118,9 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.Search` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetSearchIndexStatus` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.PutEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ListEmbeddingSpecs` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.DeleteEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |

@@ -627,6 +627,7 @@ impl ObjectPathHarness {
                 evidence_submission_ids: vec![],
                 request_id: format!("req-{step}"),
                 ontology_digest: String::new(),
+                offline: None,
             },
             READER,
         )))?;
@@ -1077,6 +1078,7 @@ fn seed_action_type(db: &RuntimeDb, namespace: &str) -> Result<(), String> {
         declared_effect_kinds: vec![],
         system_one: None,
         review_queue: Default::default(),
+        last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
     };
     db.put_governed_action_type(type_def, READER, 1).map(|_| ())
 }
