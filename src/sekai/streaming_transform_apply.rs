@@ -306,6 +306,8 @@ pub fn apply(
             &type_def,
             &run.namespace,
             &parameters_json,
+            // No principal submits a streaming edit, so none may curate.
+            None,
             // The run stamps its own admitted marking on the output below.
             None,
             now_ms,

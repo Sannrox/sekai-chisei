@@ -141,6 +141,7 @@ pub fn preview_object_action(
     request: ObjectActionPreviewRequest<'_>,
 ) -> Result<ObjectActionPreview, ObjectActionProjectionError> {
     let ObjectActionPreviewRequest {
+        actor,
         object,
         parameters_json,
         evidence_submission_ids,
@@ -206,6 +207,7 @@ pub fn preview_object_action(
         &type_def,
         &object.namespace,
         parameters_json,
+        Some(actor),
         // A preview admits nothing, so nothing is derived to inherit.
         None,
         chrono::Utc::now().timestamp_millis(),
