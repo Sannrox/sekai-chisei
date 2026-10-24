@@ -64,8 +64,8 @@ partition digest.
 ## Consequences
 
 Isolated runners still choose which partitions to send. The plane owns atomic
-commit. Community `RuntimeDb::append_rows` stays SQLite-only; PostgreSQL
-partition writes use native dataset-row APIs.
+commit. Community `RuntimeDb::append_rows` was SQLite-only here; it runs on
+PostgreSQL too since #1320. Partition writes use native dataset-row APIs.
 
 ## Validation
 

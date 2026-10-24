@@ -201,10 +201,9 @@ call rechecks namespace, object ACL, object security, and ontology visibility,
 so hidden classes, relations, and properties do not appear. Computed
 properties stay query-time overlays and are never persisted.
 
-These RPCs are `stable`. Query-time entailment is SQLite-only. Community
-PostgreSQL serves `reasoning_mode=asserted_only` and fails `entailment`
-closed with `FAILED_PRECONDITION`, and `DiscoverCapabilities` on that runtime
-reports `supports_entailment=0` for all three capabilities. See
+These RPCs are `stable`. Query-time entailment runs on SQLite and community
+PostgreSQL (#1320) from the same authorization-filtered ontology snapshot, and
+`DiscoverCapabilities` reports `supports_entailment=1` on both. See
 [integration-contract.md](integration-contract.md).
 
 ## Validation and deletion

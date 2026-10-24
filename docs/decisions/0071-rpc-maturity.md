@@ -76,10 +76,9 @@ the shrink-only SQLite-only list.
   `ExpandRelations`, and `ExplainDerivation` become `stable` because
   `sekaictl ontology context`, `expand`, and `explain` are real consumers
   on the product-loop fixtures, and the generated TypeScript and Python
-  HTTP facades carry the three methods. Availability is backend-scoped:
-  query-time entailment is SQLite-only, community PostgreSQL keeps failing
-  closed, and the integration contract says so rather than implying
-  dual-backend support. Authorization, namespace, and object security are
+  HTTP facades carry the three methods. Availability was backend-scoped
+  here (entailment SQLite-only); since #1320 entailment runs on community
+  PostgreSQL too. Authorization, namespace, and object security are
   rechecked on every call, and computed properties stay query-time overlays.
 - 2026-10-08, Issue [#1316](https://github.com/Sannrox/sekai-chisei/issues/1316):
   the Real backend column is a projection of RuntimeDb fail-closed evidence and

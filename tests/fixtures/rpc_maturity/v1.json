@@ -1233,7 +1233,7 @@
       "service": "SekaiService",
       "rpc": "AppendRows",
       "storage_path": "sekai.datasets",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "host",
       "classification": "stable",
       "product_tier": "advanced"
@@ -1242,7 +1242,7 @@
       "service": "SekaiService",
       "rpc": "QueryRows",
       "storage_path": "sekai.datasets",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "host",
       "classification": "stable",
       "product_tier": "advanced"

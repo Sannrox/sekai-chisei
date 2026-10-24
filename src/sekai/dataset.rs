@@ -654,7 +654,7 @@ impl SekaiDb {
         } else if state.quarantined {
             return Ok(Vec::new());
         } else {
-            tx.prepare("SELECT data FROM sekai_dataset_rows WHERE dataset_id = ?1")
+            tx.prepare("SELECT data FROM sekai_dataset_rows WHERE dataset_id = ?1 ORDER BY id")
                 .map_err(|e| e.to_string())?
         };
         let mut rows_iter = if state.quarantined && !state.last_healthy_version_id.is_empty() {

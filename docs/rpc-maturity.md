@@ -209,8 +209,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.CreateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.UpdateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.ListDatasets` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.AppendRows` | `sekai.datasets` | sqlite only | host | `stable` |
-| `SekaiService.QueryRows` | `sekai.datasets` | sqlite only | host | `stable` |
+| `SekaiService.AppendRows` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.QueryRows` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.ListDatasetVersions` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetDatasetVersion` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RollbackDataset` | `sekai.datasets` | yes | none | `experimental` |

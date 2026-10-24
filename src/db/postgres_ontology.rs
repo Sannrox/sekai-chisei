@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::db::postgres::PostgresDb;
 use crate::sekai::ontology::{OntologyClass, OntologyRelation};
 
@@ -152,6 +154,98 @@ impl PostgresDb {
             .into_iter()
             .map(relation_from_row)
             .collect()
+    }
+}
+
+/// Definitions in `table` (`c`) that have no grant, or one of `principals`
+/// holds an unexpired grant on, by name and at most `limit`, as SQLite's
+/// readable listing. The pool checkout and the read both count against
+/// `deadline` (the read under a statement timeout set to what is left), so a
+/// busy pool or slow catalog cannot outlive the caller's budget.
+fn select_readable(
+    db: &PostgresDb,
+    columns: &str,
+    table: &str,
+    object_prefix: &str,
+    principals: &[String],
+    deadline: Instant,
+    limit: u32,
+) -> Result<Vec<postgres::Row>, String> {
+    let mut connection = db.connection_by(deadline)?;
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis();
+    if remaining == 0 {
+        return Err("readable ontology listing deadline exceeded".into());
+    }
+    let mut transaction = connection
+        .build_transaction()
+        .read_only(true)
+        .start()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .batch_execute(&format!("SET LOCAL statement_timeout = {remaining}"))
+        .map_err(|error| error.to_string())?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let rows = transaction
+        .query(
+            &format!(
+                "SELECT {columns} FROM {table} c
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM sekai_grants g WHERE g.object_id = $1 || c.name
+                 ) OR EXISTS (
+                     SELECT 1 FROM sekai_grants g
+                     WHERE g.object_id = $1 || c.name
+                       AND g.principal = ANY($2)
+                       AND (g.not_after_ms = 0 OR g.not_after_ms > $3)
+                 ) ORDER BY c.name LIMIT $4"
+            ),
+            &[&object_prefix, &principals, &now_ms, &i64::from(limit)],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+impl PostgresDb {
+    pub fn list_readable_ontology_classes(
+        &self,
+        principals: &[String],
+        deadline: Instant,
+        limit: u32,
+    ) -> Result<Vec<OntologyClass>, String> {
+        select_readable(
+            self,
+            CLASS_COLUMNS,
+            "sekai_ontology_classes",
+            "ontology:class:",
+            principals,
+            deadline,
+            limit,
+        )?
+        .into_iter()
+        .map(class_from_row)
+        .collect()
+    }
+
+    pub fn list_readable_ontology_relations(
+        &self,
+        principals: &[String],
+        deadline: Instant,
+        limit: u32,
+    ) -> Result<Vec<OntologyRelation>, String> {
+        select_readable(
+            self,
+            RELATION_COLUMNS,
+            "sekai_ontology_relations",
+            "ontology:relation:",
+            principals,
+            deadline,
+            limit,
+        )?
+        .into_iter()
+        .map(relation_from_row)
+        .collect()
     }
 }
 

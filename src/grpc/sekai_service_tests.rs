@@ -13315,11 +13315,116 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
     .unwrap();
 }
 
-/// #1149: community PostgreSQL advertises no query-time entailment, serves
-/// the asserted-only mode, and fails the entailment mode closed.
+/// Query-time entailment over the seeded graph: whether discovery advertises
+/// it, and the ids `RetrieveContext` returns for an ontology superclass of the
+/// widget kind, asserted-only and then entailed. Run on both backends (#1320).
+async fn entailment_case(svc: &SekaiServiceImpl) -> (u64, Vec<String>, Vec<String>) {
+    seed_semantic_catalog_graph(svc).await;
+    for class in [
+        OntologyClass {
+            name: "Thing".into(),
+            description: "anything".into(),
+            ..Default::default()
+        },
+        OntologyClass {
+            name: "WidgetClass".into(),
+            description: "semantic widget".into(),
+            mapped_kind: "widget".into(),
+            superclasses: vec!["Thing".into()],
+            ..Default::default()
+        },
+    ] {
+        svc.create_ontology_class(with_named_principal(
+            CreateOntologyClassRequest { class: Some(class) },
+            "tester",
+        ))
+        .await
+        .unwrap();
+    }
+    let discovered = svc
+        .discover_capabilities(with_named_principal(
+            DiscoverCapabilitiesRequest {
+                namespace: "acme".into(),
+                page_size: 200,
+                product_tier_filter: "all".into(),
+                ..Default::default()
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let supports = discovered
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == semantic::CAPABILITY_RETRIEVE_CONTEXT)
+        .and_then(|entry| {
+            entry
+                .limits
+                .iter()
+                .find(|limit| limit.name == "supports_entailment")
+        })
+        .map(|limit| limit.value)
+        .unwrap();
+    let retrieve = |mode: &str| RetrieveContextRequest {
+        roots: vec![ContextRoot {
+            object_id: "sem-root".into(),
+            ..Default::default()
+        }],
+        relations: vec!["contains".into()],
+        direction: "outgoing".into(),
+        max_depth: 1,
+        kind_filter: vec!["Thing".into()],
+        reasoning_mode: mode.into(),
+        ..Default::default()
+    };
+    let mut ids = Vec::new();
+    for mode in ["asserted_only", "entailment"] {
+        let mut found: Vec<String> = svc
+            .retrieve_context(with_named_principal(retrieve(mode), "alice"))
+            .await
+            .unwrap()
+            .into_inner()
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.object.unwrap().id)
+            .collect();
+        found.sort();
+        ids.push(found);
+    }
+    let entailed = ids.pop().unwrap();
+    (supports, ids.pop().unwrap(), entailed)
+}
+
+/// What both backends must return for [`entailment_case`]: entailment is
+/// advertised, no object is asserted to be a `Thing`, and entailment adds the
+/// visible widget but never the one alice may not read.
+fn assert_entailment_case((supports, asserted, entailed): (u64, Vec<String>, Vec<String>)) {
+    assert_eq!(supports, 1);
+    assert!(
+        !asserted.contains(&"sem-allowed".to_string()),
+        "{asserted:?}"
+    );
+    assert!(
+        entailed.contains(&"sem-allowed".to_string()),
+        "{entailed:?}"
+    );
+    assert!(
+        !entailed.contains(&"sem-denied".to_string()),
+        "{entailed:?}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_query_time_entailment_matches_the_shared_case() {
+    assert_entailment_case(entailment_case(&service()).await);
+}
+
+/// #1320: community PostgreSQL serves query-time entailment with the same
+/// results as SQLite.
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
-fn postgres_semantic_discovery_is_honest_about_entailment() {
+fn postgres_query_time_entailment_matches_the_shared_case() {
     let scratch = crate::db::ScratchDatabase::create();
     let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
     tokio::runtime::Builder::new_multi_thread()
@@ -13330,66 +13435,7 @@ fn postgres_semantic_discovery_is_honest_about_entailment() {
             let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
                 db.clone(),
             ));
-            seed_semantic_catalog_graph(&svc).await;
-            let discovered = svc
-                .discover_capabilities(with_named_principal(
-                    DiscoverCapabilitiesRequest {
-                        namespace: "acme".into(),
-                        page_size: 200,
-                        product_tier_filter: "all".into(),
-                        ..Default::default()
-                    },
-                    "alice",
-                ))
-                .await
-                .unwrap()
-                .into_inner();
-            for name in [
-                semantic::CAPABILITY_EXPAND_RELATIONS,
-                semantic::CAPABILITY_RETRIEVE_CONTEXT,
-                semantic::CAPABILITY_EXPLAIN_DERIVATION,
-            ] {
-                let entry = discovered
-                    .capabilities
-                    .iter()
-                    .find(|entry| entry.name == name)
-                    .unwrap_or_else(|| panic!("missing semantic capability {name}"));
-                let limits = entry
-                    .limits
-                    .iter()
-                    .map(|limit| (limit.name.as_str(), limit.value))
-                    .collect::<HashMap<_, _>>();
-                assert_eq!(limits.get("supports_entailment"), Some(&0), "{name}");
-                assert_eq!(limits.get("supports_asserted_only"), Some(&1), "{name}");
-            }
-            let expand = |mode: &str| ExpandRelationsRequest {
-                namespace: "acme".into(),
-                root: Some(ContextRoot {
-                    object_id: "sem-root".into(),
-                    ..Default::default()
-                }),
-                relations: vec!["contains".into()],
-                direction: "outgoing".into(),
-                max_depth: 2,
-                reasoning_mode: mode.into(),
-                ..Default::default()
-            };
-            let asserted = svc
-                .expand_relations(with_named_principal(expand("asserted_only"), "alice"))
-                .await
-                .unwrap()
-                .into_inner();
-            assert!(
-                asserted
-                    .candidates
-                    .iter()
-                    .any(|candidate| candidate.object.as_ref().unwrap().id == "sem-root")
-            );
-            let entailment = svc
-                .expand_relations(with_named_principal(expand("entailment"), "alice"))
-                .await
-                .unwrap_err();
-            assert_eq!(entailment.code(), tonic::Code::FailedPrecondition);
+            assert_entailment_case(entailment_case(&svc).await);
         });
     drop(db);
 }

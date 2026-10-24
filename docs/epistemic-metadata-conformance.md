@@ -43,9 +43,8 @@ tests rather than recreating every source fixture:
   gateway sampling through the canonical decision preflight, receipt descriptor
   aggregates, and egress-audit projections.
 
-Asserted graph retrieval is reusable on SQLite and PostgreSQL. Query-time
-ontology entailment remains SQLite-only; PostgreSQL returns an explicit
-`FAILED_PRECONDITION` instead of a partial inference projection. The suite is
+Asserted graph retrieval and query-time ontology entailment are reusable on
+SQLite and PostgreSQL (#1320). The suite is
 credential- and service-free; backend-specific PostgreSQL conformance remains
 covered by the existing ignored inventory tests when
 `SEKAI_TEST_POSTGRES_URL` is supplied.

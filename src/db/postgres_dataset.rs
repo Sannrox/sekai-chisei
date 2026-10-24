@@ -148,6 +148,10 @@ impl PostgresDb {
         dataset_id: &str,
         rows: &[HashMap<String, String>],
     ) -> Result<i32, String> {
+        // Nothing appended is no new version, as on SQLite.
+        if rows.is_empty() {
+            return Ok(0);
+        }
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
@@ -708,33 +712,9 @@ fn validate_filters(dataset: &Dataset, filters: &[RowFilter]) -> Result<(), Stri
     Ok(())
 }
 
+/// The shared row filter, so both backends answer a query alike.
 fn matches_filters(row: &HashMap<String, String>, filters: &[RowFilter]) -> bool {
-    filters.iter().all(|filter| {
-        let Some(value) = row.get(&filter.column) else {
-            return false;
-        };
-        match filter.op.as_str() {
-            "eq" => value == &filter.value,
-            "neq" => value != &filter.value,
-            "gt" | "lt" | "gte" | "lte" => {
-                compare_numeric(value, &filter.value, filter.op.as_str())
-            }
-            _ => false,
-        }
-    })
-}
-
-fn compare_numeric(left: &str, right: &str, op: &str) -> bool {
-    let (Ok(left), Ok(right)) = (left.parse::<f64>(), right.parse::<f64>()) else {
-        return false;
-    };
-    match op {
-        "gt" => left > right,
-        "lt" => left < right,
-        "gte" => left >= right,
-        "lte" => left <= right,
-        _ => false,
-    }
+    crate::sekai::dataset::matches_row_filters(row, filters)
 }
 
 fn row_to_dataset_version(row: postgres::Row) -> Result<DatasetVersion, String> {

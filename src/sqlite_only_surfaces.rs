@@ -16,7 +16,7 @@ pub const RUNTIME_DB_SRC: &str = concat!(
     include_str!("db/runtime_db.rs"),
     include_str!("chisei_store/runtime.rs")
 );
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 13;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -422,7 +422,8 @@ mod tests {
         unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC).unwrap();
         real_backend_matches_list(&table, MATURITY_DOCS, &list).unwrap();
         assert_eq!(list.surfaces.len(), SQLITE_ONLY_SURFACE_LIMIT);
-        assert!(list.contains_rpc("SekaiService", "AppendRows"));
+        assert!(list.contains_rpc("SekaiService", "DeleteOntologyClass"));
+        assert!(!list.contains_rpc("SekaiService", "AppendRows"));
         assert!(!list.contains_rpc("SekaiService", "PutPurposeAuthorization"));
         assert!(!list.contains_rpc("SekaiService", "GetClassificationLattice"));
         assert!(!list.contains_rpc("SekaiService", "ListObjectChanges"));
@@ -437,12 +438,12 @@ mod tests {
         let list = SqliteOnlySurfaces::load().expect("list");
         let table = RpcMaturityTable::load().expect("table");
         let tampered = MATURITY_DOCS.replace(
-            "| `SekaiService.AppendRows` | `sekai.datasets` | sqlite only |",
-            "| `SekaiService.AppendRows` | `sekai.datasets` | yes |",
+            "| `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | sqlite only |",
+            "| `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | yes |",
         );
         let error = real_backend_matches_list(&table, &tampered, &list)
             .expect_err("mislabeled row must fail");
-        assert!(error.contains("AppendRows"), "{error}");
+        assert!(error.contains("DeleteOntologyClass"), "{error}");
         assert!(error.contains("docs"), "{error}");
     }
 
@@ -451,10 +452,10 @@ mod tests {
         let table = RpcMaturityTable::load().expect("table");
         let mut list = SqliteOnlySurfaces::load().expect("list");
         list.surfaces
-            .retain(|surface| surface.id != "SekaiService.AppendRows");
+            .retain(|surface| surface.id != "SekaiService.DeleteOntologyClass");
         let error = unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC)
             .expect_err("unlisted sqlite-only RPC must fail");
-        assert!(error.contains("AppendRows"), "{error}");
+        assert!(error.contains("DeleteOntologyClass"), "{error}");
     }
 
     #[test]
@@ -495,9 +496,10 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_scanner_sees_rows_and_skips_object_security() {
+    fn fail_closed_scanner_sees_ontology_deletes_and_skips_object_security() {
         let closed = postgres_fail_closed_methods(RUNTIME_DB_SRC);
-        assert!(closed.contains("append_rows"));
+        assert!(closed.contains("delete_ontology_class_with_audit"));
+        assert!(!closed.contains("append_rows"));
         assert!(!closed.contains("put_purpose_authorization"));
         assert!(
             !closed.contains("put_source_type_descriptor"),
