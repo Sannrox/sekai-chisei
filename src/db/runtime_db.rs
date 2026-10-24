@@ -729,6 +729,49 @@ impl RuntimeDb {
         }
     }
 
+    pub fn refuse_transform_claim(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        refusal: &crate::enterprise::IsolatedProcessRefusal,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.refuse_transform_claim(
+                run_id,
+                runtime_id,
+                claim_generation,
+                fencing_token,
+                refusal,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.refuse_transform_claim(
+                    run_id,
+                    runtime_id,
+                    claim_generation,
+                    fencing_token,
+                    refusal,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
+    pub fn transform_run_refusal(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::enterprise::IsolatedProcessRefusal>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_run_refusal(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_run_refusal(run_id))
+            }
+        }
+    }
+
     pub fn release_transform_claim(
         &self,
         run_id: &str,

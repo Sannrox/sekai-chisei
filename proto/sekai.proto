@@ -761,6 +761,16 @@ message TransformRun {
   string trigger_ref = 22;
   repeated TransformPartition input_partitions = 23;
   repeated TransformPartition output_partitions = 24;
+  // Set when dispatch_status is refused: why an extension refused the run
+  // for good (#1701).
+  TransformRunRefusal refusal = 25;
+}
+message TransformRunRefusal {
+  // A short rule name, such as quota_exceeded; reason_withheld when the
+  // extension's reason was malformed or looked secret.
+  string code = 1;
+  // Bounded named values, such as unit, period, limit, usage and estimate.
+  map<string, string> details = 2;
 }
 message TickGovernedTransformsRequest {
   int64 now_ms = 1;

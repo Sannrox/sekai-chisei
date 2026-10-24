@@ -22153,6 +22153,7 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
 
 struct IsolatedClaimExtension {
     deny: bool,
+    refuse: Option<crate::enterprise::IsolatedProcessRefusal>,
 }
 
 impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
@@ -22229,15 +22230,23 @@ impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
             Ok(())
         }
     }
+
+    fn refuse_isolated_process_job(
+        &self,
+        _context: &crate::enterprise::AuthenticatedContext,
+        _job: &crate::enterprise::IsolatedProcessJob,
+    ) -> Option<crate::enterprise::IsolatedProcessRefusal> {
+        self.refuse.clone()
+    }
 }
 
 fn isolated_claim_service(deny: bool) -> SekaiServiceImpl {
+    isolated_claim_service_with(IsolatedClaimExtension { deny, refuse: None })
+}
+
+fn isolated_claim_service_with(extension: IsolatedClaimExtension) -> SekaiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-        SekaiDb::new_with_enterprise_extension(
-            ":memory:",
-            Some(Arc::new(IsolatedClaimExtension { deny })),
-        )
-        .unwrap(),
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(extension))).unwrap(),
     )));
     SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
 }
@@ -22348,6 +22357,121 @@ async fn isolated_process_claim_skips_work_the_extension_denies() {
         .work;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].transform_id, "t-iso-deny");
+}
+
+/// Claims once for tenant-a in `ops` and returns the refused run's proto.
+async fn claim_refused(svc: &SekaiServiceImpl) -> TransformRun {
+    let claim = || {
+        svc.claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+    };
+    // The refused run is never handed out, now or on the next claim.
+    for _ in 0..2 {
+        assert_eq!(claim().await.unwrap_err().code(), tonic::Code::NotFound);
+    }
+    let runs = svc
+        .list_governed_transform_runs(with_tenant_admin(
+            ListGovernedTransformRunsRequest {
+                namespace: "ops".into(),
+                limit: 10,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    let listed = svc
+        .list_claimable_transform_work(with_tenant_admin(
+            ListClaimableTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                limit: 10,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert!(listed.is_empty());
+    let run = runs.into_iter().next().unwrap();
+    let read = svc
+        .get_governed_transform_run(with_tenant_admin(
+            GetGovernedTransformRunRequest {
+                run_id: run.run_id.clone(),
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(read.refusal, run.refusal);
+    read
+}
+
+#[tokio::test]
+async fn isolated_process_claim_the_extension_refuses_ends_the_run_for_good() {
+    let svc = isolated_claim_service_with(IsolatedClaimExtension {
+        deny: false,
+        refuse: Some(crate::enterprise::IsolatedProcessRefusal {
+            code: "quota_exceeded".into(),
+            details: [
+                ("unit".into(), "compute_seconds".into()),
+                ("period".into(), "month".into()),
+                ("limit".into(), "3600".into()),
+                ("usage".into(), "3590".into()),
+                ("estimate".into(), "30".into()),
+            ]
+            .into(),
+        }),
+    });
+    enqueue_isolated_claim(&svc, "t-iso-refuse").await;
+    let run = claim_refused(&svc).await;
+    assert_eq!(run.dispatch_status, "refused");
+    let refusal = run.refusal.unwrap();
+    assert_eq!(refusal.code, "quota_exceeded");
+    assert_eq!(refusal.details["limit"], "3600");
+    assert_eq!(refusal.details.len(), 5);
+}
+
+#[tokio::test]
+async fn isolated_process_refusal_with_secret_like_text_is_withheld() {
+    let svc = isolated_claim_service_with(IsolatedClaimExtension {
+        deny: false,
+        refuse: Some(crate::enterprise::IsolatedProcessRefusal {
+            code: "approval_refused".into(),
+            details: [("approver".into(), "api_key=live-abcdef123456".into())].into(),
+        }),
+    });
+    enqueue_isolated_claim(&svc, "t-iso-withheld").await;
+    let run = claim_refused(&svc).await;
+    assert_eq!(run.dispatch_status, "refused");
+    let refusal = run.refusal.unwrap();
+    assert_eq!(refusal.code, "reason_withheld");
+    assert!(refusal.details.is_empty());
+    // A credential-like detail name is withheld whatever its value.
+    let svc = isolated_claim_service_with(IsolatedClaimExtension {
+        deny: false,
+        refuse: Some(crate::enterprise::IsolatedProcessRefusal {
+            code: "approval_refused".into(),
+            details: [("api_key".into(), "live-abcdef123456".into())].into(),
+        }),
+    });
+    enqueue_isolated_claim(&svc, "t-iso-withheld-key").await;
+    assert_eq!(
+        claim_refused(&svc).await.refusal.unwrap().code,
+        "reason_withheld"
+    );
 }
 
 #[tokio::test]
