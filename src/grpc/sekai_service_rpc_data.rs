@@ -655,6 +655,175 @@ pub(super) async fn list_dataset_alerts(
         alerts: alerts.iter().map(to_proto_dataset_alert).collect(),
     }))
 }
+
+pub(super) async fn list_consumer_violation_notifications(
+    service: &SekaiServiceImpl,
+    req: Request<ListConsumerViolationNotificationsRequest>,
+) -> Result<Response<ListConsumerViolationNotificationsResponse>, Status> {
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let page_size = crate::sekai::consumer_violation::clamp_page_size(inner.page_size)
+        .map_err(Status::invalid_argument)?;
+    let mut page_token = inner.page_token;
+    let mut notifications = Vec::new();
+    let mut next_page_token = String::new();
+    loop {
+        let remaining = page_size.saturating_sub(notifications.len() as i32);
+        if remaining == 0 {
+            break;
+        }
+        let (deliveries, storage_next) = service
+            .db
+            .runtime()
+            .list_consumer_violation_deliveries(
+                &crate::sekai::consumer_violation::ListViolationDeliveries {
+                    recipients: principals.clone(),
+                    page_token,
+                    page_size: remaining,
+                    include_acknowledged: inner.include_acknowledged,
+                },
+            )
+            .map_err(Status::invalid_argument)?;
+        if deliveries.is_empty() {
+            break;
+        }
+        let mut filled = false;
+        for (index, delivery) in deliveries.iter().enumerate() {
+            if tenant_hides_violation_namespace(
+                service,
+                tenant_context.as_ref(),
+                &delivery.namespace,
+            ) {
+                continue;
+            }
+            let evidence = visible_violation_evidence(
+                service,
+                &principals,
+                tenant_context.as_ref(),
+                delivery,
+            )?;
+            notifications.push(to_proto_violation_notification(delivery, evidence));
+            if notifications.len() == page_size as usize {
+                let more = deliveries[index + 1..].iter().any(|item| {
+                    !tenant_hides_violation_namespace(
+                        service,
+                        tenant_context.as_ref(),
+                        &item.namespace,
+                    )
+                }) || !storage_next.is_empty();
+                if more {
+                    next_page_token = crate::sekai::consumer_violation::encode_page_token(
+                        delivery.created_at_ms,
+                        &delivery.event_id,
+                        &delivery.recipient,
+                    );
+                }
+                filled = true;
+                break;
+            }
+        }
+        if filled || storage_next.is_empty() {
+            break;
+        }
+        page_token = storage_next;
+    }
+    Ok(Response::new(ListConsumerViolationNotificationsResponse {
+        notifications,
+        next_page_token,
+    }))
+}
+
+fn tenant_hides_violation_namespace(
+    service: &SekaiServiceImpl,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+) -> bool {
+    tenant_context.is_some_and(|context| {
+        enforce_namespace_tenant_context(service.db.runtime(), Some(context), namespace, false)
+            .is_err()
+    })
+}
+
+pub(super) async fn acknowledge_consumer_violation_notification(
+    service: &SekaiServiceImpl,
+    req: Request<AcknowledgeConsumerViolationNotificationRequest>,
+) -> Result<Response<AcknowledgeConsumerViolationNotificationResponse>, Status> {
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    if inner.event_id.trim().is_empty() {
+        return Err(Status::invalid_argument("event_id required"));
+    }
+    let existing = service
+        .db
+        .runtime()
+        .get_consumer_violation_delivery(&principals, &inner.event_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("notification not found"))?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &existing.namespace,
+            false,
+        )?;
+    }
+    let now_ms = crate::sekai::dataset_version::now_ms();
+    let delivery = service
+        .db
+        .runtime()
+        .acknowledge_consumer_violation(&principals, &inner.event_id, now_ms)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("notification not found"))?;
+    let evidence =
+        visible_violation_evidence(service, &principals, tenant_context.as_ref(), &delivery)?;
+    Ok(Response::new(
+        AcknowledgeConsumerViolationNotificationResponse {
+            notification: Some(to_proto_violation_notification(&delivery, evidence)),
+        },
+    ))
+}
+
+fn visible_violation_evidence(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    delivery: &crate::sekai::consumer_violation::ViolationDelivery,
+) -> Result<String, Status> {
+    let runtime = service.db.runtime();
+    let object_id = match delivery.kind.as_str() {
+        crate::sekai::consumer_violation::KIND_QUALITY => {
+            crate::chisei::data_quality::dataset_object_id(&delivery.namespace, &delivery.member_id)
+        }
+        _ => match runtime
+            .get_dataset(&delivery.member_id)
+            .map_err(Status::internal)?
+        {
+            Some(dataset) if !dataset.object_id.is_empty() => dataset.object_id,
+            _ => return Ok(String::new()),
+        },
+    };
+    let Some(object) = runtime.get_object(&object_id).map_err(Status::internal)? else {
+        return Ok(String::new());
+    };
+    let allowed = object_is_visible_for(
+        runtime,
+        &service.security,
+        &object,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+    );
+    Ok(if allowed {
+        delivery.evidence.clone()
+    } else {
+        String::new()
+    })
+}
+
 pub(super) async fn create_virtual_table(
     service: &SekaiServiceImpl,
     req: Request<CreateVirtualTableRequest>,

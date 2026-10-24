@@ -107,6 +107,7 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         crate::sekai::dataset_health::migrate_dataset_health(&conn)?;
+        crate::sekai::consumer_violation::migrate_consumer_violations(&conn)?;
         crate::db::dataset_branch::migrate_dataset_branches(&conn)?;
         let _ = conn.execute(
             "ALTER TABLE sekai_datasets ADD COLUMN partition_keys TEXT NOT NULL DEFAULT '[]'",

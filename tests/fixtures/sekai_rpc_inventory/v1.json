@@ -2398,6 +2398,32 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ListConsumerViolationNotifications",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_tests.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "AcknowledgeConsumerViolationNotification",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_tests.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "CreateVirtualTable",
       "kind": "persistent",
       "surfaces": [

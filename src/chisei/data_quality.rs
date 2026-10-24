@@ -239,6 +239,9 @@ pub fn evaluate_rule(
         now_ms,
     )?;
     if is_closed(&started.status) {
+        if started.status == STATUS_FAIL {
+            emit_quality_violation(facts, &started, now_ms)?;
+        }
         return Ok(started);
     }
     finish_evaluation(db, facts, actor, &started.result_id, now_ms)
@@ -357,7 +360,11 @@ fn finish_evaluation(
     record.evaluated_by = actor.into();
     record.evaluated_at_ms = now_ms;
     record.evidence_receipt_digest = receipt_digest(&record)?;
+    // Quality cannot share a SQLite tx with Sekai. Close the receipt first
+    // so a crash cannot notify for a result that stays RUNNING. evaluate_rule
+    // retries emit on an already-closed FAIL; insert is idempotent.
     db.put_data_quality_result(&record)?;
+    emit_quality_violation(facts, &record, now_ms)?;
     audit(
         db,
         actor,
@@ -514,6 +521,34 @@ pub fn dataset_object_id(namespace: &str, dataset_id: &str) -> String {
     format!("{namespace}:dataset:{dataset_id}")
 }
 
+fn emit_quality_violation(
+    facts: &dyn SekaiFactReader,
+    record: &DataQualityResult,
+    now_ms: i64,
+) -> Result<(), String> {
+    if record.status != STATUS_FAIL {
+        return Ok(());
+    }
+    // Combined mode writes deliveries here. Remote hop has no Sekai write RPC
+    // in this slice; skip emit, still close FAIL, and leave forwarding out.
+    let store = match facts.in_process_store() {
+        Ok(store) => store,
+        Err(crate::chisei::sekai_facts::SekaiFactError::Unsupported(_)) => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let event_id = crate::sekai::consumer_violation::quality_event_id(&record.result_id);
+    store.emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+        kind: crate::sekai::consumer_violation::KIND_QUALITY,
+        namespace: &record.namespace,
+        member_id: &record.dataset_id,
+        event_id: &event_id,
+        rule_id: &record.rule_id,
+        evidence: &record.evidence_receipt_digest,
+        now_ms,
+    })?;
+    Ok(())
+}
+
 fn dataset_revision_digest(object: &Object) -> Result<String, String> {
     let properties = object.properties.iter().collect::<BTreeMap<_, _>>();
     canonical_digest("dataset-revision", &properties)
@@ -652,6 +687,95 @@ mod tests {
         (sekai, db, facts)
     }
 
+    struct HopFacts(crate::db::store::SekaiStore);
+
+    impl crate::chisei::sekai_facts::SekaiFactReader for HopFacts {
+        fn find_by_external_id(
+            &self,
+            external_id: &str,
+        ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+            crate::chisei::sekai_facts::SekaiFactReader::find_by_external_id(&self.0, external_id)
+        }
+
+        fn find_namespace_boundary(
+            &self,
+            namespace: &str,
+        ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+            crate::chisei::sekai_facts::SekaiFactReader::find_namespace_boundary(&self.0, namespace)
+        }
+
+        fn list_grants(
+            &self,
+            object_id: &str,
+        ) -> Result<
+            Vec<crate::chisei::principal::PrincipalGrant>,
+            crate::chisei::sekai_facts::SekaiFactError,
+        > {
+            crate::chisei::sekai_facts::SekaiFactReader::list_grants(&self.0, object_id)
+        }
+
+        fn marking_clearance(
+            &self,
+            operation_id: &str,
+            object: &Object,
+            principal: &str,
+        ) -> Result<
+            crate::chisei::principal::MarkingClearance,
+            crate::chisei::sekai_facts::SekaiFactError,
+        > {
+            crate::chisei::sekai_facts::SekaiFactReader::marking_clearance(
+                &self.0,
+                operation_id,
+                object,
+                principal,
+            )
+        }
+
+        fn get_object_type(
+            &self,
+            kind: &str,
+        ) -> Result<
+            Option<crate::chisei::object_schema::ObjectType>,
+            crate::chisei::sekai_facts::SekaiFactError,
+        > {
+            crate::chisei::sekai_facts::SekaiFactReader::get_object_type(&self.0, kind)
+        }
+
+        fn get_object(
+            &self,
+            id: &str,
+        ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+            crate::chisei::sekai_facts::SekaiFactReader::get_object(&self.0, id)
+        }
+
+        fn list_objects(
+            &self,
+            filter: &crate::domain::ListFilter,
+        ) -> Result<Vec<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+            crate::chisei::sekai_facts::SekaiFactReader::list_objects(&self.0, filter)
+        }
+
+        fn get_linked_objects(
+            &self,
+            object_id: &str,
+            relation: &str,
+            direction: &crate::domain::Direction,
+        ) -> Result<Vec<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+            crate::chisei::sekai_facts::SekaiFactReader::get_linked_objects(
+                &self.0, object_id, relation, direction,
+            )
+        }
+
+        fn in_process_store(
+            &self,
+        ) -> Result<&crate::db::store::SekaiStore, crate::chisei::sekai_facts::SekaiFactError>
+        {
+            Err(crate::chisei::sekai_facts::SekaiFactError::Unsupported(
+                "graph retrieval over the Sekai hop",
+            ))
+        }
+    }
+
     fn expected() -> String {
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()
     }
@@ -751,6 +875,45 @@ mod tests {
             22,
         )
         .unwrap();
+        sekai
+            .create_object(&{
+                use crate::sekai::definition_consumer_impact::{
+                    BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+                };
+                let mut binding = DefinitionConsumerBinding {
+                    contract_version: BINDING_CONTRACT.into(),
+                    owner: "buyer".into(),
+                    resource_identity: "app:buyer".into(),
+                    namespace: "quality".into(),
+                    member_kind: "dataset".into(),
+                    member_id: "orders".into(),
+                    property: String::new(),
+                    declaration_digest: String::new(),
+                    source_locator: "buyer.rs".into(),
+                    blocking: false,
+                };
+                binding.declaration_digest = binding_digest(&binding);
+                Object {
+                    id: "bind-buyer".into(),
+                    kind: BINDING_KIND.into(),
+                    name: "bind-buyer".into(),
+                    namespace: "quality".into(),
+                    external_id: "quality:bind-buyer".into(),
+                    properties: HashMap::from([
+                        ("contract_version".into(), binding.contract_version),
+                        ("owner".into(), binding.owner),
+                        ("resource_identity".into(), binding.resource_identity),
+                        ("member_kind".into(), binding.member_kind),
+                        ("member_id".into(), binding.member_id),
+                        ("property".into(), binding.property),
+                        ("declaration_digest".into(), binding.declaration_digest),
+                        ("source_locator".into(), binding.source_locator),
+                    ]),
+                    created: 1,
+                    updated: 1,
+                }
+            })
+            .unwrap();
         let failed = evaluate_rule(
             &db,
             facts.reader(),
@@ -762,6 +925,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(failed.status, STATUS_FAIL);
+        let listed = sekai
+            .list_consumer_violation_deliveries(
+                &crate::sekai::consumer_violation::ListViolationDeliveries {
+                    recipients: vec!["buyer".into()],
+                    page_token: String::new(),
+                    page_size: 0,
+                    include_acknowledged: false,
+                },
+            )
+            .unwrap()
+            .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].kind,
+            crate::sekai::consumer_violation::KIND_QUALITY
+        );
+        assert_eq!(
+            listed[0].event_id,
+            crate::sekai::consumer_violation::quality_event_id(&failed.result_id)
+        );
+        let replay_fail = evaluate_rule(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "orders-count",
+            None,
+            23,
+        )
+        .unwrap();
+        assert_eq!(replay_fail.result_id, failed.result_id);
+        assert_eq!(replay_fail.status, STATUS_FAIL);
+        let listed_again = sekai
+            .list_consumer_violation_deliveries(
+                &crate::sekai::consumer_violation::ListViolationDeliveries {
+                    recipients: vec!["buyer".into()],
+                    page_token: String::new(),
+                    page_size: 0,
+                    include_acknowledged: false,
+                },
+            )
+            .unwrap()
+            .0;
+        assert_eq!(listed_again.len(), 1);
 
         publish_rule(
             &db,
@@ -835,6 +1042,155 @@ mod tests {
         assert_eq!(invalid.status, STATUS_INVALID);
         assert_ne!(invalid.status, STATUS_PASS);
         assert_eq!(rule.evaluator, EVALUATOR_DIGEST_PIN);
+    }
+
+    #[test]
+    fn quality_fail_completes_without_deliveries_when_sekai_is_not_in_process() {
+        let (sekai, db, _) = fixture();
+        put_dataset(&sekai, "4", &[("owner", "alice")]);
+        publish_rule(
+            &db,
+            "analyst",
+            &PublishDataQualityRule {
+                namespace: "quality".into(),
+                rule_id: "orders-count".into(),
+                dataset_id: "orders".into(),
+                evaluator: EVALUATOR_ROW_COUNT.into(),
+                expected_digest: None,
+                required_fields: Vec::new(),
+                min_rows: Some(10),
+                max_rows: Some(20),
+                baseline_digest: None,
+            },
+            22,
+        )
+        .unwrap();
+        let hop = HopFacts(sekai);
+        let failed =
+            evaluate_rule(&db, &hop, "analyst", "quality", "orders-count", None, 23).unwrap();
+        assert_eq!(failed.status, STATUS_FAIL);
+        assert!(
+            hop.0
+                .list_consumer_violation_deliveries(
+                    &crate::sekai::consumer_violation::ListViolationDeliveries {
+                        recipients: vec!["buyer".into()],
+                        page_token: String::new(),
+                        page_size: 0,
+                        include_acknowledged: true,
+                    },
+                )
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn closed_fail_retries_emit_after_remote_hop() {
+        let (sekai, db, facts) = fixture();
+        put_dataset(&sekai, "4", &[("owner", "alice")]);
+        publish_rule(
+            &db,
+            "analyst",
+            &PublishDataQualityRule {
+                namespace: "quality".into(),
+                rule_id: "orders-count".into(),
+                dataset_id: "orders".into(),
+                evaluator: EVALUATOR_ROW_COUNT.into(),
+                expected_digest: None,
+                required_fields: Vec::new(),
+                min_rows: Some(10),
+                max_rows: Some(20),
+                baseline_digest: None,
+            },
+            22,
+        )
+        .unwrap();
+        sekai
+            .create_object(&{
+                use crate::sekai::definition_consumer_impact::{
+                    BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+                };
+                let mut binding = DefinitionConsumerBinding {
+                    contract_version: BINDING_CONTRACT.into(),
+                    owner: "buyer".into(),
+                    resource_identity: "app:buyer".into(),
+                    namespace: "quality".into(),
+                    member_kind: "dataset".into(),
+                    member_id: "orders".into(),
+                    property: String::new(),
+                    declaration_digest: String::new(),
+                    source_locator: "buyer.rs".into(),
+                    blocking: false,
+                };
+                binding.declaration_digest = binding_digest(&binding);
+                Object {
+                    id: "bind-buyer".into(),
+                    kind: BINDING_KIND.into(),
+                    name: "bind-buyer".into(),
+                    namespace: "quality".into(),
+                    external_id: "quality:bind-buyer".into(),
+                    properties: HashMap::from([
+                        ("contract_version".into(), binding.contract_version),
+                        ("owner".into(), binding.owner),
+                        ("resource_identity".into(), binding.resource_identity),
+                        ("member_kind".into(), binding.member_kind),
+                        ("member_id".into(), binding.member_id),
+                        ("property".into(), binding.property),
+                        ("declaration_digest".into(), binding.declaration_digest),
+                        ("source_locator".into(), binding.source_locator),
+                    ]),
+                    created: 1,
+                    updated: 1,
+                }
+            })
+            .unwrap();
+        let hop = HopFacts(sekai.clone());
+        let failed =
+            evaluate_rule(&db, &hop, "analyst", "quality", "orders-count", None, 23).unwrap();
+        assert_eq!(failed.status, STATUS_FAIL);
+        assert!(
+            sekai
+                .list_consumer_violation_deliveries(
+                    &crate::sekai::consumer_violation::ListViolationDeliveries {
+                        recipients: vec!["buyer".into()],
+                        page_token: String::new(),
+                        page_size: 0,
+                        include_acknowledged: true,
+                    },
+                )
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let replay = evaluate_rule(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "orders-count",
+            None,
+            24,
+        )
+        .unwrap();
+        assert_eq!(replay.result_id, failed.result_id);
+        assert_eq!(replay.status, STATUS_FAIL);
+        let listed = sekai
+            .list_consumer_violation_deliveries(
+                &crate::sekai::consumer_violation::ListViolationDeliveries {
+                    recipients: vec!["buyer".into()],
+                    page_token: String::new(),
+                    page_size: 0,
+                    include_acknowledged: false,
+                },
+            )
+            .unwrap()
+            .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].event_id,
+            crate::sekai::consumer_violation::quality_event_id(&failed.result_id)
+        );
     }
 
     #[test]

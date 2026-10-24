@@ -111,4 +111,33 @@ impl SekaiStore {
         self.inner
             .list_usable_evidence_classes_for_targets(target_object_ids, now_ms)
     }
+
+    pub fn emit_consumer_violation(
+        &self,
+        emit: &crate::sekai::consumer_violation::EmitViolation<'_>,
+    ) -> Result<usize, String> {
+        self.inner.emit_consumer_violation(emit)
+    }
+
+    pub fn list_consumer_violation_deliveries(
+        &self,
+        query: &crate::sekai::consumer_violation::ListViolationDeliveries,
+    ) -> Result<
+        (
+            Vec<crate::sekai::consumer_violation::ViolationDelivery>,
+            String,
+        ),
+        String,
+    > {
+        self.inner.list_consumer_violation_deliveries(query)
+    }
+
+    pub fn get_consumer_violation_delivery(
+        &self,
+        recipients: &[String],
+        event_id: &str,
+    ) -> Result<Option<crate::sekai::consumer_violation::ViolationDelivery>, String> {
+        self.inner
+            .get_consumer_violation_delivery(recipients, event_id)
+    }
 }

@@ -441,6 +441,36 @@ fn judge_version_pg(
     for result in &mut results {
         result.quarantined = state.quarantined;
         persist_result_pg(tx, result)?;
+        if !result.passed
+            && checks.iter().any(|check| {
+                check.check_id == result.check_id
+                    && check.kind == crate::sekai::dataset_health::KIND_FRESHNESS
+            })
+        {
+            let event_id = crate::sekai::consumer_violation::freshness_event_id(
+                dataset_id,
+                &result.version_id,
+                &result.check_id,
+            );
+            let namespace =
+                crate::db::postgres_consumer_violation::dataset_object_namespace_postgres(
+                    tx, dataset_id,
+                )?;
+            if !namespace.is_empty() {
+                crate::db::postgres_consumer_violation::emit_dataset_violation_postgres(
+                    tx,
+                    &crate::sekai::consumer_violation::EmitViolation {
+                        kind: crate::sekai::consumer_violation::KIND_FRESHNESS,
+                        namespace: &namespace,
+                        member_id: dataset_id,
+                        event_id: &event_id,
+                        rule_id: &result.check_id,
+                        evidence: &result.detail,
+                        now_ms,
+                    },
+                )?;
+            }
+        }
     }
     persist_state_pg(tx, dataset_id, &state)?;
     Ok(results)

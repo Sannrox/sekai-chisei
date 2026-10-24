@@ -446,6 +446,16 @@ mod tests {
         assert!(inventory.entry("ListDatasetHealthResults").is_some());
         assert!(inventory.entry("RunDatasetHealthChecks").is_some());
         assert!(inventory.entry("ListDatasetAlerts").is_some());
+        assert!(
+            inventory
+                .entry("ListConsumerViolationNotifications")
+                .is_some()
+        );
+        assert!(
+            inventory
+                .entry("AcknowledgeConsumerViolationNotification")
+                .is_some()
+        );
         assert!(inventory.entry("CompareDefinitionRevisions").is_some());
         assert!(inventory.entry("ReportDefinitionConsumerImpact").is_some());
         assert!(

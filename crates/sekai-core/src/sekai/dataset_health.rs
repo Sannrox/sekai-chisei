@@ -740,6 +740,33 @@ fn judge_version_tx(
     for result in &mut results {
         result.quarantined = state.quarantined;
         persist_result_tx(tx, result)?;
+        if !result.passed
+            && checks
+                .iter()
+                .any(|check| check.check_id == result.check_id && check.kind == KIND_FRESHNESS)
+        {
+            let event_id = crate::sekai::consumer_violation::freshness_event_id(
+                dataset_id,
+                &result.version_id,
+                &result.check_id,
+            );
+            let namespace =
+                crate::sekai::consumer_violation::dataset_object_namespace_sqlite(tx, dataset_id)?;
+            if !namespace.is_empty() {
+                crate::sekai::consumer_violation::emit_dataset_violation_sqlite(
+                    tx,
+                    &crate::sekai::consumer_violation::EmitViolation {
+                        kind: crate::sekai::consumer_violation::KIND_FRESHNESS,
+                        namespace: &namespace,
+                        member_id: dataset_id,
+                        event_id: &event_id,
+                        rule_id: &result.check_id,
+                        evidence: &result.detail,
+                        now_ms,
+                    },
+                )?;
+            }
+        }
     }
     persist_state_tx(tx, dataset_id, &state)?;
     Ok(results)

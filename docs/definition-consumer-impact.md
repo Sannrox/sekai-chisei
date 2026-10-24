@@ -46,5 +46,14 @@ declaration digest then covers the flag). A blocking binding:
 
 A blocking binding with a stale digest does not block.
 
+## Violation notifications
+
+A freshness or quality violation writes one durable delivery per
+`(recipient, event)` at commit for digest-fresh bindings of that dataset.
+`ListConsumerViolationNotifications` is caller-scoped and paged.
+`AcknowledgeConsumerViolationNotification` acknowledges the caller's row.
+Evidence is stored in full and omitted at read when the caller cannot read
+the dataset. Email and webhooks stay out of the core.
+
 See [ADR 0067](decisions/0067-definition-consumer-impact.md) and
 Discussion [863](https://github.com/Sannrox/sekai-chisei/discussions/863).
