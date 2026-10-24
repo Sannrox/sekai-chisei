@@ -674,6 +674,56 @@ pub struct ModelIdentity {
     pub endpoint: String,
 }
 
+/// A terminal refusal of an isolated-process claim (#1701): the run is
+/// marked refused and never offered again. `code` names the rule, for
+/// example `quota_exceeded`; `details` carries bounded named values such as
+/// `unit`, `period`, `limit`, `usage` and `estimate`. The core bounds both
+/// and refuses secret-like text before storing them on the run.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct IsolatedProcessRefusal {
+    pub code: String,
+    #[serde(default)]
+    pub details: std::collections::BTreeMap<String, String>,
+}
+
+/// Longest refusal code or detail key, and longest detail value.
+pub const MAX_REFUSAL_NAME_BYTES: usize = 64;
+pub const MAX_REFUSAL_VALUE_BYTES: usize = 256;
+/// Most named details one refusal carries.
+pub const MAX_REFUSAL_DETAILS: usize = 8;
+
+impl IsolatedProcessRefusal {
+    /// Bounds the refusal: identifier-like names, short printable values.
+    pub fn validate(&self) -> Result<(), String> {
+        let name_ok = |name: &str| {
+            !name.is_empty()
+                && name.len() <= MAX_REFUSAL_NAME_BYTES
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        };
+        if !name_ok(&self.code) {
+            return Err("refusal code must be a short lowercase identifier".into());
+        }
+        if self.details.len() > MAX_REFUSAL_DETAILS {
+            return Err(format!(
+                "refusal carries more than {MAX_REFUSAL_DETAILS} details"
+            ));
+        }
+        for (key, value) in &self.details {
+            if !name_ok(key) {
+                return Err("refusal detail names must be short lowercase identifiers".into());
+            }
+            if value.len() > MAX_REFUSAL_VALUE_BYTES || value.chars().any(char::is_control) {
+                return Err(format!(
+                    "refusal detail {key} must be at most {MAX_REFUSAL_VALUE_BYTES} bytes without control characters"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Isolated-process work about to be returned to a runner (#1588).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolatedProcessJob {
@@ -914,6 +964,23 @@ pub trait EnterpriseExtension: Send + Sync {
     ) -> Result<(), ExtensionError> {
         let _ = (context, job);
         Ok(())
+    }
+
+    /// Refuse an isolated-process claim for good (#1701), asked before
+    /// [`Self::admit_isolated_process_job`]. `Some` marks the run refused with
+    /// that reason, fenced by its claim, and it is never offered again; use it
+    /// for a decision that will not change, such as a refused approval or a
+    /// hard limit. To defer instead, return `PermissionDenied` from the admit
+    /// hook.
+    ///
+    /// Default: never refuse.
+    fn refuse_isolated_process_job(
+        &self,
+        context: &AuthenticatedContext,
+        job: &IsolatedProcessJob,
+    ) -> Option<IsolatedProcessRefusal> {
+        let _ = (context, job);
+        None
     }
 
     /// Resolve a tenant-scoped model-provider credential (#118).

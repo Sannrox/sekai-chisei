@@ -49,6 +49,9 @@ pub const TRANSFORM_WORK_CLAIMED: &str = "claimed";
 pub const TRANSFORM_WORK_COMPLETED: &str = "completed";
 pub const TRANSFORM_WORK_FAILED: &str = "failed";
 pub const TRANSFORM_WORK_CANCELLED: &str = "cancelled";
+/// Run dispatch status of an isolated-process run an extension refused for
+/// good (#1701). Its work is `failed`, so every binary treats it as terminal.
+pub const TRANSFORM_RUN_REFUSED: &str = "refused";
 pub const TRANSFORM_TRIGGER_MANUAL: &str = "manual";
 pub const TRANSFORM_TRIGGER_SCHEDULE: &str = "schedule";
 pub const TRANSFORM_TRIGGER_UPSTREAM: &str = "upstream";
@@ -229,7 +232,7 @@ pub struct TransformRun {
     #[serde(default)]
     pub runtime_image: String,
     /// Empty for in-process compute. `pending` / `claimed` / `completed` /
-    /// `failed` for isolated-process dispatch.
+    /// `failed` / `refused` for isolated-process dispatch.
     #[serde(default)]
     pub dispatch_status: String,
     /// Why this run was admitted: `manual`, `schedule`, `upstream`,

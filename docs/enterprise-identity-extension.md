@@ -214,6 +214,19 @@ the current `DiscoveryRule` or `Err` when the rule is withdrawn. No
 existing field changes meaning and no protocol field numbers change, so
 the contract version stays `v2`.
 
+GATE:break: `refuse_isolated_process_job` (#1701) is a new optional `v2`
+method, asked before `admit_isolated_process_job`. The default never refuses.
+`Some(IsolatedProcessRefusal)` ends the run for good: in one transaction fenced
+by the claim generation, the core fails its work, records the run as
+`refused` with the reason, and drops its input snapshot. It then releases
+quota as for any failed run. The reason is a short code plus at most eight
+named details (for example `unit`, `period`, `limit`, `usage`, `estimate`). A
+malformed reason, or one with secret-like text, is stored as
+`reason_withheld`. `PermissionDenied` from the admit hook still defers. Refused
+work keeps the terminal `failed` status, so a binary without this change never
+offers it again during a rolling deploy. No existing field changes meaning, so
+the contract version stays `v2`.
+
 Adopting the context contract requires an implementation to provide `authenticate_context`;
 there is no compatibility adapter that guesses scopes or expiry from the older
 principal-only hook. Adding optional methods within `v2` is allowed when their
