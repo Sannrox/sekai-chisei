@@ -794,6 +794,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListPublishedDefinitionRevisions"
             | "GetDefinitionMember"
             | "GetOntologyLintReport"
+            | "GetOntologyHealth"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
             | "DryRunAgent"
@@ -2091,6 +2092,8 @@ mod tests {
             (SpaceRole::Viewer, "GetObject", true),
             (SpaceRole::Viewer, "GetOntologyLintReport", true),
             (SpaceRole::Discoverer, "GetOntologyLintReport", false),
+            (SpaceRole::Viewer, "GetOntologyHealth", true),
+            (SpaceRole::Discoverer, "GetOntologyHealth", false),
             (SpaceRole::Editor, "CreateObject", true),
             (SpaceRole::Editor, "DecideActionInstance", false),
             (SpaceRole::Approver, "DecideActionInstance", true),

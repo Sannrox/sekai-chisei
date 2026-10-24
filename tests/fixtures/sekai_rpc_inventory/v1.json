@@ -406,6 +406,22 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "GetOntologyHealth",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/ontology_health.rs",
+        "src/grpc/ontology_health_rpc.rs",
+        "docs/ontology-health.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GenerateDefinitionChangeBundle",
       "kind": "query",
       "surfaces": [],
