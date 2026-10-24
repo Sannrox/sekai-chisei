@@ -917,6 +917,23 @@ pub(super) fn to_proto_health_result(
     }
 }
 
+pub(super) fn to_proto_violation_notification(
+    delivery: &crate::sekai::consumer_violation::ViolationDelivery,
+    evidence: String,
+) -> ConsumerViolationNotification {
+    ConsumerViolationNotification {
+        event_id: delivery.event_id.clone(),
+        kind: delivery.kind.clone(),
+        namespace: delivery.namespace.clone(),
+        member_kind: delivery.member_kind.clone(),
+        member_id: delivery.member_id.clone(),
+        rule_id: delivery.rule_id.clone(),
+        evidence,
+        created_at_ms: delivery.created_at_ms,
+        acknowledged_at_ms: delivery.acknowledged_at_ms,
+    }
+}
+
 pub(super) fn to_proto_dataset_alert(
     alert: &crate::sekai::dataset_health::DatasetAlert,
 ) -> DatasetAlert {

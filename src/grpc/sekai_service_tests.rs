@@ -6250,6 +6250,507 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
     assert_eq!(late[1].state, "resolved");
 }
 
+fn dataset_consumer_binding(
+    id: &str,
+    owner: &str,
+    namespace: &str,
+    dataset_id: &str,
+) -> domain::Object {
+    use crate::sekai::definition_consumer_impact::{
+        BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+    };
+    let mut binding = DefinitionConsumerBinding {
+        contract_version: BINDING_CONTRACT.into(),
+        owner: owner.into(),
+        resource_identity: format!("app:{id}"),
+        namespace: namespace.into(),
+        member_kind: "dataset".into(),
+        member_id: dataset_id.into(),
+        property: String::new(),
+        declaration_digest: String::new(),
+        source_locator: format!("{id}.rs"),
+        blocking: false,
+    };
+    binding.declaration_digest = binding_digest(&binding);
+    domain::Object {
+        id: id.into(),
+        kind: BINDING_KIND.into(),
+        name: id.into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:{id}"),
+        properties: HashMap::from([
+            ("contract_version".into(), binding.contract_version),
+            ("owner".into(), binding.owner),
+            ("resource_identity".into(), binding.resource_identity),
+            ("member_kind".into(), binding.member_kind),
+            ("member_id".into(), binding.member_id),
+            ("property".into(), binding.property),
+            ("declaration_digest".into(), binding.declaration_digest),
+            ("source_locator".into(), binding.source_locator),
+        ]),
+        created: 1,
+        updated: 1,
+    }
+}
+
+#[tokio::test]
+async fn freshness_violations_notify_bound_consumers_and_hide_unread_evidence() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "notify-orders-obj".into(),
+            kind: "dataset".into(),
+            name: "orders".into(),
+            namespace: "notify".into(),
+            external_id: "notify:orders".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let alice_grant = security::Grant {
+        id: "notify-alice-read".into(),
+        object_id: "notify-orders-obj".into(),
+        principal: "alice".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&alice_grant).unwrap();
+    svc.security.add_grant(&alice_grant);
+    let tester_grant = security::Grant {
+        id: "notify-tester-write".into(),
+        object_id: "notify-orders-obj".into(),
+        principal: "tester".into(),
+        role: security::Role::Admin,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&tester_grant).unwrap();
+    svc.security.add_grant(&tester_grant);
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-alice",
+            "alice",
+            "notify",
+            "notify-orders",
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-bob",
+            "bob",
+            "notify",
+            "notify-orders",
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-carol",
+            "carol",
+            "notify",
+            "other-dataset",
+        ))
+        .unwrap();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "notify-orders".into(),
+            name: "orders".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: "notify-orders-obj".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.put_dataset_health_check(with_principal(PutDatasetHealthCheckRequest {
+        check: Some(DatasetHealthCheck {
+            dataset_id: "notify-orders".into(),
+            check_id: "fresh".into(),
+            kind: "freshness".into(),
+            max_age_ms: 10,
+            min_rows: 0,
+            max_rows: 0,
+            columns: Vec::new(),
+            predicate: Vec::new(),
+            blocking: false,
+            every_ms: 0,
+            tenant: String::new(),
+            space: String::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "notify-orders".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v1".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let created = svc
+        .db
+        .runtime()
+        .list_dataset_versions("notify-orders")
+        .unwrap()
+        .into_iter()
+        .map(|version| version.created_at_ms)
+        .max()
+        .unwrap();
+    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
+        dataset_id: "notify-orders".into(),
+        now_ms: created.saturating_add(10_000),
+    }))
+    .await
+    .unwrap();
+
+    let alice = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(alice.notifications.len(), 1);
+    assert_eq!(alice.notifications[0].kind, "freshness");
+    assert_eq!(alice.notifications[0].member_id, "notify-orders");
+    assert!(
+        !alice.notifications[0].evidence.is_empty(),
+        "a reader sees the freshness detail"
+    );
+
+    let bob = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(bob.notifications.len(), 1);
+    assert!(
+        bob.notifications[0].evidence.is_empty(),
+        "a bound consumer without read access does not see evidence"
+    );
+
+    let carol = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "carol",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(carol.notifications.is_empty());
+
+    let event_id = alice.notifications[0].event_id.clone();
+    svc.acknowledge_consumer_violation_notification(with_named_principal(
+        AcknowledgeConsumerViolationNotificationRequest {
+            event_id: event_id.clone(),
+        },
+        "alice",
+    ))
+    .await
+    .unwrap();
+    let after = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(after.notifications.is_empty());
+    let bob_ack = svc
+        .acknowledge_consumer_violation_notification(with_named_principal(
+            AcknowledgeConsumerViolationNotificationRequest { event_id },
+            "carol",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(bob_ack.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn quality_evidence_is_authorized_on_the_namespaced_object() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "notify-orders-obj".into(),
+            kind: "dataset".into(),
+            name: "orders".into(),
+            namespace: "notify".into(),
+            external_id: "notify:orders".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let alice_grant = security::Grant {
+        id: "notify-alice-read".into(),
+        object_id: "notify-orders-obj".into(),
+        principal: "alice".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&alice_grant).unwrap();
+    svc.security.add_grant(&alice_grant);
+    let tester_grant = security::Grant {
+        id: "notify-tester-write".into(),
+        object_id: "notify-orders-obj".into(),
+        principal: "tester".into(),
+        role: security::Role::Admin,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&tester_grant).unwrap();
+    svc.security.add_grant(&tester_grant);
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "notify-orders".into(),
+            name: "orders".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: "notify-orders-obj".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-alice",
+            "alice",
+            "quality",
+            "notify-orders",
+        ))
+        .unwrap();
+    let quality_object = crate::chisei::data_quality::dataset_object_id("quality", "notify-orders");
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: quality_object.clone(),
+            kind: "dataset".into(),
+            name: "notify-orders".into(),
+            namespace: "quality".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let quality_owner = security::Grant {
+        id: "quality-tester-read".into(),
+        object_id: quality_object.clone(),
+        principal: "tester".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&quality_owner).unwrap();
+    svc.security.add_grant(&quality_owner);
+    let event_id = crate::sekai::consumer_violation::quality_event_id("result-1");
+    svc.db
+        .runtime()
+        .emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+            kind: crate::sekai::consumer_violation::KIND_QUALITY,
+            namespace: "quality",
+            member_id: "notify-orders",
+            event_id: &event_id,
+            rule_id: "orders-count",
+            evidence: "sha256:quality-receipt",
+            now_ms: 40,
+        })
+        .unwrap();
+
+    let hidden = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(hidden.notifications.len(), 1);
+    assert!(
+        hidden.notifications[0].evidence.is_empty(),
+        "runtime dataset ACL must not disclose quality evidence"
+    );
+
+    let quality_grant = security::Grant {
+        id: "quality-alice-read".into(),
+        object_id: quality_object,
+        principal: "alice".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&quality_grant).unwrap();
+    svc.security.add_grant(&quality_grant);
+    let shown = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(shown.notifications[0].evidence, "sha256:quality-receipt");
+}
+
+#[tokio::test]
+async fn consumer_violation_list_page_token_omits_tenant_filtered_events() {
+    let svc = enterprise_service();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-allowed-new",
+            "subject-a",
+            "allowed",
+            "ds-allowed-new",
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-allowed-old",
+            "subject-a",
+            "allowed",
+            "ds-allowed-old",
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-denied",
+            "subject-a",
+            "denied",
+            "ds-denied",
+        ))
+        .unwrap();
+    let hidden = crate::sekai::consumer_violation::quality_event_id("hidden");
+    let visible_new = crate::sekai::consumer_violation::quality_event_id("visible-new");
+    let visible_old = crate::sekai::consumer_violation::quality_event_id("visible-old");
+    svc.db
+        .runtime()
+        .emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+            kind: crate::sekai::consumer_violation::KIND_QUALITY,
+            namespace: "denied",
+            member_id: "ds-denied",
+            event_id: &hidden,
+            rule_id: "hidden-rule",
+            evidence: "hidden-evidence",
+            now_ms: 30,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+            kind: crate::sekai::consumer_violation::KIND_QUALITY,
+            namespace: "allowed",
+            member_id: "ds-allowed-new",
+            event_id: &visible_new,
+            rule_id: "visible-new-rule",
+            evidence: "visible-new-evidence",
+            now_ms: 20,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+            kind: crate::sekai::consumer_violation::KIND_QUALITY,
+            namespace: "allowed",
+            member_id: "ds-allowed-old",
+            event_id: &visible_old,
+            rule_id: "visible-old-rule",
+            evidence: "visible-old-evidence",
+            now_ms: 10,
+        })
+        .unwrap();
+
+    let first = svc
+        .list_consumer_violation_notifications(with_tenant_context(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 1,
+                include_acknowledged: false,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.notifications.len(), 1);
+    assert_eq!(first.notifications[0].event_id, visible_new);
+    assert_eq!(first.notifications[0].namespace, "allowed");
+    assert!(
+        !first.next_page_token.is_empty(),
+        "a later visible delivery must remain reachable"
+    );
+    assert!(
+        !first.next_page_token.contains(&hidden),
+        "a page token must not encode a tenant-filtered event"
+    );
+
+    let second = svc
+        .list_consumer_violation_notifications(with_tenant_context(
+            ListConsumerViolationNotificationsRequest {
+                page_token: first.next_page_token,
+                page_size: 1,
+                include_acknowledged: false,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.notifications.len(), 1);
+    assert_eq!(second.notifications[0].event_id, visible_old);
+    assert_eq!(second.notifications[0].namespace, "allowed");
+    assert!(second.next_page_token.is_empty());
+    assert!(!second.next_page_token.contains(&hidden));
+}
+
 #[tokio::test]
 async fn update_dataset_requires_write_access_to_existing_binding() {
     let svc = service();

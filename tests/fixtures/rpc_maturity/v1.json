@@ -1573,6 +1573,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ListConsumerViolationNotifications",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "AcknowledgeConsumerViolationNotification",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "CreateVirtualTable",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

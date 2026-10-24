@@ -2135,6 +2135,33 @@ message DatasetAlert {
 }
 message ListDatasetAlertsRequest { string dataset_id = 1; }
 message ListDatasetAlertsResponse { repeated DatasetAlert alerts = 1; }
+// Caller-scoped deliveries for freshness (#1411) and quality (#681) violations
+// written at commit for bound consumers (#1636). Evidence is stored in full
+// and stripped at read when the caller cannot read the dataset.
+message ConsumerViolationNotification {
+  string event_id = 1;
+  string kind = 2;
+  string namespace = 3;
+  string member_kind = 4;
+  string member_id = 5;
+  string rule_id = 6;
+  string evidence = 7;
+  int64 created_at_ms = 8;
+  int64 acknowledged_at_ms = 9;
+}
+message ListConsumerViolationNotificationsRequest {
+  string page_token = 1;
+  int32 page_size = 2;
+  bool include_acknowledged = 3;
+}
+message ListConsumerViolationNotificationsResponse {
+  repeated ConsumerViolationNotification notifications = 1;
+  string next_page_token = 2;
+}
+message AcknowledgeConsumerViolationNotificationRequest { string event_id = 1; }
+message AcknowledgeConsumerViolationNotificationResponse {
+  ConsumerViolationNotification notification = 1;
+}
 
 message CreateVirtualTableRequest { VirtualTable table = 1; }
 message CreateVirtualTableResponse { VirtualTable table = 1; }
@@ -4620,6 +4647,8 @@ service SekaiService {
   rpc ListDatasetHealthResults(ListDatasetHealthResultsRequest) returns (ListDatasetHealthResultsResponse);
   rpc RunDatasetHealthChecks(RunDatasetHealthChecksRequest) returns (RunDatasetHealthChecksResponse);
   rpc ListDatasetAlerts(ListDatasetAlertsRequest) returns (ListDatasetAlertsResponse);
+  rpc ListConsumerViolationNotifications(ListConsumerViolationNotificationsRequest) returns (ListConsumerViolationNotificationsResponse);
+  rpc AcknowledgeConsumerViolationNotification(AcknowledgeConsumerViolationNotificationRequest) returns (AcknowledgeConsumerViolationNotificationResponse);
   rpc CreateVirtualTable(CreateVirtualTableRequest) returns (CreateVirtualTableResponse);
   rpc ListVirtualTables(ListVirtualTablesRequest) returns (ListVirtualTablesResponse);
 

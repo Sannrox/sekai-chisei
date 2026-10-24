@@ -70,6 +70,7 @@ pub mod postgres_capability_package;
 pub mod postgres_chisei_reservation;
 pub mod postgres_client_package;
 pub mod postgres_connector_certification;
+pub mod postgres_consumer_violation;
 pub mod postgres_coordination;
 pub mod postgres_dataset;
 pub mod postgres_dataset_branch;

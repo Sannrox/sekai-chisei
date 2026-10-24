@@ -5743,6 +5743,63 @@ impl RuntimeDb {
         }
     }
 
+    pub fn emit_consumer_violation(
+        &self,
+        emit: &crate::sekai::consumer_violation::EmitViolation<'_>,
+    ) -> Result<usize, String> {
+        match self {
+            Self::Sqlite(db) => db.emit_consumer_violation(emit),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.emit_consumer_violation(emit))
+            }
+        }
+    }
+
+    pub fn list_consumer_violation_deliveries(
+        &self,
+        query: &crate::sekai::consumer_violation::ListViolationDeliveries,
+    ) -> Result<
+        (
+            Vec<crate::sekai::consumer_violation::ViolationDelivery>,
+            String,
+        ),
+        String,
+    > {
+        match self {
+            Self::Sqlite(db) => db.list_consumer_violation_deliveries(query),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_consumer_violation_deliveries(query))
+            }
+        }
+    }
+
+    pub fn get_consumer_violation_delivery(
+        &self,
+        recipients: &[String],
+        event_id: &str,
+    ) -> Result<Option<crate::sekai::consumer_violation::ViolationDelivery>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_consumer_violation_delivery(recipients, event_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_consumer_violation_delivery(recipients, event_id)
+            }),
+        }
+    }
+
+    pub fn acknowledge_consumer_violation(
+        &self,
+        recipients: &[String],
+        event_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<crate::sekai::consumer_violation::ViolationDelivery>, String> {
+        match self {
+            Self::Sqlite(db) => db.acknowledge_consumer_violation(recipients, event_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.acknowledge_consumer_violation(recipients, event_id, now_ms)
+            }),
+        }
+    }
+
     pub fn reconcile_missing_execution_evidence(
         &self,
         now_ms: i64,

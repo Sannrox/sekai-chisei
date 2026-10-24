@@ -894,6 +894,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListDatasetHealthResults"
             | "RunDatasetHealthChecks"
             | "ListDatasetAlerts"
+            | "ListConsumerViolationNotifications"
+            | "AcknowledgeConsumerViolationNotification"
             | "DescribeObjectAction"
             // Admitted for tenant assertions (#1777); each handler authorizes
             // the request's namespace against the assertion's tenant.

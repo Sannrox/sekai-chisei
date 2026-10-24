@@ -27,6 +27,7 @@ pub use sekai_types::classification_lattice;
 pub mod client_package;
 pub mod compute;
 pub mod connector_certification;
+pub mod consumer_violation;
 pub mod coordination;
 pub mod credentials;
 pub mod data_export;
