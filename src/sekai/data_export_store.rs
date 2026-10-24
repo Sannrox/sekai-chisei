@@ -13,6 +13,7 @@
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::data_export::ExportGrant;
+use crate::sekai::export_fingerprint::{ExportFingerprintPolicy, ExportFingerprintRecord};
 
 const CREATE_SQLITE: &str = "
 CREATE TABLE IF NOT EXISTS sekai_export_grants (
@@ -50,6 +51,19 @@ CREATE TABLE IF NOT EXISTS sekai_export_artifact_chunks (
     data BLOB NOT NULL,
     PRIMARY KEY (receipt_id, seq)
 );
+CREATE TABLE IF NOT EXISTS sekai_export_fingerprint_policies (
+    namespace TEXT NOT NULL,
+    marking TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    PRIMARY KEY (namespace, marking)
+);
+CREATE TABLE IF NOT EXISTS sekai_export_fingerprints (
+    operation_id TEXT PRIMARY KEY,
+    namespace TEXT NOT NULL,
+    record_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sekai_export_fingerprints_namespace
+    ON sekai_export_fingerprints (namespace);
 ";
 
 /// One dataset version row with its row id.
@@ -291,6 +305,94 @@ impl SekaiDb {
         })
         .collect()
     }
+
+    pub fn put_export_fingerprint_policy(
+        &self,
+        policy: &ExportFingerprintPolicy,
+    ) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_export_fingerprint_policies (namespace, marking, record_json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (namespace, marking) DO UPDATE SET record_json = excluded.record_json",
+                rusqlite::params![policy.namespace, policy.marking, encode_json(policy)?],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn get_export_fingerprint_policy(
+        &self,
+        namespace: &str,
+        marking: &str,
+    ) -> Result<Option<ExportFingerprintPolicy>, String> {
+        use rusqlite::OptionalExtension;
+        self.conn()
+            .query_row(
+                "SELECT record_json FROM sekai_export_fingerprint_policies
+                 WHERE namespace = ?1 AND marking = ?2",
+                rusqlite::params![namespace, marking],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|json| decode_json(&json))
+            .transpose()
+    }
+
+    pub fn list_export_fingerprint_policies(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExportFingerprintPolicy>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT record_json FROM sekai_export_fingerprint_policies WHERE namespace = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params![namespace], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| decode_json(&row.map_err(|error| error.to_string())?))
+            .collect()
+    }
+
+    pub fn put_export_fingerprint(&self, record: &ExportFingerprintRecord) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_export_fingerprints (operation_id, namespace, record_json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (operation_id) DO UPDATE SET
+                    namespace = excluded.namespace,
+                    record_json = excluded.record_json",
+                rusqlite::params![record.operation_id, record.namespace, encode_json(record)?],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_export_fingerprints(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExportFingerprintRecord>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare("SELECT record_json FROM sekai_export_fingerprints WHERE namespace = ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params![namespace], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| decode_json(&row.map_err(|error| error.to_string())?))
+            .collect()
+    }
+}
+
+fn encode_json<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| error.to_string())
+}
+
+fn decode_json<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
+    serde_json::from_str(json).map_err(|error| format!("corrupt export fingerprint: {error}"))
 }
 
 impl PostgresDb {
@@ -491,6 +593,85 @@ impl PostgresDb {
             })
             .collect()
     }
+
+    pub fn put_export_fingerprint_policy(
+        &self,
+        policy: &ExportFingerprintPolicy,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_export_fingerprint_policies (namespace, marking, record_json)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (namespace, marking) DO UPDATE SET record_json = EXCLUDED.record_json",
+                &[&policy.namespace, &policy.marking, &encode_json(policy)?],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn get_export_fingerprint_policy(
+        &self,
+        namespace: &str,
+        marking: &str,
+    ) -> Result<Option<ExportFingerprintPolicy>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT record_json FROM sekai_export_fingerprint_policies
+                 WHERE namespace = $1 AND marking = $2",
+                &[&namespace, &marking],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| decode_json(row.get(0)))
+            .transpose()
+    }
+
+    pub fn list_export_fingerprint_policies(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExportFingerprintPolicy>, String> {
+        self.connection()?
+            .query(
+                "SELECT record_json FROM sekai_export_fingerprint_policies WHERE namespace = $1",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| decode_json(row.get(0)))
+            .collect()
+    }
+
+    pub fn put_export_fingerprint(&self, record: &ExportFingerprintRecord) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_export_fingerprints (operation_id, namespace, record_json)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (operation_id) DO UPDATE SET
+                    namespace = EXCLUDED.namespace,
+                    record_json = EXCLUDED.record_json",
+                &[
+                    &record.operation_id,
+                    &record.namespace,
+                    &encode_json(record)?,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_export_fingerprints(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExportFingerprintRecord>, String> {
+        self.connection()?
+            .query(
+                "SELECT record_json FROM sekai_export_fingerprints WHERE namespace = $1",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| decode_json(row.get(0)))
+            .collect()
+    }
 }
 
 /// Dispatches to the backend the plane runs on; PostgreSQL off the async
@@ -619,5 +800,38 @@ impl crate::db::runtime_db::RuntimeDb {
         limit: usize,
     ) -> Result<Vec<VersionRow>, String> {
         dispatch!(self, db => db.dataset_version_rows_after(dataset_id, version_id, after_row_id, limit))
+    }
+
+    pub fn put_export_fingerprint_policy(
+        &self,
+        policy: &ExportFingerprintPolicy,
+    ) -> Result<(), String> {
+        dispatch!(self, db => db.put_export_fingerprint_policy(policy))
+    }
+
+    pub fn get_export_fingerprint_policy(
+        &self,
+        namespace: &str,
+        marking: &str,
+    ) -> Result<Option<ExportFingerprintPolicy>, String> {
+        dispatch!(self, db => db.get_export_fingerprint_policy(namespace, marking))
+    }
+
+    pub fn list_export_fingerprint_policies(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExportFingerprintPolicy>, String> {
+        dispatch!(self, db => db.list_export_fingerprint_policies(namespace))
+    }
+
+    pub fn put_export_fingerprint(&self, record: &ExportFingerprintRecord) -> Result<(), String> {
+        dispatch!(self, db => db.put_export_fingerprint(record))
+    }
+
+    pub fn list_export_fingerprints(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExportFingerprintRecord>, String> {
+        dispatch!(self, db => db.list_export_fingerprints(namespace))
     }
 }

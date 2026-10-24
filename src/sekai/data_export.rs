@@ -351,6 +351,16 @@ impl RowEncoder {
         })
     }
 
+    /// Selected columns, in export order.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// Whether the encoder leads with an object id column.
+    pub fn id_column(&self) -> bool {
+        self.id_column
+    }
+
     /// Bytes before the first row.
     pub fn header(&self) -> Vec<u8> {
         match self.format {
@@ -421,6 +431,11 @@ pub struct ExportSource {
     pub columns: Vec<String>,
     /// The principal whose export grant allowed the export.
     pub granted_via: String,
+    /// Properties listed on a fingerprint policy for this namespace; empty
+    /// when fingerprinting is off.
+    pub fingerprint_properties: Vec<String>,
+    /// Row-group size of a fingerprinted export; 0 when off.
+    pub fingerprint_group_size: u32,
 }
 
 /// The receipt of one export. It is written when the export begins, before
@@ -565,14 +580,27 @@ impl ExportReceipt {
                 ReceiptEventKind::IntentRecorded,
                 actor,
                 now_ms,
-                BTreeMap::from([
-                    ("source_kind".into(), source.source_kind.into()),
-                    ("source_id".into(), source.source_id.clone()),
-                    ("source_version".into(), source.source_version.clone()),
-                    ("format".into(), source.format.as_str().into()),
-                    ("properties".into(), source.columns.join(",")),
-                    ("granted_via".into(), source.granted_via.clone()),
-                ]),
+                {
+                    let mut attributes = BTreeMap::from([
+                        ("source_kind".into(), source.source_kind.into()),
+                        ("source_id".into(), source.source_id.clone()),
+                        ("source_version".into(), source.source_version.clone()),
+                        ("format".into(), source.format.as_str().into()),
+                        ("properties".into(), source.columns.join(",")),
+                        ("granted_via".into(), source.granted_via.clone()),
+                    ]);
+                    if !source.fingerprint_properties.is_empty() {
+                        attributes.insert(
+                            "fingerprint_properties".into(),
+                            source.fingerprint_properties.join(","),
+                        );
+                        attributes.insert(
+                            "fingerprint_group_size".into(),
+                            source.fingerprint_group_size.to_string(),
+                        );
+                    }
+                    attributes
+                },
             )],
             uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
@@ -938,6 +966,8 @@ mod tests {
             format: ExportFormat::Csv,
             columns: Vec::new(),
             granted_via: "alice".into(),
+            fingerprint_properties: Vec::new(),
+            fingerprint_group_size: 0,
         };
         let receipt = ExportReceipt::begin(db.clone(), "alice", &source, now_ms()).unwrap();
         let id = receipt.operation_id().to_string();
@@ -981,6 +1011,8 @@ mod tests {
             format: ExportFormat::JsonLines,
             columns: Vec::new(),
             granted_via: "alice".into(),
+            fingerprint_properties: Vec::new(),
+            fingerprint_group_size: 0,
         };
         let now = now_ms();
         let done = ExportReceipt::begin(db.clone(), "alice", &source, now).unwrap();
@@ -1018,6 +1050,8 @@ mod tests {
             format: ExportFormat::Csv,
             columns: vec!["title".into()],
             granted_via: "alice".into(),
+            fingerprint_properties: Vec::new(),
+            fingerprint_group_size: 0,
         };
         let mut lost = ExportReceipt::begin(db.clone(), "alice", &source, 1_000).unwrap();
         let id = lost.operation_id().to_string();

@@ -17918,8 +17918,9 @@ fn guest_access_needs_explicit_extension_opt_in() {
     shared.sort_unstable();
     assert_eq!(shared, ["allowed", "allowed", "denied"]);
     assert_eq!(outcome("allowed"), ["denied"]);
-    assert!(decisions.iter().any(|decision| decision.evidence["space"] == "space-a"
-        && decision.outcome == "denied"));
+    assert!(decisions
+        .iter()
+        .any(|decision| decision.evidence["space"] == "space-a" && decision.outcome == "denied"));
     assert!(
         decisions
             .iter()
@@ -29753,6 +29754,286 @@ async fn an_export_needs_its_grant_and_streams_only_what_a_read_shows() {
         .err()
         .unwrap();
     assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
+}
+
+async fn collect_export(
+    svc: &SekaiServiceImpl,
+    request: ExportObjectSetRequest,
+    principal: &str,
+) -> (String, String) {
+    use futures_util::StreamExt;
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .export_object_set(with_named_principal(request, principal))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let receipt_id = chunks[0].receipt_id.clone();
+    let data =
+        String::from_utf8(chunks.iter().flat_map(|chunk| chunk.data.clone()).collect()).unwrap();
+    (receipt_id, data)
+}
+
+fn tenth_sample(csv: &str) -> Vec<u8> {
+    let mut lines = csv.lines();
+    let header = lines.next().expect("csv header");
+    let rows: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+    let take = (rows.len() / 10).max(8);
+    let mut sample = String::from(header);
+    sample.push('\n');
+    for line in rows.into_iter().take(take) {
+        sample.push_str(line);
+        sample.push('\n');
+    }
+    sample.into_bytes()
+}
+
+#[tokio::test]
+async fn watermarked_exports_fingerprint_marked_decimals_and_trace_from_a_sample() {
+    use crate::sekai::audit;
+    use crate::sekai::markings;
+    use std::collections::BTreeMap;
+    let svc = service();
+    let ns = format!(
+        "wm-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    seed_definition_parent(&svc, &ns);
+    let db = svc.db.runtime();
+    for actor in ["alice", "bob"] {
+        let profile_id = format!("principal-{actor}-{ns}");
+        db.create_object(&crate::domain::Object {
+            id: profile_id.clone(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: actor.into(),
+            namespace: ns.clone(),
+            external_id: markings::principal_profile_external_id(actor),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "internal".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        grant_object_role(&svc, &profile_id, "root", security::Role::Admin);
+    }
+    for n in 0..80 {
+        db.create_object(&crate::domain::Object {
+            id: format!("w-{n:05}"),
+            kind: "Ticket".into(),
+            name: format!("w-{n:05}"),
+            namespace: ns.clone(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("title".into(), format!("row-{n}")),
+                ("temperature".into(), format!("{}.50", 10 + n)),
+                ("secret".into(), format!("s{n}")),
+                (
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "internal".into(),
+                ),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    }
+    let ticket_policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: ns.clone(),
+        kind: "Ticket".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![
+            crate::sekai::object_security::PropertyGrant {
+                property: "title".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            },
+            crate::sekai::object_security::PropertyGrant {
+                property: "temperature".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            },
+        ]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let profile_policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: ns.clone(),
+        kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: None,
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let ticket_revision = db
+        .put_object_security_policy(&ticket_policy, "root", "put-wm", 1)
+        .unwrap();
+    let profile_revision = db
+        .put_object_security_policy(&profile_policy, "root", "put-wm-profile", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        &ns,
+        &BTreeMap::from([
+            ("Ticket".into(), ticket_revision.revision_digest),
+            (
+                markings::PRINCIPAL_PROFILE_KIND.into(),
+                profile_revision.revision_digest,
+            ),
+        ]),
+        "root",
+        "activate-wm",
+        2,
+    )
+    .unwrap();
+    let digest = published_digest(&svc, &ns).await;
+    let request = ExportObjectSetRequest {
+        descriptor: Some(ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: ns.clone(),
+            kind: "Ticket".into(),
+            definition_digest: digest,
+            ..Default::default()
+        }),
+        properties: vec!["title".into(), "temperature".into()],
+        format: "csv".into(),
+    };
+    for principal in ["alice", "bob"] {
+        svc.grant_namespace_export(with_named_principal(
+            GrantNamespaceExportRequest {
+                namespace: ns.clone(),
+                principal: principal.into(),
+                reason: "watermark audit".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    let (_, alice_plain) = collect_export(&svc, request.clone(), "alice").await;
+    let (_, bob_plain) = collect_export(&svc, request.clone(), "bob").await;
+    assert_eq!(alice_plain, bob_plain);
+    assert!(alice_plain.contains("row-0"));
+    assert!(alice_plain.contains("10.50"));
+
+    svc.put_export_fingerprint_policy(with_named_principal(
+        PutExportFingerprintPolicyRequest {
+            policy: Some(ExportFingerprintPolicy {
+                namespace: ns.clone(),
+                marking: "internal".into(),
+                fingerprint_properties: vec!["temperature".into()],
+                ..Default::default()
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let loaded = svc
+        .get_export_fingerprint_policy(with_named_principal(
+            GetExportFingerprintPolicyRequest {
+                namespace: ns.clone(),
+                marking: "internal".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .policy
+        .unwrap();
+    assert_eq!(loaded.fingerprint_properties, ["temperature"]);
+
+    let (alice_id, alice_marked) = collect_export(&svc, request.clone(), "alice").await;
+    let (bob_id, bob_marked) = collect_export(&svc, request, "bob").await;
+    assert_ne!(alice_marked, bob_marked);
+    for line in alice_marked.lines().skip(1).filter(|line| !line.is_empty()) {
+        let mut fields = line.split(',');
+        let _id = fields.next().unwrap();
+        let title = fields.next().unwrap();
+        assert!(title.starts_with("row-"), "{line}");
+        let temperature = fields.next().unwrap();
+        assert!(
+            temperature.contains('.'),
+            "temperature stays a decimal: {line}"
+        );
+    }
+
+    let alice_trace = svc
+        .trace_export(with_named_principal(
+            TraceExportRequest {
+                namespace: ns.clone(),
+                sample: tenth_sample(&alice_marked),
+                format: "csv".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(alice_trace.matches.len(), 1, "{alice_trace:?}");
+    assert_eq!(alice_trace.matches[0].receipt_id, alice_id);
+    assert_eq!(alice_trace.matches[0].score, 1.0);
+
+    let bob_trace = svc
+        .trace_export(with_named_principal(
+            TraceExportRequest {
+                namespace: ns.clone(),
+                sample: tenth_sample(&bob_marked),
+                format: "csv".into(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(bob_trace.matches[0].receipt_id, bob_id);
+
+    let denied = svc
+        .trace_export(with_named_principal(
+            TraceExportRequest {
+                namespace: ns.clone(),
+                sample: tenth_sample(&alice_marked),
+                format: "csv".into(),
+            },
+            "carol",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+    let decisions = db
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("trace_export".into()),
+            target_id: Some(ns.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.actor == "alice" && decision.outcome == "completed")
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.actor == "carol" && decision.outcome == "denied")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

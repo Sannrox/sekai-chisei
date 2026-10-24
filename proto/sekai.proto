@@ -665,6 +665,42 @@ message GetExportReceiptResponse {
   // The full receipt (`sekai.governed-export/v1`), JSON.
   string receipt_json = 9;
 }
+// Fingerprinting for one marking in one namespace (#1466). An empty
+// fingerprint_properties list is off.
+message ExportFingerprintPolicy {
+  string namespace = 1;
+  string marking = 2;
+  repeated string fingerprint_properties = 3;
+  string updated_by = 4;
+  int64 updated_at_ms = 5;
+}
+message PutExportFingerprintPolicyRequest {
+  ExportFingerprintPolicy policy = 1;
+}
+message PutExportFingerprintPolicyResponse {
+  ExportFingerprintPolicy policy = 1;
+}
+message GetExportFingerprintPolicyRequest {
+  string namespace = 1;
+  string marking = 2;
+}
+message GetExportFingerprintPolicyResponse {
+  ExportFingerprintPolicy policy = 1;
+}
+// Scores a leaked fragment against fingerprinted exports in a namespace.
+message TraceExportRequest {
+  string namespace = 1;
+  bytes sample = 2;
+  // csv | jsonl
+  string format = 3;
+}
+message TraceExportMatch {
+  string receipt_id = 1;
+  double score = 2;
+}
+message TraceExportResponse {
+  repeated TraceExportMatch matches = 1;
+}
 message ExportObjectSetChunk {
   string receipt_id = 1;
   bytes data = 2;
@@ -4373,6 +4409,9 @@ service SekaiService {
   rpc RevokeNamespaceExport(RevokeNamespaceExportRequest) returns (RevokeNamespaceExportResponse);
   rpc ExportObjectSet(ExportObjectSetRequest) returns (stream ExportObjectSetChunk);
   rpc GetExportReceipt(GetExportReceiptRequest) returns (GetExportReceiptResponse);
+  rpc PutExportFingerprintPolicy(PutExportFingerprintPolicyRequest) returns (PutExportFingerprintPolicyResponse);
+  rpc GetExportFingerprintPolicy(GetExportFingerprintPolicyRequest) returns (GetExportFingerprintPolicyResponse);
+  rpc TraceExport(TraceExportRequest) returns (TraceExportResponse);
   rpc PutExportDefinition(PutExportDefinitionRequest) returns (PutExportDefinitionResponse);
   rpc GetExportDefinition(GetExportDefinitionRequest) returns (GetExportDefinitionResponse);
   rpc DeleteExportDefinition(DeleteExportDefinitionRequest) returns (DeleteExportDefinitionResponse);
