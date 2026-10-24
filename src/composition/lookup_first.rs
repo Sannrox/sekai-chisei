@@ -999,9 +999,6 @@ fn lookup_ontology_snapshot(
     if query.reasoning_mode != ReasoningMode::Entailment {
         return Ok((None, 0, false));
     }
-    if db.runtime().backend_name() == "postgres" {
-        return Err(RetrievalLookupError::Refusal("backend_unsupported"));
-    }
     let deadline = started + lookup_reasoning_timeout(query.max_time_ms);
     let source_limit = if query.max_source_rows == 0 {
         retrieval::DEFAULT_MAX_SOURCE_ROWS

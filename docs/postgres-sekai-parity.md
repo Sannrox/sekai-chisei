@@ -77,8 +77,9 @@ I/O and partitioned write-back share the same envelope
 ([ADR 0105](decisions/0105-partitioned-transform-io.md), #1388). Normal CI
 runs SQLite; PostgreSQL conformance remains an ignored isolated-database
 test behind `SEKAI_TEST_POSTGRES_URL`. Dataset row `append_rows` /
-`query_rows` through the community `RuntimeDb` dispatcher stay SQLite-only;
-the transform path uses each backend's native dataset-row APIs.
+`query_rows` through the community `RuntimeDb` dispatcher run on both
+backends (#1320), with shared conformance for order, filters, projection,
+paging and empty appends.
 
 The reusable `sekai.connector-certification/v1` admin projection shares
 certify, get, verify, revoke, and supersession identities across SQLite and
@@ -104,8 +105,8 @@ shrink-only list
 [`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
 Execution-evidence reject and record helpers used by evidence admission stay
 SQLite-only until #1318 (`SekaiService.SubmitEvidence` on that list).
-Query-time ontology entailment stays backend-scoped on `RetrieveContext` /
-`ExpandRelations` (asserted-only on PostgreSQL; see
+Query-time ontology entailment on `RetrieveContext` / `ExpandRelations` runs
+on PostgreSQL too (#1320), with a shared case asserting the same results; see
 [rpc-maturity.md](rpc-maturity.md),
 [ADR 0001](decisions/0001-query-time-ontology-entailment.md), and
 [capability catalog](capability-catalog.md)).

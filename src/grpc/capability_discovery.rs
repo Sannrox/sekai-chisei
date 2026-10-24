@@ -46,12 +46,8 @@ impl SekaiServiceImpl {
         entries.push(evaluate_object_set_capability());
         entries.push(object_change_subscription_capability());
         entries.push(traverse_capability());
-        // Query-time entailment runs only on the SQLite runtime; PostgreSQL
-        // serves the asserted-only mode and says so (#1149).
-        let entailment = matches!(
-            self.db.runtime(),
-            crate::db::runtime_db::RuntimeDb::Sqlite(_)
-        );
+        // Query-time entailment runs on both community runtimes (#1320).
+        let entailment = true;
         entries.push(expand_relations_capability(entailment));
         entries.push(retrieve_context_capability(entailment));
         entries.push(explain_derivation_capability(entailment));
@@ -706,7 +702,7 @@ fn epistemic_projection_limits() -> [CapabilityLimit; 6] {
         },
         CapabilityLimit {
             name: "backend_postgres_entailment".into(),
-            value: 0,
+            value: 1,
         },
     ]
 }

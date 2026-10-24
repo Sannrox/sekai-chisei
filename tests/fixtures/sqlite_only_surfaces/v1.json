@@ -1,18 +1,8 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 13,
+  "limit": 11,
   "surfaces": [
-    {
-      "id": "SekaiService.AppendRows",
-      "kind": "rpc",
-      "methods": ["append_rows"]
-    },
-    {
-      "id": "SekaiService.QueryRows",
-      "kind": "rpc",
-      "methods": ["query_rows"]
-    },
     {
       "id": "SekaiService.DeleteOntologyClass",
       "kind": "rpc",

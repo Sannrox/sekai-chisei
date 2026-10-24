@@ -2454,8 +2454,8 @@ impl RuntimeDb {
     ) -> Result<i32, String> {
         match self {
             Self::Sqlite(db) => db.append_rows(dataset_id, rows),
-            Self::Postgres(_) => {
-                Err("append_rows is unavailable on the PostgreSQL community runtime".into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.append_dataset_rows(dataset_id, rows))
             }
         }
     }
@@ -5368,10 +5368,9 @@ impl RuntimeDb {
     ) -> Result<Vec<OntologyClass>, String> {
         match self {
             Self::Sqlite(db) => db.list_readable_ontology_classes(principals, deadline, limit),
-            Self::Postgres(_) => Err(
-                "list_readable_ontology_classes is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_readable_ontology_classes(principals, deadline, limit)
+            }),
         }
     }
 
@@ -5383,7 +5382,9 @@ impl RuntimeDb {
     ) -> Result<Vec<OntologyRelation>, String> {
         match self {
             Self::Sqlite(db) => db.list_readable_ontology_relations(principals, deadline, limit),
-            Self::Postgres(_) => Err("list_readable_ontology_relations is unavailable on the PostgreSQL community runtime".into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_readable_ontology_relations(principals, deadline, limit)
+            }),
         }
     }
 
@@ -5661,8 +5662,8 @@ impl RuntimeDb {
     ) -> Result<Vec<HashMap<String, String>>, String> {
         match self {
             Self::Sqlite(db) => db.query_rows(dataset_id, q),
-            Self::Postgres(_) => {
-                Err("query_rows is unavailable on the PostgreSQL community runtime".into())
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.query_dataset_rows(dataset_id, q))
             }
         }
     }

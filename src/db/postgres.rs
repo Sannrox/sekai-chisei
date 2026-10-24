@@ -1188,6 +1188,20 @@ impl PostgresDb {
         let _ = self.plane.set(plane);
     }
 
+    /// A connection checked out within `deadline`; the wait counts against it.
+    pub(crate) fn connection_by(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<PooledConnection<Manager>, String> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("acquire PostgreSQL connection: deadline exceeded".into());
+        }
+        self.pool
+            .get_timeout(remaining)
+            .map_err(|error| format!("acquire PostgreSQL connection: {error}"))
+    }
+
     pub(crate) fn connection(&self) -> Result<PooledConnection<Manager>, String> {
         use crate::obs::labels::{Outcome, PoolPlane};
         let started = std::time::Instant::now();

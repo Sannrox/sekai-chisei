@@ -50,7 +50,7 @@ namespace-specific expansion and explanation projection, and protocol metadata.
 Computed-property response helpers are shared private implementation with
 authorized query and object mutation. Discoverable capability helpers are
 shared private implementation with authorized query and catalog discovery.
-PostgreSQL community retrieval remains asserted-only.
+PostgreSQL community retrieval serves entailment too (#1320).
 
 ## Authorized query
 
