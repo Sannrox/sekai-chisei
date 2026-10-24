@@ -1114,6 +1114,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "GetCatalogEntryLineage",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "BeginMediaUpload",
       "storage_path": "sekai.graph",
       "real_backend": "yes",

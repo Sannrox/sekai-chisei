@@ -1610,7 +1610,7 @@ message GetOntologyChangelogResponse {
 // kind `catalog_entry`, read and searched under the ordinary read policy.
 message RegisterCatalogEntryRequest {
   string namespace = 1;
-  // dataset | object_type | pipeline
+  // dataset | object_type | pipeline | source
   string entry_kind = 2;
   string source_system = 3;
   string source_id = 4;
@@ -1623,12 +1623,40 @@ message RegisterCatalogEntryRequest {
   string schema_summary = 11;
   int64 freshness_ms = 12;
   bool deprecated = 13;
+  // Optional. Exactly one typed core binding; omitted entries have no lineage.
+  CatalogBinding binding = 14;
 }
 message RegisterCatalogEntryResponse {
   // Empty when the caller may write the entry but not read it.
   Object entry = 1;
   // False when the stored entry already said exactly this.
   bool changed = 2;
+}
+// Core artifact an entry binds to. kind is dataset | object_type | transform | source.
+message CatalogBinding {
+  string kind = 1;
+  string target_id = 2;
+  // Required when kind is source.
+  string source_type_descriptor_id = 3;
+}
+message CatalogLineageNode {
+  // Empty when redacted: kind only, no id, name or marking.
+  Object entry = 1;
+  bool redacted = 2;
+  string entry_kind = 3;
+}
+message GetCatalogEntryLineageRequest {
+  string namespace = 1;
+  string entry_id = 2;
+  int32 depth = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+message GetCatalogEntryLineageResponse {
+  bool has_binding = 1;
+  repeated CatalogLineageNode upstream = 2;
+  repeated CatalogLineageNode downstream = 3;
+  string next_page_token = 4;
 }
 message ObjectPolicyAuditEvent {
   string event_id = 1;
@@ -4540,6 +4568,7 @@ service SekaiService {
   rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
   rpc RegisterCatalogEntry(RegisterCatalogEntryRequest) returns (RegisterCatalogEntryResponse);
+  rpc GetCatalogEntryLineage(GetCatalogEntryLineageRequest) returns (GetCatalogEntryLineageResponse);
   rpc CreateObjectComment(CreateObjectCommentRequest) returns (CreateObjectCommentResponse);
   rpc UpdateObjectComment(UpdateObjectCommentRequest) returns (UpdateObjectCommentResponse);
   rpc ListObjectComments(ListObjectCommentsRequest) returns (ListObjectCommentsResponse);

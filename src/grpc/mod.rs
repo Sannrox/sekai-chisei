@@ -263,6 +263,7 @@ fn is_discover_rpc(method: &str) -> bool {
             | "DescribeObjectAction"
             | "DiscoverCapabilities"
             | "Search"
+            | "GetCatalogEntryLineage"
     )
 }
 
@@ -831,6 +832,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "DryRunAgent"
             | "RunAgentShadow"
             | "GetAgentShadowReport"
+            | "GetCatalogEntryLineage"
             | "GetDefinitionBranch"
             | "CreateDefinitionBranch"
             | "ApplyDefinitionBranchEdit"
@@ -2099,6 +2101,10 @@ mod tests {
             NamespaceAction::Discover
         );
         assert_eq!(
+            rpc_namespace_action("GetCatalogEntryLineage"),
+            NamespaceAction::Discover
+        );
+        assert_eq!(
             rpc_namespace_action("ListDatasetVersions"),
             NamespaceAction::Discover
         );
@@ -2145,6 +2151,7 @@ mod tests {
         for (role, method, allowed) in [
             (SpaceRole::Discoverer, "ListSchemaTypes", true),
             (SpaceRole::Discoverer, "ListDatasets", true),
+            (SpaceRole::Discoverer, "GetCatalogEntryLineage", true),
             (SpaceRole::Discoverer, "ListDatasetVersions", true),
             (SpaceRole::Discoverer, "GetDatasetVersion", false),
             (SpaceRole::Discoverer, "RollbackDataset", false),

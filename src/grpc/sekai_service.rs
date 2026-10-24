@@ -1,5 +1,4 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
-
 #[path = "action_binding.rs"]
 mod action_binding;
 #[path = "authorized_link_mutation.rs"]
@@ -1025,6 +1024,13 @@ impl SekaiService for SekaiServiceImpl {
         catalog_rpc::register_catalog_entry(self, req).await
     }
 
+    async fn get_catalog_entry_lineage(
+        &self,
+        req: Request<GetCatalogEntryLineageRequest>,
+    ) -> Result<Response<GetCatalogEntryLineageResponse>, Status> {
+        catalog_rpc::get_catalog_entry_lineage(self, req).await
+    }
+
     async fn query_object_policy_audit(
         &self,
         req: Request<QueryObjectPolicyAuditRequest>,
@@ -1960,7 +1966,6 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<crate::grpc::pb::sekai::ListEvidenceAdaptersResponse>, Status> {
         rpc_data::list_evidence_adapters(self, req).await
     }
-
     async fn submit_evidence(
         &self,
         req: Request<SubmitEvidenceRequest>,
