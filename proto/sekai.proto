@@ -3714,6 +3714,31 @@ message DefinitionPropertyDefault {
   // Value existing objects get for a new required property.
   string value = 3;
 }
+// Ontology lint (#1454): structural findings over one namespace's published
+// definition and what the caller may see of its data. Experimental.
+message GetOntologyLintReportRequest {
+  string namespace = 1;
+}
+message OntologyLintFinding {
+  // orphan_object_type | orphan_object | unowned_object_type |
+  // unowned_link_type | broad_marking_applied | broad_marking_granted |
+  // action_type_never_run
+  string rule = 1;
+  // object_type | link_type | object | marking | action_type
+  string subject_kind = 2;
+  string subject_id = 3;
+  // warning | info
+  string severity = 4;
+  string detail = 5;
+}
+message GetOntologyLintReportResponse {
+  string revision_digest = 1;
+  // Sorted by rule, then subject.
+  repeated OntologyLintFinding findings = 2;
+  // False when the object scan was cut short (the object rules were skipped)
+  // or findings past the cap were dropped.
+  bool complete = 3;
+}
 message DefinitionPropertyRef {
   string object_type = 1;
   string property = 2;
@@ -4025,6 +4050,7 @@ service SekaiService {
   rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
+  rpc GetOntologyLintReport(GetOntologyLintReportRequest) returns (GetOntologyLintReportResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   // Experimental: apply an approved proposal's change bundle, resumably (#1693).

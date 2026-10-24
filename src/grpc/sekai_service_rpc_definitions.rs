@@ -1686,3 +1686,302 @@ fn admit_dry_run_route(
     }
     Err(DryRunFailure::RouteAdmission(REFUSAL_NOT_ENABLED.into()))
 }
+
+/// Objects the lint scans in a namespace; past this the object rules are
+/// skipped and the report is partial.
+const MAX_LINT_OBJECTS: usize = 2_000;
+/// Links read per object and direction, and neighbors authorized in all.
+const MAX_LINT_LINKS: usize = 64;
+const MAX_LINT_NEIGHBORS: usize = 2_000;
+/// Recent instances checked for one the caller may see, per Action type.
+const MAX_LINT_INSTANCES: usize = 50;
+
+/// Lints a namespace's published definition (#1454). The caller needs read
+/// on the namespace and on every published member; data the lint reads is
+/// limited to what the caller may see, so no finding names a hidden object,
+/// consumer or principal.
+pub(super) async fn get_ontology_lint_report(
+    service: &SekaiServiceImpl,
+    req: Request<GetOntologyLintReportRequest>,
+) -> Result<Response<GetOntologyLintReportResponse>, Status> {
+    use crate::sekai::ontology_lint::{LintInput, lint, profile_clearance};
+
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let policy_context = principal_policy_context(&req);
+    let purpose = request_purpose_presentation(&req, &principals);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let namespace = req.into_inner().namespace;
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &namespace,
+        false,
+    )?;
+    let db = service.db.runtime();
+    let revision = db
+        .get_published_definition_revision(&namespace)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("no published definition"))?;
+    authorize_definition_revision(
+        service,
+        &principals,
+        &namespace,
+        &revision.revision_digest,
+        true,
+    )?;
+    let members = db
+        .get_definition_members(&namespace, &revision.revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    // Up to `cap` objects of `kind` the caller may read, and whether that
+    // is all of them.
+    // Visibility filtering scans the whole matching population, so a
+    // population past the cap is not scanned at all.
+    let visible = |kind: &str, namespace: Option<&str>, cap: usize| {
+        let over_cap = !db
+            .list_objects(&domain::ListFilter {
+                kind: Some(kind.into()),
+                name: None,
+                namespace: namespace.map(String::from),
+                property_filters: Vec::new(),
+                interface_filter: Vec::new(),
+                limit: 1,
+                offset: i32::try_from(cap).unwrap_or(i32::MAX),
+                order_by: "name".into(),
+                descending: false,
+            })
+            .map_err(Status::internal)?
+            .is_empty();
+        if over_cap {
+            return Ok((Vec::new(), false));
+        }
+        let mut objects = Vec::new();
+        loop {
+            let filter = domain::ListFilter {
+                kind: Some(kind.into()),
+                name: None,
+                namespace: namespace.map(String::from),
+                property_filters: Vec::new(),
+                interface_filter: Vec::new(),
+                limit: MAX_LIST_LIMIT,
+                offset: objects.len() as i32,
+                order_by: "name".into(),
+                descending: false,
+            };
+            let (page, _) = list_objects_with_marking(
+                db,
+                &filter,
+                &principals,
+                &policy_context,
+                purpose.as_ref(),
+                tenant_context.as_ref(),
+                // Findings read properties only as a read would show them.
+                |objects, principals, tenant_context| {
+                    service.resolve_computed_for_responses_with_policy(
+                        objects,
+                        principals,
+                        Some(&policy_context),
+                        tenant_context,
+                        purpose.as_ref(),
+                    )
+                },
+            )?;
+            let last = page.len() < MAX_LIST_LIMIT as usize;
+            objects.extend(page);
+            if objects.len() > cap {
+                objects.truncate(cap);
+                return Ok::<_, Status>((objects, false));
+            }
+            if last {
+                return Ok((objects, true));
+            }
+        }
+    };
+
+    // The object rules cover instances of the published object types only.
+    let mut objects = Vec::new();
+    let mut objects_complete = true;
+    for object_type in members.iter().filter(|m| m.member_kind == "object_type") {
+        let (found, complete) = visible(
+            &object_type.member_id,
+            Some(&namespace),
+            MAX_LINT_OBJECTS.saturating_sub(objects.len()),
+        )?;
+        objects.extend(found);
+        objects_complete &= complete;
+    }
+    let ids: std::collections::BTreeSet<&str> =
+        objects.iter().map(|object| object.id.as_str()).collect();
+    // A link counts only when the caller can see its other end, an object of
+    // the namespace of any kind, read with this request's purpose. Reads are
+    // bounded per object and across neighbors; an object the bounds leave
+    // undecided makes the object rules skip, so no finding is a guess.
+    let mut neighbor_reads = 0usize;
+    let mut neighbors = std::collections::BTreeMap::<String, bool>::new();
+    let mut visible_neighbor = |id: &str| -> Result<Option<bool>, Status> {
+        if ids.contains(id) {
+            return Ok(Some(true));
+        }
+        if let Some(known) = neighbors.get(id) {
+            return Ok(Some(*known));
+        }
+        if neighbor_reads == MAX_LINT_NEIGHBORS {
+            return Ok(None);
+        }
+        neighbor_reads += 1;
+        let visible = match db
+            .get_object_with_policy_context(id, &policy_context)
+            .map_err(Status::internal)?
+        {
+            Some(neighbor) if neighbor.namespace == namespace => require_visible_object_contents(
+                db,
+                &service.security,
+                neighbor,
+                &principals,
+                tenant_context.as_ref(),
+                &format!("ontology_lint:{id}"),
+                purpose.as_ref(),
+            )
+            .is_ok(),
+            _ => false,
+        };
+        neighbors.insert(id.to_string(), visible);
+        Ok(Some(visible))
+    };
+    let mut linked = std::collections::BTreeSet::new();
+    if objects_complete {
+        'objects: for object in &objects {
+            let mut decided = true;
+            for direction in [domain::Direction::Outgoing, domain::Direction::Incoming] {
+                let links = db
+                    .get_links_limited(&object.id, "", &direction, MAX_LINT_LINKS + 1)
+                    .map_err(Status::internal)?;
+                decided &= links.len() <= MAX_LINT_LINKS;
+                for link in links.iter().take(MAX_LINT_LINKS) {
+                    let other = if link.from_id == object.id {
+                        &link.to_id
+                    } else {
+                        &link.from_id
+                    };
+                    if other == &object.id {
+                        continue;
+                    }
+                    match visible_neighbor(other)? {
+                        Some(true) => {
+                            linked.insert(object.id.clone());
+                            continue 'objects;
+                        }
+                        Some(false) => {}
+                        None => decided = false,
+                    }
+                }
+            }
+            if !decided {
+                objects_complete = false;
+                break;
+            }
+        }
+    }
+    let (bindings, bindings_complete) = visible(
+        crate::sekai::definition_consumer_impact::BINDING_KIND,
+        Some(&namespace),
+        MAX_LINT_OBJECTS,
+    )?;
+    let consumed = bindings
+        .iter()
+        .filter_map(|object| {
+            crate::sekai::definition_consumer_impact::binding_from_object(object).ok()
+        })
+        .map(|binding| (binding.member_kind, binding.member_id))
+        .collect();
+    let (entries, entries_complete) = visible(
+        crate::sekai::catalog::CATALOG_ENTRY_KIND,
+        Some(&namespace),
+        MAX_LINT_OBJECTS,
+    )?;
+    let property = |object: &domain::Object, key: &str| {
+        object
+            .properties
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let catalog_owned = entries
+        .iter()
+        .filter(|entry| {
+            property(entry, "source_system") == crate::sekai::catalog::ONTOLOGY_SOURCE
+                && property(entry, "entry_kind") == "object_type"
+                && !property(entry, "owners").is_empty()
+        })
+        .map(|entry| property(entry, "source_id"))
+        .collect();
+    // Action types the caller administers, each with whether it has an
+    // instance the caller may see, so neither the registry nor a hidden run
+    // shows through.
+    let mut action_types = std::collections::BTreeMap::new();
+    for action_type in db
+        .list_governed_action_types(&namespace, None, true)
+        .map_err(Status::internal)?
+    {
+        if action_types.contains_key(&action_type.type_id)
+            || check_action_admin(&service.security, &action_type.type_id, &principals).is_err()
+        {
+            continue;
+        }
+        let ran = db
+            .list_action_instances(
+                &namespace,
+                Some(&action_type.type_id),
+                None,
+                MAX_LINT_INSTANCES,
+            )
+            .map_err(Status::internal)?
+            .iter()
+            .any(|instance| {
+                super::rpc_actions::authorize_action_instance_visibility(
+                    service,
+                    &principals,
+                    tenant_context.as_ref(),
+                    &policy_context,
+                    instance,
+                )
+                .is_ok()
+            });
+        action_types.insert(action_type.type_id, ran);
+    }
+    let (profiles, profiles_complete) = visible(
+        crate::sekai::markings::PRINCIPAL_PROFILE_KIND,
+        None,
+        MAX_LINT_OBJECTS,
+    )?;
+    let report = lint(&LintInput {
+        members,
+        objects,
+        objects_complete,
+        linked,
+        consumed,
+        catalog_owned,
+        action_types,
+        clearances: profiles.iter().map(profile_clearance).collect(),
+    });
+    Ok(Response::new(GetOntologyLintReportResponse {
+        revision_digest: revision.revision_digest,
+        findings: report
+            .findings
+            .into_iter()
+            .map(|finding| OntologyLintFinding {
+                rule: finding.rule.into(),
+                subject_kind: finding.subject_kind.into(),
+                subject_id: finding.subject_id,
+                severity: finding.severity.into(),
+                detail: finding.detail,
+            })
+            .collect(),
+        // A capped side scan can only add findings, never hide one, but
+        // the report says it is partial.
+        complete: report.complete && bindings_complete && entries_complete && profiles_complete,
+    }))
+}

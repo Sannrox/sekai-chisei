@@ -373,6 +373,15 @@ fn classify_member_change(
     for field in &change.changed_properties {
         match field.as_str() {
             "required" | "access_marking" => {}
+            "owner" => {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Compatible,
+                    change,
+                    "changed_owner",
+                    field,
+                ));
+                classified = true;
+            }
             "name" | "mode" => {
                 reasons.push(reason(
                     DefinitionCompatibilityClass::Conditional,
@@ -409,8 +418,16 @@ fn inspect_member_constructs(member: &DefinitionMember) -> Result<(), String> {
     inspect_value_constructs(&parse_definition(&member.definition_json)?)
 }
 
-const KNOWN_DEFINITION_FIELDS: &[&str] =
-    &["access_marking", "mode", "name", "properties", "required"];
+/// `owner` names who answers for a member (ontology lint, #1454); changing
+/// it is compatible.
+const KNOWN_DEFINITION_FIELDS: &[&str] = &[
+    "access_marking",
+    "mode",
+    "name",
+    "owner",
+    "properties",
+    "required",
+];
 
 fn push_unknown_fields(
     change: &DefinitionMemberChange,
@@ -444,6 +461,7 @@ fn inspect_value_constructs(value: &Value) -> Result<(), String> {
     named_string_set(value, "properties")?;
     named_string_set(value, "required")?;
     optional_string_field(value, "access_marking")?;
+    optional_string_field(value, "owner")?;
     Ok(())
 }
 
@@ -785,6 +803,40 @@ mod tests {
         let replay =
             classify_definition_revision_compatibility(&from, &members, &to, &members).unwrap();
         assert_eq!(report, replay);
+    }
+
+    #[test]
+    fn naming_or_changing_an_owner_is_compatible() {
+        let from_members = vec![prepared("object_type", "Ticket", r#"{"name":"Ticket"}"#)];
+        let to_members = vec![prepared(
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","owner":"support"}"#,
+        )];
+        let from = revision(&from_members, "");
+        let to = revision(&to_members, "");
+        let report =
+            classify_definition_revision_compatibility(&from, &from_members, &to, &to_members)
+                .unwrap();
+        assert_eq!(report.class, "compatible");
+        assert_eq!(report.reasons[0].code, "changed_owner");
+        let numeric = DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","owner":7}"#.into(),
+            member_digest: String::new(),
+        }
+        .prepare("team-a")
+        .unwrap();
+        assert!(
+            classify_definition_revision_compatibility(
+                &from,
+                &from_members,
+                &revision(std::slice::from_ref(&numeric), ""),
+                std::slice::from_ref(&numeric),
+            )
+            .is_err()
+        );
     }
 
     #[test]

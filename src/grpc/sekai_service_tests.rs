@@ -28615,3 +28615,151 @@ async fn a_denied_plan_records_the_decision_and_runs_nothing() {
         "account"
     );
 }
+
+#[tokio::test]
+async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_sees() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "lint-a");
+    let member = |kind: &str, id: &str, json: &str| DefinitionMemberInput {
+        member_kind: kind.into(),
+        member_id: id.into(),
+        definition_json: json.into(),
+        member_digest: String::new(),
+    };
+    publish_definition_history_entry(
+        &svc,
+        "lint-a",
+        &parent.revision_digest,
+        "lint-a-1",
+        "lint-a-cs-1",
+        vec![
+            member(
+                "object_type",
+                "Ticket",
+                r#"{"name":"Ticket","owner":"support"}"#,
+            ),
+            member(
+                "object_type",
+                "User",
+                r#"{"name":"User","owner":"identity"}"#,
+            ),
+            member("object_type", "Note", r#"{"name":"Note"}"#),
+            member(
+                "link_type",
+                "AssignedTo",
+                r#"{"name":"AssignedTo","owner":"support"}"#,
+            ),
+        ],
+    )
+    .await;
+    let db = svc.db.runtime();
+    let object = |id: &str, kind: &str, marking: &str| crate::domain::Object {
+        id: id.into(),
+        kind: kind.into(),
+        name: id.into(),
+        namespace: "lint-a".into(),
+        external_id: String::new(),
+        properties: if marking.is_empty() {
+            HashMap::new()
+        } else {
+            HashMap::from([("access_marking".into(), marking.into())])
+        },
+        created: 1,
+        updated: 1,
+    };
+    for (id, kind, marking) in [
+        ("t-1", "Ticket", ""),
+        ("u-1", "User", ""),
+        ("t-2", "Ticket", ""),
+        ("t-secret", "Ticket", "restricted"),
+        // Linked only to an object of a type the definition does not publish.
+        ("t-3", "Ticket", ""),
+        ("w-1", "Widget", ""),
+    ] {
+        db.create_object(&object(id, kind, marking)).unwrap();
+    }
+    db.create_link(&crate::domain::Link {
+        id: "l-2".into(),
+        from_id: "w-1".into(),
+        to_id: "t-3".into(),
+        relation: "Uses".into(),
+        created: 1,
+    })
+    .unwrap();
+    db.put_governed_action_type(
+        crate::sekai::governed_action_type::GovernedActionType {
+            namespace: "lint-a".into(),
+            type_id: "ticket.close".into(),
+            version: "1".into(),
+            description: "Close a ticket".into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            parameter_schema_json:
+                r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.into(),
+            enabled: true,
+            ..Default::default()
+        },
+        "operator",
+        1,
+    )
+    .unwrap();
+    db.create_link(&crate::domain::Link {
+        id: "l-1".into(),
+        from_id: "t-1".into(),
+        to_id: "u-1".into(),
+        relation: "AssignedTo".into(),
+        created: 1,
+    })
+    .unwrap();
+
+    let lint = |principal: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.get_ontology_lint_report(with_named_principal(
+                GetOntologyLintReportRequest {
+                    namespace: "lint-a".into(),
+                },
+                principal,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+        }
+    };
+    let subjects = |report: &GetOntologyLintReportResponse| {
+        report
+            .findings
+            .iter()
+            .map(|finding| format!("{}:{}", finding.rule, finding.subject_id))
+            .collect::<Vec<_>>()
+    };
+    let full = lint("root").await;
+    assert!(full.complete);
+    assert_eq!(
+        subjects(&full),
+        [
+            "action_type_never_run:ticket.close",
+            "orphan_object:t-2",
+            "orphan_object:t-secret",
+            "orphan_object_type:Note",
+            "unowned_object_type:Note",
+        ]
+    );
+    // A caller not cleared for the restricted object never sees it named,
+    // and one who does not administer Actions sees nothing of them.
+    let limited = subjects(&lint("tester").await);
+    assert!(limited.contains(&"orphan_object:t-2".to_string()));
+    assert!(!limited.contains(&"orphan_object:t-secret".to_string()));
+    assert!(
+        !limited
+            .iter()
+            .any(|subject| subject.starts_with("action_type"))
+    );
+
+    let missing = svc
+        .get_ontology_lint_report(with_principal(GetOntologyLintReportRequest {
+            namespace: "lint-none".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
