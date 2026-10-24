@@ -6,12 +6,12 @@ use crate::sekai::governed_transform::{
     GovernedTransform, InputLoadBudget, MAX_TRANSFORM_LEASE_EXPIRIES, PREVIEW_AUTH_ALIAS,
     PREVIEW_RESULT_ALIAS, PreviewGovernedTransformResult, PreviewInputStat, STALE_TRANSFORM_CLAIM,
     TRANSFORM_DEFINITION_CHANGED, TRANSFORM_DIGEST_MISMATCH, TRANSFORM_OUTPUT_BLOCKED,
-    TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE, TRANSFORM_TRIGGER_CANCELLED,
-    TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_UPSTREAM,
-    TRANSFORM_WORK_CANCELLED, TRANSFORM_WORK_CLAIMED, TRANSFORM_WORK_COMPLETED,
-    TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows, TransformOutputState,
-    TransformRun, TransformRunInputRow, TransformWork, WriteTransformRunCommand,
-    admit_isolated_run, apply_preview_column_allowlist, bind_checkpoint,
+    TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE, TRANSFORM_RUN_REFUSED,
+    TRANSFORM_TRIGGER_CANCELLED, TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE,
+    TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED, TRANSFORM_WORK_CLAIMED,
+    TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows,
+    TransformOutputState, TransformRun, TransformRunInputRow, TransformWork,
+    WriteTransformRunCommand, admit_isolated_run, apply_preview_column_allowlist, bind_checkpoint,
     bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
     checkpoint_after_id, compute_preview_tables, compute_run_tables_until, dataset_digest,
     derive_transform_markings, evaluate_quality, fold_live_output_marking, fold_output_digest,
@@ -84,6 +84,11 @@ impl SekaiDb {
                     lease_expiries INTEGER NOT NULL DEFAULT 0,
                     created_at_ms INTEGER NOT NULL,
                     tenant_id TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS sekai_transform_run_refusals (
+                    run_id TEXT PRIMARY KEY,
+                    refusal_json TEXT NOT NULL,
+                    refused_at_ms INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS sekai_transform_run_input (
                     run_id TEXT NOT NULL,
@@ -663,6 +668,63 @@ impl SekaiDb {
         persist_transform_work(&tx, &work)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(work)
+    }
+
+    /// Refuses the claimed run for good (#1701), fenced by its claim: the
+    /// work fails, the run reads `refused` with `refusal`, and its input
+    /// snapshot goes, in one transaction. The caller then releases quota as
+    /// for any failed run.
+    pub fn refuse_transform_claim(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        refusal: &crate::enterprise::IsolatedProcessRefusal,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        refusal.validate()?;
+        let refusal_json = serde_json::to_string(refusal).map_err(|error| error.to_string())?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut work = load_transform_work(&tx, run_id)?.ok_or("transform work not found")?;
+        if !transform_claim_is_current(&work, runtime_id, claim_generation, fencing_token) {
+            return Err(STALE_TRANSFORM_CLAIM.into());
+        }
+        work.status = TRANSFORM_WORK_FAILED.into();
+        work.claim_owner = String::new();
+        work.fencing_token = String::new();
+        work.claim_expires_at_ms = 0;
+        persist_transform_work(&tx, &work)?;
+        tx.execute(
+            "INSERT INTO sekai_transform_run_refusals (run_id, refusal_json, refused_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(run_id) DO NOTHING",
+            params![run_id, refusal_json, now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        stamp_run_dispatch(&tx, run_id, TRANSFORM_RUN_REFUSED)?;
+        delete_run_input_snapshot(&tx, run_id)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Why the run was refused, when it was (#1701).
+    pub fn transform_run_refusal(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::enterprise::IsolatedProcessRefusal>, String> {
+        self.conn()
+            .query_row(
+                "SELECT refusal_json FROM sekai_transform_run_refusals WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
     }
 
     pub fn release_transform_claim(
@@ -6425,6 +6487,86 @@ mod tests {
         assert_eq!(second.claim_generation, first.claim_generation + 1);
         assert_eq!(second.lease_expiries, 1);
         assert_ne!(second.fencing_token, first.fencing_token);
+    }
+
+    #[test]
+    fn isolated_process_refusal_is_fenced_terminal_and_never_offered_again() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (claimed, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claim");
+        let refusal = crate::enterprise::IsolatedProcessRefusal {
+            code: "quota_exceeded".into(),
+            details: [
+                ("unit".into(), "seconds".into()),
+                ("limit".into(), "60".into()),
+            ]
+            .into(),
+        };
+        // A claimant on an older generation cannot refuse.
+        assert_eq!(
+            db.refuse_transform_claim(
+                &claimed.run_id,
+                &claimed.claim_owner,
+                claimed.claim_generation - 1,
+                &claimed.fencing_token,
+                &refusal,
+                31,
+            )
+            .unwrap_err(),
+            STALE_TRANSFORM_CLAIM
+        );
+        db.refuse_transform_claim(
+            &claimed.run_id,
+            &claimed.claim_owner,
+            claimed.claim_generation,
+            &claimed.fencing_token,
+            &refusal,
+            32,
+        )
+        .unwrap();
+        let stored = db
+            .get_governed_transform_run(&admitted.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.dispatch_status, TRANSFORM_RUN_REFUSED);
+        assert_eq!(
+            db.transform_run_refusal(&admitted.run_id).unwrap(),
+            Some(refusal)
+        );
+        // The old claim cannot release the run back to the queue, and it is
+        // never offered again, even once its lease would have expired.
+        assert_eq!(
+            db.release_transform_claim(
+                &claimed.run_id,
+                &claimed.claim_owner,
+                claimed.claim_generation,
+                &claimed.fencing_token,
+                33,
+                false,
+            )
+            .unwrap_err(),
+            STALE_TRANSFORM_CLAIM
+        );
+        assert!(
+            db.claim_transform_work("ops", "runner-b", "", 60_000, 120_000)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

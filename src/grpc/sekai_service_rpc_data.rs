@@ -2346,7 +2346,11 @@ pub(super) async fn get_governed_transform_run(
     check_team_namespace(service.db.runtime(), &principals, &run.namespace, false)?;
     let reveal = caller_can_read_run_datasets(service, &principals, &run);
     Ok(Response::new(GetGovernedTransformRunResponse {
-        run: Some(to_proto_transform_run(&run, reveal)),
+        run: Some(with_refusal(
+            service,
+            &run,
+            to_proto_transform_run(&run, reveal),
+        )?),
     }))
 }
 pub(super) async fn list_governed_transforms(
@@ -2401,9 +2405,9 @@ pub(super) async fn list_governed_transform_runs(
         .iter()
         .map(|run| {
             let reveal = caller_can_read_run_datasets(service, &principals, run);
-            to_proto_transform_run(run, reveal)
+            with_refusal(service, run, to_proto_transform_run(run, reveal))
         })
-        .collect();
+        .collect::<Result<_, Status>>()?;
     Ok(Response::new(ListGovernedTransformRunsResponse { runs }))
 }
 pub(super) async fn list_claimable_transform_work(
@@ -2481,6 +2485,36 @@ pub(super) async fn claim_transform_work(
                         "local",
                     ))
                 };
+                // A terminal refusal ends the run before any admission (#1701).
+                if let Some(refusal) = extension_refusal(service, owner.as_ref(), &work) {
+                    match service.db.runtime().refuse_transform_claim(
+                        &work.run_id,
+                        &work.claim_owner,
+                        work.claim_generation,
+                        &work.fencing_token,
+                        &refusal,
+                        now_millis(),
+                    ) {
+                        Ok(()) => release_failed_transform_quota(
+                            service.db.runtime(),
+                            quota.clone(),
+                            std::slice::from_ref(&work.run_id),
+                        )?,
+                        // Another claimant moved the run on: it owns the run
+                        // and its quota now.
+                        Err(error)
+                            if error == crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM => {
+                        }
+                        Err(error) => return Err(Status::internal(error)),
+                    }
+                    if targeted {
+                        return Err(Status::failed_precondition(format!(
+                            "isolated-process run refused: {}",
+                            refusal.code
+                        )));
+                    }
+                    continue;
+                }
                 let prior_admission = if work.claim_generation > 1 {
                     match service.db.runtime().reclaim_transform_quota_hold(
                         &work.run_id,
@@ -3227,6 +3261,53 @@ fn admit_claimed_isolated_process(
     )
 }
 
+/// The extension's terminal refusal of this claim, if any, bounded and with
+/// secret-like text withheld before it is stored on the run.
+fn extension_refusal(
+    service: &SekaiServiceImpl,
+    owner: Option<&crate::enterprise::AuthenticatedContext>,
+    work: &crate::sekai::governed_transform::TransformWork,
+) -> Option<crate::enterprise::IsolatedProcessRefusal> {
+    let extension = service.db.runtime().enterprise_extension()?;
+    let refusal = extension.refuse_isolated_process_job(
+        owner?,
+        &crate::enterprise::IsolatedProcessJob {
+            run_id: work.run_id.clone(),
+            namespace: work.namespace.clone(),
+            estimated_seconds: DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
+        },
+    )?;
+    // Each detail is checked as the `name=value` pair it reads as, and a
+    // credential-like name is refused whatever its value.
+    let secret = crate::sekai::object_sync::contains_secret_like_text(&refusal.code)
+        || refusal.details.iter().any(|(key, value)| {
+            credential_like_name(key)
+                || crate::sekai::object_sync::contains_secret_like_text(value)
+                || crate::sekai::object_sync::contains_secret_like_text(&format!("{key}={value}"))
+        });
+    Some(if secret || refusal.validate().is_err() {
+        crate::enterprise::IsolatedProcessRefusal {
+            code: REFUSAL_REASON_WITHHELD.into(),
+            details: Default::default(),
+        }
+    } else {
+        refusal
+    })
+}
+
+/// A refusal detail name that suggests a credential rather than a usage figure.
+fn credential_like_name(name: &str) -> bool {
+    name.split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "token" | "credential" | "key" | "authorization" | "bearer"
+        )
+    })
+}
+
+/// Stored in place of a refusal that is malformed or carries secret-like text.
+const REFUSAL_REASON_WITHHELD: &str = "reason_withheld";
+
 fn admit_extension_isolated_process(
     service: &SekaiServiceImpl,
     owner: Option<&crate::enterprise::AuthenticatedContext>,
@@ -3880,6 +3961,26 @@ fn to_proto_partition(
     }
 }
 
+/// `proto` with the stored refusal of a refused run (#1701).
+fn with_refusal(
+    service: &SekaiServiceImpl,
+    run: &crate::sekai::governed_transform::TransformRun,
+    mut proto: TransformRun,
+) -> Result<TransformRun, Status> {
+    if run.dispatch_status == crate::sekai::governed_transform::TRANSFORM_RUN_REFUSED {
+        proto.refusal = service
+            .db
+            .runtime()
+            .transform_run_refusal(&run.run_id)
+            .map_err(Status::internal)?
+            .map(|refusal| TransformRunRefusal {
+                code: refusal.code,
+                details: refusal.details.into_iter().collect(),
+            });
+    }
+    Ok(proto)
+}
+
 fn to_proto_transform_run(
     run: &crate::sekai::governed_transform::TransformRun,
     reveal_partition_keys: bool,
@@ -3917,6 +4018,7 @@ fn to_proto_transform_run(
             .iter()
             .map(|partition| to_proto_partition(partition, reveal_partition_keys))
             .collect(),
+        refusal: None,
     }
 }
 

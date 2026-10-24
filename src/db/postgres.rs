@@ -177,6 +177,8 @@ const ACTION_BINDINGS_SCHEMA: &str = include_str!("postgres/0103_action_bindings
 const PURPOSES_AND_LATTICES_SCHEMA: &str = include_str!("postgres/0104_purposes_and_lattices.sql");
 const PLAN_EXECUTIONS_SCHEMA: &str = include_str!("postgres/0105_sekai_plan_executions.sql");
 const EXPORT_GRANTS_SCHEMA: &str = include_str!("postgres/0106_sekai_export_grants.sql");
+const TRANSFORM_RUN_REFUSALS_SCHEMA: &str =
+    include_str!("postgres/0107_transform_run_refusals.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -838,6 +840,12 @@ const MIGRATIONS: &[Migration] = &[
         105,
         "sekai_export_grants",
         EXPORT_GRANTS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        106,
+        "transform_run_refusals",
+        TRANSFORM_RUN_REFUSALS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
