@@ -2463,6 +2463,34 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "SubmitPlanReview",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/plan_review.rs",
+        "src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "DecidePlanReview",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/plan_review.rs",
+        "src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetActionInstance",
       "kind": "persistent",
       "surfaces": [

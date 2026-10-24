@@ -1861,6 +1861,13 @@ pub(super) async fn get_plan(
         &may_read,
     )
     .map_err(plan_status)?;
+    // read_plan clears the object of every step the reader may not see.
+    let hidden: Vec<bool> = view
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.object_id.is_empty())
+        .collect();
     Ok(Response::new(GetPlanResponse {
         intent: Some(plan_intent_to_proto(view.intent)),
         plan: Some(plan_to_proto(view.plan)),
@@ -1869,6 +1876,179 @@ pub(super) async fn get_plan(
             .into_iter()
             .map(plan_simulation_to_proto)
             .collect(),
+        // Routing can depend on parameters, so the review names only the
+        // queues of steps the reader may see.
+        review: service
+            .db
+            .runtime()
+            .get_plan_review(&inner.namespace, &inner.plan_id)
+            .map_err(Status::internal)?
+            .map(|review| plan_review_to_proto(review, |index| hidden[index])),
+    }))
+}
+
+/// The review, naming the queues of the steps not `hidden`.
+fn plan_review_to_proto(
+    review: crate::sekai::plan_review::PlanReview,
+    hidden: impl Fn(usize) -> bool,
+) -> PlanReview {
+    PlanReview {
+        queue_ids: review.queue_ids(hidden),
+        namespace: review.namespace,
+        plan_id: review.plan_id,
+        simulation_id: review.simulation_id,
+        simulation_digest: review.simulation_digest,
+        submitted_by: review.submitted_by,
+        submitted_at_ms: review.submitted_at_ms,
+        decision: review.decision,
+        decided_by: review.decided_by,
+        reason: review.reason,
+        decided_at_ms: review.decided_at_ms,
+    }
+}
+
+fn review_status(error: crate::sekai::plan_review::ReviewError) -> Status {
+    use crate::sekai::action_instance_admission::DECISION_ACCESS_DENIED;
+    use crate::sekai::plan_review::{
+        REVIEW_ALREADY_DECIDED, REVIEW_DIGEST_MISMATCH, REVIEW_STEP_NOT_DECIDABLE, ReviewError,
+    };
+    match error {
+        ReviewError::Plan(error) => plan_status(error),
+        ReviewError::AccessDenied => Status::permission_denied(DECISION_ACCESS_DENIED),
+        ReviewError::StepNotDecidable { index, type_id } => Status::permission_denied(format!(
+            "{REVIEW_STEP_NOT_DECIDABLE}: step {index} ({type_id}) is beyond the decider's authority"
+        )),
+        ReviewError::DigestMismatch => Status::failed_precondition(format!(
+            "{REVIEW_DIGEST_MISMATCH}: the review is bound to another simulation"
+        )),
+        ReviewError::AlreadyDecided => Status::failed_precondition(format!(
+            "{REVIEW_ALREADY_DECIDED}: the plan was decided otherwise"
+        )),
+    }
+}
+
+/// Submits a simulated plan to review as one bundle item, bound to one of
+/// its stored simulations. Only the planner submits, and must still be able
+/// to submit Actions in the namespace.
+pub(super) async fn submit_plan_review(
+    service: &SekaiServiceImpl,
+    req: Request<SubmitPlanReviewRequest>,
+) -> Result<Response<SubmitPlanReviewResponse>, Status> {
+    let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let submitter = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let review = crate::sekai::plan_review::submit_review(
+        service.db.runtime(),
+        &inner.namespace,
+        &inner.plan_id,
+        &inner.simulation_id,
+        &submitter,
+        now_millis(),
+    )
+    .map_err(review_status)?;
+    Ok(Response::new(SubmitPlanReviewResponse {
+        // The planner wrote every step's parameters.
+        review: Some(plan_review_to_proto(review, |_| false)),
+    }))
+}
+
+/// Decides a submitted plan as a whole. The decider passes the same gates
+/// as `DecideActionInstance` and must be able to decide every step as a
+/// single parked Action: read its object, be one of its type's approvers
+/// (or a namespace administrator when it names none), and belong to the
+/// review queue placement the step would get.
+pub(super) async fn decide_plan_review(
+    service: &SekaiServiceImpl,
+    req: Request<DecidePlanReviewRequest>,
+) -> Result<Response<DecidePlanReviewResponse>, Status> {
+    use crate::sekai::action_instance_admission::DECISION_ACCESS_DENIED;
+
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let policy_context = principal_policy_context(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    if let Some(context) = tenant_context.as_ref() {
+        context
+            .authorize_space_approval()
+            .map_err(extension_status)?;
+    }
+    let access_denied = || Status::permission_denied(DECISION_ACCESS_DENIED);
+    let decider = credentialed_decider(&req, &principals).ok_or_else(access_denied)?;
+    let deciders = vec![decider.clone()];
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )
+    .map_err(|_| access_denied())?;
+    let decider_is_namespace_admin =
+        authorize_source_type_namespace_admin(service, &deciders, &inner.namespace).is_ok();
+    let now = now_millis();
+    let may_decide = |plan: &crate::sekai::action_plan::ProposedPlan,
+                      step: &crate::sekai::action_plan::PlanStep| {
+        let Ok(Some(type_def)) = service.db.runtime().get_governed_action_type(
+            &plan.namespace,
+            &step.type_id,
+            &step.version,
+        ) else {
+            return false;
+        };
+        let entitled = if type_def.approvers.is_empty() {
+            decider_is_namespace_admin
+        } else {
+            type_def.approvers.contains(&decider)
+        };
+        let placement = crate::sekai::review_queue::place(
+            &type_def.review_queue,
+            &step.parameters_json,
+            now,
+            &plan.planner,
+            &type_def.approvers,
+        );
+        entitled
+            && crate::sekai::review_queue::reviewer_may_decide(
+                &type_def.review_queue,
+                &placement,
+                &decider,
+            )
+            && visible_action_object(
+                service,
+                &deciders,
+                tenant_context.as_ref(),
+                &policy_context,
+                &plan.namespace,
+                &step.object_id,
+                crate::enterprise::NamespaceAction::Read,
+            )
+            .is_ok()
+    };
+    let (review, replay) = crate::sekai::plan_review::decide_review(
+        service.db.runtime(),
+        &inner.namespace,
+        &inner.plan_id,
+        &crate::sekai::plan_review::ReviewDecision {
+            simulation_digest: &inner.simulation_digest,
+            decision: inner.decision.trim(),
+            reason: &inner.reason,
+        },
+        &decider,
+        &may_decide,
+        now,
+    )
+    .map_err(review_status)?;
+    Ok(Response::new(DecidePlanReviewResponse {
+        // A decider may read every step's object, or nothing is decided.
+        review: Some(plan_review_to_proto(review, |_| false)),
+        replay,
     }))
 }
 

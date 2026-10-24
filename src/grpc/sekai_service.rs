@@ -1312,6 +1312,20 @@ impl SekaiService for SekaiServiceImpl {
         rpc_actions::get_plan(self, req).await
     }
 
+    async fn submit_plan_review(
+        &self,
+        req: Request<SubmitPlanReviewRequest>,
+    ) -> Result<Response<SubmitPlanReviewResponse>, Status> {
+        rpc_actions::submit_plan_review(self, req).await
+    }
+
+    async fn decide_plan_review(
+        &self,
+        req: Request<DecidePlanReviewRequest>,
+    ) -> Result<Response<DecidePlanReviewResponse>, Status> {
+        rpc_actions::decide_plan_review(self, req).await
+    }
+
     async fn get_action_instance(
         &self,
         req: Request<GetActionInstanceRequest>,
@@ -1975,16 +1989,6 @@ impl SekaiService for SekaiServiceImpl {
 }
 
 type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
-
-#[async_trait::async_trait]
-impl KnowledgeWriter for SekaiServiceImpl {
-    async fn write_knowledge(
-        &self,
-        request: &KnowledgeWriteRequest,
-    ) -> Result<KnowledgeWriteOutcome, String> {
-        scored_knowledge_admission::admit(self, request).await
-    }
-}
 
 #[cfg(test)]
 #[path = "sekai_service_tests.rs"]

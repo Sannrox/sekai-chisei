@@ -86,8 +86,40 @@ may not see keeps only its position and Action type, in the plan and in
 every simulation. A step the simulator may not see simulates as
 `unavailable`.
 
-Approval and execution are the next layers. Execution goes through
-`SubmitActionInstance` with idempotency key (plan id, step index).
+### Plan review
+
+Issue: [#1678](https://github.com/Sannrox/sekai-chisei/issues/1678), layer 2 of
+[#1460](https://github.com/Sannrox/sekai-chisei/issues/1460). A plan is
+reviewed as one bundle, not one Action at a time.
+
+- `SubmitPlanReview` submits a plan, bound to one of its stored simulations,
+  as one review item. Only the planner submits it, under the same submit
+  authorization as creating the plan. The item names the queues its steps route to, as their Action types
+  would place a parked instance of each. Each plan is reviewed once. A retry
+  returns the stored item, and another simulation for a submitted plan is
+  `ALREADY_EXISTS`: a changed world needs a new plan.
+- `DecidePlanReview` records one decision, `grant` or `deny`, for the whole
+  plan. The decision is bound to the plan id and the simulation digest, which
+  the request must repeat (`plan_review_digest_mismatch` otherwise). The
+  decider passes the gates of `DecideActionInstance`: one credentialed subject,
+  space approval in a tenant (a space approver, not an editor), and not the
+  planner. They
+  must also be able to decide every step as a single parked Action: read its
+  object, be one of its type's approvers (or a namespace administrator when it
+  names none), and be the reviewer the step's queue placement would allow.
+  When any step fails this check, the first such step is named
+  (`plan_review_step_not_decidable: step <index> (<type>)`) and nothing is
+  recorded. There is no partial approval.
+- The same decision again replays (`replay`); the other decision is
+  `plan_review_already_decided`. The first decision of two concurrent ones
+  wins.
+- `GetPlan` returns the review with the plan. Routing can depend on
+  parameters, so the review names only the queues of steps the reader may
+  see.
+
+A denied plan never executes. Execution is the next layer. It goes through
+`SubmitActionInstance` with idempotency key (plan id, step index) and
+rechecks authority per step.
 
 ## Admission flow
 
@@ -280,7 +312,8 @@ A device that prepared an Action while disconnected submits it with `offline` ([
 
 SQLite migrate-on-use and PostgreSQL migration
 `0021_governed_action_instances`. Plans, intents and simulations use PostgreSQL
-migration `0100_sekai_action_plans`.
+migration `0100_sekai_action_plans`, and plan reviews
+`0102_sekai_plan_reviews`.
 
 ## Non-goals
 

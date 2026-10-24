@@ -28338,3 +28338,280 @@ mod spawn_db_tests {
         .unwrap();
     }
 }
+
+/// Stores three one-step Action types on `cust-plan` in `acme`: `plan.a`
+/// and `plan.b` decided by alice or bob, and `plan.c` by alice alone on the
+/// `risk` queue. Returns the plan request steps, one per type.
+fn plan_review_fixture(svc: &SekaiServiceImpl) -> Vec<PlanStep> {
+    grant_action_admin(svc);
+    let db = svc.db.runtime();
+    db.upsert_object_type(&crate::sekai::schema::ObjectType {
+        kind: "customer_record".into(),
+        description: "fixture".into(),
+        properties: vec![],
+        is_builtin: false,
+        implements: vec![],
+    })
+    .unwrap();
+    db.create_object(&crate::domain::Object {
+        id: "cust-plan".into(),
+        kind: "customer_record".into(),
+        name: "Northwind".into(),
+        namespace: "acme".into(),
+        external_id: String::new(),
+        properties: HashMap::from([("title".into(), "account".into())]),
+        created: 10,
+        updated: 20,
+    })
+    .unwrap();
+    let mut steps = Vec::new();
+    for (type_id, approvers, queue) in [
+        ("plan.a", vec!["alice", "bob"], ""),
+        ("plan.b", vec!["alice", "bob"], ""),
+        ("plan.c", vec!["alice"], "risk"),
+    ] {
+        db.put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: "acme".into(),
+                type_id: type_id.into(),
+                version: "1".into(),
+                description: "Retitle one customer".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"title":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                object_kind: "customer_record".into(),
+                object_mutation: "update".into(),
+                enabled: true,
+                approvers: approvers.into_iter().map(String::from).collect(),
+                review_queue: crate::sekai::review_queue::ReviewQueueSpec {
+                    queue_id: queue.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            "operator",
+            1,
+        )
+        .unwrap();
+        steps.push(PlanStep {
+            type_id: type_id.into(),
+            version: "1".into(),
+            object_id: "cust-plan".into(),
+            parameters_json: r#"{"object_id":"cust-plan","title":"vip"}"#.into(),
+        });
+    }
+    steps
+}
+
+/// Proposes and simulates `plan_id` as `tester`; returns the simulation digest.
+async fn simulated_plan(
+    svc: &SekaiServiceImpl,
+    plan_id: &str,
+    simulation_id: &str,
+    steps: Vec<PlanStep>,
+) -> String {
+    svc.create_plan_intent(with_principal(CreatePlanIntentRequest {
+        namespace: "acme".into(),
+        intent_id: "intent-review".into(),
+        goal: "Retitle Northwind".into(),
+        constraints: vec![],
+    }))
+    .await
+    .unwrap();
+    svc.propose_plan(with_principal(ProposePlanRequest {
+        namespace: "acme".into(),
+        plan_id: plan_id.into(),
+        intent_id: "intent-review".into(),
+        steps,
+    }))
+    .await
+    .unwrap();
+    svc.simulate_plan(with_principal(SimulatePlanRequest {
+        namespace: "acme".into(),
+        plan_id: plan_id.into(),
+        simulation_id: simulation_id.into(),
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .simulation
+    .unwrap()
+    .digest
+}
+
+fn as_decider<T>(payload: T, principal: &str) -> Request<T> {
+    let mut request = with_named_principal(payload, principal);
+    request
+        .metadata_mut()
+        .insert("x-sekai-auth-source", MetadataValue::from_static("token"));
+    request
+}
+
+async fn decide_plan(
+    svc: &SekaiServiceImpl,
+    plan_id: &str,
+    digest: &str,
+    decision: &str,
+    decider: &str,
+) -> Result<DecidePlanReviewResponse, Status> {
+    svc.decide_plan_review(as_decider(
+        DecidePlanReviewRequest {
+            namespace: "acme".into(),
+            plan_id: plan_id.into(),
+            simulation_digest: digest.into(),
+            decision: decision.into(),
+            reason: "reviewed".into(),
+        },
+        decider,
+    ))
+    .await
+    .map(Response::into_inner)
+}
+
+#[tokio::test]
+async fn a_plan_is_granted_once_by_an_approver_of_every_step() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    let digest = simulated_plan(&svc, "plan-r", "sim-1", steps).await;
+    // Not submitted yet: nothing to decide.
+    let early = decide_plan(&svc, "plan-r", &digest, "grant", "alice")
+        .await
+        .unwrap_err();
+    assert_eq!(early.code(), tonic::Code::PermissionDenied);
+
+    let submit = || SubmitPlanReviewRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-r".into(),
+        simulation_id: "sim-1".into(),
+    };
+    let review = svc
+        .submit_plan_review(with_principal(submit()))
+        .await
+        .unwrap()
+        .into_inner()
+        .review
+        .unwrap();
+    assert_eq!(review.simulation_digest, digest);
+    assert_eq!(review.queue_ids, ["risk"]);
+    assert!(review.decision.is_empty());
+    let retried = svc
+        .submit_plan_review(with_principal(submit()))
+        .await
+        .unwrap()
+        .into_inner()
+        .review
+        .unwrap();
+    assert_eq!(retried, review);
+    // A decision binds one simulation: another one cannot replace it.
+    svc.simulate_plan(with_principal(SimulatePlanRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-r".into(),
+        simulation_id: "sim-2".into(),
+    }))
+    .await
+    .unwrap();
+    let rebound = svc
+        .submit_plan_review(with_principal(SubmitPlanReviewRequest {
+            simulation_id: "sim-2".into(),
+            ..submit()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(rebound.code(), tonic::Code::AlreadyExists);
+
+    // Only the planner submits a plan for review.
+    let foreign = svc
+        .submit_plan_review(with_named_principal(submit(), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    // The planner never decides their own plan.
+    let own = decide_plan(&svc, "plan-r", &digest, "grant", "tester")
+        .await
+        .unwrap_err();
+    assert_eq!(own.code(), tonic::Code::PermissionDenied);
+    // bob may decide the first two steps but not the third.
+    let partial = decide_plan(&svc, "plan-r", &digest, "grant", "bob")
+        .await
+        .unwrap_err();
+    assert_eq!(partial.code(), tonic::Code::PermissionDenied);
+    assert!(
+        partial.message().contains("step 2 (plan.c)"),
+        "{}",
+        partial.message()
+    );
+    let stale = decide_plan(&svc, "plan-r", "sha256:other", "grant", "alice")
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    let read = || async {
+        svc.get_plan(with_principal(GetPlanRequest {
+            namespace: "acme".into(),
+            plan_id: "plan-r".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .review
+        .unwrap()
+    };
+    assert!(read().await.decision.is_empty());
+
+    let granted = decide_plan(&svc, "plan-r", &digest, "grant", "alice")
+        .await
+        .unwrap();
+    assert!(!granted.replay);
+    let decided = granted.review.unwrap();
+    assert_eq!(
+        (
+            decided.plan_id.as_str(),
+            decided.simulation_digest.as_str(),
+            decided.decision.as_str(),
+            decided.decided_by.as_str()
+        ),
+        ("plan-r", digest.as_str(), "grant", "alice")
+    );
+    assert_eq!(read().await, decided);
+    let again = decide_plan(&svc, "plan-r", &digest, "grant", "alice")
+        .await
+        .unwrap();
+    assert!(again.replay);
+    assert_eq!(again.review.unwrap(), decided);
+    let reversed = decide_plan(&svc, "plan-r", &digest, "deny", "alice")
+        .await
+        .unwrap_err();
+    assert_eq!(reversed.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn a_denied_plan_records_the_decision_and_runs_nothing() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    let digest = simulated_plan(&svc, "plan-d", "sim-1", steps).await;
+    svc.submit_plan_review(with_principal(SubmitPlanReviewRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-d".into(),
+        simulation_id: "sim-1".into(),
+    }))
+    .await
+    .unwrap();
+    let denied = decide_plan(&svc, "plan-d", &digest, "deny", "alice")
+        .await
+        .unwrap();
+    assert_eq!(denied.review.unwrap().decision, "deny");
+    assert!(
+        decide_plan(&svc, "plan-d", &digest, "deny", "alice")
+            .await
+            .unwrap()
+            .replay
+    );
+    let db = svc.db.runtime();
+    assert!(
+        db.list_action_instances("acme", None, None, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.get_object("cust-plan").unwrap().unwrap().properties["title"],
+        "account"
+    );
+}

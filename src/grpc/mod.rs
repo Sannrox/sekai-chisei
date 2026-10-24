@@ -434,7 +434,8 @@ fn finish_authenticated(
         return Err(Status::permission_denied("enterprise authorization denied"));
     }
     if let Some((_, method)) = rpc_identity::request_rpc_method(&req) {
-        if method == "DecideActionInstance" {
+        // Deciding a parked Action or a whole plan is approval, not write.
+        if matches!(method, "DecideActionInstance" | "DecidePlanReview") {
             authenticated_context
                 .authorize_space_approval()
                 .map_err(|_| Status::permission_denied("space approval denied"))?;
@@ -811,6 +812,14 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ResolveInvariantSet"
             | "SubmitActionInstance"
             | "DecideActionInstance"
+            // Plans (#1675) and their review (#1678): handlers enforce the
+            // tenant context per namespace.
+            | "CreatePlanIntent"
+            | "ProposePlan"
+            | "SimulatePlan"
+            | "GetPlan"
+            | "SubmitPlanReview"
+            | "DecidePlanReview"
             | "GetActionInstance"
             | "ListActionInstances"
             | "GetActionEffect"
@@ -2082,6 +2091,11 @@ mod tests {
             (SpaceRole::Editor, "CreateObject", true),
             (SpaceRole::Editor, "DecideActionInstance", false),
             (SpaceRole::Approver, "DecideActionInstance", true),
+            (SpaceRole::Editor, "DecidePlanReview", false),
+            (SpaceRole::Approver, "DecidePlanReview", true),
+            (SpaceRole::Viewer, "GetPlan", true),
+            (SpaceRole::Viewer, "SubmitPlanReview", false),
+            (SpaceRole::Editor, "SubmitPlanReview", true),
             (SpaceRole::Approver, "CreateObject", false),
             (SpaceRole::Administrator, "CreateObject", true),
         ] {

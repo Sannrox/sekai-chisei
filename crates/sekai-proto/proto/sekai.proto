@@ -2448,6 +2448,48 @@ message GetPlanResponse {
   PlanIntent intent = 1;
   ProposedPlan plan = 2;
   repeated PlanSimulation simulations = 3;
+  // Absent until the plan is submitted for review (#1678).
+  PlanReview review = 4;
+}
+// One review-queue bundle over a simulated plan (#1678), bound to one stored
+// simulation. decision is empty while pending, else grant or deny.
+message PlanReview {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+  string simulation_digest = 4;
+  // Queues the steps route to, as their Action types would place them.
+  repeated string queue_ids = 5;
+  string submitted_by = 6;
+  int64 submitted_at_ms = 7;
+  string decision = 8;
+  string decided_by = 9;
+  string reason = 10;
+  int64 decided_at_ms = 11;
+}
+message SubmitPlanReviewRequest {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+}
+message SubmitPlanReviewResponse {
+  PlanReview review = 1;
+}
+// One decision for the whole plan. The decider must be able to decide every
+// step as a single parked Action; otherwise the first step beyond their
+// authority is named and nothing is recorded.
+message DecidePlanReviewRequest {
+  string namespace = 1;
+  string plan_id = 2;
+  // The digest of the simulation the review is bound to.
+  string simulation_digest = 3;
+  // grant | deny
+  string decision = 4;
+  string reason = 5;
+}
+message DecidePlanReviewResponse {
+  PlanReview review = 1;
+  bool replay = 2;
 }
 message GetActionInstanceRequest {
   string instance_id = 1;
@@ -4160,6 +4202,8 @@ service SekaiService {
   rpc ProposePlan(ProposePlanRequest) returns (ProposePlanResponse);
   rpc SimulatePlan(SimulatePlanRequest) returns (SimulatePlanResponse);
   rpc GetPlan(GetPlanRequest) returns (GetPlanResponse);
+  rpc SubmitPlanReview(SubmitPlanReviewRequest) returns (SubmitPlanReviewResponse);
+  rpc DecidePlanReview(DecidePlanReviewRequest) returns (DecidePlanReviewResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
   // Typed effects on admitted ActionInstances (#398).
