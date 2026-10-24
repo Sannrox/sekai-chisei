@@ -1157,6 +1157,7 @@ pub fn apply(db: &RuntimeDb, plan: &SyntheticPlan) -> Result<(), String> {
                     binding_markings: Vec::new(),
                     source_object_id: String::new(),
                     marking_gate: Default::default(),
+                    expected_object_revision: String::new(),
                     offline: None,
                 },
                 &action.submitter,

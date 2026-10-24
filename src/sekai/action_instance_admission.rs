@@ -75,6 +75,11 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     /// The transport adapter fills the device id from the device-bound
     /// assertion after checking the device's proof.
     pub offline: Option<crate::sekai::offline_action::OfflineSubmission>,
+    /// The target object's revision the caller checked (an executed plan
+    /// step, #1679). Admission refuses unless the object it writes or parks
+    /// against still has it, in the same read the write applies against.
+    /// Empty checks nothing.
+    pub expected_object_revision: String,
 }
 
 /// Clearance check admission runs against the marking it derives (#1706).
@@ -120,16 +125,25 @@ pub(crate) struct ActionInstanceDecisionRequest {
     pub decider_principals: Vec<String>,
     pub decider_is_namespace_admin: bool,
     pub delegating_actor: Option<String>,
+    /// Set when a plan execution grants its own step (#1679).
+    pub execution_claim: Option<crate::sekai::action_instance::ExecutionClaim>,
 }
 
 /// One bounded answer for every refused or unknown decision target, so a
 /// caller learns nothing about instances or types it may not decide.
 pub(crate) const DECISION_ACCESS_DENIED: &str = "access denied";
 
+/// A plan step's grant whose execution claim is gone; the run that took
+/// over (or none, for a stopped plan) decides the step.
+pub(crate) const PLAN_EXECUTION_CLAIM_LOST: &str = "plan execution claim lost";
+
 #[derive(Debug, Clone)]
 pub(crate) struct ActionInstanceAdmissionOutcome {
     pub instance: ActionInstance,
     pub replay: bool,
+    /// The revision of the object this admission wrote; none on a replay or
+    /// when nothing was written.
+    pub object_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +203,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         now: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         let budget_already_reserved = request.budget_already_reserved;
+        let expected_object_revision = request.expected_object_revision.clone();
         let namespace = request.namespace.trim().to_string();
         require_value("namespace", &namespace)?;
         require_value("type_id", request.type_id.trim())?;
@@ -380,10 +395,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             Some(object) => self
                 .db
                 .active_object_policy(&object.namespace, &object.kind)
+                // A store failure, retryable; not a refused precondition.
                 .map_err(|_| {
-                    ActionInstanceAdmissionError::FailedPrecondition(
-                        "object action unavailable".into(),
-                    )
+                    ActionInstanceAdmissionError::Internal("object policy unavailable".into())
                 })?,
             None => None,
         };
@@ -550,6 +564,19 @@ impl<'a> ActionInstanceAdmission<'a> {
                 // conflict check passed, not to a later read.
                 Some(checked) => crate::sekai::action_instance::object_state_digest(Some(checked))
                     .map_err(ActionInstanceAdmissionError::Internal)?,
+                None if !request.expected_object_revision.is_empty() => {
+                    // The revision check and the parked digest read one object.
+                    let object = target_object(self.db, &request.parameters_json)?;
+                    if object
+                        .as_ref()
+                        .map(crate::sekai::action_describe_preview::object_revision)
+                        != Some(request.expected_object_revision.clone())
+                    {
+                        return Err(object_changed());
+                    }
+                    crate::sekai::action_instance::object_state_digest(object.as_ref())
+                        .map_err(ActionInstanceAdmissionError::Internal)?
+                }
                 None => target_object_digest(self.db, &request.parameters_json)?,
             }
         } else {
@@ -657,6 +684,20 @@ impl<'a> ActionInstanceAdmission<'a> {
                 Some(&stored.marking),
                 now,
             ) {
+                // The caller checked a revision: the write applies only over
+                // the snapshot it is planned from, so compare that one.
+                Ok(planned)
+                    if !expected_object_revision.is_empty()
+                        && !matches!(
+                            &planned,
+                            Some(action_object_mutation::PlannedObjectMutation::Update(_, snapshot))
+                                if crate::sekai::action_describe_preview::object_revision(snapshot)
+                                    == expected_object_revision
+                        ) =>
+                {
+                    let _ = self.db.delete_action_instance(&stored.instance_id);
+                    return Err(object_changed());
+                }
                 Ok(None) => None,
                 // The conflict check passed against one version; a write
                 // that landed since is judged afresh by a new submit.
@@ -739,6 +780,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             .map_err(ActionInstanceAdmissionError::Internal)?;
         }
         Ok(ActionInstanceAdmissionOutcome {
+            object_revision: applied_object.as_ref().map(|applied| {
+                crate::sekai::action_describe_preview::object_revision(&applied.object)
+            }),
             instance: stored,
             replay,
         })
@@ -875,10 +919,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             Some(object) => self
                 .db
                 .active_object_policy(&object.namespace, &object.kind)
+                // A store failure, retryable; not a refused precondition.
                 .map_err(|_| {
-                    ActionInstanceAdmissionError::FailedPrecondition(
-                        "object action unavailable".into(),
-                    )
+                    ActionInstanceAdmissionError::Internal("object policy unavailable".into())
                 })?,
             None => None,
         };
@@ -1056,6 +1099,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             &target_object_id(&instance.parameters_json),
             &instance.parked_object_digest,
             &instance.principal,
+            request.execution_claim.as_ref(),
             now,
         )
         .map_err(map_object_mutation_error)?
@@ -1068,6 +1112,11 @@ impl<'a> ActionInstanceAdmission<'a> {
             }
             action_object_mutation::ParkedGrant::Stale => {
                 return self.finish_denied(instance, "stale_on_resume", &approval, now);
+            }
+            action_object_mutation::ParkedGrant::ClaimLost => {
+                return Err(ActionInstanceAdmissionError::FailedPrecondition(
+                    PLAN_EXECUTION_CLAIM_LOST.into(),
+                ));
             }
         };
         let ontology_digest = self
@@ -1120,6 +1169,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             );
         }
         Ok(ActionInstanceAdmissionOutcome {
+            object_revision: applied_object.as_ref().map(|applied| {
+                crate::sekai::action_describe_preview::object_revision(&applied.object)
+            }),
             instance: granted,
             replay: false,
         })
@@ -1178,6 +1230,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         )
         .map_err(ActionInstanceAdmissionError::Internal)?;
         Ok(ActionInstanceAdmissionOutcome {
+            object_revision: None,
             instance: denied,
             replay: false,
         })
@@ -1360,6 +1413,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 .map_err(ActionInstanceAdmissionError::Internal)?;
             }
             Ok(ActionInstanceAdmissionOutcome {
+                object_revision: None,
                 instance: current,
                 replay: true,
             })
@@ -1399,6 +1453,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             );
         }
         Ok(ActionInstanceAdmissionOutcome {
+            object_revision: None,
             instance: existing,
             replay: true,
         })
@@ -1846,6 +1901,24 @@ fn target_object_id(parameters_json: &str) -> String {
         .unwrap_or_default()
 }
 
+fn object_changed() -> ActionInstanceAdmissionError {
+    ActionInstanceAdmissionError::FailedPrecondition(
+        "the object changed since the revision the caller checked".into(),
+    )
+}
+
+fn target_object(
+    db: &RuntimeDb,
+    parameters_json: &str,
+) -> Result<Option<crate::domain::Object>, ActionInstanceAdmissionError> {
+    let object_id = target_object_id(parameters_json);
+    if object_id.is_empty() {
+        return Ok(None);
+    }
+    db.get_object(&object_id)
+        .map_err(ActionInstanceAdmissionError::Internal)
+}
+
 fn target_object_digest(
     db: &RuntimeDb,
     parameters_json: &str,
@@ -2149,6 +2222,7 @@ mod tests {
             binding_markings: Vec::new(),
             source_object_id: String::new(),
             marking_gate: Default::default(),
+            expected_object_revision: String::new(),
             offline: None,
         }
     }
@@ -2792,6 +2866,7 @@ mod tests {
                     decider_principals: vec!["ops".into()],
                     decider_is_namespace_admin: true,
                     delegating_actor: None,
+                    execution_claim: None,
                 },
                 "ops",
                 20,
@@ -2982,6 +3057,7 @@ mod tests {
                     decider_principals: vec!["ops-admin".into()],
                     decider_is_namespace_admin: true,
                     delegating_actor: None,
+                    execution_claim: None,
                 },
                 "ops-admin",
                 45,
@@ -3047,6 +3123,7 @@ mod tests {
             binding_markings: Vec::new(),
             source_object_id: String::new(),
             marking_gate: Default::default(),
+                    expected_object_revision: String::new(),
                     offline: None,
                 },
                 "alice",
@@ -3222,6 +3299,7 @@ mod tests {
             binding_markings: Vec::new(),
             source_object_id: String::new(),
             marking_gate: Default::default(),
+            expected_object_revision: String::new(),
             offline: None,
         }
     }
@@ -3868,6 +3946,7 @@ mod tests {
             decider_principals: vec![principal.into()],
             decider_is_namespace_admin: false,
             delegating_actor: None,
+            execution_claim: None,
         }
     }
 
@@ -4468,6 +4547,7 @@ mod tests {
                 &parked.parked_object_digest,
                 Some(&write),
                 "alice",
+                None,
             )
             .unwrap(),
             ParkedGrantOutcome::Stale
@@ -4495,6 +4575,7 @@ mod tests {
                 &current_digest,
                 Some(&write),
                 "alice",
+                None,
             )
             .unwrap(),
             ParkedGrantOutcome::NotParked

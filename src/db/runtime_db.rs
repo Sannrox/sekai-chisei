@@ -4470,6 +4470,7 @@ impl RuntimeDb {
         parked_object_digest: &str,
         write: Option<&crate::sekai::action_instance::ParkedGrantWrite>,
         actor: &str,
+        claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     ) -> Result<crate::sekai::action_instance::ParkedGrantOutcome, String> {
         match self {
             Self::Sqlite(db) => db.grant_parked_action_instance(
@@ -4478,6 +4479,7 @@ impl RuntimeDb {
                 parked_object_digest,
                 write,
                 actor,
+                claim,
             ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.grant_parked_action_instance(
@@ -4486,6 +4488,7 @@ impl RuntimeDb {
                     parked_object_digest,
                     write,
                     actor,
+                    claim,
                 )
             }),
         }

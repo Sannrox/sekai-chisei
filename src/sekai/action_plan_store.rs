@@ -5,7 +5,9 @@
 
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
+use crate::sekai::action_instance::ActionInstance;
 use crate::sekai::action_plan::{PlanIntent, PlanSimulation, ProposedPlan};
+use crate::sekai::plan_execution::PlanExecution;
 use crate::sekai::plan_review::PlanReview;
 
 const CREATE_SQLITE: &str = "
@@ -39,6 +41,14 @@ CREATE TABLE IF NOT EXISTS sekai_plan_reviews (
     decision TEXT NOT NULL DEFAULT '',
     body_json TEXT NOT NULL,
     submitted_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (namespace, plan_id)
+);
+CREATE TABLE IF NOT EXISTS sekai_plan_executions (
+    namespace TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    body_json TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
     PRIMARY KEY (namespace, plan_id)
 );
 ";
@@ -239,6 +249,114 @@ impl SekaiDb {
             .map(|updated| updated == 1)
             .map_err(|error| error.to_string())
     }
+
+    pub fn put_plan_execution(&self, execution: &PlanExecution) -> Result<PlanExecution, String> {
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_plan_executions
+                     (namespace, plan_id, revision, body_json, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+                rusqlite::params![
+                    execution.namespace,
+                    execution.plan_id,
+                    execution.revision as i64,
+                    encode(execution)?,
+                    execution.updated_at_ms
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.get_plan_execution(&execution.namespace, &execution.plan_id)?
+            .ok_or_else(|| "plan execution vanished after write".into())
+    }
+
+    pub fn get_plan_execution(
+        &self,
+        namespace: &str,
+        plan_id: &str,
+    ) -> Result<Option<PlanExecution>, String> {
+        self.sqlite_one(
+            "SELECT body_json FROM sekai_plan_executions WHERE namespace = ?1 AND plan_id = ?2",
+            &[&namespace, &plan_id],
+        )?
+        .map(|json| decode(&json))
+        .transpose()
+    }
+
+    /// Writes `execution` only over `expected_revision`; `false` when
+    /// another executor advanced it first.
+    pub fn advance_plan_execution(
+        &self,
+        execution: &PlanExecution,
+        expected_revision: u64,
+    ) -> Result<bool, String> {
+        self.conn()
+            .execute(
+                "UPDATE sekai_plan_executions
+                 SET revision = ?3, body_json = ?4, updated_at_ms = ?5
+                 WHERE namespace = ?1 AND plan_id = ?2 AND revision = ?6",
+                rusqlite::params![
+                    execution.namespace,
+                    execution.plan_id,
+                    execution.revision as i64,
+                    encode(execution)?,
+                    execution.updated_at_ms,
+                    expected_revision as i64
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Takes the unused key of a stopped step with `closing` (a denied
+    /// record), only while `holder` still owns the plan's execution. False
+    /// when the key is taken or the claim is lost.
+    pub fn close_plan_step_key(
+        &self,
+        closing: &ActionInstance,
+        plan_id: &str,
+        holder: &str,
+    ) -> Result<bool, String> {
+        self.migrate_action_instances()?;
+        closing.validate_fields()?;
+        let evidence_json =
+            serde_json::to_string(&closing.evidence_submission_ids).map_err(|e| e.to_string())?;
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_action_instances
+                 (instance_id, namespace, type_id, version, principal, parameters_json,
+                  request_digest, idempotency_key, operation_id, status, deny_reason,
+                  evidence_submission_ids_json, policy_decision, budget_decision,
+                  created_at_ms, decided_at_ms, body_json)
+                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17
+                 WHERE EXISTS (SELECT 1 FROM sekai_plan_executions
+                               WHERE namespace = ?2 AND plan_id = ?18
+                                 AND json_extract(body_json, '$.claim_holder') = ?19)
+                 ON CONFLICT (namespace, idempotency_key) DO NOTHING",
+                rusqlite::params![
+                    closing.instance_id,
+                    closing.namespace,
+                    closing.type_id,
+                    closing.version,
+                    closing.principal,
+                    closing.parameters_json,
+                    closing.request_digest,
+                    closing.idempotency_key,
+                    closing.operation_id,
+                    closing.status,
+                    closing.deny_reason,
+                    evidence_json,
+                    closing.policy_decision,
+                    closing.budget_decision,
+                    closing.created_at_ms,
+                    closing.decided_at_ms,
+                    encode(closing)?,
+                    plan_id,
+                    holder
+                ],
+            )
+            .map(|inserted| inserted == 1)
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl PostgresDb {
@@ -416,6 +534,112 @@ impl PostgresDb {
             .map(|updated| updated == 1)
             .map_err(|error| error.to_string())
     }
+    pub fn put_plan_execution(&self, execution: &PlanExecution) -> Result<PlanExecution, String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_plan_executions
+                     (namespace, plan_id, revision, body_json, updated_at_ms)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                &[
+                    &execution.namespace,
+                    &execution.plan_id,
+                    &(execution.revision as i64),
+                    &encode(execution)?,
+                    &execution.updated_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.get_plan_execution(&execution.namespace, &execution.plan_id)?
+            .ok_or_else(|| "plan execution vanished after write".into())
+    }
+
+    pub fn get_plan_execution(
+        &self,
+        namespace: &str,
+        plan_id: &str,
+    ) -> Result<Option<PlanExecution>, String> {
+        self.postgres_one(
+            "SELECT body_json FROM sekai_plan_executions WHERE namespace = $1 AND plan_id = $2",
+            &[&namespace, &plan_id],
+        )?
+        .map(|json| decode(&json))
+        .transpose()
+    }
+
+    pub fn advance_plan_execution(
+        &self,
+        execution: &PlanExecution,
+        expected_revision: u64,
+    ) -> Result<bool, String> {
+        self.connection()?
+            .execute(
+                "UPDATE sekai_plan_executions
+                 SET revision = $3, body_json = $4, updated_at_ms = $5
+                 WHERE namespace = $1 AND plan_id = $2 AND revision = $6",
+                &[
+                    &execution.namespace,
+                    &execution.plan_id,
+                    &(execution.revision as i64),
+                    &encode(execution)?,
+                    &execution.updated_at_ms,
+                    &(expected_revision as i64),
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// As on SQLite; the execution row is share-locked, so a takeover that
+    /// is replacing the claim commits first and the statement sees it.
+    pub fn close_plan_step_key(
+        &self,
+        closing: &ActionInstance,
+        plan_id: &str,
+        holder: &str,
+    ) -> Result<bool, String> {
+        closing.validate_fields()?;
+        let evidence_json =
+            serde_json::to_string(&closing.evidence_submission_ids).map_err(|e| e.to_string())?;
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_action_instances
+                 (instance_id, namespace, type_id, version, principal, parameters_json,
+                  request_digest, idempotency_key, operation_id, status, deny_reason,
+                  evidence_submission_ids_json, policy_decision, budget_decision,
+                  created_at_ms, decided_at_ms, body_json)
+                 SELECT $1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, $5::TEXT, $6::TEXT,
+                        $7::TEXT, $8::TEXT, $9::TEXT, $10::TEXT, $11::TEXT, $12::TEXT,
+                        $13::TEXT, $14::TEXT, $15::BIGINT, $16::BIGINT, $17::TEXT
+                 WHERE EXISTS (SELECT 1 FROM sekai_plan_executions
+                               WHERE namespace = $2 AND plan_id = $18
+                                 AND body_json::jsonb ->> 'claim_holder' = $19
+                               FOR SHARE)
+                 ON CONFLICT (namespace, idempotency_key) DO NOTHING",
+                &[
+                    &closing.instance_id,
+                    &closing.namespace,
+                    &closing.type_id,
+                    &closing.version,
+                    &closing.principal,
+                    &closing.parameters_json,
+                    &closing.request_digest,
+                    &closing.idempotency_key,
+                    &closing.operation_id,
+                    &closing.status,
+                    &closing.deny_reason,
+                    &evidence_json,
+                    &closing.policy_decision,
+                    &closing.budget_decision,
+                    &closing.created_at_ms,
+                    &closing.decided_at_ms,
+                    &encode(closing)?,
+                    &plan_id,
+                    &holder,
+                ],
+            )
+            .map(|inserted| inserted == 1)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Dispatches to the backend the plane runs on; PostgreSQL off the async
@@ -488,5 +712,34 @@ impl crate::db::runtime_db::RuntimeDb {
 
     pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
         dispatch!(self, db => db.decide_plan_review(review))
+    }
+
+    pub fn put_plan_execution(&self, execution: &PlanExecution) -> Result<PlanExecution, String> {
+        dispatch!(self, db => db.put_plan_execution(execution))
+    }
+
+    pub fn get_plan_execution(
+        &self,
+        namespace: &str,
+        plan_id: &str,
+    ) -> Result<Option<PlanExecution>, String> {
+        dispatch!(self, db => db.get_plan_execution(namespace, plan_id))
+    }
+
+    pub fn advance_plan_execution(
+        &self,
+        execution: &PlanExecution,
+        expected_revision: u64,
+    ) -> Result<bool, String> {
+        dispatch!(self, db => db.advance_plan_execution(execution, expected_revision))
+    }
+
+    pub fn close_plan_step_key(
+        &self,
+        closing: &ActionInstance,
+        plan_id: &str,
+        holder: &str,
+    ) -> Result<bool, String> {
+        dispatch!(self, db => db.close_plan_step_key(closing, plan_id, holder))
     }
 }

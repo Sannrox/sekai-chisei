@@ -1645,6 +1645,14 @@ pub(super) fn visible_action_object(
     action: crate::enterprise::NamespaceAction,
 ) -> Result<crate::domain::Object, Status> {
     let unavailable = || Status::permission_denied("object action unavailable");
+    // A refusal reads as unavailable; a dependency that failed stays an
+    // internal error, so a caller can tell it apart and retry.
+    let refused_or_internal = |status: Status| match status.code() {
+        tonic::Code::Internal | tonic::Code::Unavailable => {
+            Status::internal("object visibility unavailable")
+        }
+        _ => unavailable(),
+    };
     let namespace = namespace.trim();
     let object_id = object_id.trim();
     if namespace.is_empty() || object_id.is_empty() {
@@ -1667,7 +1675,7 @@ pub(super) fn visible_action_object(
         &object.namespace,
         action,
     )
-    .map_err(|_| unavailable())?;
+    .map_err(refused_or_internal)?;
     require_visible_object_contents(
         service.db.runtime(),
         &service.security,
@@ -1678,7 +1686,7 @@ pub(super) fn visible_action_object(
         None,
     )
     .map(|(object, _)| object)
-    .map_err(|_| unavailable())
+    .map_err(refused_or_internal)
 }
 pub(super) fn map_object_action_projection_error(
     error: crate::sekai::action_describe_preview::ObjectActionProjectionError,
@@ -1690,6 +1698,9 @@ pub(super) fn map_object_action_projection_error(
         crate::sekai::action_describe_preview::ObjectActionProjectionError::InvalidArgument(
             message,
         ) => Status::invalid_argument(message),
+        crate::sekai::action_describe_preview::ObjectActionProjectionError::Store(_) => {
+            Status::internal("object action store unavailable")
+        }
     }
 }
 pub(super) fn object_action_description_to_proto(

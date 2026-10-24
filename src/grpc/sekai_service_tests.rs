@@ -29293,3 +29293,101 @@ async fn a_proposal_introducing_an_orphan_type_merges_only_with_a_suppression() 
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn the_planner_executes_a_granted_plan_and_get_plan_reads_it() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    let digest = simulated_plan(&svc, "plan-x", "sim-1", steps).await;
+    svc.submit_plan_review(with_principal(SubmitPlanReviewRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-x".into(),
+        simulation_id: "sim-1".into(),
+    }))
+    .await
+    .unwrap();
+    decide_plan(&svc, "plan-x", &digest, "grant", "alice")
+        .await
+        .unwrap();
+    let execute = |principal: &str| {
+        with_named_principal(
+            ExecuteActionPlanRequest {
+                namespace: "acme".into(),
+                plan_id: "plan-x".into(),
+            },
+            principal,
+        )
+    };
+    // Only the planner runs the plan; to anyone else it does not exist.
+    for other in ["alice", "bob"] {
+        let refused = svc.execute_action_plan(execute(other)).await.unwrap_err();
+        assert!(
+            matches!(
+                refused.code(),
+                tonic::Code::NotFound | tonic::Code::PermissionDenied
+            ),
+            "{other}: {refused:?}"
+        );
+    }
+    let execution = svc
+        .execute_action_plan(execute("tester"))
+        .await
+        .unwrap()
+        .into_inner()
+        .execution
+        .unwrap();
+    assert_eq!(execution.status, "completed", "{execution:?}");
+    assert_eq!(execution.steps.len(), 3);
+    assert!(execution.steps.iter().all(|step| step.status == "admitted"));
+    let read = svc
+        .get_plan(with_principal(GetPlanRequest {
+            namespace: "acme".into(),
+            plan_id: "plan-x".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.execution.unwrap(), execution);
+}
+
+#[tokio::test]
+async fn a_plan_whose_approver_holds_no_active_credential_stops_before_any_step() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    let digest = simulated_plan(&svc, "plan-x", "sim-1", steps).await;
+    svc.submit_plan_review(with_principal(SubmitPlanReviewRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-x".into(),
+        simulation_id: "sim-1".into(),
+    }))
+    .await
+    .unwrap();
+    decide_plan(&svc, "plan-x", &digest, "grant", "alice")
+        .await
+        .unwrap();
+    // Credentials are in use, and the approver holds none.
+    svc.db
+        .runtime()
+        .create_principal_credential(
+            "tester",
+            &sekai_domain::gateway_keys::hash_gateway_key("planner-token"),
+            1,
+        )
+        .unwrap();
+    let execution = svc
+        .execute_action_plan(with_named_principal(
+            ExecuteActionPlanRequest {
+                namespace: "acme".into(),
+                plan_id: "plan-x".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .execution
+        .unwrap();
+    assert_eq!(execution.status, "stopped", "{execution:?}");
+    assert_eq!(execution.stop_reason, "approver_authority_revoked");
+    assert!(execution.steps.is_empty());
+}

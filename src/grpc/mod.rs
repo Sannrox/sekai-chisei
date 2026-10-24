@@ -822,6 +822,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetPlan"
             | "SubmitPlanReview"
             | "DecidePlanReview"
+            | "ExecuteActionPlan"
             | "GetActionInstance"
             | "ListActionInstances"
             | "GetActionEffect"
@@ -2102,6 +2103,8 @@ mod tests {
             (SpaceRole::Viewer, "GetPlan", true),
             (SpaceRole::Viewer, "SubmitPlanReview", false),
             (SpaceRole::Editor, "SubmitPlanReview", true),
+            (SpaceRole::Viewer, "ExecuteActionPlan", false),
+            (SpaceRole::Editor, "ExecuteActionPlan", true),
             (SpaceRole::Approver, "CreateObject", false),
             (SpaceRole::Administrator, "CreateObject", true),
         ] {
