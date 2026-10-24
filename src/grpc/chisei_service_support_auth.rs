@@ -1,5 +1,6 @@
 use super::*;
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
+use crate::ext::*;
 
 pub(super) fn evaluation_gate_suite_digest(suite: &crate::chisei::eval::Suite) -> String {
     let snapshot = EvaluationGateSuiteSnapshot {

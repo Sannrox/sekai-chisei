@@ -3,8 +3,32 @@ use crate::chisei::portfolio::{
 };
 use crate::db::postgres::PostgresDb;
 
-impl PostgresDb {
-    pub fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String> {
+pub trait PostgresPortfolioPostgresDbExt {
+    fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String>;
+
+    fn portfolio_points(
+        &self,
+        namespace: &str,
+        task_class: &str,
+    ) -> Result<Vec<FrontierPoint>, String>;
+
+    fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String>;
+
+    fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String>;
+
+    fn portfolio_damped_route(
+        &self,
+        namespace: &str,
+        task_class: &str,
+        proposed_model: &str,
+        proposed_prompt_variant: &str,
+        now_ms: i64,
+        force: bool,
+    ) -> Result<RouteSelection, String>;
+}
+
+impl PostgresPortfolioPostgresDbExt for PostgresDb {
+    fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String> {
         let prompt_variant =
             crate::chisei::portfolio::normalize_prompt_variant(&observation.prompt_variant);
         self.connection()?
@@ -40,7 +64,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn portfolio_points(
+    fn portfolio_points(
         &self,
         namespace: &str,
         task_class: &str,
@@ -68,7 +92,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String> {
+    fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String> {
         let namespace = objective.namespace.trim();
         self.connection()?
             .execute(
@@ -94,7 +118,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String> {
+    fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String> {
         self.connection()?
             .query_opt(
                 "SELECT namespace, mode, budget_usd_micros, quality_bar, min_samples, updated_at
@@ -116,7 +140,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn portfolio_damped_route(
+    fn portfolio_damped_route(
         &self,
         namespace: &str,
         task_class: &str,

@@ -285,6 +285,7 @@ fn nonnegative_u64(event: &OperationReceiptEvent, key: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::chisei::receipt::OPERATION_RECEIPT_VERSION;
+    use crate::chisei_store::ChiseiRuntimeDb;
     use crate::domain::Object;
     use crate::sekai::security::{Grant, Role};
     use std::collections::HashMap;

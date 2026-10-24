@@ -258,17 +258,7 @@ fn site_id_env(key: &str, default: &str) -> String {
 
 /// Validate a region/site pin used for lease and permit pinning.
 pub fn validate_site_id(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("site_id must not be empty".into());
-    }
-    if trimmed.len() > 128 {
-        return Err("site_id must be at most 128 characters".into());
-    }
-    if trimmed.contains('*') || trimmed.contains('?') || trimmed.contains('\0') {
-        return Err("site_id must not contain wildcards or null bytes".into());
-    }
-    Ok(trimmed.to_string())
+    crate::sekai::lease::validate_site_id(value)
 }
 
 fn socket_path(key: &str, default: &str) -> Option<String> {

@@ -18,6 +18,7 @@ use crate::chisei::sekai_facts::SekaiFactReader;
 use crate::chisei_store::{ChiseiDecisionStore, ChiseiStore};
 use crate::db::store::SekaiStore;
 use crate::domain::Object;
+use crate::ext::*;
 use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
 use crate::sekai::compute;
 use crate::sekai::governed_facts::{FACT_KIND, PROFILE_KIND, WAIVER_KIND};

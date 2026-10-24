@@ -45,8 +45,47 @@ fn decode_feedback(
     }
 }
 
-impl PostgresDb {
-    pub fn put_model_release_trust(
+pub trait PostgresModelReleaseEvidencePostgresDbExt {
+    fn put_model_release_trust(
+        &self,
+        roots: &EvaluationTrustRoots,
+        updated_at_ms: i64,
+    ) -> Result<(), String>;
+
+    fn get_model_release_trust(&self) -> Result<Option<EvaluationTrustRoots>, String>;
+
+    fn put_model_runtime_evidence(
+        &self,
+        evidence: &ModelRuntimeEvidence,
+        ingested_at_ms: i64,
+    ) -> Result<(), String>;
+
+    fn get_model_runtime_evidence(
+        &self,
+        identity: &ModelReleaseIdentity,
+    ) -> Result<Option<String>, String>;
+
+    fn put_model_evaluation_export(
+        &self,
+        evidence: &ModelEvaluationEvidence,
+        exported_at_ms: i64,
+    ) -> Result<(), String>;
+
+    fn get_model_evaluation_export(
+        &self,
+        identity: &ModelReleaseIdentity,
+    ) -> Result<Option<String>, String>;
+
+    fn put_model_release_feedback(&self, record: &ModelReleaseFeedback) -> Result<(), String>;
+
+    fn list_model_release_feedback(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ModelReleaseFeedback>, String>;
+}
+
+impl PostgresModelReleaseEvidencePostgresDbExt for PostgresDb {
+    fn put_model_release_trust(
         &self,
         roots: &EvaluationTrustRoots,
         updated_at_ms: i64,
@@ -66,7 +105,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn get_model_release_trust(&self) -> Result<Option<EvaluationTrustRoots>, String> {
+    fn get_model_release_trust(&self) -> Result<Option<EvaluationTrustRoots>, String> {
         self.connection()?
             .query_opt(
                 "SELECT roots_json FROM chisei_model_release_trust WHERE id = 1",
@@ -83,7 +122,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn put_model_runtime_evidence(
+    fn put_model_runtime_evidence(
         &self,
         evidence: &ModelRuntimeEvidence,
         ingested_at_ms: i64,
@@ -117,7 +156,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn get_model_runtime_evidence(
+    fn get_model_runtime_evidence(
         &self,
         identity: &ModelReleaseIdentity,
     ) -> Result<Option<String>, String> {
@@ -135,7 +174,7 @@ impl PostgresDb {
             .map(|row| row.get(0)))
     }
 
-    pub fn put_model_evaluation_export(
+    fn put_model_evaluation_export(
         &self,
         evidence: &ModelEvaluationEvidence,
         exported_at_ms: i64,
@@ -167,7 +206,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn get_model_evaluation_export(
+    fn get_model_evaluation_export(
         &self,
         identity: &ModelReleaseIdentity,
     ) -> Result<Option<String>, String> {
@@ -185,7 +224,7 @@ impl PostgresDb {
             .map(|row| row.get(0)))
     }
 
-    pub fn put_model_release_feedback(&self, record: &ModelReleaseFeedback) -> Result<(), String> {
+    fn put_model_release_feedback(&self, record: &ModelReleaseFeedback) -> Result<(), String> {
         record.validate()?;
         let parts = identity_params(&record.identity);
         self.connection()?
@@ -221,7 +260,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn list_model_release_feedback(
+    fn list_model_release_feedback(
         &self,
         namespace: &str,
     ) -> Result<Vec<ModelReleaseFeedback>, String> {

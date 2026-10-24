@@ -157,8 +157,14 @@ fn source(file: &str) -> &'static str {
         PROBES_FILE => include_str!("isolation_probes.rs"),
         SEKAI_TESTS => include_str!("sekai_service_tests.rs"),
         CHISEI_TESTS => include_str!("chisei_service_tests.rs"),
-        "src/sekai/function_document.rs" => include_str!("../sekai/function_document.rs"),
-        "src/sekai/action_work_lifecycle.rs" => include_str!("../sekai/action_work_lifecycle.rs"),
+        "src/sekai/function_document.rs" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/sekai-core/src/sekai/function_document.rs"
+        )),
+        "src/sekai/action_work_lifecycle.rs" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/sekai-core/src/sekai/action_work_lifecycle.rs"
+        )),
         other => panic!("catalogue names an unknown source file {other}"),
     }
 }

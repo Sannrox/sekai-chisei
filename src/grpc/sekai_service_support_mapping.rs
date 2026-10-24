@@ -1,4 +1,5 @@
 use super::*;
+use crate::ext::*;
 
 pub(super) type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
 

@@ -45,6 +45,15 @@ const TENANT_CONTEXT_HEADER: &str = "x-sekai-tenant-id";
 /// authority-bearing. Tenant hints are stripped and therefore absent here.
 pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization", "x-principal"];
 
+pub(crate) fn write_freeze_status(err: crate::sekai::write_freeze::WriteFreezeError) -> Status {
+    match err {
+        crate::sekai::write_freeze::WriteFreezeError::Frozen(reason) => {
+            Status::failed_precondition(reason)
+        }
+        crate::sekai::write_freeze::WriteFreezeError::Internal(error) => Status::internal(error),
+    }
+}
+
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
     store: Arc<PrincipalCredentialStore>,

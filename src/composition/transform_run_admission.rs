@@ -14,6 +14,7 @@ use crate::chisei_store::ChiseiStore;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
 use crate::enterprise::AuthenticatedContext;
+use crate::ext::*;
 use crate::sekai::governed_transform::{TRANSFORM_CLASS, TransformRun};
 
 pub fn receipt_from_transform_run(

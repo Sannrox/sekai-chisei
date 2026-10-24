@@ -440,7 +440,8 @@ impl SekaiServiceImpl {
                 true,
             ));
         }
-        crate::sekai::write_freeze::refuse_if_frozen_any(self.db.runtime(), &freeze_checks)?;
+        crate::sekai::write_freeze::refuse_if_frozen_any(self.db.runtime(), &freeze_checks)
+            .map_err(crate::grpc::write_freeze_status)?;
         Ok((tenant, resource_tenant))
     }
 

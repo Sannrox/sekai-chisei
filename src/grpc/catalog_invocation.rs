@@ -8,6 +8,7 @@ use crate::chisei::receipt::{
     ReceiptSurface, UncoveredSurface,
 };
 use crate::db::runtime_db::RuntimeDb;
+use crate::ext::*;
 use crate::sekai::capability;
 
 /// Owns the durable receipt lifecycle for one catalog-attributed invocation.

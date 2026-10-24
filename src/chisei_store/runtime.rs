@@ -4,18 +4,22 @@
 
 use crate::chisei::eval;
 use crate::chisei::evaluation_execution::EvaluationExecutionIndex;
+use crate::chisei::evolve;
 use crate::chisei::external_action::{
-    AuthorizationClaim, AuthorizationRecord, ExternalActionRequest,
+    AuthorizationClaim, AuthorizationRecord, ExternalActionRequest, ExternalActionSekaiDbExt,
 };
 use crate::chisei::external_permit::{
-    ExternalPermitPolicy, HostContext, Permit, Redemption, RedemptionTiming,
+    ExternalPermitPolicy, ExternalPermitSekaiDbExt, HostContext, Permit, Redemption,
+    RedemptionTiming,
 };
 use crate::chisei::kioku::*;
 use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
-use crate::chisei_store::chisei_kioku::ChiseiKiokuBackend;
+use crate::chisei_store::ext::*;
+use crate::composition::sekai_principal::SekaiPrincipalRuntimeDbExt;
 use crate::db::runtime_db::RuntimeDb;
+use crate::sekai::evidence::EvidenceClassification;
 use ed25519_dalek::VerifyingKey;
-use sekai_domain::receipt::OperationReceipt;
+use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use sekai_types::principal::PrincipalContext;
 
 fn verify_evaluation_manifest(
@@ -29,7 +33,7 @@ fn verify_evaluation_manifest(
     Ok(manifest)
 }
 
-pub(crate) struct EvaluationManifestWrite {
+pub struct EvaluationManifestWrite {
     pub manifest: crate::chisei::evaluation_manifest::ResolvedEvaluationManifest,
     pub request_id: String,
     pub request_digest: String,
@@ -42,8 +46,729 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-impl RuntimeDb {
-    pub(crate) fn with_evaluation_resolution_snapshot<T, E, F, M>(
+pub trait ChiseiRuntimeDb {
+    fn with_evaluation_resolution_snapshot<T, E, F, M>(
+        &self,
+        operation: F,
+        map_db_error: M,
+    ) -> Result<
+        (
+            T,
+            Option<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest>,
+        ),
+        E,
+    >
+    where
+        F: FnOnce() -> Result<(T, Option<EvaluationManifestWrite>), E>,
+        M: Fn(String) -> E;
+
+    fn get_evaluation_execution_index(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<EvaluationExecutionIndex>, String>;
+
+    fn create_evaluation_execution(
+        &self,
+        index: &EvaluationExecutionIndex,
+        receipt: &OperationReceipt,
+    ) -> Result<EvaluationExecutionIndex, String>;
+
+    fn list_kioku_lifecycle_events_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String>;
+
+    fn list_kioku_outcomes_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MemoryOutcomeObservation>, String>;
+
+    fn abandon_external_action_claim(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+    ) -> Result<(), String>;
+
+    fn claim_external_action_authorization(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+        authorization_id: &str,
+        now_ms: i64,
+    ) -> Result<AuthorizationClaim, String>;
+
+    fn compare_and_swap_external_action_authorization(
+        &self,
+        expected: &AuthorizationRecord,
+        next: &AuthorizationRecord,
+    ) -> Result<bool, String>;
+
+    fn disable_kioku_memory(
+        &self,
+        id: &str,
+        version: u32,
+        actor: &str,
+        rationale: &str,
+        recorded_at_ms: i64,
+    ) -> Result<KiokuMemory, String>;
+
+    fn evaluate_kioku_impact_if_ready(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<Option<MemoryImpactEvaluation>, String>;
+
+    fn get_external_action_authorization_by_id(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<AuthorizationRecord>, String>;
+
+    fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String>;
+
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String>;
+
+    fn reassess_kioku_memory(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String>;
+
+    fn reassess_kioku_memory_after_graph_auth(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String>;
+
+    fn authorize_kioku_retrieval(&self, request: &MemoryRetrievalRequest) -> Result<(), String>;
+
+    fn authorize_kioku_evidence(
+        &self,
+        request: &KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String>;
+
+    fn put_evaluator_definition(
+        &self,
+        definition: crate::chisei::evaluation_plan::EvaluatorDefinition,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::chisei::evaluation_plan::EvaluatorDefinition, String>;
+
+    fn get_evaluator_definition(
+        &self,
+        definition_id: &str,
+    ) -> Result<Option<crate::chisei::evaluation_plan::EvaluatorDefinition>, String>;
+
+    fn list_evaluator_definitions(
+        &self,
+        namespace: &str,
+        evaluator_id: Option<&str>,
+    ) -> Result<Vec<crate::chisei::evaluation_plan::EvaluatorDefinition>, String>;
+
+    fn get_evaluator_availability(
+        &self,
+        definition_id: &str,
+    ) -> Result<Option<crate::chisei::evaluation_plan::EvaluatorAvailability>, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_evaluator_availability(
+        &self,
+        definition_id: &str,
+        state: &str,
+        superseded_by_definition_id: &str,
+        reason: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::chisei::evaluation_plan::EvaluatorAvailability, String>;
+
+    fn put_evaluation_plan(
+        &self,
+        plan: crate::chisei::evaluation_plan::EvaluationPlan,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::chisei::evaluation_plan::EvaluationPlan, String>;
+
+    fn get_evaluation_manifest(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest>, String>;
+
+    fn get_evaluation_manifest_for_request(
+        &self,
+        namespace: &str,
+        actor: &str,
+        request_id: &str,
+    ) -> Result<Option<crate::chisei::evaluation_manifest::EvaluationManifestReplay>, String>;
+
+    fn put_evaluation_manifest(
+        &self,
+        manifest: &crate::chisei::evaluation_manifest::ResolvedEvaluationManifest,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest, String>;
+
+    fn get_evaluation_plan(
+        &self,
+        plan_version_id: &str,
+    ) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String>;
+
+    fn list_evaluation_plans(
+        &self,
+        namespace: &str,
+        plan_id: Option<&str>,
+    ) -> Result<Vec<crate::chisei::evaluation_plan::EvaluationPlan>, String>;
+
+    fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+
+    fn list_kioku_candidates(
+        &self,
+        namespace: &str,
+        operation_class: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KiokuMemory>, String>;
+
+    fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&crate::chisei::kioku::KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String>;
+
+    fn list_kioku_evidence(&self, id: &str, version: u32)
+    -> Result<Vec<KiokuEvidenceLink>, String>;
+
+    fn list_kioku_lifecycle_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String>;
+
+    fn list_kioku_outcome_assignments(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<MemoryOutcomeAssignment>, String>;
+
+    fn list_unscored_observations(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String>;
+
+    fn put_external_action_authorization(&self, record: &AuthorizationRecord)
+    -> Result<(), String>;
+
+    fn put_hosted_routing_profile(
+        &self,
+        profile: &crate::chisei::routing_profiles::HostedRoutingProfile,
+    ) -> Result<(), String>;
+
+    fn list_hosted_routing_profiles(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String>;
+
+    fn revoke_hosted_routing_profile(
+        &self,
+        namespace: &str,
+        profile_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn list_all_hosted_routing_profiles(
+        &self,
+    ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String>;
+
+    fn start_policy_shadow(
+        &self,
+        shadow: &crate::chisei::policy_shadow::PolicyShadow,
+    ) -> Result<(), String>;
+
+    fn stop_policy_shadow(
+        &self,
+        namespace: &str,
+        shadow_id: Option<&str>,
+        unclaimed_at_ms: Option<i64>,
+    ) -> Result<bool, String>;
+
+    fn claim_policy_shadow_activation(
+        &self,
+        namespace: &str,
+        shadow_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn confirm_policy_shadow_activation(
+        &self,
+        namespace: &str,
+        shadow_id: &str,
+        claimed_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn find_policy_shadow(
+        &self,
+        scopes: &[String],
+    ) -> Result<Option<crate::chisei::policy_shadow::PolicyShadow>, String>;
+
+    fn record_policy_shadow_observation(
+        &self,
+        shadow_id: &str,
+        sample: &crate::chisei::policy_shadow::ShadowSample,
+    ) -> Result<(), String>;
+
+    fn policy_shadow_report(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<crate::chisei::policy_shadow::PolicyShadowReport>, String>;
+
+    fn put_model_review_record(
+        &self,
+        record: &crate::chisei::model_review::ModelReviewRecord,
+    ) -> Result<(), String>;
+
+    fn insert_model_review_record_if_absent(
+        &self,
+        record: &crate::chisei::model_review::ModelReviewRecord,
+    ) -> Result<bool, String>;
+
+    fn get_model_review_record(
+        &self,
+        namespace: &str,
+        provider: &str,
+        model: &str,
+        artifact_digest: &str,
+    ) -> Result<Option<crate::chisei::model_review::ModelReviewRecord>, String>;
+
+    fn list_model_review_records(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::chisei::model_review::ModelReviewRecord>, String>;
+
+    fn put_family_enablement_record(
+        &self,
+        record: &crate::chisei::model_review::FamilyEnablementRecord,
+    ) -> Result<(), String>;
+
+    fn insert_family_enablement_record_if_absent(
+        &self,
+        record: &crate::chisei::model_review::FamilyEnablementRecord,
+    ) -> Result<bool, String>;
+
+    fn get_family_enablement_record(
+        &self,
+        namespace: &str,
+        region_label: &str,
+        family_id: &str,
+    ) -> Result<Option<crate::chisei::model_review::FamilyEnablementRecord>, String>;
+
+    fn list_family_enablement_records(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::chisei::model_review::FamilyEnablementRecord>, String>;
+
+    fn model_review_row_count(&self) -> Result<i64, String>;
+
+    fn family_enablement_row_count(&self) -> Result<i64, String>;
+
+    fn put_model_release_trust(
+        &self,
+        roots: &crate::chisei::model_release_evidence::EvaluationTrustRoots,
+        updated_at_ms: i64,
+    ) -> Result<(), String>;
+
+    fn get_model_release_trust(
+        &self,
+    ) -> Result<Option<crate::chisei::model_release_evidence::EvaluationTrustRoots>, String>;
+
+    fn put_model_runtime_evidence(
+        &self,
+        evidence: &crate::chisei::model_release_evidence::ModelRuntimeEvidence,
+        ingested_at_ms: i64,
+    ) -> Result<(), String>;
+
+    fn get_model_runtime_evidence(
+        &self,
+        identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity,
+    ) -> Result<Option<String>, String>;
+
+    fn put_model_evaluation_export(
+        &self,
+        evidence: &crate::chisei::model_release_evidence::ModelEvaluationEvidence,
+        exported_at_ms: i64,
+    ) -> Result<(), String>;
+
+    fn get_model_evaluation_export(
+        &self,
+        identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity,
+    ) -> Result<Option<String>, String>;
+
+    fn put_model_release_feedback(
+        &self,
+        record: &crate::chisei::model_release_evidence::ModelReleaseFeedback,
+    ) -> Result<(), String>;
+
+    fn list_model_release_feedback(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::chisei::model_release_evidence::ModelReleaseFeedback>, String>;
+
+    fn put_sample_observation(
+        &self,
+        obs: &crate::chisei::scoring::SampleObservation,
+    ) -> Result<(), String>;
+
+    fn get_sample_observation(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String>;
+
+    fn get_sample_observation_in_namespace(
+        &self,
+        request_id: &str,
+        namespace: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String>;
+
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String>;
+
+    fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String>;
+
+    fn redeem_or_reconcile_permit(
+        &self,
+        permit: &Permit,
+        context: &HostContext,
+        trusted_key: &VerifyingKey,
+        idempotency_key: &str,
+        execution_id: &str,
+        host_site_id: &str,
+        timing: RedemptionTiming,
+    ) -> Result<Redemption, String>;
+
+    fn release_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+    ) -> Result<(), String>;
+
+    fn reserve_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+        max_mutations: Option<u32>,
+        max_deletes: Option<u32>,
+    ) -> Result<(), String>;
+
+    fn review_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String>;
+
+    fn review_kioku_candidate_after_graph_auth(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String>;
+
+    fn set_external_permit_policy(
+        &self,
+        policy: &ExternalPermitPolicy,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String>;
+
+    fn put_learning_change(
+        &self,
+        record: &crate::chisei::learning_change::LearningChange,
+    ) -> Result<(), String>;
+
+    fn get_learning_change(
+        &self,
+        change_id: &str,
+    ) -> Result<Option<crate::chisei::learning_change::LearningChange>, String>;
+
+    fn list_learning_changes(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::chisei::learning_change::LearningChange>, String>;
+
+    fn put_data_quality_rule(
+        &self,
+        record: &crate::chisei::data_quality::DataQualityRule,
+    ) -> Result<(), String>;
+
+    fn get_data_quality_rule(
+        &self,
+        namespace: &str,
+        rule_id: &str,
+    ) -> Result<Option<crate::chisei::data_quality::DataQualityRule>, String>;
+
+    fn list_data_quality_rules(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::chisei::data_quality::DataQualityRule>, String>;
+
+    fn put_data_quality_result(
+        &self,
+        record: &crate::chisei::data_quality::DataQualityResult,
+    ) -> Result<(), String>;
+
+    fn get_data_quality_result(
+        &self,
+        result_id: &str,
+    ) -> Result<Option<crate::chisei::data_quality::DataQualityResult>, String>;
+
+    fn list_data_quality_results(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::chisei::data_quality::DataQualityResult>, String>;
+
+    fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String>;
+
+    fn get_latest_eval_run_record_for_gate(
+        &self,
+        suite_id: &str,
+        config_ref: &str,
+        max_timestamp_ms: i64,
+    ) -> Result<Option<eval::Run>, String>;
+
+    fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String>;
+
+    fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String>;
+
+    fn list_all_eval_iteration_records(&self) -> Result<Vec<eval::Iteration>, String>;
+
+    fn list_eval_iteration_records(&self, suite_id: &str) -> Result<Vec<eval::Iteration>, String>;
+
+    fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String>;
+
+    fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String>;
+
+    fn portfolio_damped_route(
+        &self,
+        namespace: &str,
+        task_class: &str,
+        proposed_model: &str,
+        proposed_prompt_variant: &str,
+        now_ms: i64,
+        force: bool,
+    ) -> Result<RouteSelection, String>;
+
+    fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String>;
+
+    fn portfolio_points(
+        &self,
+        namespace: &str,
+        task_class: &str,
+    ) -> Result<Vec<FrontierPoint>, String>;
+
+    fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String>;
+
+    fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String>;
+
+    fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String>;
+
+    fn put_eval_run(&self, run: &eval::Run) -> Result<(), String>;
+
+    fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String>;
+
+    fn append_feedback_eval_suite(&self, suite: &eval::Suite) -> Result<(), String>;
+
+    fn retrieve_kioku_memories(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String>;
+
+    fn retrieve_kioku_memories_after_graph_auth(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String>;
+
+    fn insert_kioku_memory(
+        &self,
+        memory: &KiokuMemory,
+        evidence: &[KiokuEvidenceLink],
+    ) -> Result<(), String>;
+
+    fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String>;
+
+    fn sweep_kioku_lifecycle(
+        &self,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryLifecycleSweep, String>;
+
+    fn count_active_kioku_promotions_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+    ) -> Result<i64, String>;
+
+    fn append_operation_receipt_event(
+        &self,
+        operation_id: &str,
+        event: OperationReceiptEvent,
+    ) -> Result<(OperationReceipt, bool), String>;
+
+    fn authorize_operation_reporter(
+        &self,
+        operation_id: &str,
+        principal: &str,
+        event_kinds: Vec<ReceiptEventKind>,
+    ) -> Result<bool, String>;
+
+    fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String>;
+
+    fn claim_gateway_request_alias_dispatch(
+        &self,
+        caller_scope: &str,
+        request_alias: &str,
+        request_id: &str,
+        operation_id: &str,
+        dispatch_token: &str,
+    ) -> Result<bool, String>;
+
+    fn delete_observation(&self, request_id: &str) -> Result<(), String>;
+
+    fn find_gateway_receipt_by_logical_operation_id(
+        &self,
+        operation_id: &str,
+        attempt: Option<u32>,
+    ) -> Result<Option<OperationReceipt>, String>;
+
+    fn find_operation_receipt_by_lookup_request_id(
+        &self,
+        request_id: &str,
+        caller_scope: Option<&str>,
+        initiating_actor: Option<&str>,
+    ) -> Result<Option<OperationReceipt>, String>;
+
+    fn find_operation_receipt_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<OperationReceipt>, String>;
+
+    fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String>;
+
+    fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String>;
+
+    fn list_evolve_task_records(&self) -> Result<Vec<evolve::TaskRecord>, String>;
+
+    fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String>;
+
+    fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String>;
+
+    fn put_delegated_permit(&self, permit: &Permit, issued_by: &str) -> Result<Permit, String>;
+
+    fn put_evolve_task(&self, task: &evolve::TaskRecord) -> Result<(), String>;
+
+    fn get_gunshi_allocation_state(&self, namespace: &str) -> Result<Option<String>, String>;
+
+    fn put_gunshi_allocation_state_cas(
+        &self,
+        namespace: &str,
+        revision_id: &str,
+        changed_at_ms: i64,
+        state_json: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<bool, String>;
+
+    fn put_operation_receipt_with_kioku_holdouts(
+        &self,
+        receipt: &OperationReceipt,
+        holdouts: &[(String, u32)],
+        actor: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), String>;
+
+    fn put_permit(
+        &self,
+        permit: &Permit,
+        idempotency_key: &str,
+        issued_by: &str,
+    ) -> Result<Permit, String>;
+
+    fn replay_permit(
+        &self,
+        authorization_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<Permit>, String>;
+
+    fn replay_redemption(
+        &self,
+        permit: &Permit,
+        idempotency_key: &str,
+        execution_id: &str,
+    ) -> Result<Option<Redemption>, String>;
+
+    fn reserve_gateway_request_alias(
+        &self,
+        caller_scope: &str,
+        request_alias: &str,
+        request_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, String>;
+
+    fn revoke_permit(
+        &self,
+        handle: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn set_permit_kill_switch(
+        &self,
+        kind: &str,
+        value: &str,
+        enabled: bool,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String>;
+
+    fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String>;
+
+    fn validate_permit_state(&self, permit: &Permit) -> Result<(), String>;
+
+    fn record_kioku_holdout(
+        &self,
+        id: &str,
+        version: u32,
+        operation_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn redeem_permit(
+        &self,
+        permit: &Permit,
+        context: &HostContext,
+        trusted_key: &VerifyingKey,
+        idempotency_key: &str,
+        execution_id: &str,
+        host_site_id: &str,
+        now_ms: i64,
+    ) -> Result<Redemption, String>;
+}
+
+impl ChiseiRuntimeDb for RuntimeDb {
+    fn with_evaluation_resolution_snapshot<T, E, F, M>(
         &self,
         operation: F,
         map_db_error: M,
@@ -143,7 +868,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_evaluation_execution_index(
+    fn get_evaluation_execution_index(
         &self,
         manifest_digest: &str,
     ) -> Result<Option<EvaluationExecutionIndex>, String> {
@@ -155,7 +880,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn create_evaluation_execution(
+    fn create_evaluation_execution(
         &self,
         index: &EvaluationExecutionIndex,
         receipt: &OperationReceipt,
@@ -168,7 +893,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_kioku_lifecycle_events_in_window(
+    fn list_kioku_lifecycle_events_in_window(
         &self,
         namespace: &str,
         start_timestamp_ms: i64,
@@ -193,7 +918,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_kioku_outcomes_in_window(
+    fn list_kioku_outcomes_in_window(
         &self,
         namespace: &str,
         start_timestamp_ms: i64,
@@ -218,7 +943,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn abandon_external_action_claim(
+    fn abandon_external_action_claim(
         &self,
         request: &ExternalActionRequest,
         request_digest: &str,
@@ -231,7 +956,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn claim_external_action_authorization(
+    fn claim_external_action_authorization(
         &self,
         request: &ExternalActionRequest,
         request_digest: &str,
@@ -256,7 +981,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn compare_and_swap_external_action_authorization(
+    fn compare_and_swap_external_action_authorization(
         &self,
         expected: &AuthorizationRecord,
         next: &AuthorizationRecord,
@@ -269,7 +994,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn disable_kioku_memory(
+    fn disable_kioku_memory(
         &self,
         id: &str,
         version: u32,
@@ -287,7 +1012,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn evaluate_kioku_impact_if_ready(
+    fn evaluate_kioku_impact_if_ready(
         &self,
         id: &str,
         version: u32,
@@ -312,7 +1037,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_external_action_authorization_by_id(
+    fn get_external_action_authorization_by_id(
         &self,
         authorization_id: &str,
     ) -> Result<Option<AuthorizationRecord>, String> {
@@ -324,7 +1049,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String> {
+    fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String> {
         match self {
             Self::Sqlite(db) => db.get_external_permit_policy(scope),
             Self::Postgres(db) => {
@@ -333,7 +1058,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
         match self {
             Self::Sqlite(db) => db.get_kioku_memory(id, version),
             Self::Postgres(db) => {
@@ -342,34 +1067,47 @@ impl RuntimeDb {
         }
     }
 
-    pub fn reassess_kioku_memory(
+    fn reassess_kioku_memory(
         &self,
         request: KiokuEvidenceReassessmentRequest,
     ) -> Result<KiokuEvidenceReassessmentResult, String> {
         match self {
-            Self::Sqlite(db) => db.reassess_kioku_memory(request),
-            Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.reassess_kioku_memory(request))
+            Self::Sqlite(db) => {
+                crate::chisei_store::chisei_kioku::ChiseiKiokuBackend::reassess_kioku_memory(
+                    db.as_ref(),
+                    request,
+                )
             }
-        }
-    }
-
-    pub fn reassess_kioku_memory_after_graph_auth(
-        &self,
-        request: KiokuEvidenceReassessmentRequest,
-    ) -> Result<KiokuEvidenceReassessmentResult, String> {
-        match self {
-            Self::Sqlite(db) => db.reassess_kioku_memory_after_graph_auth(request),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.reassess_kioku_memory_after_graph_auth(request)
+                crate::chisei_store::chisei_kioku::ChiseiKiokuBackend::reassess_kioku_memory(
+                    db.as_ref(),
+                    request,
+                )
             }),
         }
     }
 
-    pub fn authorize_kioku_retrieval(
+    fn reassess_kioku_memory_after_graph_auth(
         &self,
-        request: &MemoryRetrievalRequest,
-    ) -> Result<(), String> {
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String> {
+        match self {
+            Self::Sqlite(db) => {
+                crate::chisei_store::chisei_kioku::ChiseiKiokuBackend::reassess_kioku_memory_after_graph_auth(
+                    db.as_ref(),
+                    request,
+                )
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                crate::chisei_store::chisei_kioku::ChiseiKiokuBackend::reassess_kioku_memory_after_graph_auth(
+                    db.as_ref(),
+                    request,
+                )
+            }),
+        }
+    }
+
+    fn authorize_kioku_retrieval(&self, request: &MemoryRetrievalRequest) -> Result<(), String> {
         let actor = request.actor.trim();
         let namespace = request.namespace.trim();
         let authorized_ceiling = self.kioku_authorized_classification_ceiling(namespace, actor)?;
@@ -391,7 +1129,7 @@ impl RuntimeDb {
         Ok(())
     }
 
-    pub fn authorize_kioku_evidence(
+    fn authorize_kioku_evidence(
         &self,
         request: &KiokuEvidenceAuthorizationRequest,
     ) -> Result<(), String> {
@@ -403,7 +1141,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_evaluator_definition(
+    fn put_evaluator_definition(
         &self,
         definition: crate::chisei::evaluation_plan::EvaluatorDefinition,
         actor: &str,
@@ -417,7 +1155,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_evaluator_definition(
+    fn get_evaluator_definition(
         &self,
         definition_id: &str,
     ) -> Result<Option<crate::chisei::evaluation_plan::EvaluatorDefinition>, String> {
@@ -429,7 +1167,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_evaluator_definitions(
+    fn list_evaluator_definitions(
         &self,
         namespace: &str,
         evaluator_id: Option<&str>,
@@ -442,7 +1180,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_evaluator_availability(
+    fn get_evaluator_availability(
         &self,
         definition_id: &str,
     ) -> Result<Option<crate::chisei::evaluation_plan::EvaluatorAvailability>, String> {
@@ -455,7 +1193,7 @@ impl RuntimeDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn set_evaluator_availability(
+    fn set_evaluator_availability(
         &self,
         definition_id: &str,
         state: &str,
@@ -489,7 +1227,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_evaluation_plan(
+    fn put_evaluation_plan(
         &self,
         plan: crate::chisei::evaluation_plan::EvaluationPlan,
         actor: &str,
@@ -503,7 +1241,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_evaluation_manifest(
+    fn get_evaluation_manifest(
         &self,
         manifest_digest: &str,
     ) -> Result<Option<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest>, String>
@@ -527,7 +1265,7 @@ impl RuntimeDb {
             .transpose()
     }
 
-    pub fn get_evaluation_manifest_for_request(
+    fn get_evaluation_manifest_for_request(
         &self,
         namespace: &str,
         actor: &str,
@@ -549,7 +1287,7 @@ impl RuntimeDb {
             .transpose()
     }
 
-    pub fn put_evaluation_manifest(
+    fn put_evaluation_manifest(
         &self,
         manifest: &crate::chisei::evaluation_manifest::ResolvedEvaluationManifest,
         request_id: &str,
@@ -569,7 +1307,7 @@ impl RuntimeDb {
         Ok(stored)
     }
 
-    pub fn get_evaluation_plan(
+    fn get_evaluation_plan(
         &self,
         plan_version_id: &str,
     ) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String> {
@@ -581,7 +1319,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_evaluation_plans(
+    fn list_evaluation_plans(
         &self,
         namespace: &str,
         plan_id: Option<&str>,
@@ -594,7 +1332,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
+    fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
         match self {
             Self::Sqlite(db) => db.list_external_action_authorizations(),
             Self::Postgres(db) => {
@@ -603,7 +1341,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_kioku_candidates(
+    fn list_kioku_candidates(
         &self,
         namespace: &str,
         operation_class: Option<&str>,
@@ -617,7 +1355,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_kioku_candidate_page(
+    fn list_kioku_candidate_page(
         &self,
         namespace: &str,
         limit: usize,
@@ -631,7 +1369,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_kioku_evidence(
+    fn list_kioku_evidence(
         &self,
         id: &str,
         version: u32,
@@ -644,7 +1382,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_kioku_lifecycle_events(
+    fn list_kioku_lifecycle_events(
         &self,
         id: &str,
         version: u32,
@@ -657,7 +1395,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_kioku_outcome_assignments(
+    fn list_kioku_outcome_assignments(
         &self,
         operation_id: &str,
     ) -> Result<Vec<MemoryOutcomeAssignment>, String> {
@@ -670,7 +1408,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_unscored_observations(
+    fn list_unscored_observations(
         &self,
         limit: i32,
     ) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String> {
@@ -682,7 +1420,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_external_action_authorization(
+    fn put_external_action_authorization(
         &self,
         record: &AuthorizationRecord,
     ) -> Result<(), String> {
@@ -694,7 +1432,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_hosted_routing_profile(
+    fn put_hosted_routing_profile(
         &self,
         profile: &crate::chisei::routing_profiles::HostedRoutingProfile,
     ) -> Result<(), String> {
@@ -707,7 +1445,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_hosted_routing_profiles(
+    fn list_hosted_routing_profiles(
         &self,
         namespace: &str,
     ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String> {
@@ -722,7 +1460,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn revoke_hosted_routing_profile(
+    fn revoke_hosted_routing_profile(
         &self,
         namespace: &str,
         profile_id: &str,
@@ -742,7 +1480,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_all_hosted_routing_profiles(
+    fn list_all_hosted_routing_profiles(
         &self,
     ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String> {
         use crate::chisei_store::chisei_routing_profile::ChiseiRoutingProfileBackend;
@@ -754,7 +1492,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn start_policy_shadow(
+    fn start_policy_shadow(
         &self,
         shadow: &crate::chisei::policy_shadow::PolicyShadow,
     ) -> Result<(), String> {
@@ -766,7 +1504,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn stop_policy_shadow(
+    fn stop_policy_shadow(
         &self,
         namespace: &str,
         shadow_id: Option<&str>,
@@ -780,7 +1518,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn claim_policy_shadow_activation(
+    fn claim_policy_shadow_activation(
         &self,
         namespace: &str,
         shadow_id: &str,
@@ -794,7 +1532,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn confirm_policy_shadow_activation(
+    fn confirm_policy_shadow_activation(
         &self,
         namespace: &str,
         shadow_id: &str,
@@ -811,7 +1549,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn find_policy_shadow(
+    fn find_policy_shadow(
         &self,
         scopes: &[String],
     ) -> Result<Option<crate::chisei::policy_shadow::PolicyShadow>, String> {
@@ -823,7 +1561,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn record_policy_shadow_observation(
+    fn record_policy_shadow_observation(
         &self,
         shadow_id: &str,
         sample: &crate::chisei::policy_shadow::ShadowSample,
@@ -836,7 +1574,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn policy_shadow_report(
+    fn policy_shadow_report(
         &self,
         namespace: &str,
     ) -> Result<Option<crate::chisei::policy_shadow::PolicyShadowReport>, String> {
@@ -848,7 +1586,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_model_review_record(
+    fn put_model_review_record(
         &self,
         record: &crate::chisei::model_review::ModelReviewRecord,
     ) -> Result<(), String> {
@@ -861,7 +1599,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn insert_model_review_record_if_absent(
+    fn insert_model_review_record_if_absent(
         &self,
         record: &crate::chisei::model_review::ModelReviewRecord,
     ) -> Result<bool, String> {
@@ -874,7 +1612,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_model_review_record(
+    fn get_model_review_record(
         &self,
         namespace: &str,
         provider: &str,
@@ -898,7 +1636,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_model_review_records(
+    fn list_model_review_records(
         &self,
         namespace: &str,
     ) -> Result<Vec<crate::chisei::model_review::ModelReviewRecord>, String> {
@@ -911,7 +1649,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_family_enablement_record(
+    fn put_family_enablement_record(
         &self,
         record: &crate::chisei::model_review::FamilyEnablementRecord,
     ) -> Result<(), String> {
@@ -924,7 +1662,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn insert_family_enablement_record_if_absent(
+    fn insert_family_enablement_record_if_absent(
         &self,
         record: &crate::chisei::model_review::FamilyEnablementRecord,
     ) -> Result<bool, String> {
@@ -940,7 +1678,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_family_enablement_record(
+    fn get_family_enablement_record(
         &self,
         namespace: &str,
         region_label: &str,
@@ -960,7 +1698,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_family_enablement_records(
+    fn list_family_enablement_records(
         &self,
         namespace: &str,
     ) -> Result<Vec<crate::chisei::model_review::FamilyEnablementRecord>, String> {
@@ -973,7 +1711,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn model_review_row_count(&self) -> Result<i64, String> {
+    fn model_review_row_count(&self) -> Result<i64, String> {
         use crate::chisei_store::chisei_model_review::ChiseiModelReviewBackend;
         match self {
             Self::Sqlite(db) => db.model_review_row_count(),
@@ -983,7 +1721,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn family_enablement_row_count(&self) -> Result<i64, String> {
+    fn family_enablement_row_count(&self) -> Result<i64, String> {
         use crate::chisei_store::chisei_model_review::ChiseiModelReviewBackend;
         match self {
             Self::Sqlite(db) => db.family_enablement_row_count(),
@@ -993,7 +1731,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_model_release_trust(
+    fn put_model_release_trust(
         &self,
         roots: &crate::chisei::model_release_evidence::EvaluationTrustRoots,
         updated_at_ms: i64,
@@ -1011,7 +1749,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_model_release_trust(
+    fn get_model_release_trust(
         &self,
     ) -> Result<Option<crate::chisei::model_release_evidence::EvaluationTrustRoots>, String> {
         use crate::chisei_store::chisei_model_release_evidence::ChiseiModelReleaseEvidenceBackend;
@@ -1023,7 +1761,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_model_runtime_evidence(
+    fn put_model_runtime_evidence(
         &self,
         evidence: &crate::chisei::model_release_evidence::ModelRuntimeEvidence,
         ingested_at_ms: i64,
@@ -1041,7 +1779,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_model_runtime_evidence(
+    fn get_model_runtime_evidence(
         &self,
         identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity,
     ) -> Result<Option<String>, String> {
@@ -1054,7 +1792,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_model_evaluation_export(
+    fn put_model_evaluation_export(
         &self,
         evidence: &crate::chisei::model_release_evidence::ModelEvaluationEvidence,
         exported_at_ms: i64,
@@ -1072,7 +1810,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_model_evaluation_export(
+    fn get_model_evaluation_export(
         &self,
         identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity,
     ) -> Result<Option<String>, String> {
@@ -1088,7 +1826,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_model_release_feedback(
+    fn put_model_release_feedback(
         &self,
         record: &crate::chisei::model_release_evidence::ModelReleaseFeedback,
     ) -> Result<(), String> {
@@ -1101,7 +1839,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_model_release_feedback(
+    fn list_model_release_feedback(
         &self,
         namespace: &str,
     ) -> Result<Vec<crate::chisei::model_release_evidence::ModelReleaseFeedback>, String> {
@@ -1117,7 +1855,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_sample_observation(
+    fn put_sample_observation(
         &self,
         obs: &crate::chisei::scoring::SampleObservation,
     ) -> Result<(), String> {
@@ -1129,7 +1867,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_sample_observation(
+    fn get_sample_observation(
         &self,
         request_id: &str,
     ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String> {
@@ -1141,7 +1879,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_sample_observation_in_namespace(
+    fn get_sample_observation_in_namespace(
         &self,
         request_id: &str,
         namespace: &str,
@@ -1154,7 +1892,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.record_kioku_lifecycle_event(event),
             Self::Postgres(db) => {
@@ -1163,10 +1901,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn record_kioku_outcome(
-        &self,
-        observation: &MemoryOutcomeObservation,
-    ) -> Result<bool, String> {
+    fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String> {
         match self {
             Self::Sqlite(db) => db.record_kioku_outcome(observation),
             Self::Postgres(_) => Err(
@@ -1175,7 +1910,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn redeem_or_reconcile_permit(
+    fn redeem_or_reconcile_permit(
         &self,
         permit: &Permit,
         context: &HostContext,
@@ -1202,7 +1937,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn release_external_action_blast_radius(
+    fn release_external_action_blast_radius(
         &self,
         authorization_id: &str,
         request: &ExternalActionRequest,
@@ -1215,7 +1950,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn reserve_external_action_blast_radius(
+    fn reserve_external_action_blast_radius(
         &self,
         authorization_id: &str,
         request: &ExternalActionRequest,
@@ -1240,7 +1975,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn review_kioku_candidate(
+    fn review_kioku_candidate(
         &self,
         id: &str,
         version: u32,
@@ -1254,7 +1989,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn review_kioku_candidate_after_graph_auth(
+    fn review_kioku_candidate_after_graph_auth(
         &self,
         id: &str,
         version: u32,
@@ -1268,7 +2003,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn set_external_permit_policy(
+    fn set_external_permit_policy(
         &self,
         policy: &ExternalPermitPolicy,
         now_ms: i64,
@@ -1281,11 +2016,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn validate_kioku_candidate(
-        &self,
-        id: &str,
-        version: u32,
-    ) -> Result<MemoryValidation, String> {
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String> {
         match self {
             Self::Sqlite(db) => db.validate_kioku_candidate(id, version),
             Self::Postgres(db) => {
@@ -1294,7 +2025,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_learning_change(
+    fn put_learning_change(
         &self,
         record: &crate::chisei::learning_change::LearningChange,
     ) -> Result<(), String> {
@@ -1304,7 +2035,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_learning_change(
+    fn get_learning_change(
         &self,
         change_id: &str,
     ) -> Result<Option<crate::chisei::learning_change::LearningChange>, String> {
@@ -1314,7 +2045,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_learning_changes(
+    fn list_learning_changes(
         &self,
         namespace: Option<&str>,
     ) -> Result<Vec<crate::chisei::learning_change::LearningChange>, String> {
@@ -1324,7 +2055,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_data_quality_rule(
+    fn put_data_quality_rule(
         &self,
         record: &crate::chisei::data_quality::DataQualityRule,
     ) -> Result<(), String> {
@@ -1334,7 +2065,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_data_quality_rule(
+    fn get_data_quality_rule(
         &self,
         namespace: &str,
         rule_id: &str,
@@ -1345,7 +2076,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_data_quality_rules(
+    fn list_data_quality_rules(
         &self,
         namespace: Option<&str>,
     ) -> Result<Vec<crate::chisei::data_quality::DataQualityRule>, String> {
@@ -1355,7 +2086,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_data_quality_result(
+    fn put_data_quality_result(
         &self,
         record: &crate::chisei::data_quality::DataQualityResult,
     ) -> Result<(), String> {
@@ -1365,7 +2096,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_data_quality_result(
+    fn get_data_quality_result(
         &self,
         result_id: &str,
     ) -> Result<Option<crate::chisei::data_quality::DataQualityResult>, String> {
@@ -1375,7 +2106,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_data_quality_results(
+    fn list_data_quality_results(
         &self,
         namespace: Option<&str>,
     ) -> Result<Vec<crate::chisei::data_quality::DataQualityResult>, String> {
@@ -1385,14 +2116,14 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
+    fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_run_record(id),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.get_eval_run_record(id)),
         }
     }
 
-    pub fn get_latest_eval_run_record_for_gate(
+    fn get_latest_eval_run_record_for_gate(
         &self,
         suite_id: &str,
         config_ref: &str,
@@ -1408,14 +2139,14 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
+    fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_suite_record(id),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.get_eval_suite_record(id)),
         }
     }
 
-    pub fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String> {
+    fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_suite_record_for_gate(id),
             Self::Postgres(db) => {
@@ -1424,7 +2155,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_all_eval_iteration_records(&self) -> Result<Vec<eval::Iteration>, String> {
+    fn list_all_eval_iteration_records(&self) -> Result<Vec<eval::Iteration>, String> {
         match self {
             Self::Sqlite(db) => db.list_all_eval_iteration_records(),
             Self::Postgres(db) => {
@@ -1433,10 +2164,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_eval_iteration_records(
-        &self,
-        suite_id: &str,
-    ) -> Result<Vec<eval::Iteration>, String> {
+    fn list_eval_iteration_records(&self, suite_id: &str) -> Result<Vec<eval::Iteration>, String> {
         match self {
             Self::Sqlite(db) => db.list_eval_iteration_records(suite_id),
             Self::Postgres(db) => {
@@ -1445,7 +2173,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String> {
+    fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.list_eval_run_records(suite_id),
             Self::Postgres(db) => {
@@ -1454,14 +2182,14 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String> {
+    fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String> {
         match self {
             Self::Sqlite(db) => db.list_eval_suite_records(),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.list_eval_suite_records()),
         }
     }
 
-    pub fn portfolio_damped_route(
+    fn portfolio_damped_route(
         &self,
         namespace: &str,
         task_class: &str,
@@ -1492,7 +2220,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String> {
+    fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String> {
         match self {
             Self::Sqlite(db) => db.portfolio_objective(namespace),
             Self::Postgres(db) => {
@@ -1501,7 +2229,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn portfolio_points(
+    fn portfolio_points(
         &self,
         namespace: &str,
         task_class: &str,
@@ -1514,7 +2242,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String> {
+    fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.portfolio_record_observation(observation),
             Self::Postgres(db) => {
@@ -1523,7 +2251,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String> {
+    fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.portfolio_set_objective(objective),
             Self::Postgres(db) => {
@@ -1532,7 +2260,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
+    fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_eval_iteration(iteration),
             Self::Postgres(db) => {
@@ -1541,21 +2269,21 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
+    fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_eval_run(run),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.put_eval_run(run)),
         }
     }
 
-    pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
+    fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_eval_suite(suite),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.put_eval_suite(suite)),
         }
     }
 
-    pub fn append_feedback_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
+    fn append_feedback_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.append_feedback_eval_suite(suite),
             Self::Postgres(_) => Err(
@@ -1565,7 +2293,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn retrieve_kioku_memories(
+    fn retrieve_kioku_memories(
         &self,
         request: &MemoryRetrievalRequest,
     ) -> Result<Vec<RetrievedMemory>, String> {
@@ -1577,7 +2305,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn retrieve_kioku_memories_after_graph_auth(
+    fn retrieve_kioku_memories_after_graph_auth(
         &self,
         request: &MemoryRetrievalRequest,
     ) -> Result<Vec<RetrievedMemory>, String> {
@@ -1589,7 +2317,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn insert_kioku_memory(
+    fn insert_kioku_memory(
         &self,
         memory: &KiokuMemory,
         evidence: &[KiokuEvidenceLink],
@@ -1602,10 +2330,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn produce_kioku_candidate(
-        &self,
-        input: CandidateDerivation,
-    ) -> Result<KiokuMemory, String> {
+    fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String> {
         match self {
             Self::Sqlite(db) => db.produce_kioku_candidate(input),
             Self::Postgres(_) => Err(
@@ -1614,7 +2339,7 @@ impl RuntimeDb {
         }
     }
 
-    pub fn sweep_kioku_lifecycle(
+    fn sweep_kioku_lifecycle(
         &self,
         actor: &str,
         now_ms: i64,
@@ -1625,5 +2350,496 @@ impl RuntimeDb {
                 "sweep_kioku_lifecycle is unavailable on the PostgreSQL community runtime".into(),
             ),
         }
+    }
+
+    fn count_active_kioku_promotions_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+    ) -> Result<i64, String> {
+        match self {
+            Self::Sqlite(db) => db.count_active_kioku_promotions_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.count_active_kioku_promotions_in_window(
+                    namespace,
+                    start_timestamp_ms,
+                    end_timestamp_ms,
+                )
+            }),
+        }
+    }
+
+    fn append_operation_receipt_event(
+        &self,
+        operation_id: &str,
+        event: OperationReceiptEvent,
+    ) -> Result<(OperationReceipt, bool), String> {
+        match self {
+            Self::Sqlite(db) => db.append_operation_receipt_event(operation_id, event),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.append_operation_receipt_event(operation_id, event)
+            }),
+        }
+    }
+
+    fn authorize_operation_reporter(
+        &self,
+        operation_id: &str,
+        principal: &str,
+        event_kinds: Vec<ReceiptEventKind>,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.authorize_operation_reporter(operation_id, principal, event_kinds)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.authorize_operation_reporter(operation_id, principal, event_kinds)
+            }),
+        }
+    }
+
+    fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
+        match self {
+            Self::Sqlite(db) => db.bump_observation_attempts(request_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.bump_observation_attempts(request_id))
+            }
+        }
+    }
+
+    fn claim_gateway_request_alias_dispatch(
+        &self,
+        caller_scope: &str,
+        request_alias: &str,
+        request_id: &str,
+        operation_id: &str,
+        dispatch_token: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.claim_gateway_request_alias_dispatch(
+                caller_scope,
+                request_alias,
+                request_id,
+                operation_id,
+                dispatch_token,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.claim_gateway_request_alias_dispatch(
+                    caller_scope,
+                    request_alias,
+                    request_id,
+                    operation_id,
+                    dispatch_token,
+                )
+            }),
+        }
+    }
+
+    fn delete_observation(&self, request_id: &str) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.delete_observation(request_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.delete_observation(request_id))
+            }
+        }
+    }
+
+    fn find_gateway_receipt_by_logical_operation_id(
+        &self,
+        operation_id: &str,
+        attempt: Option<u32>,
+    ) -> Result<Option<OperationReceipt>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.find_gateway_receipt_by_logical_operation_id(operation_id, attempt)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.find_gateway_receipt_by_logical_operation_id(operation_id, attempt)
+            }),
+        }
+    }
+
+    fn find_operation_receipt_by_lookup_request_id(
+        &self,
+        request_id: &str,
+        caller_scope: Option<&str>,
+        initiating_actor: Option<&str>,
+    ) -> Result<Option<OperationReceipt>, String> {
+        match self {
+            Self::Sqlite(db) => db.find_operation_receipt_by_lookup_request_id(
+                request_id,
+                caller_scope,
+                initiating_actor,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.find_operation_receipt_by_lookup_request_id(
+                    request_id,
+                    caller_scope,
+                    initiating_actor,
+                )
+            }),
+        }
+    }
+
+    fn find_operation_receipt_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<OperationReceipt>, String> {
+        match self {
+            Self::Sqlite(db) => db.find_operation_receipt_by_request_id(request_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.find_operation_receipt_by_request_id(request_id)
+            }),
+        }
+    }
+
+    fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.insert_operation_receipt(receipt),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.insert_operation_receipt(receipt))
+            }
+        }
+    }
+
+    fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String> {
+        match self {
+            Self::Sqlite(db) => db.kioku_authorized_classification_ceiling(namespace, actor),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.kioku_authorized_classification_ceiling(namespace, actor)
+            }),
+        }
+    }
+
+    fn list_evolve_task_records(&self) -> Result<Vec<evolve::TaskRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_evolve_task_records(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_evolve_task_records())
+            }
+        }
+    }
+
+    fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.prune_eval_iterations_for_suite(suite_id, keep),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.prune_eval_iterations_for_suite(suite_id, keep)
+            }),
+        }
+    }
+
+    fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.prune_eval_runs_for_suite(suite_id, keep),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.prune_eval_runs_for_suite(suite_id, keep))
+            }
+        }
+    }
+
+    fn put_delegated_permit(&self, permit: &Permit, issued_by: &str) -> Result<Permit, String> {
+        match self {
+            Self::Sqlite(db) => db.put_delegated_permit(permit, issued_by),
+            Self::Postgres(_) => Err(
+                "put_delegated_permit is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    fn put_evolve_task(&self, task: &evolve::TaskRecord) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_evolve_task(task),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.put_evolve_task(task)),
+        }
+    }
+
+    fn get_gunshi_allocation_state(&self, namespace: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_gunshi_allocation_state(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_gunshi_allocation_state(namespace))
+            }
+        }
+    }
+
+    fn put_gunshi_allocation_state_cas(
+        &self,
+        namespace: &str,
+        revision_id: &str,
+        changed_at_ms: i64,
+        state_json: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.put_gunshi_allocation_state_cas(
+                namespace,
+                revision_id,
+                changed_at_ms,
+                state_json,
+                expected_revision,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_gunshi_allocation_state_cas(
+                    namespace,
+                    revision_id,
+                    changed_at_ms,
+                    state_json,
+                    expected_revision,
+                )
+            }),
+        }
+    }
+
+    fn put_operation_receipt_with_kioku_holdouts(
+        &self,
+        receipt: &OperationReceipt,
+        holdouts: &[(String, u32)],
+        actor: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_operation_receipt_with_kioku_holdouts(receipt, holdouts, actor, recorded_at_ms),
+            Self::Postgres(_) => Err("put_operation_receipt_with_kioku_holdouts is unavailable on the PostgreSQL community runtime".into()),
+        }
+    }
+
+    fn put_permit(
+        &self,
+        permit: &Permit,
+        idempotency_key: &str,
+        issued_by: &str,
+    ) -> Result<Permit, String> {
+        match self {
+            Self::Sqlite(db) => db.put_permit(permit, idempotency_key, issued_by),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_permit(permit, idempotency_key, issued_by)
+            }),
+        }
+    }
+
+    fn replay_permit(
+        &self,
+        authorization_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<Permit>, String> {
+        match self {
+            Self::Sqlite(db) => db.replay_permit(authorization_id, idempotency_key),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.replay_permit(authorization_id, idempotency_key)
+            }),
+        }
+    }
+
+    fn replay_redemption(
+        &self,
+        permit: &Permit,
+        idempotency_key: &str,
+        execution_id: &str,
+    ) -> Result<Option<Redemption>, String> {
+        match self {
+            Self::Sqlite(db) => db.replay_redemption(permit, idempotency_key, execution_id),
+            Self::Postgres(_) => {
+                Err("replay_redemption is unavailable on the PostgreSQL community runtime".into())
+            }
+        }
+    }
+
+    fn reserve_gateway_request_alias(
+        &self,
+        caller_scope: &str,
+        request_alias: &str,
+        request_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.reserve_gateway_request_alias(
+                caller_scope,
+                request_alias,
+                request_id,
+                operation_id,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.reserve_gateway_request_alias(
+                    caller_scope,
+                    request_alias,
+                    request_id,
+                    operation_id,
+                )
+            }),
+        }
+    }
+
+    fn revoke_permit(
+        &self,
+        handle: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.revoke_permit(handle, actor, reason, now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.revoke_permit(handle, actor, reason, now_ms))
+            }
+        }
+    }
+
+    fn set_permit_kill_switch(
+        &self,
+        kind: &str,
+        value: &str,
+        enabled: bool,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.set_permit_kill_switch(kind, value, enabled, reason, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.set_permit_kill_switch(kind, value, enabled, reason, now_ms)
+            }),
+        }
+    }
+
+    fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.validate_delegation_chain(permit),
+            Self::Postgres(_) => Err(
+                "validate_delegation_chain is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.validate_permit_for_delegation(permit),
+            Self::Postgres(_) => Err(
+                "validate_permit_for_delegation is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    fn validate_permit_state(&self, permit: &Permit) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.validate_permit_state(permit),
+            Self::Postgres(_) => Err(
+                "validate_permit_state is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    fn record_kioku_holdout(
+        &self,
+        id: &str,
+        version: u32,
+        operation_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.record_kioku_holdout(id, version, operation_id, actor, now_ms),
+            Self::Postgres(_) => Err(
+                "record_kioku_holdout is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    fn redeem_permit(
+        &self,
+        permit: &Permit,
+        context: &HostContext,
+        trusted_key: &VerifyingKey,
+        idempotency_key: &str,
+        execution_id: &str,
+        host_site_id: &str,
+        now_ms: i64,
+    ) -> Result<Redemption, String> {
+        match self {
+            Self::Sqlite(db) => db.redeem_permit(
+                permit,
+                context,
+                trusted_key,
+                idempotency_key,
+                execution_id,
+                host_site_id,
+                now_ms,
+            ),
+            Self::Postgres(_) => {
+                Err("redeem_permit is unavailable on the PostgreSQL community runtime".into())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod evaluation_resolution_snapshot_tests {
+    use super::ChiseiRuntimeDb;
+    use crate::db::runtime_db::RuntimeDb;
+    use crate::db::sekai::SekaiDb;
+    use crate::domain::Object;
+    use std::collections::HashMap;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    #[test]
+    fn persistent_sqlite_snapshot_excludes_concurrent_prerequisite_writes() {
+        let path = std::env::temp_dir().join(format!(
+            "sekai-evaluation-snapshot-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&path_string).unwrap()));
+        let resolver_db = db.clone();
+        let writer_db = db.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let resolver = std::thread::spawn(move || {
+            resolver_db
+                .with_evaluation_resolution_snapshot(
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok::<_, String>(((), None))
+                    },
+                    |error| error,
+                )
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let (written_tx, written_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            writer_db
+                .create_object(&Object {
+                    id: "concurrent-prerequisite".into(),
+                    kind: "document".into(),
+                    name: "Concurrent prerequisite".into(),
+                    namespace: "acme".into(),
+                    external_id: "document:concurrent".into(),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+            written_tx.send(()).unwrap();
+        });
+        assert!(written_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        release_tx.send(()).unwrap();
+        written_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        resolver.join().unwrap();
+        writer.join().unwrap();
+        drop(db);
+        std::fs::remove_file(path).ok();
     }
 }
