@@ -16,7 +16,7 @@ pub const RUNTIME_DB_SRC: &str = concat!(
     include_str!("db/runtime_db.rs"),
     include_str!("chisei_store/runtime.rs")
 );
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 19;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 17;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

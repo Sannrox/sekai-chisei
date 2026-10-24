@@ -199,6 +199,51 @@ pub enum ReadMarker {
 
 const READ_MARKER_ABSENT: &str = "absent";
 
+/// A cursor's pending events and read marker as both backends store them.
+pub(crate) fn encode_cursor(cursor: &ActionBindingCursor) -> Result<(String, String), String> {
+    let pending =
+        serde_json::to_string(&cursor.pending_events).map_err(|error| error.to_string())?;
+    let marker = match &cursor.read_marker {
+        None => String::new(),
+        Some(ReadMarker::Absent) => READ_MARKER_ABSENT.into(),
+        Some(ReadMarker::Subscription(subscription)) => {
+            serde_json::to_string(subscription).map_err(|error| error.to_string())?
+        }
+    };
+    Ok((pending, marker))
+}
+
+/// A stored binding row, as both backends read it back.
+pub(crate) fn decode_stored(
+    body: &str,
+    snapshot_revision: String,
+    last_page_digest: String,
+    pending: &str,
+    marker: &str,
+) -> Result<(ActionBinding, ActionBindingCursor), String> {
+    let binding: ActionBinding =
+        serde_json::from_str(body).map_err(|error| format!("corrupt action binding: {error}"))?;
+    let pending_events = serde_json::from_str(pending)
+        .map_err(|error| format!("corrupt action binding cursor: {error}"))?;
+    let read_marker = match marker {
+        "" => None,
+        READ_MARKER_ABSENT => Some(ReadMarker::Absent),
+        json => Some(ReadMarker::Subscription(Box::new(
+            serde_json::from_str(json)
+                .map_err(|error| format!("corrupt action binding cursor: {error}"))?,
+        ))),
+    };
+    Ok((
+        binding,
+        ActionBindingCursor {
+            snapshot_revision,
+            last_page_digest,
+            pending_events,
+            read_marker,
+        },
+    ))
+}
+
 impl SekaiDb {
     fn migrate_action_bindings(&self) -> Result<(), String> {
         self.conn()
@@ -299,28 +344,13 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?
             .map(
                 |(body, snapshot_revision, last_page_digest, pending, marker)| {
-                    let binding: ActionBinding = serde_json::from_str(&body)
-                        .map_err(|error| format!("corrupt action binding: {error}"))?;
-                    let pending_events = serde_json::from_str(&pending)
-                        .map_err(|error| format!("corrupt action binding cursor: {error}"))?;
-                    let read_marker = match marker.as_str() {
-                        "" => None,
-                        READ_MARKER_ABSENT => Some(ReadMarker::Absent),
-                        json => Some(ReadMarker::Subscription(Box::new(
-                            serde_json::from_str(json).map_err(|error| {
-                                format!("corrupt action binding cursor: {error}")
-                            })?,
-                        ))),
-                    };
-                    Ok((
-                        binding,
-                        ActionBindingCursor {
-                            snapshot_revision,
-                            last_page_digest,
-                            pending_events,
-                            read_marker,
-                        },
-                    ))
+                    decode_stored(
+                        &body,
+                        snapshot_revision,
+                        last_page_digest,
+                        &pending,
+                        &marker,
+                    )
                 },
             )
             .transpose()
@@ -335,15 +365,7 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<(), String> {
         self.migrate_action_bindings()?;
-        let pending =
-            serde_json::to_string(&cursor.pending_events).map_err(|error| error.to_string())?;
-        let marker = match &cursor.read_marker {
-            None => String::new(),
-            Some(ReadMarker::Absent) => READ_MARKER_ABSENT.into(),
-            Some(ReadMarker::Subscription(subscription)) => {
-                serde_json::to_string(subscription).map_err(|error| error.to_string())?
-            }
-        };
+        let (pending, marker) = encode_cursor(cursor)?;
         self.conn()
             .execute(
                 "UPDATE sekai_action_bindings
