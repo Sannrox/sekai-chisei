@@ -5,100 +5,32 @@ use crate::chisei::portfolio::{
 };
 use crate::db::sekai::SekaiDb;
 
-impl SekaiDb {
-    pub(crate) fn migrate_portfolio(&self) -> Result<(), String> {
-        let mut conn = self.conn();
-        let observation_exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chisei_portfolio_observations')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| err.to_string())?;
-        let has_prompt_variant = if observation_exists {
-            let mut statement = conn
-                .prepare("PRAGMA table_info(chisei_portfolio_observations)")
-                .map_err(|err| err.to_string())?;
-            let columns = statement
-                .query_map([], |row| row.get::<_, String>(1))
-                .map_err(|err| err.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|err| err.to_string())?;
-            columns.iter().any(|column| column == "prompt_variant")
-        } else {
-            true
-        };
-        let transaction = conn.transaction().map_err(|err| err.to_string())?;
-        if observation_exists && !has_prompt_variant {
-            transaction.execute_batch(
-                "ALTER TABLE chisei_portfolio_observations RENAME TO chisei_portfolio_observations_legacy;
-                 CREATE TABLE chisei_portfolio_observations (
-                    namespace TEXT NOT NULL, task_class TEXT NOT NULL, model TEXT NOT NULL,
-                    prompt_variant TEXT NOT NULL, quality_score REAL NOT NULL,
-                    cost_usd_micros INTEGER NOT NULL, sample_count INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    PRIMARY KEY (namespace, task_class, model, prompt_variant));
-                 INSERT INTO chisei_portfolio_observations
-                    (namespace, task_class, model, prompt_variant, quality_score,
-                     cost_usd_micros, sample_count, updated_at)
-                 SELECT namespace, task_class, model, 'legacy@1', quality_score,
-                        cost_usd_micros, sample_count, updated_at
-                 FROM chisei_portfolio_observations_legacy;
-                 DROP TABLE chisei_portfolio_observations_legacy;",
-            ).map_err(|err| err.to_string())?;
-        }
-        transaction
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_portfolio_observations (
-                namespace TEXT NOT NULL,
-                task_class TEXT NOT NULL,
-                model TEXT NOT NULL,
-                prompt_variant TEXT NOT NULL,
-                quality_score REAL NOT NULL,
-                cost_usd_micros INTEGER NOT NULL,
-                sample_count INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (namespace, task_class, model, prompt_variant)
-            );
-            CREATE INDEX IF NOT EXISTS idx_chisei_portfolio_frontier
-                ON chisei_portfolio_observations(namespace, task_class, cost_usd_micros);
-            CREATE TABLE IF NOT EXISTS chisei_portfolio_objectives (
-                namespace TEXT PRIMARY KEY,
-                mode TEXT NOT NULL,
-                budget_usd_micros INTEGER NOT NULL,
-                quality_bar REAL NOT NULL,
-                min_samples INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS chisei_portfolio_routes (
-                namespace TEXT NOT NULL,
-                task_class TEXT NOT NULL,
-                current_model TEXT NOT NULL,
-                pending_model TEXT NOT NULL DEFAULT '',
-                pending_count INTEGER NOT NULL DEFAULT 0,
-                shifted_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (namespace, task_class)
-            );",
-            )
-            .map_err(|err| err.to_string())?;
-        for statement in [
-            "ALTER TABLE chisei_portfolio_routes ADD COLUMN current_prompt_variant TEXT NOT NULL DEFAULT 'legacy@1'",
-            "ALTER TABLE chisei_portfolio_routes ADD COLUMN pending_prompt_variant TEXT NOT NULL DEFAULT ''",
-        ] {
-            if let Err(error) = transaction.execute(statement, [])
-                && !error.to_string().contains("duplicate column name")
-            {
-                return Err(error.to_string());
-            }
-        }
-        transaction.commit().map_err(|err| err.to_string())
-    }
+pub trait ChiseiPortfolioSekaiDbExt {
+    fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String>;
 
-    pub(crate) fn portfolio_record_observation(
+    fn portfolio_points(
         &self,
-        observation: &Observation,
-    ) -> Result<(), String> {
+        namespace: &str,
+        task_class: &str,
+    ) -> Result<Vec<FrontierPoint>, String>;
+
+    fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String>;
+
+    fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String>;
+
+    fn portfolio_damped_route(
+        &self,
+        namespace: &str,
+        task_class: &str,
+        proposed_model: &str,
+        proposed_prompt_variant: &str,
+        now_ms: i64,
+        force: bool,
+    ) -> Result<RouteSelection, String>;
+}
+
+impl ChiseiPortfolioSekaiDbExt for SekaiDb {
+    fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String> {
         let conn = self.conn();
         let prompt_variant =
             crate::chisei::portfolio::normalize_prompt_variant(&observation.prompt_variant);
@@ -130,7 +62,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub(crate) fn portfolio_points(
+    fn portfolio_points(
         &self,
         namespace: &str,
         task_class: &str,
@@ -160,7 +92,7 @@ impl SekaiDb {
             .map_err(|err| err.to_string())
     }
 
-    pub(crate) fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String> {
+    fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String> {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO chisei_portfolio_objectives
@@ -185,7 +117,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub(crate) fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String> {
+    fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String> {
         use rusqlite::OptionalExtension;
 
         let conn = self.conn();
@@ -222,7 +154,7 @@ impl SekaiDb {
         .transpose()
     }
 
-    pub(crate) fn portfolio_damped_route(
+    fn portfolio_damped_route(
         &self,
         namespace: &str,
         task_class: &str,

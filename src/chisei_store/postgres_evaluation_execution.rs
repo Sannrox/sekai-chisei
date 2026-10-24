@@ -4,8 +4,21 @@ use crate::chisei::evaluation_execution::{EXECUTOR_VERSION, EvaluationExecutionI
 use crate::db::postgres::PostgresDb;
 use sekai_domain::receipt::OperationReceipt;
 
-impl PostgresDb {
-    pub fn get_evaluation_execution_index(
+pub trait PostgresEvaluationExecutionPostgresDbExt {
+    fn get_evaluation_execution_index(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<EvaluationExecutionIndex>, String>;
+
+    fn create_evaluation_execution(
+        &self,
+        index: &EvaluationExecutionIndex,
+        receipt: &OperationReceipt,
+    ) -> Result<EvaluationExecutionIndex, String>;
+}
+
+impl PostgresEvaluationExecutionPostgresDbExt for PostgresDb {
+    fn get_evaluation_execution_index(
         &self,
         manifest_digest: &str,
     ) -> Result<Option<EvaluationExecutionIndex>, String> {
@@ -21,7 +34,7 @@ impl PostgresDb {
             .map(|row| row.map(index_from_row))
     }
 
-    pub fn create_evaluation_execution(
+    fn create_evaluation_execution(
         &self,
         index: &EvaluationExecutionIndex,
         receipt: &OperationReceipt,

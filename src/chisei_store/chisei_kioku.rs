@@ -262,16 +262,16 @@ pub trait ChiseiKiokuBackend: Send + Sync {
 }
 
 macro_rules! forward {
-    ($target:ty) => {
+    ($target:ty, $ext:path) => {
         fn insert_kioku_memory(
             &self,
             memory: &KiokuMemory,
             evidence: &[KiokuEvidenceLink],
         ) -> Result<(), String> {
-            <$target>::insert_kioku_memory(self, memory, evidence)
+            <$target as $ext>::insert_kioku_memory(self, memory, evidence)
         }
         fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
-            <$target>::get_kioku_memory(self, id, version)
+            <$target as $ext>::get_kioku_memory(self, id, version)
         }
         fn list_kioku_candidates(
             &self,
@@ -279,7 +279,7 @@ macro_rules! forward {
             operation_class: Option<&str>,
             limit: usize,
         ) -> Result<Vec<KiokuMemory>, String> {
-            <$target>::list_kioku_candidates(self, namespace, operation_class, limit)
+            <$target as $ext>::list_kioku_candidates(self, namespace, operation_class, limit)
         }
         fn list_kioku_candidate_page(
             &self,
@@ -287,21 +287,21 @@ macro_rules! forward {
             limit: usize,
             cursor: Option<&KiokuCandidateCursor>,
         ) -> Result<Vec<KiokuMemory>, String> {
-            <$target>::list_kioku_candidate_page(self, namespace, limit, cursor)
+            <$target as $ext>::list_kioku_candidate_page(self, namespace, limit, cursor)
         }
         fn list_kioku_evidence(
             &self,
             id: &str,
             version: u32,
         ) -> Result<Vec<KiokuEvidenceLink>, String> {
-            <$target>::list_kioku_evidence(self, id, version)
+            <$target as $ext>::list_kioku_evidence(self, id, version)
         }
         fn validate_kioku_candidate(
             &self,
             id: &str,
             version: u32,
         ) -> Result<MemoryValidation, String> {
-            <$target>::validate_kioku_candidate(self, id, version)
+            <$target as $ext>::validate_kioku_candidate(self, id, version)
         }
         fn review_kioku_candidate(
             &self,
@@ -309,17 +309,17 @@ macro_rules! forward {
             version: u32,
             review: HumanMemoryReview,
         ) -> Result<KiokuMemory, String> {
-            <$target>::review_kioku_candidate(self, id, version, review)
+            <$target as $ext>::review_kioku_candidate(self, id, version, review)
         }
         fn list_kioku_lifecycle_events(
             &self,
             id: &str,
             version: u32,
         ) -> Result<Vec<MemoryLifecycleEvent>, String> {
-            <$target>::list_kioku_lifecycle_events(self, id, version)
+            <$target as $ext>::list_kioku_lifecycle_events(self, id, version)
         }
         fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
-            <$target>::record_kioku_lifecycle_event(self, event)
+            <$target as $ext>::record_kioku_lifecycle_event(self, event)
         }
         fn disable_kioku_memory(
             &self,
@@ -329,27 +329,37 @@ macro_rules! forward {
             rationale: &str,
             recorded_at_ms: i64,
         ) -> Result<KiokuMemory, String> {
-            <$target>::disable_kioku_memory(self, id, version, actor, rationale, recorded_at_ms)
+            <$target as $ext>::disable_kioku_memory(
+                self,
+                id,
+                version,
+                actor,
+                rationale,
+                recorded_at_ms,
+            )
         }
         fn kioku_authorized_classification_ceiling(
             &self,
             namespace: &str,
             actor: &str,
         ) -> Result<EvidenceClassification, String> {
-            <$target>::kioku_authorized_classification_ceiling(self, namespace, actor)
+            <$target as $ext>::kioku_authorized_classification_ceiling(self, namespace, actor)
         }
         fn authorize_kioku_evidence(
             &self,
             request: &KiokuEvidenceAuthorizationRequest,
         ) -> Result<(), String> {
-            <$target>::authorize_kioku_evidence(self, request)
+            <$target as $ext>::authorize_kioku_evidence(self, request)
         }
     };
 }
 
 impl ChiseiKiokuBackend for SekaiDb {
-    forward!(SekaiDb);
+    forward!(SekaiDb, crate::chisei::kioku::KiokuSekaiDbExt);
 }
 impl ChiseiKiokuBackend for PostgresDb {
-    forward!(PostgresDb);
+    forward!(
+        PostgresDb,
+        crate::chisei_store::postgres_kioku::PostgresKiokuPostgresDbExt
+    );
 }

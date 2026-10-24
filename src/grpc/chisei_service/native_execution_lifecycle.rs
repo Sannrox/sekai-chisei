@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::chisei_store::{ChiseiKiokuStore, ChiseiRoutingProfileStore};
+use crate::ext::*;
 
 /// Result of the post-authz lookup-first attempt on ExecutePlanStream.
 #[derive(Debug)]

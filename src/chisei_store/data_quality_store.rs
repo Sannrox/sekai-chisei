@@ -5,33 +5,33 @@ use rusqlite::{OptionalExtension, params};
 use crate::chisei::data_quality::{DataQualityResult, DataQualityRule};
 use crate::db::sekai::SekaiDb;
 
-impl SekaiDb {
-    pub(crate) fn migrate_data_quality_rules(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_data_quality_rules (
-                    namespace TEXT NOT NULL,
-                    rule_id TEXT NOT NULL,
-                    rule_digest TEXT NOT NULL,
-                    record_json TEXT NOT NULL,
-                    published_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY (namespace, rule_id)
-                );
-                CREATE TABLE IF NOT EXISTS chisei_data_quality_results (
-                    result_id TEXT PRIMARY KEY,
-                    namespace TEXT NOT NULL,
-                    rule_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    record_json TEXT NOT NULL,
-                    evaluated_at_ms INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_chisei_data_quality_results_ns
-                    ON chisei_data_quality_results(namespace, rule_id);",
-            )
-            .map_err(|error| error.to_string())
-    }
+pub trait DataQualityStoreSekaiDbExt {
+    fn put_data_quality_rule(&self, record: &DataQualityRule) -> Result<(), String>;
 
-    pub fn put_data_quality_rule(&self, record: &DataQualityRule) -> Result<(), String> {
+    fn get_data_quality_rule(
+        &self,
+        namespace: &str,
+        rule_id: &str,
+    ) -> Result<Option<DataQualityRule>, String>;
+
+    fn list_data_quality_rules(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<DataQualityRule>, String>;
+
+    fn put_data_quality_result(&self, record: &DataQualityResult) -> Result<(), String>;
+
+    fn get_data_quality_result(&self, result_id: &str)
+    -> Result<Option<DataQualityResult>, String>;
+
+    fn list_data_quality_results(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<DataQualityResult>, String>;
+}
+
+impl DataQualityStoreSekaiDbExt for SekaiDb {
+    fn put_data_quality_rule(&self, record: &DataQualityRule) -> Result<(), String> {
         let json = serde_json::to_string(record)
             .map_err(|error| format!("encode data quality rule: {error}"))?;
         self.conn()
@@ -55,7 +55,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub fn get_data_quality_rule(
+    fn get_data_quality_rule(
         &self,
         namespace: &str,
         rule_id: &str,
@@ -77,7 +77,7 @@ impl SekaiDb {
         .transpose()
     }
 
-    pub fn list_data_quality_rules(
+    fn list_data_quality_rules(
         &self,
         namespace: Option<&str>,
     ) -> Result<Vec<DataQualityRule>, String> {
@@ -103,7 +103,7 @@ impl SekaiDb {
         Ok(records)
     }
 
-    pub fn put_data_quality_result(&self, record: &DataQualityResult) -> Result<(), String> {
+    fn put_data_quality_result(&self, record: &DataQualityResult) -> Result<(), String> {
         let json = serde_json::to_string(record)
             .map_err(|error| format!("encode data quality result: {error}"))?;
         self.conn()
@@ -130,7 +130,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub fn get_data_quality_result(
+    fn get_data_quality_result(
         &self,
         result_id: &str,
     ) -> Result<Option<DataQualityResult>, String> {
@@ -150,7 +150,7 @@ impl SekaiDb {
         .transpose()
     }
 
-    pub fn list_data_quality_results(
+    fn list_data_quality_results(
         &self,
         namespace: Option<&str>,
     ) -> Result<Vec<DataQualityResult>, String> {

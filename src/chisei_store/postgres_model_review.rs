@@ -3,8 +3,50 @@
 use crate::chisei::model_review::{FamilyEnablementRecord, ModelReviewRecord};
 use crate::db::postgres::PostgresDb;
 
-impl PostgresDb {
-    pub fn put_model_review_record(&self, record: &ModelReviewRecord) -> Result<(), String> {
+pub trait PostgresModelReviewPostgresDbExt {
+    fn put_model_review_record(&self, record: &ModelReviewRecord) -> Result<(), String>;
+
+    fn insert_model_review_record_if_absent(
+        &self,
+        record: &ModelReviewRecord,
+    ) -> Result<bool, String>;
+
+    fn get_model_review_record(
+        &self,
+        namespace: &str,
+        provider: &str,
+        model: &str,
+        artifact_digest: &str,
+    ) -> Result<Option<ModelReviewRecord>, String>;
+
+    fn list_model_review_records(&self, namespace: &str) -> Result<Vec<ModelReviewRecord>, String>;
+
+    fn put_family_enablement_record(&self, record: &FamilyEnablementRecord) -> Result<(), String>;
+
+    fn insert_family_enablement_record_if_absent(
+        &self,
+        record: &FamilyEnablementRecord,
+    ) -> Result<bool, String>;
+
+    fn get_family_enablement_record(
+        &self,
+        namespace: &str,
+        region_label: &str,
+        family_id: &str,
+    ) -> Result<Option<FamilyEnablementRecord>, String>;
+
+    fn list_family_enablement_records(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<FamilyEnablementRecord>, String>;
+
+    fn model_review_row_count(&self) -> Result<i64, String>;
+
+    fn family_enablement_row_count(&self) -> Result<i64, String>;
+}
+
+impl PostgresModelReviewPostgresDbExt for PostgresDb {
+    fn put_model_review_record(&self, record: &ModelReviewRecord) -> Result<(), String> {
         record.validate()?;
         self.connection()?
             .execute(
@@ -31,7 +73,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn insert_model_review_record_if_absent(
+    fn insert_model_review_record_if_absent(
         &self,
         record: &ModelReviewRecord,
     ) -> Result<bool, String> {
@@ -58,7 +100,7 @@ impl PostgresDb {
         Ok(inserted > 0)
     }
 
-    pub fn get_model_review_record(
+    fn get_model_review_record(
         &self,
         namespace: &str,
         provider: &str,
@@ -88,10 +130,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn list_model_review_records(
-        &self,
-        namespace: &str,
-    ) -> Result<Vec<ModelReviewRecord>, String> {
+    fn list_model_review_records(&self, namespace: &str) -> Result<Vec<ModelReviewRecord>, String> {
         self.connection()?
             .query(
                 "SELECT namespace, provider, model, artifact_digest, status, actor, reason, updated_at_ms
@@ -117,10 +156,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn put_family_enablement_record(
-        &self,
-        record: &FamilyEnablementRecord,
-    ) -> Result<(), String> {
+    fn put_family_enablement_record(&self, record: &FamilyEnablementRecord) -> Result<(), String> {
         record.validate()?;
         self.connection()?
             .execute(
@@ -146,7 +182,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn insert_family_enablement_record_if_absent(
+    fn insert_family_enablement_record_if_absent(
         &self,
         record: &FamilyEnablementRecord,
     ) -> Result<bool, String> {
@@ -172,7 +208,7 @@ impl PostgresDb {
         Ok(inserted > 0)
     }
 
-    pub fn get_family_enablement_record(
+    fn get_family_enablement_record(
         &self,
         namespace: &str,
         region_label: &str,
@@ -200,7 +236,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn list_family_enablement_records(
+    fn list_family_enablement_records(
         &self,
         namespace: &str,
     ) -> Result<Vec<FamilyEnablementRecord>, String> {
@@ -228,14 +264,14 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn model_review_row_count(&self) -> Result<i64, String> {
+    fn model_review_row_count(&self) -> Result<i64, String> {
         self.connection()?
             .query_one("SELECT COUNT(*) FROM chisei_model_review", &[])
             .map(|row| row.get(0))
             .map_err(|error| error.to_string())
     }
 
-    pub fn family_enablement_row_count(&self) -> Result<i64, String> {
+    fn family_enablement_row_count(&self) -> Result<i64, String> {
         self.connection()?
             .query_one("SELECT COUNT(*) FROM chisei_model_family_enablement", &[])
             .map(|row| row.get(0))

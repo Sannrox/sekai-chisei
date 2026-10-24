@@ -1,6 +1,7 @@
 //! Customer-hosted routing profiles (#1171) on both community backends.
 
 use crate::chisei::routing_profiles::HostedRoutingProfile;
+use crate::chisei_store::postgres_routing_profile::PostgresRoutingProfilePostgresDbExt;
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 
@@ -64,46 +65,6 @@ pub(crate) fn hosted_profile_from_parts(
         evidence_artifact_digest,
         evidence_endpoint,
     })
-}
-
-impl SekaiDb {
-    pub(crate) fn migrate_routing_profiles(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_routing_profiles (
-                    namespace TEXT NOT NULL,
-                    profile_id TEXT NOT NULL,
-                    endpoint_origin TEXT NOT NULL,
-                    model_patterns_json TEXT NOT NULL,
-                    credential_ref TEXT NOT NULL,
-                    registered_by TEXT NOT NULL,
-                    registered_at_ms INTEGER NOT NULL,
-                    revoked_at_ms INTEGER,
-                    artifact_digest TEXT,
-                    require_runtime_evidence INTEGER NOT NULL DEFAULT 0,
-                    evidence_provider TEXT NOT NULL DEFAULT '',
-                    evidence_model TEXT NOT NULL DEFAULT '',
-                    evidence_profile_version TEXT NOT NULL DEFAULT '',
-                    evidence_artifact_digest TEXT NOT NULL DEFAULT '',
-                    evidence_endpoint TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (namespace, profile_id)
-                 );",
-            )
-            .map_err(|error| error.to_string())?;
-        // Stores created before #1499 lack the digest column.
-        match self.conn().execute(
-            "ALTER TABLE chisei_routing_profiles ADD COLUMN artifact_digest TEXT",
-            [],
-        ) {
-            Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
-                if message.contains("duplicate column name") =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error.to_string()),
-        }
-    }
 }
 
 impl ChiseiRoutingProfileBackend for SekaiDb {
@@ -322,14 +283,14 @@ impl ChiseiRoutingProfileBackend for SekaiDb {
 
 impl ChiseiRoutingProfileBackend for PostgresDb {
     fn put_hosted_routing_profile(&self, profile: &HostedRoutingProfile) -> Result<(), String> {
-        PostgresDb::put_hosted_routing_profile(self, profile)
+        PostgresRoutingProfilePostgresDbExt::put_hosted_routing_profile(self, profile)
     }
 
     fn list_hosted_routing_profiles(
         &self,
         namespace: &str,
     ) -> Result<Vec<HostedRoutingProfile>, String> {
-        PostgresDb::list_hosted_routing_profiles(self, namespace)
+        PostgresRoutingProfilePostgresDbExt::list_hosted_routing_profiles(self, namespace)
     }
 
     fn revoke_hosted_routing_profile(
@@ -338,10 +299,12 @@ impl ChiseiRoutingProfileBackend for PostgresDb {
         profile_id: &str,
         now_ms: i64,
     ) -> Result<bool, String> {
-        PostgresDb::revoke_hosted_routing_profile(self, namespace, profile_id, now_ms)
+        PostgresRoutingProfilePostgresDbExt::revoke_hosted_routing_profile(
+            self, namespace, profile_id, now_ms,
+        )
     }
 
     fn list_all_hosted_routing_profiles(&self) -> Result<Vec<HostedRoutingProfile>, String> {
-        PostgresDb::list_all_hosted_routing_profiles(self)
+        PostgresRoutingProfilePostgresDbExt::list_all_hosted_routing_profiles(self)
     }
 }

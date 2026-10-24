@@ -6,6 +6,7 @@ use sekai_chisei::chisei::policy_shadow::{
     PolicyShadowReport, ShadowDelta, ShadowSample,
 };
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_chisei::ext::*;
 
 trait ShadowHarness {
     fn start(&self, shadow: &PolicyShadow) -> Result<(), String>;

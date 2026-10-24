@@ -6,8 +6,26 @@ use crate::chisei::usage_ledger::{
 use crate::db::postgres::PostgresDb;
 use sekai_domain::receipt::OperationReceipt;
 
-impl PostgresDb {
-    pub fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String> {
+pub trait PostgresUsageLedgerPostgresDbExt {
+    fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String>;
+
+    fn project_usage_from_receipt(
+        &self,
+        tenant_id: &str,
+        receipt: &OperationReceipt,
+    ) -> Result<Vec<UsageEvent>, String>;
+
+    fn aggregate_usage_for_tenant(
+        &self,
+        tenant_id: &str,
+        unit: UsageUnit,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<UsageAggregate, String>;
+}
+
+impl PostgresUsageLedgerPostgresDbExt for PostgresDb {
+    fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String> {
         validate_event(event)?;
         let unit = event.unit.as_str();
         let source = event.source.as_str();
@@ -39,7 +57,7 @@ impl PostgresDb {
         Ok(inserted == 1)
     }
 
-    pub fn project_usage_from_receipt(
+    fn project_usage_from_receipt(
         &self,
         tenant_id: &str,
         receipt: &OperationReceipt,
@@ -51,7 +69,7 @@ impl PostgresDb {
         Ok(events)
     }
 
-    pub fn aggregate_usage_for_tenant(
+    fn aggregate_usage_for_tenant(
         &self,
         tenant_id: &str,
         unit: UsageUnit,

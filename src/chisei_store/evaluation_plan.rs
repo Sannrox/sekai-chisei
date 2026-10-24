@@ -7,58 +7,60 @@ use crate::chisei::evaluation_plan::{
 use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-impl SekaiDb {
-    pub(crate) fn migrate_evaluation_plans(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_evaluator_definitions (
-                    definition_id TEXT PRIMARY KEY,
-                    namespace TEXT NOT NULL,
-                    evaluator_id TEXT NOT NULL,
-                    version TEXT NOT NULL,
-                    implementation_digest TEXT NOT NULL,
-                    content_digest TEXT NOT NULL,
-                    body_json TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    UNIQUE(namespace, evaluator_id, version)
-                );
-                CREATE INDEX IF NOT EXISTS idx_chisei_evaluator_definitions_namespace
-                    ON chisei_evaluator_definitions(namespace, evaluator_id, version);
-                CREATE TABLE IF NOT EXISTS chisei_evaluator_availability (
-                    definition_id TEXT PRIMARY KEY,
-                    state TEXT NOT NULL,
-                    body_json TEXT NOT NULL,
-                    changed_at_ms INTEGER NOT NULL,
-                    FOREIGN KEY(definition_id) REFERENCES chisei_evaluator_definitions(definition_id)
-                );
-                CREATE TABLE IF NOT EXISTS chisei_evaluator_availability_events (
-                    definition_id TEXT NOT NULL,
-                    request_id TEXT NOT NULL,
-                    request_digest TEXT NOT NULL,
-                    body_json TEXT NOT NULL,
-                    changed_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY(definition_id, request_id),
-                    FOREIGN KEY(definition_id) REFERENCES chisei_evaluator_definitions(definition_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_chisei_evaluator_availability_events_time
-                    ON chisei_evaluator_availability_events(definition_id, changed_at_ms);
-                CREATE TABLE IF NOT EXISTS chisei_evaluation_plans (
-                    plan_version_id TEXT PRIMARY KEY,
-                    namespace TEXT NOT NULL,
-                    plan_id TEXT NOT NULL,
-                    version TEXT NOT NULL,
-                    content_digest TEXT NOT NULL,
-                    body_json TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    UNIQUE(namespace, plan_id, version)
-                );
-                CREATE INDEX IF NOT EXISTS idx_chisei_evaluation_plans_namespace
-                    ON chisei_evaluation_plans(namespace, plan_id, version);",
-            )
-            .map_err(|error| error.to_string())
-    }
+pub trait EvaluationPlanSekaiDbExt {
+    fn put_evaluator_definition(
+        &self,
+        definition: EvaluatorDefinition,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<EvaluatorDefinition, String>;
 
-    pub fn put_evaluator_definition(
+    fn get_evaluator_definition(
+        &self,
+        definition_id: &str,
+    ) -> Result<Option<EvaluatorDefinition>, String>;
+
+    fn list_evaluator_definitions(
+        &self,
+        namespace: &str,
+        evaluator_id: Option<&str>,
+    ) -> Result<Vec<EvaluatorDefinition>, String>;
+
+    fn get_evaluator_availability(
+        &self,
+        definition_id: &str,
+    ) -> Result<Option<EvaluatorAvailability>, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_evaluator_availability(
+        &self,
+        definition_id: &str,
+        state: &str,
+        superseded_by_definition_id: &str,
+        reason: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<EvaluatorAvailability, String>;
+
+    fn put_evaluation_plan(
+        &self,
+        plan: EvaluationPlan,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<EvaluationPlan, String>;
+
+    fn get_evaluation_plan(&self, plan_version_id: &str) -> Result<Option<EvaluationPlan>, String>;
+
+    fn list_evaluation_plans(
+        &self,
+        namespace: &str,
+        plan_id: Option<&str>,
+    ) -> Result<Vec<EvaluationPlan>, String>;
+}
+
+impl EvaluationPlanSekaiDbExt for SekaiDb {
+    fn put_evaluator_definition(
         &self,
         definition: EvaluatorDefinition,
         actor: &str,
@@ -105,7 +107,7 @@ impl SekaiDb {
         Ok(definition)
     }
 
-    pub fn get_evaluator_definition(
+    fn get_evaluator_definition(
         &self,
         definition_id: &str,
     ) -> Result<Option<EvaluatorDefinition>, String> {
@@ -113,7 +115,7 @@ impl SekaiDb {
         get_definition_connection(&connection, definition_id)
     }
 
-    pub fn list_evaluator_definitions(
+    fn list_evaluator_definitions(
         &self,
         namespace: &str,
         evaluator_id: Option<&str>,
@@ -152,7 +154,7 @@ impl SekaiDb {
         Ok(definitions)
     }
 
-    pub fn get_evaluator_availability(
+    fn get_evaluator_availability(
         &self,
         definition_id: &str,
     ) -> Result<Option<EvaluatorAvailability>, String> {
@@ -169,7 +171,7 @@ impl SekaiDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn set_evaluator_availability(
+    fn set_evaluator_availability(
         &self,
         definition_id: &str,
         state: &str,
@@ -212,7 +214,7 @@ impl SekaiDb {
         Ok(availability)
     }
 
-    pub fn put_evaluation_plan(
+    fn put_evaluation_plan(
         &self,
         plan: EvaluationPlan,
         actor: &str,
@@ -248,15 +250,12 @@ impl SekaiDb {
         Ok(plan)
     }
 
-    pub fn get_evaluation_plan(
-        &self,
-        plan_version_id: &str,
-    ) -> Result<Option<EvaluationPlan>, String> {
+    fn get_evaluation_plan(&self, plan_version_id: &str) -> Result<Option<EvaluationPlan>, String> {
         let connection = self.conn();
         get_plan_connection(&connection, plan_version_id)
     }
 
-    pub fn list_evaluation_plans(
+    fn list_evaluation_plans(
         &self,
         namespace: &str,
         plan_id: Option<&str>,

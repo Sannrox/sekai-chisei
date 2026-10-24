@@ -1578,7 +1578,8 @@ pub(super) async fn ack_action_work(
                 origin_agent,
             ));
         }
-        crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)?;
+        crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)
+            .map_err(crate::grpc::write_freeze_status)?;
     }
     let now = now_millis();
     let acked = ActionWorkLifecycle::new(service.db.runtime())

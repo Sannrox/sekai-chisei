@@ -240,7 +240,8 @@ fn apply_source_batch_blocking(
             agent,
         ));
     }
-    crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)?;
+    crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)
+        .map_err(crate::grpc::write_freeze_status)?;
     let mut batch = from_proto_source_batch(proto)?;
     batch.producer_identity = principal.clone();
     let authorized_objects = authorize_source_batch_object_policy(

@@ -205,7 +205,8 @@ impl SekaiServiceImpl {
                     binding.type_id.trim(),
                     true,
                 ),
-            )?;
+            )
+            .map_err(crate::grpc::write_freeze_status)?;
         }
         // One run per binding at a time, so concurrent runs cannot record
         // different outcomes for one event; reinstalls clear the lease.

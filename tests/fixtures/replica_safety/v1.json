@@ -13,8 +13,8 @@
       "class": "shared_store_required",
       "notes": "Reserve, adjust, and idempotent record must be atomic in the shared store.",
       "evidence": [
-        "src/db/chisei_budget.rs",
-        "src/db/replica_safety.rs",
+        "crates/sekai-core/src/db/chisei_budget.rs",
+        "crates/sekai-core/src/db/replica_safety.rs",
         "tests/replica_safety_harness.rs",
         "tests/replica_safety_budget.rs"
       ]
@@ -24,7 +24,7 @@
       "class": "shared_store_required",
       "notes": "Operation receipts and gateway aliases are durable authority.",
       "evidence": [
-        "src/db/chisei_receipt.rs"
+        "crates/sekai-core/src/db/chisei_receipt.rs"
       ]
     },
     {
@@ -53,7 +53,7 @@
       "class": "shared_store_required",
       "notes": "Single-winner acquisition and reclaim after owner loss.",
       "evidence": [
-        "src/db/lease.rs",
+        "crates/sekai-core/src/db/lease.rs",
         "tests/reusable_sekai_backend_conformance.rs",
         "tests/replica_safety_leases.rs"
       ]
@@ -63,7 +63,7 @@
       "class": "shared_store_required",
       "notes": "Work admission and lifecycle transitions.",
       "evidence": [
-        "src/db/coordination.rs",
+        "crates/sekai-core/src/db/coordination.rs",
         "tests/replica_safety_leases.rs"
       ]
     },
@@ -73,7 +73,7 @@
       "max_stale_ms": 5000,
       "notes": "PrincipalCredentialStore may cache with CREDENTIAL_CACHE_MAX_STALE_MS; epoch changes reload immediately. Request-path auth rechecks durable rows and never widens authority from cache alone.",
       "evidence": [
-        "src/sekai/credentials.rs",
+        "crates/sekai-core/src/sekai/credentials.rs",
         "src/grpc/mod.rs",
         "tests/replica_safety_credentials.rs"
       ]
@@ -83,7 +83,7 @@
       "class": "shared_store_required",
       "notes": "Grants and ACL checks resolve against durable store (with optional bounded cache later).",
       "evidence": [
-        "src/db/graph.rs"
+        "crates/sekai-core/src/db/graph.rs"
       ]
     },
     {
@@ -91,7 +91,7 @@
       "class": "shared_store_required",
       "notes": "Decisions and object changes are append-only durable evidence.",
       "evidence": [
-        "src/sekai/audit.rs"
+        "crates/sekai-core/src/sekai/audit.rs"
       ]
     },
     {

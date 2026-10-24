@@ -7,6 +7,7 @@ use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 use crate::db::store::SekaiStore;
 use crate::domain::{Direction, ListFilter, Object};
+use crate::ext::*;
 
 fn read<T>(result: Result<T, String>) -> Result<T, SekaiFactError> {
     result.map_err(SekaiFactError::Read)

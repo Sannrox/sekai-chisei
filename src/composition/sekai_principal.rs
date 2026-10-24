@@ -14,24 +14,44 @@ use crate::sekai::classification_lattice::evaluate_lattice_access;
 use crate::sekai::markings;
 use crate::sekai::security::Grant;
 
-impl SekaiDb {
+pub trait SekaiPrincipalSekaiDbExt {
     /// Grants on `object_id` as Chisei sees them.
-    pub fn list_principal_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, String> {
+    fn list_principal_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, String>;
+}
+
+impl SekaiPrincipalSekaiDbExt for SekaiDb {
+    /// Grants on `object_id` as Chisei sees them.
+    fn list_principal_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, String> {
         self.list_grants(object_id)
             .map(|grants| principal_grants(&grants))
     }
 }
 
-impl RuntimeDb {
+pub trait SekaiPrincipalRuntimeDbExt {
     /// Grants on `object_id` as Chisei sees them.
-    pub fn list_principal_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, String> {
+    fn list_principal_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, String>;
+
+    /// Record a Sekai grant described in Chisei terms. Fixture seeding uses
+    /// it so Chisei code never builds a Sekai `Grant` itself.
+    fn create_principal_grant(
+        &self,
+        grant_id: &str,
+        object_id: &str,
+        grant: &PrincipalGrant,
+        created: i64,
+    ) -> Result<(), String>;
+}
+
+impl SekaiPrincipalRuntimeDbExt for RuntimeDb {
+    /// Grants on `object_id` as Chisei sees them.
+    fn list_principal_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, String> {
         self.list_grants(object_id)
             .map(|grants| principal_grants(&grants))
     }
 
     /// Record a Sekai grant described in Chisei terms. Fixture seeding uses
     /// it so Chisei code never builds a Sekai `Grant` itself.
-    pub fn create_principal_grant(
+    fn create_principal_grant(
         &self,
         grant_id: &str,
         object_id: &str,
@@ -49,7 +69,38 @@ impl RuntimeDb {
     }
 }
 
-impl SekaiStore {
+pub trait SekaiPrincipalStoreExt {
+    fn principal_classification_ceiling(&self, principal: &str) -> Result<Option<String>, String>;
+    fn principal_marking_clearance(
+        &self,
+        operation_id: &str,
+        object: &Object,
+        principal: &str,
+    ) -> Result<MarkingClearance, String>;
+
+    /// Record a Sekai grant described in Chisei terms. Fixture seeding uses
+    /// it so Chisei code never builds a Sekai `Grant` itself.
+    fn create_principal_grant(
+        &self,
+        grant_id: &str,
+        object_id: &str,
+        grant: &PrincipalGrant,
+        created: i64,
+    ) -> Result<(), String>;
+}
+
+impl SekaiPrincipalStoreExt for SekaiStore {
+    fn create_principal_grant(
+        &self,
+        grant_id: &str,
+        object_id: &str,
+        grant: &PrincipalGrant,
+        created: i64,
+    ) -> Result<(), String> {
+        self.runtime()
+            .create_principal_grant(grant_id, object_id, grant, created)
+    }
+
     /// Classification-marking clearance of `principal` for `object`.
     ///
     /// Unmarked objects never consult the principal profile. Marked objects
@@ -59,14 +110,11 @@ impl SekaiStore {
     /// principal profile are errors, which callers treat as a deny.
     /// Raw `classification_ceiling` of `principal`'s trusted profile, the
     /// marking ceiling of a service principal; `None` when unset.
-    pub fn principal_classification_ceiling(
-        &self,
-        principal: &str,
-    ) -> Result<Option<String>, String> {
+    fn principal_classification_ceiling(&self, principal: &str) -> Result<Option<String>, String> {
         Ok(trusted_principal_authority(self.runtime(), principal)?.classification_token)
     }
 
-    pub fn principal_marking_clearance(
+    fn principal_marking_clearance(
         &self,
         operation_id: &str,
         object: &Object,

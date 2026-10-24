@@ -9,6 +9,7 @@ use sekai_chisei::chisei::receipt::{
     ReceiptSurface,
 };
 use sekai_chisei::db::{postgres::PostgresDb, runtime_db::RuntimeDb, sekai::SekaiDb};
+use sekai_chisei::ext::*;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 

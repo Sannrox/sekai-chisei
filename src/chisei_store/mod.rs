@@ -19,6 +19,7 @@ pub mod eval_run;
 mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;
+pub mod ext;
 mod handle;
 mod learning_change_store;
 pub mod policy_shadow;
@@ -39,6 +40,7 @@ mod postgres_portfolio;
 mod postgres_routing_profile;
 mod postgres_usage_ledger;
 pub(crate) mod runtime;
+pub use runtime::ChiseiRuntimeDb;
 
 #[cfg(test)]
 pub use handle::paired_memory;

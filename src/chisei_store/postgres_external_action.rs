@@ -8,8 +8,64 @@ use crate::db::postgres::PostgresDb;
 /// Claim lease duration for in-progress authorization claims (matches SQLite).
 const CLAIM_LEASE_MS: i64 = 30_000;
 
-impl PostgresDb {
-    pub fn claim_external_action_authorization(
+pub trait PostgresExternalActionPostgresDbExt {
+    fn claim_external_action_authorization(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+        authorization_id: &str,
+        now_ms: i64,
+    ) -> Result<AuthorizationClaim, String>;
+
+    fn abandon_external_action_claim(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+    ) -> Result<(), String>;
+
+    /// Atomically replace one exact lifecycle snapshot. A concurrent terminal
+    /// transition makes this return `false` instead of overwriting its result.
+    fn compare_and_swap_external_action_authorization(
+        &self,
+        expected: &AuthorizationRecord,
+        next: &AuthorizationRecord,
+    ) -> Result<bool, String>;
+
+    /// Atomically reserve cumulative external effects for one operation.
+    fn reserve_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+        max_mutations: Option<u32>,
+        max_deletes: Option<u32>,
+    ) -> Result<(), String>;
+
+    fn release_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+    ) -> Result<(), String>;
+
+    fn get_external_action_authorization(
+        &self,
+        actor: &str,
+        operation_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<AuthorizationRecord>, String>;
+
+    fn put_external_action_authorization(&self, record: &AuthorizationRecord)
+    -> Result<(), String>;
+
+    fn get_external_action_authorization_by_id(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<AuthorizationRecord>, String>;
+
+    fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+}
+
+impl PostgresExternalActionPostgresDbExt for PostgresDb {
+    fn claim_external_action_authorization(
         &self,
         request: &ExternalActionRequest,
         request_digest: &str,
@@ -92,7 +148,7 @@ impl PostgresDb {
         Ok(claim)
     }
 
-    pub fn abandon_external_action_claim(
+    fn abandon_external_action_claim(
         &self,
         request: &ExternalActionRequest,
         request_digest: &str,
@@ -115,7 +171,7 @@ impl PostgresDb {
 
     /// Atomically replace one exact lifecycle snapshot. A concurrent terminal
     /// transition makes this return `false` instead of overwriting its result.
-    pub fn compare_and_swap_external_action_authorization(
+    fn compare_and_swap_external_action_authorization(
         &self,
         expected: &AuthorizationRecord,
         next: &AuthorizationRecord,
@@ -138,7 +194,7 @@ impl PostgresDb {
     }
 
     /// Atomically reserve cumulative external effects for one operation.
-    pub fn reserve_external_action_blast_radius(
+    fn reserve_external_action_blast_radius(
         &self,
         authorization_id: &str,
         request: &ExternalActionRequest,
@@ -251,7 +307,7 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    pub fn release_external_action_blast_radius(
+    fn release_external_action_blast_radius(
         &self,
         authorization_id: &str,
         request: &ExternalActionRequest,
@@ -307,7 +363,7 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    pub fn get_external_action_authorization(
+    fn get_external_action_authorization(
         &self,
         actor: &str,
         operation_id: &str,
@@ -327,7 +383,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn put_external_action_authorization(
+    fn put_external_action_authorization(
         &self,
         record: &AuthorizationRecord,
     ) -> Result<(), String> {
@@ -353,7 +409,7 @@ impl PostgresDb {
         Ok(())
     }
 
-    pub fn get_external_action_authorization_by_id(
+    fn get_external_action_authorization_by_id(
         &self,
         authorization_id: &str,
     ) -> Result<Option<AuthorizationRecord>, String> {
@@ -371,7 +427,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
+    fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
         let rows = self
             .connection()?
             .query(

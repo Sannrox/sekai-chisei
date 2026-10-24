@@ -9,6 +9,7 @@ use crate::chisei::kioku::{
     KiokuEvidenceLink, KiokuEvidenceReassessmentRequest, KiokuMemory, MemoryLifecycleEvent,
 };
 use crate::chisei_store::ChiseiStore;
+use crate::ext::*;
 
 const CANDIDATE_PAGE_SIZE: usize = 100;
 const MAX_CANDIDATE_PAGES: usize = 4;

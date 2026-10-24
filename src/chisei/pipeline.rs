@@ -11,6 +11,7 @@ use crate::chisei::principal::PrincipalContext;
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader, SekaiFacts};
 use crate::chisei_store::{ChiseiKiokuStore, ChiseiStore};
 use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
+use crate::ext::*;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 

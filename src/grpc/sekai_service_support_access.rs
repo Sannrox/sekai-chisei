@@ -1,4 +1,5 @@
 use super::*;
+use crate::ext::*;
 
 pub(super) fn map_capability_error(error: capability::CatalogError) -> Status {
     match error {
@@ -751,6 +752,7 @@ pub(super) fn refuse_frozen_object_write(
         ));
     }
     crate::sekai::write_freeze::refuse_if_frozen_any(db, &checks)
+        .map_err(crate::grpc::write_freeze_status)
 }
 pub(super) fn enforce_object_operation_access(
     db: &RuntimeDb,

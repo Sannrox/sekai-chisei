@@ -5,25 +5,17 @@ use rusqlite::{OptionalExtension, params};
 use crate::chisei::learning_change::LearningChange;
 use crate::db::sekai::SekaiDb;
 
-impl SekaiDb {
-    pub(crate) fn migrate_learning_changes(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_learning_changes (
-                    change_id TEXT PRIMARY KEY,
-                    namespace TEXT NOT NULL,
-                    learning_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    record_json TEXT NOT NULL,
-                    updated_at_ms INTEGER NOT NULL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_chisei_learning_changes_learning
-                    ON chisei_learning_changes(namespace, learning_id);",
-            )
-            .map_err(|error| error.to_string())
-    }
+pub trait LearningChangeStoreSekaiDbExt {
+    fn put_learning_change(&self, record: &LearningChange) -> Result<(), String>;
 
-    pub fn put_learning_change(&self, record: &LearningChange) -> Result<(), String> {
+    fn get_learning_change(&self, change_id: &str) -> Result<Option<LearningChange>, String>;
+
+    fn list_learning_changes(&self, namespace: Option<&str>)
+    -> Result<Vec<LearningChange>, String>;
+}
+
+impl LearningChangeStoreSekaiDbExt for SekaiDb {
+    fn put_learning_change(&self, record: &LearningChange) -> Result<(), String> {
         let json = serde_json::to_string(record)
             .map_err(|error| format!("encode learning change: {error}"))?;
         self.conn()
@@ -50,7 +42,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub fn get_learning_change(&self, change_id: &str) -> Result<Option<LearningChange>, String> {
+    fn get_learning_change(&self, change_id: &str) -> Result<Option<LearningChange>, String> {
         let json: Option<String> = self
             .conn()
             .query_row(
@@ -66,7 +58,7 @@ impl SekaiDb {
         .transpose()
     }
 
-    pub fn list_learning_changes(
+    fn list_learning_changes(
         &self,
         namespace: Option<&str>,
     ) -> Result<Vec<LearningChange>, String> {

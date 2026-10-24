@@ -265,45 +265,64 @@ pub enum AuthorizationClaim {
     InProgress,
 }
 
-impl SekaiDb {
-    pub(crate) fn ensure_external_action_tables(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_external_action_reservations (
-                    actor TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    mutations INTEGER NOT NULL,
-                    deletes INTEGER NOT NULL,
-                    PRIMARY KEY(actor, namespace, operation_id)
-                );
-                CREATE TABLE IF NOT EXISTS chisei_external_action_authorizations (
-                    actor TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
-                    request_digest TEXT NOT NULL,
-                    authorization_id TEXT NOT NULL UNIQUE,
-                    record_json TEXT,
-                    claimed_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY(actor, operation_id, idempotency_key)
-                );
-                CREATE TABLE IF NOT EXISTS chisei_external_action_releases (
-                    authorization_id TEXT PRIMARY KEY,
-                    released_at_ms INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS chisei_external_action_blast_claims (
-                    authorization_id TEXT PRIMARY KEY,
-                    actor TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    mutations INTEGER NOT NULL,
-                    deletes INTEGER NOT NULL
-                );",
-            )
-            .map_err(|error| error.to_string())
-    }
+pub trait ExternalActionSekaiDbExt {
+    fn claim_external_action_authorization(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+        authorization_id: &str,
+        now_ms: i64,
+    ) -> Result<AuthorizationClaim, String>;
 
-    pub fn claim_external_action_authorization(
+    fn abandon_external_action_claim(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+    ) -> Result<(), String>;
+
+    /// Atomically replace one exact lifecycle snapshot. A concurrent terminal
+    /// transition makes this return `false` instead of overwriting its result.
+    fn compare_and_swap_external_action_authorization(
+        &self,
+        expected: &AuthorizationRecord,
+        next: &AuthorizationRecord,
+    ) -> Result<bool, String>;
+
+    /// Atomically reserve cumulative external effects for one operation.
+    fn reserve_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+        max_mutations: Option<u32>,
+        max_deletes: Option<u32>,
+    ) -> Result<(), String>;
+
+    fn release_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+    ) -> Result<(), String>;
+
+    fn get_external_action_authorization(
+        &self,
+        actor: &str,
+        operation_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<AuthorizationRecord>, String>;
+
+    fn put_external_action_authorization(&self, record: &AuthorizationRecord)
+    -> Result<(), String>;
+
+    fn get_external_action_authorization_by_id(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<AuthorizationRecord>, String>;
+
+    fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+}
+
+impl ExternalActionSekaiDbExt for SekaiDb {
+    fn claim_external_action_authorization(
         &self,
         request: &ExternalActionRequest,
         request_digest: &str,
@@ -368,7 +387,7 @@ impl SekaiDb {
         }
     }
 
-    pub fn abandon_external_action_claim(
+    fn abandon_external_action_claim(
         &self,
         request: &ExternalActionRequest,
         request_digest: &str,
@@ -392,7 +411,7 @@ impl SekaiDb {
 
     /// Atomically replace one exact lifecycle snapshot. A concurrent terminal
     /// transition makes this return `false` instead of overwriting its result.
-    pub fn compare_and_swap_external_action_authorization(
+    fn compare_and_swap_external_action_authorization(
         &self,
         expected: &AuthorizationRecord,
         next: &AuthorizationRecord,
@@ -416,7 +435,7 @@ impl SekaiDb {
     }
 
     /// Atomically reserve cumulative external effects for one operation.
-    pub fn reserve_external_action_blast_radius(
+    fn reserve_external_action_blast_radius(
         &self,
         authorization_id: &str,
         request: &ExternalActionRequest,
@@ -502,7 +521,7 @@ impl SekaiDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn release_external_action_blast_radius(
+    fn release_external_action_blast_radius(
         &self,
         authorization_id: &str,
         request: &ExternalActionRequest,
@@ -542,7 +561,7 @@ impl SekaiDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    pub fn get_external_action_authorization(
+    fn get_external_action_authorization(
         &self,
         actor: &str,
         operation_id: &str,
@@ -563,7 +582,7 @@ impl SekaiDb {
             .transpose()
     }
 
-    pub fn put_external_action_authorization(
+    fn put_external_action_authorization(
         &self,
         record: &AuthorizationRecord,
     ) -> Result<(), String> {
@@ -589,7 +608,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub fn get_external_action_authorization_by_id(
+    fn get_external_action_authorization_by_id(
         &self,
         authorization_id: &str,
     ) -> Result<Option<AuthorizationRecord>, String> {
@@ -604,7 +623,7 @@ impl SekaiDb {
             .transpose()
     }
 
-    pub fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
+    fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
         self.ensure_external_action_tables()?;
         let conn = self.conn();
         let mut statement = conn

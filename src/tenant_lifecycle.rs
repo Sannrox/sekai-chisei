@@ -13,6 +13,7 @@ use crate::chisei::billing_adapter::FakeBillingAdapter;
 use crate::chisei::usage_ledger::UsageUnit;
 use crate::db::sekai::SekaiDb;
 use crate::enterprise::AuthenticatedContext;
+use crate::ext::*;
 use crate::provider_credentials::MemoryTenantProviderCredentialResolver;
 
 pub const TENANT_LIFECYCLE_VERSION: &str = "sekai.tenant-lifecycle/v1";

@@ -59,7 +59,7 @@ pub trait ChiseiExternalActionBackend: Send + Sync {
 }
 
 macro_rules! forward {
-    ($target:ty) => {
+    ($target:ty, $ext:path) => {
         fn claim_external_action_authorization(
             &self,
             request: &ExternalActionRequest,
@@ -67,7 +67,7 @@ macro_rules! forward {
             authorization_id: &str,
             now_ms: i64,
         ) -> Result<AuthorizationClaim, String> {
-            <$target>::claim_external_action_authorization(
+            <$target as $ext>::claim_external_action_authorization(
                 self,
                 request,
                 request_digest,
@@ -81,7 +81,7 @@ macro_rules! forward {
             request: &ExternalActionRequest,
             request_digest: &str,
         ) -> Result<(), String> {
-            <$target>::abandon_external_action_claim(self, request, request_digest)
+            <$target as $ext>::abandon_external_action_claim(self, request, request_digest)
         }
 
         fn compare_and_swap_external_action_authorization(
@@ -89,7 +89,7 @@ macro_rules! forward {
             expected: &AuthorizationRecord,
             next: &AuthorizationRecord,
         ) -> Result<bool, String> {
-            <$target>::compare_and_swap_external_action_authorization(self, expected, next)
+            <$target as $ext>::compare_and_swap_external_action_authorization(self, expected, next)
         }
 
         fn reserve_external_action_blast_radius(
@@ -99,7 +99,7 @@ macro_rules! forward {
             max_mutations: Option<u32>,
             max_deletes: Option<u32>,
         ) -> Result<(), String> {
-            <$target>::reserve_external_action_blast_radius(
+            <$target as $ext>::reserve_external_action_blast_radius(
                 self,
                 authorization_id,
                 request,
@@ -113,7 +113,7 @@ macro_rules! forward {
             authorization_id: &str,
             request: &ExternalActionRequest,
         ) -> Result<(), String> {
-            <$target>::release_external_action_blast_radius(self, authorization_id, request)
+            <$target as $ext>::release_external_action_blast_radius(self, authorization_id, request)
         }
 
         fn get_external_action_authorization(
@@ -122,32 +122,43 @@ macro_rules! forward {
             operation_id: &str,
             idempotency_key: &str,
         ) -> Result<Option<AuthorizationRecord>, String> {
-            <$target>::get_external_action_authorization(self, actor, operation_id, idempotency_key)
+            <$target as $ext>::get_external_action_authorization(
+                self,
+                actor,
+                operation_id,
+                idempotency_key,
+            )
         }
 
         fn put_external_action_authorization(
             &self,
             record: &AuthorizationRecord,
         ) -> Result<(), String> {
-            <$target>::put_external_action_authorization(self, record)
+            <$target as $ext>::put_external_action_authorization(self, record)
         }
 
         fn get_external_action_authorization_by_id(
             &self,
             authorization_id: &str,
         ) -> Result<Option<AuthorizationRecord>, String> {
-            <$target>::get_external_action_authorization_by_id(self, authorization_id)
+            <$target as $ext>::get_external_action_authorization_by_id(self, authorization_id)
         }
 
         fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
-            <$target>::list_external_action_authorizations(self)
+            <$target as $ext>::list_external_action_authorizations(self)
         }
     };
 }
 
 impl ChiseiExternalActionBackend for SekaiDb {
-    forward!(SekaiDb);
+    forward!(
+        SekaiDb,
+        crate::chisei::external_action::ExternalActionSekaiDbExt
+    );
 }
 impl ChiseiExternalActionBackend for PostgresDb {
-    forward!(PostgresDb);
+    forward!(
+        PostgresDb,
+        crate::chisei_store::postgres_external_action::PostgresExternalActionPostgresDbExt
+    );
 }

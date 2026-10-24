@@ -5,8 +5,93 @@ use crate::db::postgres::PostgresDb;
 const ITERATION_COLUMNS: &str = "id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created";
 const SAMPLE_LEASE_MS: i64 = 30 * 60 * 1000;
 
-impl PostgresDb {
-    pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
+pub trait PostgresEvalPostgresDbExt {
+    fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String>;
+
+    fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String>;
+
+    fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String>;
+
+    fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String>;
+
+    fn put_eval_run(&self, run: &eval::Run) -> Result<(), String>;
+
+    fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String>;
+
+    fn get_latest_eval_run_record_for_gate(
+        &self,
+        suite_id: &str,
+        config_ref: &str,
+        max_timestamp_ms: i64,
+    ) -> Result<Option<eval::Run>, String>;
+
+    fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String>;
+
+    fn list_all_eval_run_records(&self) -> Result<Vec<eval::Run>, String>;
+
+    fn query_eval_runs(
+        &self,
+        sql: &str,
+        params: &[&(dyn postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<eval::Run>, String>;
+
+    fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String>;
+
+    fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String>;
+
+    fn list_eval_iteration_records(&self, suite_id: &str) -> Result<Vec<eval::Iteration>, String>;
+
+    fn list_all_eval_iteration_records(&self) -> Result<Vec<eval::Iteration>, String>;
+
+    fn latest_eval_iteration_for_file(
+        &self,
+        changed_file: &str,
+    ) -> Result<Option<eval::Iteration>, String>;
+
+    fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String>;
+
+    fn query_eval_iterations(
+        &self,
+        sql: &str,
+        params: &[&(dyn postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<eval::Iteration>, String>;
+
+    fn put_evolve_task(&self, task: &evolve::TaskRecord) -> Result<(), String>;
+
+    fn get_evolve_task_record(&self, id: &str) -> Result<Option<evolve::TaskRecord>, String>;
+
+    fn list_evolve_task_records(&self) -> Result<Vec<evolve::TaskRecord>, String>;
+
+    fn put_sample_observation(
+        &self,
+        observation: &crate::chisei::scoring::SampleObservation,
+    ) -> Result<(), String>;
+
+    /// Read one observation for an authorized, bounded telemetry projection.
+    fn get_sample_observation(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String>;
+
+    /// Read one observation only when its request identity and namespace match.
+    fn get_sample_observation_in_namespace(
+        &self,
+        request_id: &str,
+        namespace: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String>;
+
+    fn list_unscored_observations(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String>;
+
+    fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String>;
+
+    fn delete_observation(&self, request_id: &str) -> Result<(), String>;
+}
+
+impl PostgresEvalPostgresDbExt for PostgresDb {
+    fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
         let cases_json = serde_json::to_string(&suite.cases).map_err(|error| error.to_string())?;
         let mut connection = self.connection()?;
         let mut transaction = connection
@@ -39,7 +124,7 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    pub fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
+    fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
         self.connection()?
             .query_opt(
                 "SELECT id, name, description, cases_json FROM chisei_eval_suites WHERE id = $1",
@@ -50,7 +135,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String> {
+    fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String> {
         self.connection()?
             .query_opt(
                 "SELECT id, name, description, cases_json FROM chisei_eval_suites WHERE id = $1",
@@ -72,7 +157,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String> {
+    fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String> {
         self.connection()?
             .query(
                 "SELECT id, name, description, cases_json FROM chisei_eval_suites ORDER BY id",
@@ -84,7 +169,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
+    fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
         let results_json =
             serde_json::to_string(&run.results).map_err(|error| error.to_string())?;
         let mut connection = self.connection()?;
@@ -121,7 +206,7 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
+    fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         self.connection()?
             .query_opt(
                 "SELECT id, suite_id, config_ref, results_json, timestamp
@@ -133,7 +218,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn get_latest_eval_run_record_for_gate(
+    fn get_latest_eval_run_record_for_gate(
         &self,
         suite_id: &str,
         config_ref: &str,
@@ -163,7 +248,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String> {
+    fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String> {
         self.query_eval_runs(
             "SELECT id, suite_id, config_ref, results_json, timestamp
              FROM chisei_eval_runs WHERE suite_id = $1 ORDER BY timestamp",
@@ -171,7 +256,7 @@ impl PostgresDb {
         )
     }
 
-    pub fn list_all_eval_run_records(&self) -> Result<Vec<eval::Run>, String> {
+    fn list_all_eval_run_records(&self) -> Result<Vec<eval::Run>, String> {
         self.query_eval_runs(
             "SELECT id, suite_id, config_ref, results_json, timestamp
              FROM chisei_eval_runs ORDER BY timestamp",
@@ -192,7 +277,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
+    fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
         self.connection()?
             .execute(
                 "DELETE FROM chisei_eval_runs
@@ -206,7 +291,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
+    fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
         let regressed = i64::from(iteration.regressed);
         self.connection()?
             .execute(
@@ -245,10 +330,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn list_eval_iteration_records(
-        &self,
-        suite_id: &str,
-    ) -> Result<Vec<eval::Iteration>, String> {
+    fn list_eval_iteration_records(&self, suite_id: &str) -> Result<Vec<eval::Iteration>, String> {
         self.query_eval_iterations(
             &format!(
                 "SELECT {ITERATION_COLUMNS} FROM chisei_eval_iterations
@@ -258,14 +340,14 @@ impl PostgresDb {
         )
     }
 
-    pub fn list_all_eval_iteration_records(&self) -> Result<Vec<eval::Iteration>, String> {
+    fn list_all_eval_iteration_records(&self) -> Result<Vec<eval::Iteration>, String> {
         self.query_eval_iterations(
             &format!("SELECT {ITERATION_COLUMNS} FROM chisei_eval_iterations ORDER BY created, id"),
             &[],
         )
     }
 
-    pub fn latest_eval_iteration_for_file(
+    fn latest_eval_iteration_for_file(
         &self,
         changed_file: &str,
     ) -> Result<Option<eval::Iteration>, String> {
@@ -282,7 +364,7 @@ impl PostgresDb {
             .map(row_to_eval_iteration))
     }
 
-    pub fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
+    fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
         self.connection()?
             .execute(
                 "DELETE FROM chisei_eval_iterations
@@ -310,7 +392,7 @@ impl PostgresDb {
             .collect())
     }
 
-    pub fn put_evolve_task(&self, task: &evolve::TaskRecord) -> Result<(), String> {
+    fn put_evolve_task(&self, task: &evolve::TaskRecord) -> Result<(), String> {
         let task_json = serde_json::to_string(task).map_err(|error| error.to_string())?;
         self.connection()?
             .execute(
@@ -322,7 +404,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn get_evolve_task_record(&self, id: &str) -> Result<Option<evolve::TaskRecord>, String> {
+    fn get_evolve_task_record(&self, id: &str) -> Result<Option<evolve::TaskRecord>, String> {
         self.connection()?
             .query_opt(
                 "SELECT task_json FROM chisei_evolve_tasks WHERE id = $1",
@@ -336,7 +418,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn list_evolve_task_records(&self) -> Result<Vec<evolve::TaskRecord>, String> {
+    fn list_evolve_task_records(&self) -> Result<Vec<evolve::TaskRecord>, String> {
         self.connection()?
             .query("SELECT task_json FROM chisei_evolve_tasks ORDER BY id", &[])
             .map_err(|error| error.to_string())?
@@ -348,7 +430,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn put_sample_observation(
+    fn put_sample_observation(
         &self,
         observation: &crate::chisei::scoring::SampleObservation,
     ) -> Result<(), String> {
@@ -382,7 +464,7 @@ impl PostgresDb {
     }
 
     /// Read one observation for an authorized, bounded telemetry projection.
-    pub fn get_sample_observation(
+    fn get_sample_observation(
         &self,
         request_id: &str,
     ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String> {
@@ -403,7 +485,7 @@ impl PostgresDb {
     }
 
     /// Read one observation only when its request identity and namespace match.
-    pub fn get_sample_observation_in_namespace(
+    fn get_sample_observation_in_namespace(
         &self,
         request_id: &str,
         namespace: &str,
@@ -425,7 +507,7 @@ impl PostgresDb {
         row.map(row_to_sample_observation).transpose()
     }
 
-    pub fn list_unscored_observations(
+    fn list_unscored_observations(
         &self,
         limit: i32,
     ) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String> {
@@ -485,7 +567,7 @@ impl PostgresDb {
         Ok(observations)
     }
 
-    pub fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
+    fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
         self.connection()?
             .query_opt(
                 "UPDATE chisei_sample_observations
@@ -499,7 +581,7 @@ impl PostgresDb {
             .ok_or_else(|| format!("sample observation not found: {request_id}"))
     }
 
-    pub fn delete_observation(&self, request_id: &str) -> Result<(), String> {
+    fn delete_observation(&self, request_id: &str) -> Result<(), String> {
         self.connection()?
             .execute(
                 "DELETE FROM chisei_sample_observations WHERE request_id = $1",

@@ -6,6 +6,7 @@ use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 #[cfg(test)]
 use crate::chisei_store::ChiseiStore;
 use crate::db::sekai::SekaiDb;
+use crate::ext::*;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1030,67 +1031,149 @@ impl KiokuEvidenceLink {
     }
 }
 
-impl SekaiDb {
-    pub(crate) fn migrate_kioku(&self) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chisei_kioku_memories (
-                id TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                namespace TEXT NOT NULL,
-                state TEXT NOT NULL,
-                classification TEXT NOT NULL,
-                expires_at_ms INTEGER,
-                memory_json TEXT NOT NULL,
-                PRIMARY KEY (id, version)
-            );
-            CREATE INDEX IF NOT EXISTS idx_kioku_memory_retrieval
-                ON chisei_kioku_memories(namespace, state, expires_at_ms);
-            CREATE TABLE IF NOT EXISTS chisei_kioku_evidence_links (
-                memory_id TEXT NOT NULL,
-                memory_version INTEGER NOT NULL,
-                operation_id TEXT NOT NULL,
-                stance TEXT NOT NULL,
-                link_json TEXT NOT NULL,
-                PRIMARY KEY (memory_id, memory_version, operation_id),
-                FOREIGN KEY (memory_id, memory_version)
-                    REFERENCES chisei_kioku_memories(id, version)
-            );
-            CREATE INDEX IF NOT EXISTS idx_kioku_evidence_operation
-                ON chisei_kioku_evidence_links(operation_id);
-            CREATE TABLE IF NOT EXISTS chisei_kioku_lifecycle_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                memory_id TEXT NOT NULL,
-                memory_version INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                from_state TEXT,
-                to_state TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                recorded_at_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_kioku_lifecycle_memory
-                ON chisei_kioku_lifecycle_events(memory_id, memory_version, id);
-            CREATE TABLE IF NOT EXISTS chisei_kioku_outcomes (
-                memory_id TEXT NOT NULL,
-                memory_version INTEGER NOT NULL,
-                operation_id TEXT NOT NULL,
-                memory_applied INTEGER NOT NULL,
-                outcome_metric TEXT NOT NULL,
-                outcome_value REAL NOT NULL,
-                passed INTEGER NOT NULL,
-                recorded_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (memory_id, memory_version, operation_id),
-                FOREIGN KEY (memory_id, memory_version)
-                    REFERENCES chisei_kioku_memories(id, version)
-            );
-            CREATE INDEX IF NOT EXISTS idx_kioku_outcome_comparison
-                ON chisei_kioku_outcomes(memory_id, memory_version, memory_applied);",
-        )
-        .map_err(|error| error.to_string())
-    }
+pub trait KiokuSekaiDbExt {
+    fn insert_kioku_memory(
+        &self,
+        memory: &KiokuMemory,
+        evidence: &[KiokuEvidenceLink],
+    ) -> Result<(), String>;
 
-    pub fn insert_kioku_memory(
+    fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String>;
+
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String>;
+
+    fn list_kioku_candidates(
+        &self,
+        namespace: &str,
+        operation_class: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KiokuMemory>, String>;
+
+    fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String>;
+
+    fn list_kioku_evidence(&self, id: &str, version: u32)
+    -> Result<Vec<KiokuEvidenceLink>, String>;
+
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String>;
+
+    fn review_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String>;
+
+    fn review_kioku_candidate_after_graph_auth(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String>;
+
+    fn review_kioku_candidate_inner(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+        authorize_graph: bool,
+    ) -> Result<KiokuMemory, String>;
+
+    fn list_kioku_lifecycle_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String>;
+
+    fn disable_kioku_memory(
+        &self,
+        id: &str,
+        version: u32,
+        actor: &str,
+        rationale: &str,
+        recorded_at_ms: i64,
+    ) -> Result<KiokuMemory, String>;
+
+    fn retrieve_kioku_memories(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String>;
+
+    fn retrieve_kioku_memories_after_graph_auth(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String>;
+
+    fn retrieve_kioku_memories_inner(
+        &self,
+        request: &MemoryRetrievalRequest,
+        authorize_graph: bool,
+    ) -> Result<Vec<RetrievedMemory>, String>;
+
+    fn authorize_kioku_retrieval(&self, request: &MemoryRetrievalRequest) -> Result<(), String>;
+
+    fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String>;
+
+    fn authorize_kioku_evidence(
+        &self,
+        request: &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String>;
+
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String>;
+
+    fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String>;
+
+    fn list_kioku_outcome_assignments(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<MemoryOutcomeAssignment>, String>;
+
+    fn record_kioku_holdout(
+        &self,
+        id: &str,
+        version: u32,
+        operation_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn evaluate_kioku_impact(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryImpactEvaluation, String>;
+
+    fn evaluate_kioku_impact_if_ready(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<Option<MemoryImpactEvaluation>, String>;
+
+    fn sweep_kioku_lifecycle(
+        &self,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryLifecycleSweep, String>;
+}
+
+impl KiokuSekaiDbExt for SekaiDb {
+    fn insert_kioku_memory(
         &self,
         memory: &KiokuMemory,
         evidence: &[KiokuEvidenceLink],
@@ -1185,16 +1268,13 @@ impl SekaiDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn produce_kioku_candidate(
-        &self,
-        input: CandidateDerivation,
-    ) -> Result<KiokuMemory, String> {
+    fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String> {
         let (memory, evidence) = derive_verified_outcome_candidate(input)?;
         self.insert_kioku_memory(&memory, &evidence)?;
         Ok(memory)
     }
 
-    pub fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
         let conn = self.conn();
         let json: Option<String> = conn
             .query_row(
@@ -1208,7 +1288,7 @@ impl SekaiDb {
             .transpose()
     }
 
-    pub fn list_kioku_candidates(
+    fn list_kioku_candidates(
         &self,
         namespace: &str,
         operation_class: Option<&str>,
@@ -1256,7 +1336,7 @@ impl SekaiDb {
         .collect()
     }
 
-    pub fn list_kioku_candidate_page(
+    fn list_kioku_candidate_page(
         &self,
         namespace: &str,
         limit: usize,
@@ -1293,7 +1373,7 @@ impl SekaiDb {
         .collect()
     }
 
-    pub fn list_kioku_evidence(
+    fn list_kioku_evidence(
         &self,
         id: &str,
         version: u32,
@@ -1315,11 +1395,7 @@ impl SekaiDb {
         .collect()
     }
 
-    pub fn validate_kioku_candidate(
-        &self,
-        id: &str,
-        version: u32,
-    ) -> Result<MemoryValidation, String> {
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String> {
         let Some(memory) = self.get_kioku_memory(id, version)? else {
             return Err(format!("memory {id} version {version} not found"));
         };
@@ -1435,7 +1511,7 @@ impl SekaiDb {
         })
     }
 
-    pub fn review_kioku_candidate(
+    fn review_kioku_candidate(
         &self,
         id: &str,
         version: u32,
@@ -1444,7 +1520,7 @@ impl SekaiDb {
         self.review_kioku_candidate_inner(id, version, review, true)
     }
 
-    pub(crate) fn review_kioku_candidate_after_graph_auth(
+    fn review_kioku_candidate_after_graph_auth(
         &self,
         id: &str,
         version: u32,
@@ -1609,7 +1685,7 @@ impl SekaiDb {
         Ok(memory)
     }
 
-    pub fn list_kioku_lifecycle_events(
+    fn list_kioku_lifecycle_events(
         &self,
         id: &str,
         version: u32,
@@ -1641,7 +1717,7 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn disable_kioku_memory(
+    fn disable_kioku_memory(
         &self,
         id: &str,
         version: u32,
@@ -1689,7 +1765,7 @@ impl SekaiDb {
         Ok(memory)
     }
 
-    pub fn retrieve_kioku_memories(
+    fn retrieve_kioku_memories(
         &self,
         request: &MemoryRetrievalRequest,
     ) -> Result<Vec<RetrievedMemory>, String> {
@@ -1708,7 +1784,7 @@ impl SekaiDb {
         self.retrieve_kioku_memories_inner(request, true)
     }
 
-    pub(crate) fn retrieve_kioku_memories_after_graph_auth(
+    fn retrieve_kioku_memories_after_graph_auth(
         &self,
         request: &MemoryRetrievalRequest,
     ) -> Result<Vec<RetrievedMemory>, String> {
@@ -1866,7 +1942,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub fn kioku_authorized_classification_ceiling(
+    fn kioku_authorized_classification_ceiling(
         &self,
         namespace: &str,
         actor: &str,
@@ -1884,7 +1960,7 @@ impl SekaiDb {
         )
     }
 
-    pub fn authorize_kioku_evidence(
+    fn authorize_kioku_evidence(
         &self,
         request: &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest,
     ) -> Result<(), String> {
@@ -1936,17 +2012,14 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         insert_lifecycle_event(&tx, event)?;
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn record_kioku_outcome(
-        &self,
-        observation: &MemoryOutcomeObservation,
-    ) -> Result<bool, String> {
+    fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String> {
         if observation.operation_id.trim().is_empty()
             || observation.request_id.trim().is_empty()
             || observation.outcome_metric.trim().is_empty()
@@ -2117,7 +2190,7 @@ impl SekaiDb {
         Ok(true)
     }
 
-    pub fn list_kioku_outcome_assignments(
+    fn list_kioku_outcome_assignments(
         &self,
         operation_id: &str,
     ) -> Result<Vec<MemoryOutcomeAssignment>, String> {
@@ -2191,7 +2264,7 @@ impl SekaiDb {
             .collect())
     }
 
-    pub fn record_kioku_holdout(
+    fn record_kioku_holdout(
         &self,
         id: &str,
         version: u32,
@@ -2220,7 +2293,7 @@ impl SekaiDb {
         })
     }
 
-    pub fn evaluate_kioku_impact(
+    fn evaluate_kioku_impact(
         &self,
         id: &str,
         version: u32,
@@ -2326,7 +2399,7 @@ impl SekaiDb {
         })
     }
 
-    pub fn evaluate_kioku_impact_if_ready(
+    fn evaluate_kioku_impact_if_ready(
         &self,
         id: &str,
         version: u32,
@@ -2372,7 +2445,7 @@ impl SekaiDb {
         .map(Some)
     }
 
-    pub fn sweep_kioku_lifecycle(
+    fn sweep_kioku_lifecycle(
         &self,
         actor: &str,
         now_ms: i64,
@@ -2706,8 +2779,18 @@ fn authorize_kioku_evidence_tx(
     Ok(())
 }
 
-impl SekaiDb {
-    pub(crate) fn put_operation_receipt_with_kioku_holdouts(
+pub trait KiokuSekaiDbExt2 {
+    fn put_operation_receipt_with_kioku_holdouts(
+        &self,
+        receipt: &OperationReceipt,
+        holdouts: &[(String, u32)],
+        actor: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), String>;
+}
+
+impl KiokuSekaiDbExt2 for SekaiDb {
+    fn put_operation_receipt_with_kioku_holdouts(
         &self,
         receipt: &OperationReceipt,
         holdouts: &[(String, u32)],

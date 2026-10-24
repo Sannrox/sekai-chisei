@@ -8,7 +8,7 @@ use crate::chisei::external_action::{AuthorizationRecord, REDEMPTION_VERSION};
 use crate::chisei_store::ChiseiStore;
 use crate::db::sekai::SekaiDb;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -324,98 +324,90 @@ fn validate_delegation_chain_on(
     Ok(())
 }
 
-fn ensure_external_permit_tables_on(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chisei_external_action_permits (
-                permit_id TEXT PRIMARY KEY, authorization_id TEXT NOT NULL UNIQUE,
-                issuance_idempotency_key TEXT NOT NULL, permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS chisei_external_action_redemptions (
-                permit_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, execution_id TEXT NOT NULL,
-                redemption_json TEXT NOT NULL, redeemed_at_ms INTEGER NOT NULL,
-                invocation_ordinal INTEGER NOT NULL, redemption_id TEXT,
-                evidence_due_at_ms INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(permit_id,idempotency_key), UNIQUE(permit_id,execution_id),
-                UNIQUE(permit_id,invocation_ordinal)
-             );
-             CREATE TABLE IF NOT EXISTS chisei_external_action_revocations (
-                revocation_handle TEXT PRIMARY KEY, reason TEXT NOT NULL, revoked_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS chisei_external_action_kill_switches (
-                scope_kind TEXT NOT NULL, scope_value TEXT NOT NULL, reason TEXT NOT NULL,
-                enabled_at_ms INTEGER NOT NULL, PRIMARY KEY(scope_kind,scope_value)
-             );
-             CREATE TABLE IF NOT EXISTS chisei_external_action_delegated_permits (
-                permit_id TEXT PRIMARY KEY, parent_permit_id TEXT NOT NULL,
-                permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
-             );
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_external_action_one_child_per_parent
-             ON chisei_external_action_delegated_permits(parent_permit_id);
-             CREATE TABLE IF NOT EXISTS chisei_external_permit_policies (
-                scope TEXT PRIMARY KEY, policy_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
-             );"
-        ).map_err(|error| error.to_string())?;
-    for (column, definition) in [
-        ("redemption_id", "TEXT"),
-        ("evidence_due_at_ms", "INTEGER NOT NULL DEFAULT 0"),
-    ] {
-        let exists = {
-            let mut statement = conn
-                .prepare("PRAGMA table_info(chisei_external_action_redemptions)")
-                .map_err(|error| error.to_string())?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))
-                .map_err(|error| error.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?
-                .iter()
-                .any(|name| name == column)
-        };
-        if !exists {
-            conn.execute_batch(&format!(
-                "ALTER TABLE chisei_external_action_redemptions ADD COLUMN {column} {definition}"
-            ))
-            .map_err(|error| error.to_string())?;
-        }
-    }
-    conn.execute_batch(
-        "UPDATE chisei_external_action_redemptions
-             SET redemption_id=COALESCE(
-                     redemption_id,
-                     json_extract(redemption_json,'$.redemption_id')
-                 ),
-                 evidence_due_at_ms=CASE
-                     WHEN evidence_due_at_ms=0 THEN COALESCE(
-                         json_extract(redemption_json,'$.evidence_due_at_ms'),
-                         (SELECT json_extract(p.permit_json,'$.expires_at_ms')
-                          FROM chisei_external_action_permits p
-                          WHERE p.permit_id=chisei_external_action_redemptions.permit_id),
-                         0
-                     )
-                     ELSE evidence_due_at_ms
-                 END
-             WHERE redemption_id IS NULL OR evidence_due_at_ms=0;
-             UPDATE chisei_external_action_redemptions
-             SET redemption_json=json_set(
-                 redemption_json,
-                 '$.evidence_due_at_ms',
-                 evidence_due_at_ms
-             )
-             WHERE COALESCE(json_extract(redemption_json,'$.evidence_due_at_ms'),0)
-                   != evidence_due_at_ms;
-             CREATE INDEX IF NOT EXISTS idx_external_action_redemptions_evidence_due
-             ON chisei_external_action_redemptions(evidence_due_at_ms,redemption_id);",
-    )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+pub trait ExternalPermitSekaiDbExt {
+    fn put_permit(
+        &self,
+        permit: &Permit,
+        idempotency_key: &str,
+        issued_by: &str,
+    ) -> Result<Permit, String>;
+
+    fn put_delegated_permit(&self, permit: &Permit, issued_by: &str) -> Result<Permit, String>;
+
+    fn set_external_permit_policy(
+        &self,
+        policy: &ExternalPermitPolicy,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String>;
+
+    fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String>;
+
+    fn replay_permit(
+        &self,
+        authorization_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<Permit>, String>;
+
+    fn revoke_permit(
+        &self,
+        handle: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn set_permit_kill_switch(
+        &self,
+        kind: &str,
+        value: &str,
+        enabled: bool,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn redeem_permit(
+        &self,
+        permit: &Permit,
+        context: &HostContext,
+        trusted_key: &VerifyingKey,
+        idempotency_key: &str,
+        execution_id: &str,
+        host_site_id: &str,
+        now_ms: i64,
+    ) -> Result<Redemption, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn redeem_or_reconcile_permit(
+        &self,
+        permit: &Permit,
+        context: &HostContext,
+        trusted_key: &VerifyingKey,
+        idempotency_key: &str,
+        execution_id: &str,
+        host_site_id: &str,
+        timing: RedemptionTiming,
+    ) -> Result<Redemption, String>;
+
+    /// Validate online lifecycle state without consuming an invocation. Hosts
+    /// must still redeem immediately before execution; redemption repeats all
+    /// checks atomically with consumption.
+    fn validate_permit_state(&self, permit: &Permit) -> Result<(), String>;
+
+    fn replay_redemption(
+        &self,
+        permit: &Permit,
+        idempotency_key: &str,
+        execution_id: &str,
+    ) -> Result<Option<Redemption>, String>;
+
+    fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String>;
 }
 
-impl SekaiDb {
-    pub(crate) fn ensure_external_permit_tables(&self) -> Result<(), String> {
-        ensure_external_permit_tables_on(&self.conn())
-    }
-
-    pub fn put_permit(
+impl ExternalPermitSekaiDbExt for SekaiDb {
+    fn put_permit(
         &self,
         permit: &Permit,
         idempotency_key: &str,
@@ -466,7 +458,7 @@ impl SekaiDb {
         Ok(stored)
     }
 
-    pub fn put_delegated_permit(&self, permit: &Permit, issued_by: &str) -> Result<Permit, String> {
+    fn put_delegated_permit(&self, permit: &Permit, issued_by: &str) -> Result<Permit, String> {
         self.ensure_external_permit_tables()?;
         if permit.delegation_depth == 0 || permit.parent_permit_id.is_empty() {
             return Err("delegated permit must name its parent".into());
@@ -515,7 +507,7 @@ impl SekaiDb {
         Ok(permit.clone())
     }
 
-    pub fn set_external_permit_policy(
+    fn set_external_permit_policy(
         &self,
         policy: &ExternalPermitPolicy,
         now_ms: i64,
@@ -535,7 +527,7 @@ impl SekaiDb {
         ).map(|_| ()).map_err(|error| error.to_string())
     }
 
-    pub fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String> {
+    fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String> {
         self.ensure_external_permit_tables()?;
         let json: Option<String> = self
             .conn()
@@ -551,13 +543,13 @@ impl SekaiDb {
             .map(|value| value.unwrap_or_else(|| ExternalPermitPolicy::disabled(scope)))
     }
 
-    pub fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String> {
+    fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String> {
         self.ensure_external_permit_tables()?;
         let conn = self.conn();
         validate_delegation_chain_on(&conn, permit)
     }
 
-    pub fn replay_permit(
+    fn replay_permit(
         &self,
         authorization_id: &str,
         idempotency_key: &str,
@@ -578,7 +570,7 @@ impl SekaiDb {
         }
     }
 
-    pub fn revoke_permit(
+    fn revoke_permit(
         &self,
         handle: &str,
         actor: &str,
@@ -613,7 +605,7 @@ impl SekaiDb {
         Ok(changed)
     }
 
-    pub fn set_permit_kill_switch(
+    fn set_permit_kill_switch(
         &self,
         kind: &str,
         value: &str,
@@ -637,7 +629,7 @@ impl SekaiDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn redeem_permit(
+    fn redeem_permit(
         &self,
         permit: &Permit,
         context: &HostContext,
@@ -662,7 +654,7 @@ impl SekaiDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn redeem_or_reconcile_permit(
+    fn redeem_or_reconcile_permit(
         &self,
         permit: &Permit,
         context: &HostContext,
@@ -857,7 +849,7 @@ impl SekaiDb {
     /// Validate online lifecycle state without consuming an invocation. Hosts
     /// must still redeem immediately before execution; redemption repeats all
     /// checks atomically with consumption.
-    pub fn validate_permit_state(&self, permit: &Permit) -> Result<(), String> {
+    fn validate_permit_state(&self, permit: &Permit) -> Result<(), String> {
         self.ensure_external_permit_tables()?;
         self.validate_delegation_chain(permit)?;
         let conn = self.conn();
@@ -932,7 +924,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    pub fn replay_redemption(
+    fn replay_redemption(
         &self,
         permit: &Permit,
         idempotency_key: &str,
@@ -971,7 +963,7 @@ impl SekaiDb {
             })
     }
 
-    pub fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String> {
+    fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String> {
         self.validate_permit_state(permit)?;
         let count: u32 = self
             .conn()
@@ -1308,7 +1300,7 @@ mod tests {
         let path = dir.path().join("concurrent-open.db");
         let path = path.to_str().unwrap().to_string();
         drop(ChiseiStore::open_sqlite(&path));
-        Connection::open(&path)
+        rusqlite::Connection::open(&path)
             .unwrap()
             .pragma_update(None, "user_version", 0)
             .unwrap();

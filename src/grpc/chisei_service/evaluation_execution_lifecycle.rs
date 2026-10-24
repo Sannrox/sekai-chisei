@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::chisei_store::{ChiseiEvaluationStore, ChiseiReceiptStore};
+use crate::ext::*;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},

@@ -4,57 +4,9 @@ use crate::chisei::model_release_evidence::{
     EvaluationTrustRoots, ModelEvaluationEvidence, ModelReleaseFeedback, ModelReleaseIdentity,
     ModelRuntimeEvidence,
 };
+use crate::chisei_store::postgres_model_release_evidence::PostgresModelReleaseEvidencePostgresDbExt;
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
-
-const CREATE_SQLITE: &str = "
-CREATE TABLE IF NOT EXISTS chisei_model_release_trust (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    roots_json TEXT NOT NULL,
-    updated_at_ms INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS chisei_model_runtime_evidence (
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
-    profile_version TEXT NOT NULL,
-    artifact_digest TEXT NOT NULL,
-    endpoint TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    ingested_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (provider, model, profile_version, artifact_digest, endpoint)
-);
-CREATE TABLE IF NOT EXISTS chisei_model_evaluation_export (
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
-    profile_version TEXT NOT NULL,
-    artifact_digest TEXT NOT NULL,
-    endpoint TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    exported_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (provider, model, profile_version, artifact_digest, endpoint)
-);
-CREATE TABLE IF NOT EXISTS chisei_model_release_feedback (
-    id TEXT PRIMARY KEY,
-    namespace TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
-    profile_version TEXT NOT NULL,
-    artifact_digest TEXT NOT NULL,
-    endpoint TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    note TEXT NOT NULL,
-    recorded_at_ms INTEGER NOT NULL
-);
-";
-
-const ALTER_ROUTING: &[&str] = &[
-    "ALTER TABLE chisei_routing_profiles ADD COLUMN require_runtime_evidence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE chisei_routing_profiles ADD COLUMN evidence_provider TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE chisei_routing_profiles ADD COLUMN evidence_model TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE chisei_routing_profiles ADD COLUMN evidence_profile_version TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE chisei_routing_profiles ADD COLUMN evidence_artifact_digest TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE chisei_routing_profiles ADD COLUMN evidence_endpoint TEXT NOT NULL DEFAULT ''",
-];
 
 pub trait ChiseiModelReleaseEvidenceBackend: Send + Sync {
     fn put_model_release_trust(
@@ -86,25 +38,6 @@ pub trait ChiseiModelReleaseEvidenceBackend: Send + Sync {
         &self,
         namespace: &str,
     ) -> Result<Vec<ModelReleaseFeedback>, String>;
-}
-
-impl SekaiDb {
-    pub(crate) fn migrate_model_release_evidence(&self) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute_batch(CREATE_SQLITE)
-            .map_err(|error| error.to_string())?;
-        for statement in ALTER_ROUTING {
-            conn.execute(statement, []).map(|_| ()).or_else(|error| {
-                let text = error.to_string();
-                if text.contains("duplicate column") {
-                    Ok(())
-                } else {
-                    Err(text)
-                }
-            })?;
-        }
-        Ok(())
-    }
 }
 
 fn identity_params(identity: &ModelReleaseIdentity) -> [&str; 5] {
@@ -375,44 +308,56 @@ impl ChiseiModelReleaseEvidenceBackend for PostgresDb {
         roots: &EvaluationTrustRoots,
         updated_at_ms: i64,
     ) -> Result<(), String> {
-        PostgresDb::put_model_release_trust(self, roots, updated_at_ms)
+        PostgresModelReleaseEvidencePostgresDbExt::put_model_release_trust(
+            self,
+            roots,
+            updated_at_ms,
+        )
     }
     fn get_model_release_trust(&self) -> Result<Option<EvaluationTrustRoots>, String> {
-        PostgresDb::get_model_release_trust(self)
+        PostgresModelReleaseEvidencePostgresDbExt::get_model_release_trust(self)
     }
     fn put_model_runtime_evidence(
         &self,
         evidence: &ModelRuntimeEvidence,
         ingested_at_ms: i64,
     ) -> Result<(), String> {
-        PostgresDb::put_model_runtime_evidence(self, evidence, ingested_at_ms)
+        PostgresModelReleaseEvidencePostgresDbExt::put_model_runtime_evidence(
+            self,
+            evidence,
+            ingested_at_ms,
+        )
     }
     fn get_model_runtime_evidence(
         &self,
         identity: &ModelReleaseIdentity,
     ) -> Result<Option<String>, String> {
-        PostgresDb::get_model_runtime_evidence(self, identity)
+        PostgresModelReleaseEvidencePostgresDbExt::get_model_runtime_evidence(self, identity)
     }
     fn put_model_evaluation_export(
         &self,
         evidence: &ModelEvaluationEvidence,
         exported_at_ms: i64,
     ) -> Result<(), String> {
-        PostgresDb::put_model_evaluation_export(self, evidence, exported_at_ms)
+        PostgresModelReleaseEvidencePostgresDbExt::put_model_evaluation_export(
+            self,
+            evidence,
+            exported_at_ms,
+        )
     }
     fn get_model_evaluation_export(
         &self,
         identity: &ModelReleaseIdentity,
     ) -> Result<Option<String>, String> {
-        PostgresDb::get_model_evaluation_export(self, identity)
+        PostgresModelReleaseEvidencePostgresDbExt::get_model_evaluation_export(self, identity)
     }
     fn put_model_release_feedback(&self, record: &ModelReleaseFeedback) -> Result<(), String> {
-        PostgresDb::put_model_release_feedback(self, record)
+        PostgresModelReleaseEvidencePostgresDbExt::put_model_release_feedback(self, record)
     }
     fn list_model_release_feedback(
         &self,
         namespace: &str,
     ) -> Result<Vec<ModelReleaseFeedback>, String> {
-        PostgresDb::list_model_release_feedback(self, namespace)
+        PostgresModelReleaseEvidencePostgresDbExt::list_model_release_feedback(self, namespace)
     }
 }

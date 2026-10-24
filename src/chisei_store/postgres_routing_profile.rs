@@ -4,8 +4,26 @@ use crate::chisei::routing_profiles::HostedRoutingProfile;
 use crate::chisei_store::chisei_routing_profile::hosted_profile_from_parts;
 use crate::db::postgres::PostgresDb;
 
-impl PostgresDb {
-    pub fn put_hosted_routing_profile(&self, profile: &HostedRoutingProfile) -> Result<(), String> {
+pub trait PostgresRoutingProfilePostgresDbExt {
+    fn put_hosted_routing_profile(&self, profile: &HostedRoutingProfile) -> Result<(), String>;
+
+    fn list_hosted_routing_profiles(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<HostedRoutingProfile>, String>;
+
+    fn revoke_hosted_routing_profile(
+        &self,
+        namespace: &str,
+        profile_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn list_all_hosted_routing_profiles(&self) -> Result<Vec<HostedRoutingProfile>, String>;
+}
+
+impl PostgresRoutingProfilePostgresDbExt for PostgresDb {
+    fn put_hosted_routing_profile(&self, profile: &HostedRoutingProfile) -> Result<(), String> {
         let patterns =
             serde_json::to_string(&profile.model_patterns).map_err(|error| error.to_string())?;
         self.connection()?
@@ -52,7 +70,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn list_hosted_routing_profiles(
+    fn list_hosted_routing_profiles(
         &self,
         namespace: &str,
     ) -> Result<Vec<HostedRoutingProfile>, String> {
@@ -90,7 +108,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn revoke_hosted_routing_profile(
+    fn revoke_hosted_routing_profile(
         &self,
         namespace: &str,
         profile_id: &str,
@@ -106,7 +124,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn list_all_hosted_routing_profiles(&self) -> Result<Vec<HostedRoutingProfile>, String> {
+    fn list_all_hosted_routing_profiles(&self) -> Result<Vec<HostedRoutingProfile>, String> {
         self.connection()?
             .query(
                 "SELECT namespace, profile_id, endpoint_origin, model_patterns_json, credential_ref,
