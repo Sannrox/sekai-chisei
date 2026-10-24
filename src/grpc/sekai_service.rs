@@ -338,91 +338,6 @@ impl SekaiServiceImpl {
         self.site_id = site_id.into();
         self
     }
-
-    fn catalog_metadata_value(req: &Request<impl prost::Message>, key: &str) -> Option<String> {
-        req.metadata()
-            .get(key)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    }
-
-    /// MCP link tools send `x-sekai-capability` as `sekai.links.get` /
-    /// `sekai.links.create`. Direct gRPC and the HTTP gateway also carry
-    /// `x-sekai-namespace`; only the MCP tools bind object ids to it.
-    fn mcp_link_session_namespace(req: &Request<impl prost::Message>) -> Option<String> {
-        match Self::catalog_metadata_value(req, "x-sekai-capability").as_deref() {
-            Some("sekai.links.get") | Some("sekai.links.create") => {
-                Self::catalog_metadata_value(req, "x-sekai-namespace")
-            }
-            _ => None,
-        }
-    }
-
-    /// Begin a receipt-attributed catalog invocation for a semantic capability.
-    /// Returns `None` when the caller did not send `x-sekai-capability` (direct RPC).
-    /// Live discovery is rechecked; a previously observed catalog is never a grant.
-    fn begin_semantic_catalog_invocation<'a>(
-        &'a self,
-        req: &Request<impl prost::Message + 'static>,
-        expected_capability: &str,
-        namespace: &str,
-        principals: &[String],
-    ) -> Result<Option<(String, CatalogInvocation<'a>)>, Status> {
-        let Some(capability_name) = Self::catalog_metadata_value(req, "x-sekai-capability") else {
-            return Ok(None);
-        };
-        let catalog_namespace = Self::catalog_metadata_value(req, "x-sekai-namespace")
-            .unwrap_or_else(|| namespace.to_string());
-        if catalog_namespace.is_empty() {
-            return Err(Status::invalid_argument(
-                "catalog semantic invocation requires namespace",
-            ));
-        }
-        if catalog_namespace != namespace && !namespace.is_empty() {
-            return Err(Status::invalid_argument(
-                "catalog namespace metadata must match request namespace",
-            ));
-        }
-        let namespace = if namespace.is_empty() {
-            catalog_namespace.as_str()
-        } else {
-            namespace
-        };
-        let operation_id = Self::catalog_metadata_value(req, "x-sekai-operation-id")
-            .unwrap_or_else(|| format!("catalog-invocation-{}", Uuid::new_v4().simple()));
-        let catalog_version = Self::catalog_metadata_value(req, "x-sekai-catalog-version");
-        let actor = principals.first().cloned().unwrap_or_default();
-
-        let tenant_context = request_tenant_context(self.db.runtime(), req)?;
-        let visible = self
-            .discoverable_capabilities(namespace, principals, tenant_context.as_ref())?
-            .into_iter()
-            .any(|entry| entry.name == capability_name && capability_name == expected_capability);
-        if !visible {
-            CatalogInvocation::record_refusal(
-                self.db.runtime(),
-                &operation_id,
-                namespace,
-                &actor,
-                &capability_name,
-                catalog_version.as_deref(),
-                "capability_unavailable",
-            )?;
-            return Err(Status::failed_precondition("capability unavailable"));
-        }
-
-        let invocation = CatalogInvocation::begin(
-            self.db.runtime(),
-            operation_id.clone(),
-            namespace,
-            actor,
-            capability_name,
-            catalog_version,
-        )?;
-        Ok(Some((operation_id, invocation)))
-    }
 }
 
 const DEFAULT_LIST_LIMIT: i32 = domain::DEFAULT_LIST_LIMIT;
@@ -435,6 +350,36 @@ impl SekaiService for SekaiServiceImpl {
     type ReadTransformRunInputsStream = Pin<
         Box<dyn futures_util::Stream<Item = Result<ReadTransformRunInputsResponse, Status>> + Send>,
     >;
+    type ExportObjectSetStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<ExportObjectSetChunk, Status>> + Send>>;
+
+    async fn grant_namespace_export(
+        &self,
+        req: Request<GrantNamespaceExportRequest>,
+    ) -> Result<Response<GrantNamespaceExportResponse>, Status> {
+        self.grant_namespace_export_rpc(req).await
+    }
+
+    async fn revoke_namespace_export(
+        &self,
+        req: Request<RevokeNamespaceExportRequest>,
+    ) -> Result<Response<RevokeNamespaceExportResponse>, Status> {
+        self.revoke_namespace_export_rpc(req).await
+    }
+
+    async fn export_object_set(
+        &self,
+        req: Request<ExportObjectSetRequest>,
+    ) -> Result<Response<Self::ExportObjectSetStream>, Status> {
+        self.export_object_set_rpc(req).await
+    }
+
+    async fn get_export_receipt(
+        &self,
+        req: Request<GetExportReceiptRequest>,
+    ) -> Result<Response<GetExportReceiptResponse>, Status> {
+        self.get_export_receipt_rpc(req).await
+    }
 
     async fn acquire_lease(
         &self,

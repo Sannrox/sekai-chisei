@@ -412,6 +412,42 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "GrantNamespaceExport",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RevokeNamespaceExport",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ExportObjectSet",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetExportReceipt",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "RegisterObjectTypeDatasource",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

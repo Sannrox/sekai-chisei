@@ -29437,3 +29437,232 @@ async fn a_plan_whose_approver_holds_no_active_credential_stops_before_any_step(
     assert_eq!(execution.stop_reason, "approver_authority_revoked");
     assert!(execution.steps.is_empty());
 }
+
+/// `exp` publishes `Ticket`, whose `secret` property a read policy withholds
+/// from everyone, and holds `rows` visible tickets plus one restricted one.
+async fn export_fixture(svc: &SekaiServiceImpl, rows: usize, title: &str) -> String {
+    seed_definition_parent(svc, "exp");
+    let db = svc.db.runtime();
+    let ticket = |id: String, properties: Vec<(&str, String)>| crate::domain::Object {
+        name: id.clone(),
+        id,
+        kind: "Ticket".into(),
+        namespace: "exp".into(),
+        external_id: String::new(),
+        properties: properties
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+        created: 1,
+        updated: 1,
+    };
+    for n in 0..rows {
+        db.create_object(&ticket(
+            format!("t-{n:05}"),
+            vec![("title", title.into()), ("secret", format!("s{n}"))],
+        ))
+        .unwrap();
+    }
+    db.create_object(&ticket(
+        "t-hidden".into(),
+        vec![
+            ("title", "hidden".into()),
+            ("access_marking", "restricted".into()),
+        ],
+    ))
+    .unwrap();
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "exp".into(),
+        kind: "Ticket".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+            property: "title".into(),
+            access: crate::sekai::object_security::PropertyGrantAccess::Read,
+        }]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-export", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        "exp",
+        &BTreeMap::from([("Ticket".into(), revision.revision_digest)]),
+        "root",
+        "activate-export",
+        2,
+    )
+    .unwrap();
+    published_digest(svc, "exp").await
+}
+
+fn export_request(digest: &str) -> ExportObjectSetRequest {
+    ExportObjectSetRequest {
+        descriptor: Some(ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "exp".into(),
+            kind: "Ticket".into(),
+            definition_digest: digest.into(),
+            ..Default::default()
+        }),
+        properties: vec!["title".into(), "secret".into()],
+        format: "csv".into(),
+    }
+}
+
+fn receipt_outcome(svc: &SekaiServiceImpl, receipt_id: &str) -> Option<String> {
+    crate::sekai::data_export::export_receipt(svc.db.runtime(), receipt_id)
+        .unwrap()
+        .and_then(|receipt| {
+            receipt
+                .events
+                .iter()
+                .find(|event| event.attributes.contains_key("outcome"))
+                .map(|event| event.attributes["outcome"].clone())
+        })
+}
+
+#[tokio::test]
+async fn an_export_needs_its_grant_and_streams_only_what_a_read_shows() {
+    use futures_util::StreamExt;
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "a, \"quoted\"").await;
+    let refused = svc
+        .export_object_set(with_principal(export_request(&digest)))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "quarterly audit".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .export_object_set(with_principal(export_request(&digest)))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let receipt_id = chunks[0].receipt_id.clone();
+    let data: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.data.clone()).collect();
+    assert_eq!(
+        String::from_utf8(data.clone()).unwrap(),
+        "id,title,secret\nt-00000,\"a, \"\"quoted\"\"\",\nt-00001,\"a, \"\"quoted\"\"\",\n"
+    );
+    let done = chunks.last().unwrap();
+    assert!(done.done);
+    assert_eq!(done.row_count, 2);
+    let expected = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+    assert_eq!(done.content_digest, expected);
+    let read = |principal: &'static str| {
+        let svc = &svc;
+        let receipt_id = receipt_id.clone();
+        async move {
+            svc.get_export_receipt(with_named_principal(
+                GetExportReceiptRequest {
+                    operation_id: receipt_id,
+                },
+                principal,
+            ))
+            .await
+        }
+    };
+    let receipt = read("tester").await.unwrap().into_inner();
+    assert_eq!(
+        (
+            receipt.outcome.as_str(),
+            receipt.row_count,
+            receipt.content_digest.as_str()
+        ),
+        ("completed", 2, expected.as_str())
+    );
+    // Another reader learns nothing of it.
+    assert_eq!(read("bob").await.unwrap_err().code(), tonic::Code::NotFound);
+
+    // A traversal (here as v2 hops) is not exported as its start set.
+    let mut hops = export_request(&digest);
+    hops.descriptor.as_mut().unwrap().hops = vec![ObjectSetTraversal {
+        relation: "rel".into(),
+        far_kind: "Ticket".into(),
+        ..Default::default()
+    }];
+    let refused_hops = svc
+        .export_object_set(with_principal(hops))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            refused_hops.code(),
+            tonic::Code::Unimplemented | tonic::Code::InvalidArgument
+        ),
+        "{refused_hops:?}"
+    );
+
+    svc.revoke_namespace_export(with_named_principal(
+        RevokeNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "audit closed".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let revoked = svc
+        .export_object_set(with_principal(export_request(&digest)))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_export_leaves_an_aborted_receipt() {
+    use futures_util::StreamExt;
+    let svc = service();
+    // Far more than the stream buffers, so the export is still writing.
+    let digest = export_fixture(&svc, 3_000, &"x".repeat(400)).await;
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "migration".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let mut stream = svc
+        .export_object_set(with_principal(export_request(&digest)))
+        .await
+        .unwrap()
+        .into_inner();
+    let receipt_id = stream.next().await.unwrap().unwrap().receipt_id;
+    assert_eq!(receipt_outcome(&svc, &receipt_id), None);
+    drop(stream);
+    let aborted = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Some(outcome) = receipt_outcome(&svc, &receipt_id) {
+                return outcome;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(aborted, "aborted");
+}

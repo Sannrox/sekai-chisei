@@ -554,6 +554,71 @@ message EvaluateObjectSetRequest {
   string page_token = 2;
   int64 required_freshness_ms = 3;
 }
+// Governed export (#1627, ADR 0130). An export grant is a namespace grant
+// on top of read: reading an object set does not entitle a principal to
+// take it out of the plane.
+message NamespaceExportGrant {
+  string namespace = 1;
+  string principal = 2;
+  string granted_by = 3;
+  int64 granted_at_ms = 4;
+  string reason = 5;
+  // Empty while the grant is active.
+  string revoked_by = 6;
+  int64 revoked_at_ms = 7;
+  string revocation_reason = 8;
+}
+message GrantNamespaceExportRequest {
+  string namespace = 1;
+  string principal = 2;
+  string reason = 3;
+}
+message GrantNamespaceExportResponse {
+  NamespaceExportGrant grant = 1;
+}
+message RevokeNamespaceExportRequest {
+  string namespace = 1;
+  string principal = 2;
+  string reason = 3;
+}
+message RevokeNamespaceExportResponse {
+  NamespaceExportGrant grant = 1;
+}
+// Streams an object set as CSV or JSON Lines under the caller's read policy.
+message ExportObjectSetRequest {
+  ObjectSetDescriptor descriptor = 1;
+  // Properties to export, in column order; the object id always comes first.
+  repeated string properties = 2;
+  // csv | jsonl
+  string format = 3;
+}
+// The first message carries the receipt id, later ones the file bytes, and
+// the last one (`done`) the row count and the digest the receipt records.
+// An export's receipt, to its initiating caller or a namespace admin.
+message GetExportReceiptRequest {
+  string operation_id = 1;
+}
+message GetExportReceiptResponse {
+  string operation_id = 1;
+  string namespace = 2;
+  string initiating_actor = 3;
+  // Empty while open, else completed or aborted.
+  string outcome = 4;
+  int64 row_count = 5;
+  string content_digest = 6;
+  int64 started_at_ms = 7;
+  int64 completed_at_ms = 8;
+  // The full receipt (`sekai.governed-export/v1`), JSON.
+  string receipt_json = 9;
+}
+message ExportObjectSetChunk {
+  string receipt_id = 1;
+  bytes data = 2;
+  bool done = 3;
+  int64 row_count = 4;
+  // sha256:<hex> of every data byte, in order.
+  string content_digest = 5;
+}
 message ObjectTypeDatasource {
   string contract_version = 1;
   string namespace = 2;
@@ -4163,6 +4228,10 @@ service SekaiService {
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc EvaluateObjectSet(EvaluateObjectSetRequest) returns (EvaluateObjectSetResponse);
+  rpc GrantNamespaceExport(GrantNamespaceExportRequest) returns (GrantNamespaceExportResponse);
+  rpc RevokeNamespaceExport(RevokeNamespaceExportRequest) returns (RevokeNamespaceExportResponse);
+  rpc ExportObjectSet(ExportObjectSetRequest) returns (stream ExportObjectSetChunk);
+  rpc GetExportReceipt(GetExportReceiptRequest) returns (GetExportReceiptResponse);
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
   rpc GetObjectTypeIndexStatus(GetObjectTypeIndexStatusRequest) returns (GetObjectTypeIndexStatusResponse);

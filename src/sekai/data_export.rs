@@ -1,0 +1,850 @@
+//! Governed export (#1627, ADR 0130).
+//!
+//! Data leaving the plane needs more than read. A namespace admin grants a
+//! principal export on a namespace, and every grant and revocation is an
+//! audit decision. An export streams an object set as CSV or JSON Lines
+//! under the caller's read policy, so hidden rows and properties never
+//! reach the file. Its receipt is written before the first byte and closed
+//! with the row count and the digest of every byte sent; a stream that ends
+//! early (a dropped client, an error) closes it as aborted.
+
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::db::runtime_db::RuntimeDb;
+use crate::domain::Object;
+use crate::sekai::audit::Decision;
+use sekai_domain::receipt::{
+    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptArtifact,
+    ReceiptEventKind,
+};
+
+pub const EXPORT_CONTRACT: &str = "sekai.governed-export/v1";
+pub const EXPORT_DENIED: &str = "export_not_granted";
+/// Another change to the same grant landed first; retry.
+pub const GRANT_CHANGED: &str = "export_grant_changed";
+/// An exporter renews its lease while it streams; another instance may
+/// close an export whose lease ran out as aborted.
+pub const EXPORT_LEASE_MS: i64 = 60_000;
+const EXPORT_RENEW_MS: i64 = 10_000;
+/// A send must end this long before the lease would run out.
+const SEND_MARGIN_MS: i64 = 5_000;
+/// Abandoned exports closed per sweep.
+const RECOVERY_BATCH: usize = 32;
+const MAX_REASON: usize = 1024;
+/// Columns an export may select.
+pub const MAX_EXPORT_COLUMNS: usize = 256;
+
+/// One principal's export grant on one namespace. Revoking keeps the record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportGrant {
+    pub namespace: String,
+    pub principal: String,
+    pub granted_by: String,
+    pub granted_at_ms: i64,
+    pub reason: String,
+    #[serde(default)]
+    pub revoked_by: String,
+    #[serde(default)]
+    pub revoked_at_ms: i64,
+    #[serde(default)]
+    pub revocation_reason: String,
+}
+
+impl ExportGrant {
+    pub fn active(&self) -> bool {
+        self.revoked_by.is_empty()
+    }
+}
+
+fn check_reason(reason: &str) -> Result<(), String> {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.len() > MAX_REASON {
+        return Err(format!("reason must be 1 to {MAX_REASON} bytes"));
+    }
+    Ok(())
+}
+
+/// Records the next state of a grant: the history row, which is the
+/// durable record and fails when another change landed since, then the
+/// audit decision mirroring it.
+fn record_change(db: &RuntimeDb, seq: i64, grant: &ExportGrant) -> Result<(), String> {
+    if !db.insert_export_grant(seq, grant)? {
+        return Err(GRANT_CHANGED.into());
+    }
+    mirror(db, seq, grant)
+}
+
+/// Mirrors every entry of a grant's history, so an audit write lost before
+/// any later change is repaired by the next call, not only the latest.
+fn mirror_history(db: &RuntimeDb, namespace: &str, principal: &str) -> Result<(), String> {
+    for (seq, grant) in db.export_grant_history(namespace, principal)? {
+        mirror(db, seq, &grant)?;
+    }
+    Ok(())
+}
+
+/// The decision id of history entry `seq`: a digest of the length-prefixed
+/// (namespace, principal, seq), so no two grants share one.
+fn grant_decision_id(namespace: &str, principal: &str, seq: i64) -> String {
+    let mut hasher = Sha256::new();
+    for part in [namespace, principal] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(seq.to_be_bytes());
+    format!("export-grant:{:x}", hasher.finalize())
+}
+
+/// Writes the audit decision of history entry `seq`. It is derived from the
+/// entry alone and written idempotently, so a retry after a lost write
+/// repairs it and never duplicates it.
+fn mirror(db: &RuntimeDb, seq: i64, grant: &ExportGrant) -> Result<(), String> {
+    let (outcome, actor, at_ms) = if grant.active() {
+        ("granted", &grant.granted_by, grant.granted_at_ms)
+    } else {
+        ("revoked", &grant.revoked_by, grant.revoked_at_ms)
+    };
+    db.record_decisions_idempotently(&[Decision {
+        id: grant_decision_id(&grant.namespace, &grant.principal, seq),
+        timestamp: at_ms,
+        actor: actor.clone(),
+        action: "namespace_export_grant".into(),
+        reason: format!("export grant {outcome} under {EXPORT_CONTRACT}"),
+        evidence: HashMap::from([
+            ("contract_version".into(), EXPORT_CONTRACT.into()),
+            ("namespace".into(), grant.namespace.clone()),
+            ("principal".into(), grant.principal.clone()),
+            ("grant_seq".into(), seq.to_string()),
+            (
+                "grant_record".into(),
+                serde_json::to_string(grant).map_err(|error| error.to_string())?,
+            ),
+        ]),
+        target_id: format!("{}:{}", grant.namespace, grant.principal),
+        outcome: outcome.into(),
+    }])
+}
+
+/// Grants `principal` export on `namespace`. An active grant is returned as
+/// it stands, so a retry records nothing twice; any audit decision lost
+/// earlier is written first.
+pub fn grant_export(
+    db: &RuntimeDb,
+    namespace: &str,
+    principal: &str,
+    reason: &str,
+    actor: &str,
+    now_ms: i64,
+) -> Result<ExportGrant, String> {
+    check_reason(reason)?;
+    if principal.trim().is_empty() || principal.trim() != principal {
+        return Err("principal must be canonical".into());
+    }
+    mirror_history(db, namespace, principal)?;
+    let latest = db.latest_export_grant(namespace, principal)?;
+    if let Some((_, existing)) = &latest
+        && existing.active()
+    {
+        return Ok(existing.clone());
+    }
+    let grant = ExportGrant {
+        namespace: namespace.into(),
+        principal: principal.into(),
+        granted_by: actor.into(),
+        granted_at_ms: now_ms,
+        reason: reason.trim().into(),
+        revoked_by: String::new(),
+        revoked_at_ms: 0,
+        revocation_reason: String::new(),
+    };
+    let seq = latest.map_or(1, |(seq, _)| seq + 1);
+    record_change(db, seq, &grant)?;
+    Ok(grant)
+}
+
+/// Revokes `principal`'s export on `namespace`, keeping the grant and the
+/// revocation's own reason; revoking a revoked or missing grant changes
+/// nothing.
+pub fn revoke_export(
+    db: &RuntimeDb,
+    namespace: &str,
+    principal: &str,
+    reason: &str,
+    actor: &str,
+    now_ms: i64,
+) -> Result<Option<ExportGrant>, String> {
+    check_reason(reason)?;
+    mirror_history(db, namespace, principal)?;
+    let Some((seq, existing)) = db.latest_export_grant(namespace, principal)? else {
+        return Ok(None);
+    };
+    if !existing.active() {
+        return Ok(Some(existing));
+    }
+    let revoked = ExportGrant {
+        revoked_by: actor.into(),
+        revoked_at_ms: now_ms,
+        revocation_reason: reason.trim().into(),
+        ..existing
+    };
+    record_change(db, seq + 1, &revoked)?;
+    Ok(Some(revoked))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Csv,
+    JsonLines,
+}
+
+impl ExportFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "csv" => Some(Self::Csv),
+            "jsonl" => Some(Self::JsonLines),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::JsonLines => "jsonl",
+        }
+    }
+}
+
+/// Encodes objects as rows: the object id, then the selected properties in
+/// order. A property the reader may not see is absent from the object it
+/// reads, so its cell is empty (CSV) or its key absent (JSON Lines).
+pub struct RowEncoder {
+    format: ExportFormat,
+    columns: Vec<String>,
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) || value.trim() != value {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+impl RowEncoder {
+    pub fn new(format: ExportFormat, columns: Vec<String>) -> Result<Self, String> {
+        if columns.len() > MAX_EXPORT_COLUMNS {
+            return Err(format!(
+                "at most {MAX_EXPORT_COLUMNS} properties may be exported"
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for column in &columns {
+            if column.trim().is_empty() || column == "id" || !seen.insert(column) {
+                return Err(format!(
+                    "property {column:?} cannot be exported twice or as id"
+                ));
+            }
+        }
+        Ok(Self { format, columns })
+    }
+
+    /// Bytes before the first row.
+    pub fn header(&self) -> Vec<u8> {
+        match self.format {
+            ExportFormat::Csv => {
+                let mut line = std::iter::once("id")
+                    .chain(self.columns.iter().map(String::as_str))
+                    .map(csv_field)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                line.push('\n');
+                line.into_bytes()
+            }
+            ExportFormat::JsonLines => Vec::new(),
+        }
+    }
+
+    pub fn row(&self, object: &Object) -> Vec<u8> {
+        match self.format {
+            ExportFormat::Csv => {
+                let mut line = std::iter::once(object.id.as_str())
+                    .chain(self.columns.iter().map(|column| {
+                        object
+                            .properties
+                            .get(column)
+                            .map(String::as_str)
+                            .unwrap_or("")
+                    }))
+                    .map(csv_field)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                line.push('\n');
+                line.into_bytes()
+            }
+            ExportFormat::JsonLines => {
+                let mut row = serde_json::Map::new();
+                row.insert("id".into(), object.id.clone().into());
+                for column in &self.columns {
+                    if let Some(value) = object.properties.get(column) {
+                        row.insert(column.clone(), value.clone().into());
+                    }
+                }
+                let mut line = serde_json::Value::Object(row).to_string().into_bytes();
+                line.push(b'\n');
+                line
+            }
+        }
+    }
+}
+
+/// What an export reads, for its receipt.
+pub struct ExportSource {
+    pub namespace: String,
+    pub kind: String,
+    pub query_digest: String,
+    pub definition_digest: String,
+    pub format: ExportFormat,
+    pub columns: Vec<String>,
+    /// The principal whose export grant allowed the export.
+    pub granted_via: String,
+}
+
+/// The receipt of one export. It is written when the export begins, before
+/// any byte, with a lease on the export the exporter renews as it sends;
+/// [`ExportReceipt::complete`] closes it, and dropping it without completing
+/// closes it as aborted. An exporter whose process dies cannot drop it: the
+/// next export sweeps leases that ran out and closes those receipts as
+/// aborted. An outcome is decided once, on the lease row, before the receipt
+/// carries it; an exporter whose lease ran out can neither renew nor
+/// complete, and stops.
+pub struct ExportReceipt {
+    db: RuntimeDb,
+    receipt: OperationReceipt,
+    hasher: Sha256,
+    rows: u64,
+    renewed_at_ms: i64,
+    lease_until_ms: i64,
+    /// Set once a renewal fails; the export can then never complete.
+    lost: bool,
+    closed: bool,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+/// The decided outcome of an export, recorded on its lease row before the
+/// receipt carries it.
+#[derive(Serialize, Deserialize)]
+struct Closing {
+    attributes: BTreeMap<String, String>,
+    artifact: Option<ReceiptArtifact>,
+    at_ms: i64,
+}
+
+/// Decides the export's outcome under the lease condition; true when this
+/// call decided it.
+fn claim_close(
+    db: &RuntimeDb,
+    operation_id: &str,
+    closing: &Closing,
+    expired: bool,
+    now_ms: i64,
+) -> Result<bool, String> {
+    let json = serde_json::to_string(closing).map_err(|error| error.to_string())?;
+    db.claim_export_close(operation_id, &json, expired, now_ms)
+}
+
+/// Writes a decided outcome into the export's receipt, once. Safe to repeat
+/// and to run from any instance.
+fn finalize(db: &RuntimeDb, operation_id: &str) -> Result<(), String> {
+    let Some((Some(json), receipt_json)) = db.open_export_row(operation_id)? else {
+        return Ok(());
+    };
+    let closing: Closing = serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    let mut receipt: OperationReceipt =
+        serde_json::from_str(&receipt_json).map_err(|error| error.to_string())?;
+    let actor = receipt.initiating_actor.clone();
+    receipt.events.push(event(
+        operation_id,
+        "outcome",
+        ReceiptEventKind::OutcomeRecorded,
+        &actor,
+        closing.at_ms,
+        closing.attributes,
+    ));
+    receipt.artifact = closing.artifact;
+    receipt.completed_at_ms = Some(closing.at_ms);
+    db.finish_export_receipt(
+        operation_id,
+        &serde_json::to_string(&receipt).map_err(|error| error.to_string())?,
+    )
+}
+
+/// The receipt of an export, open or closed.
+pub fn export_receipt(
+    db: &RuntimeDb,
+    operation_id: &str,
+) -> Result<Option<OperationReceipt>, String> {
+    db.get_export_receipt_json(operation_id)?
+        .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn aborted(rows: u64, reason: &str, at_ms: i64) -> Closing {
+    Closing {
+        attributes: BTreeMap::from([
+            ("outcome".to_string(), "aborted".to_string()),
+            ("row_count".to_string(), rows.to_string()),
+            ("reason".to_string(), reason.to_string()),
+        ]),
+        artifact: None,
+        at_ms,
+    }
+}
+
+/// Finishes exports whose outcome is decided, and closes as aborted those
+/// whose exporter stopped renewing its lease. Each outcome is decided once
+/// under its lease condition, so two instances never disagree.
+pub fn recover_abandoned_exports(db: &RuntimeDb, now_ms: i64) -> Result<(), String> {
+    for (operation_id, decided) in db.recoverable_exports(now_ms, RECOVERY_BATCH)? {
+        if decided
+            || claim_close(
+                db,
+                &operation_id,
+                &aborted(0, "exporter_lost", now_ms),
+                true,
+                now_ms,
+            )?
+        {
+            finalize(db, &operation_id)?;
+        }
+    }
+    Ok(())
+}
+
+impl ExportReceipt {
+    pub fn begin(
+        db: RuntimeDb,
+        actor: &str,
+        source: &ExportSource,
+        now_ms: i64,
+    ) -> Result<Self, String> {
+        recover_abandoned_exports(&db, now_ms)?;
+        let operation_id = format!("export-{}", uuid::Uuid::new_v4().simple());
+        let receipt = OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.clone(),
+            parent_operation_id: None,
+            namespace: source.namespace.clone(),
+            operation_class: "governed_export".into(),
+            initiating_actor: actor.into(),
+            schema_version: EXPORT_CONTRACT.into(),
+            policy_version: source.definition_digest.clone(),
+            started_at_ms: now_ms,
+            completed_at_ms: None,
+            events: vec![event(
+                &operation_id,
+                "intent",
+                ReceiptEventKind::IntentRecorded,
+                actor,
+                now_ms,
+                BTreeMap::from([
+                    ("source_kind".into(), "object_set".into()),
+                    ("object_kind".into(), source.kind.clone()),
+                    ("query_digest".into(), source.query_digest.clone()),
+                    ("format".into(), source.format.as_str().into()),
+                    ("properties".into(), source.columns.join(",")),
+                    ("granted_via".into(), source.granted_via.clone()),
+                ]),
+            )],
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+            ontology_digest: Some(source.definition_digest.clone()),
+            artifact: None,
+        };
+        // One row holds the receipt and the lease, so whoever closes the
+        // export closes it there.
+        let lease_until_ms = now_ms + EXPORT_LEASE_MS;
+        db.open_export(
+            &operation_id,
+            &source.namespace,
+            lease_until_ms,
+            &serde_json::to_string(&receipt).map_err(|error| error.to_string())?,
+        )?;
+        Ok(Self {
+            db,
+            receipt,
+            hasher: Sha256::new(),
+            rows: 0,
+            renewed_at_ms: now_ms,
+            lease_until_ms,
+            lost: false,
+            closed: false,
+        })
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.receipt.operation_id
+    }
+
+    /// Counts bytes about to be sent toward the digest, renewing the lease
+    /// as time passes. False when the lease is gone: the export must stop.
+    pub fn record(&mut self, bytes: &[u8], rows: u64) -> bool {
+        self.hasher.update(bytes);
+        self.rows += rows;
+        let now = now_ms();
+        if self.lost || now - self.renewed_at_ms < EXPORT_RENEW_MS {
+            return !self.lost;
+        }
+        // An expired lease is never revived, swept or not; any failure to
+        // renew ends the export for good.
+        if self
+            .db
+            .renew_export(&self.receipt.operation_id, now, now + EXPORT_LEASE_MS)
+            .unwrap_or(false)
+        {
+            self.renewed_at_ms = now;
+            self.lease_until_ms = now + EXPORT_LEASE_MS;
+        } else {
+            self.lost = true;
+        }
+        !self.lost
+    }
+
+    /// False once a renewal failed: the export must stop and not complete.
+    pub fn live(&self) -> bool {
+        !self.lost
+    }
+
+    /// The time by which anything queued now must reach the client: before
+    /// the lease could run out and another instance close the export.
+    pub fn deadline_ms(&self) -> i64 {
+        self.lease_until_ms - SEND_MARGIN_MS
+    }
+
+    /// How long a send may wait and still end before [`Self::deadline_ms`].
+    pub fn send_budget(&self) -> Option<std::time::Duration> {
+        let left = self.deadline_ms() - now_ms();
+        (left > 0).then(|| std::time::Duration::from_millis(left as u64))
+    }
+
+    /// Closes the receipt as complete, only while the lease is live;
+    /// returns the row count and digest.
+    pub fn complete(mut self, now_ms: i64) -> Result<(u64, String), String> {
+        if self.lost {
+            // Left open: the sweep closes it as aborted once the lease ends.
+            return Err("export lease lost".into());
+        }
+        self.closed = true;
+        let digest = format!("sha256:{:x}", self.hasher.clone().finalize());
+        let operation_id = self.receipt.operation_id.clone();
+        let closing = Closing {
+            attributes: BTreeMap::from([
+                ("outcome".to_string(), "completed".to_string()),
+                ("row_count".to_string(), self.rows.to_string()),
+                ("content_digest".to_string(), digest.clone()),
+            ]),
+            artifact: Some(ReceiptArtifact {
+                artifact_id: operation_id.clone(),
+                digest: digest.clone(),
+                tree_digest: String::new(),
+                files: Vec::new(),
+            }),
+            at_ms: now_ms,
+        };
+        if !claim_close(&self.db, &operation_id, &closing, false, now_ms)? {
+            return Err("export lease lost".into());
+        }
+        finalize(&self.db, &operation_id)?;
+        Ok((self.rows, digest))
+    }
+}
+
+impl Drop for ExportReceipt {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let now = now_ms();
+        // An expired lease is left to the sweep, which decides it.
+        if claim_close(
+            &self.db,
+            &self.receipt.operation_id,
+            &aborted(self.rows, "export_ended", now),
+            false,
+            now,
+        )
+        .unwrap_or(false)
+        {
+            let _ = finalize(&self.db, &self.receipt.operation_id);
+        }
+    }
+}
+
+fn event(
+    operation_id: &str,
+    suffix: &str,
+    kind: ReceiptEventKind,
+    actor: &str,
+    now_ms: i64,
+    attributes: BTreeMap<String, String>,
+) -> OperationReceiptEvent {
+    OperationReceiptEvent {
+        event_id: format!("{operation_id}:{suffix}"),
+        operation_id: operation_id.into(),
+        parent_event_id: (suffix != "intent").then(|| format!("{operation_id}:intent")),
+        timestamp_ms: now_ms,
+        surface: kind.surface(),
+        kind,
+        actor: actor.into(),
+        references: Vec::new(),
+        attributes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(id: &str, properties: &[(&str, &str)]) -> Object {
+        Object {
+            id: id.into(),
+            kind: "Ticket".into(),
+            name: id.into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: properties
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            created: 0,
+            updated: 0,
+        }
+    }
+
+    #[test]
+    fn csv_quotes_what_needs_it_and_leaves_hidden_cells_empty() {
+        let encoder =
+            RowEncoder::new(ExportFormat::Csv, vec!["title".into(), "secret".into()]).unwrap();
+        assert_eq!(encoder.header(), b"id,title,secret\n");
+        assert_eq!(
+            encoder.row(&object("t-1", &[("title", "a, \"b\"\nc")])),
+            b"t-1,\"a, \"\"b\"\"\nc\",\n"
+        );
+    }
+
+    #[test]
+    fn json_lines_omit_hidden_properties() {
+        let encoder = RowEncoder::new(
+            ExportFormat::JsonLines,
+            vec!["title".into(), "secret".into()],
+        )
+        .unwrap();
+        assert!(encoder.header().is_empty());
+        assert_eq!(
+            encoder.row(&object("t-1", &[("title", "x")])),
+            b"{\"id\":\"t-1\",\"title\":\"x\"}\n"
+        );
+    }
+
+    /// Grant, retry, revoke and re-grant on either backend.
+    fn grant_contract(db: &RuntimeDb, ns: &str) {
+        let granted = grant_export(db, ns, "alice", "audit", "admin", 1).unwrap();
+        assert!(granted.active());
+        assert_eq!(
+            grant_export(db, ns, "alice", "again", "admin", 2).unwrap(),
+            granted
+        );
+        assert!(grant_export(db, ns, "alice", " ", "admin", 2).is_err());
+        let revoked = revoke_export(db, ns, "alice", "done", "admin", 3)
+            .unwrap()
+            .unwrap();
+        assert!(!revoked.active());
+        assert_eq!(revoked.revocation_reason, "done");
+        assert_eq!(revoked.reason, "audit");
+        assert_eq!(db.get_export_grant(ns, "alice").unwrap(), Some(revoked));
+        assert_eq!(
+            revoke_export(db, ns, "bob", "done", "admin", 3).unwrap(),
+            None
+        );
+        assert!(
+            grant_export(db, ns, "alice", "new audit", "admin", 4)
+                .unwrap()
+                .active()
+        );
+    }
+
+    #[test]
+    fn grant_decision_ids_never_collide_across_delimiters() {
+        assert_ne!(
+            grant_decision_id("a:b", "c", 1),
+            grant_decision_id("a", "b:c", 1)
+        );
+    }
+
+    #[test]
+    fn sqlite_export_grants_follow_the_contract() {
+        grant_contract(&RuntimeDb::memory(), "acme");
+    }
+
+    #[test]
+    fn a_sekai_only_plane_holds_grants_and_receipts() {
+        let path = std::env::temp_dir().join(format!(
+            "export-plane-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new_for_plane(
+                path.to_str().unwrap(),
+                crate::db::schema_plane::SchemaPlane::Sekai,
+            )
+            .unwrap(),
+        ));
+        grant_contract(&db, "acme");
+        let source = ExportSource {
+            namespace: "acme".into(),
+            kind: "Ticket".into(),
+            query_digest: "sha256:q".into(),
+            definition_digest: "sha256:d".into(),
+            format: ExportFormat::Csv,
+            columns: Vec::new(),
+            granted_via: "alice".into(),
+        };
+        let receipt = ExportReceipt::begin(db.clone(), "alice", &source, now_ms()).unwrap();
+        let id = receipt.operation_id().to_string();
+        receipt.complete(now_ms()).unwrap();
+        assert!(
+            export_receipt(&db, &id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_export_grants_follow_the_contract() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
+        let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                &url,
+                4,
+                &std::fs::read(path).unwrap(),
+            ),
+            Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
+        };
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(db.unwrap()));
+        // A namespace of its own, so concurrent or repeated runs never share
+        // a record.
+        let ns = format!("export-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        grant_contract(&db, &ns);
+        // Receipts: one completes; one is abandoned past its lease and swept.
+        let source = ExportSource {
+            namespace: ns.clone(),
+            kind: "Ticket".into(),
+            query_digest: "sha256:q".into(),
+            definition_digest: "sha256:d".into(),
+            format: ExportFormat::JsonLines,
+            columns: Vec::new(),
+            granted_via: "alice".into(),
+        };
+        let now = now_ms();
+        let done = ExportReceipt::begin(db.clone(), "alice", &source, now).unwrap();
+        let done_id = done.operation_id().to_string();
+        done.complete(now).unwrap();
+        let lost = ExportReceipt::begin(db.clone(), "alice", &source, now).unwrap();
+        let lost_id = lost.operation_id().to_string();
+        std::mem::forget(lost);
+        recover_abandoned_exports(&db, now + EXPORT_LEASE_MS + 1).unwrap();
+        let outcome = |id: &str| {
+            export_receipt(&db, id)
+                .unwrap()
+                .unwrap()
+                .events
+                .last()
+                .unwrap()
+                .attributes["outcome"]
+                .clone()
+        };
+        assert_eq!(outcome(&done_id), "completed");
+        assert_eq!(outcome(&lost_id), "aborted");
+    }
+
+    #[test]
+    fn an_abandoned_export_is_closed_once_as_aborted_and_fences_its_exporter() {
+        let db = RuntimeDb::memory();
+        let source = ExportSource {
+            namespace: "acme".into(),
+            kind: "Ticket".into(),
+            query_digest: "sha256:q".into(),
+            definition_digest: "sha256:d".into(),
+            format: ExportFormat::Csv,
+            columns: vec!["title".into()],
+            granted_via: "alice".into(),
+        };
+        let mut lost = ExportReceipt::begin(db.clone(), "alice", &source, 1_000).unwrap();
+        let id = lost.operation_id().to_string();
+        // The exporter stalls past its lease; another export sweeps it.
+        let later = 1_000 + EXPORT_LEASE_MS + 1;
+        recover_abandoned_exports(&db, later).unwrap();
+        let receipt = export_receipt(&db, &id).unwrap().unwrap();
+        assert!(receipt.completed_at_ms.is_some());
+        assert_eq!(
+            receipt.events.last().unwrap().attributes["outcome"],
+            "aborted"
+        );
+        // A second sweep finds nothing, and the stalled exporter is fenced.
+        recover_abandoned_exports(&db, later + 1).unwrap();
+        assert_eq!(export_receipt(&db, &id).unwrap().unwrap().events.len(), 2);
+        lost.renewed_at_ms = 0;
+        assert!(!lost.record(b"late", 1));
+        assert!(lost.complete(later + 2).is_err());
+        assert_eq!(export_receipt(&db, &id).unwrap().unwrap().events.len(), 2);
+
+        // A crash after the outcome is decided, before the receipt carries
+        // it: the next sweep finishes it with that outcome.
+        let crashed = ExportReceipt::begin(db.clone(), "alice", &source, later).unwrap();
+        let crashed_id = crashed.operation_id().to_string();
+        assert!(
+            claim_close(
+                &db,
+                &crashed_id,
+                &aborted(7, "export_ended", later + 1),
+                false,
+                later + 1
+            )
+            .unwrap()
+        );
+        std::mem::forget(crashed);
+        assert!(
+            export_receipt(&db, &crashed_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_none()
+        );
+        recover_abandoned_exports(&db, later + 2).unwrap();
+        let finished = export_receipt(&db, &crashed_id).unwrap().unwrap();
+        assert_eq!(finished.events.last().unwrap().attributes["row_count"], "7");
+        assert!(db.recoverable_exports(i64::MAX, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn columns_are_distinct_and_never_the_id() {
+        for columns in [vec!["id"], vec!["a", "a"], vec![" "]] {
+            let columns = columns.into_iter().map(String::from).collect();
+            assert!(RowEncoder::new(ExportFormat::Csv, columns).is_err());
+        }
+    }
+}

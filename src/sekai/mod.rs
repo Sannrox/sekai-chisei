@@ -28,6 +28,8 @@ pub mod compute;
 pub mod connector_certification;
 pub mod coordination;
 pub mod credentials;
+pub mod data_export;
+mod data_export_store;
 pub mod dataset;
 pub mod dataset_health;
 pub use sekai_types::dataset_branch;

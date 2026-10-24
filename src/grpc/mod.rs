@@ -794,6 +794,12 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListPublishedDefinitionRevisions"
             | "GetDefinitionMember"
             | "GetOntologyLintReport"
+            // Governed export (#1627): the handlers check the export grant and
+            // namespace administration per namespace.
+            | "GrantNamespaceExport"
+            | "RevokeNamespaceExport"
+            | "ExportObjectSet"
+            | "GetExportReceipt"
             | "GetOntologyHealth"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
@@ -2092,6 +2098,9 @@ mod tests {
             (SpaceRole::Viewer, "CreateObject", false),
             (SpaceRole::Viewer, "GetObject", true),
             (SpaceRole::Viewer, "GetOntologyLintReport", true),
+            // Data leaving the plane takes space write, not view.
+            (SpaceRole::Viewer, "ExportObjectSet", false),
+            (SpaceRole::Editor, "ExportObjectSet", true),
             (SpaceRole::Discoverer, "GetOntologyLintReport", false),
             (SpaceRole::Viewer, "GetOntologyHealth", true),
             (SpaceRole::Discoverer, "GetOntologyHealth", false),

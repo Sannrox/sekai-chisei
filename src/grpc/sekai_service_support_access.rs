@@ -1213,35 +1213,25 @@ pub(super) fn retain_reachable_visible_lineage(
     nodes.retain(|node| reachable.contains(&node.object.id));
     edges.retain(|edge| reachable.contains(&edge.from) && reachable.contains(&edge.to));
 }
-/// ACL-visible list with marking filter, exact marking-visible totals, and
-/// offset/limit applied over the filtered set.
-pub(super) fn list_objects_with_marking<F>(
+/// Visits, in one scan and in filter order, every object of `filter` the
+/// caller may read: ACL and row policy, marking, collaboration, object
+/// security and purpose, exactly as reads apply them (ignores the filter's
+/// offset and limit). Stops when `visit` returns false. Objects are raw:
+/// callers project properties as reads do. `scanned` runs after every page
+/// scanned, visible rows or not, and stops the scan by returning false.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn for_each_visible_object(
     db: &RuntimeDb,
     filter: &domain::ListFilter,
     principals: &[String],
     policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
     tenant_context: Option<&RequestEnterpriseContext>,
-    resolve: F,
-) -> Result<(Vec<domain::Object>, i32), Status>
-where
-    F: FnOnce(
-        Vec<domain::Object>,
-        &[String],
-        Option<&RequestEnterpriseContext>,
-    ) -> Result<Vec<domain::Object>, Status>,
-{
+    visit: &mut dyn FnMut(domain::Object) -> Result<bool, Status>,
+    scanned: &mut dyn FnMut() -> bool,
+) -> Result<(), Status> {
     let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
-    let requested_limit = if filter.limit <= 0 {
-        domain::DEFAULT_LIST_LIMIT as usize
-    } else {
-        (filter.limit as usize).min(domain::MAX_LIST_LIMIT as usize)
-    };
-    let requested_offset = filter.offset.max(0) as usize;
     let mut scan_offset = 0i32;
-    let mut visible_index = 0usize;
-    let mut collected = Vec::new();
-    let mut visible_total = 0i32;
     let mut recorded_purposes = HashSet::new();
     loop {
         let mut scan_filter = filter.clone();
@@ -1256,7 +1246,7 @@ where
             )
             .map_err(Status::internal)?;
         if page.is_empty() {
-            break;
+            return Ok(());
         }
         let page_len = page.len() as i32;
         for object in page {
@@ -1289,17 +1279,60 @@ where
             )? {
                 continue;
             }
+            if !visit(object)? {
+                return Ok(());
+            }
+        }
+        scan_offset = scan_offset.saturating_add(page_len);
+        if scan_offset >= principal_total || !scanned() {
+            return Ok(());
+        }
+    }
+}
+
+/// ACL-visible list with marking filter, exact marking-visible totals, and
+/// offset/limit applied over the filtered set.
+pub(super) fn list_objects_with_marking<F>(
+    db: &RuntimeDb,
+    filter: &domain::ListFilter,
+    principals: &[String],
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    resolve: F,
+) -> Result<(Vec<domain::Object>, i32), Status>
+where
+    F: FnOnce(
+        Vec<domain::Object>,
+        &[String],
+        Option<&RequestEnterpriseContext>,
+    ) -> Result<Vec<domain::Object>, Status>,
+{
+    let requested_limit = if filter.limit <= 0 {
+        domain::DEFAULT_LIST_LIMIT as usize
+    } else {
+        (filter.limit as usize).min(domain::MAX_LIST_LIMIT as usize)
+    };
+    let requested_offset = filter.offset.max(0) as usize;
+    let mut visible_index = 0usize;
+    let mut collected = Vec::new();
+    for_each_visible_object(
+        db,
+        filter,
+        principals,
+        policy_context,
+        purpose,
+        tenant_context,
+        &mut |object| {
             if visible_index >= requested_offset && collected.len() < requested_limit {
                 collected.push(object);
             }
             visible_index = visible_index.saturating_add(1);
-            visible_total = visible_total.saturating_add(1);
-        }
-        scan_offset = scan_offset.saturating_add(page_len);
-        if scan_offset >= principal_total {
-            break;
-        }
-    }
+            Ok(true)
+        },
+        &mut || true,
+    )?;
+    let visible_total = i32::try_from(visible_index).unwrap_or(i32::MAX);
     let objects = resolve(collected, principals, tenant_context)?;
     Ok((objects, visible_total))
 }

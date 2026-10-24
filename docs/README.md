@@ -120,6 +120,8 @@ If you want to deploy or operate the control plane:
   Zero visible dependents is not proof of zero impact.
 - [Ontology lint](ontology-lint.md): structural findings over a namespace
   under the caller's read policy.
+- [Governed export](governed-export.md): object sets out of the plane
+  under an export grant, with a receipt per export.
 - [Ontology health](ontology-health.md): a 0-100 score per namespace from
   freshness, checks, contracts, lint and grants.
 - [Definition change bundles](definition-change-bundles.md) — revision
