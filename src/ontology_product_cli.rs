@@ -891,13 +891,25 @@ async fn lint_namespace(target: &str, args: &[String]) -> Result<(), BoxErr> {
         .await?
         .into_inner();
     for finding in &report.findings {
+        let property = if finding.property.is_empty() {
+            String::new()
+        } else {
+            format!(".{}", finding.property)
+        };
+        let suppressed = if finding.suppressed {
+            format!(" (suppressed: {})", finding.suppression_reason)
+        } else {
+            String::new()
+        };
         println!(
-            "{} {} {}:{} {}",
+            "{} {} {}:{}{} {}{}",
             finding.severity,
             finding.rule,
             finding.subject_kind,
             finding.subject_id,
-            finding.detail
+            property,
+            finding.detail,
+            suppressed
         );
     }
     println!(

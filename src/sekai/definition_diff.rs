@@ -373,11 +373,11 @@ fn classify_member_change(
     for field in &change.changed_properties {
         match field.as_str() {
             "required" | "access_marking" => {}
-            "owner" => {
+            "owner" | "lint_suppressions" => {
                 reasons.push(reason(
                     DefinitionCompatibilityClass::Compatible,
                     change,
-                    "changed_owner",
+                    &format!("changed_{field}"),
                     field,
                 ));
                 classified = true;
@@ -418,10 +418,12 @@ fn inspect_member_constructs(member: &DefinitionMember) -> Result<(), String> {
     inspect_value_constructs(&parse_definition(&member.definition_json)?)
 }
 
-/// `owner` names who answers for a member (ontology lint, #1454); changing
-/// it is compatible.
+/// `owner` names who answers for a member (ontology lint, #1454) and
+/// `lint_suppressions` waives its lint findings with a reason (#1684);
+/// changing either is compatible and shows in the diff.
 const KNOWN_DEFINITION_FIELDS: &[&str] = &[
     "access_marking",
+    "lint_suppressions",
     "mode",
     "name",
     "owner",
@@ -820,6 +822,21 @@ mod tests {
                 .unwrap();
         assert_eq!(report.class, "compatible");
         assert_eq!(report.reasons[0].code, "changed_owner");
+        // A suppression shows in the diff as its own compatible change.
+        let suppressed = vec![prepared(
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","owner":"support","lint_suppressions":[{"rule":"orphan_object_type","reason":"seed type"}]}"#,
+        )];
+        let report = classify_definition_revision_compatibility(
+            &to,
+            &to_members,
+            &revision(&suppressed, ""),
+            &suppressed,
+        )
+        .unwrap();
+        assert_eq!(report.class, "compatible");
+        assert_eq!(report.reasons[0].code, "changed_lint_suppressions");
         let numeric = DefinitionMemberInput {
             member_kind: "object_type".into(),
             member_id: "Ticket".into(),

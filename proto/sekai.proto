@@ -3722,14 +3722,19 @@ message GetOntologyLintReportRequest {
 message OntologyLintFinding {
   // orphan_object_type | orphan_object | unowned_object_type |
   // unowned_link_type | broad_marking_applied | broad_marking_granted |
-  // action_type_never_run
+  // action_type_never_run | unreferenced_property
   string rule = 1;
-  // object_type | link_type | object | marking | action_type
+  // object_type | link_type | object | marking | action_type | property
+  // (subject_id is then the object type, and property the property)
   string subject_kind = 2;
   string subject_id = 3;
   // warning | info
   string severity = 4;
   string detail = 5;
+  // A suppression in the subject's definition covers the finding (#1684).
+  bool suppressed = 6;
+  string suppression_reason = 7;
+  string property = 8;
 }
 message GetOntologyLintReportResponse {
   string revision_digest = 1;
