@@ -439,6 +439,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ExportDatasetVersion",
+      "storage_path": "sekai.dataset, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GetExportReceipt",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",

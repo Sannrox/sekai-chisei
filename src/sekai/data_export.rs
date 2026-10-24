@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::domain::Object;
 use crate::sekai::audit::Decision;
 use sekai_domain::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptArtifact,
@@ -194,6 +193,33 @@ pub fn revoke_export(
     Ok(Some(revoked))
 }
 
+/// Records an export refused for want of an export grant: a refusal, never
+/// data.
+pub fn record_refusal(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    source_kind: &str,
+    source_id: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    db.record_decision(&Decision {
+        id: format!("export-refused:{}", uuid::Uuid::new_v4().simple()),
+        timestamp: now_ms,
+        actor: actor.into(),
+        action: "governed_export".into(),
+        reason: EXPORT_DENIED.into(),
+        evidence: HashMap::from([
+            ("contract_version".into(), EXPORT_CONTRACT.into()),
+            ("namespace".into(), namespace.into()),
+            ("source_kind".into(), source_kind.into()),
+            ("source_id".into(), source_id.into()),
+        ]),
+        target_id: namespace.into(),
+        outcome: "refused".into(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
     Csv,
@@ -217,12 +243,13 @@ impl ExportFormat {
     }
 }
 
-/// Encodes objects as rows: the object id, then the selected properties in
-/// order. A property the reader may not see is absent from the object it
+/// Encodes rows: the object id when exporting objects, then the selected
+/// columns in order. A value the reader may not see is absent from what it
 /// reads, so its cell is empty (CSV) or its key absent (JSON Lines).
 pub struct RowEncoder {
     format: ExportFormat,
     columns: Vec<String>,
+    id_column: bool,
 }
 
 fn csv_field(value: &str) -> String {
@@ -234,7 +261,11 @@ fn csv_field(value: &str) -> String {
 }
 
 impl RowEncoder {
-    pub fn new(format: ExportFormat, columns: Vec<String>) -> Result<Self, String> {
+    pub fn new(
+        format: ExportFormat,
+        columns: Vec<String>,
+        id_column: bool,
+    ) -> Result<Self, String> {
         if columns.len() > MAX_EXPORT_COLUMNS {
             return Err(format!(
                 "at most {MAX_EXPORT_COLUMNS} properties may be exported"
@@ -242,20 +273,27 @@ impl RowEncoder {
         }
         let mut seen = std::collections::BTreeSet::new();
         for column in &columns {
-            if column.trim().is_empty() || column == "id" || !seen.insert(column) {
+            if column.trim().is_empty() || (id_column && column == "id") || !seen.insert(column) {
                 return Err(format!(
                     "property {column:?} cannot be exported twice or as id"
                 ));
             }
         }
-        Ok(Self { format, columns })
+        Ok(Self {
+            format,
+            columns,
+            id_column,
+        })
     }
 
     /// Bytes before the first row.
     pub fn header(&self) -> Vec<u8> {
         match self.format {
             ExportFormat::Csv => {
-                let mut line = std::iter::once("id")
+                let mut line = self
+                    .id_column
+                    .then_some("id")
+                    .into_iter()
                     .chain(self.columns.iter().map(String::as_str))
                     .map(csv_field)
                     .collect::<Vec<_>>()
@@ -267,17 +305,18 @@ impl RowEncoder {
         }
     }
 
-    pub fn row(&self, object: &Object) -> Vec<u8> {
+    /// One row: `id` leads when the encoder exports objects.
+    pub fn row(&self, id: &str, values: &HashMap<String, String>) -> Vec<u8> {
+        let lead = self.id_column.then_some(id);
         match self.format {
             ExportFormat::Csv => {
-                let mut line = std::iter::once(object.id.as_str())
-                    .chain(self.columns.iter().map(|column| {
-                        object
-                            .properties
-                            .get(column)
-                            .map(String::as_str)
-                            .unwrap_or("")
-                    }))
+                let mut line = lead
+                    .into_iter()
+                    .chain(
+                        self.columns
+                            .iter()
+                            .map(|column| values.get(column).map(String::as_str).unwrap_or("")),
+                    )
                     .map(csv_field)
                     .collect::<Vec<_>>()
                     .join(",");
@@ -286,9 +325,11 @@ impl RowEncoder {
             }
             ExportFormat::JsonLines => {
                 let mut row = serde_json::Map::new();
-                row.insert("id".into(), object.id.clone().into());
+                if let Some(id) = lead {
+                    row.insert("id".into(), id.into());
+                }
                 for column in &self.columns {
-                    if let Some(value) = object.properties.get(column) {
+                    if let Some(value) = values.get(column) {
                         row.insert(column.clone(), value.clone().into());
                     }
                 }
@@ -303,8 +344,13 @@ impl RowEncoder {
 /// What an export reads, for its receipt.
 pub struct ExportSource {
     pub namespace: String,
-    pub kind: String,
-    pub query_digest: String,
+    /// `object_set` or `dataset_version`.
+    pub source_kind: &'static str,
+    /// The object kind, or the dataset id.
+    pub source_id: String,
+    /// The object set's query digest, or the dataset version id.
+    pub source_version: String,
+    /// The definition revision the set was read under; empty for datasets.
     pub definition_digest: String,
     pub format: ExportFormat,
     pub columns: Vec<String>,
@@ -455,9 +501,9 @@ impl ExportReceipt {
                 actor,
                 now_ms,
                 BTreeMap::from([
-                    ("source_kind".into(), "object_set".into()),
-                    ("object_kind".into(), source.kind.clone()),
-                    ("query_digest".into(), source.query_digest.clone()),
+                    ("source_kind".into(), source.source_kind.into()),
+                    ("source_id".into(), source.source_id.clone()),
+                    ("source_version".into(), source.source_version.clone()),
                     ("format".into(), source.format.as_str().into()),
                     ("properties".into(), source.columns.join(",")),
                     ("granted_via".into(), source.granted_via.clone()),
@@ -465,7 +511,8 @@ impl ExportReceipt {
             )],
             uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
-            ontology_digest: Some(source.definition_digest.clone()),
+            ontology_digest: (!source.definition_digest.is_empty())
+                .then(|| source.definition_digest.clone()),
             artifact: None,
         };
         // One row holds the receipt and the lease, so whoever closes the
@@ -611,6 +658,7 @@ fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Object;
 
     fn object(id: &str, properties: &[(&str, &str)]) -> Object {
         Object {
@@ -630,11 +678,18 @@ mod tests {
 
     #[test]
     fn csv_quotes_what_needs_it_and_leaves_hidden_cells_empty() {
-        let encoder =
-            RowEncoder::new(ExportFormat::Csv, vec!["title".into(), "secret".into()]).unwrap();
+        let encoder = RowEncoder::new(
+            ExportFormat::Csv,
+            vec!["title".into(), "secret".into()],
+            true,
+        )
+        .unwrap();
         assert_eq!(encoder.header(), b"id,title,secret\n");
         assert_eq!(
-            encoder.row(&object("t-1", &[("title", "a, \"b\"\nc")])),
+            {
+                let object = object("t-1", &[("title", "a, \"b\"\nc")]);
+                encoder.row(&object.id, &object.properties)
+            },
             b"t-1,\"a, \"\"b\"\"\nc\",\n"
         );
     }
@@ -644,11 +699,15 @@ mod tests {
         let encoder = RowEncoder::new(
             ExportFormat::JsonLines,
             vec!["title".into(), "secret".into()],
+            true,
         )
         .unwrap();
         assert!(encoder.header().is_empty());
         assert_eq!(
-            encoder.row(&object("t-1", &[("title", "x")])),
+            {
+                let object = object("t-1", &[("title", "x")]);
+                encoder.row(&object.id, &object.properties)
+            },
             b"{\"id\":\"t-1\",\"title\":\"x\"}\n"
         );
     }
@@ -688,6 +747,45 @@ mod tests {
         );
     }
 
+    /// A dataset version reads back whole, in order, a page at a time.
+    fn version_pages(db: &RuntimeDb, ns: &str) {
+        let dataset_id = format!("{ns}-rows");
+        db.create_dataset(&crate::sekai::dataset::Dataset {
+            id: dataset_id.clone(),
+            name: dataset_id.clone(),
+            columns: vec![crate::sekai::dataset::ColumnDef {
+                name: "n".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        let rows: Vec<HashMap<String, String>> = (0..5)
+            .map(|n| HashMap::from([("n".to_string(), n.to_string())]))
+            .collect();
+        db.append_rows(&dataset_id, &rows).unwrap();
+        let version = db.latest_dataset_version_id(&dataset_id).unwrap();
+        let mut after = i64::MIN;
+        let mut read = Vec::new();
+        loop {
+            let page = db
+                .dataset_version_rows_after(&dataset_id, &version, after, 2)
+                .unwrap();
+            let Some((last, _)) = page.last() else { break };
+            after = *last;
+            read.extend(page.into_iter().map(|(_, row)| row["n"].clone()));
+        }
+        assert_eq!(read, ["0", "1", "2", "3", "4"]);
+    }
+
+    #[test]
+    fn sqlite_dataset_versions_read_in_pages() {
+        version_pages(&RuntimeDb::memory(), "acme");
+    }
+
     #[test]
     fn sqlite_export_grants_follow_the_contract() {
         grant_contract(&RuntimeDb::memory(), "acme");
@@ -710,8 +808,9 @@ mod tests {
         grant_contract(&db, "acme");
         let source = ExportSource {
             namespace: "acme".into(),
-            kind: "Ticket".into(),
-            query_digest: "sha256:q".into(),
+            source_kind: "object_set",
+            source_id: "Ticket".into(),
+            source_version: "sha256:q".into(),
             definition_digest: "sha256:d".into(),
             format: ExportFormat::Csv,
             columns: Vec::new(),
@@ -752,8 +851,9 @@ mod tests {
         // Receipts: one completes; one is abandoned past its lease and swept.
         let source = ExportSource {
             namespace: ns.clone(),
-            kind: "Ticket".into(),
-            query_digest: "sha256:q".into(),
+            source_kind: "object_set",
+            source_id: "Ticket".into(),
+            source_version: "sha256:q".into(),
             definition_digest: "sha256:d".into(),
             format: ExportFormat::JsonLines,
             columns: Vec::new(),
@@ -779,6 +879,7 @@ mod tests {
         };
         assert_eq!(outcome(&done_id), "completed");
         assert_eq!(outcome(&lost_id), "aborted");
+        version_pages(&db, &ns);
     }
 
     #[test]
@@ -786,8 +887,9 @@ mod tests {
         let db = RuntimeDb::memory();
         let source = ExportSource {
             namespace: "acme".into(),
-            kind: "Ticket".into(),
-            query_digest: "sha256:q".into(),
+            source_kind: "object_set",
+            source_id: "Ticket".into(),
+            source_version: "sha256:q".into(),
             definition_digest: "sha256:d".into(),
             format: ExportFormat::Csv,
             columns: vec!["title".into()],
@@ -844,7 +946,7 @@ mod tests {
     fn columns_are_distinct_and_never_the_id() {
         for columns in [vec!["id"], vec!["a", "a"], vec![" "]] {
             let columns = columns.into_iter().map(String::from).collect();
-            assert!(RowEncoder::new(ExportFormat::Csv, columns).is_err());
+            assert!(RowEncoder::new(ExportFormat::Csv, columns, true).is_err());
         }
     }
 }

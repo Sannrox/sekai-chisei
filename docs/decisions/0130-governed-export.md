@@ -63,8 +63,10 @@ Rejected:
 ## Consequences
 
 - Sets with traversal or aggregation, and object types backed by a dataset,
-  are not exported yet (`UNIMPLEMENTED`). Dataset versions are #1695, and
-  downloadable artifacts are #1628.
+  are not exported yet (`UNIMPLEMENTED`); downloadable artifacts are #1628.
+- Dataset versions (#1695) export through the same pipeline, grant and
+  receipt. Their access is the dataset's read plus the full read policy of
+  the object it is bound to. Columns follow that object's property grants.
 - The underlying scan pages by offset, so a very large export reads more
   than it sends. Its memory stays bounded.
 - On enterprise transport an export takes space write, not view.

@@ -29790,3 +29790,171 @@ async fn a_dropped_export_leaves_an_aborted_receipt() {
     .unwrap();
     assert_eq!(aborted, "aborted");
 }
+
+#[tokio::test]
+async fn a_dataset_version_exports_under_its_grant_without_withheld_columns() {
+    use futures_util::StreamExt;
+    let svc = service();
+    let db = svc.db.runtime();
+    db.create_object(&crate::domain::Object {
+        id: "orders-binding".into(),
+        kind: "OrderBook".into(),
+        name: "orders".into(),
+        namespace: "dexp".into(),
+        external_id: String::new(),
+        properties: HashMap::new(),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    db.create_dataset(&crate::sekai::dataset::Dataset {
+        id: "orders".into(),
+        name: "orders".into(),
+        // `amount` is restricted: redacted for a reader who may not
+        // administer the bound object.
+        columns: [
+            ("id", "public"),
+            ("amount", "sensitive"),
+            ("secret", "public"),
+        ]
+        .map(|(name, classification)| crate::sekai::dataset::ColumnDef {
+            name: name.into(),
+            col_type: "string".into(),
+            classification: classification.into(),
+        })
+        .to_vec(),
+        object_id: "orders-binding".into(),
+        created: 0,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    db.append_rows(
+        "orders",
+        &[("1", "10"), ("2", "20")].map(|(id, amount)| {
+            HashMap::from([
+                ("id".to_string(), id.to_string()),
+                ("amount".to_string(), amount.to_string()),
+                ("secret".to_string(), format!("s{id}")),
+            ])
+        }),
+    )
+    .unwrap();
+    let version_id = db.latest_dataset_version_id("orders").unwrap();
+    // The bound object's read policy withholds `secret`.
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "dexp".into(),
+        kind: "OrderBook".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(
+            ["id", "amount"]
+                .map(|property| crate::sekai::object_security::PropertyGrant {
+                    property: property.into(),
+                    access: crate::sekai::object_security::PropertyGrantAccess::Read,
+                })
+                .to_vec(),
+        ),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-dexp", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        "dexp",
+        &BTreeMap::from([("OrderBook".into(), revision.revision_digest)]),
+        "root",
+        "activate-dexp",
+        2,
+    )
+    .unwrap();
+    let request = || ExportDatasetVersionRequest {
+        dataset_id: "orders".into(),
+        version_id: version_id.clone(),
+        columns: Vec::new(),
+        format: "csv".into(),
+    };
+
+    let refused = svc
+        .export_dataset_version(with_principal(request()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let refusals = db
+        .list_decisions(&sekai_types::decision_ledger::DecisionFilter {
+            action: Some("governed_export".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].outcome, "refused");
+
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "dexp".into(),
+            principal: "tester".into(),
+            reason: "finance close".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .export_dataset_version(with_principal(request()))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let data: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.data.clone()).collect();
+    assert_eq!(
+        String::from_utf8(data.clone()).unwrap(),
+        "id,amount,secret\n1,[redacted],\n2,[redacted],\n"
+    );
+    let done = chunks.last().unwrap();
+    assert_eq!(done.row_count, 2);
+    assert_eq!(
+        done.content_digest,
+        format!("sha256:{:x}", sha2::Sha256::digest(&data))
+    );
+    let receipt = svc
+        .get_export_receipt(with_principal(GetExportReceiptRequest {
+            operation_id: chunks[0].receipt_id.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (receipt.outcome.as_str(), receipt.content_digest.as_str()),
+        ("completed", done.content_digest.as_str())
+    );
+
+    // Cell grants cannot be mapped onto dataset rows: refused, not exported.
+    let cells = crate::sekai::object_security::ObjectSecurityPolicy {
+        value_instance_grants: Some(Vec::new()),
+        ..policy
+    };
+    let revision = db
+        .put_object_security_policy(&cells, "root", "put-dexp-cells", 3)
+        .unwrap();
+    db.activate_object_security_policies(
+        "dexp",
+        &BTreeMap::from([("OrderBook".into(), revision.revision_digest)]),
+        "root",
+        "activate-dexp-cells",
+        4,
+    )
+    .unwrap();
+    let refused_cells = svc
+        .export_dataset_version(with_principal(request()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused_cells.code(), tonic::Code::FailedPrecondition);
+}

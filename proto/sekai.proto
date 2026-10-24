@@ -594,6 +594,17 @@ message ExportObjectSetRequest {
 }
 // The first message carries the receipt id, later ones the file bytes, and
 // the last one (`done`) the row count and the digest the receipt records.
+// Streams one dataset version as CSV or JSON Lines (#1695), under the same
+// export grant and receipt as ExportObjectSet; the response messages are
+// the same.
+message ExportDatasetVersionRequest {
+  string dataset_id = 1;
+  string version_id = 2;
+  // Columns to export, in order; empty means every column of the dataset.
+  repeated string columns = 3;
+  // csv | jsonl
+  string format = 4;
+}
 // An export's receipt, to its initiating caller or a namespace admin.
 message GetExportReceiptRequest {
   string operation_id = 1;
@@ -4242,6 +4253,7 @@ service SekaiService {
   rpc RevokeNamespaceExport(RevokeNamespaceExportRequest) returns (RevokeNamespaceExportResponse);
   rpc ExportObjectSet(ExportObjectSetRequest) returns (stream ExportObjectSetChunk);
   rpc GetExportReceipt(GetExportReceiptRequest) returns (GetExportReceiptResponse);
+  rpc ExportDatasetVersion(ExportDatasetVersionRequest) returns (stream ExportObjectSetChunk);
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
   rpc GetObjectTypeIndexStatus(GetObjectTypeIndexStatusRequest) returns (GetObjectTypeIndexStatusResponse);
