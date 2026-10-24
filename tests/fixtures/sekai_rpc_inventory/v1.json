@@ -838,6 +838,53 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ListDeliverableExportArtifacts",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/data_export.rs",
+        "src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "FetchExportArtifact",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/data_export.rs",
+        "src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "AcknowledgeExportDelivery",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/data_export.rs",
+        "src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "RegisterObjectTypeDatasource",
       "kind": "persistent",
       "surfaces": [
