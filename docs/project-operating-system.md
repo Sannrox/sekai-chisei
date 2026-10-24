@@ -334,6 +334,29 @@ Local isolation protects lanes that share a machine; it is not a claim.
   A lane commits and publishes its own branch from its own worktree; that is
   not a shared mutation. Nobody holds a slot across implementation, test runs,
   or a remote wait.
+- Builds and tests are isolated per lane (#1554):
+  - **Cargo:** each worktree builds into its own `target/`, the default with
+    no `target-dir` in `.cargo/config.toml`. Two lanes sharing a
+    `CARGO_TARGET_DIR` wait on Cargo's exclusive lock and overwrite each
+    other's test binaries; set it only to a path inside the lane's worktree.
+  - **SQLite:** in-memory stores hold one connection. A nested checkout on
+    one thread panics at once rather than waiting on the pool.
+    `--test-threads=1` serializes tests inside one process; it does not
+    isolate two agents.
+  - **Files and ports:** tests open `:memory:` or unique temp paths and bind
+    `127.0.0.1:0`. Tests that start the server pass `GRPC_PORT` from a free
+    port (or a socket) and clear `OPS_PORT` and `SEKAI_HTTP_PORT`, so the
+    defaults 50051, 9464 and 50080 are never bound by a test.
+  - **PostgreSQL:** the PostgreSQL scripts start their own container on an
+    ephemeral host port unless `SEKAI_TEST_POSTGRES_PORT` is set. One
+    `SEKAI_TEST_POSTGRES_URL` serves one process at a time.
+    `ScratchDatabase` users create and drop a unique database per test.
+    Tests that read the URL directly share its database and are not
+    parallel-safe across processes. List them with
+    `git grep -l 'SEKAI_TEST_POSTGRES_URL' -- src tests | xargs grep -L ScratchDatabase`.
+    Some of them reset the whole schema (`reset_database` in
+    `src/db/postgres.rs`). Run them only through
+    `scripts/postgres-conformance.sh`, which gives each run its own server.
 
 ### Limits, collisions, and landing
 

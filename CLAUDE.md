@@ -34,7 +34,11 @@ implementing. Agents never switch, reset, or stash the primary checkout;
 inspect `git status -sb` and `git worktree list` before Git or GitHub work and
 preserve other lanes. The "Parallel delivery lanes" section of
 `docs/project-operating-system.md` defines claims, the lane limit, collision
-surfaces, and serialized Git mutations.
+surfaces, and serialized Git mutations. Each lane builds into its own worktree's
+`target/` (the default; never point two lanes at one `CARGO_TARGET_DIR`), binds
+test ports at `:0`, and gives PostgreSQL conformance its own database through
+`scripts/postgres-conformance.sh`. `--test-threads=1` serializes tests inside one
+process; it does not isolate two agents.
 
 ## Ontology Policy
 
