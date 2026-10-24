@@ -1880,8 +1880,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
+ "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -2690,6 +2694,7 @@ dependencies = [
  "sekai-admin-client",
  "sekai-client",
  "sekai-connector-template",
+ "sekai-core",
  "sekai-domain",
  "sekai-obs",
  "sekai-ontology",
@@ -2746,6 +2751,42 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "sekai-core"
+version = "1.3.0"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "ed25519-dalek",
+ "fs2",
+ "hmac 0.12.1",
+ "metrics",
+ "mikura",
+ "mikura-host",
+ "mikura-ingest",
+ "native-tls",
+ "postgres",
+ "postgres-native-tls",
+ "r2d2",
+ "r2d2_postgres",
+ "r2d2_sqlite",
+ "rusqlite",
+ "same-file",
+ "sekai-domain",
+ "sekai-obs",
+ "sekai-ontology",
+ "sekai-source-sdk",
+ "sekai-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

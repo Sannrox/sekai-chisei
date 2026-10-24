@@ -103,7 +103,7 @@ tests for the affected path.
 | --- | --- |
 | [`proto/`](proto/) | Public gRPC service definitions |
 | [`src/grpc/`](src/grpc/) | Tonic services and transport boundary |
-| [`src/sekai/`](src/sekai/) | Graph, audit, lineage, security, coordination, and memory |
+| [`crates/sekai-core/`](crates/sekai-core/) | Graph, audit, lineage, security, coordination, and Sekai persistence |
 | [`src/chisei/`](src/chisei/) | Policy, budgets, routing, evaluation, and learning |
 | [`crates/chisei-provider/`](crates/chisei-provider/) | Chisei provider registry, adapters, pricing, and routing |
 | [`crates/chisei-gateway/`](crates/chisei-gateway/) | Standalone compatible HTTP gateway |
