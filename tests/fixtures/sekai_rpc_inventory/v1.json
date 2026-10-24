@@ -689,6 +689,23 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ExportDatasetVersion",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/data_export.rs",
+        "src/sekai/data_export_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.dataset",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetExportReceipt",
       "kind": "query",
       "surfaces": [],

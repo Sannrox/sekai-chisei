@@ -1166,268 +1166,7 @@ fn map_object_set_error(error: ObjectSetError) -> Status {
     }
 }
 
-/// Objects resolved and encoded per batch, and bytes buffered per message.
-const EXPORT_BATCH: usize = 256;
-const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
-
-fn grant_status(error: String) -> Status {
-    if error == crate::sekai::data_export::GRANT_CHANGED {
-        Status::aborted(error)
-    } else if error.starts_with("reason") || error.starts_with("principal") {
-        Status::invalid_argument(error)
-    } else {
-        Status::internal(error)
-    }
-}
-
-fn to_proto_export_grant(grant: crate::sekai::data_export::ExportGrant) -> NamespaceExportGrant {
-    NamespaceExportGrant {
-        namespace: grant.namespace,
-        principal: grant.principal,
-        granted_by: grant.granted_by,
-        granted_at_ms: grant.granted_at_ms,
-        reason: grant.reason,
-        revoked_by: grant.revoked_by,
-        revoked_at_ms: grant.revoked_at_ms,
-        revocation_reason: grant.revocation_reason,
-    }
-}
-
-/// What the export producer hands the response stream. Data carries the
-/// time it must reach the client by (before the lease could lapse); the
-/// receipt itself comes last, so it completes only once the stream has
-/// passed every byte on.
-enum ExportItem {
-    Data(ExportObjectSetChunk, i64),
-    Finish(Box<crate::sekai::data_export::ExportReceipt>),
-    Fail(Status),
-}
-
-/// Sends export bytes in bounded messages, counting them toward the
-/// receipt's digest as they leave. A send fails once the client is gone or
-/// would outlast the lease.
-struct ExportWriter {
-    receipt: crate::sekai::data_export::ExportReceipt,
-    tx: tokio::sync::mpsc::Sender<ExportItem>,
-    buffer: Vec<u8>,
-    buffered_rows: u64,
-}
-
-impl ExportWriter {
-    fn write(&mut self, bytes: Vec<u8>, rows: u64) -> bool {
-        self.buffer.extend(bytes);
-        self.buffered_rows += rows;
-        self.buffer.len() < EXPORT_CHUNK_BYTES || self.flush()
-    }
-
-    fn flush(&mut self) -> bool {
-        if self.buffer.is_empty() {
-            return true;
-        }
-        let data = std::mem::take(&mut self.buffer);
-        let mut rows = std::mem::take(&mut self.buffered_rows);
-        // A row may be larger than a message; rows span messages freely.
-        // Each message renews the lease as it goes, and a lost lease means
-        // another instance closed this export.
-        data.chunks(EXPORT_CHUNK_BYTES).all(|part| {
-            self.receipt.record(part, std::mem::take(&mut rows))
-                && self.send(ExportObjectSetChunk {
-                    data: part.to_vec(),
-                    ..Default::default()
-                })
-        })
-    }
-
-    fn send(&self, chunk: ExportObjectSetChunk) -> bool {
-        let deadline = self.receipt.deadline_ms();
-        send_item(&self.tx, ExportItem::Data(chunk, deadline), &self.receipt)
-    }
-}
-
-/// Queues an item, waiting for a slow client no longer than the lease
-/// allows.
-fn send_item(
-    tx: &tokio::sync::mpsc::Sender<ExportItem>,
-    item: ExportItem,
-    receipt: &crate::sekai::data_export::ExportReceipt,
-) -> bool {
-    let Some(budget) = receipt.send_budget() else {
-        return false;
-    };
-    tokio::runtime::Handle::current()
-        .block_on(tx.send_timeout(item, budget))
-        .is_ok()
-}
-
-/// The response stream: passes data on while its deadline holds, and
-/// completes the receipt when it reaches it. Dropped early (the client
-/// left), the receipt it has not reached closes as aborted.
-fn export_response_stream(
-    mut rx: tokio::sync::mpsc::Receiver<ExportItem>,
-) -> impl futures_util::Stream<Item = Result<ExportObjectSetChunk, Status>> {
-    async_stream::stream! {
-        let mut ended = false;
-        while let Some(item) = rx.recv().await {
-            match item {
-                ExportItem::Data(chunk, deadline) => {
-                    if now_millis() >= deadline {
-                        yield Err(Status::aborted("export lease expired"));
-                        ended = true;
-                        break;
-                    }
-                    yield Ok(chunk);
-                }
-                ExportItem::Finish(receipt) => {
-                    if now_millis() >= receipt.deadline_ms() {
-                        yield Err(Status::aborted("export lease expired"));
-                        ended = true;
-                        break;
-                    }
-                    let completed =
-                        tokio::task::spawn_blocking(move || receipt.complete(now_millis())).await;
-                    match completed {
-                        Ok(Ok((row_count, content_digest))) => {
-                            yield Ok(ExportObjectSetChunk {
-                                done: true,
-                                row_count: i64::try_from(row_count).unwrap_or(i64::MAX),
-                                content_digest,
-                                ..Default::default()
-                            });
-                        }
-                        _ => yield Err(Status::aborted("export could not be completed")),
-                    }
-                    ended = true;
-                    break;
-                }
-                ExportItem::Fail(status) => {
-                    yield Err(status);
-                    ended = true;
-                    break;
-                }
-            }
-        }
-        // The producer stopped without finishing: never end as success.
-        if !ended {
-            yield Err(Status::aborted("export ended before completion"));
-        }
-    }
-}
-
 impl SekaiServiceImpl {
-    /// Grants a principal export on a namespace. Needs namespace admin.
-    pub(super) async fn grant_namespace_export_rpc(
-        &self,
-        req: Request<GrantNamespaceExportRequest>,
-    ) -> Result<Response<GrantNamespaceExportResponse>, Status> {
-        let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
-        let inner = req.into_inner();
-        enforce_namespace_tenant_context(
-            self.db.runtime(),
-            tenant_context.as_ref(),
-            &inner.namespace,
-            true,
-        )?;
-        let actor = authorize_source_type_namespace_admin(self, &principals, &inner.namespace)?;
-        let grant = crate::sekai::data_export::grant_export(
-            self.db.runtime(),
-            &inner.namespace,
-            &inner.principal,
-            &inner.reason,
-            &actor,
-            now_millis(),
-        )
-        .map_err(grant_status)?;
-        Ok(Response::new(GrantNamespaceExportResponse {
-            grant: Some(to_proto_export_grant(grant)),
-        }))
-    }
-
-    /// Revokes a principal's export on a namespace. Needs namespace admin.
-    pub(super) async fn revoke_namespace_export_rpc(
-        &self,
-        req: Request<RevokeNamespaceExportRequest>,
-    ) -> Result<Response<RevokeNamespaceExportResponse>, Status> {
-        let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
-        let inner = req.into_inner();
-        enforce_namespace_tenant_context(
-            self.db.runtime(),
-            tenant_context.as_ref(),
-            &inner.namespace,
-            true,
-        )?;
-        let actor = authorize_source_type_namespace_admin(self, &principals, &inner.namespace)?;
-        let grant = crate::sekai::data_export::revoke_export(
-            self.db.runtime(),
-            &inner.namespace,
-            &inner.principal,
-            &inner.reason,
-            &actor,
-            now_millis(),
-        )
-        .map_err(grant_status)?
-        .ok_or_else(|| Status::not_found("export grant not found"))?;
-        Ok(Response::new(RevokeNamespaceExportResponse {
-            grant: Some(to_proto_export_grant(grant)),
-        }))
-    }
-
-    /// Reads an export's receipt. Only its initiating caller or an
-    /// administrator of its namespace sees it; anyone else gets not found.
-    pub(super) async fn get_export_receipt_rpc(
-        &self,
-        req: Request<GetExportReceiptRequest>,
-    ) -> Result<Response<GetExportReceiptResponse>, Status> {
-        let principals = caller_principals(&req);
-        require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
-        let operation_id = req.into_inner().operation_id;
-        let unavailable = || Status::not_found("export receipt unavailable");
-        let receipt = crate::sekai::data_export::export_receipt(self.db.runtime(), &operation_id)
-            .map_err(Status::internal)?
-            .ok_or_else(unavailable)?;
-        enforce_namespace_tenant_context(
-            self.db.runtime(),
-            tenant_context.as_ref(),
-            &receipt.namespace,
-            false,
-        )
-        .map_err(|_| unavailable())?;
-        if !principals.contains(&receipt.initiating_actor)
-            && authorize_source_type_namespace_admin(self, &principals, &receipt.namespace).is_err()
-        {
-            return Err(unavailable());
-        }
-        let outcome = receipt
-            .events
-            .iter()
-            .rev()
-            .find_map(|event| event.attributes.get("outcome"))
-            .cloned();
-        let attribute = |key: &str| {
-            receipt
-                .events
-                .iter()
-                .rev()
-                .find_map(|event| event.attributes.get(key))
-                .cloned()
-                .unwrap_or_default()
-        };
-        Ok(Response::new(GetExportReceiptResponse {
-            operation_id: receipt.operation_id.clone(),
-            namespace: receipt.namespace.clone(),
-            initiating_actor: receipt.initiating_actor.clone(),
-            outcome: outcome.unwrap_or_default(),
-            row_count: attribute("row_count").parse().unwrap_or(0),
-            content_digest: attribute("content_digest"),
-            started_at_ms: receipt.started_at_ms,
-            completed_at_ms: receipt.completed_at_ms.unwrap_or(0),
-            receipt_json: serde_json::to_string(&receipt)
-                .map_err(|_| Status::internal("export receipt unavailable"))?,
-        }))
-    }
-
     /// Streams an object set as CSV or JSON Lines. The caller passes every
     /// read check of EvaluateObjectSet and holds an active export grant on
     /// the namespace; rows and properties are what a read would return. The
@@ -1444,9 +1183,7 @@ impl SekaiServiceImpl {
         >,
         Status,
     > {
-        use crate::sekai::data_export::{
-            EXPORT_DENIED, ExportFormat, ExportReceipt, ExportSource, RowEncoder,
-        };
+        use crate::sekai::data_export::{ExportFormat, ExportSource, RowEncoder};
 
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
@@ -1456,26 +1193,19 @@ impl SekaiServiceImpl {
         let inner = req.into_inner();
         let format = ExportFormat::parse(&inner.format)
             .ok_or_else(|| Status::invalid_argument("format must be csv or jsonl"))?;
-        let encoder =
-            RowEncoder::new(format, inner.properties.clone()).map_err(Status::invalid_argument)?;
+        let encoder = RowEncoder::new(format, inner.properties.clone(), true)
+            .map_err(Status::invalid_argument)?;
         let bound =
             self.authorize_object_set_read(&principals, tenant_context.as_ref(), inner.descriptor)?;
         let namespace = bound.descriptor.namespace.clone();
         // Fail closed: reading a set never entitles taking it out.
-        let mut granted = None;
-        for principal in &principals {
-            if self
-                .db
-                .runtime()
-                .get_export_grant(&namespace, principal)
-                .map_err(Status::internal)?
-                .is_some_and(|grant| grant.active())
-            {
-                granted = Some(principal.clone());
-                break;
-            }
-        }
-        let granted_via = granted.ok_or_else(|| Status::permission_denied(EXPORT_DENIED))?;
+        let granted_via = export_grantee(
+            self.db.runtime(),
+            &principals,
+            &namespace,
+            "object_set",
+            &bound.descriptor.kind,
+        )?;
         // The receipt names who asked; the grant that allowed it is evidence.
         let actor = principals[0].clone();
         if bound.descriptor.aggregation.is_some()
@@ -1493,8 +1223,9 @@ impl SekaiServiceImpl {
         }
         let source = ExportSource {
             namespace,
-            kind: bound.descriptor.kind.clone(),
-            query_digest: bound.query_digest.clone(),
+            source_kind: "object_set",
+            source_id: bound.descriptor.kind.clone(),
+            source_version: bound.query_digest.clone(),
             definition_digest: bound.descriptor.definition_digest.clone(),
             format,
             columns: inner.properties,
@@ -1503,101 +1234,57 @@ impl SekaiServiceImpl {
         let mut filter = bound.filter;
         filter.offset = 0;
         let service = self.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        tokio::task::spawn_blocking(move || {
-            let db = service.db.runtime().clone();
-            let receipt = match ExportReceipt::begin(db.clone(), &actor, &source, now_millis()) {
-                Ok(receipt) => receipt,
-                Err(_) => {
-                    // Nothing is queued yet, so this send cannot wait.
-                    let _ = tx.try_send(ExportItem::Fail(Status::internal(
-                        "export receipt unavailable",
-                    )));
-                    return;
-                }
-            };
-            let receipt_id = receipt.operation_id().to_string();
-            let mut writer = ExportWriter {
-                receipt,
-                tx: tx.clone(),
-                buffer: Vec::new(),
-                buffered_rows: 0,
-            };
-            if !writer.send(ExportObjectSetChunk {
-                receipt_id,
-                ..Default::default()
-            }) || !writer.write(encoder.header(), 0)
-            {
-                return;
-            }
-            // Rows are resolved per batch exactly as a read projects them.
-            let mut batch = Vec::with_capacity(EXPORT_BATCH);
-            let mut connected = true;
-            // Shared by the row writer and the scan's keep-alive below.
-            let writer = std::cell::RefCell::new(writer);
-            let emit = |batch: &mut Vec<domain::Object>| -> Result<bool, Status> {
-                let resolved = service.resolve_computed_for_responses_with_policy(
-                    std::mem::take(batch),
+        let db = self.db.runtime().clone();
+        Ok(Response::new(run_export(
+            db.clone(),
+            actor,
+            source,
+            encoder.header(),
+            move |writer| {
+                // Rows are resolved per batch exactly as a read projects them.
+                let mut batch = Vec::with_capacity(EXPORT_BATCH);
+                let mut connected = true;
+                let emit = |batch: &mut Vec<domain::Object>| -> Result<bool, Status> {
+                    let resolved = service.resolve_computed_for_responses_with_policy(
+                        std::mem::take(batch),
+                        &principals,
+                        Some(&policy_context),
+                        tenant_context.as_ref(),
+                        purpose.as_ref(),
+                    )?;
+                    let mut writer = writer.borrow_mut();
+                    for object in &resolved {
+                        if !writer.write(encoder.row(&object.id, &object.properties), 1) {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                };
+                for_each_visible_object(
+                    &db,
+                    &filter,
                     &principals,
-                    Some(&policy_context),
-                    tenant_context.as_ref(),
+                    &policy_context,
                     purpose.as_ref(),
+                    tenant_context.as_ref(),
+                    &mut |object| {
+                        batch.push(object);
+                        if batch.len() == EXPORT_BATCH {
+                            connected = emit(&mut batch)?;
+                        }
+                        Ok(connected)
+                    },
+                    // A long scan over rows the caller may not see still
+                    // renews the lease, and stops once it is lost.
+                    &mut || writer.borrow_mut().keep_alive(),
                 )?;
-                let mut writer = writer.borrow_mut();
-                for object in &resolved {
-                    if !writer.write(encoder.row(object), 1) {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            };
-            let scanned = for_each_visible_object(
-                &db,
-                &filter,
-                &principals,
-                &policy_context,
-                purpose.as_ref(),
-                tenant_context.as_ref(),
-                &mut |object| {
-                    batch.push(object);
-                    if batch.len() == EXPORT_BATCH {
-                        connected = emit(&mut batch)?;
-                    }
-                    Ok(connected)
-                },
-                // A long scan over rows the caller may not see still renews
-                // the lease, and stops once it is lost.
-                &mut || writer.borrow_mut().receipt.record(&[], 0),
-            )
-            .and_then(|()| {
                 if connected {
                     emit(&mut batch)
                 } else {
                     Ok(false)
                 }
-            });
-            let mut writer = writer.into_inner();
-            match scanned {
-                // A scan the lease stopped is never a complete export.
-                Ok(true) if writer.receipt.live() && writer.flush() => {
-                    // The stream completes the receipt once it reaches it.
-                    let ExportWriter { receipt, tx, .. } = writer;
-                    let budget = receipt.send_budget();
-                    if let Some(budget) = budget {
-                        let _ = tokio::runtime::Handle::current().block_on(
-                            tx.send_timeout(ExportItem::Finish(Box::new(receipt)), budget),
-                        );
-                    }
-                }
-                // The client left, or the lease ran short: the receipt drops
-                // as aborted.
-                Ok(_) => {}
-                Err(status) => {
-                    let _ = send_item(&tx, ExportItem::Fail(status), &writer.receipt);
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(export_response_stream(rx))))
+            },
+        )))
     }
 }
 

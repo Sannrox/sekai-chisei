@@ -46,5 +46,33 @@ as `aborted` (`exporter_lost`) once its 60 s lease has run out. A client
 that stops reading for longer than that loses the export.
 
 Not yet exported: sets with traversal or aggregation, and object types backed
-by a dataset (`UNIMPLEMENTED`). See #1695 for dataset versions and #1628 for
-downloadable artifacts.
+by a dataset (`UNIMPLEMENTED`). See #1628 for downloadable artifacts.
+
+An export refused for want of a grant writes a refusal, never data: an audit
+decision (`governed_export`, outcome `refused`) naming the caller, the
+namespace and the source.
+
+## Dataset version export
+
+`ExportDatasetVersion` (#1695) takes `dataset_id`, `version_id`, the `columns`
+to export in order (empty: every column), and a `format`. It answers with the
+same stream and receipt as `ExportObjectSet`. CSV has a header of the
+columns, and neither format adds an id column. The caller needs:
+
+- read on the dataset;
+- the full read policy (marking, object security, purpose) of the object the
+  dataset is bound to;
+- an export grant on that object's namespace.
+
+A dataset bound to no object has no namespace to grant on, so it is refused
+(`FAILED_PRECONDITION`). So is a dataset whose bound object type enforces
+cell (value-instance) grants, which name object values that dataset rows do
+not carry. Columns the bound object's property grants withhold
+are written empty, or left out. Restricted columns (by the dataset's column
+classification or the bound object type's schema) read `[redacted]` unless
+the caller, and any actor it acts for, may read restricted properties of
+that object, as on a read of it. Rows are read in row order, a page at a
+time, so memory stays bounded. A version purged while it streams fails the
+export rather than completing it. Redaction rewrites version rows in place,
+so an export that spans a redaction may carry values from before it, as a
+read made just before would.

@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS sekai_export_receipts (
 );
 ";
 
+/// One dataset version row with its row id.
+pub type VersionRow = (i64, std::collections::HashMap<String, String>);
+
 fn decode(json: &str) -> Result<ExportGrant, String> {
     serde_json::from_str(json).map_err(|error| format!("corrupt export grant: {error}"))
 }
@@ -218,6 +221,39 @@ impl SekaiDb {
         rows.map(|row| row.map_err(|error| error.to_string()))
             .collect()
     }
+    /// Up to `limit` rows of one dataset version after `after_row_id`, in
+    /// row order, with their row ids: a keyset page, so a whole version is
+    /// read in one pass with bounded memory.
+    pub fn dataset_version_rows_after(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        after_row_id: i64,
+        limit: usize,
+    ) -> Result<Vec<VersionRow>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT row_id, data FROM sekai_dataset_version_rows
+                 WHERE dataset_id = ?1 AND version_id = ?2 AND row_id > ?3
+                 ORDER BY row_id LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![dataset_id, version_id, after_row_id, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (row_id, data) = row.map_err(|error| error.to_string())?;
+            Ok((
+                row_id,
+                serde_json::from_str(&data).map_err(|error| error.to_string())?,
+            ))
+        })
+        .collect()
+    }
 }
 
 impl PostgresDb {
@@ -376,6 +412,31 @@ impl PostgresDb {
             .map(|row| (row.get(0), row.get(1)))
             .collect())
     }
+    pub fn dataset_version_rows_after(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        after_row_id: i64,
+        limit: usize,
+    ) -> Result<Vec<VersionRow>, String> {
+        self.connection()?
+            .query(
+                "SELECT row_id, data FROM sekai_dataset_version_rows
+                 WHERE dataset_id = $1 AND version_id = $2 AND row_id > $3
+                 ORDER BY row_id LIMIT $4",
+                &[&dataset_id, &version_id, &after_row_id, &(limit as i64)],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| {
+                let data: String = row.get(1);
+                Ok((
+                    row.get::<_, i64>(0),
+                    serde_json::from_str(&data).map_err(|error| error.to_string())?,
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Dispatches to the backend the plane runs on; PostgreSQL off the async
@@ -484,5 +545,15 @@ impl crate::db::runtime_db::RuntimeDb {
         limit: usize,
     ) -> Result<Vec<(String, bool)>, String> {
         dispatch!(self, db => db.recoverable_exports(now_ms, limit))
+    }
+    /// Up to `limit` rows of a dataset version after `after_row_id`.
+    pub fn dataset_version_rows_after(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        after_row_id: i64,
+        limit: usize,
+    ) -> Result<Vec<VersionRow>, String> {
+        dispatch!(self, db => db.dataset_version_rows_after(dataset_id, version_id, after_row_id, limit))
     }
 }

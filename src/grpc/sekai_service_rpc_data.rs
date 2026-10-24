@@ -3643,7 +3643,7 @@ fn load_transform_run_or_preview(
     })
 }
 
-fn preview_column_allowlist(
+pub(super) fn preview_column_allowlist(
     service: &SekaiServiceImpl,
     dataset: &crate::sekai::dataset::Dataset,
 ) -> Result<Option<Vec<String>>, Status> {

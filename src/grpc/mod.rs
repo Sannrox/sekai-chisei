@@ -799,6 +799,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GrantNamespaceExport"
             | "RevokeNamespaceExport"
             | "ExportObjectSet"
+            | "ExportDatasetVersion"
             | "GetExportReceipt"
             | "GetOntologyHealth"
             | "RecordOntologyHealthSnapshot"

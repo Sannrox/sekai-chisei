@@ -14,6 +14,9 @@ mod catalog_invocation;
 mod catalog_rpc;
 #[path = "computed_response.rs"]
 mod computed_response;
+#[path = "data_export_rpc.rs"]
+mod data_export_rpc;
+use data_export_rpc::{EXPORT_BATCH, export_grantee, run_export};
 #[path = "definition_bundle_apply_rpc.rs"]
 mod definition_bundle_apply_rpc;
 #[path = "definition_change_bundle_rpc.rs"]
@@ -329,6 +332,8 @@ impl SekaiService for SekaiServiceImpl {
     type ReadTransformRunInputsStream = Pin<
         Box<dyn futures_util::Stream<Item = Result<ReadTransformRunInputsResponse, Status>> + Send>,
     >;
+    type ExportDatasetVersionStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<ExportObjectSetChunk, Status>> + Send>>;
     type ExportObjectSetStream =
         Pin<Box<dyn futures_util::Stream<Item = Result<ExportObjectSetChunk, Status>> + Send>>;
 
@@ -351,6 +356,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ExportObjectSetRequest>,
     ) -> Result<Response<Self::ExportObjectSetStream>, Status> {
         self.export_object_set_rpc(req).await
+    }
+
+    async fn export_dataset_version(
+        &self,
+        req: Request<ExportDatasetVersionRequest>,
+    ) -> Result<Response<Self::ExportDatasetVersionStream>, Status> {
+        self.export_dataset_version_rpc(req).await
     }
 
     async fn get_export_receipt(
