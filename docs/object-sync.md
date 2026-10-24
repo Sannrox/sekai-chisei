@@ -286,6 +286,19 @@ open transaction or ordered range. Recovery is exact replay, an authorized
 next-generation snapshot after `recovery_required`, or database repair from
 authoritative evidence.
 
+A producer that no longer holds the exact batch replays it from the plane's
+copy (#1766). `RuntimeDb::resume_open_source_batch(namespace,
+source_instance, type_digest, producer, now_ms)` re-applies the stored body of
+the binding's open transaction. It succeeds or fails exactly as replaying the
+identical batch would, and with nothing open it is a no-op. Concurrent
+resumes commit once. `RuntimeDb::abort_open_source_batch(..., reason, ...)`
+closes an open transaction that can no longer become valid as `ABORTED`
+(`aborted_by_producer: <reason>`). The checkpoint stays where it was, and the
+binding takes a fresh batch again. Both act only for the producer that opened
+the transaction (`open_transaction_producer_mismatch` otherwise), and both
+are idempotent. They are library calls for in-process connectors and
+replacement processes, not operator endpoints.
+
 ## Identity and deletion
 
 Object-sync identity has two admitted grammars. They share the

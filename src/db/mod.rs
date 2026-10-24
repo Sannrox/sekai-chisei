@@ -49,6 +49,7 @@ mod peer_import_store;
 pub mod postgres;
 pub(crate) mod postgres_receipt_chain;
 pub(crate) mod receipt_chain;
+pub mod source_batch_recovery;
 pub mod sync_scope;
 pub mod transform_replay;
 #[cfg(test)]

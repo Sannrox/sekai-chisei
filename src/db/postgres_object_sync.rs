@@ -1838,6 +1838,64 @@ fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyE
 mod tests {
     use super::*;
 
+    /// An open batch left by a dropped applier resumes once from its stored
+    /// body, and a second open one aborts with a reason, on PostgreSQL.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_open_batches_resume_and_abort_from_their_stored_body() {
+        use crate::db::object_sync::SourceBatchMapper;
+        use crate::db::object_sync::tests::{PRODUCER, TYPE_DIGEST, batch};
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
+        let connect = || {
+            let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+                Ok(path) => {
+                    PostgresDb::connect_with_ca_certificate(&url, 4, &std::fs::read(path).unwrap())
+                }
+                Err(_) => PostgresDb::connect(&url, 4),
+            };
+            crate::db::runtime_db::RuntimeDb::Postgres(std::sync::Arc::new(db.unwrap()))
+        };
+        // A namespace of its own, so concurrent or repeated runs never share
+        // a binding.
+        let namespace = format!("recover-{}", uuid::Uuid::new_v4().simple());
+        let open = |key: &str, next: &str, current: &str| {
+            let mut source = batch(current, next, key);
+            source.namespace = namespace.clone();
+            crate::db::object_sync::tests::redigest(&mut source);
+            let crate::db::runtime_db::RuntimeDb::Postgres(db) = connect() else {
+                unreachable!()
+            };
+            let prepared = PreparedBatch::new(&source, &SourceBatchMapper::Github).unwrap();
+            db.persist_source_batch_open(&source, &prepared, 100)
+                .unwrap();
+        };
+        open("batch-1", "cursor:1", "");
+        let db = connect();
+        let instance = "acme/ops";
+        let resumed = db
+            .resume_open_source_batch(&namespace, instance, TYPE_DIGEST, PRODUCER, 200)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.transaction.closed_at_ms, Some(200));
+        assert!(
+            db.resume_open_source_batch(&namespace, instance, TYPE_DIGEST, PRODUCER, 300)
+                .unwrap()
+                .is_none()
+        );
+        open("batch-2", "cursor:2", "cursor:1");
+        assert!(
+            db.abort_open_source_batch(&namespace, instance, TYPE_DIGEST, PRODUCER, "gone", 400)
+                .unwrap()
+        );
+        let state = db
+            .get_source_sync_state(&namespace, instance, TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.checkpoint.unwrap().cursor, "cursor:1");
+        assert!(state.open_transaction.is_none());
+    }
+
     #[test]
     fn lock_seeds_are_stable_and_distinct() {
         assert_eq!(SOURCE_LOCK_SEED, 665);
