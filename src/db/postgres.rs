@@ -185,6 +185,8 @@ const EXPORT_ARTIFACTS_SCHEMA: &str = include_str!("postgres/0109_sekai_export_a
 const TRANSFORM_RUN_FINISH_SCHEMA: &str = include_str!("postgres/0110_transform_run_finish.sql");
 const TRANSFORM_RUN_INPUT_VERSIONS_SCHEMA: &str =
     include_str!("postgres/0111_transform_run_input_versions.sql");
+const EXPORT_FINGERPRINTS_SCHEMA: &str =
+    include_str!("postgres/0112_sekai_export_fingerprints.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -876,6 +878,12 @@ const MIGRATIONS: &[Migration] = &[
         110,
         "transform_run_input_versions",
         TRANSFORM_RUN_INPUT_VERSIONS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        111,
+        "sekai_export_fingerprints",
+        EXPORT_FINGERPRINTS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

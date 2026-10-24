@@ -125,6 +125,9 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.ExportObjectSet` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ExportDatasetVersion` | `sekai.dataset, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetExportReceipt` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.PutExportFingerprintPolicy` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetExportFingerprintPolicy` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.TraceExport` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.PutExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.DeleteExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |

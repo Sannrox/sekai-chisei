@@ -152,3 +152,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0128: Sync purges replace resnapshots on authorization change](0128-sync-purges-and-offline-age.md)
 - [ADR 0129: Chisei schedules, workers pull, the deployment layer scales](0129-scheduling-ownership.md)
 - [ADR 0130: Data leaves the plane only through a governed export](0130-governed-export.md)
+- [ADR 0131: Watermarked exports carry an export-keyed fingerprint](0131-watermarked-export.md)

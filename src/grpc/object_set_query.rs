@@ -1226,6 +1226,17 @@ impl SekaiServiceImpl {
             "object_set",
             &bound.descriptor.kind,
         )?;
+        let plan = crate::sekai::export_fingerprint::namespace_plan(self.db.runtime(), &namespace)
+            .map_err(Status::internal)?;
+        let fingerprint_properties = plan
+            .as_ref()
+            .map(crate::sekai::export_fingerprint::FingerprintPlan::properties)
+            .unwrap_or_default();
+        let fingerprint_group_size = if plan.is_some() {
+            crate::sekai::export_fingerprint::FINGERPRINT_GROUP_SIZE as u32
+        } else {
+            0
+        };
         // The receipt names who asked; the grant that allowed it is evidence.
         let actor = principals[0].clone();
         if bound.descriptor.aggregation.is_some()
@@ -1250,6 +1261,8 @@ impl SekaiServiceImpl {
             format,
             columns: inner.properties,
             granted_via,
+            fingerprint_properties,
+            fingerprint_group_size,
         };
         let mut filter = bound.filter;
         filter.offset = 0;
@@ -1260,48 +1273,77 @@ impl SekaiServiceImpl {
             source,
             header: encoder.header(),
             rows: Box::new(move |writer: &std::cell::RefCell<ExportWriter>| {
+                let export_id = writer.borrow().operation_id().to_string();
+                let mut sink = crate::sekai::export_fingerprint::FingerprintSink::new(
+                    export_id, encoder, plan,
+                );
                 // Rows are resolved per batch exactly as a read projects them.
                 let mut batch = Vec::with_capacity(EXPORT_BATCH);
                 let mut connected = true;
-                let emit = |batch: &mut Vec<domain::Object>| -> Result<bool, Status> {
-                    let resolved = service.resolve_computed_for_responses_with_policy(
-                        std::mem::take(batch),
+                {
+                    let emit = |batch: &mut Vec<domain::Object>,
+                                sink: &mut crate::sekai::export_fingerprint::FingerprintSink|
+                     -> Result<bool, Status> {
+                        let markings: Vec<String> = batch
+                            .iter()
+                            .map(|object| {
+                                crate::sekai::markings::object_marking_token(object)
+                                    .unwrap_or("")
+                                    .to_string()
+                            })
+                            .collect();
+                        let resolved = service.resolve_computed_for_responses_with_policy(
+                            std::mem::take(batch),
+                            &principals,
+                            Some(&policy_context),
+                            tenant_context.as_ref(),
+                            purpose.as_ref(),
+                        )?;
+                        let mut writer = writer.borrow_mut();
+                        for (object, marking) in resolved.iter().zip(markings) {
+                            let encoded = sink
+                                .push(&object.id, &marking, object.properties.clone())
+                                .map_err(Status::invalid_argument)?;
+                            for row in encoded {
+                                if !writer.write(row, 1) {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        Ok(true)
+                    };
+                    for_each_visible_object(
+                        &db,
+                        &filter,
                         &principals,
-                        Some(&policy_context),
-                        tenant_context.as_ref(),
+                        &policy_context,
                         purpose.as_ref(),
+                        tenant_context.as_ref(),
+                        &mut |object| {
+                            batch.push(object);
+                            if batch.len() == EXPORT_BATCH {
+                                connected = emit(&mut batch, &mut sink)?;
+                            }
+                            Ok(connected)
+                        },
+                        // A long scan over rows the caller may not see still
+                        // renews the lease, and stops once it is lost.
+                        &mut || writer.borrow_mut().keep_alive(),
                     )?;
-                    let mut writer = writer.borrow_mut();
-                    for object in &resolved {
-                        if !writer.write(encoder.row(&object.id, &object.properties), 1) {
-                            return Ok(false);
-                        }
+                    if connected {
+                        connected = emit(&mut batch, &mut sink)?;
                     }
-                    Ok(true)
-                };
-                for_each_visible_object(
-                    &db,
-                    &filter,
-                    &principals,
-                    &policy_context,
-                    purpose.as_ref(),
-                    tenant_context.as_ref(),
-                    &mut |object| {
-                        batch.push(object);
-                        if batch.len() == EXPORT_BATCH {
-                            connected = emit(&mut batch)?;
-                        }
-                        Ok(connected)
-                    },
-                    // A long scan over rows the caller may not see still
-                    // renews the lease, and stops once it is lost.
-                    &mut || writer.borrow_mut().keep_alive(),
-                )?;
-                if connected {
-                    emit(&mut batch)
-                } else {
-                    Ok(false)
                 }
+                if !connected {
+                    return Ok(false);
+                }
+                let mut writer = writer.borrow_mut();
+                for row in sink.finish() {
+                    if !writer.write(row, 1) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }),
         })
     }

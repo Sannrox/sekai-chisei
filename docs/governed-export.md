@@ -52,6 +52,25 @@ An export refused for want of a grant writes a refusal, never data: an audit
 decision (`governed_export`, outcome `refused`) naming the caller, the
 namespace and the source.
 
+## Watermarked fingerprint
+
+Fingerprinting is off until a namespace administrator puts an explicit
+`fingerprint_properties` allowlist on a marking
+(`PutExportFingerprintPolicy` / `GetExportFingerprintPolicy`;
+[ADR 0131](decisions/0131-watermarked-export.md), #1466). Only decimal
+measurement properties may be listed; integers, identifiers, timestamps,
+strings, booleans, enums, `id` and `access_marking` cannot. Listed values
+move by at most one unit in the last decimal place, keyed by the export id.
+Exact-value properties stay as the reader saw them. A fingerprinted export
+records those properties on its receipt, stores a compact fingerprint
+record, and permutes rows in groups of 16.
+
+`TraceExport` (`namespace`, `sample`, `format`) scores fingerprint records
+in that namespace and returns matches with a confidence. A namespace
+administrator sees every match; anyone else sees only exports they
+initiated. A caller with neither is refused. Every call is an audit
+decision (`trace_export`).
+
 ## Dataset version export
 
 `ExportDatasetVersion` (#1695) takes `dataset_id`, `version_id`, the `columns`

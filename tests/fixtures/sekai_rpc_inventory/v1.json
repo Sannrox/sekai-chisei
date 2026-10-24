@@ -721,6 +721,57 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutExportFingerprintPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/export_fingerprint.rs",
+        "src/sekai/data_export_store.rs",
+        "docs/governed-export.md",
+        "docs/decisions/0131-watermarked-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetExportFingerprintPolicy",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/export_fingerprint.rs",
+        "src/sekai/data_export_store.rs",
+        "docs/governed-export.md",
+        "docs/decisions/0131-watermarked-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "TraceExport",
+      "kind": "query",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/export_fingerprint.rs",
+        "src/sekai/data_export_store.rs",
+        "docs/governed-export.md",
+        "docs/decisions/0131-watermarked-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutExportDefinition",
       "kind": "persistent",
       "surfaces": [

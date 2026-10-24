@@ -33,6 +33,7 @@ pub mod data_export_artifact_store;
 mod data_export_store;
 pub mod dataset;
 pub mod dataset_health;
+pub mod export_fingerprint;
 pub use sekai_types::dataset_branch;
 pub use sekai_types::dataset_version;
 pub use sekai_types::transform_replay;

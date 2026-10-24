@@ -114,6 +114,10 @@ pub(super) struct PreparedExport {
 pub(super) type ExportRows = Box<dyn FnOnce(&RefCell<ExportWriter>) -> Result<bool, Status> + Send>;
 
 impl ExportWriter {
+    pub(super) fn operation_id(&self) -> &str {
+        self.receipt.operation_id()
+    }
+
     /// Renews the lease between rows; false once it is lost.
     pub(super) fn keep_alive(&mut self) -> bool {
         self.receipt.record(&[], 0)
@@ -346,6 +350,154 @@ impl SekaiServiceImpl {
                 .map_err(|_| Status::internal("export receipt unavailable"))?,
         }))
     }
+
+    /// Sets the fingerprint allowlist for one marking. Needs namespace admin.
+    pub(super) async fn put_export_fingerprint_policy_rpc(
+        &self,
+        req: Request<PutExportFingerprintPolicyRequest>,
+    ) -> Result<Response<PutExportFingerprintPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let policy = req
+            .into_inner()
+            .policy
+            .ok_or_else(|| Status::invalid_argument("policy required"))?;
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &policy.namespace,
+            true,
+        )?;
+        let actor = authorize_source_type_namespace_admin(self, &principals, &policy.namespace)?;
+        let stored = crate::sekai::export_fingerprint::put_fingerprint_policy(
+            self.db.runtime(),
+            &policy.namespace,
+            &policy.marking,
+            policy.fingerprint_properties,
+            &actor,
+            now_millis(),
+        )
+        .map_err(fingerprint_status)?;
+        Ok(Response::new(PutExportFingerprintPolicyResponse {
+            policy: Some(to_proto_fingerprint_policy(stored)),
+        }))
+    }
+
+    /// Reads the fingerprint allowlist for one marking. Needs namespace admin.
+    pub(super) async fn get_export_fingerprint_policy_rpc(
+        &self,
+        req: Request<GetExportFingerprintPolicyRequest>,
+    ) -> Result<Response<GetExportFingerprintPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let inner = req.into_inner();
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &inner.namespace,
+            false,
+        )?;
+        authorize_source_type_namespace_admin(self, &principals, &inner.namespace)?;
+        let policy = crate::sekai::export_fingerprint::get_fingerprint_policy(
+            self.db.runtime(),
+            &inner.namespace,
+            &inner.marking,
+        )
+        .map_err(fingerprint_status)?;
+        Ok(Response::new(GetExportFingerprintPolicyResponse {
+            policy: Some(to_proto_fingerprint_policy(policy)),
+        }))
+    }
+
+    /// Scores a leaked sample against fingerprinted exports in a namespace.
+    pub(super) async fn trace_export_rpc(
+        &self,
+        req: Request<TraceExportRequest>,
+    ) -> Result<Response<TraceExportResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let inner = req.into_inner();
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &inner.namespace,
+            false,
+        )?;
+        let format = crate::sekai::data_export::ExportFormat::parse(&inner.format)
+            .ok_or_else(|| Status::invalid_argument("format must be csv or jsonl"))?;
+        let actor = principals[0].clone();
+        let admin =
+            authorize_source_type_namespace_admin(self, &principals, &inner.namespace).is_ok();
+        let matches = crate::sekai::export_fingerprint::trace_export(
+            self.db.runtime(),
+            &inner.namespace,
+            format,
+            &inner.sample,
+            &actor,
+            now_millis(),
+            admin,
+        )
+        .map_err(fingerprint_status)?;
+        Ok(Response::new(TraceExportResponse {
+            matches: matches
+                .into_iter()
+                .map(|found| TraceExportMatch {
+                    receipt_id: found.receipt_id,
+                    score: found.score,
+                })
+                .collect(),
+        }))
+    }
+}
+
+fn fingerprint_status(error: String) -> Status {
+    if error == crate::sekai::data_export::EXPORT_DENIED {
+        Status::permission_denied(error)
+    } else if error.starts_with("sample")
+        || error.starts_with("namespace")
+        || error.starts_with("marking")
+        || error.starts_with("property")
+        || error.starts_with("at most")
+        || error.starts_with("fingerprint property")
+    {
+        Status::invalid_argument(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
+fn record_fingerprint(
+    db: &crate::db::runtime_db::RuntimeDb,
+    operation_id: &str,
+    source: &crate::sekai::data_export::ExportSource,
+) -> Result<(), Status> {
+    if source.fingerprint_properties.is_empty() {
+        return Ok(());
+    }
+    crate::sekai::export_fingerprint::record_export_fingerprint(
+        db,
+        &crate::sekai::export_fingerprint::ExportFingerprintRecord {
+            operation_id: operation_id.into(),
+            namespace: source.namespace.clone(),
+            columns: source.fingerprint_properties.clone(),
+            group_size: source.fingerprint_group_size,
+            id_column: source.source_kind == "object_set",
+        },
+    )
+    .map_err(Status::internal)
+}
+
+fn to_proto_fingerprint_policy(
+    policy: crate::sekai::export_fingerprint::ExportFingerprintPolicy,
+) -> ExportFingerprintPolicy {
+    ExportFingerprintPolicy {
+        namespace: policy.namespace,
+        marking: policy.marking,
+        fingerprint_properties: policy.fingerprint_properties,
+        updated_by: policy.updated_by,
+        updated_at_ms: policy.updated_at_ms,
+    }
 }
 
 pub(super) type ExportStream = std::pin::Pin<
@@ -370,7 +522,7 @@ pub(super) fn run_export(
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tokio::task::spawn_blocking(move || {
         let receipt = match crate::sekai::data_export::ExportReceipt::begin(
-            db,
+            db.clone(),
             &actor,
             &source,
             now_millis(),
@@ -385,6 +537,10 @@ pub(super) fn run_export(
             }
         };
         let receipt_id = receipt.operation_id().to_string();
+        if let Err(status) = record_fingerprint(&db, &receipt_id, &source) {
+            let _ = tx.try_send(ExportItem::Fail(status));
+            return;
+        }
         let mut writer = ExportWriter {
             receipt,
             sink: ExportSink::Stream(tx.clone()),
@@ -451,6 +607,7 @@ pub(super) fn run_to_artifact(
     let receipt = crate::sekai::data_export::ExportReceipt::begin(db.clone(), &actor, &source, now)
         .map_err(|_| Status::internal("export receipt unavailable"))?;
     let receipt_id = receipt.operation_id().to_string();
+    record_fingerprint(&db, &receipt_id, &source)?;
     db.open_export_artifact(&receipt_id, &source.namespace, definition_id, now)
         .map_err(Status::internal)?;
     let mut writer = ExportWriter {
@@ -668,6 +825,17 @@ impl SekaiServiceImpl {
         };
         let granted_via =
             export_grantee(&db, &principals, &namespace, "dataset_version", &dataset.id)?;
+        let plan = crate::sekai::export_fingerprint::namespace_plan(&db, &namespace)
+            .map_err(Status::internal)?;
+        let fingerprint_properties = plan
+            .as_ref()
+            .map(crate::sekai::export_fingerprint::FingerprintPlan::properties)
+            .unwrap_or_default();
+        let fingerprint_group_size = if plan.is_some() {
+            crate::sekai::export_fingerprint::FINGERPRINT_GROUP_SIZE as u32
+        } else {
+            0
+        };
         let source = ExportSource {
             namespace,
             source_kind: "dataset_version",
@@ -677,15 +845,24 @@ impl SekaiServiceImpl {
             format,
             columns,
             granted_via,
+            fingerprint_properties,
+            fingerprint_group_size,
         };
         let dataset_id = dataset.id;
         let version_id = version.version_id;
         let reader = db.clone();
+        let bound_marking = crate::sekai::markings::object_marking_token(&object)
+            .unwrap_or("")
+            .to_string();
         Ok(PreparedExport {
             actor: principals[0].clone(),
             source,
             header: encoder.header(),
             rows: Box::new(move |writer: &RefCell<ExportWriter>| {
+                let export_id = writer.borrow().operation_id().to_string();
+                let mut sink = crate::sekai::export_fingerprint::FingerprintSink::new(
+                    export_id, encoder, plan,
+                );
                 let mut after = i64::MIN;
                 loop {
                     let page = reader
@@ -710,12 +887,25 @@ impl SekaiServiceImpl {
                                 *value = REDACTED_VALUE.to_string();
                             }
                         }
-                        if !writer.write(encoder.row("", &values), 1) {
-                            return Ok(false);
+                        let encoded = sink
+                            .push("", &bound_marking, values)
+                            .map_err(Status::invalid_argument)?;
+                        for row in encoded {
+                            if !writer.write(row, 1) {
+                                return Ok(false);
+                            }
                         }
                     }
                     if !writer.keep_alive() {
                         return Ok(false);
+                    }
+                }
+                {
+                    let mut writer = writer.borrow_mut();
+                    for row in sink.finish() {
+                        if !writer.write(row, 1) {
+                            return Ok(false);
+                        }
                     }
                 }
                 // A version purged while it streamed is not exported whole.

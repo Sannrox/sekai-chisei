@@ -403,6 +403,27 @@ impl SekaiService for SekaiServiceImpl {
         self.get_export_receipt_rpc(req).await
     }
 
+    async fn put_export_fingerprint_policy(
+        &self,
+        req: Request<PutExportFingerprintPolicyRequest>,
+    ) -> Result<Response<PutExportFingerprintPolicyResponse>, Status> {
+        self.put_export_fingerprint_policy_rpc(req).await
+    }
+
+    async fn get_export_fingerprint_policy(
+        &self,
+        req: Request<GetExportFingerprintPolicyRequest>,
+    ) -> Result<Response<GetExportFingerprintPolicyResponse>, Status> {
+        self.get_export_fingerprint_policy_rpc(req).await
+    }
+
+    async fn trace_export(
+        &self,
+        req: Request<TraceExportRequest>,
+    ) -> Result<Response<TraceExportResponse>, Status> {
+        self.trace_export_rpc(req).await
+    }
+
     async fn acquire_lease(
         &self,
         req: Request<AcquireLeaseRequest>,
