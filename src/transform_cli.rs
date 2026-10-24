@@ -312,6 +312,7 @@ fn parse_list(args: &[String]) -> Result<ListConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::usage_ledger::UsageLedgerSekaiDbExt;
     use crate::db::sekai::SekaiDb;
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use crate::sekai::governed_transform::{CONTRACT_VERSION, TransformStep};

@@ -1,9 +1,10 @@
 //! Ratchet for ADR 0096 rule 1: Sekai never depends on Chisei.
 //!
-//! Scans `src/sekai` and `src/db` (Sekai persistence) for `crate::chisei::<module>`
-//! and `crate::chisei_store` paths and compares them with `ALLOWED`. A new
-//! edge fails; so does an allowlisted edge that no longer exists, which keeps
-//! the list shrinking until it is empty and the rule is absolute.
+//! Scans `crates/sekai-core/src/sekai` and `crates/sekai-core/src/db` for
+//! `crate::chisei::<module>` and `crate::chisei_store` paths and compares them
+//! with `ALLOWED`. A new edge fails; so does an allowlisted edge that no longer
+//! exists, which keeps the list shrinking until it is empty and the rule is
+//! absolute.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -11,8 +12,8 @@ use std::path::Path;
 
 const NEEDLE: &str = "crate::chisei";
 
-/// Directories that will form `sekai-core`; none may name Chisei.
-const SEKAI_DIRS: &[&str] = &["src/sekai", "src/db"];
+/// Sekai persistence crate; none of these modules may name Chisei.
+const SEKAI_DIRS: &[&str] = &["crates/sekai-core/src/sekai", "crates/sekai-core/src/db"];
 
 /// `<file> <chisei module>` pairs still waiting to move (ADR 0096 disposition
 /// table). Remove an entry in the change that removes the edge.

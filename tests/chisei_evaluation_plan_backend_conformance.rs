@@ -2,6 +2,7 @@
 
 use sekai_chisei::chisei::evaluation_plan::*;
 use sekai_chisei::db::{postgres::PostgresDb, runtime_db::RuntimeDb, sekai::SekaiDb};
+use sekai_chisei::ext::*;
 use std::sync::Arc;
 
 fn definition(namespace: &str, suffix: &str) -> EvaluatorDefinition {

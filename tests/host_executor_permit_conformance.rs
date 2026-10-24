@@ -14,6 +14,7 @@ use sekai_chisei::chisei::external_permit::{
 };
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
+use sekai_chisei::ext::*;
 use sekai_chisei::sekai::execution_evidence::{
     EXECUTION_EVIDENCE_SCHEMA, ExecutionEvidence, ExecutionLifecycleState, verify_for_executor,
 };
