@@ -142,6 +142,11 @@ fn stored_suite_result(
             crate::sekai::agent_dry_run::REFUSAL_DRY_RUN,
         ));
     }
+    if crate::sekai::agent_shadow::run_is_shadow(&run.config_ref, &run.suite_id) {
+        return Err(Status::failed_precondition(
+            crate::sekai::agent_shadow::REFUSAL_SHADOW_CERTIFY,
+        ));
+    }
     if run.suite_id != suite_id {
         return Err(Status::failed_precondition(
             crate::sekai::agent_promotion::REFUSAL_SUITE_MISSING,
@@ -859,6 +864,7 @@ pub(super) fn authorize_definition_proposal_merge(
     }
     agent_tool_approvals(service, &proposal.namespace, &proposal.candidate_digest)?
         .map_err(Status::failed_precondition)?;
+    require_agent_shadow_for_merge(service, proposal)?;
     Ok(actor.clone())
 }
 
@@ -1593,6 +1599,425 @@ pub(super) async fn dry_run_agent(
             })
             .collect(),
     }))
+}
+
+pub(super) async fn run_agent_shadow(
+    service: &SekaiServiceImpl,
+    req: Request<RunAgentShadowRequest>,
+) -> Result<Response<RunAgentShadowResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    definition_branch_domain::validate_digest(
+        "candidate_revision_digest",
+        &input.candidate_revision_digest,
+    )
+    .map_err(Status::invalid_argument)?;
+    definition_branch_domain::DefinitionMemberRef {
+        member_kind: crate::sekai::agent_promotion::MEMBER_KIND_AGENT.into(),
+        member_id: input.member_id.clone(),
+    }
+    .validate()
+    .map_err(Status::invalid_argument)?;
+    let envelopes: Vec<crate::sekai::agent_shadow::TriggerEnvelope> = input
+        .envelopes
+        .into_iter()
+        .map(|envelope| crate::sekai::agent_shadow::TriggerEnvelope {
+            id: envelope.id,
+            input: envelope.input,
+        })
+        .collect();
+    let candidate = load_agent_definition(
+        service,
+        &principals,
+        &input.namespace,
+        &input.candidate_revision_digest,
+        &input.member_id,
+    )?;
+    let active_digest = if input.active_revision_digest.is_empty() {
+        service
+            .db
+            .runtime()
+            .get_published_definition_revision(&input.namespace)
+            .map_err(|_| Status::internal("definition member unavailable"))?
+            .ok_or_else(|| Status::not_found("definition member unavailable"))?
+            .revision_digest
+    } else {
+        definition_branch_domain::validate_digest(
+            "active_revision_digest",
+            &input.active_revision_digest,
+        )
+        .map_err(Status::invalid_argument)?;
+        input.active_revision_digest.clone()
+    };
+    let active = load_agent_definition(
+        service,
+        &principals,
+        &input.namespace,
+        &active_digest,
+        &input.member_id,
+    )?;
+    let runtime = service.db.runtime();
+    let namespace = input.namespace.clone();
+    let host = ShadowDryRunHost {
+        injected: service.dry_run_host.as_deref(),
+        runtime,
+    };
+    let shadow_id = format!("agent-shadow-{}", uuid::Uuid::new_v4().simple());
+    let report = crate::sekai::agent_shadow::run_shadow(
+        &crate::sekai::agent_shadow::ShadowRun {
+            namespace: &input.namespace,
+            member_id: &input.member_id,
+            active_digest: &active_digest,
+            candidate_digest: &input.candidate_revision_digest,
+            active: &active,
+            candidate: &candidate,
+            envelopes: &envelopes,
+            require_for_promotion: input.require_for_promotion,
+            shadow_id: &shadow_id,
+        },
+        &host,
+        |action_type, parameters_json| {
+            crate::sekai::agent_dry_run::validate_dry_run_proposed_action(
+                runtime,
+                &namespace,
+                action_type,
+                parameters_json,
+            )
+        },
+    )
+    .map_err(map_shadow_failure)?;
+    persist_shadow_report(service, &report, now_millis())?;
+    if input.require_for_promotion {
+        persist_shadow_requirement(service, &input.namespace, now_millis())?;
+    }
+    Ok(Response::new(RunAgentShadowResponse {
+        report: Some(to_proto_shadow_report(&report)),
+    }))
+}
+
+pub(super) async fn get_agent_shadow_report(
+    service: &SekaiServiceImpl,
+    req: Request<GetAgentShadowReportRequest>,
+) -> Result<Response<GetAgentShadowReportResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    let report = load_shadow_report(
+        service,
+        &input.namespace,
+        &input.member_id,
+        &input.candidate_revision_digest,
+        false,
+        None,
+    )?
+    .ok_or_else(|| Status::not_found("agent shadow report unavailable"))?;
+    for digest in [
+        report.active_revision_digest.as_str(),
+        report.candidate_revision_digest.as_str(),
+    ] {
+        authorize_definition_revision(service, &principals, &report.namespace, digest, false)
+            .map_err(|status| match status.code() {
+                tonic::Code::NotFound => Status::not_found("agent shadow report unavailable"),
+                tonic::Code::Internal => Status::internal("agent shadow report unavailable"),
+                _ => status,
+            })?;
+    }
+    Ok(Response::new(GetAgentShadowReportResponse {
+        report: Some(to_proto_shadow_report(&report)),
+    }))
+}
+
+struct ShadowDryRunHost<'a> {
+    injected: Option<&'a dyn crate::sekai::agent_dry_run::AgentDryRunHost>,
+    runtime: &'a crate::db::runtime_db::RuntimeDb,
+}
+
+impl crate::sekai::agent_dry_run::AgentDryRunHost for ShadowDryRunHost<'_> {
+    fn admit_and_complete(
+        &self,
+        request: &crate::sekai::agent_dry_run::DryRunModelRequest,
+    ) -> Result<
+        crate::sekai::agent_dry_run::DryRunModelReply,
+        crate::sekai::agent_dry_run::DryRunFailure,
+    > {
+        match self.injected {
+            Some(host) => host.admit_and_complete(request),
+            None => default_dry_run(self.runtime, request),
+        }
+    }
+}
+
+fn map_shadow_failure(error: crate::sekai::agent_shadow::ShadowFailure) -> Status {
+    match error {
+        crate::sekai::agent_shadow::ShadowFailure::RouteAdmission(reason)
+        | crate::sekai::agent_shadow::ShadowFailure::Budget(reason)
+        | crate::sekai::agent_shadow::ShadowFailure::Model(reason) => {
+            Status::failed_precondition(reason)
+        }
+    }
+}
+
+fn load_agent_definition(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    revision_digest: &str,
+    member_id: &str,
+) -> Result<crate::sekai::agent_definition::AgentDefinition, Status> {
+    authorize_definition_revision(service, principals, namespace, revision_digest, false).map_err(
+        |status| match status.code() {
+            tonic::Code::NotFound => Status::not_found("definition member unavailable"),
+            tonic::Code::Internal => Status::internal("definition member unavailable"),
+            _ => status,
+        },
+    )?;
+    let member = service
+        .db
+        .runtime()
+        .get_definition_member(
+            namespace,
+            revision_digest,
+            crate::sekai::agent_promotion::MEMBER_KIND_AGENT,
+            member_id,
+        )
+        .map_err(|_| Status::internal("definition member unavailable"))?
+        .ok_or_else(|| Status::not_found("definition member unavailable"))?;
+    let definition: crate::sekai::agent_definition::AgentDefinition =
+        serde_json::from_str(&member.definition_json)
+            .map_err(|_| Status::not_found("definition member unavailable"))?;
+    definition
+        .validate()
+        .map_err(|_| Status::not_found("definition member unavailable"))?;
+    Ok(definition)
+}
+
+fn persist_shadow_report(
+    service: &SekaiServiceImpl,
+    report: &crate::sekai::agent_shadow::ShadowReport,
+    timestamp: i64,
+) -> Result<(), Status> {
+    use crate::chisei::eval::{CaseResult, Run};
+    let run = Run {
+        id: report.shadow_id.clone(),
+        suite_id: crate::sekai::agent_shadow::suite_id(&report.namespace, &report.member_id),
+        config_ref: crate::sekai::agent_shadow::SHADOW_CONFIG_REF.into(),
+        results: vec![CaseResult {
+            case_id: report.candidate_revision_digest.clone(),
+            passed: report.passing,
+            status: "agent_shadow".into(),
+            result: serde_json::to_string(report).unwrap_or_else(|_| "{}".into()),
+            score: i32::from(report.passing),
+            reason: report.verdict_reason.clone(),
+            elapsed: report.latency_ms,
+        }],
+        timestamp,
+    };
+    service
+        .db
+        .runtime()
+        .put_eval_run(&run)
+        .map_err(Status::internal)?;
+    Ok(())
+}
+
+fn persist_shadow_requirement(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    timestamp: i64,
+) -> Result<(), Status> {
+    use crate::chisei::eval::{CaseResult, Run};
+    let run = Run {
+        id: format!("agent-shadow-required-{}", uuid::Uuid::new_v4().simple()),
+        suite_id: crate::sekai::agent_shadow::required_suite_id(namespace),
+        config_ref: crate::sekai::agent_shadow::REQUIRED_CONFIG_REF.into(),
+        results: vec![CaseResult {
+            case_id: namespace.into(),
+            passed: true,
+            status: "required".into(),
+            result: "required".into(),
+            score: 1,
+            reason: String::new(),
+            elapsed: 0,
+        }],
+        timestamp,
+    };
+    service
+        .db
+        .runtime()
+        .put_eval_run(&run)
+        .map_err(Status::internal)?;
+    Ok(())
+}
+
+fn load_shadow_report(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    member_id: &str,
+    candidate_digest: &str,
+    passing_only: bool,
+    expected_active: Option<&str>,
+) -> Result<Option<crate::sekai::agent_shadow::ShadowReport>, Status> {
+    let mut runs = service
+        .db
+        .runtime()
+        .list_eval_run_records(&crate::sekai::agent_shadow::suite_id(namespace, member_id))
+        .map_err(Status::internal)?;
+    runs.sort_by_key(|run| std::cmp::Reverse(run.timestamp));
+    for run in runs {
+        if !crate::sekai::agent_shadow::run_is_shadow(&run.config_ref, &run.suite_id) {
+            continue;
+        }
+        let Some(result) = run.results.first() else {
+            continue;
+        };
+        if !candidate_digest.is_empty() && result.case_id != candidate_digest {
+            continue;
+        }
+        if let Ok(report) =
+            serde_json::from_str::<crate::sekai::agent_shadow::ShadowReport>(&result.result)
+        {
+            if report.namespace == namespace
+                && report.member_id == member_id
+                && (!passing_only || report.passing)
+                && expected_active
+                    .map(|active| report.active_revision_digest == active)
+                    .unwrap_or(true)
+            {
+                return Ok(Some(report));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn namespace_requires_agent_shadow(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+) -> Result<bool, Status> {
+    let runs = service
+        .db
+        .runtime()
+        .list_eval_run_records(&crate::sekai::agent_shadow::required_suite_id(namespace))
+        .map_err(Status::internal)?;
+    Ok(runs
+        .iter()
+        .any(|run| crate::sekai::agent_shadow::run_is_shadow(&run.config_ref, &run.suite_id)))
+}
+
+fn require_agent_shadow_for_merge(
+    service: &SekaiServiceImpl,
+    proposal: &crate::sekai::definition_proposal::DefinitionProposal,
+) -> Result<(), Status> {
+    if !namespace_requires_agent_shadow(service, &proposal.namespace)? {
+        return Ok(());
+    }
+    let candidate = service
+        .db
+        .runtime()
+        .get_definition_revision(&proposal.namespace, &proposal.candidate_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?
+        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    let base = service
+        .db
+        .runtime()
+        .get_definition_revision(&proposal.namespace, &proposal.base_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?;
+    for member in candidate
+        .members
+        .iter()
+        .filter(|member| member.member_kind == crate::sekai::agent_promotion::MEMBER_KIND_AGENT)
+    {
+        let expected_active = base.as_ref().and_then(|revision| {
+            revision
+                .members
+                .iter()
+                .any(|base_member| {
+                    base_member.member_kind == crate::sekai::agent_promotion::MEMBER_KIND_AGENT
+                        && base_member.member_id == member.member_id
+                })
+                .then_some(proposal.base_digest.as_str())
+        });
+        let report = load_shadow_report(
+            service,
+            &proposal.namespace,
+            &member.member_id,
+            &proposal.candidate_digest,
+            true,
+            expected_active,
+        )?;
+        crate::sekai::agent_shadow::require_shadow_report(
+            true,
+            report.as_ref(),
+            &proposal.candidate_digest,
+            expected_active,
+        )
+        .map_err(Status::failed_precondition)?;
+    }
+    Ok(())
+}
+
+fn to_proto_shadow_report(report: &crate::sekai::agent_shadow::ShadowReport) -> AgentShadowReport {
+    AgentShadowReport {
+        contract_version: report.contract_version.clone(),
+        namespace: report.namespace.clone(),
+        member_id: report.member_id.clone(),
+        active_revision_digest: report.active_revision_digest.clone(),
+        candidate_revision_digest: report.candidate_revision_digest.clone(),
+        shadow_id: report.shadow_id.clone(),
+        evaluated: report.evaluated,
+        unchanged: report.unchanged,
+        differed: report.differed,
+        cost_tokens: report.cost_tokens,
+        latency_ms: report.latency_ms,
+        passing: report.passing,
+        verdict_reason: report.verdict_reason.clone(),
+        require_for_promotion: report.require_for_promotion,
+        samples: report
+            .samples
+            .iter()
+            .map(|sample| AgentShadowSample {
+                envelope_id: sample.envelope_id.clone(),
+                input: sample.input.clone(),
+                active: sample
+                    .active
+                    .iter()
+                    .map(|action| DryRunAgentAction {
+                        action_type: action.action_type.clone(),
+                        parameters_json: action.parameters_json.clone(),
+                        disposition: action.disposition.clone(),
+                        reason: action.reason.clone(),
+                    })
+                    .collect(),
+                candidate: sample
+                    .candidate
+                    .iter()
+                    .map(|action| DryRunAgentAction {
+                        action_type: action.action_type.clone(),
+                        parameters_json: action.parameters_json.clone(),
+                        disposition: action.disposition.clone(),
+                        reason: action.reason.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 fn map_dry_run_failure(error: crate::sekai::agent_dry_run::DryRunFailure) -> Status {
