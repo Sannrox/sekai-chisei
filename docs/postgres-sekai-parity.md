@@ -32,7 +32,9 @@ head or published pointer.
 
 The reusable `sekai.object-security` surface shares immutable policy
 revisions, exact replay, complete atomic activation, and SQL-enforced direct
-read/list predicates across SQLite and PostgreSQL. Normal CI runs SQLite;
+read/list predicates across SQLite and PostgreSQL. Purpose authorizations and
+classification lattices (#1321) share the same storage semantics, and a read
+a lattice or a missing purpose denies is denied on both. Normal CI runs SQLite;
 PostgreSQL conformance remains an ignored isolated-database test.
 `sekai.geospatial-query/v1` is a computed query on that authorized list:
 both backends share the same in-process evaluator after property grants.

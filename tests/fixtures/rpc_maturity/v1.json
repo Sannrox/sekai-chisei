@@ -738,7 +738,7 @@
       "service": "SekaiService",
       "rpc": "PutPurposeAuthorization",
       "storage_path": "sekai.object-security",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -747,7 +747,7 @@
       "service": "SekaiService",
       "rpc": "RevokePurposeAuthorization",
       "storage_path": "sekai.object-security",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -756,7 +756,7 @@
       "service": "SekaiService",
       "rpc": "PutClassificationLattice",
       "storage_path": "sekai.object-security",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -765,7 +765,7 @@
       "service": "SekaiService",
       "rpc": "GetClassificationLattice",
       "storage_path": "sekai.object-security",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"

@@ -229,7 +229,10 @@ impl PostgresDb {
             .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row))
             .collect();
         let (markings_in, markings_out) = derive_transform_markings(
-            None,
+            crate::db::postgres_object_security_terms::load_classification_lattice(
+                &mut tx, namespace,
+            )?
+            .as_ref(),
             input_object_tokens.iter().map(|token| token.as_deref()),
             prior_token.as_deref(),
             marking_rows,
@@ -1928,7 +1931,11 @@ fn admit_isolated_postgres(
         .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row))
         .collect();
     let (markings_in, markings_out) = derive_transform_markings(
-        None,
+        crate::db::postgres_object_security_terms::load_classification_lattice(
+            tx,
+            &transform.namespace,
+        )?
+        .as_ref(),
         input_object_tokens.iter().map(|token| token.as_deref()),
         prior_token.as_deref(),
         marking_rows,
@@ -3734,7 +3741,11 @@ fn run_in_process_pg(
         .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row))
         .collect();
     let (markings_in, markings_out) = derive_transform_markings(
-        None,
+        crate::db::postgres_object_security_terms::load_classification_lattice(
+            tx,
+            &transform.namespace,
+        )?
+        .as_ref(),
         input_object_tokens.iter().map(|token| token.as_deref()),
         prior_token.as_deref(),
         marking_rows,

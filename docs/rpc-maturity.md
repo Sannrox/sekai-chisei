@@ -154,10 +154,10 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.ActivateObjectSecurityPolicies` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityActivation` | `sekai.object-security` | yes | none | `stable` |
-| `SekaiService.PutPurposeAuthorization` | `sekai.object-security` | sqlite only | none | `experimental` |
-| `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | sqlite only | none | `experimental` |
-| `SekaiService.PutClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
-| `SekaiService.GetClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
+| `SekaiService.PutPurposeAuthorization` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.PutClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.GetClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.QueryCounterfactualView` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |

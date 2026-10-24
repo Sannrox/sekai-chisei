@@ -850,23 +850,44 @@ impl SekaiDb {
             })
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((stored_namespace, contract_version, digest, lattice_json)) = row else {
-            return Ok(None);
-        };
-        if stored_namespace != namespace {
-            return Err("classification lattice namespace mismatch".into());
-        }
-        let lattice: crate::sekai::classification_lattice::ClassificationLattice =
-            serde_json::from_str(&lattice_json).map_err(|error| error.to_string())?;
-        let lattice = lattice.prepare()?;
-        if lattice.namespace != namespace || lattice.contract_version != contract_version {
-            return Err("classification lattice identity is stale".into());
-        }
-        if lattice.digest()? != digest {
-            return Err("classification lattice digest is stale".into());
-        }
-        Ok(Some(lattice))
+        row.map(
+            |(stored_namespace, contract_version, digest, lattice_json)| {
+                verify_stored_lattice(
+                    namespace,
+                    &stored_namespace,
+                    &contract_version,
+                    &digest,
+                    &lattice_json,
+                )
+            },
+        )
+        .transpose()
     }
+}
+
+/// A stored lattice row, checked as both backends read it: the row and the
+/// document name the requested namespace and version, and the digest still
+/// matches the document.
+pub(crate) fn verify_stored_lattice(
+    namespace: &str,
+    stored_namespace: &str,
+    contract_version: &str,
+    digest: &str,
+    lattice_json: &str,
+) -> Result<crate::sekai::classification_lattice::ClassificationLattice, String> {
+    if stored_namespace != namespace {
+        return Err("classification lattice namespace mismatch".into());
+    }
+    let lattice: crate::sekai::classification_lattice::ClassificationLattice =
+        serde_json::from_str(lattice_json).map_err(|error| error.to_string())?;
+    let lattice = lattice.prepare()?;
+    if lattice.namespace != namespace || lattice.contract_version != contract_version {
+        return Err("classification lattice identity is stale".into());
+    }
+    if lattice.digest()? != digest {
+        return Err("classification lattice digest is stale".into());
+    }
+    Ok(lattice)
 }
 
 fn row_to_purpose_authorization(

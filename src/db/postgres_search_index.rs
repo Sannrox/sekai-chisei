@@ -726,7 +726,8 @@ impl PostgresDb {
             return Ok(None);
         }
         let marking = object_marking_token(&object).unwrap_or_default();
-        if !lattice_marking_allows(marking, query, None) {
+        let lattice = self.get_classification_lattice(namespace)?;
+        if !lattice_marking_allows(marking, query, lattice.as_ref()) {
             return Ok(None);
         }
         let attributes = policy_attributes(&object);
@@ -1052,6 +1053,7 @@ impl PostgresDb {
         match_query: &str,
         limit: usize,
     ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
+        let lattice = self.get_classification_lattice(&query.policy.namespace)?;
         let rows = self
             .connection()?
             .query(
@@ -1082,7 +1084,7 @@ impl PostgresDb {
                 Some(allowed) if !allowed.iter().any(|item| item == &property) => continue,
                 _ => {}
             }
-            if !lattice_marking_allows(&marking, query, None) {
+            if !lattice_marking_allows(&marking, query, lattice.as_ref()) {
                 continue;
             }
             let parsed: BTreeMap<String, String> =
@@ -1136,7 +1138,7 @@ impl PostgresDb {
                     Some(allowed) if !allowed.iter().any(|item| item == &property) => continue,
                     _ => {}
                 }
-                if !lattice_marking_allows(&marking, query, None) {
+                if !lattice_marking_allows(&marking, query, lattice.as_ref()) {
                     continue;
                 }
                 let parsed: BTreeMap<String, String> =
@@ -1193,6 +1195,7 @@ impl PostgresDb {
         match_query: &str,
         limit: usize,
     ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
+        let lattice = self.get_classification_lattice(&query.policy.namespace)?;
         if !query.policy.kinds.is_empty()
             && !query.policy.kinds.iter().any(|kind| kind == "dataset")
         {
@@ -1219,7 +1222,7 @@ impl PostgresDb {
             let bound_marking: String = row.get(3);
             let bound_attributes: String = row.get(4);
             let bound_object_id: String = row.get(5);
-            if !lattice_marking_allows(&bound_marking, query, None) {
+            if !lattice_marking_allows(&bound_marking, query, lattice.as_ref()) {
                 continue;
             }
             let parsed: BTreeMap<String, String> =
@@ -1269,7 +1272,7 @@ impl PostgresDb {
                 if !text_matches_query(&stored, &query.text) {
                     continue;
                 }
-                if !lattice_marking_allows(&bound_marking, query, None) {
+                if !lattice_marking_allows(&bound_marking, query, lattice.as_ref()) {
                     continue;
                 }
                 let parsed: BTreeMap<String, String> =
@@ -1474,11 +1477,12 @@ impl SearchIndex for PostgresDb {
         keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
     ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
         use crate::sekai::embedding_index::EmbeddingStore;
-        // Exact over the chunk table, as on SQLite; Postgres has no lattice.
+        // Exact over the chunk table, as on SQLite.
         let namespace = &query.policy.namespace;
         let chunks = self.embedding_chunks(namespace, &query.spec_id)?;
+        let lattice = self.get_classification_lattice(namespace)?;
         let policy = query.policy_query();
-        exact_vector_candidates(chunks, query, None, |candidate| {
+        exact_vector_candidates(chunks, query, lattice.as_ref(), |candidate| {
             let id = candidate.object_id.as_str();
             Ok(self.grant_allows(id, &query.policy.subjects)?
                 && self

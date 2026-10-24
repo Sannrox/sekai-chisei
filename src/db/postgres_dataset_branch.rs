@@ -697,7 +697,11 @@ fn branch_run_pg(
     }
     let prior = load_object_marking_token(tx, &output_object_id)?;
     let (_, markings_out) = derive_transform_markings(
-        None,
+        crate::db::postgres_object_security_terms::load_classification_lattice(
+            tx,
+            &transform.namespace,
+        )?
+        .as_ref(),
         tokens.iter().map(|token| token.as_deref()),
         prior.as_deref(),
         loaded
