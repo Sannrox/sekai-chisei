@@ -3910,6 +3910,65 @@ message GetOntologyHealthResponse {
   // False when more namespaces matched than one request scores.
   bool complete = 3;
 }
+// Records one health snapshot of a namespace for the current window
+// (#1694). An external periodic caller drives it; the plane runs no
+// scheduler. The caller's schedule carries the window, retention and
+// threshold.
+message RecordOntologyHealthSnapshotRequest {
+  string namespace = 1;
+  // Window length; the snapshot belongs to the window holding the current
+  // time. At least one minute.
+  int64 window_ms = 2;
+  // Snapshots of windows that started longer ago are pruned. At least one
+  // window.
+  int64 retention_ms = 3;
+  // 0-100: a total that falls below it writes one threshold event.
+  uint32 threshold = 4;
+}
+message OntologyHealthPartScore {
+  // freshness | quality | contract | lint | trust | access
+  string part = 1;
+  // Absent when the part was unavailable when recorded.
+  optional uint32 score = 2;
+  // False when the inputs were capped, so the score may be too high.
+  bool complete = 3;
+}
+message OntologyHealthSnapshot {
+  string namespace = 1;
+  int64 window_start_ms = 2;
+  int64 window_ms = 3;
+  int64 recorded_at_ms = 4;
+  uint32 threshold = 5;
+  // Only the parts the reader may see now.
+  repeated OntologyHealthPartScore parts = 6;
+  // The lowest score of `parts`; absent when none has one.
+  optional uint32 score = 7;
+}
+message OntologyHealthEvent {
+  string namespace = 1;
+  int64 window_start_ms = 2;
+  // below_threshold
+  string kind = 3;
+  uint32 score = 4;
+  uint32 threshold = 5;
+  int64 emitted_at_ms = 6;
+}
+message RecordOntologyHealthSnapshotResponse {
+  OntologyHealthSnapshot snapshot = 1;
+  // True when this window was already recorded; nothing was written.
+  bool replay = 2;
+  // The threshold event this record wrote, if any.
+  optional OntologyHealthEvent event = 3;
+}
+message ListOntologyHealthTrendRequest {
+  string namespace = 1;
+}
+message ListOntologyHealthTrendResponse {
+  // Oldest first, within the retention of the latest record.
+  repeated OntologyHealthSnapshot snapshots = 1;
+  // Only events whose snapshot the reader may see in full.
+  repeated OntologyHealthEvent events = 2;
+}
 message DefinitionPropertyRef {
   string object_type = 1;
   string property = 2;
@@ -4223,6 +4282,10 @@ service SekaiService {
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc GetOntologyLintReport(GetOntologyLintReportRequest) returns (GetOntologyLintReportResponse);
   rpc GetOntologyHealth(GetOntologyHealthRequest) returns (GetOntologyHealthResponse);
+  rpc RecordOntologyHealthSnapshot(RecordOntologyHealthSnapshotRequest)
+      returns (RecordOntologyHealthSnapshotResponse);
+  rpc ListOntologyHealthTrend(ListOntologyHealthTrendRequest)
+      returns (ListOntologyHealthTrendResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   // Experimental: apply an approved proposal's change bundle, resumably (#1693).

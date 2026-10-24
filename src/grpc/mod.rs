@@ -801,6 +801,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExportObjectSet"
             | "GetExportReceipt"
             | "GetOntologyHealth"
+            | "RecordOntologyHealthSnapshot"
+            | "ListOntologyHealthTrend"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
             | "DryRunAgent"
@@ -2104,6 +2106,9 @@ mod tests {
             (SpaceRole::Discoverer, "GetOntologyLintReport", false),
             (SpaceRole::Viewer, "GetOntologyHealth", true),
             (SpaceRole::Discoverer, "GetOntologyHealth", false),
+            (SpaceRole::Viewer, "ListOntologyHealthTrend", true),
+            (SpaceRole::Viewer, "RecordOntologyHealthSnapshot", false),
+            (SpaceRole::Editor, "RecordOntologyHealthSnapshot", true),
             (SpaceRole::Editor, "CreateObject", true),
             (SpaceRole::Editor, "DecideActionInstance", false),
             (SpaceRole::Approver, "DecideActionInstance", true),
