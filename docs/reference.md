@@ -123,6 +123,8 @@ lives in the separate [research index](research/README.md).
   definition-consumer bindings joined to revision comparison.
 - [Ontology lint](ontology-lint.md): structural findings over a namespace
   under the caller's read policy.
+- [Ontology health](ontology-health.md): a 0-100 score per namespace from
+  freshness, checks, contracts, lint and grants.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
   `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
   hops/aggregates, evaluated through authorized list and traverse.

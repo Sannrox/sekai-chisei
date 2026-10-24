@@ -162,6 +162,30 @@ impl DefinitionMemberRef {
     }
 }
 
+/// Longest `source_turn` reference a drafted member may carry.
+pub const MAX_SOURCE_TURN_BYTES: usize = 256;
+
+/// `source_turn`, when present, names the conversation turn a drafted member
+/// came from (#1461): an opaque reference such as `session-7#turn-3`.
+fn validate_source_turn(value: &Value) -> Result<(), String> {
+    let Some(turn) = value.get("source_turn") else {
+        return Ok(());
+    };
+    match turn.as_str() {
+        Some(turn)
+            if !turn.is_empty()
+                && turn.len() <= MAX_SOURCE_TURN_BYTES
+                && turn.trim() == turn
+                && !turn.chars().any(char::is_control) =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "source_turn must be a non-empty string of at most {MAX_SOURCE_TURN_BYTES} bytes without control characters or surrounding whitespace"
+        )),
+    }
+}
+
 impl DefinitionMemberInput {
     pub fn prepare(&self, namespace: &str) -> Result<DefinitionMember, String> {
         validate_namespace(namespace)?;
@@ -178,6 +202,12 @@ impl DefinitionMemberInput {
             return Err("definition_json must be a JSON object".into());
         }
         crate::sekai::ontology_lint::suppressions(&self.member_kind, &value)?;
+        validate_source_turn(&value)?;
+        // The Agent document contract is strict and read by other services;
+        // a turn reference would break their parsing.
+        if self.member_kind == "agent" && value.get("source_turn").is_some() {
+            return Err("source_turn is not part of the Agent definition document".into());
+        }
         if self.member_kind == "agent" {
             let agent: crate::sekai::agent_definition::AgentDefinition =
                 serde_json::from_value(value.clone())
@@ -644,6 +674,28 @@ mod tests {
             .unwrap();
         assert_eq!(first.member_digest, second.member_digest);
         assert_eq!(first.definition_json, second.definition_json);
+    }
+
+    #[test]
+    fn source_turn_is_a_bounded_reference_outside_agent_documents() {
+        assert!(
+            input(r#"{"name":"Ticket","source_turn":"interview-1#turn-2"}"#)
+                .prepare("team-a")
+                .is_ok()
+        );
+        let long = "t".repeat(MAX_SOURCE_TURN_BYTES + 1);
+        for turn in [r#""""#, r#"" turn""#, "7", &format!("{long:?}")] {
+            let json = format!(r#"{{"name":"Ticket","source_turn":{turn}}}"#);
+            assert!(input(&json).prepare("team-a").is_err(), "{json}");
+        }
+        let mut agent = input(r#"{"source_turn":"interview-1#turn-2"}"#);
+        agent.member_kind = "agent".into();
+        assert!(
+            agent
+                .prepare("team-a")
+                .unwrap_err()
+                .contains("not part of the Agent")
+        );
     }
 
     #[test]

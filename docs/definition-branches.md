@@ -367,6 +367,25 @@ administration, approval, expected-published-digest, and ADR 0079 certification
 checks apply; `CloseDefinitionProposal` is not available to scoped contexts. See
 [ADR 0111](decisions/0111-scoped-definition-proposals.md).
 
+#### Drafting from a conversation
+
+An agent that interviews a domain expert drafts through the same calls
+(#1461). Each drafted member names the conversation turn it came from in an
+optional `source_turn` string inside `definition_json`, for example
+`"source_turn":"interview-7#turn-3"`. It must be non-empty, at most 256
+bytes, with no control characters or surrounding whitespace. The reference
+is opaque to the core: it is part of the member's content and digest, stays
+with the member through publication, and changing it is a compatible change
+(`changed_source_turn`). Markings are drafted as `access_marking` on the
+member they protect. Agent members do not take `source_turn`: the Agent
+document contract is strict, so an Agent definition carrying it is refused.
+
+Before proposing, the agent can lint the draft with `GetOntologyLintReport`
+and `branch_id` ([ontology lint](ontology-lint.md)). The draft is then an
+ordinary proposal: diffed, approved by someone other than its author, and
+merged. A principal without namespace write is refused when it creates the
+branch, and one without member administration when it edits.
+
 ## Lint gate
 
 A merge is refused when the candidate introduces an unsuppressed error-level

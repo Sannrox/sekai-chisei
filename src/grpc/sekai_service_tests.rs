@@ -28633,6 +28633,299 @@ async fn a_denied_plan_records_the_decision_and_runs_nothing() {
 }
 
 #[tokio::test]
+async fn conversation_draft_traces_each_member_to_its_turn_and_lints_unpublished() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "interview");
+    // A team namespace: principals outside the team may not draft in it.
+    grant_source_namespace(&svc, "interview", "root", security::Role::Admin);
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: "interview".into(),
+            branch_id: "draft".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: "create".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    // One edit per answered turn of a scripted interview.
+    let turns = [
+        (
+            "object_type",
+            "Customer",
+            r#"{"name":"Customer","owner":"sales","source_turn":"interview-1#turn-1"}"#,
+        ),
+        (
+            "object_type",
+            "Order",
+            r#"{"name":"Order","owner":"sales","properties":["total"],"access_marking":"finance","source_turn":"interview-1#turn-2"}"#,
+        ),
+        (
+            "link_type",
+            "PlacedBy",
+            r#"{"name":"PlacedBy","source_turn":"interview-1#turn-3"}"#,
+        ),
+    ];
+    let mut head = parent.revision_digest.clone();
+    for (turn, (kind, id, json)) in turns.iter().enumerate() {
+        head = svc
+            .apply_definition_branch_edit(with_named_principal(
+                ApplyDefinitionBranchEditRequest {
+                    namespace: "interview".into(),
+                    branch_id: "draft".into(),
+                    expected_head_digest: head,
+                    upserts: vec![DefinitionMemberInput {
+                        member_kind: (*kind).into(),
+                        member_id: (*id).into(),
+                        definition_json: (*json).into(),
+                        member_digest: String::new(),
+                    }],
+                    removals: Vec::new(),
+                    idempotency_key: format!("turn-{turn}"),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .branch
+            .unwrap()
+            .head_revision_digest;
+    }
+    let db = svc.db.runtime();
+    let mut traced: Vec<(String, String)> = db
+        .get_definition_members("interview", &head)
+        .unwrap()
+        .into_iter()
+        .filter_map(|member| {
+            let value: serde_json::Value = serde_json::from_str(&member.definition_json).unwrap();
+            Some((member.member_id, value["source_turn"].as_str()?.to_string()))
+        })
+        .collect();
+    traced.sort();
+    assert_eq!(
+        traced,
+        [
+            ("Customer".to_string(), "interview-1#turn-1".to_string()),
+            ("Order".into(), "interview-1#turn-2".into()),
+            ("PlacedBy".into(), "interview-1#turn-3".into()),
+        ]
+    );
+    // Drafting never publishes.
+    assert_eq!(
+        db.get_published_definition_revision("interview")
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        parent.revision_digest
+    );
+
+    let lint = |branch_id: &str, principal: &'static str| {
+        svc.get_ontology_lint_report(with_named_principal(
+            GetOntologyLintReportRequest {
+                namespace: "interview".into(),
+                branch_id: branch_id.into(),
+            },
+            principal,
+        ))
+    };
+    let draft = lint("draft", "root").await.unwrap().into_inner();
+    assert_eq!(draft.revision_digest, head);
+    let subjects: Vec<String> = draft
+        .findings
+        .iter()
+        .map(|finding| format!("{}:{}", finding.rule, finding.subject_id))
+        .collect();
+    assert!(
+        subjects.contains(&"unowned_link_type:PlacedBy".into()),
+        "{subjects:?}"
+    );
+    assert!(!subjects.contains(&"unowned_object_type:Customer".into()));
+    let published = lint("", "root").await.unwrap().into_inner();
+    assert_eq!(published.revision_digest, parent.revision_digest);
+    assert_eq!(
+        lint("missing", "root").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+
+    // A malformed turn reference is refused.
+    let malformed = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: "interview".into(),
+                branch_id: "draft".into(),
+                expected_head_digest: head.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Invoice".into(),
+                    definition_json: r#"{"name":"Invoice","source_turn":7}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "malformed".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+
+    // An agent without draft permission for the namespace is refused, and
+    // cannot read the draft through lint.
+    let refused = svc
+        .create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: "interview".into(),
+                branch_id: "agent-draft".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "agent-create".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let refused = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: "interview".into(),
+                branch_id: "draft".into(),
+                expected_head_digest: head,
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Invoice".into(),
+                    definition_json: r#"{"name":"Invoice","source_turn":"interview-1#turn-4"}"#
+                        .into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "agent-edit".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        lint("draft", "tester").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn ontology_health_drops_with_a_stale_dataset_and_a_broken_contract_and_recovers() {
+    let svc = service();
+    seed_definition_parent(&svc, "health");
+    grant_source_namespace(&svc, "health", "root", security::Role::Admin);
+    let db = svc.db.runtime();
+    db.create_object(&domain::Object {
+        id: "orders-object".into(),
+        kind: "Ticket".into(),
+        name: "orders".into(),
+        namespace: "health".into(),
+        external_id: String::new(),
+        properties: HashMap::new(),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    db.create_dataset(&dataset::Dataset {
+        id: "orders".into(),
+        name: "orders".into(),
+        columns: vec![dataset::ColumnDef {
+            name: "total".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: "orders-object".into(),
+        created: 1,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    // Scheduled checks judge the latest version.
+    db.append_rows(
+        "orders",
+        &[HashMap::from([("total".to_string(), "9".to_string())])],
+    )
+    .unwrap();
+    db.put_dataset_health_check(&crate::sekai::dataset_health::DatasetHealthCheck {
+        dataset_id: "orders".into(),
+        check_id: "fresh".into(),
+        kind: "freshness".into(),
+        max_age_ms: i64::MAX / 2,
+        min_rows: 0,
+        max_rows: 0,
+        columns: Vec::new(),
+        predicate: Vec::new(),
+        blocking: false,
+        every_ms: 1_000,
+        tenant: String::new(),
+        space: String::new(),
+        last_run_ms: 0,
+    })
+    .unwrap();
+    // The binding's `Ticket.title` is not in the published Ticket.
+    let binding = gate_binding("health", true);
+    db.create_object(&binding).unwrap();
+    let health = |principal: &'static str, namespace: &'static str| {
+        svc.get_ontology_health(with_named_principal(
+            GetOntologyHealthRequest {
+                namespace: namespace.into(),
+            },
+            principal,
+        ))
+    };
+    let part = |response: &GetOntologyHealthResponse, name: &str| {
+        response.namespaces[0]
+            .parts
+            .iter()
+            .find(|part| part.part == name)
+            .cloned()
+            .unwrap()
+    };
+
+    // Missing two scheduled runs fires a late alert: the dataset is stale.
+    for now_ms in [5_000, 7_000] {
+        db.run_dataset_health_checks("orders", now_ms).unwrap();
+    }
+    let sick = health("root", "health").await.unwrap().into_inner();
+    assert_eq!(part(&sick, "freshness").score, 0);
+    assert_eq!(part(&sick, "freshness").problems[0].subject_id, "orders");
+    assert_eq!(part(&sick, "quality").score, 100);
+    let contract = part(&sick, "contract");
+    assert_eq!(contract.score, 0);
+    assert_eq!(contract.problems[0].code, "property_removed");
+    assert!(!part(&sick, "trust").available);
+    assert_eq!(part(&sick, "access").score, 100);
+    assert_eq!(sick.namespaces[0].score, Some(0));
+    assert_eq!(sick.score, Some(0));
+
+    // Back on schedule and the binding withdrawn: both parts recover.
+    for now_ms in [7_500, 8_000] {
+        db.run_dataset_health_checks("orders", now_ms).unwrap();
+    }
+    db.delete_object(&binding.id).unwrap();
+    let well = health("root", "health").await.unwrap().into_inner();
+    assert_eq!(part(&well, "freshness").score, 100);
+    assert_eq!(part(&well, "contract").score, 100);
+    // Lint still flags the ownerless Ticket, so it is now the lowest part.
+    assert_eq!(well.namespaces[0].score, Some(part(&well, "lint").score));
+    assert!(part(&well, "lint").score < 100);
+
+    // A caller without access to the namespace gets nothing about it.
+    assert_eq!(
+        health("tester", "health").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let tenant = health("tester", "").await.unwrap().into_inner();
+    assert!(tenant.namespaces.is_empty());
+    assert_eq!(tenant.score, None);
+    let everything = health("root", "").await.unwrap().into_inner();
+    assert_eq!(everything.namespaces.len(), 1);
+}
+
+#[tokio::test]
 async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_sees() {
     let svc = service();
     let parent = seed_definition_parent(&svc, "lint-a");
@@ -28739,6 +29032,7 @@ async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_
             svc.get_ontology_lint_report(with_named_principal(
                 GetOntologyLintReportRequest {
                     namespace: "lint-a".into(),
+                    branch_id: String::new(),
                 },
                 principal,
             ))
@@ -28780,6 +29074,7 @@ async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_
     let missing = svc
         .get_ontology_lint_report(with_principal(GetOntologyLintReportRequest {
             namespace: "lint-none".into(),
+            branch_id: String::new(),
         }))
         .await
         .unwrap_err();
@@ -28844,6 +29139,7 @@ async fn unreferenced_properties_follow_visible_consumers_and_suppressions() {
             svc.get_ontology_lint_report(with_named_principal(
                 GetOntologyLintReportRequest {
                     namespace: "lint-b".into(),
+                    branch_id: String::new(),
                 },
                 principal,
             ))

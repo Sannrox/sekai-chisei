@@ -3726,6 +3726,10 @@ message DefinitionPropertyDefault {
 // definition and what the caller may see of its data. Experimental.
 message GetOntologyLintReportRequest {
   string namespace = 1;
+  // Empty lints the published definition. Set, it lints the head of that
+  // draft branch (#1461). A server without branch lint ignores this field and
+  // lints the published revision; compare revision_digest with the branch head.
+  string branch_id = 2;
 }
 message OntologyLintFinding {
   // orphan_object_type | orphan_object | unowned_object_type |
@@ -3750,6 +3754,47 @@ message GetOntologyLintReportResponse {
   repeated OntologyLintFinding findings = 2;
   // False when the object scan was cut short (the object rules were skipped)
   // or findings past the cap were dropped.
+  bool complete = 3;
+}
+message GetOntologyHealthRequest {
+  // Empty scores every namespace with a published definition that the
+  // caller may read (its tenant's, under an enterprise context).
+  string namespace = 1;
+}
+message OntologyHealthProblem {
+  // dataset | binding | grant | object_type | link_type | object | marking |
+  // action_type
+  string subject_kind = 1;
+  string subject_id = 2;
+  // What is wrong: stale, check_failed, member_removed, property_removed,
+  // unverifiable, expired, unreviewed, or a lint rule.
+  string code = 3;
+}
+message OntologyHealthPart {
+  // freshness | quality | contract | lint | trust | access
+  string part = 1;
+  // False when the server cannot compute the part or the caller may not see
+  // it; unavailable_reason says which, and the part leaves the total.
+  bool available = 2;
+  // 0-100, higher is healthier.
+  uint32 score = 3;
+  string unavailable_reason = 4;
+  // The top contributing problems, at most ten.
+  repeated OntologyHealthProblem problems = 5;
+  // False when the inputs were capped, so the score may be too high.
+  bool complete = 6;
+}
+message NamespaceHealth {
+  string namespace = 1;
+  // The lowest available part; absent when no part is available.
+  optional uint32 score = 2;
+  repeated OntologyHealthPart parts = 3;
+}
+message GetOntologyHealthResponse {
+  // The lowest namespace score; absent when no namespace has one.
+  optional uint32 score = 1;
+  repeated NamespaceHealth namespaces = 2;
+  // False when more namespaces matched than one request scores.
   bool complete = 3;
 }
 message DefinitionPropertyRef {
@@ -4064,6 +4109,7 @@ service SekaiService {
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc GetOntologyLintReport(GetOntologyLintReportRequest) returns (GetOntologyLintReportResponse);
+  rpc GetOntologyHealth(GetOntologyHealthRequest) returns (GetOntologyHealthResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   // Experimental: apply an approved proposal's change bundle, resumably (#1693).
