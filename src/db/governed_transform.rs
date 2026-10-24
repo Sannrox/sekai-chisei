@@ -191,6 +191,11 @@ impl SekaiDb {
              ADD COLUMN input_partition_digests TEXT NOT NULL DEFAULT '{}'",
             [],
         );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_run
+             ADD COLUMN input_versions TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
         self.conn()
             .execute_batch(
                 "
@@ -516,7 +521,7 @@ impl SekaiDb {
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
                         profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
-                        input_partitions, output_partitions
+                        input_partitions, output_partitions, input_versions
                  FROM sekai_governed_transform_run WHERE run_id = ?1",
                 params![run_id],
                 map_transform_run,
@@ -558,7 +563,7 @@ impl SekaiDb {
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
                         profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
-                        input_partitions, output_partitions
+                        input_partitions, output_partitions, input_versions
                  FROM sekai_governed_transform_run
                  WHERE namespace = ?1
                  ORDER BY created_at_ms DESC, run_id DESC
@@ -1471,6 +1476,11 @@ fn run_governed_transform_tx(
     if !transform.allows_incremental() {
         incremental = false;
     }
+    if incremental && unversioned_input(tx, &bindings)? {
+        // A pin is a full dataset version. Incremental would load a delta,
+        // then snapshot the rest unbounded; rebuild fully while there is no version.
+        incremental = false;
+    }
     let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
     let mut load_budget = InputLoadBudget::for_transform(&transform);
     let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
@@ -1550,6 +1560,7 @@ fn run_governed_transform_tx(
     run.markings_out = markings_out;
     run.stamp_trigger(trigger_cause, trigger_ref);
     run.input_partitions = input_receipts_from_loaded(tx, &bindings, &loaded)?;
+    run.input_versions = input_version_pins(tx, &bindings, now_ms, !run.quarantined)?;
     if run.quarantined {
         if !incremental {
             run.output_digest = live_output_digest(tx, &transform.output_dataset_id)?;
@@ -1665,6 +1676,7 @@ fn admit_isolated_process_tx(
     run.markings_in = markings_in;
     run.markings_out = markings_out;
     run.input_partitions = input_receipts_from_loaded(tx, &bindings, &loaded)?;
+    run.input_versions = input_version_pins(tx, &bindings, now_ms, true)?;
     insert_transform_run(tx, &run)?;
     persist_run_input_snapshot(tx, &run.run_id, &bindings, &loaded)?;
     let spec = transform
@@ -2232,7 +2244,7 @@ fn load_transform_run(tx: &Transaction<'_>, run_id: &str) -> Result<Option<Trans
                 last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                 lineage_parent, created_at_ms, markings_in, markings_out,
                 profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
-                        input_partitions, output_partitions
+                        input_partitions, output_partitions, input_versions
          FROM sekai_governed_transform_run WHERE run_id = ?1",
         params![run_id],
         map_transform_run,
@@ -2973,6 +2985,7 @@ fn persist_computed_output(
 ) -> Result<(), String> {
     let keys = load_dataset_partition_keys(tx, &transform.output_dataset_id)?;
     run.input_partitions = input_receipts_from_loaded(tx, bindings, loaded)?;
+    run.input_versions = input_version_pins(tx, bindings, run.created_at_ms, true)?;
     if keys.is_empty() {
         if !incremental {
             tx.execute(
@@ -3013,6 +3026,86 @@ fn persist_computed_output(
     }
     run.output_digest = dataset_digest(&keys, &live);
     Ok(())
+}
+
+/// The version each input dataset is at, read in the run's transaction: the
+/// rows the run read are exactly that version's (#1794). A populated dataset
+/// with no version history (upgrade before versioning) is snapshotted here so
+/// the pin is replayable; an empty unversioned input stays `unversioned`.
+fn input_version_pins(
+    tx: &Transaction<'_>,
+    bindings: &[(String, String)],
+    now_ms: i64,
+    snapshot_legacy: bool,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    bindings
+        .iter()
+        .map(|(_, dataset_id)| {
+            let version = tx
+                .query_row(
+                    "SELECT version_id FROM sekai_dataset_versions
+                     WHERE dataset_id = ?1 ORDER BY seq DESC LIMIT 1",
+                    params![dataset_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let version = match version {
+                Some(version) => version,
+                None => pin_unversioned_input(tx, dataset_id, now_ms, snapshot_legacy)?,
+            };
+            Ok((dataset_id.clone(), version))
+        })
+        .collect()
+}
+
+fn dataset_has_version(tx: &Transaction<'_>, dataset_id: &str) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT 1 FROM sekai_dataset_versions WHERE dataset_id = ?1 LIMIT 1",
+        params![dataset_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+    .map(|row| row.is_some())
+}
+
+fn unversioned_input(tx: &Transaction<'_>, bindings: &[(String, String)]) -> Result<bool, String> {
+    for (_, dataset_id) in bindings {
+        if !dataset_has_version(tx, dataset_id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn pin_unversioned_input(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    now_ms: i64,
+    snapshot_legacy: bool,
+) -> Result<String, String> {
+    if !snapshot_legacy {
+        // Quarantined runs already stopped at the load budget. Snapshotting a
+        // legacy input would reread every remaining row unbounded.
+        return Ok(crate::sekai::governed_transform::INPUT_UNVERSIONED.to_string());
+    }
+    let populated = tx
+        .query_row(
+            "SELECT 1 FROM sekai_dataset_rows WHERE dataset_id = ?1 LIMIT 1",
+            params![dataset_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !populated {
+        return Ok(crate::sekai::governed_transform::INPUT_UNVERSIONED.to_string());
+    }
+    Ok(
+        crate::sekai::dataset::snapshot_dataset_version_tx(tx, dataset_id, "", "", "", "", now_ms)?
+            .version_id,
+    )
 }
 
 fn input_receipts_from_loaded(
@@ -3184,6 +3277,11 @@ fn map_transform_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformRun> 
         trigger_ref: row.get(21).unwrap_or_default(),
         input_partitions: parse_partition_json(row.get(22).unwrap_or_else(|_| "[]".into())),
         output_partitions: parse_partition_json(row.get(23).unwrap_or_else(|_| "[]".into())),
+        input_versions: row
+            .get::<_, String>(24)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -3213,7 +3311,7 @@ pub(crate) fn redact_transform_partition_receipts(
     let rows = {
         let mut stmt = tx
             .prepare(
-                "SELECT run_id, input_partitions, output_partitions
+                "SELECT run_id, input_partitions, output_partitions, input_versions
                  FROM sekai_governed_transform_run",
             )
             .map_err(|error| error.to_string())?;
@@ -3258,8 +3356,9 @@ pub(crate) fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> 
          (run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
           last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
           lineage_parent, created_at_ms, markings_in, markings_out,
-          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref, input_partitions, output_partitions)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref, input_partitions, output_partitions,
+          input_versions)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
         params![
             run.run_id,
             run.namespace,
@@ -3284,7 +3383,8 @@ pub(crate) fn insert_transform_run(tx: &Transaction<'_>, run: &TransformRun) -> 
             run.trigger_cause,
             run.trigger_ref,
             input_partitions,
-            output_partitions
+            output_partitions,
+            serde_json::to_string(&run.input_versions).map_err(|error| error.to_string())?
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -4206,6 +4306,7 @@ fn skip_downstream_pending_tx(
             continue;
         }
         let skip = TransformRun {
+            input_versions: Default::default(),
             run_id: Uuid::new_v4().to_string(),
             namespace: downstream.namespace.clone(),
             transform_id: downstream.transform_id.clone(),
@@ -5710,6 +5811,121 @@ mod tests {
             crate::sekai::transform_engine::BUDGET_MEMORY
         );
         assert_eq!(db.query_rows("out", &Default::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn over_budget_legacy_input_is_not_snapshotted() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[
+                HashMap::from([("id".into(), "1".into()), ("keep".into(), "yes".into())]),
+                HashMap::from([("id".into(), "2".into()), ("keep".into(), "x".repeat(400))]),
+            ],
+        )
+        .unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = 'in'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM sekai_dataset_versions WHERE dataset_id = 'in'",
+                [],
+            )
+            .unwrap();
+        }
+        let hog = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: Some(AnalyticalSpec {
+                inputs: vec![TransformInput {
+                    alias: "input".into(),
+                    dataset_id: "in".into(),
+                }],
+                sql: "SELECT * FROM input".into(),
+                memory_limit_bytes: 80,
+                time_limit_ms: 5_000,
+            }),
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&hog, 40).unwrap();
+        let failed = db.run_governed_transform("ops", "t1", false, 50).unwrap();
+        assert!(failed.quarantined);
+        assert_eq!(
+            failed.input_versions.get("in").map(String::as_str),
+            Some(crate::sekai::governed_transform::INPUT_UNVERSIONED)
+        );
+        assert!(db.list_dataset_versions("in").unwrap().is_empty());
+    }
+
+    #[test]
+    fn incremental_legacy_input_reloads_fully_and_snapshots() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[
+                HashMap::from([("id".into(), "1".into()), ("keep".into(), "yes".into())]),
+                HashMap::from([("id".into(), "2".into()), ("keep".into(), "yes".into())]),
+            ],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert_eq!(first.rows_in, 2);
+        {
+            let conn = db.conn();
+            conn.execute(
+                "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = 'in'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM sekai_dataset_versions WHERE dataset_id = 'in'",
+                [],
+            )
+            .unwrap();
+        }
+        let second = db.run_governed_transform("ops", "t1", true, 30).unwrap();
+        assert!(!second.quarantined);
+        assert_eq!(second.rows_in, 2);
+        assert_ne!(
+            second.input_versions.get("in").map(String::as_str),
+            Some(crate::sekai::governed_transform::INPUT_UNVERSIONED)
+        );
+        assert_eq!(db.list_dataset_versions("in").unwrap().len(), 1);
     }
 
     #[test]

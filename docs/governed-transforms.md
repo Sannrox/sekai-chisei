@@ -23,6 +23,21 @@ opaque and is stored without trimming. Admitted `markings_out` is the
 classification floor on every output object; a stricter existing marking is
 kept. Updates still run declassify the same as guarded object writes.
 
+Every run receipt pins the version each input dataset was read at
+(`input_versions`, dataset id to version id, #1794). The pins are read in the
+run's own transaction, so the rows the run read are exactly those versions.
+They are part of the receipt signed into the namespace's receipt chain and
+verify offline with it. Two runs with the same pins read identical inputs.
+Replaying a transform pinned to a receipt's `input_versions` reads those
+versions as they were, even after the inputs moved on, and reproduces the
+receipt's output digest. Receipts from before the pins carry none and still
+read. An input with no version and no rows yet pins as `unversioned`, which a
+replay reads as no rows. A populated input with no version history is
+snapshotted in the run transaction and pinned to that version; an incremental
+run rebuilds from all rows in that case so the snapshot stays inside the load
+budget. A skipped run reads nothing and carries no pins. A quarantined run
+does not snapshot.
+
 A dataset may declare ordered `partition_keys`. Empty keys keep the
 whole-dataset `sha256-sum-v1:` digest. Partitioned datasets use
 `sha256-partitions-v1:` over a sorted map of partition identity to that

@@ -56,6 +56,7 @@ fn quarantined_run(
 ) -> (TransformRun, Vec<HashMap<String, String>>) {
     (
         TransformRun {
+            input_versions: Default::default(),
             run_id,
             namespace: transform.namespace.clone(),
             transform_id: transform.transform_id.clone(),
@@ -247,6 +248,7 @@ pub fn compute_run_tables_until(
         );
     }
     let run = TransformRun {
+        input_versions: Default::default(),
         run_id,
         namespace: transform.namespace.clone(),
         transform_id: transform.transform_id.clone(),
@@ -307,6 +309,7 @@ pub fn admit_isolated_run(
         });
     }
     Ok(TransformRun {
+        input_versions: Default::default(),
         run_id,
         namespace: transform.namespace.clone(),
         transform_id: transform.transform_id.clone(),
@@ -817,6 +820,7 @@ mod tests {
 
     fn sample_run(id: &str, created_at_ms: i64) -> TransformRun {
         TransformRun {
+            input_versions: Default::default(),
             run_id: id.into(),
             namespace: "ops".into(),
             transform_id: "t".into(),

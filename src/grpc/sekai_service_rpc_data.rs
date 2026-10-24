@@ -3628,6 +3628,7 @@ fn load_transform_run_or_preview(
         .map_err(transform_work_status)?
         .ok_or_else(|| Status::not_found("admitted transform not found"))?;
     Ok(crate::sekai::governed_transform::TransformRun {
+        input_versions: Default::default(),
         run_id: run_id.to_string(),
         namespace: transform.namespace,
         transform_id: transform.transform_id,
@@ -4044,6 +4045,7 @@ fn to_proto_transform_run(
         refusal: None,
         finished_at_ms: None,
         compute_seconds: None,
+        input_versions: run.input_versions.clone().into_iter().collect(),
     }
 }
 

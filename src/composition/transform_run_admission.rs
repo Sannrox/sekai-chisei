@@ -145,6 +145,7 @@ mod tests {
 
     fn run(id: &str) -> TransformRun {
         TransformRun {
+            input_versions: Default::default(),
             run_id: id.into(),
             namespace: "ops".into(),
             transform_id: "t1".into(),

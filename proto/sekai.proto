@@ -890,6 +890,9 @@ message TransformRun {
   // count on their own), isolated from the latest claim to write-back.
   // Absent for a run that never computed (failed, refused, cancelled).
   optional double compute_seconds = 27;
+  // The dataset version each input was read at, by dataset id (#1794). Empty
+  // on runs from before pins and on runs that read nothing.
+  map<string, string> input_versions = 28;
 }
 message TransformRunRefusal {
   // A short rule name, such as quota_exceeded; reason_withheld when the
