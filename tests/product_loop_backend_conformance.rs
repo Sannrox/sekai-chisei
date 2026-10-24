@@ -276,7 +276,9 @@ async fn exercise_product_loop(server: &LoopServer) {
             upserts: vec![DefinitionMemberInput {
                 member_kind: "object_type".into(),
                 member_id: "incident".into(),
-                definition_json: r#"{"name":"incident"}"#.into(),
+                // A reasoned suppression lets the lint gate publish a type no
+                // consumer references yet.
+                definition_json: r#"{"name":"incident","lint_suppressions":[{"rule":"orphan_object_type","reason":"first type of the product loop"}]}"#.into(),
                 member_digest: String::new(),
             }],
             removals: Vec::new(),

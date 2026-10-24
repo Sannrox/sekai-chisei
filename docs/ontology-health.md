@@ -13,7 +13,7 @@ part is never averaged away behind healthy ones.
 | `freshness` | share of visible datasets not stale | `stale`: a firing late-schedule alert, or a failed latest freshness check |
 | `quality` | share of visible datasets passing their checks | `check_failed`: quarantined, or a failed latest row-count, schema, null, unique or predicate check |
 | `contract` | share of blocking consumer bindings still satisfied | `member_removed`, `property_removed` (a major revision dropped what the binding names), `unverifiable` (malformed or stale binding digest) |
-| `lint` | share of published members without a lint warning | the [ontology lint](ontology-lint.md) findings, warnings first; only warnings about a published member lower the score |
+| `lint` | share of published members without a lint error or warning | the [ontology lint](ontology-lint.md) findings, errors and warnings first; only errors and warnings about a published member lower the score |
 | `trust` | unavailable (`not_stored`) | trust scores are computed per object on request by `ScoreObjectTrust` and not stored |
 | `access` | share of grants on the namespace and its objects in good standing | `expired`: past its end date; `unreviewed`: no purpose or end date while the namespace policy requires terms, and no recorded exception |
 

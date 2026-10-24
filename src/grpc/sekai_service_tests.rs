@@ -1800,6 +1800,26 @@ async fn publish_definition_history_entry(
     proposal_id: &str,
     upserts: Vec<DefinitionMemberInput>,
 ) -> (String, String) {
+    let merged =
+        propose_and_merge_definition(svc, namespace, parent, branch_id, proposal_id, upserts)
+            .await
+            .unwrap();
+    (
+        merged.published_revision.unwrap().revision_digest,
+        merged.receipt_id,
+    )
+}
+
+/// Opens, approves and merges a proposal as `root`; returns the merge
+/// outcome.
+async fn propose_and_merge_definition(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    parent: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    upserts: Vec<DefinitionMemberInput>,
+) -> Result<MergeDefinitionProposalResponse, Status> {
     svc.create_definition_branch(with_named_principal(
         CreateDefinitionBranchRequest {
             namespace: namespace.into(),
@@ -1854,23 +1874,17 @@ async fn publish_definition_history_entry(
     ))
     .await
     .unwrap();
-    let merged = svc
-        .merge_definition_proposal(with_named_principal(
-            MergeDefinitionProposalRequest {
-                namespace: namespace.into(),
-                proposal_id: proposal_id.into(),
-                expected_published_digest: parent.into(),
-                idempotency_key: format!("{branch_id}-merge"),
-            },
-            "root",
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    (
-        merged.published_revision.unwrap().revision_digest,
-        merged.receipt_id,
-    )
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: proposal_id.into(),
+            expected_published_digest: parent.into(),
+            idempotency_key: format!("{branch_id}-merge"),
+        },
+        "root",
+    ))
+    .await
+    .map(Response::into_inner)
 }
 
 #[tokio::test]
@@ -1899,7 +1913,9 @@ async fn definition_package_round_trips_between_namespaces_and_refuses_tampering
     let member = |id: &str| DefinitionMemberInput {
         member_kind: "object_type".into(),
         member_id: id.into(),
-        definition_json: format!(r#"{{"name":"{id}","properties":["title"]}}"#),
+        definition_json: format!(
+            r#"{{"name":"{id}","properties":["title"],"lint_suppressions":[{{"rule":"orphan_object_type","reason":"test fixture"}}]}}"#
+        ),
         member_digest: String::new(),
     };
 
@@ -25733,7 +25749,7 @@ async fn publishing_an_object_type_registers_and_retires_its_catalog_entry() {
             member_kind: "object_type".into(),
             member_id: "Invoice".into(),
             definition_json:
-                r#"{"name":"Invoice","properties":["total","due"],"access_marking":"confidential"}"#
+                r#"{"name":"Invoice","properties":["total","due"],"access_marking":"confidential","lint_suppressions":[{"rule":"orphan_object_type","reason":"test fixture"}]}"#
                     .into(),
             member_digest: String::new(),
         }],
@@ -28934,9 +28950,15 @@ async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_
             member(
                 "object_type",
                 "User",
-                r#"{"name":"User","owner":"identity"}"#,
+                // Linked by data only after publishing, so the gate needs
+                // the suppression at merge time.
+                r#"{"name":"User","owner":"identity","lint_suppressions":[{"rule":"orphan_object_type","reason":"linked once tickets are assigned"}]}"#,
             ),
-            member("object_type", "Note", r#"{"name":"Note"}"#),
+            member(
+                "object_type",
+                "Note",
+                r#"{"name":"Note","lint_suppressions":[{"rule":"orphan_object_type","reason":"kept for the lint fixture"}]}"#,
+            ),
             member(
                 "link_type",
                 "AssignedTo",
@@ -29078,35 +29100,39 @@ async fn unreferenced_properties_follow_visible_consumers_and_suppressions() {
     )
     .await;
     // A consumer the tester may not read references `title`.
-    svc.db
-        .runtime()
-        .create_object(&crate::domain::Object {
-            id: "binding-secret".into(),
-            kind: crate::sekai::definition_consumer_impact::BINDING_KIND.into(),
-            name: "binding-secret".into(),
-            namespace: "lint-b".into(),
-            external_id: String::new(),
-            properties: HashMap::from(
-                [
-                    (
-                        "contract_version",
-                        crate::sekai::definition_consumer_impact::BINDING_CONTRACT,
-                    ),
-                    ("owner", "secret-team"),
-                    ("resource_identity", "secret-dashboard"),
-                    ("member_kind", "object_type"),
-                    ("member_id", "Ticket"),
-                    ("property", "title"),
-                    ("declaration_digest", "sha256:declared"),
-                    ("source_locator", "dashboards/secret"),
-                    ("access_marking", "restricted"),
-                ]
-                .map(|(key, value)| (key.to_string(), value.to_string())),
-            ),
-            created: 1,
-            updated: 1,
-        })
-        .unwrap();
+    let mut binding = crate::domain::Object {
+        id: "binding-secret".into(),
+        kind: crate::sekai::definition_consumer_impact::BINDING_KIND.into(),
+        name: "binding-secret".into(),
+        namespace: "lint-b".into(),
+        external_id: String::new(),
+        properties: HashMap::from(
+            [
+                (
+                    "contract_version",
+                    crate::sekai::definition_consumer_impact::BINDING_CONTRACT,
+                ),
+                ("owner", "secret-team"),
+                ("resource_identity", "secret-dashboard"),
+                ("member_kind", "object_type"),
+                ("member_id", "Ticket"),
+                ("property", "title"),
+                ("declaration_digest", "sha256:declared"),
+                ("source_locator", "dashboards/secret"),
+                ("access_marking", "restricted"),
+            ]
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+        ),
+        created: 1,
+        updated: 1,
+    };
+    let declared = crate::sekai::definition_consumer_impact::binding_digest(
+        &crate::sekai::definition_consumer_impact::binding_from_object(&binding).unwrap(),
+    );
+    binding
+        .properties
+        .insert("declaration_digest".into(), declared);
+    svc.db.runtime().create_object(&binding).unwrap();
     let lint = |principal: &'static str| {
         let svc = &svc;
         async move {
@@ -29160,4 +29186,110 @@ async fn unreferenced_properties_follow_visible_consumers_and_suppressions() {
         !finding.detail.contains("secret") && !finding.subject_id.contains("secret")
     }));
     assert!(limited[0].suppressed && !limited[2].suppressed);
+}
+
+#[tokio::test]
+async fn a_proposal_introducing_an_orphan_type_merges_only_with_a_suppression() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "gate-a").revision_digest;
+    let orphan = |json: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: "Orphan".into(),
+        definition_json: json.into(),
+        member_digest: String::new(),
+    };
+    let refused = propose_and_merge_definition(
+        &svc,
+        "gate-a",
+        &parent,
+        "gate-a-1",
+        "gate-a-cs-1",
+        vec![orphan(r#"{"name":"Orphan"}"#)],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("definition_lint_gate: orphan_object_type Orphan"),
+        "{}",
+        refused.message()
+    );
+    // The reviewer sees the blocking finding on the proposal.
+    let proposal = |id: &'static str| {
+        let svc = &svc;
+        async move {
+            let response = svc
+                .get_definition_proposal(with_named_principal(
+                    GetDefinitionProposalRequest {
+                        namespace: "gate-a".into(),
+                        proposal_id: id.into(),
+                    },
+                    "root",
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.lint_complete);
+            response.lint_findings
+        }
+    };
+    let blocking = proposal("gate-a-cs-1").await;
+    assert_eq!(
+        blocking
+            .iter()
+            .map(|finding| (
+                finding.rule.as_str(),
+                finding.severity.as_str(),
+                finding.suppressed
+            ))
+            .collect::<Vec<_>>(),
+        // The warning shows and does not block.
+        [
+            ("orphan_object_type", "error", false),
+            ("unowned_object_type", "warning", false)
+        ]
+    );
+    // The seed's own orphan `Ticket` predates the proposal and never blocks.
+    assert!(
+        blocking
+            .iter()
+            .all(|finding| finding.subject_id == "Orphan")
+    );
+
+    let merged = propose_and_merge_definition(
+        &svc,
+        "gate-a",
+        &parent,
+        "gate-a-2",
+        "gate-a-cs-2",
+        vec![orphan(
+            r#"{"name":"Orphan","lint_suppressions":[{"rule":"orphan_object_type","reason":"wired to a consumer next release"}]}"#,
+        )],
+    )
+    .await
+    .unwrap();
+    let published = merged.published_revision.unwrap().revision_digest;
+    assert_eq!(
+        proposal("gate-a-cs-2").await[0].suppression_reason,
+        "wired to a consumer next release"
+    );
+
+    // A proposal introducing nothing the gate blocks merges as before.
+    propose_and_merge_definition(
+        &svc,
+        "gate-a",
+        &published,
+        "gate-a-3",
+        "gate-a-cs-3",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","owner":"support"}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await
+    .unwrap();
 }

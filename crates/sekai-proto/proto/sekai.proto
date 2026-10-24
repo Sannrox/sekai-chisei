@@ -3542,6 +3542,14 @@ message GetDefinitionProposalRequest {
 
 message GetDefinitionProposalResponse {
   DefinitionProposal proposal = 1;
+  // Lint findings the candidate introduces over the base (#1687), judged on
+  // the consumer bindings the caller may see. Unsuppressed error findings
+  // block the merge, which judges them on every binding.
+  repeated OntologyLintFinding lint_findings = 2;
+  // False when the caller's consumer bindings were too many to scan; the
+  // findings then judge as if none existed, while the merge gate still
+  // reads them all.
+  bool lint_complete = 3;
 }
 
 message ApproveDefinitionProposalRequest {
@@ -3732,7 +3740,7 @@ message OntologyLintFinding {
   // (subject_id is then the object type, and property the property)
   string subject_kind = 2;
   string subject_id = 3;
-  // warning | info
+  // error | warning | info
   string severity = 4;
   string detail = 5;
   // A suppression in the subject's definition covers the finding (#1684).

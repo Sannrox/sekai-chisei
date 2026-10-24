@@ -184,22 +184,20 @@ pub struct Finding {
 }
 
 /// The share of published members (`(member_kind, member_id)`) with no
-/// warning. Findings about anything else, such as a marking or an object,
-/// and informational findings are named but do not lower the score.
+/// warning or error. Findings about anything else, such as a marking or an
+/// object, and informational findings are named but do not lower the score.
 pub fn lint(members: &BTreeSet<(String, String)>, findings: &[Finding], complete: bool) -> Part {
+    // Errors and warnings lower the score; information does not.
+    let lowers = |finding: &&Finding| finding.severity != "info";
     let mut problems: Vec<Problem> = findings
         .iter()
-        .filter(|finding| finding.severity == "warning")
-        .chain(
-            findings
-                .iter()
-                .filter(|finding| finding.severity != "warning"),
-        )
+        .filter(lowers)
+        .chain(findings.iter().filter(|finding| !lowers(finding)))
         .map(|finding| Problem::new(&finding.subject_kind, &finding.subject_id, &finding.rule))
         .collect();
     let warned = findings
         .iter()
-        .filter(|finding| finding.severity == "warning")
+        .filter(lowers)
         .map(|finding| (finding.subject_kind.clone(), finding.subject_id.clone()))
         .filter(|subject| members.contains(subject))
         .collect::<BTreeSet<_>>()
@@ -346,12 +344,13 @@ mod tests {
             &[
                 finding("orphan_object", "o-1", "info"),
                 finding("unowned_object_type", "Note", "warning"),
-                finding("orphan_object_type", "Note", "warning"),
+                finding("orphan_object_type", "User", "error"),
                 broad,
             ],
             true,
         );
-        assert_eq!(part.score, Some(75));
+        // Note warned and User errored: two of four members lowered.
+        assert_eq!(part.score, Some(50));
         assert_eq!(part.problems[0].code, "unowned_object_type");
         assert_eq!(part.problems.len(), 4);
     }

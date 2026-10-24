@@ -385,3 +385,10 @@ and `branch_id` ([ontology lint](ontology-lint.md)). The draft is then an
 ordinary proposal: diffed, approved by someone other than its author, and
 merged. A principal without namespace write is refused when it creates the
 branch, and one without member administration when it edits.
+
+## Lint gate
+
+A merge is refused when the candidate introduces an unsuppressed error-level
+[ontology lint](ontology-lint.md#proposal-gate) finding (#1687), such as an
+object type no consumer references. `GetDefinitionProposal` lists the
+findings the candidate introduces.
