@@ -7,8 +7,15 @@ namespace's published definition and the data the caller may see. It is
 Gating a definition proposal on findings is a separate layer.
 
 ```sh
-sekaictl ontology lint --namespace <ns> [--target <url-or-socket>]
+sekaictl ontology lint --namespace <ns> [--branch <id>] [--target <url-or-socket>]
 ```
+
+With `branch_id` (`--branch`), the lint reads the head of that draft branch
+instead of the published revision, so a draft can be checked before it is
+proposed. The data rules still read the namespace's live objects. A server
+that predates branch lint ignores `branch_id` and lints the published
+revision: the response `revision_digest` says which revision was read, and
+the CLI refuses a report whose digest is not the branch head.
 
 ## Rules
 
@@ -28,8 +35,8 @@ compatible change.
 
 ## Visibility
 
-The caller needs read on the namespace and on every published member, as for
-reading the published revision. Everything else the lint reads is limited to
+The caller needs read on the namespace and on every member of the linted
+revision, as for reading it. Everything else the lint reads is limited to
 what the caller may see: objects, links, consumer bindings, catalog entries
 and principal profiles pass the object read policy. A link counts only when
 the caller can see both of its ends, objects of the namespace of any kind.

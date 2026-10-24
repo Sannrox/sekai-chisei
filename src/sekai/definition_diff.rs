@@ -382,6 +382,15 @@ fn classify_member_change(
                 ));
                 classified = true;
             }
+            "source_turn" => {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Compatible,
+                    change,
+                    "changed_source_turn",
+                    field,
+                ));
+                classified = true;
+            }
             "name" | "mode" => {
                 reasons.push(reason(
                     DefinitionCompatibilityClass::Conditional,
@@ -418,8 +427,9 @@ fn inspect_member_constructs(member: &DefinitionMember) -> Result<(), String> {
     inspect_value_constructs(&parse_definition(&member.definition_json)?)
 }
 
-/// `owner` names who answers for a member (ontology lint, #1454); changing
-/// it is compatible.
+/// `owner` names who answers for a member (ontology lint, #1454), and
+/// `source_turn` the conversation turn a drafted member came from (#1461);
+/// changing either is compatible.
 const KNOWN_DEFINITION_FIELDS: &[&str] = &[
     "access_marking",
     "mode",
@@ -427,6 +437,7 @@ const KNOWN_DEFINITION_FIELDS: &[&str] = &[
     "owner",
     "properties",
     "required",
+    "source_turn",
 ];
 
 fn push_unknown_fields(
@@ -462,6 +473,7 @@ fn inspect_value_constructs(value: &Value) -> Result<(), String> {
     named_string_set(value, "required")?;
     optional_string_field(value, "access_marking")?;
     optional_string_field(value, "owner")?;
+    optional_string_field(value, "source_turn")?;
     Ok(())
 }
 

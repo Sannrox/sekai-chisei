@@ -1711,7 +1711,10 @@ pub(super) async fn get_ontology_lint_report(
     let policy_context = principal_policy_context(&req);
     let purpose = request_purpose_presentation(&req, &principals);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
-    let namespace = req.into_inner().namespace;
+    let GetOntologyLintReportRequest {
+        namespace,
+        branch_id,
+    } = req.into_inner();
     authorize_source_sync_namespace(
         service,
         &principals,
@@ -1720,19 +1723,27 @@ pub(super) async fn get_ontology_lint_report(
         false,
     )?;
     let db = service.db.runtime();
-    let revision = db
-        .get_published_definition_revision(&namespace)
-        .map_err(|_| Status::internal("definition revision unavailable"))?
-        .ok_or_else(|| Status::not_found("no published definition"))?;
+    // A draft branch lints its head; otherwise the published revision.
+    let revision_digest = if branch_id.is_empty() {
+        db.get_published_definition_revision(&namespace)
+            .map_err(|_| Status::internal("definition revision unavailable"))?
+            .ok_or_else(|| Status::not_found("no published definition"))?
+            .revision_digest
+    } else {
+        db.get_definition_branch(&namespace, &branch_id)
+            .map_err(|_| Status::internal("definition branch unavailable"))?
+            .ok_or_else(|| Status::not_found("definition branch unavailable"))?
+            .head_revision_digest
+    };
     authorize_definition_revision(
         service,
         &principals,
         &namespace,
-        &revision.revision_digest,
-        true,
+        &revision_digest,
+        branch_id.is_empty(),
     )?;
     let members = db
-        .get_definition_members(&namespace, &revision.revision_digest)
+        .get_definition_members(&namespace, &revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?;
     // Up to `cap` objects of `kind` the caller may read, and whether that
     // is all of them.
@@ -1799,7 +1810,7 @@ pub(super) async fn get_ontology_lint_report(
         }
     };
 
-    // The object rules cover instances of the published object types only.
+    // The object rules cover instances of the linted revision's object types only.
     let mut objects = Vec::new();
     let mut objects_complete = true;
     for object_type in members.iter().filter(|m| m.member_kind == "object_type") {
@@ -1968,7 +1979,7 @@ pub(super) async fn get_ontology_lint_report(
         clearances: profiles.iter().map(profile_clearance).collect(),
     });
     Ok(Response::new(GetOntologyLintReportResponse {
-        revision_digest: revision.revision_digest,
+        revision_digest,
         findings: report
             .findings
             .into_iter()

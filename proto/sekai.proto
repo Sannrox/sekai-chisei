@@ -3718,6 +3718,10 @@ message DefinitionPropertyDefault {
 // definition and what the caller may see of its data. Experimental.
 message GetOntologyLintReportRequest {
   string namespace = 1;
+  // Empty lints the published definition. Set, it lints the head of that
+  // draft branch (#1461). A server without branch lint ignores this field and
+  // lints the published revision; compare revision_digest with the branch head.
+  string branch_id = 2;
 }
 message OntologyLintFinding {
   // orphan_object_type | orphan_object | unowned_object_type |
