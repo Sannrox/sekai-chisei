@@ -250,8 +250,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.DecideActionInstance` | `sekai.audit` | yes | host, example | `stable` |
-| `SekaiService.PutActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
-| `SekaiService.RunActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
+| `SekaiService.PutActionBinding` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.RunActionBinding` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.PutFenceBinding` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RunFenceBinding` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |

@@ -54,6 +54,7 @@ pub mod transform_replay;
 #[cfg(test)]
 pub(crate) use postgres::ScratchDatabase;
 pub(crate) use postgres::off_runtime;
+pub(crate) mod postgres_action_binding;
 mod postgres_action_effect;
 mod postgres_action_governance;
 mod postgres_action_instance;

@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 19,
+  "limit": 17,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -22,16 +22,6 @@
       "id": "SekaiService.GetClassificationLattice",
       "kind": "rpc",
       "methods": ["get_classification_lattice"]
-    },
-    {
-      "id": "SekaiService.PutActionBinding",
-      "kind": "rpc",
-      "methods": ["put_action_binding"]
-    },
-    {
-      "id": "SekaiService.RunActionBinding",
-      "kind": "rpc",
-      "methods": ["get_action_binding", "advance_action_binding_cursor"]
     },
     {
       "id": "SekaiService.AppendRows",

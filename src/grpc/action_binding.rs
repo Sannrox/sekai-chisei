@@ -664,9 +664,7 @@ pub(super) fn load_bound_objects(
 }
 
 fn map_binding_store_error(error: String) -> Status {
-    if error == crate::db::runtime_db::ACTION_BINDINGS_UNAVAILABLE {
-        Status::unavailable(error)
-    } else if error.contains("must") || error.contains("unsupported") || error.contains("invalid") {
+    if error.contains("must") || error.contains("unsupported") || error.contains("invalid") {
         Status::invalid_argument(error)
     } else {
         Status::internal(error)

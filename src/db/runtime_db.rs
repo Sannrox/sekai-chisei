@@ -78,9 +78,6 @@ impl std::fmt::Debug for RuntimeDb {
     }
 }
 
-pub(crate) const ACTION_BINDINGS_UNAVAILABLE: &str =
-    "action bindings are unavailable on the PostgreSQL community runtime";
-
 impl RuntimeDb {
     /// Connection-pool ceiling used as the gRPC `spawn_blocking` bound.
     pub(crate) fn connection_pool_max(&self) -> u32 {
@@ -4291,7 +4288,9 @@ impl RuntimeDb {
     ) -> Result<crate::sekai::action_binding::ActionBinding, String> {
         match self {
             Self::Sqlite(db) => db.put_action_binding(binding, actor, now_ms),
-            Self::Postgres(_) => Err(ACTION_BINDINGS_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_action_binding(binding, actor, now_ms))
+            }
         }
     }
 
@@ -4308,7 +4307,9 @@ impl RuntimeDb {
     > {
         match self {
             Self::Sqlite(db) => db.get_action_binding(namespace, binding_id),
-            Self::Postgres(_) => Err(ACTION_BINDINGS_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_action_binding(namespace, binding_id))
+            }
         }
     }
 
@@ -4320,7 +4321,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.advance_action_binding_cursor(binding, cursor, now_ms),
-            Self::Postgres(_) => Err(ACTION_BINDINGS_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.advance_action_binding_cursor(binding, cursor, now_ms)
+            }),
         }
     }
 
