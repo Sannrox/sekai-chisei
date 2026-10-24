@@ -48,7 +48,10 @@ const SUPPRESSIBLE: &[(&str, &str)] = &[
     ("link_type", RULE_UNOWNED_LINK_TYPE),
 ];
 
+/// Error findings a definition proposal introduces block its merge (#1687).
+pub const SEVERITY_ERROR: &str = "error";
 pub const SEVERITY_WARNING: &str = "warning";
+pub const LINT_GATE: &str = "definition_lint_gate";
 pub const SEVERITY_INFO: &str = "info";
 
 /// A marking is broad when it covers at least this share (in percent) of a
@@ -123,6 +126,10 @@ pub fn suppressions(
     Ok(entries)
 }
 
+/// Consumer references as `(member_kind, member_id)` or `(object_type,
+/// property)` pairs.
+pub type References = BTreeSet<(String, String)>;
+
 /// What the caller may see of one namespace.
 #[derive(Debug, Default)]
 pub struct LintInput {
@@ -137,9 +144,9 @@ pub struct LintInput {
     /// may see in the namespace.
     pub linked: BTreeSet<String>,
     /// `(member_kind, member_id)` referenced by a visible consumer binding.
-    pub consumed: BTreeSet<(String, String)>,
+    pub consumed: References,
     /// `(object_type, property)` referenced by a visible consumer binding.
-    pub consumed_properties: BTreeSet<(String, String)>,
+    pub consumed_properties: References,
     /// Object types whose visible catalog entry lists an owner.
     pub catalog_owned: BTreeSet<String>,
     /// Enabled Action type ids the caller administers, each with whether an
@@ -192,7 +199,17 @@ fn broad(count: usize, population: usize) -> bool {
     population >= BROAD_MIN_POPULATION && count * 100 >= population * BROAD_SHARE_PERCENT
 }
 
+/// The report: every finding, capped at [`MAX_FINDINGS`].
 pub fn lint(input: &LintInput) -> LintReport {
+    let mut findings = lint_all(input);
+    let complete = input.objects_complete && findings.len() <= MAX_FINDINGS;
+    findings.truncate(MAX_FINDINGS);
+    LintReport { findings, complete }
+}
+
+/// Every finding, sorted and marked with its suppression; uncapped, so a
+/// gate never misses one.
+pub fn lint_all(input: &LintInput) -> Vec<LintFinding> {
     let mut findings = Vec::new();
     let of_kind = |kind: &'static str| {
         input
@@ -219,7 +236,7 @@ pub fn lint(input: &LintInput) -> LintReport {
                 RULE_ORPHAN_OBJECT_TYPE,
                 "object_type",
                 id,
-                SEVERITY_WARNING,
+                SEVERITY_ERROR,
                 "no visible object of this type is linked, and no consumer references it".into(),
             ));
         }
@@ -334,9 +351,7 @@ pub fn lint(input: &LintInput) -> LintReport {
     }
     suppress(&input.members, &mut findings);
     findings.sort();
-    let complete = input.objects_complete && findings.len() <= MAX_FINDINGS;
-    findings.truncate(MAX_FINDINGS);
-    LintReport { findings, complete }
+    findings
 }
 
 /// Marks every finding a definition member suppresses about itself or one
@@ -367,6 +382,94 @@ fn suppress(members: &[DefinitionMember], findings: &mut [LintFinding]) {
             })
             .map(|entry| entry.reason.trim().to_string());
     }
+}
+
+/// The definition-level findings `candidate` introduces over `base`: the
+/// rules that read only members and consumer references, evaluated on both
+/// revisions with the same references, keeping the candidate's findings the
+/// base does not have in the same suppression state. A finding already
+/// present and unsuppressed before the proposal never blocks it; one whose
+/// suppression the proposal removes does.
+pub fn introduced_findings(
+    base: &[DefinitionMember],
+    candidate: &[DefinitionMember],
+    consumed: &References,
+    consumed_properties: &References,
+) -> Vec<LintFinding> {
+    let definition_only = |members: &[DefinitionMember]| {
+        lint_all(&LintInput {
+            members: members.to_vec(),
+            // No data: a type counts as linked only through a consumer.
+            objects_complete: true,
+            consumed: consumed.clone(),
+            consumed_properties: consumed_properties.clone(),
+            ..LintInput::default()
+        })
+    };
+    let key = |finding: &LintFinding| {
+        (
+            finding.rule,
+            finding.subject_kind,
+            finding.subject_id.clone(),
+            finding.property.clone(),
+            // Removing a suppression counts as introducing the finding.
+            finding.suppressed.is_some(),
+        )
+    };
+    let before: BTreeSet<_> = definition_only(base).iter().map(key).collect();
+    definition_only(candidate)
+        .into_iter()
+        .filter(|finding| !before.contains(&key(finding)))
+        .collect()
+}
+
+/// Refuses a merge whose candidate introduces an unsuppressed error
+/// finding, naming each one. Reads every consumer reference: the gate is
+/// the system's decision, not a caller's view.
+pub fn require_definition_lint(
+    base: &[DefinitionMember],
+    candidate: &[DefinitionMember],
+    consumed: &References,
+    consumed_properties: &References,
+) -> Result<(), String> {
+    let blocking: Vec<String> = introduced_findings(base, candidate, consumed, consumed_properties)
+        .into_iter()
+        .filter(|finding| finding.severity == SEVERITY_ERROR && finding.suppressed.is_none())
+        .map(|finding| format!("{} {}", finding.rule, finding.subject_id))
+        .collect();
+    if blocking.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{LINT_GATE}: {} (fix, or add a lint_suppressions entry with a reason)",
+            blocking.join(", ")
+        ))
+    }
+}
+
+/// Consumer references held by binding objects whose declaration digest
+/// still matches, as `(member_kind, member_id)` and `(object_type,
+/// property)`.
+pub fn consumer_references(bindings: &[Object]) -> (References, References) {
+    let mut consumed = BTreeSet::new();
+    let mut consumed_properties = BTreeSet::new();
+    for binding in bindings
+        .iter()
+        .filter_map(|object| {
+            crate::sekai::definition_consumer_impact::binding_from_object(object).ok()
+        })
+        // A binding edited since it was declared references nothing.
+        .filter(|binding| {
+            binding.declaration_digest
+                == crate::sekai::definition_consumer_impact::binding_digest(binding)
+        })
+    {
+        if binding.member_kind == "object_type" && !binding.property.is_empty() {
+            consumed_properties.insert((binding.member_id.clone(), binding.property));
+        }
+        consumed.insert((binding.member_kind, binding.member_id));
+    }
+    (consumed, consumed_properties)
 }
 
 /// The ceiling a principal profile clears, when it names a standard level.
@@ -638,6 +741,72 @@ mod tests {
         }
         .prepare("acme");
         assert!(rejected.is_err());
+    }
+
+    #[test]
+    fn the_gate_sees_an_introduced_error_past_the_report_cap() {
+        let base: Vec<DefinitionMember> = (0..MAX_FINDINGS)
+            .map(|n| member("object_type", &format!("a-{n:04}"), r#"{"owner":"o"}"#))
+            .collect();
+        let mut candidate = base.clone();
+        candidate.push(member("object_type", "z-new", r#"{"owner":"o"}"#));
+        let refused =
+            require_definition_lint(&base, &candidate, &BTreeSet::new(), &BTreeSet::new())
+                .unwrap_err();
+        assert!(refused.contains("orphan_object_type z-new"), "{refused}");
+    }
+
+    #[test]
+    fn removing_a_suppression_reintroduces_the_finding() {
+        let suppressed = vec![member(
+            "object_type",
+            "Note",
+            r#"{"owner":"o","lint_suppressions":[{"rule":"orphan_object_type","reason":"kept"}]}"#,
+        )];
+        let bare = vec![member("object_type", "Note", r#"{"owner":"o"}"#)];
+        let none = BTreeSet::new();
+        assert!(require_definition_lint(&suppressed, &bare, &none, &none).is_err());
+        assert!(require_definition_lint(&suppressed, &suppressed, &none, &none).is_ok());
+        assert!(require_definition_lint(&bare, &bare, &none, &none).is_ok());
+    }
+
+    #[test]
+    fn a_binding_edited_since_its_declaration_references_nothing() {
+        use crate::sekai::definition_consumer_impact::{
+            BINDING_CONTRACT, BINDING_KIND, binding_digest, binding_from_object,
+        };
+        let mut binding = Object {
+            id: "b-1".into(),
+            kind: BINDING_KIND.into(),
+            name: "b-1".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: [
+                ("contract_version", BINDING_CONTRACT),
+                ("owner", "team"),
+                ("resource_identity", "dashboard"),
+                ("member_kind", "object_type"),
+                ("member_id", "Ticket"),
+                ("declaration_digest", "pending"),
+                ("source_locator", "dashboards/1"),
+            ]
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .into(),
+            created: 0,
+            updated: 0,
+        };
+        binding.properties.insert(
+            "declaration_digest".into(),
+            binding_digest(&binding_from_object(&binding).unwrap()),
+        );
+        assert_eq!(
+            consumer_references(std::slice::from_ref(&binding)).0.len(),
+            1
+        );
+        binding
+            .properties
+            .insert("member_id".into(), "Orphan".into());
+        assert!(consumer_references(&[binding]).0.is_empty());
     }
 
     #[test]

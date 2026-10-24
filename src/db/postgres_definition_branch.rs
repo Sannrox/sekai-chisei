@@ -886,6 +886,18 @@ impl PostgresDb {
             &candidate,
             &candidate_members,
         )?;
+        // #1687: an unsuppressed error finding the candidate introduces
+        // blocks the merge, on every merge path, judged on every consumer
+        // binding the namespace holds.
+        let (consumed, consumed_properties) = crate::sekai::ontology_lint::consumer_references(
+            &consumer_bindings_postgres(&mut transaction, &proposal.namespace)?,
+        );
+        crate::sekai::ontology_lint::require_definition_lint(
+            &published_members,
+            &candidate_members,
+            &consumed,
+            &consumed_properties,
+        )?;
         if !proposal.restored_from_digest.is_empty() {
             if proposal.migration_plan_digest.is_empty() {
                 let rollback_diff = crate::sekai::definition_diff::compare_definition_revisions(
@@ -1883,4 +1895,30 @@ fn string_field<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str
 
 fn optional_string_field<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a str> {
     value.get(field).and_then(serde_json::Value::as_str)
+}
+
+/// Every definition consumer binding object of `namespace`, read in the
+/// merge transaction for the lint gate.
+fn consumer_bindings_postgres(
+    transaction: &mut postgres::Transaction<'_>,
+    namespace: &str,
+) -> Result<Vec<crate::domain::Object>, String> {
+    transaction
+        .query(
+            "SELECT id, properties FROM sekai_objects WHERE namespace = $1 AND kind = $2",
+            &[
+                &namespace,
+                &crate::sekai::definition_consumer_impact::BINDING_KIND,
+            ],
+        )
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|row| {
+            crate::db::definition_branch::binding_object(
+                namespace,
+                row.get(0),
+                row.get::<_, &str>(1),
+            )
+        })
+        .collect()
 }

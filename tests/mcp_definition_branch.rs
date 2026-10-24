@@ -100,7 +100,7 @@ async fn mcp_definition_branch_opens_a_proposal_for_human_review() {
                 "upserts": [{
                     "memberKind": "object_type",
                     "memberId": "Ticket",
-                    "definitionJson": "{\"name\":\"Ticket\",\"properties\":[\"title\",\"priority\"]}",
+                    "definitionJson": "{\"name\":\"Ticket\",\"properties\":[\"title\",\"priority\"],\"lint_suppressions\":[{\"rule\":\"orphan_object_type\",\"reason\":\"reviewed by a human\"}]}",
                     "memberDigest": ""
                 }],
                 "removals": [],

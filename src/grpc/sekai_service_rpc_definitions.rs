@@ -661,6 +661,8 @@ pub(super) async fn get_definition_proposal(
 ) -> Result<Response<GetDefinitionProposalResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let policy_context = principal_policy_context(&req);
+    let purpose = request_purpose_presentation(&req, &principals);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
@@ -690,8 +692,39 @@ pub(super) async fn get_definition_proposal(
         &proposal.candidate_digest,
         false,
     )?;
+    // The lint findings the candidate introduces over the base (#1687),
+    // judged on the consumers this caller may see; the merge gate judges
+    // the same on every consumer.
+    let db = service.db.runtime();
+    let members = |digest: &str| {
+        db.get_definition_members(&proposal.namespace, digest)
+            .map_err(|_| Status::internal("definition revision unavailable"))
+    };
+    let (bindings, lint_complete) = visible_lint_objects(
+        service,
+        &principals,
+        &policy_context,
+        purpose.as_ref(),
+        tenant_context.as_ref(),
+        crate::sekai::definition_consumer_impact::BINDING_KIND,
+        Some(&proposal.namespace),
+        MAX_LINT_OBJECTS,
+    )?;
+    let (consumed, consumed_properties) =
+        crate::sekai::ontology_lint::consumer_references(&bindings);
+    let lint_findings = crate::sekai::ontology_lint::introduced_findings(
+        &members(&proposal.base_digest)?,
+        &members(&proposal.candidate_digest)?,
+        &consumed,
+        &consumed_properties,
+    );
     Ok(Response::new(GetDefinitionProposalResponse {
         proposal: Some(to_proto_definition_proposal(&proposal)),
+        lint_findings: lint_findings
+            .into_iter()
+            .map(lint_finding_to_proto)
+            .collect(),
+        lint_complete,
     }))
 }
 fn refuse_proposal_creator(
@@ -1711,10 +1744,7 @@ pub(super) async fn get_ontology_lint_report(
     let policy_context = principal_policy_context(&req);
     let purpose = request_purpose_presentation(&req, &principals);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
-    let GetOntologyLintReportRequest {
-        namespace,
-        branch_id,
-    } = req.into_inner();
+    let namespace = req.into_inner().namespace;
     authorize_source_sync_namespace(
         service,
         &principals,
@@ -1723,94 +1753,34 @@ pub(super) async fn get_ontology_lint_report(
         false,
     )?;
     let db = service.db.runtime();
-    // A draft branch lints its head; otherwise the published revision.
-    let revision_digest = if branch_id.is_empty() {
-        db.get_published_definition_revision(&namespace)
-            .map_err(|_| Status::internal("definition revision unavailable"))?
-            .ok_or_else(|| Status::not_found("no published definition"))?
-            .revision_digest
-    } else {
-        db.get_definition_branch(&namespace, &branch_id)
-            .map_err(|_| Status::internal("definition branch unavailable"))?
-            .ok_or_else(|| Status::not_found("definition branch unavailable"))?
-            .head_revision_digest
-    };
+    let revision = db
+        .get_published_definition_revision(&namespace)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("no published definition"))?;
     authorize_definition_revision(
         service,
         &principals,
         &namespace,
-        &revision_digest,
-        branch_id.is_empty(),
+        &revision.revision_digest,
+        true,
     )?;
     let members = db
-        .get_definition_members(&namespace, &revision_digest)
+        .get_definition_members(&namespace, &revision.revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?;
-    // Up to `cap` objects of `kind` the caller may read, and whether that
-    // is all of them.
-    // Visibility filtering scans the whole matching population, so a
-    // population past the cap is not scanned at all.
     let visible = |kind: &str, namespace: Option<&str>, cap: usize| {
-        let over_cap = !db
-            .list_objects(&domain::ListFilter {
-                kind: Some(kind.into()),
-                name: None,
-                namespace: namespace.map(String::from),
-                property_filters: Vec::new(),
-                interface_filter: Vec::new(),
-                limit: 1,
-                offset: i32::try_from(cap).unwrap_or(i32::MAX),
-                order_by: "name".into(),
-                descending: false,
-            })
-            .map_err(Status::internal)?
-            .is_empty();
-        if over_cap {
-            return Ok((Vec::new(), false));
-        }
-        let mut objects = Vec::new();
-        loop {
-            let filter = domain::ListFilter {
-                kind: Some(kind.into()),
-                name: None,
-                namespace: namespace.map(String::from),
-                property_filters: Vec::new(),
-                interface_filter: Vec::new(),
-                limit: MAX_LIST_LIMIT,
-                offset: objects.len() as i32,
-                order_by: "name".into(),
-                descending: false,
-            };
-            let (page, _) = list_objects_with_marking(
-                db,
-                &filter,
-                &principals,
-                &policy_context,
-                purpose.as_ref(),
-                tenant_context.as_ref(),
-                // Findings read properties only as a read would show them.
-                |objects, principals, tenant_context| {
-                    service.resolve_computed_for_responses_with_policy(
-                        objects,
-                        principals,
-                        Some(&policy_context),
-                        tenant_context,
-                        purpose.as_ref(),
-                    )
-                },
-            )?;
-            let last = page.len() < MAX_LIST_LIMIT as usize;
-            objects.extend(page);
-            if objects.len() > cap {
-                objects.truncate(cap);
-                return Ok::<_, Status>((objects, false));
-            }
-            if last {
-                return Ok((objects, true));
-            }
-        }
+        visible_lint_objects(
+            service,
+            &principals,
+            &policy_context,
+            purpose.as_ref(),
+            tenant_context.as_ref(),
+            kind,
+            namespace,
+            cap,
+        )
     };
 
-    // The object rules cover instances of the linted revision's object types only.
+    // The object rules cover instances of the published object types only.
     let mut objects = Vec::new();
     let mut objects_complete = true;
     for object_type in members.iter().filter(|m| m.member_kind == "object_type") {
@@ -1899,21 +1869,8 @@ pub(super) async fn get_ontology_lint_report(
         Some(&namespace),
         MAX_LINT_OBJECTS,
     )?;
-    let references: Vec<_> = bindings
-        .iter()
-        .filter_map(|object| {
-            crate::sekai::definition_consumer_impact::binding_from_object(object).ok()
-        })
-        .collect();
-    let consumed = references
-        .iter()
-        .map(|binding| (binding.member_kind.clone(), binding.member_id.clone()))
-        .collect();
-    let consumed_properties = references
-        .into_iter()
-        .filter(|binding| binding.member_kind == "object_type" && !binding.property.is_empty())
-        .map(|binding| (binding.member_id, binding.property))
-        .collect();
+    let (consumed, consumed_properties) =
+        crate::sekai::ontology_lint::consumer_references(&bindings);
     let (entries, entries_complete) = visible(
         crate::sekai::catalog::CATALOG_ENTRY_KIND,
         Some(&namespace),
@@ -1988,23 +1945,103 @@ pub(super) async fn get_ontology_lint_report(
         clearances: profiles.iter().map(profile_clearance).collect(),
     });
     Ok(Response::new(GetOntologyLintReportResponse {
-        revision_digest,
+        revision_digest: revision.revision_digest,
         findings: report
             .findings
             .into_iter()
-            .map(|finding| OntologyLintFinding {
-                rule: finding.rule.into(),
-                subject_kind: finding.subject_kind.into(),
-                subject_id: finding.subject_id,
-                property: finding.property,
-                severity: finding.severity.into(),
-                detail: finding.detail,
-                suppressed: finding.suppressed.is_some(),
-                suppression_reason: finding.suppressed.unwrap_or_default(),
-            })
+            .map(lint_finding_to_proto)
             .collect(),
         // A capped side scan can only add findings, never hide one, but
         // the report says it is partial.
         complete: report.complete && bindings_complete && entries_complete && profiles_complete,
     }))
+}
+
+/// Up to `cap` objects of `kind` the caller may read, as a read would show
+/// them, and whether that is all of them. Visibility filtering scans the
+/// whole matching population, so a population past the cap is not scanned
+/// at all.
+#[allow(clippy::too_many_arguments)]
+fn visible_lint_objects(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    kind: &str,
+    namespace: Option<&str>,
+    cap: usize,
+) -> Result<(Vec<domain::Object>, bool), Status> {
+    let db = service.db.runtime();
+    let over_cap = !db
+        .list_objects(&domain::ListFilter {
+            kind: Some(kind.into()),
+            name: None,
+            namespace: namespace.map(String::from),
+            property_filters: Vec::new(),
+            interface_filter: Vec::new(),
+            limit: 1,
+            offset: i32::try_from(cap).unwrap_or(i32::MAX),
+            order_by: "name".into(),
+            descending: false,
+        })
+        .map_err(Status::internal)?
+        .is_empty();
+    if over_cap {
+        return Ok((Vec::new(), false));
+    }
+    let mut objects = Vec::new();
+    loop {
+        let filter = domain::ListFilter {
+            kind: Some(kind.into()),
+            name: None,
+            namespace: namespace.map(String::from),
+            property_filters: Vec::new(),
+            interface_filter: Vec::new(),
+            limit: MAX_LIST_LIMIT,
+            offset: objects.len() as i32,
+            order_by: "name".into(),
+            descending: false,
+        };
+        let (page, _) = list_objects_with_marking(
+            db,
+            &filter,
+            principals,
+            policy_context,
+            purpose,
+            tenant_context,
+            // Findings read properties only as a read would show them.
+            |objects, principals, tenant_context| {
+                service.resolve_computed_for_responses_with_policy(
+                    objects,
+                    principals,
+                    Some(policy_context),
+                    tenant_context,
+                    purpose,
+                )
+            },
+        )?;
+        let last = page.len() < MAX_LIST_LIMIT as usize;
+        objects.extend(page);
+        if objects.len() > cap {
+            objects.truncate(cap);
+            return Ok((objects, false));
+        }
+        if last {
+            return Ok((objects, true));
+        }
+    }
+}
+
+fn lint_finding_to_proto(finding: crate::sekai::ontology_lint::LintFinding) -> OntologyLintFinding {
+    OntologyLintFinding {
+        rule: finding.rule.into(),
+        subject_kind: finding.subject_kind.into(),
+        subject_id: finding.subject_id,
+        property: finding.property,
+        severity: finding.severity.into(),
+        detail: finding.detail,
+        suppressed: finding.suppressed.is_some(),
+        suppression_reason: finding.suppressed.unwrap_or_default(),
+    }
 }

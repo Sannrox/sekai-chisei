@@ -1322,6 +1322,18 @@ impl SekaiDb {
             &candidate,
             &candidate_members,
         )?;
+        // #1687: an unsuppressed error finding the candidate introduces
+        // blocks the merge, on every merge path, judged on every consumer
+        // binding the namespace holds.
+        let (consumed, consumed_properties) = crate::sekai::ontology_lint::consumer_references(
+            &consumer_bindings_sqlite(&transaction, &proposal.namespace)?,
+        );
+        crate::sekai::ontology_lint::require_definition_lint(
+            &published_members,
+            &candidate_members,
+            &consumed,
+            &consumed_properties,
+        )?;
         if !proposal.restored_from_digest.is_empty() {
             if proposal.migration_plan_digest.is_empty() {
                 let rollback_diff = crate::sekai::definition_diff::compare_definition_revisions(
@@ -2432,6 +2444,48 @@ impl crate::sekai::definition_bundle_apply::BundleApplyStore for crate::db::runt
             }),
         }
     }
+}
+
+/// Every definition consumer binding object of `namespace`, read in the
+/// merge transaction for the lint gate.
+fn consumer_bindings_sqlite(
+    transaction: &rusqlite::Transaction<'_>,
+    namespace: &str,
+) -> Result<Vec<crate::domain::Object>, String> {
+    let mut statement = transaction
+        .prepare("SELECT id, properties FROM sekai_objects WHERE namespace = ?1 AND kind = ?2")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![
+                namespace,
+                crate::sekai::definition_consumer_impact::BINDING_KIND
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        let (id, properties) = row.map_err(|error| error.to_string())?;
+        binding_object(namespace, id, &properties)
+    })
+    .collect()
+}
+
+pub(crate) fn binding_object(
+    namespace: &str,
+    id: String,
+    properties: &str,
+) -> Result<crate::domain::Object, String> {
+    Ok(crate::domain::Object {
+        name: id.clone(),
+        id,
+        kind: crate::sekai::definition_consumer_impact::BINDING_KIND.into(),
+        namespace: namespace.into(),
+        external_id: String::new(),
+        properties: serde_json::from_str(properties).map_err(|error| error.to_string())?,
+        created: 0,
+        updated: 0,
+    })
 }
 
 #[cfg(test)]

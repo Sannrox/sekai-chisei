@@ -3,25 +3,18 @@
 `GetOntologyLintReport` (#1454) reports structural problems in one
 namespace's published definition and the data the caller may see. It is
 `experimental`, so it is rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
-`experimental-rpcs` Cargo feature is enabled. It reports and does not block.
-Gating a definition proposal on findings is a separate layer.
+`experimental-rpcs` Cargo feature is enabled. The report itself blocks
+nothing; the proposal gate below does.
 
 ```sh
-sekaictl ontology lint --namespace <ns> [--branch <id>] [--target <url-or-socket>]
+sekaictl ontology lint --namespace <ns> [--target <url-or-socket>]
 ```
-
-With `branch_id` (`--branch`), the lint reads the head of that draft branch
-instead of the published revision, so a draft can be checked before it is
-proposed. The data rules still read the namespace's live objects. A server
-that predates branch lint ignores `branch_id` and lints the published
-revision: the response `revision_digest` says which revision was read, and
-the CLI refuses a report whose digest is not the branch head.
 
 ## Rules
 
 | `rule` | Subject | Severity | Finds |
 | --- | --- | --- | --- |
-| `orphan_object_type` | object type | warning | no visible object of the type has a link to another visible object, and no visible consumer binding references it |
+| `orphan_object_type` | object type | error | no visible object of the type has a link to another visible object, and no visible consumer binding references it |
 | `orphan_object` | object | info | an object of a published type with no link to another visible object of the namespace |
 | `unowned_object_type` | object type | warning | the definition has no `owner`, and no catalog entry of the type lists an owner |
 | `unowned_link_type` | link type | warning | the definition has no `owner` |
@@ -64,10 +57,30 @@ them as `changed_lint_suppressions`, a compatible change. There is no
 separate table. Findings about objects, markings and Action types cannot be
 suppressed.
 
+## Proposal gate
+
+Every definition merge runs the definition-level rules (`orphan_object_type`,
+`unowned_object_type`, `unowned_link_type`, `unreferenced_property`) on the
+published revision and on the candidate (#1687). For this, a type counts as
+linked only through a consumer reference: data does not exist yet for a new
+type. A finding the candidate introduces, at error severity and not
+suppressed, refuses the merge with `FAILED_PRECONDITION`
+`definition_lint_gate: <rule> <subject>, ...`. Findings already present
+before the proposal never block it, and warnings never block.
+
+The gate runs in the merge transaction on both backends, on every merge path
+(including imported packages and bundle applies). It reads every consumer
+binding of the namespace, since it is the system's decision.
+`GetDefinitionProposal` returns the introduced findings as `lint_findings`,
+judged on the bindings the reviewer may see, with `lint_complete` false when
+those bindings exceed the scan bound (the findings then assume none). A suppression added in the
+proposal is part of the candidate's definition, so reviewers see it in the
+diff.
+
 ## Visibility
 
-The caller needs read on the namespace and on every member of the linted
-revision, as for reading it. Everything else the lint reads is limited to
+The caller needs read on the namespace and on every published member, as for
+reading the published revision. Everything else the lint reads is limited to
 what the caller may see: objects, links, consumer bindings, catalog entries
 and principal profiles pass the object read policy. A link counts only when
 the caller can see both of its ends, objects of the namespace of any kind.

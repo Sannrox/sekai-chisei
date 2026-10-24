@@ -26,8 +26,8 @@ use crate::grpc::pb::sekai::{
     Cardinality as ProtoCardinality, ContextCandidate, ContextRoot, CreateLinkRequest,
     CreateObjectRequest, CreateOntologyClassRequest, CreateOntologyRelationRequest,
     CreateSchemaTypeRequest, ExpandRelationsRequest, ExplainDerivationRequest,
-    GetDefinitionBranchRequest, GetOntologyLintReportRequest, Link, Object, ObjectType,
-    OntologyClass, OntologyProperty, OntologyRelation, RetrieveContextRequest,
+    GetOntologyLintReportRequest, Link, Object, ObjectType, OntologyClass, OntologyProperty,
+    OntologyRelation, RetrieveContextRequest,
 };
 use crate::sekai::schema::is_builtin_schema_kind;
 use crate::sekai::semantic;
@@ -46,7 +46,7 @@ pub fn usage() -> &'static str {
      sekaictl ontology context --object <id> [--object <id> ...] [--relation <r>] [--depth <n>] [--entailment] [--target ...]\n  \
      sekaictl ontology expand --namespace <ns> --object <id> [--relation <r>] [--depth <n>] [--entailment] [--target ...]\n  \
      sekaictl ontology explain --namespace <ns> --from <id> --to <id> [--relation <r>] [--entailment] [--target ...]\n  \
-     sekaictl ontology lint --namespace <ns> [--branch <id>] [--target ...]\n  \
+     sekaictl ontology lint --namespace <ns> [--target ...]\n  \
      sekaictl ontology inspect ...  (see inspect --help path)"
 }
 
@@ -886,34 +886,10 @@ async fn explain_derivation(target: &str, args: &[String]) -> Result<(), BoxErr>
 /// not gate: blocking a proposal on findings is the proposal gate's job.
 async fn lint_namespace(target: &str, args: &[String]) -> Result<(), BoxErr> {
     let namespace = require_flag(args, "--namespace").map_err(std::io::Error::other)?;
-    let branch_id = flag_value(args, "--branch").unwrap_or_default();
-    let mut client = SekaiServiceClient::new(connect_sekai(target).await?);
-    let report = client
-        .get_ontology_lint_report(GetOntologyLintReportRequest {
-            namespace: namespace.clone(),
-            branch_id: branch_id.clone(),
-        })
+    let report = SekaiServiceClient::new(connect_sekai(target).await?)
+        .get_ontology_lint_report(GetOntologyLintReportRequest { namespace })
         .await?
         .into_inner();
-    // A server without branch lint answers for the published revision.
-    if !branch_id.is_empty() {
-        let head = client
-            .get_definition_branch(GetDefinitionBranchRequest {
-                namespace,
-                branch_id,
-            })
-            .await?
-            .into_inner()
-            .branch
-            .map(|branch| branch.head_revision_digest)
-            .unwrap_or_default();
-        if head != report.revision_digest {
-            return Err(std::io::Error::other(
-                "the server linted a different revision than the branch head; it may not support branch lint",
-            )
-            .into());
-        }
-    }
     for finding in &report.findings {
         let property = if finding.property.is_empty() {
             String::new()

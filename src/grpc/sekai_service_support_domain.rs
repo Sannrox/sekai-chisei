@@ -1042,6 +1042,9 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         || error.starts_with(crate::sekai::definition_package::REFUSAL_INCOMPATIBLE)
     {
         Status::failed_precondition(error)
+    } else if error.starts_with(crate::sekai::ontology_lint::LINT_GATE) {
+        // Names only definition members the merger may already read.
+        Status::failed_precondition(error)
     } else if let Some(gate) = error.strip_prefix("compatibility_gate:") {
         Status::failed_precondition(format!("compatibility_gate:{gate}"))
     } else if error.starts_with("unknown_definition_construct") {
