@@ -4,42 +4,29 @@ use crate::chisei::evaluation_manifest::{EvaluationManifestReplay, ResolvedEvalu
 use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-impl SekaiDb {
-    pub(crate) fn migrate_evaluation_manifests(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_evaluation_manifests (
-                    manifest_digest TEXT PRIMARY KEY,
-                    manifest_id TEXT NOT NULL UNIQUE,
-                    namespace TEXT NOT NULL,
-                    plan_version_id TEXT NOT NULL,
-                    subject_identity TEXT NOT NULL,
-                    evaluation_time_ms INTEGER NOT NULL,
-                    body_json TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_chisei_evaluation_manifests_namespace
-                    ON chisei_evaluation_manifests(
-                        namespace, plan_version_id, subject_identity, evaluation_time_ms
-                    );
-                CREATE TABLE IF NOT EXISTS chisei_evaluation_manifest_requests (
-                    namespace TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    request_id TEXT NOT NULL,
-                    request_digest TEXT NOT NULL,
-                    manifest_digest TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY(namespace, actor, request_id),
-                    FOREIGN KEY(manifest_digest)
-                        REFERENCES chisei_evaluation_manifests(manifest_digest)
-                );
-                CREATE INDEX IF NOT EXISTS idx_chisei_evaluation_manifest_requests_manifest
-                    ON chisei_evaluation_manifest_requests(manifest_digest);",
-            )
-            .map_err(|error| error.to_string())
-    }
+pub trait EvaluationManifestSekaiDbExt {
+    fn get_evaluation_manifest(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<ResolvedEvaluationManifest>, String>;
 
-    pub fn get_evaluation_manifest(
+    fn get_evaluation_manifest_for_request(
+        &self,
+        namespace: &str,
+        actor: &str,
+        request_id: &str,
+    ) -> Result<Option<EvaluationManifestReplay>, String>;
+
+    fn put_evaluation_manifest(
+        &self,
+        manifest: &ResolvedEvaluationManifest,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<ResolvedEvaluationManifest, String>;
+}
+
+impl EvaluationManifestSekaiDbExt for SekaiDb {
+    fn get_evaluation_manifest(
         &self,
         manifest_digest: &str,
     ) -> Result<Option<ResolvedEvaluationManifest>, String> {
@@ -56,7 +43,7 @@ impl SekaiDb {
             .transpose()
     }
 
-    pub fn get_evaluation_manifest_for_request(
+    fn get_evaluation_manifest_for_request(
         &self,
         namespace: &str,
         actor: &str,
@@ -99,7 +86,7 @@ impl SekaiDb {
             .transpose()
     }
 
-    pub fn put_evaluation_manifest(
+    fn put_evaluation_manifest(
         &self,
         manifest: &ResolvedEvaluationManifest,
         request_id: &str,

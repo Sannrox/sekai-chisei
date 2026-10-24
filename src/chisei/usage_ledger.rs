@@ -97,35 +97,56 @@ pub struct UsageAggregate {
     pub net: i64,
 }
 
-impl SekaiDb {
-    pub(crate) fn migrate_usage_ledger(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_usage_events (
-                    event_id TEXT PRIMARY KEY,
-                    version TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    unit TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    source TEXT NOT NULL,
-                    receipt_operation_id TEXT NOT NULL,
-                    dedupe_key TEXT NOT NULL UNIQUE,
-                    event_time_ms INTEGER NOT NULL,
-                    corrects_event_id TEXT,
-                    CHECK (unit IN ('tokens', 'requests')),
-                    CHECK (source IN ('measured', 'provider_reported', 'estimated', 'correction'))
-                );
-                CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_time
-                    ON chisei_usage_events(tenant_id, event_time_ms, event_id);
-                CREATE INDEX IF NOT EXISTS idx_usage_events_receipt
-                    ON chisei_usage_events(receipt_operation_id);",
-            )
-            .map_err(|e| e.to_string())
-    }
-
+pub trait UsageLedgerSekaiDbExt {
     /// Append a usage event. Identical `dedupe_key` is a no-op success (replay-safe).
-    pub fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String> {
+    fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String>;
+
+    fn get_usage_event(&self, event_id: &str) -> Result<Option<UsageEvent>, String>;
+
+    fn list_usage_events_for_tenant(
+        &self,
+        tenant_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<UsageEvent>, String>;
+
+    fn aggregate_usage_for_tenant(
+        &self,
+        tenant_id: &str,
+        unit: UsageUnit,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<UsageAggregate, String>;
+
+    /// Project measured usage from a completed receipt into the ledger.
+    /// `tenant_id` must come from verified enterprise context, not the receipt alone.
+    fn project_usage_from_receipt(
+        &self,
+        tenant_id: &str,
+        receipt: &OperationReceipt,
+    ) -> Result<Vec<UsageEvent>, String>;
+
+    /// Append-only correction (never mutates prior rows).
+    fn correct_usage_event(
+        &self,
+        prior_event_id: &str,
+        delta: i64,
+        actor_note: &str,
+    ) -> Result<UsageEvent, String>;
+
+    /// Export events for a closed period as versioned JSON lines payload.
+    fn export_usage_period(
+        &self,
+        tenant_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<String, String>;
+}
+
+impl UsageLedgerSekaiDbExt for SekaiDb {
+    /// Append a usage event. Identical `dedupe_key` is a no-op success (replay-safe).
+    fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String> {
         validate_event(event)?;
         let conn = self.conn();
         let inserted = conn
@@ -152,7 +173,7 @@ impl SekaiDb {
         Ok(inserted == 1)
     }
 
-    pub fn get_usage_event(&self, event_id: &str) -> Result<Option<UsageEvent>, String> {
+    fn get_usage_event(&self, event_id: &str) -> Result<Option<UsageEvent>, String> {
         self.conn()
             .query_row(
                 "SELECT event_id, version, tenant_id, namespace, unit, quantity, source,
@@ -165,7 +186,7 @@ impl SekaiDb {
             .map_err(|e| e.to_string())
     }
 
-    pub fn list_usage_events_for_tenant(
+    fn list_usage_events_for_tenant(
         &self,
         tenant_id: &str,
         start_ms: i64,
@@ -194,7 +215,7 @@ impl SekaiDb {
             .map_err(|e| e.to_string())
     }
 
-    pub fn aggregate_usage_for_tenant(
+    fn aggregate_usage_for_tenant(
         &self,
         tenant_id: &str,
         unit: UsageUnit,
@@ -221,7 +242,7 @@ impl SekaiDb {
 
     /// Project measured usage from a completed receipt into the ledger.
     /// `tenant_id` must come from verified enterprise context, not the receipt alone.
-    pub fn project_usage_from_receipt(
+    fn project_usage_from_receipt(
         &self,
         tenant_id: &str,
         receipt: &OperationReceipt,
@@ -234,7 +255,7 @@ impl SekaiDb {
     }
 
     /// Append-only correction (never mutates prior rows).
-    pub fn correct_usage_event(
+    fn correct_usage_event(
         &self,
         prior_event_id: &str,
         delta: i64,
@@ -262,7 +283,7 @@ impl SekaiDb {
     }
 
     /// Export events for a closed period as versioned JSON lines payload.
-    pub fn export_usage_period(
+    fn export_usage_period(
         &self,
         tenant_id: &str,
         start_ms: i64,

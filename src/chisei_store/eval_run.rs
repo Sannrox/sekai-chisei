@@ -9,34 +9,6 @@ use crate::chisei::eval_run::{EvalCaseResult, EvalRunSpec};
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 
-const CREATE_SQLITE: &str = "
-CREATE TABLE IF NOT EXISTS chisei_dataset_runs (
-    namespace TEXT NOT NULL,
-    run_id TEXT NOT NULL,
-    spec_json TEXT NOT NULL,
-    lease_holder TEXT NOT NULL DEFAULT '',
-    lease_until_ms INTEGER NOT NULL DEFAULT 0,
-    uncertain_micros INTEGER NOT NULL DEFAULT 0,
-    created_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (namespace, run_id)
-);
-CREATE TABLE IF NOT EXISTS chisei_dataset_run_artifacts (
-    namespace TEXT NOT NULL,
-    run_id TEXT NOT NULL,
-    artifact_digest TEXT NOT NULL,
-    PRIMARY KEY (namespace, run_id)
-);
-CREATE TABLE IF NOT EXISTS chisei_dataset_run_cases (
-    namespace TEXT NOT NULL,
-    run_id TEXT NOT NULL,
-    case_id TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    cost_micros INTEGER NOT NULL,
-    recorded_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (namespace, run_id, case_id)
-);
-";
-
 /// The lease-held predicate over `chisei_dataset_runs`, with the holder and
 /// the time as the given parameters.
 fn held(holder: &str, now: &str) -> String {
@@ -51,14 +23,86 @@ fn result_from(json: &str) -> Result<EvalCaseResult, String> {
     serde_json::from_str(json).map_err(|error| format!("corrupt eval case result: {error}"))
 }
 
-impl SekaiDb {
-    pub(crate) fn migrate_eval_runs(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(CREATE_SQLITE)
-            .map_err(|error| error.to_string())
-    }
+pub trait EvalRunSekaiDbExt {
+    fn put_dataset_run(&self, spec: &EvalRunSpec, now_ms: i64) -> Result<EvalRunSpec, String>;
 
-    pub fn put_dataset_run(&self, spec: &EvalRunSpec, now_ms: i64) -> Result<EvalRunSpec, String> {
+    fn lease_dataset_run(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        renew: bool,
+        now_ms: i64,
+        until_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn release_dataset_run(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+    ) -> Result<(), String>;
+
+    fn reserve_dataset_run_case(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        reserve_micros: i64,
+        now_ms: i64,
+        until_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn record_dataset_run_case(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        result: &EvalCaseResult,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<Option<EvalCaseResult>, String>;
+
+    fn unreserve_dataset_run_case(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn dataset_run_uncertain_micros(&self, namespace: &str, run_id: &str) -> Result<i64, String>;
+
+    fn list_dataset_run_cases(
+        &self,
+        namespace: &str,
+        run_id: &str,
+    ) -> Result<Vec<EvalCaseResult>, String>;
+
+    /// Records the run bound to the released artifact it evaluates, in one
+    /// transaction: a new run is created with its binding, and an existing
+    /// run keeps whatever binding it was created with (none, if it was
+    /// started without one). Returns the stored spec and binding (#1677).
+    /// The binding is kept apart from the spec so readers of the spec format
+    /// are unchanged.
+    fn put_bound_dataset_run(
+        &self,
+        spec: &EvalRunSpec,
+        artifact_digest: &str,
+        now_ms: i64,
+    ) -> Result<(EvalRunSpec, Option<String>), String>;
+
+    fn dataset_run_artifact(&self, namespace: &str, run_id: &str)
+    -> Result<Option<String>, String>;
+
+    /// Every run of `namespace` with when it was first started, oldest
+    /// first (#1677).
+    fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String>;
+}
+
+impl EvalRunSekaiDbExt for SekaiDb {
+    fn put_dataset_run(&self, spec: &EvalRunSpec, now_ms: i64) -> Result<EvalRunSpec, String> {
         let json = serde_json::to_string(spec).map_err(|error| error.to_string())?;
         let conn = self.conn();
         conn.execute(
@@ -77,7 +121,7 @@ impl SekaiDb {
         spec_from(&stored)
     }
 
-    pub fn lease_dataset_run(
+    fn lease_dataset_run(
         &self,
         namespace: &str,
         run_id: &str,
@@ -103,7 +147,7 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn release_dataset_run(
+    fn release_dataset_run(
         &self,
         namespace: &str,
         run_id: &str,
@@ -119,7 +163,7 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn reserve_dataset_run_case(
+    fn reserve_dataset_run_case(
         &self,
         namespace: &str,
         run_id: &str,
@@ -142,7 +186,7 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn record_dataset_run_case(
+    fn record_dataset_run_case(
         &self,
         namespace: &str,
         run_id: &str,
@@ -196,7 +240,7 @@ impl SekaiDb {
         result_from(&stored).map(Some)
     }
 
-    pub fn unreserve_dataset_run_case(
+    fn unreserve_dataset_run_case(
         &self,
         namespace: &str,
         run_id: &str,
@@ -218,11 +262,7 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn dataset_run_uncertain_micros(
-        &self,
-        namespace: &str,
-        run_id: &str,
-    ) -> Result<i64, String> {
+    fn dataset_run_uncertain_micros(&self, namespace: &str, run_id: &str) -> Result<i64, String> {
         use rusqlite::OptionalExtension;
         Ok(self
             .conn()
@@ -237,7 +277,7 @@ impl SekaiDb {
             .unwrap_or(0))
     }
 
-    pub fn list_dataset_run_cases(
+    fn list_dataset_run_cases(
         &self,
         namespace: &str,
         run_id: &str,
@@ -264,7 +304,7 @@ impl SekaiDb {
     /// started without one). Returns the stored spec and binding (#1677).
     /// The binding is kept apart from the spec so readers of the spec format
     /// are unchanged.
-    pub fn put_bound_dataset_run(
+    fn put_bound_dataset_run(
         &self,
         spec: &EvalRunSpec,
         artifact_digest: &str,
@@ -309,7 +349,7 @@ impl SekaiDb {
         Ok((spec_from(&stored)?, bound))
     }
 
-    pub fn dataset_run_artifact(
+    fn dataset_run_artifact(
         &self,
         namespace: &str,
         run_id: &str,
@@ -328,7 +368,7 @@ impl SekaiDb {
 
     /// Every run of `namespace` with when it was first started, oldest
     /// first (#1677).
-    pub fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
+    fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
         let conn = self.conn();
         let mut statement = conn
             .prepare(
@@ -349,8 +389,78 @@ impl SekaiDb {
     }
 }
 
-impl PostgresDb {
-    pub fn put_dataset_run(&self, spec: &EvalRunSpec, now_ms: i64) -> Result<EvalRunSpec, String> {
+pub trait EvalRunPostgresDbExt {
+    fn put_dataset_run(&self, spec: &EvalRunSpec, now_ms: i64) -> Result<EvalRunSpec, String>;
+
+    fn lease_dataset_run(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        renew: bool,
+        now_ms: i64,
+        until_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn release_dataset_run(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+    ) -> Result<(), String>;
+
+    fn reserve_dataset_run_case(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        reserve_micros: i64,
+        now_ms: i64,
+        until_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn record_dataset_run_case(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        result: &EvalCaseResult,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<Option<EvalCaseResult>, String>;
+
+    fn unreserve_dataset_run_case(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn dataset_run_uncertain_micros(&self, namespace: &str, run_id: &str) -> Result<i64, String>;
+
+    fn list_dataset_run_cases(
+        &self,
+        namespace: &str,
+        run_id: &str,
+    ) -> Result<Vec<EvalCaseResult>, String>;
+
+    fn put_bound_dataset_run(
+        &self,
+        spec: &EvalRunSpec,
+        artifact_digest: &str,
+        now_ms: i64,
+    ) -> Result<(EvalRunSpec, Option<String>), String>;
+
+    fn dataset_run_artifact(&self, namespace: &str, run_id: &str)
+    -> Result<Option<String>, String>;
+
+    fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String>;
+}
+
+impl EvalRunPostgresDbExt for PostgresDb {
+    fn put_dataset_run(&self, spec: &EvalRunSpec, now_ms: i64) -> Result<EvalRunSpec, String> {
         let json = serde_json::to_string(spec).map_err(|error| error.to_string())?;
         let mut connection = self.connection()?;
         connection
@@ -369,7 +479,7 @@ impl PostgresDb {
         spec_from(row.get(0))
     }
 
-    pub fn lease_dataset_run(
+    fn lease_dataset_run(
         &self,
         namespace: &str,
         run_id: &str,
@@ -396,7 +506,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn release_dataset_run(
+    fn release_dataset_run(
         &self,
         namespace: &str,
         run_id: &str,
@@ -413,7 +523,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn reserve_dataset_run_case(
+    fn reserve_dataset_run_case(
         &self,
         namespace: &str,
         run_id: &str,
@@ -444,7 +554,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn record_dataset_run_case(
+    fn record_dataset_run_case(
         &self,
         namespace: &str,
         run_id: &str,
@@ -498,7 +608,7 @@ impl PostgresDb {
         result_from(&stored).map(Some)
     }
 
-    pub fn unreserve_dataset_run_case(
+    fn unreserve_dataset_run_case(
         &self,
         namespace: &str,
         run_id: &str,
@@ -521,11 +631,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn dataset_run_uncertain_micros(
-        &self,
-        namespace: &str,
-        run_id: &str,
-    ) -> Result<i64, String> {
+    fn dataset_run_uncertain_micros(&self, namespace: &str, run_id: &str) -> Result<i64, String> {
         let mut connection = self.connection()?;
         Ok(connection
             .query_opt(
@@ -537,7 +643,7 @@ impl PostgresDb {
             .map_or(0, |row| row.get::<_, i64>(0)))
     }
 
-    pub fn list_dataset_run_cases(
+    fn list_dataset_run_cases(
         &self,
         namespace: &str,
         run_id: &str,
@@ -555,7 +661,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn put_bound_dataset_run(
+    fn put_bound_dataset_run(
         &self,
         spec: &EvalRunSpec,
         artifact_digest: &str,
@@ -600,7 +706,7 @@ impl PostgresDb {
         Ok((spec_from(&stored)?, bound))
     }
 
-    pub fn dataset_run_artifact(
+    fn dataset_run_artifact(
         &self,
         namespace: &str,
         run_id: &str,
@@ -616,7 +722,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
+    fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
         let mut connection = self.connection()?;
         connection
             .query(
@@ -631,10 +737,22 @@ impl PostgresDb {
     }
 }
 
-impl crate::db::runtime_db::RuntimeDb {
+pub trait EvalRunRuntimeDbExt {
+    fn put_bound_dataset_run(
+        &self,
+        spec: &EvalRunSpec,
+        artifact_digest: &str,
+        now_ms: i64,
+    ) -> Result<(EvalRunSpec, Option<String>), String>;
+    fn dataset_run_artifact(&self, namespace: &str, run_id: &str)
+    -> Result<Option<String>, String>;
+    fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String>;
+}
+
+impl EvalRunRuntimeDbExt for crate::db::runtime_db::RuntimeDb {
     /// Records a run with its artifact binding in one write; see
     /// `SekaiDb::put_bound_dataset_run`.
-    pub fn put_bound_dataset_run(
+    fn put_bound_dataset_run(
         &self,
         spec: &EvalRunSpec,
         artifact_digest: &str,
@@ -649,7 +767,7 @@ impl crate::db::runtime_db::RuntimeDb {
     }
 
     /// The artifact a run is bound to, if any.
-    pub fn dataset_run_artifact(
+    fn dataset_run_artifact(
         &self,
         namespace: &str,
         run_id: &str,
@@ -663,7 +781,7 @@ impl crate::db::runtime_db::RuntimeDb {
     }
 
     /// Every eval run of `namespace` with when it was first started.
-    pub fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
+    fn list_dataset_runs(&self, namespace: &str) -> Result<Vec<(EvalRunSpec, i64)>, String> {
         match self {
             Self::Sqlite(db) => db.list_dataset_runs(namespace),
             Self::Postgres(db) => {
@@ -772,6 +890,7 @@ mod tests {
         CaseOutcome, EvalCaseExecutor, EvalCaseResult, EvalRunSpec, EvalRunStore, RUN_CONFLICT,
         STATUS_COMPLETED, run,
     };
+    use crate::chisei_store::eval_run::EvalRunRuntimeDbExt;
     use crate::db::runtime_db::RuntimeDb;
     use std::sync::Arc;
 

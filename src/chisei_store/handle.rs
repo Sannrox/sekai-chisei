@@ -99,6 +99,7 @@ impl ChiseiStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei_store::ChiseiRuntimeDb;
 
     #[test]
     fn split_shared_runtime_is_one_physical_store() {

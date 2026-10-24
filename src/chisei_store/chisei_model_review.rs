@@ -1,32 +1,9 @@
 //! Model review state (#1493) on both community backends.
 
 use crate::chisei::model_review::{FamilyEnablementRecord, ModelReviewRecord};
+use crate::chisei_store::postgres_model_review::PostgresModelReviewPostgresDbExt;
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
-
-const CREATE_SQLITE: &str = "
-CREATE TABLE IF NOT EXISTS chisei_model_review (
-    namespace TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
-    artifact_digest TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    updated_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (namespace, provider, model, artifact_digest)
-);
-CREATE TABLE IF NOT EXISTS chisei_model_family_enablement (
-    namespace TEXT NOT NULL,
-    region_label TEXT NOT NULL,
-    family_id TEXT NOT NULL,
-    status TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    updated_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (namespace, region_label, family_id)
-);
-";
 
 pub trait ChiseiModelReviewBackend: Send + Sync {
     fn put_model_review_record(&self, record: &ModelReviewRecord) -> Result<(), String>;
@@ -59,14 +36,6 @@ pub trait ChiseiModelReviewBackend: Send + Sync {
     ) -> Result<Vec<FamilyEnablementRecord>, String>;
     fn model_review_row_count(&self) -> Result<i64, String>;
     fn family_enablement_row_count(&self) -> Result<i64, String>;
-}
-
-impl SekaiDb {
-    pub(crate) fn migrate_model_review(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(CREATE_SQLITE)
-            .map_err(|error| error.to_string())
-    }
 }
 
 impl ChiseiModelReviewBackend for SekaiDb {
@@ -407,13 +376,13 @@ impl OptionalMapped<FamilyEnablementRecord>
 
 impl ChiseiModelReviewBackend for PostgresDb {
     fn put_model_review_record(&self, record: &ModelReviewRecord) -> Result<(), String> {
-        PostgresDb::put_model_review_record(self, record)
+        PostgresModelReviewPostgresDbExt::put_model_review_record(self, record)
     }
     fn insert_model_review_record_if_absent(
         &self,
         record: &ModelReviewRecord,
     ) -> Result<bool, String> {
-        PostgresDb::insert_model_review_record_if_absent(self, record)
+        PostgresModelReviewPostgresDbExt::insert_model_review_record_if_absent(self, record)
     }
     fn get_model_review_record(
         &self,
@@ -422,19 +391,25 @@ impl ChiseiModelReviewBackend for PostgresDb {
         model: &str,
         artifact_digest: &str,
     ) -> Result<Option<ModelReviewRecord>, String> {
-        PostgresDb::get_model_review_record(self, namespace, provider, model, artifact_digest)
+        PostgresModelReviewPostgresDbExt::get_model_review_record(
+            self,
+            namespace,
+            provider,
+            model,
+            artifact_digest,
+        )
     }
     fn list_model_review_records(&self, namespace: &str) -> Result<Vec<ModelReviewRecord>, String> {
-        PostgresDb::list_model_review_records(self, namespace)
+        PostgresModelReviewPostgresDbExt::list_model_review_records(self, namespace)
     }
     fn put_family_enablement_record(&self, record: &FamilyEnablementRecord) -> Result<(), String> {
-        PostgresDb::put_family_enablement_record(self, record)
+        PostgresModelReviewPostgresDbExt::put_family_enablement_record(self, record)
     }
     fn insert_family_enablement_record_if_absent(
         &self,
         record: &FamilyEnablementRecord,
     ) -> Result<bool, String> {
-        PostgresDb::insert_family_enablement_record_if_absent(self, record)
+        PostgresModelReviewPostgresDbExt::insert_family_enablement_record_if_absent(self, record)
     }
     fn get_family_enablement_record(
         &self,
@@ -442,18 +417,23 @@ impl ChiseiModelReviewBackend for PostgresDb {
         region_label: &str,
         family_id: &str,
     ) -> Result<Option<FamilyEnablementRecord>, String> {
-        PostgresDb::get_family_enablement_record(self, namespace, region_label, family_id)
+        PostgresModelReviewPostgresDbExt::get_family_enablement_record(
+            self,
+            namespace,
+            region_label,
+            family_id,
+        )
     }
     fn list_family_enablement_records(
         &self,
         namespace: &str,
     ) -> Result<Vec<FamilyEnablementRecord>, String> {
-        PostgresDb::list_family_enablement_records(self, namespace)
+        PostgresModelReviewPostgresDbExt::list_family_enablement_records(self, namespace)
     }
     fn model_review_row_count(&self) -> Result<i64, String> {
-        PostgresDb::model_review_row_count(self)
+        PostgresModelReviewPostgresDbExt::model_review_row_count(self)
     }
     fn family_enablement_row_count(&self) -> Result<i64, String> {
-        PostgresDb::family_enablement_row_count(self)
+        PostgresModelReviewPostgresDbExt::family_enablement_row_count(self)
     }
 }

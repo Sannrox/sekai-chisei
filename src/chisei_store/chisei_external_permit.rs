@@ -45,17 +45,17 @@ pub trait ChiseiExternalPermitBackend: Send + Sync {
 }
 
 macro_rules! forward_external_permit {
-    ($target:ty) => {
+    ($target:ty, $ext:path) => {
         fn set_external_permit_policy(
             &self,
             policy: &ExternalPermitPolicy,
             now_ms: i64,
         ) -> Result<(), String> {
-            <$target>::set_external_permit_policy(self, policy, now_ms)
+            <$target as $ext>::set_external_permit_policy(self, policy, now_ms)
         }
 
         fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String> {
-            <$target>::get_external_permit_policy(self, scope)
+            <$target as $ext>::get_external_permit_policy(self, scope)
         }
 
         fn put_permit(
@@ -64,7 +64,7 @@ macro_rules! forward_external_permit {
             idempotency_key: &str,
             issued_by: &str,
         ) -> Result<Permit, String> {
-            <$target>::put_permit(self, permit, idempotency_key, issued_by)
+            <$target as $ext>::put_permit(self, permit, idempotency_key, issued_by)
         }
 
         fn replay_permit(
@@ -72,7 +72,7 @@ macro_rules! forward_external_permit {
             authorization_id: &str,
             idempotency_key: &str,
         ) -> Result<Option<Permit>, String> {
-            <$target>::replay_permit(self, authorization_id, idempotency_key)
+            <$target as $ext>::replay_permit(self, authorization_id, idempotency_key)
         }
 
         fn revoke_permit(
@@ -82,7 +82,7 @@ macro_rules! forward_external_permit {
             reason: &str,
             now_ms: i64,
         ) -> Result<bool, String> {
-            <$target>::revoke_permit(self, handle, actor, reason, now_ms)
+            <$target as $ext>::revoke_permit(self, handle, actor, reason, now_ms)
         }
 
         fn set_permit_kill_switch(
@@ -93,15 +93,21 @@ macro_rules! forward_external_permit {
             reason: &str,
             now_ms: i64,
         ) -> Result<bool, String> {
-            <$target>::set_permit_kill_switch(self, kind, value, enabled, reason, now_ms)
+            <$target as $ext>::set_permit_kill_switch(self, kind, value, enabled, reason, now_ms)
         }
     };
 }
 
 impl ChiseiExternalPermitBackend for SekaiDb {
-    forward_external_permit!(SekaiDb);
+    forward_external_permit!(
+        SekaiDb,
+        crate::chisei::external_permit::ExternalPermitSekaiDbExt
+    );
 }
 
 impl ChiseiExternalPermitBackend for PostgresDb {
-    forward_external_permit!(PostgresDb);
+    forward_external_permit!(
+        PostgresDb,
+        crate::chisei_store::postgres_external_permit::PostgresExternalPermitPostgresDbExt
+    );
 }

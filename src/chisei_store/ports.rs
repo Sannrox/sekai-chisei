@@ -10,6 +10,7 @@
 
 use ed25519_dalek::VerifyingKey;
 
+use super::ChiseiRuntimeDb;
 use super::ChiseiStore;
 use crate::chisei::eval;
 use crate::chisei::evaluation_execution::EvaluationExecutionIndex;

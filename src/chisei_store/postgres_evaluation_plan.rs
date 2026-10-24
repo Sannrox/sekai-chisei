@@ -7,8 +7,60 @@ use crate::chisei::evaluation_plan::{
 use crate::db::postgres::PostgresDb;
 use postgres::{GenericClient, Transaction};
 
-impl PostgresDb {
-    pub fn put_evaluator_definition(
+pub trait PostgresEvaluationPlanPostgresDbExt {
+    fn put_evaluator_definition(
+        &self,
+        definition: EvaluatorDefinition,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<EvaluatorDefinition, String>;
+
+    fn get_evaluator_definition(
+        &self,
+        definition_id: &str,
+    ) -> Result<Option<EvaluatorDefinition>, String>;
+
+    fn list_evaluator_definitions(
+        &self,
+        namespace: &str,
+        evaluator_id: Option<&str>,
+    ) -> Result<Vec<EvaluatorDefinition>, String>;
+
+    fn get_evaluator_availability(
+        &self,
+        definition_id: &str,
+    ) -> Result<Option<EvaluatorAvailability>, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_evaluator_availability(
+        &self,
+        definition_id: &str,
+        state: &str,
+        superseded_by_definition_id: &str,
+        reason: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<EvaluatorAvailability, String>;
+
+    fn put_evaluation_plan(
+        &self,
+        plan: EvaluationPlan,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<EvaluationPlan, String>;
+
+    fn get_evaluation_plan(&self, plan_version_id: &str) -> Result<Option<EvaluationPlan>, String>;
+
+    fn list_evaluation_plans(
+        &self,
+        namespace: &str,
+        plan_id: Option<&str>,
+    ) -> Result<Vec<EvaluationPlan>, String>;
+}
+
+impl PostgresEvaluationPlanPostgresDbExt for PostgresDb {
+    fn put_evaluator_definition(
         &self,
         definition: EvaluatorDefinition,
         actor: &str,
@@ -61,7 +113,7 @@ impl PostgresDb {
         Ok(definition)
     }
 
-    pub fn get_evaluator_definition(
+    fn get_evaluator_definition(
         &self,
         definition_id: &str,
     ) -> Result<Option<EvaluatorDefinition>, String> {
@@ -69,7 +121,7 @@ impl PostgresDb {
         get_definition(&mut *connection, definition_id)
     }
 
-    pub fn list_evaluator_definitions(
+    fn list_evaluator_definitions(
         &self,
         namespace: &str,
         evaluator_id: Option<&str>,
@@ -93,7 +145,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn get_evaluator_availability(
+    fn get_evaluator_availability(
         &self,
         definition_id: &str,
     ) -> Result<Option<EvaluatorAvailability>, String> {
@@ -108,7 +160,7 @@ impl PostgresDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn set_evaluator_availability(
+    fn set_evaluator_availability(
         &self,
         definition_id: &str,
         state: &str,
@@ -157,7 +209,7 @@ impl PostgresDb {
         Ok(availability)
     }
 
-    pub fn put_evaluation_plan(
+    fn put_evaluation_plan(
         &self,
         plan: EvaluationPlan,
         actor: &str,
@@ -199,15 +251,12 @@ impl PostgresDb {
         Ok(plan)
     }
 
-    pub fn get_evaluation_plan(
-        &self,
-        plan_version_id: &str,
-    ) -> Result<Option<EvaluationPlan>, String> {
+    fn get_evaluation_plan(&self, plan_version_id: &str) -> Result<Option<EvaluationPlan>, String> {
         let mut connection = self.connection()?;
         get_plan(&mut *connection, plan_version_id)
     }
 
-    pub fn list_evaluation_plans(
+    fn list_evaluation_plans(
         &self,
         namespace: &str,
         plan_id: Option<&str>,

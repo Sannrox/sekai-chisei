@@ -5,29 +5,21 @@ use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sekai_domain::receipt::OperationReceipt;
 
-impl SekaiDb {
-    pub(crate) fn migrate_evaluation_executions(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_evaluation_executions (
-                    manifest_digest TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL UNIQUE,
-                    namespace TEXT NOT NULL,
-                    executor_version TEXT NOT NULL,
-                    started_by TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    FOREIGN KEY(manifest_digest)
-                        REFERENCES chisei_evaluation_manifests(manifest_digest),
-                    FOREIGN KEY(operation_id)
-                        REFERENCES chisei_operation_receipts(operation_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_chisei_evaluation_executions_namespace
-                    ON chisei_evaluation_executions(namespace, created_at_ms, operation_id);",
-            )
-            .map_err(|error| error.to_string())
-    }
+pub trait EvaluationExecutionSekaiDbExt {
+    fn get_evaluation_execution_index(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<EvaluationExecutionIndex>, String>;
 
-    pub fn get_evaluation_execution_index(
+    fn create_evaluation_execution(
+        &self,
+        index: &EvaluationExecutionIndex,
+        receipt: &OperationReceipt,
+    ) -> Result<EvaluationExecutionIndex, String>;
+}
+
+impl EvaluationExecutionSekaiDbExt for SekaiDb {
+    fn get_evaluation_execution_index(
         &self,
         manifest_digest: &str,
     ) -> Result<Option<EvaluationExecutionIndex>, String> {
@@ -44,7 +36,7 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn create_evaluation_execution(
+    fn create_evaluation_execution(
         &self,
         index: &EvaluationExecutionIndex,
         receipt: &OperationReceipt,

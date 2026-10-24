@@ -79,56 +79,59 @@ pub trait ChiseiEvalBackend: Send + Sync {
 }
 
 macro_rules! forward {
-    ($target:ty) => {
+    ($target:ty, $ext:path) => {
         fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
-            <$target>::put_eval_suite(self, suite)
+            <$target as $ext>::put_eval_suite(self, suite)
         }
         fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
-            <$target>::get_eval_suite_record(self, id)
+            <$target as $ext>::get_eval_suite_record(self, id)
         }
         fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
-            <$target>::put_eval_run(self, run)
+            <$target as $ext>::put_eval_run(self, run)
         }
         fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
-            <$target>::get_eval_run_record(self, id)
+            <$target as $ext>::get_eval_run_record(self, id)
         }
         fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
-            <$target>::put_eval_iteration(self, iteration)
+            <$target as $ext>::put_eval_iteration(self, iteration)
         }
         fn list_eval_iteration_records(
             &self,
             suite_id: &str,
         ) -> Result<Vec<eval::Iteration>, String> {
-            <$target>::list_eval_iteration_records(self, suite_id)
+            <$target as $ext>::list_eval_iteration_records(self, suite_id)
         }
         fn put_sample_observation(&self, observation: &SampleObservation) -> Result<(), String> {
-            <$target>::put_sample_observation(self, observation)
+            <$target as $ext>::put_sample_observation(self, observation)
         }
         fn get_sample_observation(
             &self,
             request_id: &str,
         ) -> Result<Option<SampleObservation>, String> {
-            <$target>::get_sample_observation(self, request_id)
+            <$target as $ext>::get_sample_observation(self, request_id)
         }
         fn get_sample_observation_in_namespace(
             &self,
             request_id: &str,
             namespace: &str,
         ) -> Result<Option<SampleObservation>, String> {
-            <$target>::get_sample_observation_in_namespace(self, request_id, namespace)
+            <$target as $ext>::get_sample_observation_in_namespace(self, request_id, namespace)
         }
         fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
-            <$target>::bump_observation_attempts(self, request_id)
+            <$target as $ext>::bump_observation_attempts(self, request_id)
         }
         fn delete_observation(&self, request_id: &str) -> Result<(), String> {
-            <$target>::delete_observation(self, request_id)
+            <$target as $ext>::delete_observation(self, request_id)
         }
     };
 }
 
 impl ChiseiEvalBackend for SekaiDb {
-    forward!(SekaiDb);
+    forward!(SekaiDb, crate::chisei_store::chisei::ChiseiSekaiDbExt2);
 }
 impl ChiseiEvalBackend for PostgresDb {
-    forward!(PostgresDb);
+    forward!(
+        PostgresDb,
+        crate::chisei_store::postgres_eval::PostgresEvalPostgresDbExt
+    );
 }

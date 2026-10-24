@@ -31,11 +31,15 @@ impl SystemOneActionType for GovernedActionType {
     }
 }
 
-impl EvidenceSubmissionRecord {
+pub trait EvidenceSubmissionRecordExt {
     /// Epistemic descriptor for this admitted evidence row. The payload is
     /// never copied; only identity, digest, lifecycle, observation time, and
     /// producer confidence are projected.
-    pub fn epistemic_descriptor(&self) -> EpistemicDescriptor {
+    fn epistemic_descriptor(&self) -> EpistemicDescriptor;
+}
+
+impl EvidenceSubmissionRecordExt for EvidenceSubmissionRecord {
+    fn epistemic_descriptor(&self) -> EpistemicDescriptor {
         EpistemicDescriptor::from_external_evidence(&ExternalEvidenceFacts {
             id: &self.id,
             content_digest: &self.content_digest,

@@ -7,8 +7,48 @@ use crate::db::postgres::PostgresDb;
 use crate::db::postgres_decision::insert_chained_decision;
 use crate::sekai::audit::Decision;
 
-impl PostgresDb {
-    pub fn set_external_permit_policy(
+pub trait PostgresExternalPermitPostgresDbExt {
+    fn set_external_permit_policy(
+        &self,
+        policy: &ExternalPermitPolicy,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String>;
+
+    fn put_permit(
+        &self,
+        permit: &Permit,
+        idempotency_key: &str,
+        issued_by: &str,
+    ) -> Result<Permit, String>;
+
+    fn replay_permit(
+        &self,
+        authorization_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<Permit>, String>;
+
+    fn revoke_permit(
+        &self,
+        handle: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn set_permit_kill_switch(
+        &self,
+        kind: &str,
+        value: &str,
+        enabled: bool,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+}
+
+impl PostgresExternalPermitPostgresDbExt for PostgresDb {
+    fn set_external_permit_policy(
         &self,
         policy: &ExternalPermitPolicy,
         now_ms: i64,
@@ -33,7 +73,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String> {
+    fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String> {
         let json: Option<String> = self
             .connection()?
             .query_opt(
@@ -47,7 +87,7 @@ impl PostgresDb {
             .map(|value| value.unwrap_or_else(|| ExternalPermitPolicy::disabled(scope)))
     }
 
-    pub fn put_permit(
+    fn put_permit(
         &self,
         permit: &Permit,
         idempotency_key: &str,
@@ -115,7 +155,7 @@ impl PostgresDb {
         Ok(stored)
     }
 
-    pub fn replay_permit(
+    fn replay_permit(
         &self,
         authorization_id: &str,
         idempotency_key: &str,
@@ -147,7 +187,7 @@ impl PostgresDb {
         }
     }
 
-    pub fn revoke_permit(
+    fn revoke_permit(
         &self,
         handle: &str,
         actor: &str,
@@ -187,7 +227,7 @@ impl PostgresDb {
         Ok(changed)
     }
 
-    pub fn set_permit_kill_switch(
+    fn set_permit_kill_switch(
         &self,
         kind: &str,
         value: &str,

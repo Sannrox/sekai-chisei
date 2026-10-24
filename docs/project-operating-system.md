@@ -353,9 +353,9 @@ Local isolation protects lanes that share a machine; it is not a claim.
     `ScratchDatabase` users create and drop a unique database per test.
     Tests that read the URL directly share its database and are not
     parallel-safe across processes. List them with
-    `git grep -l 'SEKAI_TEST_POSTGRES_URL' -- src tests | xargs grep -L ScratchDatabase`.
+    `git grep -l 'SEKAI_TEST_POSTGRES_URL' -- src crates/sekai-core tests | xargs grep -L ScratchDatabase`.
     Some of them reset the whole schema (`reset_database` in
-    `src/db/postgres.rs`). Run them only through
+    `crates/sekai-core/src/db/postgres.rs`). Run them only through
     `scripts/postgres-conformance.sh`, which gives each run its own server.
 
 ### Limits, collisions, and landing

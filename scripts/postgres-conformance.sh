@@ -140,7 +140,13 @@ status=0
 SEKAI_TEST_POSTGRES_URL="$base/sekai_conformance" \
   cargo test --locked --no-fail-fast --test it -- --ignored --test-threads=1 \
     backend_conformance postgres || status=$?
+# Root crate keeps Chisei/composition PostgreSQL tests; Sekai persistence
+# tests live in sekai-core. Run the packages one after another against the
+# same database so they do not collide.
 SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
 SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
   cargo test --locked --lib -- --ignored --test-threads=1 postgres || status=$?
+SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
+SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
+  cargo test --locked -p sekai-core --lib -- --ignored --test-threads=1 postgres || status=$?
 exit "$status"

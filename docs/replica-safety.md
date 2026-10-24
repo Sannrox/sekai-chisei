@@ -2,7 +2,7 @@
 
 Parent epic: [#117](https://github.com/Sannrox/sekai-chisei/issues/117).  
 Inventory fixture: [`tests/fixtures/replica_safety/v1.json`](../tests/fixtures/replica_safety/v1.json).  
-Harness: `src/db/replica_safety.rs` (`TwoReplicaSqlite`, `ReplicaSafetyInventory`).
+Harness: `crates/sekai-core/src/db/replica_safety.rs` (`TwoReplicaSqlite`, `ReplicaSafetyInventory`).
 
 ## Goal
 

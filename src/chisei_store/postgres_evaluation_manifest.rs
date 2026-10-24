@@ -4,8 +4,29 @@ use crate::chisei::evaluation_manifest::{EvaluationManifestReplay, ResolvedEvalu
 use crate::db::postgres::PostgresDb;
 use postgres::GenericClient;
 
-impl PostgresDb {
-    pub fn get_evaluation_manifest(
+pub trait PostgresEvaluationManifestPostgresDbExt {
+    fn get_evaluation_manifest(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<ResolvedEvaluationManifest>, String>;
+
+    fn get_evaluation_manifest_for_request(
+        &self,
+        namespace: &str,
+        actor: &str,
+        request_id: &str,
+    ) -> Result<Option<EvaluationManifestReplay>, String>;
+
+    fn put_evaluation_manifest(
+        &self,
+        manifest: &ResolvedEvaluationManifest,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<ResolvedEvaluationManifest, String>;
+}
+
+impl PostgresEvaluationManifestPostgresDbExt for PostgresDb {
+    fn get_evaluation_manifest(
         &self,
         manifest_digest: &str,
     ) -> Result<Option<ResolvedEvaluationManifest>, String> {
@@ -13,7 +34,7 @@ impl PostgresDb {
         get_manifest(&mut *connection, manifest_digest)
     }
 
-    pub fn get_evaluation_manifest_for_request(
+    fn get_evaluation_manifest_for_request(
         &self,
         namespace: &str,
         actor: &str,
@@ -23,7 +44,7 @@ impl PostgresDb {
         get_request(&mut *connection, namespace, actor, request_id)
     }
 
-    pub fn put_evaluation_manifest(
+    fn put_evaluation_manifest(
         &self,
         manifest: &ResolvedEvaluationManifest,
         request_id: &str,

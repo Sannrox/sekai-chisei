@@ -10,8 +10,87 @@ use crate::db::postgres::PostgresDb;
 use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
 use sekai_types::principal::PrincipalContext;
 
-impl PostgresDb {
-    pub fn insert_kioku_memory(
+pub trait PostgresKiokuPostgresDbExt {
+    fn insert_kioku_memory(
+        &self,
+        memory: &KiokuMemory,
+        evidence: &[KiokuEvidenceLink],
+    ) -> Result<(), String>;
+
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String>;
+
+    fn list_kioku_candidates(
+        &self,
+        namespace: &str,
+        operation_class: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KiokuMemory>, String>;
+
+    fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String>;
+
+    fn list_kioku_evidence(&self, id: &str, version: u32)
+    -> Result<Vec<KiokuEvidenceLink>, String>;
+
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String>;
+
+    fn review_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String>;
+
+    fn review_kioku_candidate_after_graph_auth(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String>;
+
+    fn review_kioku_candidate_inner(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+        authorize_graph: bool,
+    ) -> Result<KiokuMemory, String>;
+
+    fn list_kioku_lifecycle_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String>;
+
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String>;
+
+    fn disable_kioku_memory(
+        &self,
+        id: &str,
+        version: u32,
+        actor: &str,
+        rationale: &str,
+        recorded_at_ms: i64,
+    ) -> Result<KiokuMemory, String>;
+
+    fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String>;
+
+    fn authorize_kioku_evidence(
+        &self,
+        request: &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String>;
+}
+
+impl PostgresKiokuPostgresDbExt for PostgresDb {
+    fn insert_kioku_memory(
         &self,
         memory: &KiokuMemory,
         evidence: &[KiokuEvidenceLink],
@@ -112,7 +191,7 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
         let version = i64::from(version);
         let memory_json = self
             .connection()?
@@ -127,7 +206,7 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn list_kioku_candidates(
+    fn list_kioku_candidates(
         &self,
         namespace: &str,
         operation_class: Option<&str>,
@@ -174,7 +253,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn list_kioku_candidate_page(
+    fn list_kioku_candidate_page(
         &self,
         namespace: &str,
         limit: usize,
@@ -207,7 +286,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn list_kioku_evidence(
+    fn list_kioku_evidence(
         &self,
         id: &str,
         version: u32,
@@ -229,11 +308,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn validate_kioku_candidate(
-        &self,
-        id: &str,
-        version: u32,
-    ) -> Result<MemoryValidation, String> {
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String> {
         let Some(memory) = self.get_kioku_memory(id, version)? else {
             return Err(format!("memory {id} version {version} not found"));
         };
@@ -349,7 +424,7 @@ impl PostgresDb {
         })
     }
 
-    pub fn review_kioku_candidate(
+    fn review_kioku_candidate(
         &self,
         id: &str,
         version: u32,
@@ -358,7 +433,7 @@ impl PostgresDb {
         self.review_kioku_candidate_inner(id, version, review, true)
     }
 
-    pub(crate) fn review_kioku_candidate_after_graph_auth(
+    fn review_kioku_candidate_after_graph_auth(
         &self,
         id: &str,
         version: u32,
@@ -525,7 +600,7 @@ impl PostgresDb {
         Ok(memory)
     }
 
-    pub fn list_kioku_lifecycle_events(
+    fn list_kioku_lifecycle_events(
         &self,
         id: &str,
         version: u32,
@@ -557,7 +632,7 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
@@ -566,7 +641,7 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn disable_kioku_memory(
+    fn disable_kioku_memory(
         &self,
         id: &str,
         version: u32,
@@ -617,7 +692,7 @@ impl PostgresDb {
         Ok(memory)
     }
 
-    pub fn kioku_authorized_classification_ceiling(
+    fn kioku_authorized_classification_ceiling(
         &self,
         namespace: &str,
         actor: &str,
@@ -635,7 +710,7 @@ impl PostgresDb {
         )
     }
 
-    pub fn authorize_kioku_evidence(
+    fn authorize_kioku_evidence(
         &self,
         request: &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest,
     ) -> Result<(), String> {

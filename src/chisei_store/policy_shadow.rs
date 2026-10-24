@@ -14,40 +14,6 @@ use crate::chisei::policy_shadow::{
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 
-const CREATE_SQLITE: &str = "
-CREATE TABLE IF NOT EXISTS chisei_policy_shadow (
-    namespace TEXT PRIMARY KEY,
-    shadow_id TEXT NOT NULL,
-    candidate_json TEXT NOT NULL,
-    candidate_version TEXT NOT NULL,
-    active_version TEXT NOT NULL,
-    min_evaluations INTEGER NOT NULL,
-    min_match_rate_bps INTEGER NOT NULL,
-    started_by TEXT NOT NULL,
-    started_at_ms INTEGER NOT NULL,
-    evaluated INTEGER NOT NULL DEFAULT 0,
-    unchanged INTEGER NOT NULL DEFAULT 0,
-    re_routed INTEGER NOT NULL DEFAULT 0,
-    would_deny INTEGER NOT NULL DEFAULT 0,
-    would_allow INTEGER NOT NULL DEFAULT 0,
-    activation_claimed_at_ms INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS chisei_policy_shadow_sample (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    shadow_id TEXT NOT NULL,
-    delta TEXT NOT NULL,
-    preferred_runtime TEXT NOT NULL,
-    preferred_model TEXT NOT NULL,
-    active TEXT NOT NULL,
-    candidate TEXT NOT NULL,
-    observed_at_ms INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS chisei_policy_shadow_by_run
-    ON chisei_policy_shadow (shadow_id);
-CREATE INDEX IF NOT EXISTS chisei_policy_shadow_sample_by_class
-    ON chisei_policy_shadow_sample (shadow_id, delta);
-";
-
 const SHADOW_COLUMNS: &str = "shadow_id, namespace, candidate_json, candidate_version, \
      active_version, min_evaluations, min_match_rate_bps, started_by, started_at_ms, \
      evaluated, unchanged, re_routed, would_deny, would_allow";
@@ -209,15 +175,56 @@ fn postgres_shadow_row(row: &postgres::Row) -> ShadowRow {
     }
 }
 
-impl SekaiDb {
-    pub(crate) fn migrate_policy_shadow(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(CREATE_SQLITE)
-            .map_err(|error| error.to_string())
-    }
-
+pub trait PolicyShadowSekaiDbExt {
     /// Replaces any shadow for the namespace and resets its report.
-    pub fn start_policy_shadow(&self, shadow: &PolicyShadow) -> Result<(), String> {
+    fn start_policy_shadow(&self, shadow: &PolicyShadow) -> Result<(), String>;
+
+    /// Marks run `shadow_id` as admitted for activation. Returns false when the
+    /// namespace no longer holds that run.
+    fn claim_policy_shadow_activation(
+        &self,
+        namespace: &str,
+        shadow_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    /// Whether run `shadow_id` still holds the unexpired claim made at
+    /// `claimed_at_ms`.
+    fn confirm_policy_shadow_activation(
+        &self,
+        namespace: &str,
+        shadow_id: &str,
+        claimed_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    /// Removes the namespace's shadow, or only run `shadow_id` when given.
+    /// With `unclaimed_at_ms`, a run whose activation claim is still live at
+    /// that time is refused instead. Returns whether a shadow was removed.
+    fn stop_policy_shadow(
+        &self,
+        namespace: &str,
+        shadow_id: Option<&str>,
+        unclaimed_at_ms: Option<i64>,
+    ) -> Result<bool, String>;
+
+    fn find_policy_shadow(&self, scopes: &[String]) -> Result<Option<PolicyShadow>, String>;
+
+    /// Counts one live decision against run `shadow_id`, and keeps the sample
+    /// while its class is under the cap. A run restarted or stopped since is
+    /// left untouched.
+    fn record_policy_shadow_observation(
+        &self,
+        shadow_id: &str,
+        sample: &ShadowSample,
+    ) -> Result<(), String>;
+
+    fn policy_shadow_report(&self, namespace: &str) -> Result<Option<PolicyShadowReport>, String>;
+}
+
+impl PolicyShadowSekaiDbExt for SekaiDb {
+    /// Replaces any shadow for the namespace and resets its report.
+    fn start_policy_shadow(&self, shadow: &PolicyShadow) -> Result<(), String> {
         use rusqlite::OptionalExtension;
         let candidate_json = candidate_json(shadow)?;
         let mut conn = self.conn();
@@ -260,7 +267,7 @@ impl SekaiDb {
 
     /// Marks run `shadow_id` as admitted for activation. Returns false when the
     /// namespace no longer holds that run.
-    pub fn claim_policy_shadow_activation(
+    fn claim_policy_shadow_activation(
         &self,
         namespace: &str,
         shadow_id: &str,
@@ -280,7 +287,7 @@ impl SekaiDb {
 
     /// Whether run `shadow_id` still holds the unexpired claim made at
     /// `claimed_at_ms`.
-    pub fn confirm_policy_shadow_activation(
+    fn confirm_policy_shadow_activation(
         &self,
         namespace: &str,
         shadow_id: &str,
@@ -308,7 +315,7 @@ impl SekaiDb {
     /// Removes the namespace's shadow, or only run `shadow_id` when given.
     /// With `unclaimed_at_ms`, a run whose activation claim is still live at
     /// that time is refused instead. Returns whether a shadow was removed.
-    pub fn stop_policy_shadow(
+    fn stop_policy_shadow(
         &self,
         namespace: &str,
         shadow_id: Option<&str>,
@@ -350,7 +357,7 @@ impl SekaiDb {
         Ok(removed.is_some())
     }
 
-    pub fn find_policy_shadow(&self, scopes: &[String]) -> Result<Option<PolicyShadow>, String> {
+    fn find_policy_shadow(&self, scopes: &[String]) -> Result<Option<PolicyShadow>, String> {
         if scopes.is_empty() {
             return Ok(None);
         }
@@ -378,7 +385,7 @@ impl SekaiDb {
     /// Counts one live decision against run `shadow_id`, and keeps the sample
     /// while its class is under the cap. A run restarted or stopped since is
     /// left untouched.
-    pub fn record_policy_shadow_observation(
+    fn record_policy_shadow_observation(
         &self,
         shadow_id: &str,
         sample: &ShadowSample,
@@ -421,10 +428,7 @@ impl SekaiDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn policy_shadow_report(
-        &self,
-        namespace: &str,
-    ) -> Result<Option<PolicyShadowReport>, String> {
+    fn policy_shadow_report(&self, namespace: &str) -> Result<Option<PolicyShadowReport>, String> {
         use rusqlite::OptionalExtension;
         let conn = self.conn();
         let Some(row) = conn
@@ -472,8 +476,46 @@ impl SekaiDb {
     }
 }
 
-impl PostgresDb {
-    pub fn start_policy_shadow(&self, shadow: &PolicyShadow) -> Result<(), String> {
+pub trait PolicyShadowPostgresDbExt {
+    fn start_policy_shadow(&self, shadow: &PolicyShadow) -> Result<(), String>;
+
+    fn claim_policy_shadow_activation(
+        &self,
+        namespace: &str,
+        shadow_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn confirm_policy_shadow_activation(
+        &self,
+        namespace: &str,
+        shadow_id: &str,
+        claimed_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn stop_policy_shadow(
+        &self,
+        namespace: &str,
+        shadow_id: Option<&str>,
+        unclaimed_at_ms: Option<i64>,
+    ) -> Result<bool, String>;
+
+    fn find_policy_shadow(&self, scopes: &[String]) -> Result<Option<PolicyShadow>, String>;
+
+    /// The counter `UPDATE` holds the shadow row lock until commit, so the
+    /// sample cap check below is serialized per run.
+    fn record_policy_shadow_observation(
+        &self,
+        shadow_id: &str,
+        sample: &ShadowSample,
+    ) -> Result<(), String>;
+
+    fn policy_shadow_report(&self, namespace: &str) -> Result<Option<PolicyShadowReport>, String>;
+}
+
+impl PolicyShadowPostgresDbExt for PostgresDb {
+    fn start_policy_shadow(&self, shadow: &PolicyShadow) -> Result<(), String> {
         let candidate_json = candidate_json(shadow)?;
         let mut connection = self.connection()?;
         let mut tx = connection
@@ -537,7 +579,7 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn claim_policy_shadow_activation(
+    fn claim_policy_shadow_activation(
         &self,
         namespace: &str,
         shadow_id: &str,
@@ -555,7 +597,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn confirm_policy_shadow_activation(
+    fn confirm_policy_shadow_activation(
         &self,
         namespace: &str,
         shadow_id: &str,
@@ -579,7 +621,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn stop_policy_shadow(
+    fn stop_policy_shadow(
         &self,
         namespace: &str,
         shadow_id: Option<&str>,
@@ -621,7 +663,7 @@ impl PostgresDb {
         Ok(removed.is_some())
     }
 
-    pub fn find_policy_shadow(&self, scopes: &[String]) -> Result<Option<PolicyShadow>, String> {
+    fn find_policy_shadow(&self, scopes: &[String]) -> Result<Option<PolicyShadow>, String> {
         if scopes.is_empty() {
             return Ok(None);
         }
@@ -646,7 +688,7 @@ impl PostgresDb {
 
     /// The counter `UPDATE` holds the shadow row lock until commit, so the
     /// sample cap check below is serialized per run.
-    pub fn record_policy_shadow_observation(
+    fn record_policy_shadow_observation(
         &self,
         shadow_id: &str,
         sample: &ShadowSample,
@@ -691,10 +733,7 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn policy_shadow_report(
-        &self,
-        namespace: &str,
-    ) -> Result<Option<PolicyShadowReport>, String> {
+    fn policy_shadow_report(&self, namespace: &str) -> Result<Option<PolicyShadowReport>, String> {
         let mut connection = self.connection()?;
         let Some(row) = connection
             .query_opt(

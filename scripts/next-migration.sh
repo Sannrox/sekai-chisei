@@ -8,8 +8,15 @@ ROOT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "${ROOT_PATH}"
 
 git fetch --quiet origin main
-last="$(git ls-tree --name-only origin/main src/db/postgres/ \
-  | sed -n 's#^src/db/postgres/\([0-9]\{4\}\)_.*#\1#p' | sort | tail -1)"
+# origin/main still has src/db/postgres/ until this crate cut lands; after
+# that the files live in sekai-core. Take the highest number from either.
+last="$(
+  {
+    git ls-tree --name-only origin/main src/db/postgres/ 2>/dev/null || true
+    git ls-tree --name-only origin/main crates/sekai-core/src/db/postgres/ 2>/dev/null || true
+  } | sed -n 's#^.*/\([0-9]\{4\}\)_.*\.sql$#\1#p' | sort | tail -1
+)"
+[ -n "${last}" ] || { echo "no PostgreSQL migrations found on origin/main" >&2; exit 1; }
 next=$((10#${last} + 1))
-printf 'file: src/db/postgres/%04d_<name>.sql\n' "${next}"
-printf 'registry: mig(%d, "<name>", ..) in src/db/postgres.rs\n' "$((next - 1))"
+printf 'file: crates/sekai-core/src/db/postgres/%04d_<name>.sql\n' "${next}"
+printf 'registry: mig(%d, "<name>", ..) in crates/sekai-core/src/db/postgres.rs\n' "$((next - 1))"
