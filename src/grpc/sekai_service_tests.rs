@@ -28798,6 +28798,118 @@ async fn conversation_draft_traces_each_member_to_its_turn_and_lints_unpublished
 }
 
 #[tokio::test]
+async fn ontology_health_drops_with_a_stale_dataset_and_a_broken_contract_and_recovers() {
+    let svc = service();
+    seed_definition_parent(&svc, "health");
+    grant_source_namespace(&svc, "health", "root", security::Role::Admin);
+    let db = svc.db.runtime();
+    db.create_object(&domain::Object {
+        id: "orders-object".into(),
+        kind: "Ticket".into(),
+        name: "orders".into(),
+        namespace: "health".into(),
+        external_id: String::new(),
+        properties: HashMap::new(),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    db.create_dataset(&dataset::Dataset {
+        id: "orders".into(),
+        name: "orders".into(),
+        columns: vec![dataset::ColumnDef {
+            name: "total".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: "orders-object".into(),
+        created: 1,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    // Scheduled checks judge the latest version.
+    db.append_rows(
+        "orders",
+        &[HashMap::from([("total".to_string(), "9".to_string())])],
+    )
+    .unwrap();
+    db.put_dataset_health_check(&crate::sekai::dataset_health::DatasetHealthCheck {
+        dataset_id: "orders".into(),
+        check_id: "fresh".into(),
+        kind: "freshness".into(),
+        max_age_ms: i64::MAX / 2,
+        min_rows: 0,
+        max_rows: 0,
+        columns: Vec::new(),
+        predicate: Vec::new(),
+        blocking: false,
+        every_ms: 1_000,
+        tenant: String::new(),
+        space: String::new(),
+        last_run_ms: 0,
+    })
+    .unwrap();
+    // The binding's `Ticket.title` is not in the published Ticket.
+    let binding = gate_binding("health", true);
+    db.create_object(&binding).unwrap();
+    let health = |principal: &'static str, namespace: &'static str| {
+        svc.get_ontology_health(with_named_principal(
+            GetOntologyHealthRequest {
+                namespace: namespace.into(),
+            },
+            principal,
+        ))
+    };
+    let part = |response: &GetOntologyHealthResponse, name: &str| {
+        response.namespaces[0]
+            .parts
+            .iter()
+            .find(|part| part.part == name)
+            .cloned()
+            .unwrap()
+    };
+
+    // Missing two scheduled runs fires a late alert: the dataset is stale.
+    for now_ms in [5_000, 7_000] {
+        db.run_dataset_health_checks("orders", now_ms).unwrap();
+    }
+    let sick = health("root", "health").await.unwrap().into_inner();
+    assert_eq!(part(&sick, "freshness").score, 0);
+    assert_eq!(part(&sick, "freshness").problems[0].subject_id, "orders");
+    assert_eq!(part(&sick, "quality").score, 100);
+    let contract = part(&sick, "contract");
+    assert_eq!(contract.score, 0);
+    assert_eq!(contract.problems[0].code, "property_removed");
+    assert!(!part(&sick, "trust").available);
+    assert_eq!(part(&sick, "access").score, 100);
+    assert_eq!(sick.namespaces[0].score, Some(0));
+    assert_eq!(sick.score, Some(0));
+
+    // Back on schedule and the binding withdrawn: both parts recover.
+    for now_ms in [7_500, 8_000] {
+        db.run_dataset_health_checks("orders", now_ms).unwrap();
+    }
+    db.delete_object(&binding.id).unwrap();
+    let well = health("root", "health").await.unwrap().into_inner();
+    assert_eq!(part(&well, "freshness").score, 100);
+    assert_eq!(part(&well, "contract").score, 100);
+    // Lint still flags the ownerless Ticket, so it is now the lowest part.
+    assert_eq!(well.namespaces[0].score, Some(part(&well, "lint").score));
+    assert!(part(&well, "lint").score < 100);
+
+    // A caller without access to the namespace gets nothing about it.
+    assert_eq!(
+        health("tester", "health").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let tenant = health("tester", "").await.unwrap().into_inner();
+    assert!(tenant.namespaces.is_empty());
+    assert_eq!(tenant.score, None);
+    let everything = health("root", "").await.unwrap().into_inner();
+    assert_eq!(everything.namespaces.len(), 1);
+}
+
+#[tokio::test]
 async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_sees() {
     let svc = service();
     let parent = seed_definition_parent(&svc, "lint-a");

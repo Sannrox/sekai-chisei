@@ -54,6 +54,8 @@ mod sync_scope_rpc;
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
 };
+#[path = "ontology_health_rpc.rs"]
+mod ontology_health_rpc;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
 #[path = "sekai_service_support_access.rs"]
@@ -667,6 +669,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetOntologyLintReportRequest>,
     ) -> Result<Response<GetOntologyLintReportResponse>, Status> {
         rpc_definitions::get_ontology_lint_report(self, req).await
+    }
+
+    async fn get_ontology_health(
+        &self,
+        req: Request<GetOntologyHealthRequest>,
+    ) -> Result<Response<GetOntologyHealthResponse>, Status> {
+        ontology_health_rpc::get_ontology_health(self, req).await
     }
 
     async fn generate_definition_change_bundle(
