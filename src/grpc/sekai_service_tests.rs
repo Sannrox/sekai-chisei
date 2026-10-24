@@ -23753,6 +23753,100 @@ fn seed_inspect_action_type(svc: &SekaiServiceImpl, namespace: &str) {
         .unwrap();
 }
 
+fn seed_close_action_type(svc: &SekaiServiceImpl, namespace: &str) {
+    svc.db
+        .runtime()
+        .put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: namespace.into(),
+                type_id: "Ticket.close".into(),
+                version: "1".into(),
+                description: "close one ticket".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec![
+                    crate::sekai::governed_action_type::EFFECT_KIND_NOTIFY.into(),
+                ],
+                enabled: true,
+                ..Default::default()
+            },
+            "root",
+            1,
+        )
+        .unwrap();
+}
+
+struct ShadowInstructionHost {
+    remaining: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::sekai::agent_dry_run::AgentDryRunHost for ShadowInstructionHost {
+    fn admit_and_complete(
+        &self,
+        request: &crate::sekai::agent_dry_run::DryRunModelRequest,
+    ) -> Result<
+        crate::sekai::agent_dry_run::DryRunModelReply,
+        crate::sekai::agent_dry_run::DryRunFailure,
+    > {
+        if self.remaining.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(crate::sekai::agent_dry_run::DryRunFailure::Budget(
+                "budget exceeded".into(),
+            ));
+        }
+        self.remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let action_type = if request.instructions.contains("Close") {
+            "Ticket.close"
+        } else {
+            "Ticket.inspect"
+        };
+        Ok(crate::sekai::agent_dry_run::DryRunModelReply {
+            route: "native/scripted".into(),
+            output: "scripted".into(),
+            tool_calls: Vec::new(),
+            proposed_actions: vec![crate::sekai::agent_dry_run::ProposedAction {
+                action_type: action_type.into(),
+                parameters_json: r#"{"id":"1"}"#.into(),
+            }],
+        })
+    }
+}
+
+async fn seed_agent_close_edit(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    expected_head: &str,
+) -> String {
+    svc.apply_definition_branch_edit(with_named_principal(
+        ApplyDefinitionBranchEditRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            expected_head_digest: expected_head.into(),
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "agent".into(),
+                member_id: "triage".into(),
+                member_digest: String::new(),
+                definition_json: serde_json::json!({
+                    "contract_version": "sekai.agent-definition/v1",
+                    "name": "Triage",
+                    "task_class": "lookup",
+                    "instructions": "Close tickets.",
+                    "allowed_action_types": ["Ticket.inspect", "Ticket.close"]
+                })
+                .to_string(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: format!("edit-close-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .revision
+    .unwrap()
+    .revision_digest
+}
+
 async fn seed_agent_draft(svc: &SekaiServiceImpl, namespace: &str) -> String {
     let parent = seed_definition_parent(svc, namespace);
     grant_source_namespace(svc, namespace, "root", security::Role::Admin);
@@ -24170,6 +24264,399 @@ async fn agent_dry_run_refuses_allowed_actions_that_fail_the_type_schema() {
         response.actions[0].reason,
         crate::sekai::agent_dry_run::REFUSAL_INVALID_PARAMETERS
     );
+}
+
+#[tokio::test]
+async fn agent_shadow_lists_diffs_without_submitting_and_cannot_certify() {
+    let mut svc = service();
+    let namespace = "agent-shadow-rpc";
+    let active = seed_agent_draft(&svc, namespace).await;
+    let candidate = seed_agent_close_edit(&svc, namespace, &active).await;
+    seed_inspect_action_type(&svc, namespace);
+    seed_close_action_type(&svc, namespace);
+    svc.dry_run_host = Some(std::sync::Arc::new(ShadowInstructionHost {
+        remaining: std::sync::atomic::AtomicUsize::new(8),
+    }));
+    let response = svc
+        .run_agent_shadow(with_named_principal(
+            RunAgentShadowRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate.clone(),
+                envelopes: vec![AgentTriggerEnvelope {
+                    id: "env-1".into(),
+                    input: "ticket 1 arrived".into(),
+                }],
+                require_for_promotion: false,
+                active_revision_digest: active.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let report = response.report.expect("shadow report");
+    assert_eq!(report.evaluated, 1);
+    assert_eq!(report.differed, 1);
+    assert_eq!(report.unchanged, 0);
+    assert_eq!(report.samples[0].active[0].action_type, "Ticket.inspect");
+    assert_eq!(report.samples[0].candidate[0].action_type, "Ticket.close");
+    assert!(report.passing);
+    let instances = svc
+        .list_action_instances(with_named_principal(
+            ListActionInstancesRequest {
+                namespace: namespace.into(),
+                ..Default::default()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(instances.instances.is_empty());
+    let loaded = svc
+        .get_agent_shadow_report(with_named_principal(
+            GetAgentShadowReportRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .expect("stored report");
+    assert_eq!(loaded.shadow_id, report.shadow_id);
+    assert_eq!(loaded.differed, 1);
+    grant_source_namespace(&svc, namespace, "reader", security::Role::Viewer);
+    let denied_get = svc
+        .get_agent_shadow_report(with_named_principal(
+            GetAgentShadowReportRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate.clone(),
+            },
+            "reader",
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        denied_get.code() == tonic::Code::PermissionDenied
+            || denied_get.code() == tonic::Code::NotFound,
+        "{}",
+        denied_get.code()
+    );
+    let denied_require = svc
+        .run_agent_shadow(with_named_principal(
+            RunAgentShadowRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate.clone(),
+                envelopes: vec![AgentTriggerEnvelope {
+                    id: "env-1".into(),
+                    input: "ticket 1 arrived".into(),
+                }],
+                require_for_promotion: false,
+                active_revision_digest: active,
+            },
+            "reader",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_require.code(), tonic::Code::PermissionDenied);
+    let expires = now_millis() + 86_400_000;
+    let refused = svc
+        .put_definition_certification(with_named_principal(
+            PutDefinitionCertificationRequest {
+                namespace: namespace.into(),
+                revision_digest: candidate,
+                suite_id: crate::sekai::agent_shadow::suite_id(namespace, "triage"),
+                certification_id: report.shadow_id,
+                baseline_status: "pass".into(),
+                latest_status: "pass".into(),
+                expires_at_ms: expires,
+                revoked_at_ms: 0,
+            },
+            "reviewer",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        crate::sekai::agent_shadow::REFUSAL_SHADOW_CERTIFY
+    );
+}
+
+#[tokio::test]
+async fn agent_shadow_exhausted_budget_refuses_without_submitting() {
+    let mut svc = service();
+    let namespace = "agent-shadow-budget";
+    let active = seed_agent_draft(&svc, namespace).await;
+    let candidate = seed_agent_close_edit(&svc, namespace, &active).await;
+    let host = std::sync::Arc::new(crate::sekai::agent_dry_run::ScriptedHost {
+        route: Ok("native/scripted".into()),
+        budget: Err("budget exceeded".into()),
+        reply: crate::sekai::agent_dry_run::DryRunModelReply {
+            route: String::new(),
+            output: String::new(),
+            tool_calls: Vec::new(),
+            proposed_actions: Vec::new(),
+        },
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    svc.dry_run_host = Some(host.clone());
+    let denied = svc
+        .run_agent_shadow(with_named_principal(
+            RunAgentShadowRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate,
+                envelopes: vec![AgentTriggerEnvelope {
+                    id: "env-1".into(),
+                    input: "ticket 1 arrived".into(),
+                }],
+                require_for_promotion: false,
+                active_revision_digest: active,
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(denied.message(), "budget exceeded");
+    assert_eq!(host.attempts(), 1);
+    let instances = svc
+        .list_action_instances(with_named_principal(
+            ListActionInstancesRequest {
+                namespace: namespace.into(),
+                ..Default::default()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(instances.instances.is_empty());
+}
+
+#[tokio::test]
+async fn agent_shadow_blocks_merge_when_the_namespace_requires_a_report() {
+    let mut svc = service();
+    let namespace = "agent-shadow-merge";
+    let active = seed_agent_draft(&svc, namespace).await;
+    seed_inspect_action_type(&svc, namespace);
+    seed_close_action_type(&svc, namespace);
+    svc.dry_run_host = Some(std::sync::Arc::new(ShadowInstructionHost {
+        remaining: std::sync::atomic::AtomicUsize::new(16),
+    }));
+    svc.run_agent_shadow(with_named_principal(
+        RunAgentShadowRequest {
+            namespace: namespace.into(),
+            member_id: "triage".into(),
+            candidate_revision_digest: active.clone(),
+            envelopes: vec![AgentTriggerEnvelope {
+                id: "env-1".into(),
+                input: "ticket 1 arrived".into(),
+            }],
+            require_for_promotion: true,
+            active_revision_digest: active.clone(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = seed_agent_close_edit(&svc, namespace, &active).await;
+    seed_agent_eval_run(&svc, "shadow-merge-cert", "agent-suite", true);
+    let expires = now_millis() + 86_400_000;
+    svc.put_definition_certification(with_named_principal(
+        PutDefinitionCertificationRequest {
+            namespace: namespace.into(),
+            revision_digest: candidate.clone(),
+            suite_id: "agent-suite".into(),
+            certification_id: "shadow-merge-cert".into(),
+            baseline_status: "pass".into(),
+            latest_status: "pass".into(),
+            expires_at_ms: expires,
+            revoked_at_ms: 0,
+        },
+        "reviewer",
+    ))
+    .await
+    .unwrap();
+    let published = svc
+        .get_published_definition_revision(with_named_principal(
+            GetPublishedDefinitionRevisionRequest {
+                namespace: namespace.into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "shadow".into(),
+            base_digest: published.clone(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("propose-{namespace}"),
+            major_revision: false,
+            migration_plan_digest: String::new(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "shadow".into(),
+            idempotency_key: format!("approve-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let refused = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "shadow".into(),
+                expected_published_digest: published.clone(),
+                idempotency_key: format!("merge-{namespace}"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        crate::sekai::agent_shadow::REFUSAL_SHADOW
+    );
+    svc.run_agent_shadow(with_named_principal(
+        RunAgentShadowRequest {
+            namespace: namespace.into(),
+            member_id: "triage".into(),
+            candidate_revision_digest: candidate,
+            envelopes: vec![AgentTriggerEnvelope {
+                id: "env-1".into(),
+                input: "ticket 1 arrived".into(),
+            }],
+            require_for_promotion: true,
+            active_revision_digest: active,
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "shadow".into(),
+            expected_published_digest: published,
+            idempotency_key: format!("merge-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn agent_shadow_merge_without_eval_runs_table_is_not_required() {
+    let svc = service();
+    let namespace = "agent-shadow-no-eval-table";
+    let parent = seed_definition_parent(&svc, namespace);
+    svc.db
+        .runtime()
+        .conn()
+        .execute("DROP TABLE chisei_eval_runs", [])
+        .unwrap();
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: format!("create-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: format!("edit-{namespace}"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "shadow".into(),
+            base_digest: parent.revision_digest.clone(),
+            candidate_digest: candidate,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("propose-{namespace}"),
+            major_revision: false,
+            migration_plan_digest: String::new(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "shadow".into(),
+            idempotency_key: format!("approve-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "shadow".into(),
+                expected_published_digest: parent.revision_digest,
+                idempotency_key: format!("merge-{namespace}"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(merged.proposal.unwrap().status, "merged");
 }
 
 #[tokio::test]

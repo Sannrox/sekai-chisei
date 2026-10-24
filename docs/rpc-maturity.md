@@ -96,6 +96,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.PutDefinitionCertification` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionCertificationGate` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.DryRunAgent` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.RunAgentShadow` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.GetAgentShadowReport` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetPublishedDefinitionRevision` | `sekai.definition-branch` | yes | none | `stable` |
 | `SekaiService.ListPublishedDefinitionRevisions` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ProposeDefinitionRollback` | `sekai.definition-branch` | yes | none | `experimental` |

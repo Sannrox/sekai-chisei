@@ -404,6 +404,8 @@ mod tests {
         assert!(inventory.entry("PutDefinitionCertification").is_some());
         assert!(inventory.entry("GetDefinitionCertificationGate").is_some());
         assert!(inventory.entry("DryRunAgent").is_some());
+        assert!(inventory.entry("RunAgentShadow").is_some());
+        assert!(inventory.entry("GetAgentShadowReport").is_some());
         assert!(inventory.entry("CloseDefinitionProposal").is_some());
         assert!(inventory.entry("GetPublishedDefinitionRevision").is_some());
         assert!(

@@ -1,6 +1,7 @@
 //! Agent dry run: one input, a step trace, no Action submitted (ADR 0109).
 
 use crate::sekai::agent_definition::AgentDefinition;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const DRY_RUN_CONFIG_REF: &str = "dry_run";
@@ -41,7 +42,7 @@ pub struct DryRunModelReply {
     pub proposed_actions: Vec<ProposedAction>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionTrace {
     pub action_type: String,
     pub parameters_json: String,
