@@ -2479,6 +2479,26 @@ mod tests {
         SekaiDb::new(":memory:").unwrap()
     }
 
+    /// #1554: the single in-memory connection cannot be checked out twice on
+    /// one thread. That fails at once instead of waiting on the pool until
+    /// an external kill.
+    #[test]
+    #[should_panic(expected = "nested SQLite checkout")]
+    fn nested_in_memory_checkout_fails_at_once() {
+        let db = test_db();
+        let _outer = db.conn();
+        let _inner = db.conn();
+    }
+
+    /// Opening an in-memory store runs every migration family, dataset
+    /// health included, without a nested checkout.
+    #[test]
+    fn in_memory_store_migrates_without_a_nested_checkout() {
+        let db = test_db();
+        assert!(db.list_datasets().unwrap().is_empty());
+        let _held = db.conn();
+    }
+
     #[test]
     fn nested_memory_checkout_fails_fast() {
         let db = test_db();
