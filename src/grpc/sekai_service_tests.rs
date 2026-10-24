@@ -26800,6 +26800,7 @@ fn catalog_request(source_id: &str) -> RegisterCatalogEntryRequest {
         schema_summary: "id,total".into(),
         freshness_ms: 1,
         deprecated: false,
+        binding: None,
     }
 }
 
@@ -26825,6 +26826,137 @@ async fn visible_catalog_entries(svc: &SekaiServiceImpl, principal: &str) -> Vec
             .collect()
     })
     .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn catalog_lineage_follows_bindings_and_redacts_undiscoverable_targets() {
+    let svc = service();
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(
+            "warehouse",
+            "warehouse-team",
+            security::Role::Admin,
+            "local",
+        )
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "orders-binding".into(),
+            kind: "dataset_binding".into(),
+            name: "orders".into(),
+            namespace: "warehouse".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "orders".into(),
+            name: "orders".into(),
+            columns: Vec::new(),
+            object_id: "orders-binding".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "global-hidden".into(),
+            name: "global-hidden".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    let mut hidden = catalog_request("tbl-hidden");
+    hidden.binding = Some(CatalogBinding {
+        kind: "dataset".into(),
+        target_id: "global-hidden".into(),
+        source_type_descriptor_id: String::new(),
+    });
+    let denied = svc
+        .register_catalog_entry(with_named_principal(hidden, "warehouse-team"))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::InvalidArgument);
+    let mut bound = catalog_request("tbl-bound");
+    bound.binding = Some(CatalogBinding {
+        kind: "dataset".into(),
+        target_id: "orders".into(),
+        source_type_descriptor_id: String::new(),
+    });
+    let registered = svc
+        .register_catalog_entry(with_named_principal(bound, "warehouse-team"))
+        .await
+        .unwrap()
+        .into_inner();
+    let entry_id = registered.entry.unwrap().id;
+    let unbound_id = svc
+        .register_catalog_entry(with_named_principal(
+            catalog_request("tbl-free"),
+            "warehouse-team",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .entry
+        .unwrap()
+        .id;
+    let none = svc
+        .get_catalog_entry_lineage(with_named_principal(
+            GetCatalogEntryLineageRequest {
+                namespace: "warehouse".into(),
+                entry_id: unbound_id.clone(),
+                depth: 0,
+                page_size: 0,
+                page_token: String::new(),
+            },
+            "warehouse-team",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!none.has_binding);
+    let lineage = svc
+        .get_catalog_entry_lineage(with_named_principal(
+            GetCatalogEntryLineageRequest {
+                namespace: "warehouse".into(),
+                entry_id,
+                depth: 0,
+                page_size: 0,
+                page_token: String::new(),
+            },
+            "warehouse-team",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(lineage.has_binding);
+    let deep = svc
+        .get_catalog_entry_lineage(with_named_principal(
+            GetCatalogEntryLineageRequest {
+                namespace: "warehouse".into(),
+                entry_id: unbound_id,
+                depth: 9,
+                page_size: 0,
+                page_token: String::new(),
+            },
+            "warehouse-team",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(deep.code(), tonic::Code::InvalidArgument);
 }
 
 #[tokio::test]

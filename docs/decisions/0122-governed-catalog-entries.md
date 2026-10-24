@@ -76,8 +76,12 @@ catalog must not become a second metadata store with its own policy.
   reads fail closed rather than activation breaking.
 - Owners and tags are stored as comma-separated properties, so a facet on
   them groups by the whole list. Per-value facets are later work.
-- Lineage on entries (#1685), owner curation (#1686) and service, release
-  and environment entries (#1688) build on this record.
+- Lineage on entries (#1685): an entry binds to exactly one typed core
+  artifact at registration (dataset, object type, transform, or source plus
+  descriptor). Lineage is derived from those bindings and the transform
+  graph; unbound entries have none. A target the caller cannot discover is a
+  redacted placeholder. Owner curation (#1686) and service, release and
+  environment entries (#1688) build on this record.
 
 ## Alternatives considered
 

@@ -2198,6 +2198,21 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_source_identity_lineage(
+        &self,
+        namespace: &str,
+        source_id: &str,
+    ) -> Result<Option<crate::sekai::object_lineage::ObjectLineage>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                ObjectSyncBackend::get_source_identity_lineage(db.as_ref(), namespace, source_id)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ObjectSyncBackend::get_source_identity_lineage(db.as_ref(), namespace, source_id)
+            }),
+        }
+    }
+
     pub fn get_source_sync_state(
         &self,
         namespace: &str,

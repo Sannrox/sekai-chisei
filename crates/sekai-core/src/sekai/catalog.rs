@@ -28,6 +28,7 @@ pub enum EntryKind {
     Dataset,
     ObjectType,
     Pipeline,
+    Source,
 }
 
 impl EntryKind {
@@ -36,6 +37,7 @@ impl EntryKind {
             "dataset" => Ok(Self::Dataset),
             "object_type" => Ok(Self::ObjectType),
             "pipeline" => Ok(Self::Pipeline),
+            "source" => Ok(Self::Source),
             other => Err(format!("unknown catalog entry kind {other:?}")),
         }
     }
@@ -45,6 +47,188 @@ impl EntryKind {
             Self::Dataset => "dataset",
             Self::ObjectType => "object_type",
             Self::Pipeline => "pipeline",
+            Self::Source => "source",
+        }
+    }
+}
+
+pub const BINDING_KIND_DATASET: &str = "dataset";
+pub const BINDING_KIND_OBJECT_TYPE: &str = "object_type";
+pub const BINDING_KIND_TRANSFORM: &str = "transform";
+pub const BINDING_KIND_SOURCE: &str = "source";
+const BINDING_KIND_PROPERTY: &str = "binding_kind";
+const BINDING_ID_PROPERTY: &str = "binding_id";
+const BINDING_DESCRIPTOR_PROPERTY: &str = "source_type_descriptor_id";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingKind {
+    Dataset,
+    ObjectType,
+    Transform,
+    Source,
+}
+
+impl BindingKind {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            BINDING_KIND_DATASET => Ok(Self::Dataset),
+            BINDING_KIND_OBJECT_TYPE => Ok(Self::ObjectType),
+            BINDING_KIND_TRANSFORM => Ok(Self::Transform),
+            BINDING_KIND_SOURCE => Ok(Self::Source),
+            other => Err(format!("unknown catalog binding kind {other:?}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dataset => BINDING_KIND_DATASET,
+            Self::ObjectType => BINDING_KIND_OBJECT_TYPE,
+            Self::Transform => BINDING_KIND_TRANSFORM,
+            Self::Source => BINDING_KIND_SOURCE,
+        }
+    }
+
+    pub fn entry_kind(self) -> EntryKind {
+        match self {
+            Self::Dataset => EntryKind::Dataset,
+            Self::ObjectType => EntryKind::ObjectType,
+            Self::Transform => EntryKind::Pipeline,
+            Self::Source => EntryKind::Source,
+        }
+    }
+}
+
+/// One typed core artifact an entry binds to (#1685). Unbound entries have
+/// no lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogBinding {
+    pub kind: BindingKind,
+    pub target_id: String,
+    pub source_type_descriptor_id: String,
+}
+
+impl CatalogBinding {
+    pub fn parse(
+        kind: &str,
+        target_id: &str,
+        source_type_descriptor_id: &str,
+    ) -> Result<Self, CatalogError> {
+        let kind = BindingKind::parse(kind).map_err(CatalogError::Invalid)?;
+        let target_id = target_id.trim();
+        let target_ok = match kind {
+            // Registered source identities are `source:instance#kind/key`.
+            BindingKind::Source => source_identity_ok(target_id),
+            // Ontology member ids can be definition names such as `Sales Order`.
+            BindingKind::ObjectType => definition_id_ok(target_id),
+            _ => token_ok(target_id),
+        };
+        if !target_ok {
+            return Err(CatalogError::Invalid(
+                "catalog binding target_id must be a stable identifier".into(),
+            ));
+        }
+        let source_type_descriptor_id = source_type_descriptor_id.trim();
+        match kind {
+            BindingKind::Source => {
+                if !token_ok(source_type_descriptor_id) {
+                    return Err(CatalogError::Invalid(
+                        "source bindings require a registered source type descriptor".into(),
+                    ));
+                }
+            }
+            _ if !source_type_descriptor_id.is_empty() => {
+                return Err(CatalogError::Invalid(
+                    "source_type_descriptor_id is only for source bindings".into(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(Self {
+            kind,
+            target_id: target_id.into(),
+            source_type_descriptor_id: source_type_descriptor_id.into(),
+        })
+    }
+
+    pub fn matches_entry_kind(&self, entry_kind: EntryKind) -> bool {
+        self.kind.entry_kind() == entry_kind
+    }
+}
+
+pub fn binding_from_entry(entry: &Object) -> Option<CatalogBinding> {
+    let kind = entry.properties.get(BINDING_KIND_PROPERTY)?;
+    if kind.is_empty() {
+        return None;
+    }
+    CatalogBinding::parse(
+        kind,
+        entry
+            .properties
+            .get(BINDING_ID_PROPERTY)
+            .map(String::as_str)
+            .unwrap_or_default(),
+        entry
+            .properties
+            .get(BINDING_DESCRIPTOR_PROPERTY)
+            .map(String::as_str)
+            .unwrap_or_default(),
+    )
+    .ok()
+}
+
+/// The bound artifact exists and is discoverable in `namespace`.
+pub fn validate_binding_target(
+    db: &RuntimeDb,
+    namespace: &str,
+    binding: &CatalogBinding,
+) -> Result<(), CatalogError> {
+    let missing = || CatalogError::Invalid("catalog binding target does not exist".into());
+    match binding.kind {
+        BindingKind::Dataset => db
+            .get_dataset(&binding.target_id)
+            .map_err(CatalogError::Storage)?
+            .ok_or_else(missing)
+            .map(|_| ()),
+        BindingKind::ObjectType => {
+            let Some(revision) = db
+                .get_published_definition_revision(namespace)
+                .map_err(CatalogError::Storage)?
+            else {
+                return Err(missing());
+            };
+            revision
+                .members
+                .iter()
+                .any(|member| {
+                    member.member_kind == "object_type" && member.member_id == binding.target_id
+                })
+                .then_some(())
+                .ok_or_else(missing)
+        }
+        BindingKind::Transform => db
+            .get_governed_transform(namespace, &binding.target_id)
+            .map_err(CatalogError::Storage)?
+            .ok_or_else(missing)
+            .map(|_| ()),
+        BindingKind::Source => {
+            let descriptor = db
+                .get_source_type_descriptor(namespace, &binding.source_type_descriptor_id)
+                .map_err(CatalogError::Storage)?
+                .ok_or_else(missing)?;
+            if descriptor.status != crate::sekai::source_type_descriptor::STATUS_LIVE {
+                return Err(missing());
+            }
+            let Some(lineage) = db
+                .get_source_identity_lineage(namespace, &binding.target_id)
+                .map_err(CatalogError::Storage)?
+            else {
+                return Err(missing());
+            };
+            if lineage.type_digest != descriptor.digest {
+                return Err(missing());
+            }
+            Ok(())
         }
     }
 }
@@ -69,6 +253,8 @@ pub struct CatalogRegistration {
     /// Monotonic generation of the source's view; a registration older than
     /// the stored one is superseded. Zero when the source has none.
     pub source_generation: i64,
+    /// Optional typed core binding. Once set it stays stable.
+    pub binding: Option<CatalogBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +275,56 @@ fn token_ok(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.:@/".contains(c))
+}
+
+fn source_identity_ok(value: &str) -> bool {
+    // `registered_source_id` is `source:instance#kind/key`. Each part uses the
+    // registered-token alphabet (no `#` or `:`; `/` only in instance).
+    const MAX: usize = crate::sekai::object_sync::MAX_SOURCE_IDENTIFIER_BYTES;
+    const MAX_REGISTERED_SOURCE_ID: usize = MAX * 4 + 3;
+    if value.is_empty() || value.len() > MAX_REGISTERED_SOURCE_ID || value.trim() != value {
+        return false;
+    }
+    let Some((left, right)) = value.split_once('#') else {
+        return false;
+    };
+    if right.contains('#') {
+        return false;
+    }
+    let Some((source, instance)) = left.split_once(':') else {
+        return false;
+    };
+    if instance.contains(':') {
+        return false;
+    }
+    let Some((kind, key)) = right.split_once('/') else {
+        return false;
+    };
+    if key.contains('/') {
+        return false;
+    }
+    registered_token_ok(source, false)
+        && registered_token_ok(instance, true)
+        && registered_token_ok(kind, false)
+        && registered_token_ok(key, false)
+}
+
+fn registered_token_ok(value: &str, allow_slash: bool) -> bool {
+    const MAX: usize = crate::sekai::object_sync::MAX_SOURCE_IDENTIFIER_BYTES;
+    !value.is_empty()
+        && value.len() <= MAX
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+        && !value.contains('#')
+        && !value.contains(':')
+        && (allow_slash || !value.contains('/'))
+}
+
+fn definition_id_ok(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 fn normalized_list(label: &str, items: &[String]) -> Result<Vec<String>, CatalogError> {
@@ -147,6 +383,11 @@ impl CatalogRegistration {
         }
         self.owners = normalized_list("owners", &self.owners)?;
         self.tags = normalized_list("tags", &self.tags)?;
+        if let Some(binding) = &self.binding
+            && !binding.matches_entry_kind(self.entry_kind)
+        {
+            return invalid("catalog binding kind does not match entry_kind");
+        }
         Ok(self)
     }
 
@@ -194,6 +435,16 @@ impl CatalogRegistration {
                 "source_generation".into(),
                 self.source_generation.to_string(),
             );
+        }
+        if let Some(binding) = &self.binding {
+            properties.insert(BINDING_KIND_PROPERTY.into(), binding.kind.as_str().into());
+            properties.insert(BINDING_ID_PROPERTY.into(), binding.target_id.clone());
+            if !binding.source_type_descriptor_id.is_empty() {
+                properties.insert(
+                    BINDING_DESCRIPTOR_PROPERTY.into(),
+                    binding.source_type_descriptor_id.clone(),
+                );
+            }
         }
         if !self.marking.is_empty() {
             properties.insert(OBJECT_CLASSIFICATION_PROPERTY.into(), self.marking.clone());
@@ -388,6 +639,24 @@ pub fn register(
         if registration.source_generation < stored_generation {
             return Err(CatalogError::Superseded);
         }
+        let stored_binding = binding_from_entry(existing);
+        match (stored_binding, registration.binding.take()) {
+            (Some(stored), Some(incoming)) if stored != incoming => {
+                return Err(CatalogError::Invalid(
+                    "catalog binding is stable after registration".into(),
+                ));
+            }
+            (Some(stored), _) => registration.binding = Some(stored),
+            (None, incoming) => registration.binding = incoming,
+        }
+    }
+    // Stored bindings stay after the target is unpublished (ontology
+    // deprecation). Discoverability is checked on the lineage walk.
+    let stored_binding = existing.as_ref().and_then(binding_from_entry);
+    if stored_binding.is_none()
+        && let Some(binding) = &registration.binding
+    {
+        validate_binding_target(db, &registration.namespace, binding)?;
     }
     let stored = existing
         .as_ref()
@@ -552,6 +821,11 @@ pub fn sync_ontology_entries(
                 freshness_ms: revision.created_at_ms,
                 deprecated: false,
                 source_generation: generation,
+                binding: Some(CatalogBinding {
+                    kind: BindingKind::ObjectType,
+                    target_id: member.member_id.clone(),
+                    source_type_descriptor_id: String::new(),
+                }),
             },
             actor,
             now_ms,
@@ -613,6 +887,7 @@ pub fn sync_ontology_entries(
                     freshness_ms: property("freshness_ms").parse().unwrap_or(0),
                     deprecated: true,
                     source_generation: generation,
+                    binding: binding_from_entry(&entry),
                 },
                 actor,
                 now_ms,
@@ -765,6 +1040,7 @@ mod tests {
             freshness_ms: 10,
             deprecated: false,
             source_generation: 0,
+            binding: None,
         }
     }
 
@@ -827,6 +1103,84 @@ mod tests {
         assert_eq!(entries.len(), 2);
         let history = db.list_object_changes(&first.entry.id, 10, 0).unwrap();
         assert!(history.iter().any(|c| c.changed_by == "mizuchi-svc"));
+    }
+
+    #[test]
+    fn catalog_binding_is_stable_after_set_and_unbound_may_bind() {
+        let db = db();
+        let dataset = |id: &str| crate::sekai::dataset::Dataset {
+            id: id.into(),
+            name: id.into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        };
+        db.create_dataset(&dataset("orders")).unwrap();
+        let unbound = put(&db, registration("tbl-1"), 1).unwrap();
+        assert!(binding_from_entry(&unbound.entry).is_none());
+        let mut bound = registration("tbl-1");
+        bound.binding = Some(CatalogBinding {
+            kind: BindingKind::Dataset,
+            target_id: "orders".into(),
+            source_type_descriptor_id: String::new(),
+        });
+        let bound = put(&db, bound, 2).unwrap();
+        assert_eq!(
+            binding_from_entry(&bound.entry).unwrap().target_id,
+            "orders"
+        );
+        db.create_dataset(&dataset("other")).unwrap();
+        let mut retarget = registration("tbl-1");
+        retarget.binding = Some(CatalogBinding {
+            kind: BindingKind::Dataset,
+            target_id: "other".into(),
+            source_type_descriptor_id: String::new(),
+        });
+        match put(&db, retarget, 3) {
+            Err(CatalogError::Invalid(message)) => {
+                assert!(message.contains("stable"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut missing = registration("tbl-2");
+        missing.binding = Some(CatalogBinding {
+            kind: BindingKind::Dataset,
+            target_id: "nope".into(),
+            source_type_descriptor_id: String::new(),
+        });
+        match put(&db, missing, 4) {
+            Err(CatalogError::Invalid(message)) => {
+                assert!(message.contains("does not exist"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match CatalogBinding::parse("source", "raw", "sha256:desc") {
+            Err(CatalogError::Invalid(message)) => {
+                assert!(message.contains("stable identifier"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        CatalogBinding::parse("source", "warehouse:shop#Order/tbl1", "sha256:desc")
+            .expect("registered source identity");
+        CatalogBinding::parse("source", "warehouse:shop#Order/order+1", "sha256:desc")
+            .expect("registered source identities keep source-identifier characters");
+        CatalogBinding::parse("object_type", "Sales Order", "")
+            .expect("definition identifiers may contain spaces");
+        match validate_binding_target(
+            &db,
+            "acme",
+            &CatalogBinding {
+                kind: BindingKind::Source,
+                target_id: "warehouse:shop#Order/tbl1".into(),
+                source_type_descriptor_id: "sha256:desc".into(),
+            },
+        ) {
+            Err(CatalogError::Invalid(message)) => {
+                assert!(message.contains("does not exist"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

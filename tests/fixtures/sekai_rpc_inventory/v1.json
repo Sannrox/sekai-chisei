@@ -1743,6 +1743,24 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "GetCatalogEntryLineage",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/catalog.rs",
+        "crates/sekai-core/src/sekai/catalog_lineage.rs",
+        "src/grpc/catalog_rpc.rs",
+        "docs/catalog.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.datasets",
+        "sekai.definition-branch",
+        "sekai.object-sync"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "BeginMediaUpload",
       "kind": "persistent",
       "surfaces": [

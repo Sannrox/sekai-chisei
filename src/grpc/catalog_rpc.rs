@@ -48,7 +48,49 @@ pub(super) async fn register_catalog_entry(
         freshness_ms: input.freshness_ms,
         deprecated: input.deprecated,
         source_generation: 0,
+        binding: match input.binding {
+            Some(binding)
+                if !binding.kind.is_empty()
+                    || !binding.target_id.is_empty()
+                    || !binding.source_type_descriptor_id.is_empty() =>
+            {
+                Some(
+                    catalog::CatalogBinding::parse(
+                        &binding.kind,
+                        &binding.target_id,
+                        &binding.source_type_descriptor_id,
+                    )
+                    .map_err(|error| match error {
+                        CatalogError::Invalid(message) => Status::invalid_argument(message),
+                        other => Status::internal(format!("{other:?}")),
+                    })?,
+                )
+            }
+            _ => None,
+        },
     };
+    if let Some(binding) = &registration.binding {
+        let already_bound = db
+            .get_object(&registration.entry_id())
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(catalog::binding_from_entry)
+            .is_some();
+        if !already_bound
+            && !binding_discoverable_for_caller(
+                service,
+                &principals,
+                tenant_context.as_ref(),
+                &registration.namespace,
+                binding,
+            )
+        {
+            return Err(Status::invalid_argument(
+                "catalog binding target does not exist",
+            ));
+        }
+    }
     let actor = principals.first().cloned().unwrap_or_default();
     let policy_generation = object_security_generation(db, &registration.namespace)?;
     // The stored entry is checked like any object update (ACL, markings,
@@ -186,6 +228,164 @@ pub(super) async fn register_catalog_entry(
         entry: shown,
         changed: registered.changed,
     }))
+}
+
+pub(super) async fn get_catalog_entry_lineage(
+    service: &SekaiServiceImpl,
+    req: Request<GetCatalogEntryLineageRequest>,
+) -> Result<Response<GetCatalogEntryLineageResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let db = service.db.runtime();
+    let tenant_context = request_tenant_context(db, &req)?;
+    let purpose = request_purpose_presentation(&req, &principals);
+    let policy_context = principal_policy_context(&req);
+    let input = req.into_inner();
+    require_canonical_source_namespace(&input.namespace)?;
+    enforce_namespace_tenant_context_for(
+        db,
+        tenant_context.as_ref(),
+        &input.namespace,
+        crate::enterprise::NamespaceAction::Discover,
+    )?;
+    check_team_namespace(db, &principals, &input.namespace, false)?;
+    let depth =
+        crate::sekai::catalog_lineage::parse_depth(input.depth).map_err(|error| match error {
+            CatalogError::Invalid(message) => Status::invalid_argument(message),
+            other => Status::internal(format!("{other:?}")),
+        })?;
+    let (page_size, offset) =
+        crate::sekai::catalog_lineage::parse_page(input.page_size, &input.page_token).map_err(
+            |error| match error {
+                CatalogError::Invalid(message) => Status::invalid_argument(message),
+                other => Status::internal(format!("{other:?}")),
+            },
+        )?;
+    let entry = db
+        .get_object(&input.entry_id)
+        .map_err(|_| Status::internal("catalog entry unavailable"))?
+        .ok_or_else(|| Status::not_found("catalog entry unavailable"))?;
+    if entry.kind != catalog::CATALOG_ENTRY_KIND || entry.namespace != input.namespace {
+        return Err(Status::not_found("catalog entry unavailable"));
+    }
+    if !object_is_visible_for_purpose(
+        db,
+        &service.security,
+        &entry,
+        &principals,
+        tenant_context.as_ref(),
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+        purpose.as_ref(),
+    ) {
+        return Err(Status::not_found("catalog entry unavailable"));
+    }
+    let page = crate::sekai::catalog_lineage::walk_lineage(
+        db,
+        &entry,
+        depth,
+        page_size,
+        offset,
+        |candidate| {
+            object_is_visible_for_purpose(
+                db,
+                &service.security,
+                candidate,
+                &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Read,
+                purpose.as_ref(),
+            )
+        },
+        |binding| {
+            binding_discoverable_for_caller(
+                service,
+                &principals,
+                tenant_context.as_ref(),
+                &input.namespace,
+                binding,
+            )
+        },
+    )
+    .map_err(|error| match error {
+        CatalogError::Invalid(message) => Status::invalid_argument(message),
+        CatalogError::Storage(message) => Status::internal(message),
+        other => Status::internal(format!("{other:?}")),
+    })?;
+    let to_node =
+        |node: crate::sekai::catalog_lineage::LineageNode| -> Result<CatalogLineageNode, Status> {
+            Ok(CatalogLineageNode {
+                entry: match node.entry {
+                    Some(entry) => Some(to_proto_obj(
+                        &service.resolve_computed_for_response_with_policy(
+                            entry,
+                            &principals,
+                            Some(&policy_context),
+                            tenant_context.as_ref(),
+                            purpose.as_ref(),
+                        )?,
+                    )),
+                    None => None,
+                },
+                redacted: node.redacted,
+                entry_kind: node.entry_kind,
+            })
+        };
+    Ok(Response::new(GetCatalogEntryLineageResponse {
+        has_binding: page.has_binding,
+        upstream: page
+            .upstream
+            .into_iter()
+            .map(to_node)
+            .collect::<Result<Vec<_>, _>>()?,
+        downstream: page
+            .downstream
+            .into_iter()
+            .map(to_node)
+            .collect::<Result<Vec<_>, _>>()?,
+        next_page_token: page.next_page_token,
+    }))
+}
+
+/// Discover access for a bound core artifact. Datasets use the same bar as
+/// `ListDatasets`; other kinds are namespace-scoped existence plus live/published.
+fn binding_discoverable_for_caller(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    binding: &catalog::CatalogBinding,
+) -> bool {
+    if catalog::validate_binding_target(service.db.runtime(), namespace, binding).is_err() {
+        return false;
+    }
+    let db = service.db.runtime();
+    match binding.kind {
+        catalog::BindingKind::Dataset => {
+            let Ok(Some(dataset)) = db.get_dataset(&binding.target_id) else {
+                return false;
+            };
+            check_dataset_access(db, &service.security, principals, &dataset, false).is_ok()
+                && catalog_binding_discoverable(
+                    db,
+                    &service.security,
+                    tenant_context,
+                    &dataset.object_id,
+                    principals,
+                )
+        }
+        catalog::BindingKind::ObjectType => {
+            let object_id = definition_member_object_id("object_type", &binding.target_id);
+            check_read(&service.security, &object_id, principals).is_ok()
+                && catalog_binding_discoverable(
+                    db,
+                    &service.security,
+                    tenant_context,
+                    &object_id,
+                    principals,
+                )
+        }
+        catalog::BindingKind::Transform | catalog::BindingKind::Source => true,
+    }
 }
 
 /// Catalog-attributed invocation helpers shared by the semantic RPCs.

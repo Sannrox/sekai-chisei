@@ -2,14 +2,15 @@
 
 Catalog entries describe datasets, object types and pipelines: owners,
 steward, tags, marking, schema summary, freshness and status. They are
-experimental; `RegisterCatalogEntry` needs `SEKAI_EXPERIMENTAL_RPCS=1` or the
-`experimental-rpcs` Cargo feature (see [rpc-maturity.md](rpc-maturity.md)).
+experimental; `RegisterCatalogEntry` and `GetCatalogEntryLineage` need
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature (see
+[rpc-maturity.md](rpc-maturity.md)).
 The design is [ADR 0122](decisions/0122-governed-catalog-entries.md).
 
 ## Reading
 
 An entry is an object of kind `catalog_entry` in the namespace it describes,
-with properties `entry_kind` (`dataset`, `object_type` or `pipeline`),
+with properties `entry_kind` (`dataset`, `object_type`, `pipeline` or `source`),
 `source_system`, `source_id`, `description`, `owners`, `steward`, `tags`,
 `access_marking`, `schema_summary`, `freshness_ms` and `status` (`active` or
 `deprecated`). Read and find entries with the ordinary object RPCs and
@@ -65,5 +66,21 @@ object type, with its `access_marking` and property names, and deprecates
 entries for object types no longer published. Namespaces under a write
 freeze catch up after it lifts.
 
-Not yet covered: lineage on entries (#1685), and service, release and
-environment entries (#1688).
+## Lineage
+
+`GetCatalogEntryLineage` walks typed core bindings (#1685). At registration an
+entry may carry exactly one binding for its kind: a dataset id, an object type
+id, a transform id, or a source identifier plus its live source type
+descriptor. Registration checks the target exists and is discoverable; a later
+registration cannot retarget it. Ontology-published object types bind
+themselves. Unbound entries have no lineage and say so.
+
+Traversal uses those bindings, the transform graph (input and output
+datasets), recorded source dataset identity, and registered object-type
+datasources. There is no second lineage store and no name inference. Depth
+defaults to 8 and page size to 32. A node whose bound target the caller cannot
+discover is a redacted placeholder: kind only, no id, name or marking. Search
+counts and facets still omit hidden entries. Registration of a new binding
+needs the same discover access `ListDatasets` uses for that target.
+
+Not yet covered: service, release and environment entries (#1688).

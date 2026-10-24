@@ -196,6 +196,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.ListCommentMentions` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetOntologyChangelog` | `sekai.definitions` | yes | none | `experimental` |
 | `SekaiService.RegisterCatalogEntry` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetCatalogEntryLineage` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.BeginMediaUpload` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.UploadMediaChunk` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.CompleteMediaUpload` | `sekai.graph` | yes | none | `experimental` |
