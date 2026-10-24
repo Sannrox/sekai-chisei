@@ -530,6 +530,20 @@ impl SekaiService for SekaiServiceImpl {
         rpc_definitions::dry_run_agent(self, req).await
     }
 
+    async fn run_agent_shadow(
+        &self,
+        req: Request<RunAgentShadowRequest>,
+    ) -> Result<Response<RunAgentShadowResponse>, Status> {
+        rpc_definitions::run_agent_shadow(self, req).await
+    }
+
+    async fn get_agent_shadow_report(
+        &self,
+        req: Request<GetAgentShadowReportRequest>,
+    ) -> Result<Response<GetAgentShadowReportResponse>, Status> {
+        rpc_definitions::get_agent_shadow_report(self, req).await
+    }
+
     async fn get_definition_branch(
         &self,
         req: Request<GetDefinitionBranchRequest>,
@@ -1975,8 +1989,6 @@ impl SekaiService for SekaiServiceImpl {
         rpc_data::get_provenance_report(self, req).await
     }
 }
-
-type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
 
 #[cfg(test)]
 #[path = "sekai_service_tests.rs"]

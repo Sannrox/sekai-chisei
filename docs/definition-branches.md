@@ -341,6 +341,14 @@ stored as an eval run marked `dry_run` and cannot bind
 Route admission and budget are checked once; a failure is returned, not
 retried. The RPC is experimental.
 
+`RunAgentShadow` replays durably recorded trigger envelopes through
+`DryRunAgent` against an active revision and a candidate. There is no live
+trigger path and no cron. The report lists proposed-Action differences with
+cost and latency. No Action is submitted. A namespace that opts in with
+`require_for_promotion` needs a passing report in addition to certification
+(ADR 0079); the report never certifies. `GetAgentShadowReport` reads the
+stored report. The RPCs are experimental.
+
 ### Scoped draft authoring
 
 Scoped authenticated contexts can call qualified `sekai.SekaiService`

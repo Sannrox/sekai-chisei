@@ -820,6 +820,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
             | "DryRunAgent"
+            | "RunAgentShadow"
+            | "GetAgentShadowReport"
             | "GetDefinitionBranch"
             | "CreateDefinitionBranch"
             | "ApplyDefinitionBranchEdit"

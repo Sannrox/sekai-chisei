@@ -298,6 +298,32 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "RunAgentShadow",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "src/sekai/agent_shadow.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetAgentShadowReport",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "src/sekai/agent_shadow.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetPublishedDefinitionRevision",
       "kind": "persistent",
       "surfaces": [

@@ -3674,6 +3674,52 @@ message DryRunAgentResponse {
   repeated DryRunAgentToolCall tool_calls = 3;
   repeated DryRunAgentAction actions = 4;
 }
+
+// #1631 Agent shadows: replay recorded trigger envelopes through DryRunAgent.
+// No live trigger path. Proposed Actions are compared and never submitted.
+message AgentTriggerEnvelope {
+  string id = 1;
+  string input = 2;
+}
+message AgentShadowSample {
+  string envelope_id = 1;
+  string input = 2;
+  repeated DryRunAgentAction active = 3;
+  repeated DryRunAgentAction candidate = 4;
+}
+message AgentShadowReport {
+  string contract_version = 1;
+  string namespace = 2;
+  string member_id = 3;
+  string active_revision_digest = 4;
+  string candidate_revision_digest = 5;
+  string shadow_id = 6;
+  uint32 evaluated = 7;
+  uint32 unchanged = 8;
+  uint32 differed = 9;
+  uint32 cost_tokens = 10;
+  int64 latency_ms = 11;
+  bool passing = 12;
+  string verdict_reason = 13;
+  bool require_for_promotion = 14;
+  repeated AgentShadowSample samples = 15;
+}
+message RunAgentShadowRequest {
+  string namespace = 1;
+  string member_id = 2;
+  string candidate_revision_digest = 3;
+  repeated AgentTriggerEnvelope envelopes = 4;
+  bool require_for_promotion = 5;
+  // Empty means the published revision.
+  string active_revision_digest = 6;
+}
+message RunAgentShadowResponse { AgentShadowReport report = 1; }
+message GetAgentShadowReportRequest {
+  string namespace = 1;
+  string member_id = 2;
+  string candidate_revision_digest = 3;
+}
+message GetAgentShadowReportResponse { AgentShadowReport report = 1; }
 message DefinitionCertificationGate {
   string namespace = 1;
   string revision_digest = 2;
@@ -4401,6 +4447,8 @@ service SekaiService {
   rpc PutDefinitionCertification(PutDefinitionCertificationRequest) returns (PutDefinitionCertificationResponse);
   rpc GetDefinitionCertificationGate(GetDefinitionCertificationGateRequest) returns (GetDefinitionCertificationGateResponse);
   rpc DryRunAgent(DryRunAgentRequest) returns (DryRunAgentResponse);
+  rpc RunAgentShadow(RunAgentShadowRequest) returns (RunAgentShadowResponse);
+  rpc GetAgentShadowReport(GetAgentShadowReportRequest) returns (GetAgentShadowReportResponse);
   rpc CloseDefinitionProposal(CloseDefinitionProposalRequest) returns (CloseDefinitionProposalResponse);
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc ListPublishedDefinitionRevisions(ListPublishedDefinitionRevisionsRequest) returns (ListPublishedDefinitionRevisionsResponse);

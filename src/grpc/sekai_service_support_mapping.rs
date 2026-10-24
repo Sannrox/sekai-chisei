@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
+
 pub(super) fn read_limit_offset(limit: i32, offset: i32) -> Result<(i32, i32), Status> {
     if offset < 0 {
         return Err(Status::invalid_argument("offset must be >= 0"));
