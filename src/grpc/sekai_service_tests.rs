@@ -8175,6 +8175,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             type_id: "review.intake".into(),
             status: STATUS_ADMITTED.into(),
             limit: 10,
+            decidable_by_caller: false,
         }))
         .await
         .unwrap()

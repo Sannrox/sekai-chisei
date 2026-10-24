@@ -714,6 +714,9 @@ pub(super) async fn list_action_instances(
     service: &SekaiServiceImpl,
     req: Request<ListActionInstancesRequest>,
 ) -> Result<Response<ListActionInstancesResponse>, Status> {
+    if req.get_ref().decidable_by_caller {
+        return list_decidable_action_instances(service, req);
+    }
     let principals = caller_principals(&req);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let policy_context = principal_policy_context(&req);
@@ -782,6 +785,103 @@ pub(super) async fn list_action_instances(
             }
             if instances.len() == limit {
                 break;
+            }
+        }
+        if exhausted || instances.len() == limit {
+            break;
+        }
+    }
+    Ok(Response::new(ListActionInstancesResponse { instances }))
+}
+
+/// The parked instances the caller may decide (#1771), by the checks
+/// `DecideActionInstance` applies: a credentialed decider, space approval
+/// and the namespace tenant for the request, then per instance marking
+/// clearance and `may_decide`. A caller who could decide nothing gets an
+/// empty list, so an instance's existence is never revealed.
+fn list_decidable_action_instances(
+    service: &SekaiServiceImpl,
+    req: Request<ListActionInstancesRequest>,
+) -> Result<Response<ListActionInstancesResponse>, Status> {
+    let none = || Ok(Response::new(ListActionInstancesResponse::default()));
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    if req.get_ref().namespace.trim().is_empty() {
+        return Err(Status::invalid_argument("namespace required"));
+    }
+    if tenant_context
+        .as_ref()
+        .is_some_and(|context| context.authorize_space_approval().is_err())
+    {
+        return none();
+    }
+    let Some(decider) = credentialed_decider(&req, &principals) else {
+        return none();
+    };
+    let inner = req.into_inner();
+    if enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )
+    .is_err()
+    {
+        return none();
+    }
+    let runtime = service.db.runtime();
+    let _ = crate::sekai::action_instance_admission::ActionInstanceAdmission::new(runtime, None)
+        .escalate_due(&inner.namespace, now_millis());
+    let deciders = vec![decider.clone()];
+    let decider_is_namespace_admin =
+        authorize_source_type_namespace_admin(service, &deciders, &inner.namespace).is_ok();
+    let type_id = Some(inner.type_id.as_str()).filter(|type_id| !type_id.trim().is_empty());
+    let limit = (if inner.limit == 0 {
+        100
+    } else {
+        inner.limit as usize
+    })
+    .clamp(1, 500);
+    let mut types = HashMap::new();
+    let mut offset = 0;
+    let mut instances = Vec::new();
+    loop {
+        let stored = runtime
+            .list_action_instances_page(
+                &inner.namespace,
+                type_id,
+                Some(crate::sekai::action_instance::STATUS_PARKED),
+                100,
+                offset,
+            )
+            .map_err(Status::internal)?;
+        let exhausted = stored.len() < 100;
+        offset += stored.len();
+        for instance in &stored {
+            let key = (instance.type_id.clone(), instance.version.clone());
+            if !types.contains_key(&key) {
+                let type_def = runtime
+                    .get_governed_action_type(&instance.namespace, &key.0, &key.1)
+                    .map_err(Status::internal)?;
+                types.insert(key.clone(), type_def);
+            }
+            let Some(type_def) = &types[&key] else {
+                continue;
+            };
+            if action_instance_passes_marking(service, &deciders, instance)?
+                && crate::sekai::action_instance_admission::may_decide(
+                    type_def,
+                    instance,
+                    &decider,
+                    &deciders,
+                    decider_is_namespace_admin,
+                )
+            {
+                instances.push(to_proto_action_instance(instance));
+                if instances.len() == limit {
+                    break;
+                }
             }
         }
         if exhausted || instances.len() == limit {

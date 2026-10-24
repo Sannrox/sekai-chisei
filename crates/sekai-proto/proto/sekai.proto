@@ -2643,6 +2643,10 @@ message ListActionInstancesRequest {
   string type_id = 2;
   string status = 3;
   uint32 limit = 4;
+  // Only the parked instances the caller may decide, under the checks
+  // DecideActionInstance applies (#1771); `status` is ignored. Those checks
+  // replace the namespace read check: a named approver decides without one.
+  bool decidable_by_caller = 5;
 }
 message ListActionInstancesResponse { repeated ActionInstance instances = 1; }
 
