@@ -76,7 +76,16 @@ pub(super) async fn list_governed_action_types(
 ) -> Result<Response<ListGovernedActionTypesResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
+    // A tenant assertion lists only its own tenant's namespace (#1777).
+    // Listing reads; Action administration is checked below.
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )?;
     check_team_namespace(service.db.runtime(), &principals, &inner.namespace, true)?;
     check_action_admin(
         &service.security,
