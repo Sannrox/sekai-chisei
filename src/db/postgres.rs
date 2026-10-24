@@ -174,6 +174,7 @@ const DEFINITION_BUNDLE_APPLIES_SCHEMA: &str =
     include_str!("postgres/0101_definition_bundle_applies.sql");
 const PLAN_REVIEWS_SCHEMA: &str = include_str!("postgres/0102_sekai_plan_reviews.sql");
 const ACTION_BINDINGS_SCHEMA: &str = include_str!("postgres/0103_action_bindings.sql");
+const PURPOSES_AND_LATTICES_SCHEMA: &str = include_str!("postgres/0104_purposes_and_lattices.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -817,6 +818,12 @@ const MIGRATIONS: &[Migration] = &[
         102,
         "action_bindings",
         ACTION_BINDINGS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        103,
+        "purposes_and_lattices",
+        PURPOSES_AND_LATTICES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

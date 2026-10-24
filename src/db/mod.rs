@@ -91,6 +91,7 @@ mod postgres_image;
 mod postgres_lease;
 mod postgres_media_upload;
 mod postgres_object_security;
+pub(crate) mod postgres_object_security_terms;
 mod postgres_object_sync;
 mod postgres_object_type_index;
 mod postgres_objects;

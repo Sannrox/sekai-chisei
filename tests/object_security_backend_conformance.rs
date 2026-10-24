@@ -5,8 +5,9 @@ use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::{Direction, KIND_CAPABILITY, Link, ListFilter, Object, PropertyFilter};
 use sekai_chisei::sekai::classification_lattice::{
-    CLASSIFICATION_LATTICE_VERSION, ClassificationLattice,
+    CLASSIFICATION_LATTICE_VERSION, ClassificationLattice, evaluate_lattice_access,
 };
+use sekai_chisei::sekai::markings::{MarkingDecision, PrincipalAuthority};
 use sekai_chisei::sekai::object_security::{
     OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
     ObjectSecurityPredicate, ObjectSecurityRule, PrincipalPolicyContext, PropertyGrant,
@@ -1124,11 +1125,9 @@ fn exercise_purpose_bound_reads(db: &RuntimeDb, namespace: &str) {
         created_at_ms: 10,
         revoked_at_ms: 0,
     };
-    match db.put_purpose_authorization(&live) {
-        Ok(_) => {}
-        Err(error) if error.contains("unavailable") => return,
-        Err(error) => panic!("{error}"),
-    }
+    db.put_purpose_authorization(&live).unwrap();
+    // An authorization id is written once.
+    assert!(db.put_purpose_authorization(&live).is_err());
     let mut unknown = live.clone();
     unknown.authorization_id = format!("{namespace}-v2");
     unknown.contract_version = "sekai.purpose-authorization/v2".into();
@@ -1218,8 +1217,16 @@ fn exercise_purpose_bound_reads(db: &RuntimeDb, namespace: &str) {
         .unwrap()
         .is_some_and(|found| found.authorization_id == live.authorization_id)
     );
-    db.revoke_purpose_authorization(&live.authorization_id, 16)
+    let revoked_live = db
+        .revoke_purpose_authorization(&live.authorization_id, 16)
         .unwrap();
+    assert_eq!(revoked_live.revoked_at_ms, 16);
+    assert!(
+        db.revoke_purpose_authorization(&live.authorization_id, 17)
+            .unwrap_err()
+            .contains("missing or already revoked")
+    );
+    // With the authorization revoked the purpose is missing: the read is denied.
     assert!(
         db.find_purpose_authorization(
             "alice",
@@ -1253,26 +1260,59 @@ fn exercise_classification_lattices(db: &RuntimeDb, namespace: &str) {
         ]),
         incomparable: vec![("confidential".into(), "health".into())],
     };
-    match db.put_classification_lattice(&lattice, "root", 10) {
-        Ok(stored) => {
-            assert_eq!(stored.namespace, namespace);
-            let loaded = db.get_classification_lattice(namespace).unwrap().unwrap();
-            assert_eq!(loaded.digest().unwrap(), stored.digest().unwrap());
-            assert!(loaded.dominates("secret", "health").unwrap());
-            assert_eq!(loaded.join("confidential", "health").unwrap(), None);
-            let mut unknown = stored.clone();
-            unknown.contract_version = "sekai.classification-lattice/v2".into();
-            assert!(
-                db.put_classification_lattice(&unknown, "root", 11)
-                    .unwrap_err()
-                    .contains("unsupported classification lattice contract")
-            );
-        }
-        Err(error) if error.contains("unavailable") => {
-            assert!(db.get_classification_lattice(namespace).unwrap().is_none());
-        }
-        Err(error) => panic!("{error}"),
-    }
+    assert!(db.get_classification_lattice(namespace).unwrap().is_none());
+    let stored = db.put_classification_lattice(&lattice, "root", 10).unwrap();
+    assert_eq!(stored.namespace, namespace);
+    assert_eq!(
+        db.classification_lattice_recorded_at_ms(namespace).unwrap(),
+        Some(10)
+    );
+    let loaded = db.get_classification_lattice(namespace).unwrap().unwrap();
+    assert_eq!(loaded.digest().unwrap(), stored.digest().unwrap());
+    assert!(loaded.dominates("secret", "health").unwrap());
+    assert_eq!(loaded.join("confidential", "health").unwrap(), None);
+    // The stored lattice decides reads: a confidential clearance does not
+    // reach the incomparable health marking, a secret one does.
+    let read = |clearance: &str| {
+        evaluate_lattice_access(
+            "read",
+            Some("health"),
+            &PrincipalAuthority {
+                principal: "alice".into(),
+                classification_ceiling: None,
+                classification_token: Some(clearance.into()),
+                allowed_purposes: Default::default(),
+                declassify_markings: Default::default(),
+            },
+            Some(&loaded),
+        )
+        .decision
+    };
+    assert_eq!(read("confidential"), MarkingDecision::Deny);
+    assert_eq!(read("secret"), MarkingDecision::Allow);
+    let mut unknown = stored.clone();
+    unknown.contract_version = "sekai.classification-lattice/v2".into();
+    assert!(
+        db.put_classification_lattice(&unknown, "root", 11)
+            .unwrap_err()
+            .contains("unsupported classification lattice contract")
+    );
+    // A replacement is the namespace's one current lattice.
+    let mut narrower = lattice.clone();
+    narrower.incomparable.clear();
+    db.put_classification_lattice(&narrower, "root", 12)
+        .unwrap();
+    assert_eq!(
+        db.classification_lattice_recorded_at_ms(namespace).unwrap(),
+        Some(12)
+    );
+    assert!(
+        db.get_classification_lattice(namespace)
+            .unwrap()
+            .unwrap()
+            .incomparable
+            .is_empty()
+    );
 }
 
 #[test]

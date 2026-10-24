@@ -1166,9 +1166,9 @@ impl RuntimeDb {
     ) -> Result<crate::sekai::purpose_authorization::PurposeAuthorization, String> {
         match self {
             Self::Sqlite(db) => db.put_purpose_authorization(authorization),
-            Self::Postgres(_) => Err(
-                "purpose authorizations are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_purpose_authorization(authorization))
+            }
         }
     }
 
@@ -1179,9 +1179,9 @@ impl RuntimeDb {
     ) -> Result<crate::sekai::purpose_authorization::PurposeAuthorization, String> {
         match self {
             Self::Sqlite(db) => db.revoke_purpose_authorization(authorization_id, revoked_at_ms),
-            Self::Postgres(_) => Err(
-                "purpose authorizations are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.revoke_purpose_authorization(authorization_id, revoked_at_ms)
+            }),
         }
     }
 
@@ -1203,9 +1203,16 @@ impl RuntimeDb {
                 activation_digest,
                 now_ms,
             ),
-            Self::Postgres(_) => Err(
-                "purpose authorizations are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.find_purpose_authorization(
+                    actor,
+                    purpose,
+                    namespace,
+                    kind,
+                    activation_digest,
+                    now_ms,
+                )
+            }),
         }
     }
 
@@ -1217,10 +1224,9 @@ impl RuntimeDb {
     ) -> Result<crate::sekai::classification_lattice::ClassificationLattice, String> {
         match self {
             Self::Sqlite(db) => db.put_classification_lattice(lattice, actor, now_ms),
-            Self::Postgres(_) => Err(
-                "classification lattices are unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_classification_lattice(lattice, actor, now_ms)
+            }),
         }
     }
 
@@ -1230,7 +1236,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::classification_lattice::ClassificationLattice>, String> {
         match self {
             Self::Sqlite(db) => db.get_classification_lattice(namespace),
-            Self::Postgres(_) => Ok(None),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_classification_lattice(namespace))
+            }
         }
     }
 
@@ -1240,7 +1248,9 @@ impl RuntimeDb {
     ) -> Result<Option<i64>, String> {
         match self {
             Self::Sqlite(db) => db.classification_lattice_recorded_at_ms(namespace),
-            Self::Postgres(_) => Ok(None),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.classification_lattice_recorded_at_ms(namespace)
+            }),
         }
     }
 

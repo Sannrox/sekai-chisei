@@ -41,8 +41,8 @@ Dominance is reachability from the marking to the caller’s sealed ceiling.
   interpreted in the object’s namespace lattice. Do not reuse a custom token
   name across lattices unless the same clearance is intended.
 
-SQLite stores the lattice. PostgreSQL get returns no lattice so the default
-ceiling stays in force; put is unavailable.
+SQLite and PostgreSQL both store the lattice (#1321), and reads, search and
+transform markings consult it the same way on either backend.
 
 ## Object markings
 

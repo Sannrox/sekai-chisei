@@ -1,28 +1,8 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 17,
+  "limit": 13,
   "surfaces": [
-    {
-      "id": "SekaiService.PutPurposeAuthorization",
-      "kind": "rpc",
-      "methods": ["put_purpose_authorization"]
-    },
-    {
-      "id": "SekaiService.RevokePurposeAuthorization",
-      "kind": "rpc",
-      "methods": ["revoke_purpose_authorization"]
-    },
-    {
-      "id": "SekaiService.PutClassificationLattice",
-      "kind": "rpc",
-      "methods": ["put_classification_lattice"]
-    },
-    {
-      "id": "SekaiService.GetClassificationLattice",
-      "kind": "rpc",
-      "methods": ["get_classification_lattice"]
-    },
     {
       "id": "SekaiService.AppendRows",
       "kind": "rpc",
