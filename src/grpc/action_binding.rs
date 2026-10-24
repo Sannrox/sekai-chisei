@@ -534,6 +534,7 @@ impl SekaiServiceImpl {
                 &[action.run_as.to_string()],
                 action.namespace,
             ),
+            expected_object_revision: String::new(),
             offline: None,
         };
         let result = if let Some(clerk) = &self.cross_store {

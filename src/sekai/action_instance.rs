@@ -222,6 +222,14 @@ pub enum ParkedGrantWrite {
 }
 
 /// Result of [`SekaiDb::grant_parked_action_instance`].
+/// The plan execution claim a grant made for a plan step must still hold
+/// (#1679): a run that lost it, or a stopped plan, grants nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionClaim {
+    pub plan_id: String,
+    pub holder: String,
+}
+
 pub enum ParkedGrantOutcome {
     /// The write and the transition committed; `previous` is the prior
     /// object state for an update.
@@ -230,6 +238,8 @@ pub enum ParkedGrantOutcome {
     },
     /// Another decision already moved the instance.
     NotParked,
+    /// The plan execution claim the grant was made under is gone.
+    ClaimLost,
     /// The target object changed since the instance parked.
     Stale,
 }
@@ -540,6 +550,7 @@ impl SekaiDb {
         parked_object_digest: &str,
         write: Option<&ParkedGrantWrite>,
         actor: &str,
+        claim: Option<&ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
         self.migrate_action_instances()?;
         granted.validate_fields()?;
@@ -558,6 +569,20 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?;
         if status.as_deref() != Some(STATUS_PARKED) {
             return Ok(ParkedGrantOutcome::NotParked);
+        }
+        if let Some(claim) = claim {
+            let holder: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT json_extract(body_json, '$.claim_holder') FROM sekai_plan_executions
+                     WHERE namespace = ?1 AND plan_id = ?2",
+                    params![granted.namespace, claim.plan_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if holder.flatten().as_deref() != Some(claim.holder.as_str()) {
+                return Ok(ParkedGrantOutcome::ClaimLost);
+            }
         }
         if !target_object_id.is_empty() {
             let current = tx

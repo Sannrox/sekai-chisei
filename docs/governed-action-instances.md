@@ -121,6 +121,90 @@ A denied plan never executes. Execution is the next layer. It goes through
 `SubmitActionInstance` with idempotency key (plan id, step index) and
 rechecks authority per step.
 
+## Executing an approved plan
+
+Issue: [#1679](https://github.com/Sannrox/sekai-chisei/issues/1679), layer 3 of
+[#1460](https://github.com/Sannrox/sekai-chisei/issues/1460).
+
+`ExecuteActionPlan` runs a granted plan, and its planner calls it. Each step is
+submitted with idempotency key `plan:{plan_id}:step:{index}` under the
+planner's live request, so it gets the checks the planner's own
+`SubmitActionInstance` gets: namespace and enterprise authorization,
+service-principal scope, shared-space resource tenant, write freezes and
+markings. A step its policy parks is then granted as the plan's approver
+through the same path as `DecideActionInstance`. Nothing bypasses policy,
+budgets or markings.
+
+Before every step:
+
+- The approver's authority over the step is rechecked by subject: entitled
+  for the type (named approver or namespace admin), able to decide its
+  queue placement, still authorized for the namespace through the
+  enterprise extension's subject revalidation (failing closed where it
+  cannot), and able to read its object under its object policy, grants and
+  markings. A grant made under a space-scoped credential rests on a space
+  approval role only that credential carries. It cannot be revalidated, so
+  such a plan stops with `approver_authority_revoked` before its first step. The planner's submit authority and read are rechecked
+  from the live request.
+- An infrastructure failure or an admission still in flight leaves the plan
+  running, and a later call retries under the same key.
+- The step is simulated again as the planner. The plan stops when the
+  prediction differs from the approved simulation (outcome, reason, policy,
+  approval, budget). It also stops when the object's revision is neither the
+  approved one nor, for an object an earlier step wrote, the revision that
+  write produced.
+
+The checked revision travels into admission, which refuses the write unless
+the object still has it. The check uses the same read the guarded write
+applies against, or the read the parked digest is taken from. A later step
+on the same object expects the revision that write itself produced.
+
+A stopped plan records `stop_reason` and `stopped_at_step`:
+`plan_not_approved`, `approver_authority_revoked`, `simulation_changed`,
+`step_refused` or `step_instance_mismatch` (the instance under a step's key
+is not the planned submission). Later steps never run, and completed steps are not
+compensated.
+
+Progress is durable, one record per plan. A run first takes a two-minute
+claim on the record, written by compare-and-set, before anything is
+submitted. A concurrent call finds the live claim and returns the record
+untouched, and a crashed run's claim lapses for the next run to take over.
+The claim is renewed right before every submit and grant, so a run that
+lost it submits nothing. Idempotency keys and the revision checked inside
+admission keep a run that paused longer than the lease after renewing from
+applying a step twice or over a changed object. A replay that finds the
+same key's admission still in flight leaves the plan running for a retry,
+however long it has been in flight: its age proves no crash.
+Recovering an admission a crash interrupted before its receipt is #1786.
+So does an authority or simulation check that cannot complete because a
+store or dependency failed; only a refusal stops the plan.
+Stopping first closes the stopped step's unused key with a denied record
+(with no parameters), only while the stopping run still owns the claim, so
+a run that lost its claim cannot still submit that step. The plan's grant
+of a parked step holds only under its live claim; a parked step a stopped
+plan leaves stays an ordinary parked Action, decided under the usual
+checks. If the step was admitted first, the plan stays running for the
+next run to record it.
+Each step's
+operation id is a digest of the namespace and step key, so identically
+named plans in two namespaces never collide. Where credentials are in use, an approver who no longer holds an active
+credential stops the plan. A revoked authority is caught no later than a plain `SubmitActionInstance`
+would catch it. `ExecuteActionPlan` answers under the
+caller's current object visibility, like `GetPlan`. A restarted executor resumes at the next
+step. A step submitted before a crash is found by its idempotency key. It
+must match the planned submission (principal, type, version, parameters),
+and admission's replay completes it without applying it again. A parked
+step is granted only while its object is at the expected revision and its
+re-simulation predicts what was approved. The
+grant itself refuses an object changed since parking, so the parked state
+is the approved one. Namespace-admin entitlement is resolved on every check
+and right before each grant. Its produced
+revision is then unknown, so a later step on the same object stops rather
+than trust a fresh read. `GetPlan` returns the execution with each
+step's Action instance and operation id. A step the reader may not see
+keeps only its index. PostgreSQL migration `0105_sekai_plan_executions`
+holds the record.
+
 ## Admission flow
 
 1. Authenticate; require team namespace write for the target namespace.

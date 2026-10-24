@@ -243,6 +243,7 @@ impl PostgresDb {
         parked_object_digest: &str,
         write: Option<&ParkedGrantWrite>,
         actor: &str,
+        claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
         granted.validate_fields()?;
         let body_json = serde_json::to_string(granted).map_err(|e| e.to_string())?;
@@ -259,6 +260,20 @@ impl PostgresDb {
             .map(|row| row.get(0));
         if status.as_deref() != Some(STATUS_PARKED) {
             return Ok(ParkedGrantOutcome::NotParked);
+        }
+        if let Some(claim) = claim {
+            // Share-locked: a takeover replacing the claim commits first.
+            let holder: Option<Option<String>> = transaction
+                .query_opt(
+                    "SELECT body_json::jsonb ->> 'claim_holder' FROM sekai_plan_executions
+                     WHERE namespace = $1 AND plan_id = $2 FOR SHARE",
+                    &[&granted.namespace, &claim.plan_id],
+                )
+                .map_err(|error| error.to_string())?
+                .map(|row| row.get(0));
+            if holder.flatten().as_deref() != Some(claim.holder.as_str()) {
+                return Ok(ParkedGrantOutcome::ClaimLost);
+            }
         }
         if !target_object_id.is_empty() {
             // Same order as postgres object update/delete: lifecycle lock, then row.

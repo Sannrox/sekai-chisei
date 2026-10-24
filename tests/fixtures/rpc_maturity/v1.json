@@ -1708,6 +1708,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ExecuteActionPlan",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GetActionInstance",
       "storage_path": "sekai.audit",
       "real_backend": "yes",

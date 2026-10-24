@@ -270,6 +270,7 @@ pub fn submit_step(
                 binding_markings: Vec::new(),
                 source_object_id: String::new(),
                 marking_gate: Default::default(),
+                expected_object_revision: String::new(),
                 offline: None,
             },
             actor,

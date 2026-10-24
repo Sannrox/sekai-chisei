@@ -2450,6 +2450,8 @@ message GetPlanResponse {
   repeated PlanSimulation simulations = 3;
   // Absent until the plan is submitted for review (#1678).
   PlanReview review = 4;
+  // Absent until execution starts (#1679).
+  PlanExecution execution = 5;
 }
 // One review-queue bundle over a simulated plan (#1678), bound to one stored
 // simulation. decision is empty while pending, else grant or deny.
@@ -2490,6 +2492,42 @@ message DecidePlanReviewRequest {
 message DecidePlanReviewResponse {
   PlanReview review = 1;
   bool replay = 2;
+}
+// One executed step of an approved plan (#1679): the Action instance its
+// submit admitted, under idempotency key plan:{plan_id}:step:{index}. A
+// step a reader may not see keeps only its index.
+message PlanStepExecution {
+  uint32 index = 1;
+  string instance_id = 2;
+  string operation_id = 3;
+  string status = 4;
+}
+// Execution of an approved plan. status is running, completed or stopped;
+// a stopped plan names why (plan_not_approved, approver_authority_revoked,
+// simulation_changed, step_refused) and the step it stopped before.
+message PlanExecution {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+  string simulation_digest = 4;
+  string status = 5;
+  uint32 next_step = 6;
+  repeated PlanStepExecution steps = 7;
+  string stop_reason = 8;
+  optional uint32 stopped_at_step = 9;
+  string started_by = 10;
+  int64 updated_at_ms = 11;
+}
+// Runs a granted plan's steps in order as the planner, each parked step
+// decided by the approver, who calls this. Before each step the approver's
+// authority is rechecked and the step is simulated again. A retry, also
+// after a crash, resumes and never applies a step twice.
+message ExecuteActionPlanRequest {
+  string namespace = 1;
+  string plan_id = 2;
+}
+message ExecuteActionPlanResponse {
+  PlanExecution execution = 1;
 }
 message GetActionInstanceRequest {
   string instance_id = 1;
@@ -4289,6 +4327,7 @@ service SekaiService {
   rpc GetPlan(GetPlanRequest) returns (GetPlanResponse);
   rpc SubmitPlanReview(SubmitPlanReviewRequest) returns (SubmitPlanReviewResponse);
   rpc DecidePlanReview(DecidePlanReviewRequest) returns (DecidePlanReviewResponse);
+  rpc ExecuteActionPlan(ExecuteActionPlanRequest) returns (ExecuteActionPlanResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
   // Typed effects on admitted ActionInstances (#398).

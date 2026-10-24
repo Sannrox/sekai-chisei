@@ -82,6 +82,9 @@ pub struct ObjectActionPreview {
 pub enum ObjectActionProjectionError {
     Unavailable,
     InvalidArgument(String),
+    /// A store read failed: nothing about the Action is known, and the
+    /// caller may retry.
+    Store(String),
 }
 
 pub fn object_revision(object: &Object) -> String {
@@ -212,6 +215,10 @@ pub fn preview_object_action(
         None,
         chrono::Utc::now().timestamp_millis(),
     ) {
+        // A store read that failed says nothing about the write.
+        if let action_object_mutation::ActionObjectMutationError::Internal(error) = error {
+            return Err(ObjectActionProjectionError::Store(error));
+        }
         return Ok(invalid_preview(
             &type_def,
             object,
@@ -323,11 +330,11 @@ fn admit_object_action(
 
     let stored_object = db
         .get_object(&object.id)
-        .map_err(|_| ObjectActionProjectionError::Unavailable)?;
+        .map_err(ObjectActionProjectionError::Store)?;
     let bound_object = stored_object.as_ref().unwrap_or(object);
     let policy = match db.active_object_policy(&bound_object.namespace, &bound_object.kind) {
         Ok(policy) => policy,
-        Err(_) => return Ok(Admission::Complete(Box::new(unavailable_preview(object)))),
+        Err(error) => return Err(ObjectActionProjectionError::Store(error)),
     };
     let invoker = invoker_context(actor, *policy_context);
     match evaluate_submission_criteria(
@@ -357,7 +364,7 @@ fn admit_object_action(
     };
     let resolved_policy = db
         .resolve_action_policy(actor, &object.namespace, &policy_project)
-        .map_err(|_| ObjectActionProjectionError::Unavailable)?;
+        .map_err(ObjectActionProjectionError::Store)?;
     let (policy_decision, approval_state) = match &resolved_policy {
         Some(policy) => match policy.decide(SUBMIT_POLICY_ACTION, RiskClass::Write) {
             ActionDecision::Allow => ("allow".to_string(), "none".to_string()),
@@ -430,7 +437,7 @@ pub(crate) fn load_object_bound_type(
     }
     let Some(type_def) = db
         .get_governed_action_type(&object.namespace, type_id, version)
-        .map_err(|_| ObjectActionProjectionError::Unavailable)?
+        .map_err(ObjectActionProjectionError::Store)?
     else {
         return Err(ObjectActionProjectionError::Unavailable);
     };

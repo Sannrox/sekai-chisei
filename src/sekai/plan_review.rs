@@ -42,6 +42,10 @@ pub struct PlanReview {
     pub reason: String,
     #[serde(default)]
     pub decided_at_ms: i64,
+    /// Whether the decider granted under a space-scoped credential, whose
+    /// approval role cannot be revalidated without it (#1679).
+    #[serde(default)]
+    pub decided_in_space: bool,
 }
 
 impl PlanReview {
@@ -147,6 +151,8 @@ pub struct ReviewDecision<'a> {
     pub simulation_digest: &'a str,
     pub decision: &'a str,
     pub reason: &'a str,
+    /// The decider presented a space-scoped credential.
+    pub in_space: bool,
 }
 
 /// Decides a submitted review for the whole plan. The planner, who
@@ -207,6 +213,7 @@ pub fn decide_review(
         decided_by: decider.into(),
         reason: request.reason.into(),
         decided_at_ms: now_ms,
+        decided_in_space: request.in_space,
         ..review
     };
     if db.decide_plan_review(&next)? {

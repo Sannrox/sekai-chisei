@@ -2522,6 +2522,20 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ExecuteActionPlan",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/plan_execution.rs",
+        "src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetActionInstance",
       "kind": "persistent",
       "surfaces": [

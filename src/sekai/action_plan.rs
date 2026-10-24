@@ -192,6 +192,13 @@ pub fn propose_plan(db: &RuntimeDb, plan: ProposedPlan) -> Result<ProposedPlan, 
                 "parameters_json must be JSON of at most {MAX_PARAMETERS} bytes"
             )));
         }
+        // Authority and revisions are checked against the step's object, so
+        // the parameters must target that object.
+        if parameter_target(&step.parameters_json).as_deref() != Some(step.object_id.as_str()) {
+            return Err(PlanError::Invalid(
+                "parameters_json.object_id must be the step's object_id".into(),
+            ));
+        }
     }
     if db
         .get_plan_intent(&plan.namespace, &plan.intent_id)?
@@ -211,6 +218,15 @@ pub fn propose_plan(db: &RuntimeDb, plan: ProposedPlan) -> Result<ProposedPlan, 
     }
 }
 
+/// The object a step's parameters target (`object_id`).
+pub(crate) fn parameter_target(parameters_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()?
+        .get("object_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// What a simulation needs from the caller's session.
 pub struct SimulationContext<'a> {
     pub actor: &'a str,
@@ -218,7 +234,9 @@ pub struct SimulationContext<'a> {
     pub proposal: Option<&'a dyn ActionProposalPort>,
     pub policy_context: Option<&'a crate::sekai::object_security::PrincipalPolicyContext>,
     /// The object with `id` when the caller may read it.
-    pub visible_object: &'a dyn Fn(&str) -> Option<Object>,
+    /// `Ok(None)` when the caller may not read it; `Err` when that could
+    /// not be determined (the store failed).
+    pub visible_object: &'a dyn Fn(&str) -> Result<Option<Object>, String>,
     pub now_ms: i64,
 }
 
@@ -361,14 +379,14 @@ fn predicted_effect(
 }
 
 /// Runs one step through the Action preview path. Applies nothing.
-fn simulate_step(
+pub(crate) fn simulate_step(
     db: &RuntimeDb,
     context: &SimulationContext<'_>,
     index: u32,
     namespace: &str,
     step: &PlanStep,
 ) -> Result<StepSimulation, PlanError> {
-    let Some(object) = (context.visible_object)(&step.object_id) else {
+    let Some(object) = (context.visible_object)(&step.object_id)? else {
         return Ok(unavailable_step(index, step));
     };
     if object.namespace != namespace {
@@ -396,6 +414,7 @@ fn simulate_step(
         Err(ObjectActionProjectionError::InvalidArgument(error)) => {
             return Err(PlanError::Invalid(error));
         }
+        Err(ObjectActionProjectionError::Store(error)) => return Err(PlanError::Store(error)),
     };
     // A step that needs approval still shows what it would write, so the
     // approver sees it.
@@ -479,8 +498,8 @@ pub fn simulate_plan(
     let hidden: Vec<bool> = plan
         .steps
         .iter()
-        .map(|step| (context.visible_object)(&step.object_id).is_none())
-        .collect();
+        .map(|step| (context.visible_object)(&step.object_id).map(|object| object.is_none()))
+        .collect::<Result<_, _>>()?;
     let shown = |mut simulation: PlanSimulation| {
         redact_simulation(&mut simulation, &hidden);
         simulation
@@ -682,7 +701,7 @@ mod tests {
     }
 
     fn simulate(db: &RuntimeDb, ns: &str, simulation_id: &str, now_ms: i64) -> PlanSimulation {
-        let visible = |id: &str| db.get_object(id).ok().flatten();
+        let visible = |id: &str| db.get_object(id);
         let context = SimulationContext {
             actor: "planner",
             budget: None,
@@ -814,9 +833,11 @@ mod tests {
         propose_plan(&db, plan(ns)).unwrap();
         let hidden = format!("{ns}-c1");
         let visible = |id: &str| {
-            (id != hidden)
-                .then(|| db.get_object(id).ok().flatten())
-                .flatten()
+            if id == hidden {
+                Ok(None)
+            } else {
+                db.get_object(id)
+            }
         };
         let context = SimulationContext {
             actor: "planner",
@@ -847,9 +868,11 @@ mod tests {
         simulate(&db, ns, "sim-1", 1_000);
         let hidden = format!("{ns}-c1");
         let visible = |id: &str| {
-            (id != hidden)
-                .then(|| db.get_object(id).ok().flatten())
-                .flatten()
+            if id == hidden {
+                Ok(None)
+            } else {
+                db.get_object(id)
+            }
         };
         let context = SimulationContext {
             actor: "other",
@@ -866,25 +889,22 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_is_predicted_only_for_the_step_object() {
+    fn a_step_whose_parameters_aim_at_another_object_is_refused() {
         let ns = "acme";
         let db = RuntimeDb::memory();
         world(&db, ns);
         create_intent(&db, intent(ns)).unwrap();
-        // Step object c2 is visible; the parameters aim at c3.
+        // Step object c2 is the one checked; the parameters aim at c3.
         let mut aimed = step(ns, "customer.escalate", "c2", "probe");
         aimed.parameters_json = format!(r#"{{"object_id":"{ns}-c3","title":"probe"}}"#);
-        propose_plan(
+        let refused = propose_plan(
             &db,
             ProposedPlan {
                 steps: vec![aimed],
                 ..plan(ns)
             },
-        )
-        .unwrap();
-        let simulation = simulate(&db, ns, "sim-1", 1_000);
-        assert_eq!(simulation.steps[0].approval_state, "required");
-        assert!(simulation.steps[0].effect.is_none());
+        );
+        assert!(matches!(refused, Err(PlanError::Invalid(_))), "{refused:?}");
     }
 
     #[test]

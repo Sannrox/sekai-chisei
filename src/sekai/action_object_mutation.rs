@@ -406,11 +406,13 @@ pub(crate) enum ParkedGrant {
     Granted(Option<Box<AppliedObjectMutation>>),
     NotParked,
     Stale,
+    ClaimLost,
 }
 
 /// Applies the planned write and moves the parked instance to `granted` in
 /// one transaction, so a crash or a concurrent decision can never leave the
 /// write without the grant (#1139).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn grant_parked(
     db: &RuntimeDb,
     planned: Option<PlannedObjectMutation>,
@@ -418,6 +420,7 @@ pub(crate) fn grant_parked(
     target_object_id: &str,
     parked_object_digest: &str,
     actor: &str,
+    claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     now_ms: i64,
 ) -> Result<ParkedGrant, ActionObjectMutationError> {
     use crate::sekai::action_instance::{ParkedGrantOutcome, ParkedGrantWrite};
@@ -449,11 +452,13 @@ pub(crate) fn grant_parked(
             parked_object_digest,
             write.as_ref(),
             actor,
+            claim,
         )
         .map_err(ActionObjectMutationError::Internal)?;
     Ok(match outcome {
         ParkedGrantOutcome::NotParked => ParkedGrant::NotParked,
         ParkedGrantOutcome::Stale => ParkedGrant::Stale,
+        ParkedGrantOutcome::ClaimLost => ParkedGrant::ClaimLost,
         ParkedGrantOutcome::Granted { previous } => {
             ParkedGrant::Granted(prepared.map(|(mutation, created, object)| {
                 Box::new(AppliedObjectMutation {

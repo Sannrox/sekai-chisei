@@ -168,21 +168,10 @@ use self::object_mutation_lifecycle::{
     GuardedCreateObjectRequest, GuardedDeleteObjectRequest, GuardedUpdateObjectRequest,
 };
 use self::schema_definition_lifecycle::{
-    SchemaDefinitionLifecycle, SchemaDefinitionLifecycleError,
+    SchemaDefinitionLifecycle, map_schema_definition_lifecycle_error,
 };
 
 const REDACTED_VALUE: &str = "[redacted]";
-
-fn map_schema_definition_lifecycle_error(error: SchemaDefinitionLifecycleError) -> Status {
-    match error {
-        SchemaDefinitionLifecycleError::Unavailable(error) => Status::internal(error),
-        SchemaDefinitionLifecycleError::InvalidDefinition(error)
-        | SchemaDefinitionLifecycleError::InvalidComputedProperty(error) => {
-            Status::invalid_argument(error)
-        }
-        SchemaDefinitionLifecycleError::Persistence(error) => Status::internal(error),
-    }
-}
 
 #[derive(Clone)]
 pub struct SekaiServiceImpl {
@@ -1320,6 +1309,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DecidePlanReviewRequest>,
     ) -> Result<Response<DecidePlanReviewResponse>, Status> {
         rpc_actions::decide_plan_review(self, req).await
+    }
+
+    async fn execute_action_plan(
+        &self,
+        req: Request<ExecuteActionPlanRequest>,
+    ) -> Result<Response<ExecuteActionPlanResponse>, Status> {
+        rpc_actions::execute_action_plan(self, req).await
     }
 
     async fn get_action_instance(

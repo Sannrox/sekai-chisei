@@ -97,6 +97,7 @@ pub mod object_schema;
 pub mod offline_action;
 pub mod ontology_health;
 pub mod ontology_lint;
+pub mod plan_execution;
 pub mod plan_review;
 pub mod sync_scope;
 pub use sekai_types::object_security;
