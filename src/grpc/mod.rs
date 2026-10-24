@@ -801,6 +801,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExportObjectSet"
             | "ExportDatasetVersion"
             | "GetExportReceipt"
+            | "PutExportDefinition"
+            | "GetExportDefinition"
+            | "DeleteExportDefinition"
+            | "RunExportDefinition"
             | "GetOntologyHealth"
             | "RecordOntologyHealthSnapshot"
             | "ListOntologyHealthTrend"
@@ -1617,6 +1621,7 @@ fn spawn_service_background_tasks(
     }
     if plane.serves_sekai() {
         spawn_catalog_reconciler(db.clone());
+        spawn_export_sweeper(db.clone());
         spawn_execution_evidence_reconciler(db.clone());
     }
     if plane == ProcessPlane::Combined
@@ -1692,6 +1697,30 @@ fn spawn_admission_reconciler(
                 Err(error) => {
                     tracing::error!(%error, "admission reservation reconciliation task failed")
                 }
+            }
+        }
+    });
+}
+
+/// Remove expired export artifacts and close exports whose exporter was
+/// lost (#1628, ADR 0130), whether or not anything exports. Safe on every
+/// instance at once: each removal and each close is conditional.
+fn spawn_export_sweeper(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let now = chrono::Utc::now().timestamp_millis();
+                crate::sekai::data_export::recover_abandoned_exports(&db, now)?;
+                crate::sekai::data_export::sweep_expired_artifacts(&db, now)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::error!(%error, "export sweep failed"),
+                Err(error) => tracing::error!(%error, "export sweep task failed"),
             }
         }
     });

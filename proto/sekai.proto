@@ -605,6 +605,49 @@ message ExportDatasetVersionRequest {
   // csv | jsonl
   string format = 4;
 }
+// A saved export (#1628): one source, run later for its owner alone. Set
+// exactly one of object_set and dataset_version; their namespace is the
+// definition's.
+message ExportDefinition {
+  string namespace = 1;
+  string definition_id = 2;
+  // Set by the plane: the principal that saved it.
+  string owner = 3;
+  ExportObjectSetRequest object_set = 4;
+  ExportDatasetVersionRequest dataset_version = 5;
+  int64 created_at_ms = 6;
+}
+message PutExportDefinitionRequest {
+  ExportDefinition definition = 1;
+}
+message PutExportDefinitionResponse {
+  ExportDefinition definition = 1;
+}
+message GetExportDefinitionRequest {
+  string namespace = 1;
+  string definition_id = 2;
+}
+message GetExportDefinitionResponse {
+  ExportDefinition definition = 1;
+}
+message DeleteExportDefinitionRequest {
+  string namespace = 1;
+  string definition_id = 2;
+}
+message DeleteExportDefinitionResponse {
+  bool deleted = 1;
+}
+// Runs a saved export now, for its owner alone, into a stored artifact.
+message RunExportDefinitionRequest {
+  string namespace = 1;
+  string definition_id = 2;
+}
+message RunExportDefinitionResponse {
+  // The run's receipt, which keys its artifact.
+  string receipt_id = 1;
+  int64 row_count = 2;
+  string content_digest = 3;
+}
 // An export's receipt, to its initiating caller or a namespace admin.
 message GetExportReceiptRequest {
   string operation_id = 1;
@@ -4320,6 +4363,10 @@ service SekaiService {
   rpc RevokeNamespaceExport(RevokeNamespaceExportRequest) returns (RevokeNamespaceExportResponse);
   rpc ExportObjectSet(ExportObjectSetRequest) returns (stream ExportObjectSetChunk);
   rpc GetExportReceipt(GetExportReceiptRequest) returns (GetExportReceiptResponse);
+  rpc PutExportDefinition(PutExportDefinitionRequest) returns (PutExportDefinitionResponse);
+  rpc GetExportDefinition(GetExportDefinitionRequest) returns (GetExportDefinitionResponse);
+  rpc DeleteExportDefinition(DeleteExportDefinitionRequest) returns (DeleteExportDefinitionResponse);
+  rpc RunExportDefinition(RunExportDefinitionRequest) returns (RunExportDefinitionResponse);
   rpc ExportDatasetVersion(ExportDatasetVersionRequest) returns (stream ExportObjectSetChunk);
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);

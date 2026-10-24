@@ -193,6 +193,71 @@ pub fn revoke_export(
     Ok(Some(revoked))
 }
 
+/// Writes the receipt of a saved export's run refused before it began
+/// (#1628), closed as `refused` with `reason`; returns its id. A revoked
+/// grant or a lost read therefore leaves a receipt, not only a refusal.
+pub fn record_refused_run(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    definition_id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> Result<String, String> {
+    let operation_id = format!("export-{}", uuid::Uuid::new_v4().simple());
+    let receipt = OperationReceipt {
+        version: OPERATION_RECEIPT_VERSION.into(),
+        operation_id: operation_id.clone(),
+        parent_operation_id: None,
+        namespace: namespace.into(),
+        operation_class: "governed_export".into(),
+        initiating_actor: actor.into(),
+        schema_version: EXPORT_CONTRACT.into(),
+        policy_version: String::new(),
+        started_at_ms: now_ms,
+        completed_at_ms: Some(now_ms),
+        events: vec![
+            event(
+                &operation_id,
+                "intent",
+                ReceiptEventKind::IntentRecorded,
+                actor,
+                now_ms,
+                BTreeMap::from([
+                    ("source_kind".into(), "export_definition".into()),
+                    ("source_id".into(), definition_id.into()),
+                ]),
+            ),
+            event(
+                &operation_id,
+                "outcome",
+                ReceiptEventKind::OutcomeRecorded,
+                actor,
+                now_ms,
+                BTreeMap::from([
+                    ("outcome".into(), "refused".into()),
+                    ("reason".into(), reason.into()),
+                ]),
+            ),
+        ],
+        uncovered_surfaces: Vec::new(),
+        reporter_grants: Vec::new(),
+        ontology_digest: None,
+        artifact: None,
+    };
+    db.insert_closed_export_receipt(
+        &operation_id,
+        namespace,
+        &serde_json::to_string(&receipt).map_err(|error| error.to_string())?,
+    )?;
+    Ok(operation_id)
+}
+
+/// Removes expired export artifacts (#1628): any instance may sweep.
+pub fn sweep_expired_artifacts(db: &RuntimeDb, now_ms: i64) -> Result<(), String> {
+    db.sweep_export_artifacts(now_ms).map(|_| ())
+}
+
 /// Records an export refused for want of an export grant: a refusal, never
 /// data.
 pub fn record_refusal(
@@ -781,6 +846,64 @@ mod tests {
         assert_eq!(read, ["0", "1", "2", "3", "4"]);
     }
 
+    /// Definitions store once per id; artifacts fill in order, complete,
+    /// and expire.
+    fn artifact_contract(db: &RuntimeDb, ns: &str) {
+        let (owner, record) = db
+            .put_export_definition(ns, "nightly", "alice", "{\"v\":1}")
+            .unwrap();
+        assert_eq!((owner.as_str(), record.as_str()), ("alice", "{\"v\":1}"));
+        assert_eq!(
+            db.put_export_definition(ns, "nightly", "bob", "{\"v\":2}")
+                .unwrap()
+                .1,
+            "{\"v\":1}"
+        );
+        let receipt_id = format!("{ns}-run");
+        db.open_export_artifact(&receipt_id, ns, "nightly", 1_000)
+            .unwrap();
+        for (seq, part) in [b"ab".as_slice(), b"cd".as_slice()].into_iter().enumerate() {
+            db.put_export_artifact_chunk(&receipt_id, seq as i64, part)
+                .unwrap();
+        }
+        let artifact = db.get_export_artifact(&receipt_id, 2_000).unwrap().unwrap();
+        assert_eq!(artifact.bytes, b"abcd");
+        // Unreadable once expired, kept until then, and swept after.
+        let expired = 1_000 + crate::sekai::data_export_artifact_store::ARTIFACT_RETENTION_MS + 1;
+        assert!(
+            db.get_export_artifact(&receipt_id, expired)
+                .unwrap()
+                .is_none()
+        );
+        db.sweep_export_artifacts(2_000).unwrap();
+        assert!(
+            db.get_export_artifact(&receipt_id, 2_000)
+                .unwrap()
+                .is_some()
+        );
+        db.sweep_export_artifacts(expired).unwrap();
+        assert!(
+            db.get_export_artifact(&receipt_id, 2_000)
+                .unwrap()
+                .is_none()
+        );
+        // Deleted only as the record it is.
+        assert!(
+            !db.delete_export_definition(ns, "nightly", "{\"v\":2}")
+                .unwrap()
+        );
+        assert!(
+            db.delete_export_definition(ns, "nightly", "{\"v\":1}")
+                .unwrap()
+        );
+        assert!(db.get_export_definition(ns, "nightly").unwrap().is_none());
+    }
+
+    #[test]
+    fn sqlite_export_artifacts_follow_the_contract() {
+        artifact_contract(&RuntimeDb::memory(), "acme");
+    }
+
     #[test]
     fn sqlite_dataset_versions_read_in_pages() {
         version_pages(&RuntimeDb::memory(), "acme");
@@ -880,6 +1003,7 @@ mod tests {
         assert_eq!(outcome(&done_id), "completed");
         assert_eq!(outcome(&lost_id), "aborted");
         version_pages(&db, &ns);
+        artifact_contract(&db, &ns);
     }
 
     #[test]

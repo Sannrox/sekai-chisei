@@ -16,7 +16,10 @@ mod catalog_rpc;
 mod computed_response;
 #[path = "data_export_rpc.rs"]
 mod data_export_rpc;
-use data_export_rpc::{EXPORT_BATCH, export_grantee, run_export};
+use data_export_rpc::{
+    EXPORT_BATCH, ExportCaller, ExportStream, ExportWriter, PreparedExport, export_grantee,
+    run_export,
+};
 #[path = "definition_bundle_apply_rpc.rs"]
 mod definition_bundle_apply_rpc;
 #[path = "definition_change_bundle_rpc.rs"]
@@ -363,6 +366,34 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ExportDatasetVersionRequest>,
     ) -> Result<Response<Self::ExportDatasetVersionStream>, Status> {
         self.export_dataset_version_rpc(req).await
+    }
+
+    async fn put_export_definition(
+        &self,
+        req: Request<PutExportDefinitionRequest>,
+    ) -> Result<Response<PutExportDefinitionResponse>, Status> {
+        self.put_export_definition_rpc(req).await
+    }
+
+    async fn get_export_definition(
+        &self,
+        req: Request<GetExportDefinitionRequest>,
+    ) -> Result<Response<GetExportDefinitionResponse>, Status> {
+        self.get_export_definition_rpc(req).await
+    }
+
+    async fn delete_export_definition(
+        &self,
+        req: Request<DeleteExportDefinitionRequest>,
+    ) -> Result<Response<DeleteExportDefinitionResponse>, Status> {
+        self.delete_export_definition_rpc(req).await
+    }
+
+    async fn run_export_definition(
+        &self,
+        req: Request<RunExportDefinitionRequest>,
+    ) -> Result<Response<RunExportDefinitionResponse>, Status> {
+        self.run_export_definition_rpc(req).await
     }
 
     async fn get_export_receipt(

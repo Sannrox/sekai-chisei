@@ -76,3 +76,43 @@ time, so memory stays bounded. A version purged while it streams fails the
 export rather than completing it. Redaction rewrites version rows in place,
 so an export that spans a redaction may carry values from before it, as a
 read made just before would.
+
+## Saved exports
+
+A saved export (#1628) is an export definition that runs later for its owner
+alone and stores its result as an artifact for an out-of-process adapter to
+deliver. The plane holds no destination credentials.
+
+- `PutExportDefinition` saves a definition (`namespace`, `definition_id`, and
+  exactly one of `object_set` or `dataset_version`, a source in the
+  definition's namespace). The caller becomes its `owner`. Saving makes every
+  check a run would make, for the owner alone, so a definition that could not
+  run now is not saved. Each id holds one body: an identical retry returns the
+  stored definition, and a different body is `ALREADY_EXISTS`.
+  - A dataset source with an empty `version_id` exports the latest version
+    when it runs (the same holds for `ExportDatasetVersion`).
+  - Only one principal outside a tenant assertion may save an export. A run
+    has no request to carry a tenant assertion, so a tenant-scoped export
+    could not be checked as it was saved.
+- `GetExportDefinition` and `DeleteExportDefinition` serve the owner or an
+  administrator of the namespace; anyone else gets `NOT_FOUND`. Every
+  saved-export call is refused for a request under a tenant assertion
+  (`FAILED_PRECONDITION`) and needs the namespace (write to delete or run).
+- A definition whose object set requires a purpose is refused when saved and
+  when run, rather than exporting an empty file.
+- `RunExportDefinition` runs a definition now, for its owner only. Every check
+  is made again at run time, for the owner principal alone, with no tenant
+  assertion and no purpose. A source whose policy requires a purpose is
+  therefore refused. A run that is refused, for example because the export
+  grant was revoked, fails closed and writes a `refused` receipt, named in
+  the error. A run that goes through stores its bytes, chunk by chunk under
+  the export's lease, as the artifact of its receipt. The receipt completes
+  after the last chunk is stored. The receipt is the artifact's record: the
+  artifact is whole exactly when its receipt completed, with that digest.
+- An artifact is kept for 7 days at most and cannot be read once expired.
+  Every instance sweeps expired artifacts, and closes exports whose exporter
+  was lost, once a minute.
+- `DeleteExportDefinition` deletes only the record the caller was authorized
+  against. A definition saved anew under the same id meanwhile is kept.
+  Delivery (an adapter fetching an artifact and acknowledging it) and
+  scheduling runs on the transform schedule graph are the next layers.

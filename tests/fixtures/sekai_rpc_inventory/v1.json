@@ -721,6 +721,72 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutExportDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/data_export.rs",
+        "src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetExportDefinition",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/data_export.rs",
+        "src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DeleteExportDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/data_export.rs",
+        "src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RunExportDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/data_export.rs",
+        "src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "RegisterObjectTypeDatasource",
       "kind": "persistent",
       "surfaces": [
