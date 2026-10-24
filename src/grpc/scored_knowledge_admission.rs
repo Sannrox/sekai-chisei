@@ -58,6 +58,16 @@ pub(super) fn source_request_id(request_id: &str) -> String {
     format!("sha256:{encoded}")
 }
 
+#[async_trait::async_trait]
+impl KnowledgeWriter for SekaiServiceImpl {
+    async fn write_knowledge(
+        &self,
+        request: &KnowledgeWriteRequest,
+    ) -> Result<KnowledgeWriteOutcome, String> {
+        admit(self, request).await
+    }
+}
+
 pub(super) async fn admit(
     service: &SekaiServiceImpl,
     request: &KnowledgeWriteRequest,

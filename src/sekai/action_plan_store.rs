@@ -6,6 +6,7 @@
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::action_plan::{PlanIntent, PlanSimulation, ProposedPlan};
+use crate::sekai::plan_review::PlanReview;
 
 const CREATE_SQLITE: &str = "
 CREATE TABLE IF NOT EXISTS sekai_plan_intents (
@@ -31,6 +32,14 @@ CREATE TABLE IF NOT EXISTS sekai_plan_simulations (
     body_json TEXT NOT NULL,
     simulated_at_ms INTEGER NOT NULL,
     PRIMARY KEY (namespace, plan_id, simulation_id)
+);
+CREATE TABLE IF NOT EXISTS sekai_plan_reviews (
+    namespace TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    decision TEXT NOT NULL DEFAULT '',
+    body_json TEXT NOT NULL,
+    submitted_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (namespace, plan_id)
 );
 ";
 
@@ -182,6 +191,54 @@ impl SekaiDb {
         rows.map(|row| decode(&row.map_err(|error| error.to_string())?))
             .collect()
     }
+    /// Stores a review once per plan and returns the stored one.
+    pub fn put_plan_review(&self, review: &PlanReview) -> Result<PlanReview, String> {
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_plan_reviews (namespace, plan_id, body_json, submitted_at_ms)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+                rusqlite::params![
+                    review.namespace,
+                    review.plan_id,
+                    encode(review)?,
+                    review.submitted_at_ms
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.get_plan_review(&review.namespace, &review.plan_id)?
+            .ok_or_else(|| "plan review vanished after write".into())
+    }
+
+    pub fn get_plan_review(
+        &self,
+        namespace: &str,
+        plan_id: &str,
+    ) -> Result<Option<PlanReview>, String> {
+        self.sqlite_one(
+            "SELECT body_json FROM sekai_plan_reviews WHERE namespace = ?1 AND plan_id = ?2",
+            &[&namespace, &plan_id],
+        )?
+        .map(|json| decode(&json))
+        .transpose()
+    }
+
+    /// Records the decision only while the review is undecided; `false`
+    /// when another decision landed first.
+    pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
+        self.conn()
+            .execute(
+                "UPDATE sekai_plan_reviews SET decision = ?3, body_json = ?4
+                 WHERE namespace = ?1 AND plan_id = ?2 AND decision = ''",
+                rusqlite::params![
+                    review.namespace,
+                    review.plan_id,
+                    review.decision,
+                    encode(review)?
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl PostgresDb {
@@ -314,6 +371,51 @@ impl PostgresDb {
             .map(|row| decode(row.get(0)))
             .collect()
     }
+    pub fn put_plan_review(&self, review: &PlanReview) -> Result<PlanReview, String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_plan_reviews (namespace, plan_id, body_json, submitted_at_ms)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                &[
+                    &review.namespace,
+                    &review.plan_id,
+                    &encode(review)?,
+                    &review.submitted_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.get_plan_review(&review.namespace, &review.plan_id)?
+            .ok_or_else(|| "plan review vanished after write".into())
+    }
+
+    pub fn get_plan_review(
+        &self,
+        namespace: &str,
+        plan_id: &str,
+    ) -> Result<Option<PlanReview>, String> {
+        self.postgres_one(
+            "SELECT body_json FROM sekai_plan_reviews WHERE namespace = $1 AND plan_id = $2",
+            &[&namespace, &plan_id],
+        )?
+        .map(|json| decode(&json))
+        .transpose()
+    }
+
+    pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
+        self.connection()?
+            .execute(
+                "UPDATE sekai_plan_reviews SET decision = $3, body_json = $4
+                 WHERE namespace = $1 AND plan_id = $2 AND decision = ''",
+                &[
+                    &review.namespace,
+                    &review.plan_id,
+                    &review.decision,
+                    &encode(review)?,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Dispatches to the backend the plane runs on; PostgreSQL off the async
@@ -371,5 +473,20 @@ impl crate::db::runtime_db::RuntimeDb {
         limit: usize,
     ) -> Result<Vec<PlanSimulation>, String> {
         dispatch!(self, db => db.list_plan_simulations(namespace, plan_id, limit))
+    }
+    pub fn put_plan_review(&self, review: &PlanReview) -> Result<PlanReview, String> {
+        dispatch!(self, db => db.put_plan_review(review))
+    }
+
+    pub fn get_plan_review(
+        &self,
+        namespace: &str,
+        plan_id: &str,
+    ) -> Result<Option<PlanReview>, String> {
+        dispatch!(self, db => db.get_plan_review(namespace, plan_id))
+    }
+
+    pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
+        dispatch!(self, db => db.decide_plan_review(review))
     }
 }
