@@ -383,10 +383,10 @@ impl CatalogRegistration {
         }
         self.owners = normalized_list("owners", &self.owners)?;
         self.tags = normalized_list("tags", &self.tags)?;
-        if let Some(binding) = &self.binding {
-            if !binding.matches_entry_kind(self.entry_kind) {
-                return invalid("catalog binding kind does not match entry_kind");
-            }
+        if let Some(binding) = &self.binding
+            && !binding.matches_entry_kind(self.entry_kind)
+        {
+            return invalid("catalog binding kind does not match entry_kind");
         }
         Ok(self)
     }
@@ -653,10 +653,10 @@ pub fn register(
     // Stored bindings stay after the target is unpublished (ontology
     // deprecation). Discoverability is checked on the lineage walk.
     let stored_binding = existing.as_ref().and_then(binding_from_entry);
-    if stored_binding.is_none() {
-        if let Some(binding) = &registration.binding {
-            validate_binding_target(db, &registration.namespace, binding)?;
-        }
+    if stored_binding.is_none()
+        && let Some(binding) = &registration.binding
+    {
+        validate_binding_target(db, &registration.namespace, binding)?;
     }
     let stored = existing
         .as_ref()

@@ -127,14 +127,17 @@ pub fn walk_lineage(
         kind: start_binding.kind,
         id: start_binding.target_id.clone(),
     };
+    let graph = LineageGraph {
+        entries: &entries,
+        transforms: &transforms,
+        type_links: &type_links,
+        source_datasets: &source_datasets,
+    };
     let upstream = collect_direction(
         &start_core,
         Direction::Upstream,
         depth,
-        &entries,
-        &transforms,
-        &type_links,
-        &source_datasets,
+        &graph,
         &readable,
         &discoverable,
     );
@@ -142,10 +145,7 @@ pub fn walk_lineage(
         &start_core,
         Direction::Downstream,
         depth,
-        &entries,
-        &transforms,
-        &type_links,
-        &source_datasets,
+        &graph,
         &readable,
         &discoverable,
     );
@@ -169,20 +169,25 @@ enum Direction {
     Downstream,
 }
 
+struct LineageGraph<'a> {
+    entries: &'a [Object],
+    transforms: &'a [GovernedTransform],
+    type_links: &'a [(String, String)],
+    source_datasets: &'a [(String, String)],
+}
+
 fn collect_direction(
     start: &CoreRef,
     direction: Direction,
     depth: usize,
-    entries: &[Object],
-    transforms: &[GovernedTransform],
-    type_links: &[(String, String)],
-    source_datasets: &[(String, String)],
+    graph: &LineageGraph<'_>,
     readable: &impl Fn(&Object) -> bool,
     discoverable: &impl Fn(&CatalogBinding) -> bool,
 ) -> Vec<LineageNode> {
     let mut nodes = Vec::new();
     let mut seen_cores = HashSet::from([start.clone()]);
-    let mut seen_entries = HashSet::from([entries
+    let mut seen_entries = HashSet::from([graph
+        .entries
         .iter()
         .find(|entry| {
             binding_from_entry(entry)
@@ -196,12 +201,12 @@ fn collect_direction(
         if hops >= depth {
             continue;
         }
-        for neighbor in neighbors(&core, direction, transforms, type_links, source_datasets) {
+        for neighbor in neighbors(&core, direction, graph) {
             if !seen_cores.insert(neighbor.clone()) {
                 continue;
             }
             queue.push_back((neighbor.clone(), hops + 1));
-            for entry in entries_for(&neighbor, entries) {
+            for entry in entries_for(&neighbor, graph.entries) {
                 if !seen_entries.insert(entry.id.clone()) {
                     continue;
                 }
@@ -230,17 +235,11 @@ fn collect_direction(
     nodes
 }
 
-fn neighbors(
-    core: &CoreRef,
-    direction: Direction,
-    transforms: &[GovernedTransform],
-    type_links: &[(String, String)],
-    source_datasets: &[(String, String)],
-) -> Vec<CoreRef> {
+fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph<'_>) -> Vec<CoreRef> {
     let mut out = Vec::new();
     match (core.kind, direction) {
         (BindingKind::Dataset, Direction::Upstream) => {
-            for transform in transforms {
+            for transform in graph.transforms {
                 if transform.output_dataset_id == core.id {
                     out.push(CoreRef {
                         kind: BindingKind::Transform,
@@ -248,7 +247,7 @@ fn neighbors(
                     });
                 }
             }
-            for (source_id, dataset_id) in source_datasets {
+            for (source_id, dataset_id) in graph.source_datasets {
                 if dataset_id == &core.id {
                     out.push(CoreRef {
                         kind: BindingKind::Source,
@@ -258,7 +257,7 @@ fn neighbors(
             }
         }
         (BindingKind::Dataset, Direction::Downstream) => {
-            for transform in transforms {
+            for transform in graph.transforms {
                 if transform.consumes_dataset(&core.id) {
                     out.push(CoreRef {
                         kind: BindingKind::Transform,
@@ -266,7 +265,7 @@ fn neighbors(
                     });
                 }
             }
-            for (dataset_id, object_type_id) in type_links {
+            for (dataset_id, object_type_id) in graph.type_links {
                 if dataset_id == &core.id {
                     out.push(CoreRef {
                         kind: BindingKind::ObjectType,
@@ -276,7 +275,7 @@ fn neighbors(
             }
         }
         (BindingKind::Transform, Direction::Upstream) => {
-            if let Some(transform) = transforms.iter().find(|t| t.transform_id == core.id) {
+            if let Some(transform) = graph.transforms.iter().find(|t| t.transform_id == core.id) {
                 for (_, dataset_id) in transform.input_bindings() {
                     if !dataset_id.is_empty() {
                         out.push(CoreRef {
@@ -288,17 +287,17 @@ fn neighbors(
             }
         }
         (BindingKind::Transform, Direction::Downstream) => {
-            if let Some(transform) = transforms.iter().find(|t| t.transform_id == core.id) {
-                if !transform.output_dataset_id.is_empty() {
-                    out.push(CoreRef {
-                        kind: BindingKind::Dataset,
-                        id: transform.output_dataset_id.clone(),
-                    });
-                }
+            if let Some(transform) = graph.transforms.iter().find(|t| t.transform_id == core.id)
+                && !transform.output_dataset_id.is_empty()
+            {
+                out.push(CoreRef {
+                    kind: BindingKind::Dataset,
+                    id: transform.output_dataset_id.clone(),
+                });
             }
         }
         (BindingKind::ObjectType, Direction::Upstream) => {
-            for (dataset_id, object_type_id) in type_links {
+            for (dataset_id, object_type_id) in graph.type_links {
                 if object_type_id == &core.id {
                     out.push(CoreRef {
                         kind: BindingKind::Dataset,
@@ -310,7 +309,7 @@ fn neighbors(
         (BindingKind::ObjectType, Direction::Downstream) => {}
         (BindingKind::Source, Direction::Upstream) => {}
         (BindingKind::Source, Direction::Downstream) => {
-            for (source_id, dataset_id) in source_datasets {
+            for (source_id, dataset_id) in graph.source_datasets {
                 if source_id == &core.id {
                     out.push(CoreRef {
                         kind: BindingKind::Dataset,
