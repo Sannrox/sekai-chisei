@@ -2810,7 +2810,7 @@ fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyE
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use rusqlite::Connection;
@@ -2825,8 +2825,8 @@ mod tests {
         SourceSyncGenerationStatus,
     };
 
-    const PRODUCER: &str = "connector/github-primary";
-    const TYPE_DIGEST: &str = GITHUB_OBJECT_SYNC_TYPE_DIGEST;
+    pub(crate) const PRODUCER: &str = "connector/github-primary";
+    pub(crate) const TYPE_DIGEST: &str = GITHUB_OBJECT_SYNC_TYPE_DIGEST;
     const OTHER_TYPE_DIGEST: &str =
         "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const PAYLOAD_DIGEST: &str =
@@ -2895,7 +2895,7 @@ mod tests {
         }
     }
 
-    fn batch(current_cursor: &str, next_cursor: &str, key: &str) -> SourceBatch {
+    pub(crate) fn batch(current_cursor: &str, next_cursor: &str, key: &str) -> SourceBatch {
         let mut batch = SourceBatch {
             contract_version: SOURCE_BATCH_VERSION.into(),
             namespace: "acme".into(),
@@ -2918,7 +2918,7 @@ mod tests {
         batch
     }
 
-    fn redigest(batch: &mut SourceBatch) {
+    pub(crate) fn redigest(batch: &mut SourceBatch) {
         batch.batch_digest = batch.canonical_digest().unwrap();
     }
 
@@ -3255,6 +3255,126 @@ mod tests {
         assert_eq!(result.transaction.opened_at_ms, 100);
         assert_eq!(result.transaction.closed_at_ms, Some(200));
         assert_eq!(checkpoint(&reopened).as_deref(), Some("cursor:1"));
+    }
+
+    /// Persists `batch` as an open transaction in the store at `path` and
+    /// drops the handle, as a crashed applier would.
+    fn leave_open(path: &std::path::Path, batch: &SourceBatch) {
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let prepared = PreparedBatch::new(batch, &SourceBatchMapper::Github).unwrap();
+        assert!(matches!(
+            db.persist_source_batch_open(batch, &prepared, 100).unwrap(),
+            OpenDisposition::Open
+        ));
+    }
+
+    fn runtime(path: &std::path::Path) -> crate::db::runtime_db::RuntimeDb {
+        crate::db::runtime_db::RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn a_fresh_handle_resumes_an_open_batch_from_its_stored_body() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        leave_open(&path, &batch("", "cursor:1", "batch-1"));
+        // A replacement process without the batch resumes it.
+        let db = runtime(&path);
+        let result = db
+            .resume_open_source_batch("acme", "acme/ops", TYPE_DIGEST, PRODUCER, 200)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.transaction.opened_at_ms, 100);
+        assert_eq!(result.transaction.closed_at_ms, Some(200));
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.checkpoint.unwrap().cursor, "cursor:1");
+        // Nothing open any more: a no-op.
+        assert!(
+            db.resume_open_source_batch("acme", "acme/ops", TYPE_DIGEST, PRODUCER, 300)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_resumes_commit_the_open_batch_once() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        leave_open(&path, &batch("", "cursor:1", "batch-1"));
+        let resumes: Vec<_> = (0..2)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    runtime(&path).resume_open_source_batch(
+                        "acme",
+                        "acme/ops",
+                        TYPE_DIGEST,
+                        PRODUCER,
+                        200 + n,
+                    )
+                })
+            })
+            .collect();
+        for resume in resumes {
+            // Each either commits it, replays the commit, or finds it closed.
+            resume.join().unwrap().unwrap();
+        }
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let committed: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_source_batch_transactions WHERE status = 'COMMITTED'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, 1);
+        assert_eq!(checkpoint(&db).as_deref(), Some("cursor:1"));
+    }
+
+    #[test]
+    fn an_open_batch_aborts_once_with_a_reason_and_keeps_the_checkpoint() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        leave_open(&path, &batch("", "cursor:1", "batch-1"));
+        let db = runtime(&path);
+        assert!(
+            db.abort_open_source_batch("acme", "acme/ops", TYPE_DIGEST, PRODUCER, " ", 200)
+                .is_err()
+        );
+        assert_eq!(
+            db.abort_open_source_batch("acme", "acme/ops", TYPE_DIGEST, "someone-else", "x", 200)
+                .unwrap_err(),
+            crate::db::source_batch_recovery::PRODUCER_MISMATCH
+        );
+        assert!(
+            db.abort_open_source_batch(
+                "acme",
+                "acme/ops",
+                TYPE_DIGEST,
+                PRODUCER,
+                "upstream deleted",
+                200
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.abort_open_source_batch("acme", "acme/ops", TYPE_DIGEST, PRODUCER, "again", 300)
+                .unwrap()
+        );
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert!(state.checkpoint.is_none());
+        assert!(state.open_transaction.is_none());
+        // The binding takes a fresh batch again.
+        db.apply_source_batch(&batch("", "cursor:2", "batch-2"), PRODUCER, 400)
+            .unwrap();
     }
 
     #[test]
