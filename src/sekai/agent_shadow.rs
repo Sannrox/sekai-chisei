@@ -184,13 +184,15 @@ where
     Ok(classify_actions(definition, reply, validate_submit))
 }
 
-fn action_key(actions: &[ActionTrace]) -> Vec<(String, String, String)> {
+fn action_key(actions: &[ActionTrace]) -> Vec<(String, serde_json::Value, String)> {
     actions
         .iter()
         .map(|action| {
+            let parameters = serde_json::from_str(&action.parameters_json)
+                .unwrap_or_else(|_| serde_json::Value::String(action.parameters_json.clone()));
             (
                 action.action_type.clone(),
-                action.parameters_json.clone(),
+                parameters,
                 action.disposition.clone(),
             )
         })
@@ -245,7 +247,8 @@ pub fn require_shadow_report(
 mod tests {
     use super::*;
     use crate::sekai::agent_dry_run::{
-        DISPOSITION_WOULD_SUBMIT, DryRunModelReply, ProposedAction, ScriptedHost,
+        DISPOSITION_WOULD_SUBMIT, DryRunFailure, DryRunModelReply, DryRunModelRequest,
+        ProposedAction, ScriptedHost,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -345,6 +348,47 @@ mod tests {
         );
         assert_eq!(report.cost_tokens, 2);
         assert!(report.passing);
+    }
+
+    #[test]
+    fn equivalent_json_objects_count_as_unchanged() {
+        struct FlipJsonHost;
+        impl AgentDryRunHost for FlipJsonHost {
+            fn admit_and_complete(
+                &self,
+                request: &DryRunModelRequest,
+            ) -> Result<DryRunModelReply, DryRunFailure> {
+                let parameters_json = if request.instructions.contains("Close") {
+                    r#"{"n":2,"id":"1"}"#
+                } else {
+                    r#"{"id":"1","n":2}"#
+                };
+                Ok(DryRunModelReply {
+                    route: "native/scripted".into(),
+                    output: "scripted".into(),
+                    tool_calls: Vec::new(),
+                    proposed_actions: vec![ProposedAction {
+                        action_type: "Ticket.inspect".into(),
+                        parameters_json: parameters_json.into(),
+                    }],
+                })
+            }
+        }
+        let envelopes = [TriggerEnvelope {
+            id: "env-1".into(),
+            input: "ticket 1 arrived".into(),
+        }];
+        let active = definition("Inspect records.", &["Ticket.inspect"]);
+        let candidate = definition("Close tickets.", &["Ticket.inspect"]);
+        let report = run_shadow(
+            &compare(&active, &candidate, &envelopes),
+            &FlipJsonHost,
+            json_ok,
+        )
+        .expect("shadow");
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.differed, 0);
+        assert!(report.samples.is_empty());
     }
 
     #[test]
