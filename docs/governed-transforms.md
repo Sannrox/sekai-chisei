@@ -65,6 +65,25 @@ The analytical profile runs SQL in a private in-memory SQLite connection
 fail with `transform_budget_time` or `transform_budget_memory` and leave the
 previous output readable. Example: `cargo run --example analytical_transform`.
 
+## Measured usage
+
+A finished run reads back with `finished_at_ms` and `compute_seconds`
+(`TransformRun` fields 26 and 27, #1651), so an extension can record usage
+once per run id with the transform definition as a label.
+
+- **In-process runs:** compute is measured from the start of compute to the
+  moment the run's own output is written. Downstream runs it triggers in
+  the same transaction are measured as runs of their own, not counted here.
+- **Isolated-process runs:** compute is measured from the latest claim to
+  write-back.
+- **Never computed:** a failed, refused or cancelled run has
+  `finished_at_ms` and no `compute_seconds`.
+- **Unfinished:** a pending or claimed run has neither.
+
+The values live beside the run, written in the same transaction, so the
+run's receipts are unchanged. Transforms call no model, so runs carry no
+token counts.
+
 ## Operator path
 
 ```bash
