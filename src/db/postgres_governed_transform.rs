@@ -186,6 +186,9 @@ impl PostgresDb {
         let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
         lock_ids.push(transform.output_dataset_id.as_str());
         lock_transform_datasets(&mut tx, &lock_ids)?;
+        // Compute is measured from here, once the dataset locks are held, until
+        // this run's output is written, before downstream triggers run (#1651).
+        let started = std::time::Instant::now();
         let stored = load_checkpoint(&mut tx, namespace, transform_id)?;
         let output_keys = load_dataset_partition_keys_pg(&mut tx, &transform.output_dataset_id)?;
         let (mut incremental, checkpoint) = bind_checkpoint(
@@ -288,6 +291,7 @@ impl PostgresDb {
                 run.output_digest = dataset_digest(&keys, &live);
             }
             insert_transform_run(&mut tx, &run)?;
+            record_in_process_finish_pg(&mut tx, &run.run_id, started)?;
             after_run_committed_pg(&mut tx, &transform, &run, now_ms)?;
             persist_transform_usage_pending_pg(&mut tx, &run.run_id, tenant_id, now_ms)?;
             tx.commit().map_err(|error| error.to_string())?;
@@ -306,6 +310,7 @@ impl PostgresDb {
         )?;
         stamp_object_marking(&mut tx, &output_object_id, &run, now_ms)?;
         insert_transform_run(&mut tx, &run)?;
+        record_in_process_finish_pg(&mut tx, &run.run_id, started)?;
         tx.execute(
             "INSERT INTO sekai_governed_transform_checkpoint
              (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
@@ -677,8 +682,22 @@ impl PostgresDb {
         )
         .map_err(|error| error.to_string())?;
         stamp_run_dispatch_pg(&mut tx, run_id, TRANSFORM_RUN_REFUSED)?;
+        record_run_finish_pg(&mut tx, run_id, now_ms, None)?;
         delete_run_input_snapshot_pg(&mut tx, run_id)?;
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// When the run finished and how long it computed (#1651).
+    pub fn transform_run_finish(&self, run_id: &str) -> Result<Option<(i64, Option<i64>)>, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT finished_at_ms, compute_ms FROM sekai_transform_run_finish
+                 WHERE run_id = $1 AND finished_at_ms IS NOT NULL",
+                &[&run_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1))))
     }
 
     /// Why the run was refused, when it was (#1701).
@@ -2085,6 +2104,7 @@ fn claim_transform_work_pg(
                 work.status = TRANSFORM_WORK_FAILED.into();
                 persist_transform_work_pg(tx, &work)?;
                 stamp_run_dispatch_pg(tx, &work.run_id, TRANSFORM_WORK_FAILED)?;
+                record_run_finish_pg(tx, &work.run_id, now_ms, None)?;
                 delete_run_input_snapshot_pg(tx, &work.run_id)?;
                 failed_run_ids.push(work.run_id);
                 continue;
@@ -2100,6 +2120,7 @@ fn claim_transform_work_pg(
                 work.status = TRANSFORM_WORK_FAILED.into();
                 persist_transform_work_pg(tx, &work)?;
                 stamp_run_dispatch_pg(tx, &work.run_id, TRANSFORM_WORK_FAILED)?;
+                record_run_finish_pg(tx, &work.run_id, now_ms, None)?;
                 delete_run_input_snapshot_pg(tx, &work.run_id)?;
                 failed_run_ids.push(work.run_id);
                 continue;
@@ -2124,6 +2145,7 @@ fn claim_transform_work_pg(
     persist_transform_work_pg(tx, &work)?;
     carry_transform_quota_request_admission_pg(tx, &work.run_id, work.claim_generation)?;
     stamp_run_dispatch_pg(tx, &work.run_id, TRANSFORM_WORK_CLAIMED)?;
+    record_run_claimed_pg(tx, &work.run_id, now_ms)?;
     Ok(ClaimTransformWorkOutcome {
         claimed: Some((work, transform)),
         failed_run_ids,
@@ -2356,6 +2378,8 @@ fn write_transform_run_pg(
         run.engine = work.engine.clone();
         run.runtime_image = work.runtime_image.clone();
         persist_transform_run_pg(tx, &run)?;
+        let compute_ms = compute_since_claim_pg(tx, &run.run_id, now_ms)?;
+        record_run_finish_pg(tx, &run.run_id, now_ms, compute_ms)?;
         let mut done = work;
         done.status = TRANSFORM_WORK_COMPLETED.into();
         persist_fenced_transform_work_pg(
@@ -2409,6 +2433,8 @@ fn write_transform_run_pg(
     run.runtime_image = work.runtime_image.clone();
     stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
     persist_transform_run_pg(tx, &run)?;
+    let compute_ms = compute_since_claim_pg(tx, &run.run_id, now_ms)?;
+    record_run_finish_pg(tx, &run.run_id, now_ms, compute_ms)?;
     tx.execute(
         "INSERT INTO sekai_governed_transform_checkpoint
          (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
@@ -3077,6 +3103,66 @@ pub(crate) fn redact_transform_partition_receipts_pg(
         .map_err(|error| error.to_string())?;
     }
     crate::db::postgres_receipt_chain::redact_transform_run_chain(tx, dataset_id)
+}
+
+/// When an isolated run's latest claim began (#1651), as SQLite records it.
+fn record_run_claimed_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    claimed_at_ms: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO sekai_transform_run_finish (run_id, claimed_at_ms) VALUES ($1, $2)
+         ON CONFLICT (run_id) DO UPDATE SET claimed_at_ms = EXCLUDED.claimed_at_ms",
+        &[&run_id, &claimed_at_ms],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Records that a run finished, as SQLite does (#1651).
+fn record_run_finish_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    finished_at_ms: i64,
+    compute_ms: Option<i64>,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO sekai_transform_run_finish (run_id, finished_at_ms, compute_ms)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (run_id) DO UPDATE SET
+            finished_at_ms = EXCLUDED.finished_at_ms,
+            compute_ms = EXCLUDED.compute_ms",
+        &[&run_id, &finished_at_ms, &compute_ms],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// An in-process run finishes now, by the wall clock, as on SQLite.
+fn record_in_process_finish_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    started: std::time::Instant,
+) -> Result<(), String> {
+    let compute_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let finished_at_ms = chrono::Utc::now().timestamp_millis();
+    record_run_finish_pg(tx, run_id, finished_at_ms, Some(compute_ms))
+}
+
+fn compute_since_claim_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    now_ms: i64,
+) -> Result<Option<i64>, String> {
+    Ok(tx
+        .query_opt(
+            "SELECT claimed_at_ms FROM sekai_transform_run_finish WHERE run_id = $1",
+            &[&run_id],
+        )
+        .map_err(|error| error.to_string())?
+        .and_then(|row| row.get::<_, Option<i64>>(0))
+        .map(|claimed| now_ms.saturating_sub(claimed).max(0)))
 }
 
 fn persist_transform_run_pg(
@@ -3756,6 +3842,7 @@ fn run_in_process_pg(
     let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
     lock_ids.push(transform.output_dataset_id.as_str());
     lock_transform_datasets(tx, &lock_ids)?;
+    let started = std::time::Instant::now();
     let stored = load_checkpoint(tx, &transform.namespace, &transform.transform_id)?;
     let output_keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
     let (mut incremental, checkpoint) = bind_checkpoint(
@@ -3858,6 +3945,7 @@ fn run_in_process_pg(
             run.output_digest = dataset_digest(&keys, &live);
         }
         insert_transform_run(tx, &run)?;
+        record_in_process_finish_pg(tx, &run.run_id, started)?;
         return Ok(run);
     }
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
@@ -3873,6 +3961,7 @@ fn run_in_process_pg(
     )?;
     stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
     insert_transform_run(tx, &run)?;
+    record_in_process_finish_pg(tx, &run.run_id, started)?;
     tx.execute(
         "INSERT INTO sekai_governed_transform_checkpoint
          (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
@@ -3940,6 +4029,7 @@ fn cancel_governed_transform_run_pg(
         run.quality_rule = TRANSFORM_TRIGGER_CANCELLED.into();
         run.stamp_trigger(TRANSFORM_TRIGGER_CANCELLED, run_id);
         persist_transform_run_pg(tx, &run)?;
+        record_run_finish_pg(tx, run_id, now_ms, None)?;
         delete_run_input_snapshot_pg(tx, run_id)?;
     }
     if let Some(transform) = load_transform(tx, &run.namespace, &run.transform_id)? {
@@ -3993,6 +4083,7 @@ fn cancel_governed_transform_run_pg(
                         downstream_run.quality_rule = TRANSFORM_TRIGGER_CANCELLED.into();
                         downstream_run.stamp_trigger(TRANSFORM_TRIGGER_CANCELLED, &run.run_id);
                         persist_transform_run_pg(tx, &downstream_run)?;
+                        record_run_finish_pg(tx, &work_run_id, now_ms, None)?;
                     }
                     delete_run_input_snapshot_pg(tx, &work_run_id)?;
                 }
@@ -4025,6 +4116,7 @@ fn cancel_governed_transform_run_pg(
                 output_partitions: Vec::new(),
             };
             insert_transform_run(tx, &skip)?;
+            record_run_finish_pg(tx, &skip.run_id, now_ms, None)?;
         }
     }
     Ok(run)
@@ -4708,6 +4800,11 @@ mod tests {
             .unwrap();
         assert_eq!(committed.dispatch_status, TRANSFORM_WORK_COMPLETED);
         assert_eq!(committed.rows_out, 1);
+        // Claimed at 30, written back at 50: 20 ms of compute (#1651).
+        assert_eq!(
+            db.transform_run_finish(&committed.run_id).unwrap(),
+            Some((50, Some(20)))
+        );
         let live = db.query_dataset_rows("out", &RowQuery::default()).unwrap();
         assert_eq!(live, output);
         assert_eq!(committed.output_digest, rows_digest(&live));
@@ -5111,6 +5208,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.dispatch_status, TRANSFORM_RUN_REFUSED);
+        // Refused at 32: finished, with no compute (#1651).
+        assert_eq!(
+            db.transform_run_finish(&admitted.run_id).unwrap(),
+            Some((32, None))
+        );
         assert_eq!(
             db.transform_run_refusal(&admitted.run_id).unwrap(),
             Some(refusal)
