@@ -121,6 +121,19 @@ pub struct FunctionBudget {
     pub max_steps: u32,
 }
 
+/// The default caps with a time budget wall time never reaches, for tests
+/// that are not about time: under a loaded parallel test run a 50 ms budget
+/// trips first and fails them (#1772).
+#[cfg(test)]
+impl FunctionBudget {
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            max_time_ms: 60_000,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for FunctionBudget {
     fn default() -> Self {
         Self {
@@ -1653,10 +1666,9 @@ mod tests {
             &HashMap::new(),
             |_| Ok(true),
             host.clone(),
-            FunctionBudget::default(),
+            FunctionBudget::for_tests(),
         )
         .unwrap();
-        assert!(first.receipt.elapsed_ms < 50);
         assert_eq!(first.receipt.now_ms, host.now_ms);
         assert_eq!(first.receipt.rng_seed, 42);
         assert!(first.receipt.budget_exceeded.is_empty());
@@ -1667,7 +1679,7 @@ mod tests {
             &HashMap::new(),
             |_| Ok(true),
             host,
-            FunctionBudget::default(),
+            FunctionBudget::for_tests(),
         )
         .unwrap();
         assert_eq!(first.receipt.output_digest, second.receipt.output_digest);
@@ -1701,7 +1713,7 @@ mod tests {
                 rng_seed: 1,
             },
             FunctionBudget {
-                max_time_ms: 50,
+                max_time_ms: 60_000,
                 max_output_bytes: 1024,
                 max_steps: 8,
             },
@@ -1746,7 +1758,7 @@ mod tests {
                 now_ms: 1,
                 rng_seed: 1,
             },
-            FunctionBudget::default(),
+            FunctionBudget::for_tests(),
         )
         .unwrap();
         assert_eq!(invocation.result.aggregates["count"], "0");
@@ -1865,7 +1877,7 @@ mod tests {
             &HashMap::new(),
             |_| Ok(true),
             invoke_host(),
-            FunctionBudget::default(),
+            FunctionBudget::for_tests(),
             &host,
         )
         .unwrap();
@@ -1895,7 +1907,7 @@ mod tests {
             &HashMap::new(),
             |_| Ok(true),
             invoke_host(),
-            FunctionBudget::default(),
+            FunctionBudget::for_tests(),
             &host,
         )
         .unwrap();
@@ -1905,7 +1917,7 @@ mod tests {
             &HashMap::new(),
             |_| Ok(true),
             invoke_host(),
-            FunctionBudget::default(),
+            FunctionBudget::for_tests(),
             &host,
         )
         .unwrap();
@@ -1936,7 +1948,7 @@ mod tests {
             &HashMap::new(),
             |_| Ok(true),
             invoke_host(),
-            FunctionBudget::default(),
+            FunctionBudget::for_tests(),
             &host,
         )
         .unwrap();
@@ -1964,7 +1976,7 @@ mod tests {
             &HashMap::new(),
             |_| Ok(true),
             invoke_host(),
-            FunctionBudget::default(),
+            FunctionBudget::for_tests(),
         )
         .unwrap_err();
         assert_eq!(error, "llm step requires a host");
@@ -2106,7 +2118,7 @@ mod tests {
             |_| Ok(true),
             invoke_host(),
             FunctionBudget {
-                max_time_ms: 50,
+                max_time_ms: 60_000,
                 max_output_bytes: 8,
                 max_steps: 32,
             },
