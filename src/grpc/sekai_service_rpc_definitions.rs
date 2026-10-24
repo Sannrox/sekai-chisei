@@ -1888,12 +1888,20 @@ pub(super) async fn get_ontology_lint_report(
         Some(&namespace),
         MAX_LINT_OBJECTS,
     )?;
-    let consumed = bindings
+    let references: Vec<_> = bindings
         .iter()
         .filter_map(|object| {
             crate::sekai::definition_consumer_impact::binding_from_object(object).ok()
         })
-        .map(|binding| (binding.member_kind, binding.member_id))
+        .collect();
+    let consumed = references
+        .iter()
+        .map(|binding| (binding.member_kind.clone(), binding.member_id.clone()))
+        .collect();
+    let consumed_properties = references
+        .into_iter()
+        .filter(|binding| binding.member_kind == "object_type" && !binding.property.is_empty())
+        .map(|binding| (binding.member_id, binding.property))
         .collect();
     let (entries, entries_complete) = visible(
         crate::sekai::catalog::CATALOG_ENTRY_KIND,
@@ -1963,6 +1971,7 @@ pub(super) async fn get_ontology_lint_report(
         objects_complete,
         linked,
         consumed,
+        consumed_properties,
         catalog_owned,
         action_types,
         clearances: profiles.iter().map(profile_clearance).collect(),
@@ -1976,8 +1985,11 @@ pub(super) async fn get_ontology_lint_report(
                 rule: finding.rule.into(),
                 subject_kind: finding.subject_kind.into(),
                 subject_id: finding.subject_id,
+                property: finding.property,
                 severity: finding.severity.into(),
                 detail: finding.detail,
+                suppressed: finding.suppressed.is_some(),
+                suppression_reason: finding.suppressed.unwrap_or_default(),
             })
             .collect(),
         // A capped side scan can only add findings, never hide one, but

@@ -28763,3 +28763,105 @@ async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_
         .unwrap_err();
     assert_eq!(missing.code(), tonic::Code::NotFound);
 }
+
+#[tokio::test]
+async fn unreferenced_properties_follow_visible_consumers_and_suppressions() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "lint-b");
+    publish_definition_history_entry(
+        &svc,
+        "lint-b",
+        &parent.revision_digest,
+        "lint-b-1",
+        "lint-b-cs-1",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","owner":"support","properties":["title","legacy"],"lint_suppressions":[{"rule":"unreferenced_property","property":"legacy","reason":"read by the nightly export"},{"rule":"orphan_object_type","reason":"seed type"}]}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    // A consumer the tester may not read references `title`.
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "binding-secret".into(),
+            kind: crate::sekai::definition_consumer_impact::BINDING_KIND.into(),
+            name: "binding-secret".into(),
+            namespace: "lint-b".into(),
+            external_id: String::new(),
+            properties: HashMap::from(
+                [
+                    (
+                        "contract_version",
+                        crate::sekai::definition_consumer_impact::BINDING_CONTRACT,
+                    ),
+                    ("owner", "secret-team"),
+                    ("resource_identity", "secret-dashboard"),
+                    ("member_kind", "object_type"),
+                    ("member_id", "Ticket"),
+                    ("property", "title"),
+                    ("declaration_digest", "sha256:declared"),
+                    ("source_locator", "dashboards/secret"),
+                    ("access_marking", "restricted"),
+                ]
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+            ),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let lint = |principal: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.get_ontology_lint_report(with_named_principal(
+                GetOntologyLintReportRequest {
+                    namespace: "lint-b".into(),
+                },
+                principal,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .findings
+        }
+    };
+    let summary = |findings: &[OntologyLintFinding]| {
+        findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{}:{}{}:{}",
+                    finding.rule,
+                    finding.subject_id,
+                    if finding.property.is_empty() {
+                        String::new()
+                    } else {
+                        format!(".{}", finding.property)
+                    },
+                    finding.suppression_reason
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        summary(&lint("root").await),
+        ["unreferenced_property:Ticket.legacy:read by the nightly export"]
+    );
+    // Without the consumer, the type reads as orphaned and `title` as
+    // unreferenced, and nothing names the consumer.
+    let limited = lint("tester").await;
+    assert_eq!(
+        summary(&limited),
+        [
+            "orphan_object_type:Ticket:seed type",
+            "unreferenced_property:Ticket.legacy:read by the nightly export",
+            "unreferenced_property:Ticket.title:",
+        ]
+    );
+    assert!(limited.iter().all(|finding| {
+        !finding.detail.contains("secret") && !finding.subject_id.contains("secret")
+    }));
+    assert!(limited[0].suppressed && !limited[2].suppressed);
+}

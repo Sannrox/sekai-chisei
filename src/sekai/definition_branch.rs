@@ -177,6 +177,7 @@ impl DefinitionMemberInput {
         if !value.is_object() {
             return Err("definition_json must be a JSON object".into());
         }
+        crate::sekai::ontology_lint::suppressions(&self.member_kind, &value)?;
         if self.member_kind == "agent" {
             let agent: crate::sekai::agent_definition::AgentDefinition =
                 serde_json::from_value(value.clone())

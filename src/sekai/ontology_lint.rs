@@ -8,7 +8,13 @@
 //! - object and link types without an owner;
 //! - markings applied to almost every visible object, or that almost every
 //!   visible principal profile is cleared for;
-//! - enabled Action types with no instance the caller may see.
+//! - enabled Action types with no instance the caller may see;
+//! - object type properties no visible consumer binding references (#1684).
+//!
+//! A definition member can suppress findings about itself (or its
+//! properties) with a reason, in its `lint_suppressions`; a suppressed
+//! finding is still reported, marked with that reason. Suppressions live in
+//! the definition, so they are versioned and reviewed with proposals.
 //!
 //! The caller gathers the inputs already filtered by its read policy, so a
 //! finding never names what the caller cannot see. Rules are pure over the
@@ -28,6 +34,19 @@ pub const RULE_UNOWNED_LINK_TYPE: &str = "unowned_link_type";
 pub const RULE_BROAD_MARKING_APPLIED: &str = "broad_marking_applied";
 pub const RULE_BROAD_MARKING_GRANTED: &str = "broad_marking_granted";
 pub const RULE_ACTION_TYPE_NEVER_RUN: &str = "action_type_never_run";
+pub const RULE_UNREFERENCED_PROPERTY: &str = "unreferenced_property";
+
+/// Definition field holding a member's suppressions.
+pub const SUPPRESSIONS_FIELD: &str = "lint_suppressions";
+const MAX_SUPPRESSIONS: usize = 64;
+const MAX_SUPPRESSION_REASON: usize = 512;
+/// Rules a member can suppress about itself, by member kind.
+const SUPPRESSIBLE: &[(&str, &str)] = &[
+    ("object_type", RULE_ORPHAN_OBJECT_TYPE),
+    ("object_type", RULE_UNOWNED_OBJECT_TYPE),
+    ("object_type", RULE_UNREFERENCED_PROPERTY),
+    ("link_type", RULE_UNOWNED_LINK_TYPE),
+];
 
 pub const SEVERITY_WARNING: &str = "warning";
 pub const SEVERITY_INFO: &str = "info";
@@ -44,8 +63,64 @@ pub struct LintFinding {
     pub rule: &'static str,
     pub subject_kind: &'static str,
     pub subject_id: String,
+    /// For `property` findings, the property of the object type
+    /// `subject_id`; empty otherwise.
+    pub property: String,
     pub severity: &'static str,
     pub detail: String,
+    /// The reason of the suppression covering this finding, if any.
+    pub suppressed: Option<String>,
+}
+
+/// One entry of a member's `lint_suppressions`: the rule, the property for
+/// a property rule, and a required reason.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Suppression {
+    pub rule: String,
+    #[serde(default)]
+    pub property: String,
+    pub reason: String,
+}
+
+/// The suppressions a definition declares, validated: a known rule this
+/// member kind can raise, a property exactly for the property rule, and a
+/// non-empty reason.
+pub fn suppressions(
+    member_kind: &str,
+    definition: &serde_json::Value,
+) -> Result<Vec<Suppression>, String> {
+    let Some(raw) = definition.get(SUPPRESSIONS_FIELD) else {
+        return Ok(Vec::new());
+    };
+    let entries: Vec<Suppression> = serde_json::from_value(raw.clone()).map_err(|error| {
+        format!("{SUPPRESSIONS_FIELD} must be a list of {{rule, property, reason}}: {error}")
+    })?;
+    if entries.len() > MAX_SUPPRESSIONS {
+        return Err(format!(
+            "{SUPPRESSIONS_FIELD} holds at most {MAX_SUPPRESSIONS} entries"
+        ));
+    }
+    for entry in &entries {
+        if !SUPPRESSIBLE.contains(&(member_kind, entry.rule.as_str())) {
+            return Err(format!(
+                "{SUPPRESSIONS_FIELD}: a {member_kind} cannot suppress {:?}",
+                entry.rule
+            ));
+        }
+        if (entry.rule == RULE_UNREFERENCED_PROPERTY) == entry.property.trim().is_empty() {
+            return Err(format!(
+                "{SUPPRESSIONS_FIELD}: name a property exactly for {RULE_UNREFERENCED_PROPERTY}"
+            ));
+        }
+        let reason = entry.reason.trim();
+        if reason.is_empty() || reason.len() > MAX_SUPPRESSION_REASON {
+            return Err(format!(
+                "{SUPPRESSIONS_FIELD}: every suppression needs a reason of 1 to {MAX_SUPPRESSION_REASON} bytes"
+            ));
+        }
+    }
+    Ok(entries)
 }
 
 /// What the caller may see of one namespace.
@@ -63,6 +138,8 @@ pub struct LintInput {
     pub linked: BTreeSet<String>,
     /// `(member_kind, member_id)` referenced by a visible consumer binding.
     pub consumed: BTreeSet<(String, String)>,
+    /// `(object_type, property)` referenced by a visible consumer binding.
+    pub consumed_properties: BTreeSet<(String, String)>,
     /// Object types whose visible catalog entry lists an owner.
     pub catalog_owned: BTreeSet<String>,
     /// Enabled Action type ids the caller administers, each with whether an
@@ -91,8 +168,10 @@ fn finding(
         rule,
         subject_kind,
         subject_id: subject_id.into(),
+        property: String::new(),
         severity,
         detail,
+        suppressed: None,
     }
 }
 
@@ -143,6 +222,28 @@ pub fn lint(input: &LintInput) -> LintReport {
                 SEVERITY_WARNING,
                 "no visible object of this type is linked, and no consumer references it".into(),
             ));
+        }
+        let properties = serde_json::from_str::<serde_json::Value>(&object_type.definition_json)
+            .ok()
+            .and_then(|value| value.get("properties").cloned())
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+            .unwrap_or_default();
+        for property in properties {
+            if !input
+                .consumed_properties
+                .contains(&(id.clone(), property.clone()))
+            {
+                findings.push(LintFinding {
+                    property,
+                    ..finding(
+                        RULE_UNREFERENCED_PROPERTY,
+                        "property",
+                        id,
+                        SEVERITY_WARNING,
+                        "no visible consumer binding references this property".into(),
+                    )
+                });
+            }
         }
         if !declares_owner(object_type) && !input.catalog_owned.contains(id) {
             findings.push(finding(
@@ -231,10 +332,41 @@ pub fn lint(input: &LintInput) -> LintReport {
             ));
         }
     }
+    suppress(&input.members, &mut findings);
     findings.sort();
     let complete = input.objects_complete && findings.len() <= MAX_FINDINGS;
     findings.truncate(MAX_FINDINGS);
     LintReport { findings, complete }
+}
+
+/// Marks every finding a definition member suppresses about itself or one
+/// of its properties. Invalid suppressions never reach a published revision,
+/// so one that fails to parse here suppresses nothing.
+fn suppress(members: &[DefinitionMember], findings: &mut [LintFinding]) {
+    let mut declared: BTreeMap<(&str, &str), Vec<Suppression>> = BTreeMap::new();
+    for member in members {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&member.definition_json) else {
+            continue;
+        };
+        if let Ok(entries) = suppressions(&member.member_kind, &value) {
+            declared.insert((&member.member_kind, &member.member_id), entries);
+        }
+    }
+    for finding in findings {
+        let member_kind = match finding.subject_kind {
+            "property" => "object_type",
+            kind => kind,
+        };
+        let (member_id, property) = (finding.subject_id.as_str(), finding.property.as_str());
+        finding.suppressed = declared
+            .get(&(member_kind, member_id))
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.rule == finding.rule && entry.property == property)
+            })
+            .map(|entry| entry.reason.trim().to_string());
+    }
 }
 
 /// The ceiling a principal profile clears, when it names a standard level.
@@ -375,6 +507,137 @@ mod tests {
         input.objects.truncate(9);
         input.clearances.truncate(9);
         assert!(lint(&input).findings.is_empty());
+    }
+
+    #[test]
+    fn a_property_no_consumer_references_is_reported_until_one_does() {
+        let mut input = clean();
+        input.members[0] = member(
+            "object_type",
+            "Ticket",
+            r#"{"owner":"support","properties":["title","legacy"]}"#,
+        );
+        input
+            .consumed_properties
+            .insert(("Ticket".into(), "title".into()));
+        let report = lint(&input);
+        let ids: Vec<(&str, &str)> = report
+            .findings
+            .iter()
+            .map(|finding| (finding.subject_id.as_str(), finding.property.as_str()))
+            .collect();
+        assert_eq!(ids, [("Ticket", "legacy")]);
+        assert_eq!(report.findings[0].rule, RULE_UNREFERENCED_PROPERTY);
+        input
+            .consumed_properties
+            .insert(("Ticket".into(), "legacy".into()));
+        assert!(lint(&input).findings.is_empty());
+    }
+
+    #[test]
+    fn a_suppressed_finding_is_still_reported_with_its_reason() {
+        let mut input = clean();
+        input.members[0] = member(
+            "object_type",
+            "Ticket",
+            r#"{"owner":"support","properties":["legacy"],"lint_suppressions":[{"rule":"unreferenced_property","property":"legacy","reason":"read by the nightly export"}]}"#,
+        );
+        input.members.push(member(
+            "link_type",
+            "Mentions",
+            r#"{"lint_suppressions":[{"rule":"unowned_link_type","reason":"retiring"}]}"#,
+        ));
+        let report = lint(&input);
+        let suppressed: Vec<(&str, Option<&str>)> = report
+            .findings
+            .iter()
+            .map(|finding| (finding.subject_id.as_str(), finding.suppressed.as_deref()))
+            .collect();
+        assert_eq!(
+            suppressed,
+            [
+                ("Mentions", Some("retiring")),
+                ("Ticket", Some("read by the nightly export")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_property_suppression_matches_its_own_type_even_with_dotted_ids() {
+        let mut input = clean();
+        input.members.push(member(
+            "object_type",
+            "support.Ticket",
+            r#"{"owner":"support","properties":["legacy"],"lint_suppressions":[{"rule":"unreferenced_property","property":"legacy","reason":"kept"},{"rule":"orphan_object_type","reason":"seed"}]}"#,
+        ));
+        // A type named like the prefix must not lend its suppression.
+        input.members.push(member(
+            "object_type",
+            "support",
+            r#"{"owner":"support","properties":["Ticket.legacy"],"lint_suppressions":[{"rule":"orphan_object_type","reason":"seed"}]}"#,
+        ));
+        let report = lint(&input);
+        let property: Vec<(&str, Option<&str>)> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.rule == RULE_UNREFERENCED_PROPERTY)
+            .map(|finding| (finding.subject_id.as_str(), finding.suppressed.as_deref()))
+            .collect();
+        assert_eq!(
+            property,
+            [("support", None), ("support.Ticket", Some("kept"))]
+        );
+    }
+
+    #[test]
+    fn a_suppression_needs_a_reason_and_a_rule_its_member_raises() {
+        let check = |kind: &str, json: &str| {
+            suppressions(kind, &serde_json::from_str(json).unwrap()).map(|entries| entries.len())
+        };
+        assert_eq!(
+            check(
+                "object_type",
+                r#"{"lint_suppressions":[{"rule":"orphan_object_type","reason":"seed type"}]}"#
+            ),
+            Ok(1)
+        );
+        for (kind, json) in [
+            (
+                "object_type",
+                r#"{"lint_suppressions":[{"rule":"orphan_object_type"}]}"#,
+            ),
+            (
+                "object_type",
+                r#"{"lint_suppressions":[{"rule":"orphan_object_type","reason":" "}]}"#,
+            ),
+            (
+                "link_type",
+                r#"{"lint_suppressions":[{"rule":"orphan_object_type","reason":"x"}]}"#,
+            ),
+            (
+                "object_type",
+                r#"{"lint_suppressions":[{"rule":"unreferenced_property","reason":"x"}]}"#,
+            ),
+            (
+                "object_type",
+                r#"{"lint_suppressions":[{"rule":"orphan_object","reason":"x"}]}"#,
+            ),
+            (
+                "object_type",
+                r#"{"lint_suppressions":{"rule":"orphan_object_type"}}"#,
+            ),
+        ] {
+            assert!(check(kind, json).is_err(), "{kind} {json}");
+        }
+        // Preparing a member rejects it before it can reach a revision.
+        let rejected = crate::sekai::definition_branch::DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"lint_suppressions":[{"rule":"orphan_object_type"}]}"#.into(),
+            member_digest: String::new(),
+        }
+        .prepare("acme");
+        assert!(rejected.is_err());
     }
 
     #[test]

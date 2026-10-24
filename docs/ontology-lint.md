@@ -21,10 +21,41 @@ sekaictl ontology lint --namespace <ns> [--target <url-or-socket>]
 | `broad_marking_applied` | marking | warning | one `access_marking` token is on at least 90% of the visible objects |
 | `broad_marking_granted` | marking | warning | at least 90% of the visible principal profiles have a classification ceiling at or above the level |
 | `action_type_never_run` | Action type | info | an enabled Action type the caller administers, with no instance the caller may see among its latest 50 |
+| `unreferenced_property` | property (`subject_id` is the type, `property` the property) | warning | a property in an object type's `properties` that no visible consumer binding (#837) references by name |
+
+"Referenced" means declared by a registered consumer binding. The lint does not
+count reads, and a binding to the whole type does not reference its
+properties.
 
 The broad-marking rules need a population of at least ten. `owner` is an
 optional string on any definition member. Naming or changing it is a
 compatible change.
+
+## Suppressions
+
+A definition member can suppress findings about itself, with a reason, in
+`lint_suppressions` (#1684):
+
+```json
+{"name": "Ticket", "properties": ["title", "legacy"],
+ "lint_suppressions": [
+   {"rule": "unreferenced_property", "property": "legacy",
+    "reason": "read by the nightly export"}]}
+```
+
+| Member kind | Rules it can suppress |
+| --- | --- |
+| object type | `orphan_object_type`, `unowned_object_type`, `unreferenced_property` (with `property`) |
+| link type | `unowned_link_type` |
+
+A definition edit is refused when an entry has no reason, names a rule its
+member kind cannot raise, or sets `property` for any rule other than
+`unreferenced_property` (or leaves it out for that rule). A suppressed finding
+is still reported, with `suppressed` and its `suppression_reason`.
+Suppressions are part of the definition, so a proposal diff shows a change to
+them as `changed_lint_suppressions`, a compatible change. There is no
+separate table. Findings about objects, markings and Action types cannot be
+suppressed.
 
 ## Visibility
 
