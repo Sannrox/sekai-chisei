@@ -30058,3 +30058,166 @@ async fn a_dataset_version_exports_under_its_grant_without_withheld_columns() {
         .unwrap();
     assert_eq!(refused_cells.code(), tonic::Code::FailedPrecondition);
 }
+
+#[tokio::test]
+async fn a_saved_export_runs_for_its_owner_into_an_artifact_and_fails_closed_once_revoked() {
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "row").await;
+    let definition = |format: &str| ExportDefinition {
+        namespace: "exp".into(),
+        definition_id: "nightly".into(),
+        object_set: Some(ExportObjectSetRequest {
+            format: format.into(),
+            ..export_request(&digest)
+        }),
+        ..Default::default()
+    };
+    let put = |principal: &'static str, definition: ExportDefinition| {
+        let svc = &svc;
+        async move {
+            svc.put_export_definition(with_named_principal(
+                PutExportDefinitionRequest {
+                    definition: Some(definition),
+                },
+                principal,
+            ))
+            .await
+        }
+    };
+    // Saving checks what a run would: no grant, no definition.
+    assert_eq!(
+        put("tester", definition("csv")).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let grant = |revoke: bool| {
+        let svc = &svc;
+        async move {
+            if revoke {
+                svc.revoke_namespace_export(with_named_principal(
+                    RevokeNamespaceExportRequest {
+                        namespace: "exp".into(),
+                        principal: "tester".into(),
+                        reason: "rotation".into(),
+                    },
+                    "root",
+                ))
+                .await
+                .unwrap();
+            } else {
+                svc.grant_namespace_export(with_named_principal(
+                    GrantNamespaceExportRequest {
+                        namespace: "exp".into(),
+                        principal: "tester".into(),
+                        reason: "nightly extract".into(),
+                    },
+                    "root",
+                ))
+                .await
+                .unwrap();
+            }
+        }
+    };
+    grant(false).await;
+    let saved = put("tester", definition("csv"))
+        .await
+        .unwrap()
+        .into_inner()
+        .definition
+        .unwrap();
+    assert_eq!(saved.owner, "tester");
+    assert_eq!(
+        put("tester", definition("csv"))
+            .await
+            .unwrap()
+            .into_inner()
+            .definition
+            .unwrap(),
+        saved
+    );
+    assert_eq!(
+        put("tester", definition("jsonl")).await.unwrap_err().code(),
+        tonic::Code::AlreadyExists
+    );
+    let get = |principal: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.get_export_definition(with_named_principal(
+                GetExportDefinitionRequest {
+                    namespace: "exp".into(),
+                    definition_id: "nightly".into(),
+                },
+                principal,
+            ))
+            .await
+        }
+    };
+    assert_eq!(get("bob").await.unwrap_err().code(), tonic::Code::NotFound);
+    let run = |principal: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.run_export_definition(with_named_principal(
+                RunExportDefinitionRequest {
+                    namespace: "exp".into(),
+                    definition_id: "nightly".into(),
+                },
+                principal,
+            ))
+            .await
+        }
+    };
+    assert_eq!(run("bob").await.unwrap_err().code(), tonic::Code::NotFound);
+    let ran = run("tester").await.unwrap().into_inner();
+    assert_eq!(ran.row_count, 2);
+    let artifact = svc
+        .db
+        .runtime()
+        .get_export_artifact(&ran.receipt_id, now_millis())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        format!("sha256:{:x}", sha2::Sha256::digest(&artifact.bytes)),
+        ran.content_digest
+    );
+    assert_eq!(
+        String::from_utf8(artifact.bytes).unwrap(),
+        "id,title,secret\nt-00000,row,\nt-00001,row,\n"
+    );
+    assert_eq!(
+        receipt_outcome(&svc, &ran.receipt_id).as_deref(),
+        Some("completed")
+    );
+
+    // Revoked: the next run fails closed and leaves a refused receipt.
+    grant(true).await;
+    let refused = run("tester").await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let refused_id = refused
+        .message()
+        .rsplit("receipt ")
+        .next()
+        .unwrap()
+        .trim_end_matches(')')
+        .to_string();
+    assert_eq!(
+        receipt_outcome(&svc, &refused_id).as_deref(),
+        Some("refused")
+    );
+
+    assert!(
+        svc.delete_export_definition(with_named_principal(
+            DeleteExportDefinitionRequest {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .deleted
+    );
+    assert_eq!(
+        get("tester").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+}

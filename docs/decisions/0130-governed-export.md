@@ -71,3 +71,9 @@ Rejected:
   than it sends. Its memory stays bounded.
 - On enterprise transport an export takes space write, not view.
 - A client that stops reading for longer than the lease loses the export.
+- Saved exports (#1628) run for their owner principal alone, with no tenant
+  assertion and no purpose. They store their bytes as a Sekai artifact keyed
+  by the run's receipt, readable only through delivery and kept for 7 days at
+  most, never as a media object that namespace readers could see. The plane
+  never holds destination credentials. An out-of-process adapter fetches and
+  delivers.

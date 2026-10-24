@@ -30,6 +30,26 @@ CREATE TABLE IF NOT EXISTS sekai_export_receipts (
     closing_json TEXT,
     closed INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS sekai_export_definitions (
+    namespace TEXT NOT NULL,
+    definition_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    PRIMARY KEY (namespace, definition_id)
+);
+CREATE TABLE IF NOT EXISTS sekai_export_artifacts (
+    receipt_id TEXT PRIMARY KEY,
+    namespace TEXT NOT NULL,
+    definition_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sekai_export_artifact_chunks (
+    receipt_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (receipt_id, seq)
+);
 ";
 
 /// One dataset version row with its row id.
@@ -117,6 +137,23 @@ impl SekaiDb {
                      (operation_id, namespace, lease_until_ms, receipt_json)
                  VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![operation_id, namespace, lease_until_ms, receipt_json],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn insert_closed_export_receipt(
+        &self,
+        operation_id: &str,
+        namespace: &str,
+        receipt_json: &str,
+    ) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_export_receipts
+                     (operation_id, namespace, lease_until_ms, receipt_json, closed)
+                 VALUES (?1, ?2, 0, ?3, 1)",
+                rusqlite::params![operation_id, namespace, receipt_json],
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -319,6 +356,23 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn insert_closed_export_receipt(
+        &self,
+        operation_id: &str,
+        namespace: &str,
+        receipt_json: &str,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_export_receipts
+                     (operation_id, namespace, lease_until_ms, receipt_json, closed)
+                 VALUES ($1, $2, 0, $3, 1)",
+                &[&operation_id, &namespace, &receipt_json],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     pub fn renew_export(
         &self,
         operation_id: &str,
@@ -492,6 +546,16 @@ impl crate::db::runtime_db::RuntimeDb {
         receipt_json: &str,
     ) -> Result<(), String> {
         dispatch!(self, db => db.open_export(operation_id, namespace, lease_until_ms, receipt_json))
+    }
+
+    /// Stores a receipt already closed: a run refused before it began.
+    pub fn insert_closed_export_receipt(
+        &self,
+        operation_id: &str,
+        namespace: &str,
+        receipt_json: &str,
+    ) -> Result<(), String> {
+        dispatch!(self, db => db.insert_closed_export_receipt(operation_id, namespace, receipt_json))
     }
 
     pub fn renew_export(

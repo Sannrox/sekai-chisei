@@ -1175,22 +1175,42 @@ impl SekaiServiceImpl {
     pub(super) async fn export_object_set_rpc(
         &self,
         req: Request<ExportObjectSetRequest>,
-    ) -> Result<
-        Response<
-            std::pin::Pin<
-                Box<dyn futures_util::Stream<Item = Result<ExportObjectSetChunk, Status>> + Send>,
-            >,
-        >,
-        Status,
-    > {
-        use crate::sekai::data_export::{ExportFormat, ExportSource, RowEncoder};
-
-        let principals = caller_principals(&req);
-        require_authenticated(&principals)?;
-        let policy_context = principal_policy_context(&req);
-        let purpose = request_purpose_presentation(&req, &principals);
-        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+    ) -> Result<Response<ExportStream>, Status> {
+        let caller = ExportCaller::from_request(self, &req)?;
         let inner = req.into_inner();
+        let prepared = self.prepare_object_set_export(
+            caller,
+            inner.descriptor,
+            inner.properties,
+            &inner.format,
+        )?;
+        Ok(Response::new(run_export(
+            self.db.runtime().clone(),
+            prepared,
+        )))
+    }
+
+    /// What `caller` may export of this source, checked now: the export's
+    /// receipt source, its header, and the row writer to run.
+    pub(super) fn prepare_object_set_export(
+        &self,
+        caller: ExportCaller,
+        descriptor: Option<ObjectSetDescriptor>,
+        properties: Vec<String>,
+        format: &str,
+    ) -> Result<PreparedExport, Status> {
+        use crate::sekai::data_export::{ExportFormat, ExportSource, RowEncoder};
+        let ExportCaller {
+            principals,
+            policy_context,
+            purpose,
+            tenant_context,
+        } = caller;
+        let inner = ExportObjectSetRequest {
+            descriptor,
+            properties,
+            format: format.into(),
+        };
         let format = ExportFormat::parse(&inner.format)
             .ok_or_else(|| Status::invalid_argument("format must be csv or jsonl"))?;
         let encoder = RowEncoder::new(format, inner.properties.clone(), true)
@@ -1235,12 +1255,11 @@ impl SekaiServiceImpl {
         filter.offset = 0;
         let service = self.clone();
         let db = self.db.runtime().clone();
-        Ok(Response::new(run_export(
-            db.clone(),
+        Ok(PreparedExport {
             actor,
             source,
-            encoder.header(),
-            move |writer| {
+            header: encoder.header(),
+            rows: Box::new(move |writer: &std::cell::RefCell<ExportWriter>| {
                 // Rows are resolved per batch exactly as a read projects them.
                 let mut batch = Vec::with_capacity(EXPORT_BATCH);
                 let mut connected = true;
@@ -1283,8 +1302,8 @@ impl SekaiServiceImpl {
                 } else {
                     Ok(false)
                 }
-            },
-        )))
+            }),
+        })
     }
 }
 

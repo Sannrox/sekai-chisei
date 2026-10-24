@@ -29,6 +29,7 @@ pub mod connector_certification;
 pub mod coordination;
 pub mod credentials;
 pub mod data_export;
+pub mod data_export_artifact_store;
 mod data_export_store;
 pub mod dataset;
 pub mod dataset_health;

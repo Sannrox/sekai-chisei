@@ -46,10 +46,72 @@ enum ExportItem {
 /// would outlast the lease.
 pub(super) struct ExportWriter {
     receipt: crate::sekai::data_export::ExportReceipt,
-    tx: tokio::sync::mpsc::Sender<ExportItem>,
+    sink: ExportSink,
     buffer: Vec<u8>,
     buffered_rows: u64,
 }
+
+/// Where an export's bytes go.
+enum ExportSink {
+    /// To the response stream, through a bounded channel.
+    Stream(tokio::sync::mpsc::Sender<ExportItem>),
+    /// Into the run's durable artifact, one chunk after another.
+    Artifact {
+        db: crate::db::runtime_db::RuntimeDb,
+        next_seq: i64,
+    },
+}
+
+/// Who an export runs for: a request's caller, or a saved definition's
+/// owner alone.
+pub(super) struct ExportCaller {
+    pub(super) principals: Vec<String>,
+    pub(super) policy_context: crate::sekai::object_security::PrincipalPolicyContext,
+    pub(super) purpose: Option<crate::sekai::purpose_authorization::PurposePresentation>,
+    pub(super) tenant_context: Option<RequestEnterpriseContext>,
+}
+
+impl ExportCaller {
+    pub(super) fn from_request<T>(
+        service: &SekaiServiceImpl,
+        req: &Request<T>,
+    ) -> Result<Self, Status>
+    where
+        T: std::any::Any,
+    {
+        let principals = caller_principals(req);
+        require_authenticated(&principals)?;
+        Ok(Self {
+            policy_context: principal_policy_context(req),
+            purpose: request_purpose_presentation(req, &principals),
+            tenant_context: request_tenant_context(service.db.runtime(), req)?,
+            principals,
+        })
+    }
+
+    /// A saved definition's owner, alone: no tenant assertion and no
+    /// purpose presentation, so a purpose-gated source refuses the run.
+    pub(super) fn owner(owner: &str) -> Self {
+        let principals = vec![owner.to_string()];
+        Self {
+            policy_context: principal_policy_context_from(&principals, None),
+            purpose: None,
+            tenant_context: None,
+            principals,
+        }
+    }
+}
+
+/// An export checked and ready to run.
+pub(super) struct PreparedExport {
+    pub(super) actor: String,
+    pub(super) source: crate::sekai::data_export::ExportSource,
+    pub(super) header: Vec<u8>,
+    pub(super) rows: ExportRows,
+}
+
+/// Writes every row; true when it wrote them all.
+pub(super) type ExportRows = Box<dyn FnOnce(&RefCell<ExportWriter>) -> Result<bool, Status> + Send>;
 
 impl ExportWriter {
     /// Renews the lease between rows; false once it is lost.
@@ -81,9 +143,23 @@ impl ExportWriter {
         })
     }
 
-    fn send(&self, chunk: ExportObjectSetChunk) -> bool {
-        let deadline = self.receipt.deadline_ms();
-        send_item(&self.tx, ExportItem::Data(chunk, deadline), &self.receipt)
+    fn send(&mut self, chunk: ExportObjectSetChunk) -> bool {
+        match &mut self.sink {
+            ExportSink::Stream(tx) => {
+                let deadline = self.receipt.deadline_ms();
+                send_item(tx, ExportItem::Data(chunk, deadline), &self.receipt)
+            }
+            // Only bytes go into the artifact; the receipt id is its key.
+            ExportSink::Artifact { db, next_seq } => {
+                if chunk.data.is_empty() {
+                    return true;
+                }
+                let seq = *next_seq;
+                *next_seq += 1;
+                db.put_export_artifact_chunk(self.receipt.operation_id(), seq, &chunk.data)
+                    .is_ok()
+            }
+        }
     }
 }
 
@@ -281,16 +357,16 @@ pub(super) type ExportStream = std::pin::Pin<
 /// them all), then queues the receipt behind the last byte for the response
 /// stream to complete. Anything short of that leaves the receipt aborted and
 /// ends the stream in an error.
-pub(super) fn run_export<F>(
+pub(super) fn run_export(
     db: crate::db::runtime_db::RuntimeDb,
-    actor: String,
-    source: crate::sekai::data_export::ExportSource,
-    header: Vec<u8>,
-    rows: F,
-) -> ExportStream
-where
-    F: FnOnce(&RefCell<ExportWriter>) -> Result<bool, Status> + Send + 'static,
-{
+    prepared: PreparedExport,
+) -> ExportStream {
+    let PreparedExport {
+        actor,
+        source,
+        header,
+        rows,
+    } = prepared;
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tokio::task::spawn_blocking(move || {
         let receipt = match crate::sekai::data_export::ExportReceipt::begin(
@@ -311,7 +387,7 @@ where
         let receipt_id = receipt.operation_id().to_string();
         let mut writer = ExportWriter {
             receipt,
-            tx: tx.clone(),
+            sink: ExportSink::Stream(tx.clone()),
             buffer: Vec::new(),
             buffered_rows: 0,
         };
@@ -329,7 +405,7 @@ where
             // A scan the lease stopped is never a complete export.
             Ok(true) if writer.receipt.live() && writer.flush() => {
                 // The stream completes the receipt once it reaches it.
-                let ExportWriter { receipt, tx, .. } = writer;
+                let ExportWriter { receipt, .. } = writer;
                 if let Some(budget) = receipt.send_budget() {
                     let _ = tokio::runtime::Handle::current()
                         .block_on(tx.send_timeout(ExportItem::Finish(Box::new(receipt)), budget));
@@ -344,6 +420,66 @@ where
         }
     });
     Box::pin(export_response_stream(rx))
+}
+
+/// What a run into an artifact produced.
+pub(super) struct ArtifactRun {
+    pub(super) receipt_id: String,
+    pub(super) row_count: u64,
+    pub(super) content_digest: String,
+}
+
+/// Runs an export into a durable artifact (#1628), blocking: the receipt is
+/// begun first, the bytes are stored chunk by chunk under its lease, and the
+/// receipt completes only after the last chunk is stored. The receipt is the
+/// artifact's record: it is whole exactly when its receipt completed, with
+/// that digest. Anything short of that leaves the receipt aborted and the
+/// artifact for the retention sweep.
+pub(super) fn run_to_artifact(
+    db: crate::db::runtime_db::RuntimeDb,
+    definition_id: &str,
+    prepared: PreparedExport,
+) -> Result<ArtifactRun, Status> {
+    let PreparedExport {
+        actor,
+        source,
+        header,
+        rows,
+    } = prepared;
+    let now = now_millis();
+    crate::sekai::data_export::sweep_expired_artifacts(&db, now).map_err(Status::internal)?;
+    let receipt = crate::sekai::data_export::ExportReceipt::begin(db.clone(), &actor, &source, now)
+        .map_err(|_| Status::internal("export receipt unavailable"))?;
+    let receipt_id = receipt.operation_id().to_string();
+    db.open_export_artifact(&receipt_id, &source.namespace, definition_id, now)
+        .map_err(Status::internal)?;
+    let mut writer = ExportWriter {
+        receipt,
+        sink: ExportSink::Artifact {
+            db: db.clone(),
+            next_seq: 0,
+        },
+        buffer: Vec::new(),
+        buffered_rows: 0,
+    };
+    if !writer.write(header, 0) {
+        return Err(Status::aborted("export artifact could not be written"));
+    }
+    let writer = RefCell::new(writer);
+    let written = rows(&writer)?;
+    let mut writer = writer.into_inner();
+    if !(written && writer.receipt.live() && writer.flush()) {
+        return Err(Status::aborted("export did not complete"));
+    }
+    let ExportWriter { receipt, .. } = writer;
+    let (row_count, content_digest) = receipt
+        .complete(now_millis())
+        .map_err(|_| Status::aborted("export did not complete"))?;
+    Ok(ArtifactRun {
+        receipt_id,
+        row_count,
+        content_digest,
+    })
 }
 
 /// The caller principal holding an active export grant on `namespace`;
@@ -392,14 +528,30 @@ impl SekaiServiceImpl {
         &self,
         req: Request<ExportDatasetVersionRequest>,
     ) -> Result<Response<ExportStream>, Status> {
-        use crate::sekai::data_export::{ExportFormat, ExportSource, RowEncoder};
-
-        let principals = caller_principals(&req);
-        require_authenticated(&principals)?;
-        let policy_context = principal_policy_context(&req);
-        let purpose = request_purpose_presentation(&req, &principals);
-        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let caller = ExportCaller::from_request(self, &req)?;
         let inner = req.into_inner();
+        let prepared = self.prepare_dataset_version_export(caller, inner)?;
+        Ok(Response::new(run_export(
+            self.db.runtime().clone(),
+            prepared,
+        )))
+    }
+
+    /// What `caller` may export of this source, checked now: the export's
+    /// receipt source, its header, and the row writer to run.
+    pub(super) fn prepare_dataset_version_export(
+        &self,
+        caller: ExportCaller,
+        request: ExportDatasetVersionRequest,
+    ) -> Result<PreparedExport, Status> {
+        use crate::sekai::data_export::{ExportFormat, ExportSource, RowEncoder};
+        let ExportCaller {
+            principals,
+            policy_context,
+            purpose,
+            tenant_context,
+        } = caller;
+        let inner = request;
         let format = ExportFormat::parse(&inner.format)
             .ok_or_else(|| Status::invalid_argument("format must be csv or jsonl"))?;
         let db = self.db.runtime().clone();
@@ -432,8 +584,15 @@ impl SekaiServiceImpl {
             purpose.as_ref(),
         )
         .map_err(|_| unavailable())?;
+        // An empty version is the latest one, as a saved export reruns it.
+        let version_id = if inner.version_id.is_empty() {
+            db.latest_dataset_version_id(&dataset.id)
+                .map_err(Status::internal)?
+        } else {
+            inner.version_id.clone()
+        };
         let version = db
-            .get_dataset_version(&dataset.id, &inner.version_id, 0)
+            .get_dataset_version(&dataset.id, &version_id, 0)
             .map_err(map_dataset_version_error)?;
         if version.purged {
             return Err(Status::failed_precondition(
@@ -522,12 +681,11 @@ impl SekaiServiceImpl {
         let dataset_id = dataset.id;
         let version_id = version.version_id;
         let reader = db.clone();
-        Ok(Response::new(run_export(
-            db,
-            principals[0].clone(),
+        Ok(PreparedExport {
+            actor: principals[0].clone(),
             source,
-            encoder.header(),
-            move |writer| {
+            header: encoder.header(),
+            rows: Box::new(move |writer: &RefCell<ExportWriter>| {
                 let mut after = i64::MIN;
                 loop {
                     let page = reader
@@ -570,7 +728,267 @@ impl SekaiServiceImpl {
                     ));
                 }
                 Ok(true)
-            },
-        )))
+            }),
+        })
+    }
+}
+
+/// Definition ids: 1 to 128 letters, digits, '.', '_', '-' or ':'.
+fn check_definition_id(id: &str) -> Result<(), Status> {
+    let valid = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'));
+    if valid {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "definition_id must be 1 to 128 letters, digits, '.', '_', '-' or ':'",
+        ))
+    }
+}
+
+fn decode_definition(record_json: &str) -> Result<ExportDefinition, Status> {
+    serde_json::from_str(record_json).map_err(|_| Status::internal("export definition unreadable"))
+}
+
+impl SekaiServiceImpl {
+    /// The export a saved definition names, checked for `caller` exactly as
+    /// a live export of that source is.
+    fn prepare_definition_export(
+        &self,
+        caller: ExportCaller,
+        definition: &ExportDefinition,
+    ) -> Result<PreparedExport, Status> {
+        let outside =
+            || Status::invalid_argument("the export source must be in the definition's namespace");
+        match (&definition.object_set, &definition.dataset_version) {
+            (Some(set), None) => {
+                let Some(descriptor) = set
+                    .descriptor
+                    .as_ref()
+                    .filter(|descriptor| descriptor.namespace == definition.namespace)
+                else {
+                    return Err(outside());
+                };
+                // A saved export carries no purpose. A read would silently
+                // skip every row a purpose gates, so refuse it outright.
+                if !purpose_allows_kind(
+                    self.db.runtime(),
+                    &descriptor.namespace,
+                    &descriptor.kind,
+                    None,
+                    &mut std::collections::HashSet::new(),
+                )? {
+                    return Err(Status::permission_denied(
+                        "the source requires a purpose, which a saved export does not carry",
+                    ));
+                }
+                self.prepare_object_set_export(
+                    caller,
+                    set.descriptor.clone(),
+                    set.properties.clone(),
+                    &set.format,
+                )
+            }
+            (None, Some(version)) => {
+                let prepared = self.prepare_dataset_version_export(caller, version.clone())?;
+                if prepared.source.namespace != definition.namespace {
+                    return Err(outside());
+                }
+                Ok(prepared)
+            }
+            _ => Err(Status::invalid_argument(
+                "set exactly one of object_set and dataset_version",
+            )),
+        }
+    }
+
+    /// The caller of a saved-export RPC. Saved exports are for principals
+    /// outside a tenant assertion: a run cannot carry one, so a scoped
+    /// request is refused rather than reduced to its subject. The caller
+    /// also needs the namespace (write to change or run a definition).
+    fn saved_export_caller<T>(
+        &self,
+        req: &Request<T>,
+        namespace: &str,
+        write: bool,
+    ) -> Result<Vec<String>, Status>
+    where
+        T: std::any::Any,
+    {
+        let principals = caller_principals(req);
+        require_authenticated(&principals)?;
+        if request_tenant_context(self.db.runtime(), req)?.is_some() {
+            return Err(Status::failed_precondition(
+                "saved exports are for principals outside a tenant assertion",
+            ));
+        }
+        check_team_namespace(self.db.runtime(), &principals, namespace, write)?;
+        Ok(principals)
+    }
+
+    /// Loads a definition for its owner or an administrator of its
+    /// namespace; anyone else learns nothing of it.
+    fn visible_definition(
+        &self,
+        principals: &[String],
+        namespace: &str,
+        definition_id: &str,
+    ) -> Result<ExportDefinition, Status> {
+        let unavailable = || Status::not_found("export definition unavailable");
+        let (owner, record_json) = self
+            .db
+            .runtime()
+            .get_export_definition(namespace, definition_id)
+            .map_err(Status::internal)?
+            .ok_or_else(unavailable)?;
+        if !principals.contains(&owner)
+            && authorize_source_type_namespace_admin(self, principals, namespace).is_err()
+        {
+            return Err(unavailable());
+        }
+        decode_definition(&record_json)
+    }
+
+    /// Saves an export to run later for its caller alone (#1628). Saving
+    /// checks everything a run would, for the caller as the owner: a
+    /// definition that could not run now is not saved. One body per id: an
+    /// identical retry returns the stored definition.
+    pub(super) async fn put_export_definition_rpc(
+        &self,
+        req: Request<PutExportDefinitionRequest>,
+    ) -> Result<Response<PutExportDefinitionResponse>, Status> {
+        let caller = ExportCaller::from_request(self, &req)?;
+        // A run has no request to carry a tenant assertion, so a
+        // tenant-scoped caller's export could not be checked as it was saved.
+        if caller.tenant_context.is_some() || caller.principals.len() != 1 {
+            return Err(Status::failed_precondition(
+                "saved exports are for one principal outside a tenant assertion",
+            ));
+        }
+        let owner = caller.principals[0].clone();
+        let mut definition = req
+            .into_inner()
+            .definition
+            .ok_or_else(|| Status::invalid_argument("definition required"))?;
+        check_definition_id(&definition.definition_id)?;
+        definition.owner = owner.clone();
+        definition.created_at_ms = 0;
+        self.prepare_definition_export(ExportCaller::owner(&owner), &definition)?;
+        let body = serde_json::to_string(&definition)
+            .map_err(|_| Status::internal("export definition unencodable"))?;
+        definition.created_at_ms = now_millis();
+        let record = serde_json::to_string(&definition)
+            .map_err(|_| Status::internal("export definition unencodable"))?;
+        let (_, stored_json) = self
+            .db
+            .runtime()
+            .put_export_definition(
+                &definition.namespace,
+                &definition.definition_id,
+                &owner,
+                &record,
+            )
+            .map_err(Status::internal)?;
+        let mut stored = decode_definition(&stored_json)?;
+        let created_at_ms = stored.created_at_ms;
+        stored.created_at_ms = 0;
+        if serde_json::to_string(&stored).ok().as_deref() != Some(body.as_str()) {
+            return Err(Status::already_exists(
+                "another export definition is saved under that id",
+            ));
+        }
+        stored.created_at_ms = created_at_ms;
+        Ok(Response::new(PutExportDefinitionResponse {
+            definition: Some(stored),
+        }))
+    }
+
+    pub(super) async fn get_export_definition_rpc(
+        &self,
+        req: Request<GetExportDefinitionRequest>,
+    ) -> Result<Response<GetExportDefinitionResponse>, Status> {
+        let namespace = req.get_ref().namespace.clone();
+        let principals = self.saved_export_caller(&req, &namespace, false)?;
+        let inner = req.into_inner();
+        let definition =
+            self.visible_definition(&principals, &inner.namespace, &inner.definition_id)?;
+        Ok(Response::new(GetExportDefinitionResponse {
+            definition: Some(definition),
+        }))
+    }
+
+    pub(super) async fn delete_export_definition_rpc(
+        &self,
+        req: Request<DeleteExportDefinitionRequest>,
+    ) -> Result<Response<DeleteExportDefinitionResponse>, Status> {
+        let namespace = req.get_ref().namespace.clone();
+        let principals = self.saved_export_caller(&req, &namespace, true)?;
+        let inner = req.into_inner();
+        let definition =
+            self.visible_definition(&principals, &inner.namespace, &inner.definition_id)?;
+        // Only the record the caller was authorized against is deleted: a
+        // definition saved anew under the id since is not.
+        let record = serde_json::to_string(&definition)
+            .map_err(|_| Status::internal("export definition unencodable"))?;
+        let deleted = self
+            .db
+            .runtime()
+            .delete_export_definition(&inner.namespace, &inner.definition_id, &record)
+            .map_err(Status::internal)?;
+        Ok(Response::new(DeleteExportDefinitionResponse { deleted }))
+    }
+
+    /// Runs a saved export now, for its owner alone, into a stored artifact.
+    /// Only the owner runs it. Every check is made again at run time; a run
+    /// they now refuse writes a refused receipt and fails closed.
+    pub(super) async fn run_export_definition_rpc(
+        &self,
+        req: Request<RunExportDefinitionRequest>,
+    ) -> Result<Response<RunExportDefinitionResponse>, Status> {
+        let namespace = req.get_ref().namespace.clone();
+        let principals = self.saved_export_caller(&req, &namespace, true)?;
+        let inner = req.into_inner();
+        let definition =
+            self.visible_definition(&principals, &inner.namespace, &inner.definition_id)?;
+        if !principals.contains(&definition.owner) {
+            return Err(Status::permission_denied(
+                "only the owner of an export definition runs it",
+            ));
+        }
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = service.db.runtime().clone();
+            let prepared = match service
+                .prepare_definition_export(ExportCaller::owner(&definition.owner), &definition)
+            {
+                Ok(prepared) => prepared,
+                Err(status) => {
+                    let receipt_id = crate::sekai::data_export::record_refused_run(
+                        &db,
+                        &definition.owner,
+                        &definition.namespace,
+                        &definition.definition_id,
+                        status.message(),
+                        now_millis(),
+                    )
+                    .map_err(|_| Status::internal("export refusal unrecorded"))?;
+                    return Err(Status::new(
+                        status.code(),
+                        format!("{} (receipt {receipt_id})", status.message()),
+                    ));
+                }
+            };
+            let run = run_to_artifact(db, &definition.definition_id, prepared)?;
+            Ok(Response::new(RunExportDefinitionResponse {
+                receipt_id: run.receipt_id,
+                row_count: i64::try_from(run.row_count).unwrap_or(i64::MAX),
+                content_digest: run.content_digest,
+            }))
+        })
+        .await
+        .map_err(|_| Status::internal("export run failed"))?
     }
 }
