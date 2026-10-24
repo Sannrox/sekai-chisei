@@ -2314,10 +2314,14 @@ pub(super) async fn run_governed_transform(
         }
     }
     Ok(Response::new(RunGovernedTransformResponse {
-        run: Some(to_proto_transform_run(
+        run: Some(with_run_outcome(
+            service,
             &run,
-            caller_can_read_run_datasets(service, &principals, &run),
-        )),
+            to_proto_transform_run(
+                &run,
+                caller_can_read_run_datasets(service, &principals, &run),
+            ),
+        )?),
     }))
 }
 pub(super) async fn get_governed_transform_run(
@@ -2346,7 +2350,7 @@ pub(super) async fn get_governed_transform_run(
     check_team_namespace(service.db.runtime(), &principals, &run.namespace, false)?;
     let reveal = caller_can_read_run_datasets(service, &principals, &run);
     Ok(Response::new(GetGovernedTransformRunResponse {
-        run: Some(with_refusal(
+        run: Some(with_run_outcome(
             service,
             &run,
             to_proto_transform_run(&run, reveal),
@@ -2405,7 +2409,7 @@ pub(super) async fn list_governed_transform_runs(
         .iter()
         .map(|run| {
             let reveal = caller_can_read_run_datasets(service, &principals, run);
-            with_refusal(service, run, to_proto_transform_run(run, reveal))
+            with_run_outcome(service, run, to_proto_transform_run(run, reveal))
         })
         .collect::<Result<_, Status>>()?;
     Ok(Response::new(ListGovernedTransformRunsResponse { runs }))
@@ -2932,7 +2936,11 @@ pub(super) async fn write_transform_run_result(
             }
         }
         return Ok(Response::new(WriteTransformRunResultResponse {
-            run: Some(to_proto_transform_run(&run, true)),
+            run: Some(with_run_outcome(
+                service,
+                &run,
+                to_proto_transform_run(&run, true),
+            )?),
         }));
     }
     // Hold consume and TenantQuotaGate.complete stay on separate stores.
@@ -2979,10 +2987,14 @@ pub(super) async fn write_transform_run_result(
         ack_transform_usage_pending(service.db.runtime(), &run.run_id)?;
     }
     Ok(Response::new(WriteTransformRunResultResponse {
-        run: Some(to_proto_transform_run(
+        run: Some(with_run_outcome(
+            service,
             &run,
-            caller_can_read_run_datasets(service, &principals, &run),
-        )),
+            to_proto_transform_run(
+                &run,
+                caller_can_read_run_datasets(service, &principals, &run),
+            ),
+        )?),
     }))
 }
 
@@ -3961,8 +3973,10 @@ fn to_proto_partition(
     }
 }
 
-/// `proto` with the stored refusal of a refused run (#1701).
-fn with_refusal(
+/// `proto` with what the run's side records hold: the refusal of a refused
+/// run (#1701), and when a finished run finished and how long it computed
+/// (#1651).
+fn with_run_outcome(
     service: &SekaiServiceImpl,
     run: &crate::sekai::governed_transform::TransformRun,
     mut proto: TransformRun,
@@ -3977,6 +3991,15 @@ fn with_refusal(
                 code: refusal.code,
                 details: refusal.details.into_iter().collect(),
             });
+    }
+    if let Some((finished_at_ms, compute_ms)) = service
+        .db
+        .runtime()
+        .transform_run_finish(&run.run_id)
+        .map_err(Status::internal)?
+    {
+        proto.finished_at_ms = Some(finished_at_ms);
+        proto.compute_seconds = compute_ms.map(|ms| ms as f64 / 1000.0);
     }
     Ok(proto)
 }
@@ -4019,6 +4042,8 @@ fn to_proto_transform_run(
             .map(|partition| to_proto_partition(partition, reveal_partition_keys))
             .collect(),
         refusal: None,
+        finished_at_ms: None,
+        compute_seconds: None,
     }
 }
 
@@ -4125,9 +4150,9 @@ pub(super) async fn tick_governed_transforms(
         .iter()
         .map(|run| {
             let reveal = caller_can_read_run_datasets(service, &principals, run);
-            to_proto_transform_run(run, reveal)
+            with_run_outcome(service, run, to_proto_transform_run(run, reveal))
         })
-        .collect();
+        .collect::<Result<_, Status>>()?;
     Ok(Response::new(TickGovernedTransformsResponse { runs }))
 }
 
@@ -4199,10 +4224,14 @@ pub(super) async fn cancel_governed_transform_run(
         false,
     )?;
     Ok(Response::new(CancelGovernedTransformRunResponse {
-        run: Some(to_proto_transform_run(
+        run: Some(with_run_outcome(
+            service,
             &run,
-            caller_can_read_run_datasets(service, &principals, &run),
-        )),
+            to_proto_transform_run(
+                &run,
+                caller_can_read_run_datasets(service, &principals, &run),
+            ),
+        )?),
     }))
 }
 

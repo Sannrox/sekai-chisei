@@ -840,6 +840,13 @@ message TransformRun {
   // Set when dispatch_status is refused: why an extension refused the run
   // for good (#1701).
   TransformRunRefusal refusal = 25;
+  // When the run finished; absent while it has not (#1651).
+  optional int64 finished_at_ms = 26;
+  // Measured compute time of a finished run: in-process from the start of
+  // compute until its own output is written (downstream runs it triggers
+  // count on their own), isolated from the latest claim to write-back.
+  // Absent for a run that never computed (failed, refused, cancelled).
+  optional double compute_seconds = 27;
 }
 message TransformRunRefusal {
   // A short rule name, such as quota_exceeded; reason_withheld when the

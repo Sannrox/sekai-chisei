@@ -760,6 +760,16 @@ impl RuntimeDb {
         }
     }
 
+    /// When the run finished and how long it computed (#1651).
+    pub fn transform_run_finish(&self, run_id: &str) -> Result<Option<(i64, Option<i64>)>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_run_finish(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_run_finish(run_id))
+            }
+        }
+    }
+
     pub fn transform_run_refusal(
         &self,
         run_id: &str,
