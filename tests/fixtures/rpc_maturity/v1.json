@@ -277,6 +277,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "GetOntologyLintReport",
+      "storage_path": "sekai.definition-branch, sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GenerateDefinitionChangeBundle",
       "storage_path": "sekai.definition-branch, sekai.graph",
       "real_backend": "yes",

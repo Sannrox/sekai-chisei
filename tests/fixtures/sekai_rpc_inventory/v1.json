@@ -391,6 +391,21 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "GetOntologyLintReport",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/ontology_lint.rs",
+        "src/grpc/sekai_service_rpc_definitions.rs",
+        "docs/ontology-lint.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.graph"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GenerateDefinitionChangeBundle",
       "kind": "query",
       "surfaces": [],

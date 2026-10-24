@@ -25,8 +25,9 @@ use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
     Cardinality as ProtoCardinality, ContextCandidate, ContextRoot, CreateLinkRequest,
     CreateObjectRequest, CreateOntologyClassRequest, CreateOntologyRelationRequest,
-    CreateSchemaTypeRequest, ExpandRelationsRequest, ExplainDerivationRequest, Link, Object,
-    ObjectType, OntologyClass, OntologyProperty, OntologyRelation, RetrieveContextRequest,
+    CreateSchemaTypeRequest, ExpandRelationsRequest, ExplainDerivationRequest,
+    GetOntologyLintReportRequest, Link, Object, ObjectType, OntologyClass, OntologyProperty,
+    OntologyRelation, RetrieveContextRequest,
 };
 use crate::sekai::schema::is_builtin_schema_kind;
 use crate::sekai::semantic;
@@ -37,7 +38,7 @@ pub const DOMAIN_DOC_VERSION: &str = "sekai.ontology-product/v1";
 pub const SEED_DOC_VERSION: &str = "sekai.seed/v1";
 
 pub fn usage() -> &'static str {
-    "sekaictl ontology <inspect|apply|seed|run|first-run|context|expand|explain> ...\n  \
+    "sekaictl ontology <inspect|apply|seed|run|first-run|context|expand|explain|lint> ...\n  \
      sekaictl ontology apply --file <domain.json> [--target <url-or-socket>]\n  \
      sekaictl ontology seed --file <seed.json> [--target <url-or-socket>]\n  \
      sekaictl ontology run --namespace <ns> --task-type <capability> --spec <json-or-@file> [--target ...]\n  \
@@ -45,6 +46,7 @@ pub fn usage() -> &'static str {
      sekaictl ontology context --object <id> [--object <id> ...] [--relation <r>] [--depth <n>] [--entailment] [--target ...]\n  \
      sekaictl ontology expand --namespace <ns> --object <id> [--relation <r>] [--depth <n>] [--entailment] [--target ...]\n  \
      sekaictl ontology explain --namespace <ns> --from <id> --to <id> [--relation <r>] [--entailment] [--target ...]\n  \
+     sekaictl ontology lint --namespace <ns> [--target ...]\n  \
      sekaictl ontology inspect ...  (see inspect --help path)"
 }
 
@@ -880,6 +882,33 @@ async fn explain_derivation(target: &str, args: &[String]) -> Result<(), BoxErr>
     Ok(())
 }
 
+/// Prints the namespace's lint findings, one per line. It reports and does
+/// not gate: blocking a proposal on findings is the proposal gate's job.
+async fn lint_namespace(target: &str, args: &[String]) -> Result<(), BoxErr> {
+    let namespace = require_flag(args, "--namespace").map_err(std::io::Error::other)?;
+    let report = SekaiServiceClient::new(connect_sekai(target).await?)
+        .get_ontology_lint_report(GetOntologyLintReportRequest { namespace })
+        .await?
+        .into_inner();
+    for finding in &report.findings {
+        println!(
+            "{} {} {}:{} {}",
+            finding.severity,
+            finding.rule,
+            finding.subject_kind,
+            finding.subject_id,
+            finding.detail
+        );
+    }
+    println!(
+        "lint: findings={} complete={} revision={}",
+        report.findings.len(),
+        report.complete,
+        report.revision_digest
+    );
+    Ok(())
+}
+
 // --- CLI entry ----------------------------------------------------------------
 
 pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -1026,6 +1055,7 @@ pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxEr
         "context" => retrieve_context(&target_from_args(&args[1..]), &args[1..]).await,
         "expand" => expand_relations(&target_from_args(&args[1..]), &args[1..]).await,
         "explain" => explain_derivation(&target_from_args(&args[1..]), &args[1..]).await,
+        "lint" => lint_namespace(&target_from_args(&args[1..]), &args[1..]).await,
         "inspect" => Err(std::io::Error::other(
             "use sekaictl ontology inspect via the main dispatcher",
         )

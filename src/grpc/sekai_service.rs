@@ -437,26 +437,6 @@ impl SekaiServiceImpl {
 const DEFAULT_LIST_LIMIT: i32 = domain::DEFAULT_LIST_LIMIT;
 const MAX_LIST_LIMIT: i32 = domain::MAX_LIST_LIMIT;
 
-/// Internal governance object kinds that must never be created, mutated, read,
-/// or listed through the generic object CRUD RPCs. They hold policy and
-/// blast-radius counters and are managed only through dedicated RPCs plus
-/// server-internal DB paths.
-const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
-    action_policy::ACTION_POLICY_KIND,
-    action_policy::BLAST_RADIUS_KIND,
-    // Retired pre-1.0 state is purged on startup, so this name must never be
-    // reusable through generic CRUD.
-    "action_approval",
-    crate::domain::KIND_CAPABILITY,
-    crate::domain::KIND_EXTERNAL_EVIDENCE,
-    governed_fact_domain::PROFILE_KIND,
-    governed_fact_domain::FACT_KIND,
-    governed_fact_domain::WAIVER_KIND,
-    crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
-    crate::sekai::object_comment::OBJECT_COMMENT_KIND,
-    crate::sekai::media_upload::MEDIA_KIND,
-];
-
 const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
 
 #[tonic::async_trait]
@@ -680,6 +660,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ReportDefinitionConsumerImpactRequest>,
     ) -> Result<Response<ReportDefinitionConsumerImpactResponse>, Status> {
         rpc_definitions::report_definition_consumer_impact(self, req).await
+    }
+
+    async fn get_ontology_lint_report(
+        &self,
+        req: Request<GetOntologyLintReportRequest>,
+    ) -> Result<Response<GetOntologyLintReportResponse>, Status> {
+        rpc_definitions::get_ontology_lint_report(self, req).await
     }
 
     async fn generate_definition_change_bundle(
