@@ -339,6 +339,8 @@ impl SekaiService for SekaiServiceImpl {
         Pin<Box<dyn futures_util::Stream<Item = Result<ExportObjectSetChunk, Status>> + Send>>;
     type ExportObjectSetStream =
         Pin<Box<dyn futures_util::Stream<Item = Result<ExportObjectSetChunk, Status>> + Send>>;
+    type FetchExportArtifactStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<ExportObjectSetChunk, Status>> + Send>>;
 
     async fn grant_namespace_export(
         &self,
@@ -394,6 +396,27 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<RunExportDefinitionRequest>,
     ) -> Result<Response<RunExportDefinitionResponse>, Status> {
         self.run_export_definition_rpc(req).await
+    }
+
+    async fn list_deliverable_export_artifacts(
+        &self,
+        req: Request<ListDeliverableExportArtifactsRequest>,
+    ) -> Result<Response<ListDeliverableExportArtifactsResponse>, Status> {
+        self.list_deliverable_export_artifacts_rpc(req).await
+    }
+
+    async fn fetch_export_artifact(
+        &self,
+        req: Request<FetchExportArtifactRequest>,
+    ) -> Result<Response<Self::FetchExportArtifactStream>, Status> {
+        self.fetch_export_artifact_rpc(req).await
+    }
+
+    async fn acknowledge_export_delivery(
+        &self,
+        req: Request<AcknowledgeExportDeliveryRequest>,
+    ) -> Result<Response<AcknowledgeExportDeliveryResponse>, Status> {
+        self.acknowledge_export_delivery_rpc(req).await
     }
 
     async fn get_export_receipt(

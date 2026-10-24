@@ -133,5 +133,16 @@ deliver. The plane holds no destination credentials.
   was lost, once a minute.
 - `DeleteExportDefinition` deletes only the record the caller was authorized
   against. A definition saved anew under the same id meanwhile is kept.
-  Delivery (an adapter fetching an artifact and acknowledging it) and
-  scheduling runs on the transform schedule graph are the next layers.
+- A definition with `every_ms` greater than zero joins the transform
+  schedule graph ([ADR 0103](decisions/0103-transform-schedule-and-dependency-graph.md)).
+  `TickGovernedTransforms` admits one run per due bucket for its owner,
+  the same way it admits a due transform: a replica tick is idempotent, and
+  a revoked export grant fails that run closed with a receipt.
+- `ListDeliverableExportArtifacts` lists completed, unexpired, unacknowledged
+  artifacts in a namespace to the run's initiating owner or a namespace
+  administrator. `FetchExportArtifact` streams the bytes and the receipt
+  digest; the adapter verifies the digest before delivering.
+  `AcknowledgeExportDelivery` takes that digest, deletes the bytes, and is
+  idempotent. Access follows the receipt, so a later definition under the
+  same id cannot fetch another owner's retained artifact. The plane never
+  pushes and holds no destination credentials.

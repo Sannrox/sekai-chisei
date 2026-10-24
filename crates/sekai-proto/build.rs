@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "sekai.DefinitionConsumerImpactPath.blocking",
             "#[serde(default)]",
         )
+        .field_attribute("sekai.ExportDefinition.every_ms", "#[serde(default)]")
         .compile_protos(
             &[
                 format!("{proto_root}/sekai.proto"),

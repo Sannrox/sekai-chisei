@@ -132,6 +132,9 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.DeleteExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RunExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListDeliverableExportArtifacts` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.FetchExportArtifact` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.AcknowledgeExportDelivery` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RegisterObjectTypeDatasource` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |

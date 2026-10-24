@@ -30503,6 +30503,347 @@ async fn a_saved_export_runs_for_its_owner_into_an_artifact_and_fails_closed_onc
     );
 }
 
+#[tokio::test]
+async fn a_pre_schedule_export_definition_can_still_be_deleted() {
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "row").await;
+    let definition = ExportDefinition {
+        namespace: "exp".into(),
+        definition_id: "nightly".into(),
+        owner: "tester".into(),
+        object_set: Some(ExportObjectSetRequest {
+            format: "csv".into(),
+            ..export_request(&digest)
+        }),
+        ..Default::default()
+    };
+    let mut stored = serde_json::to_value(&definition).unwrap();
+    stored.as_object_mut().unwrap().remove("everyMs");
+    svc.db
+        .runtime()
+        .put_export_definition("exp", "nightly", "tester", &stored.to_string())
+        .unwrap();
+    assert!(
+        svc.delete_export_definition(with_named_principal(
+            DeleteExportDefinitionRequest {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .deleted
+    );
+}
+
+#[tokio::test]
+async fn a_scheduled_export_runs_once_per_bucket_and_an_adapter_fetches_then_acks() {
+    use futures_util::StreamExt;
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "row").await;
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "nightly extract".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.put_export_definition(with_named_principal(
+        PutExportDefinitionRequest {
+            definition: Some(ExportDefinition {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+                every_ms: 1_000,
+                object_set: Some(ExportObjectSetRequest {
+                    format: "csv".into(),
+                    ..export_request(&digest)
+                }),
+                ..Default::default()
+            }),
+        },
+        "tester",
+    ))
+    .await
+    .unwrap();
+    let tick = |now_ms: i64| {
+        let svc = &svc;
+        async move {
+            svc.tick_governed_transforms(with_named_principal(
+                TickGovernedTransformsRequest { now_ms },
+                "local",
+            ))
+            .await
+        }
+    };
+    tick(1_500).await.unwrap();
+    tick(1_500).await.unwrap();
+    let listed = svc
+        .list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts;
+    assert_eq!(listed.len(), 1);
+    assert!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .is_empty()
+    );
+    let receipt_id = listed[0].receipt_id.clone();
+    let digest = listed[0].content_digest.clone();
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .fetch_export_artifact(with_named_principal(
+            FetchExportArtifactRequest {
+                receipt_id: receipt_id.clone(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let bytes: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.data.clone()).collect();
+    assert_eq!(format!("sha256:{:x}", sha2::Sha256::digest(&bytes)), digest);
+    assert!(chunks.last().unwrap().done);
+    assert_eq!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: "sha256:deadbeef".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: digest.clone(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .acknowledged
+    );
+    assert!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: digest,
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .acknowledged
+    );
+    assert_eq!(
+        svc.fetch_export_artifact(with_named_principal(
+            FetchExportArtifactRequest {
+                receipt_id: receipt_id.clone(),
+            },
+            "tester",
+        ))
+        .await
+        .err()
+        .unwrap()
+        .code(),
+        tonic::Code::NotFound
+    );
+    assert!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .is_empty()
+    );
+    tick(2_000).await.unwrap();
+    assert_eq!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .len(),
+        1
+    );
+    svc.revoke_namespace_export(with_named_principal(
+        RevokeNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "rotation".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    tick(3_000).await.unwrap();
+    let listed = svc
+        .list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts;
+    assert_eq!(listed.len(), 1);
+}
+
+#[tokio::test]
+async fn a_reused_export_definition_id_does_not_deliver_another_owners_artifact() {
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "row").await;
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "nightly extract".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.put_export_definition(with_named_principal(
+        PutExportDefinitionRequest {
+            definition: Some(ExportDefinition {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+                object_set: Some(ExportObjectSetRequest {
+                    format: "csv".into(),
+                    ..export_request(&digest)
+                }),
+                ..Default::default()
+            }),
+        },
+        "tester",
+    ))
+    .await
+    .unwrap();
+    let ran = svc
+        .run_export_definition(with_named_principal(
+            RunExportDefinitionRequest {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        svc.delete_export_definition(with_named_principal(
+            DeleteExportDefinitionRequest {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .deleted
+    );
+    svc.db
+        .runtime()
+        .put_export_definition(
+            "exp",
+            "nightly",
+            "bob",
+            &serde_json::to_string(&ExportDefinition {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+                owner: "bob".into(),
+                object_set: Some(ExportObjectSetRequest {
+                    format: "csv".into(),
+                    ..export_request(&digest)
+                }),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .is_empty()
+    );
+    let listed = svc
+        .list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].receipt_id, ran.receipt_id);
+    assert_eq!(
+        svc.fetch_export_artifact(with_named_principal(
+            FetchExportArtifactRequest {
+                receipt_id: ran.receipt_id,
+            },
+            "bob",
+        ))
+        .await
+        .err()
+        .unwrap()
+        .code(),
+        tonic::Code::NotFound
+    );
+}
+
 /// #1777: every RPC newly admitted for tenant assertions refuses a namespace
 /// of another tenant before reading or writing it.
 #[tokio::test]

@@ -616,6 +616,8 @@ message ExportDefinition {
   ExportObjectSetRequest object_set = 4;
   ExportDatasetVersionRequest dataset_version = 5;
   int64 created_at_ms = 6;
+  // Interval for the transform schedule graph (ADR 0103). Zero is unscheduled.
+  int64 every_ms = 7;
 }
 message PutExportDefinitionRequest {
   ExportDefinition definition = 1;
@@ -647,6 +649,32 @@ message RunExportDefinitionResponse {
   string receipt_id = 1;
   int64 row_count = 2;
   string content_digest = 3;
+}
+// Adapter delivery (#1628): completed, unexpired, unacknowledged artifacts.
+message ListDeliverableExportArtifactsRequest {
+  string namespace = 1;
+}
+message DeliverableExportArtifact {
+  string receipt_id = 1;
+  string namespace = 2;
+  string definition_id = 3;
+  string content_digest = 4;
+  int64 created_at_ms = 5;
+  int64 expires_at_ms = 6;
+}
+message ListDeliverableExportArtifactsResponse {
+  repeated DeliverableExportArtifact artifacts = 1;
+}
+message FetchExportArtifactRequest {
+  string receipt_id = 1;
+}
+message AcknowledgeExportDeliveryRequest {
+  // The digest the adapter verified over the fetched bytes.
+  string receipt_id = 1;
+  string content_digest = 2;
+}
+message AcknowledgeExportDeliveryResponse {
+  bool acknowledged = 1;
 }
 // An export's receipt, to its initiating caller or a namespace admin.
 message GetExportReceiptRequest {
@@ -4416,6 +4444,9 @@ service SekaiService {
   rpc GetExportDefinition(GetExportDefinitionRequest) returns (GetExportDefinitionResponse);
   rpc DeleteExportDefinition(DeleteExportDefinitionRequest) returns (DeleteExportDefinitionResponse);
   rpc RunExportDefinition(RunExportDefinitionRequest) returns (RunExportDefinitionResponse);
+  rpc ListDeliverableExportArtifacts(ListDeliverableExportArtifactsRequest) returns (ListDeliverableExportArtifactsResponse);
+  rpc FetchExportArtifact(FetchExportArtifactRequest) returns (stream ExportObjectSetChunk);
+  rpc AcknowledgeExportDelivery(AcknowledgeExportDeliveryRequest) returns (AcknowledgeExportDeliveryResponse);
   rpc ExportDatasetVersion(ExportDatasetVersionRequest) returns (stream ExportObjectSetChunk);
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);

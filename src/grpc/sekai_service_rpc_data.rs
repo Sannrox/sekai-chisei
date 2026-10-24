@@ -4070,6 +4070,11 @@ pub(super) async fn tick_governed_transforms(
     let mut runs = runtime
         .tick_governed_transforms(now_ms)
         .map_err(Status::internal)?;
+    let export_service = service.clone();
+    tokio::task::spawn_blocking(move || export_service.tick_export_schedules(now_ms))
+        .await
+        .map_err(|_| Status::internal("export schedule tick failed"))?
+        .map_err(Status::internal)?;
     let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
     for (run_id, _, _, generation) in runtime
         .list_retryable_quota_holds()

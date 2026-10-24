@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS sekai_export_artifacts (
     namespace TEXT NOT NULL,
     definition_id TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL,
-    expires_at_ms INTEGER NOT NULL
+    expires_at_ms INTEGER NOT NULL,
+    acked_at_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS sekai_export_artifact_chunks (
     receipt_id TEXT NOT NULL,
@@ -64,6 +65,12 @@ CREATE TABLE IF NOT EXISTS sekai_export_fingerprints (
 );
 CREATE INDEX IF NOT EXISTS idx_sekai_export_fingerprints_namespace
     ON sekai_export_fingerprints (namespace);
+CREATE TABLE IF NOT EXISTS sekai_export_schedule_cursor (
+    namespace TEXT NOT NULL,
+    definition_id TEXT NOT NULL,
+    last_bucket INTEGER NOT NULL,
+    PRIMARY KEY (namespace, definition_id)
+);
 ";
 
 /// One dataset version row with its row id.
@@ -79,9 +86,19 @@ fn encode(grant: &ExportGrant) -> Result<String, String> {
 
 impl SekaiDb {
     pub(crate) fn migrate_export_grants(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(CREATE_SQLITE)
-            .map_err(|error| error.to_string())
+        let conn = self.conn();
+        conn.execute_batch(CREATE_SQLITE)
+            .map_err(|error| error.to_string())?;
+        let _ = conn.execute(
+            "ALTER TABLE sekai_export_artifacts ADD COLUMN acked_at_ms INTEGER",
+            [],
+        );
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_sekai_export_artifacts_deliverable
+             ON sekai_export_artifacts (namespace, acked_at_ms, expires_at_ms)",
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn latest_export_grant(

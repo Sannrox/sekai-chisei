@@ -7,6 +7,9 @@ use std::cell::RefCell;
 /// Objects resolved and encoded per batch, and bytes buffered per message.
 pub(super) const EXPORT_BATCH: usize = 256;
 const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+/// Artifact chunks loaded per fetch page so the DB connection is dropped
+/// before waiting on the client.
+const FETCH_CHUNK_PAGE: i64 = 8;
 
 fn grant_status(error: String) -> Status {
     if error == crate::sekai::data_export::GRANT_CHANGED {
@@ -1020,13 +1023,15 @@ impl SekaiServiceImpl {
     }
 
     /// Loads a definition for its owner or an administrator of its
-    /// namespace; anyone else learns nothing of it.
+    /// namespace; anyone else learns nothing of it. The JSON is the stored
+    /// record, so a later compare-and-swap delete matches pre-upgrade
+    /// encodings that omit newer defaulted fields.
     fn visible_definition(
         &self,
         principals: &[String],
         namespace: &str,
         definition_id: &str,
-    ) -> Result<ExportDefinition, Status> {
+    ) -> Result<(ExportDefinition, String), Status> {
         let unavailable = || Status::not_found("export definition unavailable");
         let (owner, record_json) = self
             .db
@@ -1039,7 +1044,7 @@ impl SekaiServiceImpl {
         {
             return Err(unavailable());
         }
-        decode_definition(&record_json)
+        Ok((decode_definition(&record_json)?, record_json))
     }
 
     /// Saves an export to run later for its caller alone (#1628). Saving
@@ -1064,6 +1069,11 @@ impl SekaiServiceImpl {
             .definition
             .ok_or_else(|| Status::invalid_argument("definition required"))?;
         check_definition_id(&definition.definition_id)?;
+        if definition.every_ms < 0 {
+            return Err(Status::invalid_argument(
+                "every_ms must be zero or a positive interval",
+            ));
+        }
         definition.owner = owner.clone();
         definition.created_at_ms = 0;
         self.prepare_definition_export(ExportCaller::owner(&owner), &definition)?;
@@ -1103,7 +1113,7 @@ impl SekaiServiceImpl {
         let namespace = req.get_ref().namespace.clone();
         let principals = self.saved_export_caller(&req, &namespace, false)?;
         let inner = req.into_inner();
-        let definition =
+        let (definition, _) =
             self.visible_definition(&principals, &inner.namespace, &inner.definition_id)?;
         Ok(Response::new(GetExportDefinitionResponse {
             definition: Some(definition),
@@ -1117,18 +1127,43 @@ impl SekaiServiceImpl {
         let namespace = req.get_ref().namespace.clone();
         let principals = self.saved_export_caller(&req, &namespace, true)?;
         let inner = req.into_inner();
-        let definition =
+        let (_, record) =
             self.visible_definition(&principals, &inner.namespace, &inner.definition_id)?;
         // Only the record the caller was authorized against is deleted: a
         // definition saved anew under the id since is not.
-        let record = serde_json::to_string(&definition)
-            .map_err(|_| Status::internal("export definition unencodable"))?;
         let deleted = self
             .db
             .runtime()
             .delete_export_definition(&inner.namespace, &inner.definition_id, &record)
             .map_err(Status::internal)?;
         Ok(Response::new(DeleteExportDefinitionResponse { deleted }))
+    }
+
+    /// Runs a saved export for its owner alone into a stored artifact.
+    /// Every check is made again; a refusal writes a refused receipt.
+    fn run_saved_export(&self, definition: &ExportDefinition) -> Result<ArtifactRun, Status> {
+        let db = self.db.runtime().clone();
+        let prepared = match self
+            .prepare_definition_export(ExportCaller::owner(&definition.owner), definition)
+        {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                let receipt_id = crate::sekai::data_export::record_refused_run(
+                    &db,
+                    &definition.owner,
+                    &definition.namespace,
+                    &definition.definition_id,
+                    status.message(),
+                    now_millis(),
+                )
+                .map_err(|_| Status::internal("export refusal unrecorded"))?;
+                return Err(Status::new(
+                    status.code(),
+                    format!("{} (receipt {receipt_id})", status.message()),
+                ));
+            }
+        };
+        run_to_artifact(db, &definition.definition_id, prepared)
     }
 
     /// Runs a saved export now, for its owner alone, into a stored artifact.
@@ -1141,7 +1176,7 @@ impl SekaiServiceImpl {
         let namespace = req.get_ref().namespace.clone();
         let principals = self.saved_export_caller(&req, &namespace, true)?;
         let inner = req.into_inner();
-        let definition =
+        let (definition, _) =
             self.visible_definition(&principals, &inner.namespace, &inner.definition_id)?;
         if !principals.contains(&definition.owner) {
             return Err(Status::permission_denied(
@@ -1150,28 +1185,7 @@ impl SekaiServiceImpl {
         }
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
-            let db = service.db.runtime().clone();
-            let prepared = match service
-                .prepare_definition_export(ExportCaller::owner(&definition.owner), &definition)
-            {
-                Ok(prepared) => prepared,
-                Err(status) => {
-                    let receipt_id = crate::sekai::data_export::record_refused_run(
-                        &db,
-                        &definition.owner,
-                        &definition.namespace,
-                        &definition.definition_id,
-                        status.message(),
-                        now_millis(),
-                    )
-                    .map_err(|_| Status::internal("export refusal unrecorded"))?;
-                    return Err(Status::new(
-                        status.code(),
-                        format!("{} (receipt {receipt_id})", status.message()),
-                    ));
-                }
-            };
-            let run = run_to_artifact(db, &definition.definition_id, prepared)?;
+            let run = service.run_saved_export(&definition)?;
             Ok(Response::new(RunExportDefinitionResponse {
                 receipt_id: run.receipt_id,
                 row_count: i64::try_from(run.row_count).unwrap_or(i64::MAX),
@@ -1180,5 +1194,211 @@ impl SekaiServiceImpl {
         })
         .await
         .map_err(|_| Status::internal("export run failed"))?
+    }
+
+    /// Admits each due saved-export schedule as one run (ADR 0103).
+    /// Each call claims at most one bucket, then runs it in-process: the
+    /// cursor claim is the admission, so a crash loses only that interval
+    /// and never double-runs it. Remaining due definitions stay unclaimed.
+    pub(crate) fn tick_export_schedules(&self, now_ms: i64) -> Result<usize, String> {
+        let mut n = 0;
+        while let Some(item) = self
+            .db
+            .runtime()
+            .claim_due_export_schedules(now_ms)?
+            .into_iter()
+            .next()
+        {
+            n += 1;
+            let definition = decode_definition(&item.record_json)
+                .map_err(|status| status.message().to_string())?;
+            let _ = self.run_saved_export(&definition);
+        }
+        Ok(n)
+    }
+
+    fn delivery_caller_may_access(
+        &self,
+        principals: &[String],
+        initiating_actor: &str,
+        namespace: &str,
+    ) -> bool {
+        principals
+            .iter()
+            .any(|principal| principal == initiating_actor)
+            || authorize_source_type_namespace_admin(self, principals, namespace).is_ok()
+    }
+
+    pub(super) async fn list_deliverable_export_artifacts_rpc(
+        &self,
+        req: Request<ListDeliverableExportArtifactsRequest>,
+    ) -> Result<Response<ListDeliverableExportArtifactsResponse>, Status> {
+        let namespace = req.get_ref().namespace.clone();
+        let principals = self.saved_export_caller(&req, &namespace, false)?;
+        let artifacts = crate::sekai::data_export::list_deliverable_export_artifacts(
+            self.db.runtime(),
+            &namespace,
+            now_millis(),
+        )
+        .map_err(Status::internal)?
+        .into_iter()
+        .filter(|artifact| {
+            self.delivery_caller_may_access(
+                &principals,
+                &artifact.initiating_actor,
+                &artifact.namespace,
+            )
+        })
+        .map(|artifact| DeliverableExportArtifact {
+            receipt_id: artifact.receipt_id,
+            namespace: artifact.namespace,
+            definition_id: artifact.definition_id,
+            content_digest: artifact.content_digest,
+            created_at_ms: artifact.created_at_ms,
+            expires_at_ms: artifact.expires_at_ms,
+        })
+        .collect();
+        Ok(Response::new(ListDeliverableExportArtifactsResponse {
+            artifacts,
+        }))
+    }
+
+    pub(super) async fn fetch_export_artifact_rpc(
+        &self,
+        req: Request<FetchExportArtifactRequest>,
+    ) -> Result<Response<ExportStream>, Status> {
+        let receipt_id = req.get_ref().receipt_id.clone();
+        let unavailable = || Status::not_found("export artifact unavailable");
+        let now = now_millis();
+        let receipt = crate::sekai::data_export::export_receipt(self.db.runtime(), &receipt_id)
+            .map_err(Status::internal)?
+            .ok_or_else(unavailable)?;
+        let principals = self.saved_export_caller(&req, &receipt.namespace, false)?;
+        if !self.delivery_caller_may_access(
+            &principals,
+            &receipt.initiating_actor,
+            &receipt.namespace,
+        ) {
+            return Err(unavailable());
+        }
+        let content_digest =
+            crate::sekai::data_export::completed_digest(&receipt).ok_or_else(unavailable)?;
+        if !self
+            .db
+            .runtime()
+            .export_artifact_is_deliverable(&receipt_id, now)
+            .map_err(Status::internal)?
+        {
+            return Err(unavailable());
+        }
+        let runtime = self.db.runtime().clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::task::spawn_blocking(move || {
+            let mut after_seq = -1;
+            loop {
+                let now_ms = now_millis();
+                let page = match runtime.export_artifact_chunks_after(
+                    &receipt_id,
+                    after_seq,
+                    FETCH_CHUNK_PAGE,
+                    now_ms,
+                ) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(Status::internal(error)));
+                        return;
+                    }
+                };
+                if page.is_empty() {
+                    let still_open =
+                        match runtime.export_artifact_is_deliverable(&receipt_id, now_ms) {
+                            Ok(open) => open,
+                            Err(error) => {
+                                let _ = tx.blocking_send(Err(Status::internal(error)));
+                                return;
+                            }
+                        };
+                    let _ = tx.blocking_send(if still_open {
+                        Ok(ExportObjectSetChunk {
+                            receipt_id,
+                            done: true,
+                            content_digest,
+                            ..Default::default()
+                        })
+                    } else {
+                        Err(Status::not_found("export artifact unavailable"))
+                    });
+                    return;
+                }
+                for (seq, data) in page {
+                    if tx
+                        .blocking_send(Ok(ExportObjectSetChunk {
+                            receipt_id: receipt_id.clone(),
+                            data,
+                            content_digest: content_digest.clone(),
+                            ..Default::default()
+                        }))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    after_seq = seq;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(async_stream::stream! {
+            let mut rx = rx;
+            while let Some(item) = rx.recv().await {
+                let stop = match &item {
+                    Ok(chunk) => chunk.done,
+                    Err(_) => true,
+                };
+                yield item;
+                if stop {
+                    break;
+                }
+            }
+        })))
+    }
+
+    pub(super) async fn acknowledge_export_delivery_rpc(
+        &self,
+        req: Request<AcknowledgeExportDeliveryRequest>,
+    ) -> Result<Response<AcknowledgeExportDeliveryResponse>, Status> {
+        let inner = req.get_ref();
+        let unavailable = || Status::not_found("export artifact unavailable");
+        let now = now_millis();
+        let receipt =
+            crate::sekai::data_export::export_receipt(self.db.runtime(), &inner.receipt_id)
+                .map_err(Status::internal)?
+                .ok_or_else(unavailable)?;
+        let principals = self.saved_export_caller(&req, &receipt.namespace, true)?;
+        if !self.delivery_caller_may_access(
+            &principals,
+            &receipt.initiating_actor,
+            &receipt.namespace,
+        ) {
+            return Err(unavailable());
+        }
+        let inner = req.into_inner();
+        let acknowledged = crate::sekai::data_export::acknowledge_export_delivery(
+            self.db.runtime(),
+            &inner.receipt_id,
+            &inner.content_digest,
+            now,
+        )
+        .map_err(|error| {
+            if error.contains("digest") || error.contains("not complete") {
+                Status::failed_precondition(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
+        if !acknowledged {
+            return Err(unavailable());
+        }
+        Ok(Response::new(AcknowledgeExportDeliveryResponse {
+            acknowledged: true,
+        }))
     }
 }
