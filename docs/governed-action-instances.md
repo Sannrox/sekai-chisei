@@ -300,7 +300,13 @@ admission. Parameter values stay out of audit and receipt evidence. See
 A parked instance waits for one decision through `DecideActionInstance`
 ([ADR 0089](decisions/0089-park-and-decide-action-instances.md)).
 Describe and preview still never grant. `ListActionInstances` with
-`status=parked` is the inbox.
+`status=parked` is the inbox. With `decidable_by_caller` it lists only the
+parked instances the caller may decide (#1771), by the rule a decision
+applies: a credentialed decider, space approval, the namespace tenant,
+marking clearance, entitlement and review-queue placement. Those checks
+replace the namespace read check, as they do for a decision. An instance
+the caller may not decide is absent, and a caller who may decide nothing
+gets an empty list.
 
 - **Who decides.** A principal listed in the type's `approvers`, or, when the
   type declares none, a namespace administrator. The submitter never decides
