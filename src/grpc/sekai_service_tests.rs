@@ -29792,6 +29792,105 @@ async fn a_dropped_export_leaves_an_aborted_receipt() {
 }
 
 #[tokio::test]
+async fn ontology_health_snapshots_are_recorded_once_per_window_and_read_by_what_the_reader_sees() {
+    let svc = service();
+    seed_definition_parent(&svc, "health");
+    grant_source_namespace(&svc, "health", "root", security::Role::Admin);
+    grant_source_namespace(&svc, "health", "viewer", security::Role::Viewer);
+    // A dataset bound to an object the viewer may not read.
+    let db = svc.db.runtime();
+    db.create_object(&domain::Object {
+        id: "secret-object".into(),
+        kind: "Ticket".into(),
+        name: "secret".into(),
+        namespace: "health".into(),
+        external_id: String::new(),
+        properties: HashMap::from([("access_marking".into(), "restricted".into())]),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    db.create_dataset(&dataset::Dataset {
+        id: "secret".into(),
+        name: "secret".into(),
+        columns: Vec::new(),
+        object_id: "secret-object".into(),
+        created: 1,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    const DAY: i64 = 86_400_000;
+    let record = |principal: &'static str| {
+        svc.record_ontology_health_snapshot(with_named_principal(
+            RecordOntologyHealthSnapshotRequest {
+                namespace: "health".into(),
+                window_ms: DAY,
+                retention_ms: 7 * DAY,
+                // The ownerless Ticket keeps lint below 100: the first
+                // snapshot is below the threshold.
+                threshold: 100,
+            },
+            principal,
+        ))
+    };
+    let trend = |principal: &'static str| {
+        svc.list_ontology_health_trend(with_named_principal(
+            ListOntologyHealthTrendRequest {
+                namespace: "health".into(),
+            },
+            principal,
+        ))
+    };
+
+    let first = record("root").await.unwrap().into_inner();
+    assert!(!first.replay);
+    let event = first.event.unwrap();
+    assert_eq!(event.kind, "below_threshold");
+    let snapshot = first.snapshot.unwrap();
+    assert!(snapshot.parts.iter().any(|part| part.part == "access"));
+    // The same window again stores nothing and writes no second event.
+    let again = record("root").await.unwrap().into_inner();
+    assert!(again.replay && again.event.is_none());
+    assert_eq!(
+        again.snapshot.unwrap().window_start_ms,
+        snapshot.window_start_ms
+    );
+    // Only the namespace's administrator records.
+    for other in ["viewer", "tester"] {
+        assert_eq!(
+            record(other).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied,
+            "{other}"
+        );
+    }
+
+    let full = trend("root").await.unwrap().into_inner();
+    assert_eq!(full.snapshots, std::slice::from_ref(&snapshot));
+    assert_eq!(full.events, [event]);
+    // A reader sees no part they may not see now: not the access part, nor
+    // the dataset parts scored from the dataset they may not read, nor lint
+    // (scored from what the recorder could see); nor an event whose score
+    // those parts fed.
+    let partial = trend("viewer").await.unwrap().into_inner();
+    assert_eq!(partial.snapshots.len(), 1);
+    let shown: Vec<&str> = partial.snapshots[0]
+        .parts
+        .iter()
+        .map(|part| part.part.as_str())
+        .collect();
+    for hidden in ["access", "freshness", "quality", "lint"] {
+        assert!(!shown.contains(&hidden), "{hidden} in {shown:?}");
+    }
+    assert!(shown.contains(&"contract"), "{shown:?}");
+    assert!(partial.events.is_empty());
+    // A caller without access to the namespace gets nothing about it.
+    assert_eq!(
+        trend("tester").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
+#[tokio::test]
 async fn a_dataset_version_exports_under_its_grant_without_withheld_columns() {
     use futures_util::StreamExt;
     let svc = service();

@@ -57,8 +57,11 @@ mod sync_scope_rpc;
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
 };
+#[path = "sekai_service_db_work.rs"]
+mod db_work;
 #[path = "ontology_health_rpc.rs"]
 mod ontology_health_rpc;
+use db_work::db_work_limiter;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
 #[path = "sekai_service_support_access.rs"]
@@ -201,31 +204,7 @@ pub struct SekaiServiceImpl {
     pub(super) embedding_route: Option<crate::composition::embedding_catch_up::EmbeddingRoute>,
 }
 
-fn db_work_limiter(db: &crate::db::store::SekaiStore) -> Arc<tokio::sync::Semaphore> {
-    let permits = db.runtime().connection_pool_max().max(1) as usize;
-    Arc::new(tokio::sync::Semaphore::new(permits))
-}
-
 impl SekaiServiceImpl {
-    /// Run store work on the blocking pool, bounded by the connection pool.
-    pub(super) async fn spawn_db<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> Result<T, Status> + Send + 'static,
-    ) -> Result<T, Status> {
-        let permit = self
-            .db_work
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Status::unavailable("database worker closed"))?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work()
-        })
-        .await
-        .unwrap_or_else(|_| Err(Status::unavailable("database worker cancelled")))
-    }
-
     pub fn new(db: crate::db::store::SekaiStore) -> Self {
         Self::new_with_gateway_schema_principals(db, Vec::new())
     }
@@ -622,6 +601,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetOntologyHealthRequest>,
     ) -> Result<Response<GetOntologyHealthResponse>, Status> {
         ontology_health_rpc::get_ontology_health(self, req).await
+    }
+
+    async fn record_ontology_health_snapshot(
+        &self,
+        req: Request<RecordOntologyHealthSnapshotRequest>,
+    ) -> Result<Response<RecordOntologyHealthSnapshotResponse>, Status> {
+        ontology_health_rpc::record_ontology_health_snapshot(self, req).await
+    }
+
+    async fn list_ontology_health_trend(
+        &self,
+        req: Request<ListOntologyHealthTrendRequest>,
+    ) -> Result<Response<ListOntologyHealthTrendResponse>, Status> {
+        ontology_health_rpc::list_ontology_health_trend(self, req).await
     }
 
     async fn generate_definition_change_bundle(
