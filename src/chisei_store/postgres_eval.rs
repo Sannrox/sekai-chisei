@@ -186,7 +186,7 @@ impl PostgresDb {
     ) -> Result<Vec<eval::Run>, String> {
         self.connection()?
             .query(sql, params)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| crate::db::postgres::missing_relation_or(error, "chisei_eval_runs"))?
             .into_iter()
             .map(row_to_eval_run)
             .collect()

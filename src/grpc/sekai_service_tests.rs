@@ -24573,6 +24573,93 @@ async fn agent_shadow_blocks_merge_when_the_namespace_requires_a_report() {
 }
 
 #[tokio::test]
+async fn agent_shadow_merge_without_eval_runs_table_is_not_required() {
+    let svc = service();
+    let namespace = "agent-shadow-no-eval-table";
+    let parent = seed_definition_parent(&svc, namespace);
+    svc.db
+        .runtime()
+        .conn()
+        .execute("DROP TABLE chisei_eval_runs", [])
+        .unwrap();
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: format!("create-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: format!("edit-{namespace}"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "shadow".into(),
+            base_digest: parent.revision_digest.clone(),
+            candidate_digest: candidate,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("propose-{namespace}"),
+            major_revision: false,
+            migration_plan_digest: String::new(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "shadow".into(),
+            idempotency_key: format!("approve-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "shadow".into(),
+                expected_published_digest: parent.revision_digest,
+                idempotency_key: format!("merge-{namespace}"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(merged.proposal.unwrap().status, "merged");
+}
+
+#[tokio::test]
 async fn write_freeze_refuses_in_scope_writes_and_records_receipts() {
     let svc = service();
     svc.set_write_freeze(with_named_principal(

@@ -1866,6 +1866,23 @@ fn persist_shadow_requirement(
     Ok(())
 }
 
+fn eval_runs_relation_missing(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("chisei_eval_runs")
+        && (error.contains("no such table") || error.contains("does not exist"))
+}
+
+fn list_shadow_eval_runs(
+    service: &SekaiServiceImpl,
+    suite_id: &str,
+) -> Result<Vec<crate::chisei::eval::Run>, Status> {
+    match service.db.runtime().list_eval_run_records(suite_id) {
+        Ok(runs) => Ok(runs),
+        Err(error) if eval_runs_relation_missing(&error) => Ok(Vec::new()),
+        Err(error) => Err(Status::internal(error)),
+    }
+}
+
 fn load_shadow_report(
     service: &SekaiServiceImpl,
     namespace: &str,
@@ -1874,11 +1891,10 @@ fn load_shadow_report(
     passing_only: bool,
     expected_active: Option<&str>,
 ) -> Result<Option<crate::sekai::agent_shadow::ShadowReport>, Status> {
-    let mut runs = service
-        .db
-        .runtime()
-        .list_eval_run_records(&crate::sekai::agent_shadow::suite_id(namespace, member_id))
-        .map_err(Status::internal)?;
+    let mut runs = list_shadow_eval_runs(
+        service,
+        &crate::sekai::agent_shadow::suite_id(namespace, member_id),
+    )?;
     runs.sort_by_key(|run| std::cmp::Reverse(run.timestamp));
     for run in runs {
         if !crate::sekai::agent_shadow::run_is_shadow(&run.config_ref, &run.suite_id) {
@@ -1911,11 +1927,10 @@ fn namespace_requires_agent_shadow(
     service: &SekaiServiceImpl,
     namespace: &str,
 ) -> Result<bool, Status> {
-    let runs = service
-        .db
-        .runtime()
-        .list_eval_run_records(&crate::sekai::agent_shadow::required_suite_id(namespace))
-        .map_err(Status::internal)?;
+    let runs = list_shadow_eval_runs(
+        service,
+        &crate::sekai::agent_shadow::required_suite_id(namespace),
+    )?;
     Ok(runs
         .iter()
         .any(|run| crate::sekai::agent_shadow::run_is_shadow(&run.config_ref, &run.suite_id)))
