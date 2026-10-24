@@ -49,8 +49,11 @@ impl RuntimeDb {
         let mut pins = BTreeMap::new();
         for (_, dataset_id) in &bindings {
             // An empty pin is no pin: only a dataset with no version yet
-            // reads as empty.
+            // reads as empty. A receipt's unversioned pin is that: no rows.
             let version = match request.input_versions.get(dataset_id) {
+                Some(version) if version == crate::sekai::governed_transform::INPUT_UNVERSIONED => {
+                    String::new()
+                }
                 Some(version) if !version.trim().is_empty() => version.clone(),
                 _ => self.version_at(dataset_id, request.as_of_ms)?,
             };
@@ -312,6 +315,24 @@ mod tests {
         let original = runtime
             .run_governed_transform(&namespace, "t1", false, 20)
             .unwrap();
+        // #1794: the receipt pins the version each input was read at, and a
+        // run on unchanged inputs reads the same pins.
+        assert_eq!(
+            original.input_versions,
+            BTreeMap::from([(input.clone(), first_input.clone())])
+        );
+        let stored = runtime
+            .list_governed_transform_runs(&namespace, 10)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.run_id == original.run_id)
+            .unwrap();
+        assert_eq!(stored.input_versions, original.input_versions);
+        let again = runtime
+            .run_governed_transform(&namespace, "t1", false, 25)
+            .unwrap();
+        assert_eq!(again.input_versions, original.input_versions);
+        assert_eq!(again.input_digest, original.input_digest);
         let output_versions = data.list_dataset_versions(&output).unwrap();
         let request = ReplayTransform {
             namespace: namespace.clone(),
@@ -370,6 +391,37 @@ mod tests {
 
         // A pinned past version is read as it was, after the input moved on.
         data.append_rows(&input, &[row("4", "yes")]).unwrap();
+        // #1794: the original receipt's own pins reproduce its output.
+        let from_receipt = runtime
+            .replay_governed_transform(
+                &ReplayTransform {
+                    input_versions: original.input_versions.clone(),
+                    ..request.clone()
+                },
+                45,
+            )
+            .unwrap();
+        assert_eq!(from_receipt.output_digest, original.output_digest);
+        // An unversioned pin reads no rows, whatever the input holds now.
+        let unversioned = runtime
+            .replay_governed_transform(
+                &ReplayTransform {
+                    input_versions: BTreeMap::from([(
+                        input.clone(),
+                        crate::sekai::governed_transform::INPUT_UNVERSIONED.into(),
+                    )]),
+                    ..request.clone()
+                },
+                47,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                unversioned.inputs[0].rows,
+                unversioned.inputs[0].version_id.as_str()
+            ),
+            (0, "")
+        );
         let pinned = runtime
             .replay_governed_transform(
                 &ReplayTransform {
@@ -440,10 +492,106 @@ mod tests {
             .unwrap();
     }
 
+    /// A dataset populated before versioning still has live rows and no
+    /// `sekai_dataset_versions` row. The run snapshots those rows and pins
+    /// the snapshot so replay matches after the live table moves on.
+    fn exercise_legacy_populated_pins(
+        runtime: &RuntimeDb,
+        data: &dyn DatasetBackend,
+        forget_versions: &dyn Fn(&str),
+    ) {
+        let suffix = uuid::Uuid::new_v4().as_simple().to_string();
+        let (input, output, namespace) = (
+            format!("legacy-in-{suffix}"),
+            format!("legacy-out-{suffix}"),
+            format!("legacy-ops-{suffix}"),
+        );
+        for id in [&input, &output] {
+            data.create_dataset(&Dataset {
+                id: id.clone(),
+                name: id.clone(),
+                columns: ["id", "keep"]
+                    .map(|name| ColumnDef {
+                        name: name.into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .to_vec(),
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        }
+        data.append_rows(&input, &[row("1", "yes"), row("2", "no")])
+            .unwrap();
+        forget_versions(&input);
+        assert!(data.list_dataset_versions(&input).unwrap().is_empty());
+        let transform = filter(&namespace, &input, &output, "yes");
+        runtime.put_governed_transform(&transform, 10).unwrap();
+        let original = runtime
+            .run_governed_transform(&namespace, "t1", false, 20)
+            .unwrap();
+        let pin = original
+            .input_versions
+            .get(&input)
+            .cloned()
+            .expect("receipt pins the input");
+        assert_ne!(pin, crate::sekai::governed_transform::INPUT_UNVERSIONED);
+        assert_eq!(
+            data.list_dataset_versions(&input)
+                .unwrap()
+                .last()
+                .unwrap()
+                .version_id,
+            pin
+        );
+        data.append_rows(&input, &[row("3", "yes")]).unwrap();
+        let replayed = runtime
+            .replay_governed_transform(
+                &ReplayTransform {
+                    namespace: namespace.clone(),
+                    transform_id: "t1".into(),
+                    key_column: "id".into(),
+                    actor: "analyst".into(),
+                    tenant: "t1".into(),
+                    input_versions: original.input_versions.clone(),
+                    ..ReplayTransform::default()
+                },
+                30,
+            )
+            .unwrap();
+        assert_eq!(replayed.output_digest, original.output_digest);
+        assert_eq!(replayed.inputs[0].version_id, pin);
+        assert_eq!(replayed.inputs[0].rows, 2);
+    }
+
     #[test]
     fn sqlite_replays_reproduce_diff_and_promote() {
         let db = Arc::new(crate::db::sekai::SekaiDb::new(":memory:").unwrap());
         exercise(&RuntimeDb::Sqlite(db.clone()), db.as_ref());
+    }
+
+    #[test]
+    fn sqlite_legacy_populated_input_is_snapshotted_and_replayable() {
+        let db = Arc::new(crate::db::sekai::SekaiDb::new(":memory:").unwrap());
+        exercise_legacy_populated_pins(
+            &RuntimeDb::Sqlite(db.clone()),
+            db.as_ref(),
+            &|dataset_id| {
+                let conn = db.conn();
+                conn.execute(
+                    "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = ?1",
+                    rusqlite::params![dataset_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "DELETE FROM sekai_dataset_versions WHERE dataset_id = ?1",
+                    rusqlite::params![dataset_id],
+                )
+                .unwrap();
+            },
+        );
     }
 
     #[test]
@@ -461,5 +609,38 @@ mod tests {
         };
         let db = Arc::new(db.unwrap());
         exercise(&RuntimeDb::Postgres(db.clone()), db.as_ref());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_legacy_populated_input_is_snapshotted_and_replayable() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
+        let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                &url,
+                4,
+                &std::fs::read(path).unwrap(),
+            ),
+            Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
+        };
+        let db = Arc::new(db.unwrap());
+        exercise_legacy_populated_pins(
+            &RuntimeDb::Postgres(db.clone()),
+            db.as_ref(),
+            &|dataset_id| {
+                let mut conn = db.connection().unwrap();
+                conn.execute(
+                    "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = $1",
+                    &[&dataset_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "DELETE FROM sekai_dataset_versions WHERE dataset_id = $1",
+                    &[&dataset_id],
+                )
+                .unwrap();
+            },
+        );
     }
 }

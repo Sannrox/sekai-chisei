@@ -200,6 +200,11 @@ impl PostgresDb {
         if !transform.allows_incremental() {
             incremental = false;
         }
+        if incremental && unversioned_input_pg(&mut tx, &bindings)? {
+            // A pin is a full dataset version. Incremental would load a delta,
+            // then snapshot the rest unbounded; rebuild fully while there is no version.
+            incremental = false;
+        }
         let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
         let mut load_budget = InputLoadBudget::for_transform(&transform);
         let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
@@ -284,6 +289,7 @@ impl PostgresDb {
         run.markings_out = markings_out;
         run.stamp_trigger(TRANSFORM_TRIGGER_MANUAL, "");
         run.input_partitions = input_receipts_from_loaded_pg(&mut tx, &bindings, &loaded)?;
+        run.input_versions = input_version_pins_pg(&mut tx, &bindings, now_ms, !run.quarantined)?;
         if run.quarantined {
             if !incremental {
                 let live = live_output_rows_pg(&mut tx, &transform.output_dataset_id)?;
@@ -484,7 +490,7 @@ impl PostgresDb {
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
                         profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
-                        input_partitions, output_partitions
+                        input_partitions, output_partitions, input_versions
                  FROM sekai_governed_transform_run WHERE run_id = $1",
                 &[&run_id],
             )
@@ -523,7 +529,7 @@ impl PostgresDb {
                         last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                         lineage_parent, created_at_ms, markings_in, markings_out,
                         profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
-                        input_partitions, output_partitions
+                        input_partitions, output_partitions, input_versions
                  FROM sekai_governed_transform_run
                  WHERE namespace = $1
                  ORDER BY created_at_ms DESC, run_id DESC
@@ -1659,6 +1665,7 @@ fn persist_computed_output_pg(
 ) -> Result<(), String> {
     let keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
     run.input_partitions = input_receipts_from_loaded_pg(tx, bindings, loaded)?;
+    run.input_versions = input_version_pins_pg(tx, bindings, run.created_at_ms, true)?;
     if keys.is_empty() {
         if !incremental {
             tx.execute(
@@ -1699,6 +1706,86 @@ fn persist_computed_output_pg(
     }
     run.output_digest = dataset_digest(&keys, &live);
     Ok(())
+}
+
+/// The version each input dataset is at, read in the run's transaction: the
+/// rows the run read are exactly that version's (#1794). A populated dataset
+/// with no version history (upgrade before versioning) is snapshotted here so
+/// the pin is replayable; an empty unversioned input stays `unversioned`.
+fn input_version_pins_pg(
+    tx: &mut postgres::Transaction<'_>,
+    bindings: &[(String, String)],
+    now_ms: i64,
+    snapshot_legacy: bool,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut pins = std::collections::BTreeMap::new();
+    for (_, dataset_id) in bindings {
+        let version = tx
+            .query_opt(
+                "SELECT version_id FROM sekai_dataset_versions
+                 WHERE dataset_id = $1 ORDER BY seq DESC LIMIT 1",
+                &[dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, String>(0));
+        let version = match version {
+            Some(version) => version,
+            None => pin_unversioned_input_pg(tx, dataset_id, now_ms, snapshot_legacy)?,
+        };
+        pins.insert(dataset_id.clone(), version);
+    }
+    Ok(pins)
+}
+
+fn dataset_has_version_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+) -> Result<bool, String> {
+    tx.query_opt(
+        "SELECT 1 FROM sekai_dataset_versions WHERE dataset_id = $1 LIMIT 1",
+        &[&dataset_id],
+    )
+    .map_err(|error| error.to_string())
+    .map(|row| row.is_some())
+}
+
+fn unversioned_input_pg(
+    tx: &mut postgres::Transaction<'_>,
+    bindings: &[(String, String)],
+) -> Result<bool, String> {
+    for (_, dataset_id) in bindings {
+        if !dataset_has_version_pg(tx, dataset_id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn pin_unversioned_input_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    now_ms: i64,
+    snapshot_legacy: bool,
+) -> Result<String, String> {
+    if !snapshot_legacy {
+        // Quarantined runs already stopped at the load budget. Snapshotting a
+        // legacy input would reread every remaining row unbounded.
+        return Ok(crate::sekai::governed_transform::INPUT_UNVERSIONED.to_string());
+    }
+    let populated = tx
+        .query_opt(
+            "SELECT 1 FROM sekai_dataset_rows WHERE dataset_id = $1 LIMIT 1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !populated {
+        return Ok(crate::sekai::governed_transform::INPUT_UNVERSIONED.to_string());
+    }
+    Ok(crate::db::postgres_dataset::snapshot_dataset_version_pg(
+        tx, dataset_id, "", "", "", "", now_ms,
+    )?
+    .version_id)
 }
 
 fn input_receipts_from_loaded_pg(
@@ -1799,13 +1886,16 @@ fn insert_transform_run(
         serde_json::to_string(&run.input_partitions).map_err(|error| error.to_string())?;
     let output_partitions =
         serde_json::to_string(&run.output_partitions).map_err(|error| error.to_string())?;
+    let input_versions =
+        serde_json::to_string(&run.input_versions).map_err(|error| error.to_string())?;
     tx.execute(
         "INSERT INTO sekai_governed_transform_run
          (run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
           last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
           lineage_parent, created_at_ms, markings_in, markings_out,
-          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref, input_partitions, output_partitions)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)",
+          profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref, input_partitions, output_partitions,
+          input_versions)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
         &[
             &run.run_id,
             &run.namespace,
@@ -1831,6 +1921,7 @@ fn insert_transform_run(
             &run.trigger_ref,
             &input_partitions,
             &output_partitions,
+            &input_versions,
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -1871,6 +1962,11 @@ fn row_to_run(row: Row) -> Result<TransformRun, String> {
             &row.try_get::<_, String>(23).unwrap_or_else(|_| "[]".into()),
         )
         .unwrap_or_default(),
+        input_versions: row
+            .try_get::<_, String>(24)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -2030,6 +2126,7 @@ fn admit_isolated_postgres(
     run.markings_in = markings_in;
     run.markings_out = markings_out;
     run.input_partitions = input_receipts_from_loaded_pg(tx, &bindings, &loaded)?;
+    run.input_versions = input_version_pins_pg(tx, &bindings, now_ms, true)?;
     insert_transform_run(tx, &run)?;
     persist_run_input_snapshot_pg(tx, &run.run_id, &bindings, &loaded)?;
     let spec = transform
@@ -2312,7 +2409,7 @@ fn write_transform_run_pg(
                     last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                     lineage_parent, created_at_ms, markings_in, markings_out,
                     profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
-                        input_partitions, output_partitions
+                        input_partitions, output_partitions, input_versions
              FROM sekai_governed_transform_run WHERE run_id = $1",
             &[&command.run_id],
         )
@@ -2491,7 +2588,7 @@ fn load_transform_run_pg(
                 last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
                 lineage_parent, created_at_ms, markings_in, markings_out,
                 profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
-                        input_partitions, output_partitions
+                        input_partitions, output_partitions, input_versions
          FROM sekai_governed_transform_run WHERE run_id = $1",
         &[&run_id],
     )
@@ -3072,7 +3169,7 @@ pub(crate) fn redact_transform_partition_receipts_pg(
     }
     let rows = tx
         .query(
-            "SELECT run_id, input_partitions, output_partitions
+            "SELECT run_id, input_partitions, output_partitions, input_versions
              FROM sekai_governed_transform_run
              FOR UPDATE",
             &[],
@@ -3854,6 +3951,11 @@ fn run_in_process_pg(
     if !transform.allows_incremental() {
         incremental = false;
     }
+    if incremental && unversioned_input_pg(tx, &bindings)? {
+        // A pin is a full dataset version. Incremental would load a delta,
+        // then snapshot the rest unbounded; rebuild fully while there is no version.
+        incremental = false;
+    }
     let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
     let mut load_budget = InputLoadBudget::for_transform(transform);
     let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
@@ -3938,6 +4040,7 @@ fn run_in_process_pg(
     run.markings_in = markings_in;
     run.markings_out = markings_out;
     run.input_partitions = input_receipts_from_loaded_pg(tx, &bindings, &loaded)?;
+    run.input_versions = input_version_pins_pg(tx, &bindings, now_ms, !run.quarantined)?;
     if run.quarantined {
         if !incremental {
             let live = live_output_rows_pg(tx, &transform.output_dataset_id)?;
@@ -4090,6 +4193,7 @@ fn cancel_governed_transform_run_pg(
                 continue;
             }
             let skip = TransformRun {
+                input_versions: Default::default(),
                 run_id: Uuid::new_v4().to_string(),
                 namespace: downstream.namespace.clone(),
                 transform_id: downstream.transform_id.clone(),

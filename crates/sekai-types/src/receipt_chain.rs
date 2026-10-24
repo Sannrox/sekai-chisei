@@ -828,6 +828,7 @@ mod tests {
 
     fn isolated_run_json(id: &str) -> String {
         serde_json::to_string(&TransformRun {
+            input_versions: Default::default(),
             run_id: id.into(),
             namespace: "ns".into(),
             transform_id: "tf-1".into(),

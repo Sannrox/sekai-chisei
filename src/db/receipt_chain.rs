@@ -814,6 +814,7 @@ mod tests {
 
     fn isolated_run(id: &str) -> TransformRun {
         TransformRun {
+            input_versions: Default::default(),
             run_id: id.into(),
             namespace: "ns".into(),
             transform_id: "tf-1".into(),

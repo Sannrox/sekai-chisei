@@ -201,6 +201,10 @@ pub struct TransformOutputState {
     pub updated_at_ms: i64,
 }
 
+/// Pin for an input with no version and no rows: a replay reads none (#1794).
+/// A populated unversioned input is snapshotted in the run and pinned to that version.
+pub const INPUT_UNVERSIONED: &str = "unversioned";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransformRun {
     pub run_id: String,
@@ -248,6 +252,12 @@ pub struct TransformRun {
     /// Partitions written for this run. Empty on unpartitioned historical rows.
     #[serde(default)]
     pub output_partitions: Vec<TransformPartition>,
+    /// The dataset version each input was read at (#1794), by dataset id:
+    /// a replay pinned to these reads the same inputs. Part of the signed
+    /// receipt; empty on historical rows, and [`INPUT_UNVERSIONED`] for an
+    /// input that had no version and no rows yet.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub input_versions: std::collections::BTreeMap<String, String>,
 }
 
 /// Rows read from one preview input after policy and the sample cap.
@@ -924,6 +934,7 @@ pub fn budget_quarantined_run(
     reason: &str,
 ) -> TransformRun {
     TransformRun {
+        input_versions: Default::default(),
         run_id,
         namespace: transform.namespace.clone(),
         transform_id: transform.transform_id.clone(),
@@ -1607,6 +1618,7 @@ pub fn preview_writeback_run(
     now_ms: i64,
 ) -> TransformRun {
     TransformRun {
+        input_versions: Default::default(),
         run_id: command.run_id.clone(),
         namespace: work.namespace.clone(),
         transform_id: work.transform_id.clone(),
