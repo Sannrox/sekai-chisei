@@ -30221,3 +30221,117 @@ async fn a_saved_export_runs_for_its_owner_into_an_artifact_and_fails_closed_onc
         tonic::Code::NotFound
     );
 }
+
+/// #1777: every RPC newly admitted for tenant assertions refuses a namespace
+/// of another tenant before reading or writing it.
+#[tokio::test]
+async fn admitted_tenant_rpcs_refuse_another_tenants_namespace() {
+    let svc = enterprise_service();
+    let ns = || "denied".to_string();
+    let mut codes = Vec::new();
+    macro_rules! probe {
+        ($name:literal, $call:expr) => {
+            codes.push(($name, $call.await.err().map(|status| status.code())));
+        };
+    }
+    probe!(
+        "PreviewObjectAction",
+        svc.preview_object_action(with_tenant_context(PreviewObjectActionRequest {
+            namespace: ns(),
+            object_id: "obj".into(),
+            type_id: "t".into(),
+            version: "1".into(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "ListGovernedActionTypes",
+        svc.list_governed_action_types(with_tenant_context(ListGovernedActionTypesRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "ExplainDerivation",
+        svc.explain_derivation(with_tenant_context(ExplainDerivationRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "EvaluateObjectSet",
+        svc.evaluate_object_set(with_tenant_context(EvaluateObjectSetRequest {
+            descriptor: Some(ObjectSetDescriptor {
+                contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+                namespace: ns(),
+                kind: "widget".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "GetSourceSyncState",
+        svc.get_source_sync_state(with_tenant_context(GetSourceSyncStateRequest {
+            namespace: ns(),
+            source_instance: "acme/ops".into(),
+            type_digest: crate::sekai::object_sync::GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+        }))
+    );
+    probe!(
+        "ReadObjectChangeSubscription",
+        svc.read_object_change_subscription(with_tenant_context(
+            ReadObjectChangeSubscriptionRequest {
+                scope: Some(ObjectChangeSubscriptionScope {
+                    namespace: ns(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        ))
+    );
+    probe!(
+        "CompareDefinitionRevisions",
+        svc.compare_definition_revisions(with_tenant_context(CompareDefinitionRevisionsRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "QueryObjectPolicyAudit",
+        svc.query_object_policy_audit(with_tenant_context(QueryObjectPolicyAuditRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    for (name, code) in codes {
+        assert_eq!(code, Some(tonic::Code::PermissionDenied), "{name}");
+    }
+    // The same subject, an Action administrator, lists its own tenant's
+    // types: the refusal above is the tenant's.
+    let grant = security::Grant {
+        id: "subject-a-action-admin".into(),
+        object_id: "action".into(),
+        principal: "subject-a".into(),
+        role: security::Role::Admin,
+        created: 0,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&grant).unwrap();
+    svc.security.add_grant(&grant);
+    let own = |namespace: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.list_governed_action_types(with_tenant_context(ListGovernedActionTypesRequest {
+                namespace: namespace.into(),
+                ..Default::default()
+            }))
+            .await
+        }
+    };
+    own("allowed").await.unwrap();
+    assert_eq!(
+        own("denied").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+}

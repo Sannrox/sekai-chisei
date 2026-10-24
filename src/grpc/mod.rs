@@ -269,6 +269,9 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
                 | "ResolveInvariantSet"
                 | "RetrieveContext"
                 | "DiscoverCapabilities"
+                | "ExplainDerivation"
+                | "CompareDefinitionRevisions"
+                | "QueryObjectPolicyAudit"
         )
     {
         crate::enterprise::NamespaceAction::Write
@@ -875,6 +878,16 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "RunDatasetHealthChecks"
             | "ListDatasetAlerts"
             | "DescribeObjectAction"
+            // Admitted for tenant assertions (#1777); each handler authorizes
+            // the request's namespace against the assertion's tenant.
+            | "PreviewObjectAction"
+            | "ListGovernedActionTypes"
+            | "ExplainDerivation"
+            | "EvaluateObjectSet"
+            | "GetSourceSyncState"
+            | "ReadObjectChangeSubscription"
+            | "CompareDefinitionRevisions"
+            | "QueryObjectPolicyAudit"
             | "DiscoverCapabilities"
             | "Search"
             | "GetSearchIndexStatus"
@@ -2129,6 +2142,9 @@ mod tests {
             (SpaceRole::Discoverer, "CreateObject", false),
             (SpaceRole::Viewer, "CreateObject", false),
             (SpaceRole::Viewer, "GetObject", true),
+            (SpaceRole::Viewer, "CompareDefinitionRevisions", true),
+            (SpaceRole::Viewer, "PreviewObjectAction", false),
+            (SpaceRole::Editor, "PreviewObjectAction", true),
             (SpaceRole::Viewer, "GetOntologyLintReport", true),
             // Data leaving the plane takes space write, not view.
             (SpaceRole::Viewer, "ExportObjectSet", false),
@@ -2528,6 +2544,44 @@ mod tests {
         assert!(!valid_single_principal("user,root"));
         assert!(!valid_single_principal(" enterprise-user"));
         assert!(!valid_single_principal(""));
+    }
+
+    /// Tenant-callable RPCs (#1777, docs/tenant-assertion-rpcs.md): the
+    /// namespace-scoped ones are admitted, and the global schema and ontology
+    /// calls, which have no namespace to bind a tenant to, are not.
+    #[test]
+    fn tenant_assertions_reach_namespace_scoped_rpcs_only() {
+        for method in [
+            "PreviewObjectAction",
+            "ListGovernedActionTypes",
+            "ExplainDerivation",
+            "EvaluateObjectSet",
+            "GetSourceSyncState",
+            "ReadObjectChangeSubscription",
+            "CompareDefinitionRevisions",
+            "QueryObjectPolicyAudit",
+        ] {
+            assert!(enterprise_namespace_method(method), "{method}");
+        }
+        for method in [
+            // ADR 0111: closing a proposal stays with unscoped credentials.
+            "CloseDefinitionProposal",
+            "CreateSchemaType",
+            "CreateOntologyClass",
+            "CreateOntologyRelation",
+            "ListOntologyClasses",
+            "ListOntologyRelations",
+        ] {
+            assert!(!enterprise_namespace_method(method), "{method}");
+        }
+        assert_eq!(
+            rpc_namespace_action("CompareDefinitionRevisions"),
+            crate::enterprise::NamespaceAction::Read
+        );
+        assert_eq!(
+            rpc_namespace_action("PreviewObjectAction"),
+            crate::enterprise::NamespaceAction::Write
+        );
     }
 
     #[test]

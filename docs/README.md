@@ -122,6 +122,8 @@ If you want to deploy or operate the control plane:
   under the caller's read policy.
 - [Governed export](governed-export.md): object sets out of the plane
   under an export grant, with a receipt per export.
+- [RPCs for tenant assertions](tenant-assertion-rpcs.md): which RPCs a
+  tenant-scoped identity assertion may call, and which it may not.
 - [Ontology health](ontology-health.md): a 0-100 score per namespace from
   freshness, checks, contracts, lint and grants.
 - [Definition change bundles](definition-change-bundles.md) — revision
