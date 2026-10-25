@@ -3,12 +3,13 @@
 //! receipt and diffed against the output version the run wrote.
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::governed_transform::TransformRun;
+use crate::sekai::governed_transform::{GovernedTransform, TransformRun};
 use crate::sekai::transform_replay::{self, ReplayTransform};
 use crate::sekai::transform_shadow::{
     self, DEFAULT_SHADOW_RUNS, MAX_SHADOW_RUNS, SHADOW_NEEDS_CANDIDATE, SHADOW_NO_RUNS,
     SHADOW_RUN_NOT_FOUND, ShadowRun, ShadowSample, ShadowTransform, TransformShadowReport,
 };
+use rusqlite::OptionalExtension as _;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -130,14 +131,175 @@ impl RuntimeDb {
             }));
             shadowed.push(entry);
         }
-        Ok(transform_shadow::shadow_report(
+        let mut report = transform_shadow::shadow_report(
             &request.namespace,
             &request.transform_id,
             &stored.definition_digest,
             &candidate.definition_digest,
             shadowed,
             samples,
-        ))
+        );
+        report.id = uuid::Uuid::new_v4().to_string();
+        report.candidate_member_digest = member_digest(&candidate);
+        // The report and the namespace's opt-in commit together. A crash
+        // before this leaves no report, so promotion stays refused.
+        self.save_transform_shadow_report(
+            &report,
+            request.require_for_promotion,
+            &request.actor,
+            now_ms,
+        )?;
+        Ok(report)
+    }
+
+    pub fn save_transform_shadow_report(
+        &self,
+        report: &TransformShadowReport,
+        require_for_promotion: bool,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(&report.without_rows()).map_err(|e| e.to_string())?;
+        match self {
+            Self::Sqlite(db) => {
+                let mut conn = db.conn();
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO sekai_transform_shadow_reports
+                     (id, namespace, transform_id, active_definition_digest,
+                      candidate_member_digest, passing, record_json, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        report.id,
+                        report.namespace,
+                        report.transform_id,
+                        report.active_definition_digest,
+                        report.candidate_member_digest,
+                        report.passing,
+                        json,
+                        now_ms
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                if require_for_promotion {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO sekai_transform_shadow_requirements
+                         (namespace, required_by, required_at_ms) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![report.namespace, actor, now_ms],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                tx.commit().map_err(|e| e.to_string())
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                let mut conn = db.connection()?;
+                let mut tx = conn.transaction().map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO sekai_transform_shadow_reports
+                     (id, namespace, transform_id, active_definition_digest,
+                      candidate_member_digest, passing, record_json, created_at_ms)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                    &[
+                        &report.id,
+                        &report.namespace,
+                        &report.transform_id,
+                        &report.active_definition_digest,
+                        &report.candidate_member_digest,
+                        &report.passing,
+                        &json,
+                        &now_ms,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                if require_for_promotion {
+                    tx.execute(
+                        "INSERT INTO sekai_transform_shadow_requirements
+                         (namespace, required_by, required_at_ms) VALUES ($1, $2, $3)
+                         ON CONFLICT (namespace) DO NOTHING",
+                        &[&report.namespace, &actor, &now_ms],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                tx.commit().map_err(|e| e.to_string())
+            }),
+        }
+    }
+
+    /// Whether `namespace` requires a passing shadow report to promote a
+    /// transform revision.
+    pub fn transform_shadow_required(&self, namespace: &str) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db
+                .conn()
+                .query_row(
+                    "SELECT 1 FROM sekai_transform_shadow_requirements WHERE namespace = ?1",
+                    rusqlite::params![namespace],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|row| row.is_some())
+                .map_err(|e| e.to_string()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.connection()?
+                    .query_opt(
+                        "SELECT 1 FROM sekai_transform_shadow_requirements WHERE namespace = $1",
+                        &[&namespace],
+                    )
+                    .map(|row| row.is_some())
+                    .map_err(|e| e.to_string())
+            }),
+        }
+    }
+
+    /// A passing report shadowing `candidate_member_digest` against the
+    /// active revision `active_definition_digest`, if one is stored.
+    pub fn passing_transform_shadow_report(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        active_definition_digest: &str,
+        candidate_member_digest: &str,
+    ) -> Result<Option<TransformShadowReport>, String> {
+        let json: Option<String> = match self {
+            Self::Sqlite(db) => db
+                .conn()
+                .query_row(
+                    "SELECT record_json FROM sekai_transform_shadow_reports
+                     WHERE namespace = ?1 AND transform_id = ?2
+                       AND active_definition_digest = ?3 AND candidate_member_digest = ?4
+                       AND passing = 1
+                     ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                    rusqlite::params![
+                        namespace,
+                        transform_id,
+                        active_definition_digest,
+                        candidate_member_digest
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?,
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.connection()?
+                    .query_opt(
+                        "SELECT record_json FROM sekai_transform_shadow_reports
+                         WHERE namespace = $1 AND transform_id = $2
+                           AND active_definition_digest = $3 AND candidate_member_digest = $4
+                           AND passing
+                         ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                        &[
+                            &namespace,
+                            &transform_id,
+                            &active_definition_digest,
+                            &candidate_member_digest,
+                        ],
+                    )
+                    .map(|row| row.map(|row| row.get::<_, String>(0)))
+                    .map_err(|e| e.to_string())
+            })?,
+        };
+        json.map(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
+            .transpose()
     }
 
     /// The named runs of the transform, in the request's order; else its
@@ -179,6 +341,16 @@ impl RuntimeDb {
             .take(limit)
             .collect())
     }
+}
+
+/// The digest of `transform` as a definition member carries it: schedule and
+/// trigger stay local and are not part of it.
+pub fn member_digest(transform: &GovernedTransform) -> String {
+    crate::sekai::governed_transform::definition_digest(&GovernedTransform {
+        schedule: None,
+        trigger: None,
+        ..transform.clone()
+    })
 }
 
 /// Why `run` has nothing to compare a candidate with.
@@ -374,6 +546,43 @@ mod tests {
             assert!(replay.candidate);
             assert_eq!(replay.branch, run.branch);
         }
+
+        // #1796: the report is stored by the candidate's member digest; the
+        // namespace requires shadows only once a request asks.
+        assert!(!runtime.transform_shadow_required(&namespace).unwrap());
+        let stored = runtime
+            .passing_transform_shadow_report(
+                &namespace,
+                "t1",
+                &active.definition_digest,
+                &report.candidate_member_digest,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.id, report.id);
+        assert!(stored.samples.is_empty() && stored.runs[0].changed_keys.is_empty());
+        let required = runtime
+            .shadow_governed_transform(
+                &ShadowTransform {
+                    require_for_promotion: true,
+                    ..request.clone()
+                },
+                45,
+            )
+            .unwrap();
+        assert!(required.passing);
+        assert!(runtime.transform_shadow_required(&namespace).unwrap());
+        assert!(
+            runtime
+                .passing_transform_shadow_report(
+                    &namespace,
+                    "t1",
+                    "sha256:other",
+                    &required.candidate_member_digest
+                )
+                .unwrap()
+                .is_none()
+        );
 
         // The active revision against itself matches every row.
         let same = runtime

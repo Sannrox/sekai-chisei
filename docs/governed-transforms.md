@@ -110,6 +110,30 @@ transform quota admission. The report is returned, not stored; each
 replay's record is stored, and its branch is deleted when it is no longer
 needed.
 
+### Promotion
+
+A shadow request may set `require_for_promotion`: from then on the
+namespace requires a passing shadow before promoting a transform revision
+(#1796). Once set, the requirement stays. Each report is stored by id, with
+counts and digests but without changed keys or samples. It passes when at
+least one run was compared, and it is evidence for the change, not a
+verdict on the differences.
+
+Promotion goes through a definition proposal ([definition
+branches](definition-branches.md)). In a namespace that requires shadows, a
+proposal that changes a governed transform merges only with a stored passing
+report for that candidate. The report is matched by the candidate's member
+digest (without schedule or trigger) and against the revision running when
+the proposal merges. A refusal is `FAILED_PRECONDITION`
+`transform_promotion_requires_shadow_report: <transform id>`, and nothing is
+written. The check runs in the merge transaction. New and removed
+transforms, and changes a shadow cannot compare (a transform moved to
+another output dataset, or an isolated-process one on either side), have no
+report to require. A rollback
+proposal restores a revision that was already promoted. Neither needs a
+report. Every merge, the rollback included, is an entry in the published
+revision history.
+
 ## Measured usage
 
 A finished run reads back with `finished_at_ms` and `compute_seconds`

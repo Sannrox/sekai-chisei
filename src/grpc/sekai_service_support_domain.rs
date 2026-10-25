@@ -1006,7 +1006,9 @@ pub(super) fn to_proto_definition_revision(
 }
 pub(super) fn map_definition_write_error(error: String) -> Status {
     // Names only blocking bindings, which consumers disclosed by opting in.
-    if error.starts_with("definition_publish_blocked") {
+    if error.starts_with("definition_publish_blocked")
+        || error.starts_with(crate::sekai::transform_shadow::REFUSAL_TRANSFORM_SHADOW)
+    {
         return Status::failed_precondition(error);
     }
     if error.starts_with("definition_revision_not_found")

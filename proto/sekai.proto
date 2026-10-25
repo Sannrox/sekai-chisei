@@ -2150,6 +2150,9 @@ message ShadowGovernedTransformRequest {
   uint32 limit = 5;
   // The row key; default as for a replay.
   string key_column = 6;
+  // Also make the namespace require a passing report before a definition
+  // proposal may promote a changed transform (#1796). Once set, it stays.
+  bool require_for_promotion = 7;
 }
 message ShadowRunComparison {
   string run_id = 1;
@@ -2196,6 +2199,13 @@ message TransformShadowReport {
   // Mean per compared run.
   int64 active_latency_ms = 16;
   int64 shadow_latency_ms = 17;
+  // The stored report: counts and digests, without changed keys or samples.
+  string id = 18;
+  // The candidate as a definition member carries it, without schedule or
+  // trigger; promotion checks reports by this digest.
+  string candidate_member_digest = 19;
+  // At least one run was compared.
+  bool passing = 20;
 }
 message ShadowGovernedTransformResponse { TransformShadowReport report = 1; }
 

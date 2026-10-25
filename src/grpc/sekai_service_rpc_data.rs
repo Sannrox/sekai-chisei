@@ -5259,6 +5259,7 @@ pub(super) async fn shadow_governed_transform(
                 limit: input.limit as usize,
                 key_column: input.key_column,
                 expected_definition_digest: admission.stored.definition_digest.clone(),
+                require_for_promotion: input.require_for_promotion,
                 actor: admission.actor,
                 tenant: admission.tenant,
             },
@@ -5317,6 +5318,9 @@ fn to_proto_shadow_report(
         shadow_compute_ms: report.shadow_compute_ms,
         active_latency_ms: report.active_latency_ms,
         shadow_latency_ms: report.shadow_latency_ms,
+        id: report.id,
+        candidate_member_digest: report.candidate_member_digest,
+        passing: report.passing,
     }
 }
 

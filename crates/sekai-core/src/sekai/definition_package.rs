@@ -443,7 +443,9 @@ pub fn members_for_export(
         .collect())
 }
 
-fn bind_transform_member(
+/// `definition_json` as the governed transform it publishes in `namespace`;
+/// `None` when the member is not a governed-transform document.
+pub fn bind_transform_member(
     namespace: &str,
     member_id: &str,
     definition_json: &str,
