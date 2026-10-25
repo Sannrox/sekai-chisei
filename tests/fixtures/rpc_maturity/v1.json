@@ -2277,7 +2277,7 @@
       "service": "SekaiService",
       "rpc": "SubmitEvidence",
       "storage_path": "sekai.evidence",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "example",
       "classification": "stable",
       "product_tier": "advanced"

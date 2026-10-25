@@ -5921,10 +5921,9 @@ impl RuntimeDb {
     pub fn record_execution_evidence(&self, submission_id: &str) -> Result<bool, String> {
         match self {
             Self::Sqlite(db) => db.record_execution_evidence(submission_id),
-            Self::Postgres(_) => Err(
-                "record_execution_evidence is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.record_execution_evidence(submission_id))
+            }
         }
     }
 
@@ -5986,10 +5985,9 @@ impl RuntimeDb {
     ) -> Result<EvidenceAdmission, String> {
         match self {
             Self::Sqlite(db) => db.reject_evidence_submission(submission_id, now_ms, code, summary),
-            Self::Postgres(_) => Err(
-                "reject_evidence_submission is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.reject_evidence_submission(submission_id, now_ms, code, summary)
+            }),
         }
     }
 
@@ -6328,8 +6326,12 @@ impl RuntimeDb {
         authenticated_producer: &str,
     ) -> Result<Option<ExecutionEvidence>, String> {
         match self {
-            Self::Sqlite(db) => db.validate_execution_evidence_envelope(envelope, authenticated_producer),
-            Self::Postgres(_) => Err("validate_execution_evidence_envelope is unavailable on the PostgreSQL community runtime".into()),
+            Self::Sqlite(db) => {
+                db.validate_execution_evidence_envelope(envelope, authenticated_producer)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.validate_execution_evidence_envelope(envelope, authenticated_producer)
+            }),
         }
     }
 

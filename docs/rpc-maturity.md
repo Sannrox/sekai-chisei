@@ -325,7 +325,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetProvenanceReport` | `sekai.audit, sekai.evidence, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RegisterEvidenceSchema` | `sekai.evidence` | yes | example | `stable` |
 | `SekaiService.ListEvidenceAdapters` | `sekai.evidence` | yes | none | `experimental` |
-| `SekaiService.SubmitEvidence` | `sekai.evidence` | sqlite only | example | `stable` |
+| `SekaiService.SubmitEvidence` | `sekai.evidence` | yes | example | `stable` |
 | `SekaiService.GetEvidenceSubmission` | `sekai.evidence` | yes | none | `experimental` |
 | `SekaiService.ListEvidenceSubmissions` | `sekai.evidence` | yes | none | `experimental` |
 | `SekaiService.CreateHandoff` | `sekai.handoffs` | yes | none | `experimental` |

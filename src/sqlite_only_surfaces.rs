@@ -19,7 +19,7 @@ pub const RUNTIME_DB_SRC: &str = concat!(
     )),
     include_str!("chisei_store/runtime.rs")
 );
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 11;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -437,7 +437,7 @@ mod tests {
         assert!(!list.contains_rpc("SekaiService", "PutPurposeAuthorization"));
         assert!(!list.contains_rpc("SekaiService", "GetClassificationLattice"));
         assert!(!list.contains_rpc("SekaiService", "ListObjectChanges"));
-        assert!(list.contains_rpc("SekaiService", "SubmitEvidence"));
+        assert!(!list.contains_rpc("SekaiService", "SubmitEvidence"));
         assert!(!list.contains_rpc("SekaiService", "RegisterSourceTypeDescriptor"));
         assert!(!list.contains_rpc("SekaiService", "DecideActionInstance"));
         assert!(!list.contains_rpc("SekaiService", "AdmitGovernedDocument"));
@@ -473,21 +473,20 @@ mod tests {
         let table = RpcMaturityTable::load().expect("table");
         let mut list = SqliteOnlySurfaces::load().expect("list");
         list.surfaces
-            .retain(|surface| surface.id != "SekaiService.SubmitEvidence");
+            .retain(|surface| surface.id != "SekaiService.DeleteOntologyRelation");
         let error = unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC)
             .expect_err("aliased sqlite-only RPC must fail");
-        assert!(error.contains("SubmitEvidence"), "{error}");
+        assert!(error.contains("DeleteOntologyRelation"), "{error}");
     }
 
     #[test]
-    fn unlisted_execution_evidence_rpc_fails() {
-        let table = RpcMaturityTable::load().expect("table");
-        let mut list = SqliteOnlySurfaces::load().expect("list");
-        list.surfaces
-            .retain(|surface| surface.id != "SekaiService.SubmitEvidence");
-        let error = unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC)
-            .expect_err("execution-evidence sqlite-only RPC must fail");
-        assert!(error.contains("SubmitEvidence"), "{error}");
+    fn submit_evidence_is_dual_backend() {
+        let list = SqliteOnlySurfaces::load().expect("list");
+        assert!(!list.contains_rpc("SekaiService", "SubmitEvidence"));
+        let closed = postgres_fail_closed_methods(RUNTIME_DB_SRC);
+        assert!(!closed.contains("record_execution_evidence"));
+        assert!(!closed.contains("reject_evidence_submission"));
+        assert!(!closed.contains("validate_execution_evidence_envelope"));
     }
 
     #[test]
@@ -578,6 +577,12 @@ mod tests {
                 && !closed.contains("put_open_table_snapshot")
                 && !closed.contains("get_open_table_snapshot"),
             "dual-backend open-table projections must not look sqlite-only"
+        );
+        assert!(
+            !closed.contains("record_execution_evidence")
+                && !closed.contains("reject_evidence_submission")
+                && !closed.contains("validate_execution_evidence_envelope"),
+            "dual-backend execution evidence must not look sqlite-only"
         );
     }
 }

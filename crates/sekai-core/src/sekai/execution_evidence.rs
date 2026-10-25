@@ -484,7 +484,7 @@ impl SekaiDb {
     }
 }
 
-fn valid_transition(
+pub(crate) fn valid_transition(
     current: Option<&(String, i64, bool, String, String, String)>,
     source_sequence: i64,
     next: ExecutionLifecycleState,
@@ -516,7 +516,7 @@ fn valid_transition(
     }
 }
 
-fn conflict_alert(
+pub(crate) fn conflict_alert(
     report: &ExecutionEvidence,
     submission_id: &str,
     received_at_ms: i64,
