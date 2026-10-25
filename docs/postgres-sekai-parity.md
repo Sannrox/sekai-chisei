@@ -103,8 +103,10 @@ create a scratch database on.
 treat inventory “complete” as dual-backend for these RPCs) live in the
 shrink-only list
 [`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
-Execution-evidence reject and record helpers used by evidence admission stay
-SQLite-only until #1318 (`SekaiService.SubmitEvidence` on that list).
+Execution-evidence reject and record helpers used by evidence admission share
+SQLite and PostgreSQL persistence (#1318). `SekaiService.SubmitEvidence` is a
+dual-backend RPC; community PostgreSQL conformance remains an ignored
+isolated-database test behind `SEKAI_TEST_POSTGRES_URL`.
 Query-time ontology entailment on `RetrieveContext` / `ExpandRelations` runs
 on PostgreSQL too (#1320), with a shared case asserting the same results; see
 [rpc-maturity.md](rpc-maturity.md),

@@ -1,4 +1,5 @@
 use crate::db::postgres::PostgresDb;
+use crate::db::postgres_decision::insert_chained_decision;
 use crate::sekai::evidence::{
     DEFAULT_EVIDENCE_ENVELOPE_HEADROOM_BYTES, EvidenceEnvelope, EvidenceLifecycleState,
     EvidenceLimits, SchemaCompatibility,
@@ -10,6 +11,11 @@ use crate::sekai::evidence_store::{
     canonical_envelope_digest, intent_str, parse_classification, parse_intent,
     submission_is_admitted, validate_capability,
 };
+use crate::sekai::execution_evidence::{
+    EXECUTION_EVIDENCE_TYPE, ExecutionEvidence, ExecutionEvidenceAlert, conflict_alert,
+    valid_transition,
+};
+use crate::sekai::external_permit::Redemption;
 use crate::sekai::ontology::{
     Cardinality, OntologyClass, OntologyProperty, OntologyRegistry, OntologyRelation,
 };
@@ -1083,6 +1089,278 @@ impl PostgresDb {
             failure_code: None,
         })
     }
+
+    /// Convert an admitted but not yet projected submission into the normal
+    /// durable rejection outcome used by the evidence funnel.
+    pub fn reject_evidence_submission(
+        &self,
+        submission_id: &str,
+        now_ms: i64,
+        code: &str,
+        summary: &str,
+    ) -> Result<EvidenceAdmission, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 256))",
+            &[&submission_id],
+        )
+        .map_err(|error| error.to_string())?;
+        let state: String = tx
+            .query_one(
+                "SELECT lifecycle_state FROM sekai_evidence_submissions WHERE id=$1",
+                &[&submission_id],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if state != EvidenceLifecycleState::Authorized.as_str() {
+            return Err("only authorized unprojected evidence can be rejected".into());
+        }
+        tx.execute(
+            "DELETE FROM sekai_evidence_idempotency WHERE submission_id=$1",
+            &[&submission_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_evidence_source_identity WHERE submission_id=$1",
+            &[&submission_id],
+        )
+        .map_err(|error| error.to_string())?;
+        reject_existing(tx, submission_id, now_ms, code, summary)
+    }
+
+    /// Project one already-admitted Sekai envelope into the external-action
+    /// lifecycle. The source envelope remains the authoritative evidence.
+    pub fn record_execution_evidence(&self, submission_id: &str) -> Result<bool, String> {
+        let submission = self
+            .get_evidence_submission(submission_id)?
+            .ok_or_else(|| "execution evidence submission not found".to_string())?;
+        if submission.evidence_type != EXECUTION_EVIDENCE_TYPE {
+            return Ok(false);
+        }
+        if !submission.lifecycle_state.is_usable() {
+            return Err("execution evidence must be available before lifecycle projection".into());
+        }
+        let envelope = submission
+            .envelope
+            .ok_or_else(|| "execution evidence envelope is unavailable".to_string())?;
+        let report = self
+            .validate_execution_evidence_envelope(&envelope, &submission.producer_identity)?
+            .ok_or_else(|| "execution evidence envelope was not recognized".to_string())?;
+
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 258))",
+            &[&report.redemption_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 259))",
+            &[&submission_id],
+        )
+        .map_err(|error| error.to_string())?;
+        let existing_status: Option<String> = tx
+            .query_opt(
+                "SELECT projection_status FROM sekai_external_action_execution_evidence
+                 WHERE submission_id=$1",
+                &[&submission_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        if let Some(status) = existing_status {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(status == "projected");
+        }
+        let current = tx
+            .query_opt(
+                "SELECT lifecycle_state,source_sequence,terminal,
+                        source_type,source_instance,source_record_id
+                 FROM sekai_external_action_execution_state WHERE redemption_id=$1",
+                &[&report.redemption_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, i64>(1),
+                    row.get::<_, bool>(2),
+                    row.get::<_, String>(3),
+                    row.get::<_, String>(4),
+                    row.get::<_, String>(5),
+                )
+            });
+        let transition_ok = valid_transition(
+            current.as_ref(),
+            submission.source_sequence,
+            report.lifecycle_state,
+            &envelope.source_type,
+            &envelope.source_instance,
+            &envelope.source_record_id,
+        );
+        let json = serde_json::to_string(&report).map_err(|error| error.to_string())?;
+        let projection_status = if transition_ok {
+            "projected"
+        } else {
+            "conflict"
+        };
+        tx.execute(
+            "INSERT INTO sekai_external_action_execution_evidence
+             (submission_id,permit_id,redemption_id,execution_id,producer_identity,lifecycle_state,
+              source_sequence,content_digest,evidence_json,observed_at_ms,projection_status)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            &[
+                &submission_id,
+                &report.permit_id,
+                &report.redemption_id,
+                &report.execution_id,
+                &report.host_identity,
+                &report.lifecycle_state.as_str(),
+                &submission.source_sequence,
+                &submission.content_digest,
+                &json,
+                &report.observed_at_ms,
+                &projection_status,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        if !transition_ok {
+            let alert = conflict_alert(&report, submission_id, submission.received_at_ms);
+            insert_execution_alert(&mut tx, &alert)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        let terminal = report.lifecycle_state.is_terminal();
+        tx.execute(
+            "INSERT INTO sekai_external_action_execution_state
+             (redemption_id,execution_id,permit_id,source_type,source_instance,source_record_id,
+              lifecycle_state,source_sequence,terminal,updated_at_ms)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+             ON CONFLICT(redemption_id) DO UPDATE SET lifecycle_state=EXCLUDED.lifecycle_state,
+               source_sequence=EXCLUDED.source_sequence,terminal=EXCLUDED.terminal,
+               updated_at_ms=EXCLUDED.updated_at_ms",
+            &[
+                &report.redemption_id,
+                &report.execution_id,
+                &report.permit_id,
+                &envelope.source_type,
+                &envelope.source_instance,
+                &envelope.source_record_id,
+                &report.lifecycle_state.as_str(),
+                &submission.source_sequence,
+                &terminal,
+                &submission.received_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    pub fn validate_execution_evidence_envelope(
+        &self,
+        envelope: &EvidenceEnvelope,
+        authenticated_producer: &str,
+    ) -> Result<Option<ExecutionEvidence>, String> {
+        if envelope.evidence_type != EXECUTION_EVIDENCE_TYPE {
+            return Ok(None);
+        }
+        let report: ExecutionEvidence =
+            serde_json::from_value(envelope.content.clone()).map_err(|_| {
+                "execution evidence content does not match the registered schema".to_string()
+            })?;
+        report.validate()?;
+        if report.observed_at_ms != envelope.observed_at_ms {
+            return Err("execution evidence timestamp does not match its admitted envelope".into());
+        }
+        if envelope.source_record_id != report.redemption_id {
+            return Err("execution evidence source record does not match its redemption".into());
+        }
+        if report.host_identity != authenticated_producer {
+            return Err("execution evidence host attribution does not match its producer".into());
+        }
+        // Shared-plane community PostgreSQL has this table from 0017. Dest-pair
+        // SchemaPlane::Sekai does not; permit redeem stays on the Chisei plane
+        // until #1323. Do not CREATE chisei_* on Sekai (relocation fence).
+        let redemption_json: String = self
+            .connection()?
+            .query_opt(
+                "SELECT redemption_json FROM chisei_external_action_redemptions
+                 WHERE permit_id=$1 AND execution_id=$2",
+                &[&report.permit_id, &report.execution_id],
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "execution evidence does not reference a durable redemption".to_string()
+            })?
+            .get(0);
+        let redemption: Redemption =
+            serde_json::from_str(&redemption_json).map_err(|error| error.to_string())?;
+        if redemption.redemption_id != report.redemption_id {
+            return Err("execution evidence redemption binding changed".into());
+        }
+        if redemption.executor != authenticated_producer {
+            return Err("execution evidence producer did not redeem the referenced permit".into());
+        }
+        if report.observed_at_ms < redemption.redeemed_at_ms
+            || report
+                .started_at_ms
+                .is_some_and(|value| value < redemption.redeemed_at_ms)
+            || report
+                .finished_at_ms
+                .is_some_and(|value| value < redemption.redeemed_at_ms)
+        {
+            return Err("execution evidence predates permit redemption".into());
+        }
+        Ok(Some(report))
+    }
+}
+
+fn insert_execution_alert(
+    tx: &mut postgres::Transaction<'_>,
+    alert: &ExecutionEvidenceAlert,
+) -> Result<(), String> {
+    let inserted = tx
+        .execute(
+            "INSERT INTO sekai_external_action_execution_alerts
+             (alert_id,kind,permit_id,redemption_id,execution_id,observed_at_ms,summary)
+             VALUES($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (alert_id) DO NOTHING",
+            &[
+                &alert.alert_id,
+                &alert.kind,
+                &alert.permit_id,
+                &alert.redemption_id,
+                &alert.execution_id,
+                &alert.observed_at_ms,
+                &alert.summary,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if inserted == 1 {
+        insert_chained_decision(
+            tx,
+            &Decision {
+                id: format!("{}:audit", alert.alert_id),
+                timestamp: alert.observed_at_ms,
+                actor: "sekai:execution-reconciliation".into(),
+                action: "external_action_execution/alert".into(),
+                reason: alert.kind.clone(),
+                evidence: HashMap::from([
+                    ("permit_id".into(), alert.permit_id.clone()),
+                    ("redemption_id".into(), alert.redemption_id.clone()),
+                    ("execution_id".into(), alert.execution_id.clone()),
+                ]),
+                target_id: alert.execution_id.clone(),
+                outcome: "alert".into(),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn load_ontology_registry(tx: &mut postgres::Transaction<'_>) -> Result<OntologyRegistry, String> {

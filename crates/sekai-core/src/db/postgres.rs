@@ -192,6 +192,8 @@ const CONSUMER_VIOLATION_DELIVERIES_SCHEMA: &str =
     include_str!("postgres/0114_consumer_violation_deliveries.sql");
 const CATALOG_CRITICALITY_OUTBOX_SCHEMA: &str =
     include_str!("postgres/0115_catalog_criticality_outbox.sql");
+const EXECUTION_EVIDENCE_STATE_SCHEMA: &str =
+    include_str!("postgres/0116_execution_evidence_state.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -907,6 +909,12 @@ const MIGRATIONS: &[Migration] = &[
         114,
         "catalog_criticality_outbox",
         CATALOG_CRITICALITY_OUTBOX_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        115,
+        "execution_evidence_state",
+        EXECUTION_EVIDENCE_STATE_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2416,6 +2424,25 @@ mod tests {
             migration.statements(SchemaPlane::Shared),
             vec![CHISEI_USAGE_EVENTS_SCHEMA]
         );
+    }
+
+    #[test]
+    fn execution_evidence_state_migration_is_sekai_owned() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "execution_evidence_state")
+            .expect("execution_evidence_state");
+        assert!(matches!(migration.owner, MigrationOwner::Sekai));
+        assert!(
+            EXECUTION_EVIDENCE_STATE_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_external_action_execution_state")
+        );
+        assert!(
+            EXECUTION_EVIDENCE_STATE_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_external_action_execution_alerts")
+        );
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
     }
 
     #[test]

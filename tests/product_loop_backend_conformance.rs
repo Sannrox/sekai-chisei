@@ -14,7 +14,10 @@ use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use sekai_chisei::db::runtime_db::RuntimeDb;
 
 use sekai_chisei::grpc::client::connect_sekai;
 use sekai_chisei::grpc::pb::chisei::GetOperationReceiptRequest;
@@ -521,6 +524,10 @@ async fn exercise_product_loop(server: &LoopServer) {
 async fn sqlite_runs_the_product_loop() {
     let server = LoopServer::spawn(&Backend::Sqlite);
     exercise_product_loop(&server).await;
+    crate::evidence_backend_conformance::exercise_execution_recording(
+        &RuntimeDb::memory(),
+        "loop-sqlite",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -534,4 +541,9 @@ async fn postgres_runs_the_product_loop() {
         ca_cert: sekai.ca_cert.clone(),
     });
     exercise_product_loop(&server).await;
+    let exec = ScratchDatabase::create();
+    crate::evidence_backend_conformance::exercise_execution_recording(
+        &RuntimeDb::Postgres(Arc::new(exec.connect(8))),
+        "loop-postgres",
+    );
 }

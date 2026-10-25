@@ -2,7 +2,8 @@ use sekai_chisei::db::attestation::AttestationBackend;
 use sekai_chisei::db::evidence::EvidenceBackend;
 use sekai_chisei::db::graph::GraphBackend;
 use sekai_chisei::db::handoff::HandoffBackend;
-use sekai_chisei::db::postgres::PostgresDb;
+use sekai_chisei::db::postgres::{PostgresDb, off_runtime};
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::Object;
 use sekai_chisei::sekai::action::RiskClass;
@@ -16,10 +17,15 @@ use sekai_chisei::sekai::evidence::{
     EVIDENCE_ENVELOPE_VERSION, EvidenceClassification, EvidenceEnvelope, EvidenceIntent,
     EvidenceSignal, EvidenceTarget, SchemaCompatibility,
 };
+use sekai_chisei::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle;
 use sekai_chisei::sekai::evidence_store::{
     EvidenceProducerCapability, EvidenceSchemaDefinition, EvidenceSubmissionFilter,
     canonical_content_digest,
 };
+use sekai_chisei::sekai::execution_evidence::{
+    EXECUTION_EVIDENCE_SCHEMA, EXECUTION_EVIDENCE_TYPE, ExecutionEvidence, ExecutionLifecycleState,
+};
+use sekai_chisei::sekai::external_permit::{DEFAULT_SITE_ID, Redemption};
 use sekai_chisei::sekai::handoff::{HANDOFF_VERSION, HandoffManifest, HandoffReference};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -275,10 +281,317 @@ fn exercise_backend(
     exercise_attestation(attestations, prefix);
 }
 
+fn execution_producer(prefix: &str) -> EvidenceProducerCapability {
+    EvidenceProducerCapability {
+        producer_identity: format!("{prefix}:executor"),
+        config_version: 1,
+        source_types: vec!["host_executor".into()],
+        source_instances: vec![format!("{prefix}:instance")],
+        namespaces: vec![format!("{prefix}:ns")],
+        evidence_types: vec![EXECUTION_EVIDENCE_TYPE.into()],
+        target_kinds: vec!["action".into()],
+        classification_ceiling: EvidenceClassification::Internal,
+        allowed_intents: vec![EvidenceIntent::Upsert],
+        allow_operation_attachment: false,
+        replay_window_ms: 60_000,
+        max_clock_skew_ms: 60_000,
+        max_payload_bytes: 64 * 1024,
+        max_relationships: 8,
+        rate_limit_per_minute: 100,
+        max_retained_submissions: 100,
+        revoked: false,
+    }
+}
+
+fn execution_report(
+    prefix: &str,
+    state: ExecutionLifecycleState,
+    observed_at_ms: i64,
+) -> ExecutionEvidence {
+    ExecutionEvidence {
+        version: EXECUTION_EVIDENCE_SCHEMA.into(),
+        permit_id: format!("{prefix}:permit"),
+        redemption_id: format!("{prefix}:redemption"),
+        execution_id: format!("{prefix}:execution"),
+        host_identity: format!("{prefix}:executor"),
+        lifecycle_state: state,
+        observed_at_ms,
+        started_at_ms: (!matches!(state, ExecutionLifecycleState::Accepted)).then_some(1_200),
+        finished_at_ms: state.is_terminal().then_some(1_400),
+        enforced_preconditions: BTreeMap::new(),
+        normalized_effects: vec![],
+        affected_resource_references: vec![],
+        cost_micros: 0,
+        resource_use: BTreeMap::new(),
+        artifact_hashes: vec![],
+        exit_classification: String::new(),
+        error_classification: String::new(),
+        compensation_evidence_hashes: vec![],
+        host_schema_version: "host-evidence/v1".into(),
+        host_software_version: "executor/1.0".into(),
+    }
+}
+
+fn execution_envelope(report: &ExecutionEvidence, prefix: &str, sequence: i64) -> EvidenceEnvelope {
+    let content = serde_json::to_value(report).unwrap();
+    EvidenceEnvelope {
+        contract_version: EVIDENCE_ENVELOPE_VERSION.into(),
+        source_type: "host_executor".into(),
+        source_instance: format!("{prefix}:instance"),
+        source_record_id: report.redemption_id.clone(),
+        source_version: format!("state-{sequence}"),
+        source_sequence: sequence,
+        target: EvidenceTarget {
+            namespace: format!("{prefix}:ns"),
+            object_external_id: format!("{prefix}:action"),
+            object_kind: "action".into(),
+        },
+        evidence_type: EXECUTION_EVIDENCE_TYPE.into(),
+        signal: EvidenceSignal::Delivery,
+        schema_id: EXECUTION_EVIDENCE_SCHEMA.into(),
+        schema_version: EXECUTION_EVIDENCE_SCHEMA.into(),
+        schema_compatibility: SchemaCompatibility::Exact,
+        observed_at_ms: report.observed_at_ms,
+        collected_at_ms: report.observed_at_ms,
+        expires_at_ms: None,
+        content_digest: canonical_content_digest(&content).unwrap(),
+        content,
+        relationships: vec![],
+        producer_identity: report.host_identity.clone(),
+        confidence_bps: 8_000,
+        classification: EvidenceClassification::Internal,
+        provenance: BTreeMap::new(),
+        idempotency_key: format!("{}-{sequence}", report.redemption_id),
+        intent: EvidenceIntent::Upsert,
+        causality: None,
+    }
+}
+
+fn insert_redemption(db: &RuntimeDb, redemption: &Redemption) {
+    let json = serde_json::to_string(redemption).unwrap();
+    match db {
+        RuntimeDb::Sqlite(sqlite) => {
+            sqlite
+                .conn()
+                .execute(
+                    "INSERT INTO chisei_external_action_redemptions
+                     (permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,
+                      invocation_ordinal,redemption_id,evidence_due_at_ms)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    rusqlite::params![
+                        redemption.permit_id,
+                        redemption.idempotency_key,
+                        redemption.execution_id,
+                        json,
+                        redemption.redeemed_at_ms,
+                        redemption.invocation_ordinal,
+                        redemption.redemption_id,
+                        redemption.evidence_due_at_ms
+                    ],
+                )
+                .unwrap();
+        }
+        RuntimeDb::Postgres(pg) => {
+            let ordinal = i64::from(redemption.invocation_ordinal);
+            off_runtime(|| {
+                pg.connection()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO chisei_external_action_redemptions
+                     (permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,
+                      invocation_ordinal,redemption_id,evidence_due_at_ms)
+                     VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+                        &[
+                            &redemption.permit_id,
+                            &redemption.idempotency_key,
+                            &redemption.execution_id,
+                            &json,
+                            &redemption.redeemed_at_ms,
+                            &ordinal,
+                            &redemption.redemption_id,
+                            &redemption.evidence_due_at_ms,
+                        ],
+                    )
+                    .unwrap();
+            });
+        }
+    }
+}
+
+fn execution_state(db: &RuntimeDb, redemption_id: &str) -> String {
+    match db {
+        RuntimeDb::Sqlite(sqlite) => sqlite
+            .conn()
+            .query_row(
+                "SELECT lifecycle_state FROM sekai_external_action_execution_state
+                 WHERE redemption_id=?1",
+                [redemption_id],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        RuntimeDb::Postgres(pg) => off_runtime(|| {
+            pg.connection()
+                .unwrap()
+                .query_one(
+                    "SELECT lifecycle_state FROM sekai_external_action_execution_state
+                 WHERE redemption_id=$1",
+                    &[&redemption_id],
+                )
+                .unwrap()
+                .get(0)
+        }),
+    }
+}
+
+fn conflict_alert_count(db: &RuntimeDb, redemption_id: &str) -> i64 {
+    match db {
+        RuntimeDb::Sqlite(sqlite) => sqlite
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_external_action_execution_alerts
+                 WHERE kind='conflicting_execution_evidence' AND redemption_id=?1",
+                [redemption_id],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        RuntimeDb::Postgres(pg) => off_runtime(|| {
+            pg.connection()
+                .unwrap()
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM sekai_external_action_execution_alerts
+                 WHERE kind='conflicting_execution_evidence' AND redemption_id=$1",
+                    &[&redemption_id],
+                )
+                .unwrap()
+                .get(0)
+        }),
+    }
+}
+
+/// Admit, reject invalid host identity, record Accepted→Started→OutcomeUnknown,
+/// idempotent re-record, conflict after terminal, and resolve on both backends.
+/// Shared/memory RuntimeDb only: dest-pair SchemaPlane::Sekai has no
+/// `chisei_external_action_redemptions` until permit redeem is dual-backend (#1323).
+pub(crate) fn exercise_execution_recording(db: &RuntimeDb, prefix: &str) {
+    let producer = execution_producer(prefix);
+    db.create_object(&Object {
+        id: format!("{prefix}:action-object"),
+        kind: "action".into(),
+        name: "action".into(),
+        namespace: format!("{prefix}:ns"),
+        external_id: format!("{prefix}:action"),
+        properties: HashMap::new(),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    db.upsert_evidence_producer(&producer, 1_000).unwrap();
+    db.register_evidence_schema(
+        &EvidenceSchemaDefinition {
+            schema_id: EXECUTION_EVIDENCE_SCHEMA.into(),
+            schema_version: EXECUTION_EVIDENCE_SCHEMA.into(),
+            evidence_type: EXECUTION_EVIDENCE_TYPE.into(),
+            compatible_versions: vec![],
+        },
+        1_000,
+    )
+    .unwrap();
+    let redemption = Redemption {
+        version: "external-action.redemption/v1".into(),
+        permit_id: format!("{prefix}:permit"),
+        redemption_id: format!("{prefix}:redemption"),
+        executor: producer.producer_identity.clone(),
+        execution_id: format!("{prefix}:execution"),
+        idempotency_key: format!("{prefix}:redeem"),
+        redeemed_at_ms: 1_000,
+        invocation_ordinal: 1,
+        evidence_due_at_ms: 2_000,
+        site_id: DEFAULT_SITE_ID.into(),
+    };
+    insert_redemption(db, &redemption);
+
+    let lifecycle = EvidenceAdmissionLifecycle::new(db);
+    let mut invalid = execution_report(prefix, ExecutionLifecycleState::Accepted, 1_500);
+    invalid.host_identity = format!("{prefix}:other");
+    let mut invalid = execution_envelope(&invalid, prefix, 10);
+    invalid.producer_identity = producer.producer_identity.clone();
+    let rejected = lifecycle
+        .admit(
+            &invalid,
+            &producer.producer_identity,
+            invalid.observed_at_ms,
+        )
+        .unwrap();
+    assert!(!rejected.admitted);
+    assert!(!rejected.execution_recorded);
+    assert_eq!(rejected.submission.lifecycle_state.as_str(), "rejected");
+
+    for (sequence, state) in [
+        (1, ExecutionLifecycleState::Accepted),
+        (2, ExecutionLifecycleState::Started),
+        (3, ExecutionLifecycleState::OutcomeUnknown),
+    ] {
+        let report = execution_report(prefix, state, 1_500 + sequence);
+        let envelope = execution_envelope(&report, prefix, sequence);
+        let admitted = lifecycle
+            .admit(
+                &envelope,
+                &producer.producer_identity,
+                report.observed_at_ms,
+            )
+            .unwrap();
+        assert!(admitted.admitted);
+        assert!(admitted.execution_recorded);
+        assert!(
+            admitted
+                .projection
+                .as_ref()
+                .is_some_and(|value| value.projected)
+        );
+        assert_eq!(admitted.submission.lifecycle_state.as_str(), "available");
+        assert!(
+            db.record_execution_evidence(&admitted.submission.id)
+                .unwrap()
+        );
+        let resolved = db
+            .get_evidence_submission(&admitted.submission.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.id, admitted.submission.id);
+        assert_eq!(resolved.lifecycle_state.as_str(), "available");
+    }
+    assert_eq!(
+        execution_state(db, &redemption.redemption_id),
+        "outcome_unknown"
+    );
+
+    let conflict = execution_report(prefix, ExecutionLifecycleState::Failed, 1_600);
+    let conflict = execution_envelope(&conflict, prefix, 4);
+    let admitted = lifecycle
+        .admit(
+            &conflict,
+            &producer.producer_identity,
+            conflict.observed_at_ms,
+        )
+        .unwrap();
+    assert!(admitted.admitted);
+    assert!(!admitted.execution_recorded);
+    assert!(
+        !db.record_execution_evidence(&admitted.submission.id)
+            .unwrap()
+    );
+    assert_eq!(conflict_alert_count(db, &redemption.redemption_id), 1);
+    assert_eq!(
+        execution_state(db, &redemption.redemption_id),
+        "outcome_unknown"
+    );
+}
+
 #[test]
 fn sqlite_evidence_conformance() {
     let db = SekaiDb::new(":memory:").unwrap();
     exercise_backend(&db, &db, &db, &db, "sqlite");
+    exercise_execution_recording(&RuntimeDb::memory(), "sqlite-exec");
 }
 
 fn postgres_test_database() -> PostgresDb {
@@ -299,6 +612,8 @@ fn postgres_evidence_conformance() {
     let db = postgres_test_database();
     let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
     exercise_backend(&db, &db, &db, &db, &prefix);
+    let exec_prefix = format!("pg-exec-{}", uuid::Uuid::new_v4().simple());
+    exercise_execution_recording(&RuntimeDb::Postgres(Arc::new(db)), &exec_prefix);
 }
 
 #[test]
