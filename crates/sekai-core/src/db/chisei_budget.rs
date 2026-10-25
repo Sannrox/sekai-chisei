@@ -1126,6 +1126,10 @@ pub trait ChiseiBudgetBackend: Send + Sync {
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<bool, String>;
+    fn budget_limits_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<(String, String, i64, String)>, String>;
 }
 
 macro_rules! forward_budget {
@@ -1189,6 +1193,12 @@ macro_rules! forward_budget {
                 idempotency_key,
                 now_ms,
             )
+        }
+        fn budget_limits_for_scope(
+            &self,
+            scope_id: &str,
+        ) -> Result<Vec<(String, String, i64, String)>, String> {
+            <$target>::budget_limits_for_scope(self, scope_id)
         }
     };
 }

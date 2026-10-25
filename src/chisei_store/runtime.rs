@@ -1930,10 +1930,17 @@ impl ChiseiRuntimeDb for RuntimeDb {
                 host_site_id,
                 timing,
             ),
-            Self::Postgres(_) => Err(
-                "redeem_or_reconcile_permit is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.redeem_or_reconcile_permit(
+                    permit,
+                    context,
+                    trusted_key,
+                    idempotency_key,
+                    execution_id,
+                    host_site_id,
+                    timing,
+                )
+            }),
         }
     }
 
@@ -2550,9 +2557,9 @@ impl ChiseiRuntimeDb for RuntimeDb {
     fn put_delegated_permit(&self, permit: &Permit, issued_by: &str) -> Result<Permit, String> {
         match self {
             Self::Sqlite(db) => db.put_delegated_permit(permit, issued_by),
-            Self::Postgres(_) => Err(
-                "put_delegated_permit is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_delegated_permit(permit, issued_by))
+            }
         }
     }
 
@@ -2648,9 +2655,9 @@ impl ChiseiRuntimeDb for RuntimeDb {
     ) -> Result<Option<Redemption>, String> {
         match self {
             Self::Sqlite(db) => db.replay_redemption(permit, idempotency_key, execution_id),
-            Self::Postgres(_) => {
-                Err("replay_redemption is unavailable on the PostgreSQL community runtime".into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.replay_redemption(permit, idempotency_key, execution_id)
+            }),
         }
     }
 
@@ -2713,29 +2720,27 @@ impl ChiseiRuntimeDb for RuntimeDb {
     fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.validate_delegation_chain(permit),
-            Self::Postgres(_) => Err(
-                "validate_delegation_chain is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.validate_delegation_chain(permit))
+            }
         }
     }
 
     fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.validate_permit_for_delegation(permit),
-            Self::Postgres(_) => Err(
-                "validate_permit_for_delegation is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.validate_permit_for_delegation(permit))
+            }
         }
     }
 
     fn validate_permit_state(&self, permit: &Permit) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.validate_permit_state(permit),
-            Self::Postgres(_) => Err(
-                "validate_permit_state is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.validate_permit_state(permit))
+            }
         }
     }
 
@@ -2775,9 +2780,17 @@ impl ChiseiRuntimeDb for RuntimeDb {
                 host_site_id,
                 now_ms,
             ),
-            Self::Postgres(_) => {
-                Err("redeem_permit is unavailable on the PostgreSQL community runtime".into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.redeem_permit(
+                    permit,
+                    context,
+                    trusted_key,
+                    idempotency_key,
+                    execution_id,
+                    host_site_id,
+                    now_ms,
+                )
+            }),
         }
     }
 }

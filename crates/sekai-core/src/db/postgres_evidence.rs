@@ -1283,9 +1283,10 @@ impl PostgresDb {
         if report.host_identity != authenticated_producer {
             return Err("execution evidence host attribution does not match its producer".into());
         }
-        // Shared-plane community PostgreSQL has this table from 0017. Dest-pair
-        // SchemaPlane::Sekai does not; permit redeem stays on the Chisei plane
-        // until #1323. Do not CREATE chisei_* on Sekai (relocation fence).
+        // Shared-plane RuntimeDb has this table from 0017, matching SQLite.
+        // Dest-pair SchemaPlane::Sekai does not (relocation fence). Redeem
+        // persists on the Chisei dest; this same-store lookup is the shared
+        // conformance binding. Do not CREATE chisei_* on Sekai.
         let redemption_json: String = self
             .connection()?
             .query_opt(

@@ -348,13 +348,11 @@ version, validity window, nonce, and online-redemption mode. Hosts must verify
 the configured issuer and key, every binding, their advertised enforcement
 capabilities, and current resource preconditions immediately before execution.
 
-Online redemption consumes an invocation in the same SQLite transaction that
-records its audit decision. Community PostgreSQL fails closed on
-`redeem_permit` / `redeem_or_reconcile_permit` until dual-backend redeem
-parity lands; hosts that need online redeem should use SQLite (or an enterprise
-backend that implements redeem). Request, permit, redemption, and execution IDs
-stay distinct, and an idempotency key makes an ambiguous retry return the
-original redemption. Revocation and action/executor/harness/namespace/signing-key
+Online redemption consumes an invocation in the same store transaction that
+records its audit decision. Community PostgreSQL persists redeem, reconcile,
+and delegation-chain validation with the SQLite path. Request, permit,
+redemption, and execution IDs stay distinct, and an idempotency key makes an
+ambiguous retry return the original redemption. Revocation and action/executor/harness/namespace/signing-key
 kill switches stop future redemption without removing issuance or redemption
 history. They cannot undo an effect that already started. The control plane
 does not claim exactly-once external effects: redemption proves consumed
