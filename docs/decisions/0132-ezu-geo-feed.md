@@ -6,7 +6,7 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/1797 (#1797)
 - Supersedes: none
 - Superseded by: none
-- Related: [ADR 0121](0121-fence-event-bindings.md), #1798
+- Related: [ADR 0121](0121-fence-event-bindings.md), #1565, #1798
 
 ## Context
 
