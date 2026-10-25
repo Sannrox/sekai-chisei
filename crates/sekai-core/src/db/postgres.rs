@@ -194,6 +194,7 @@ const CATALOG_CRITICALITY_OUTBOX_SCHEMA: &str =
     include_str!("postgres/0115_catalog_criticality_outbox.sql");
 const EXECUTION_EVIDENCE_STATE_SCHEMA: &str =
     include_str!("postgres/0116_execution_evidence_state.sql");
+const EZU_GEO_FEEDS_SCHEMA: &str = include_str!("postgres/0117_ezu_geo_feeds.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -915,6 +916,12 @@ const MIGRATIONS: &[Migration] = &[
         115,
         "execution_evidence_state",
         EXECUTION_EVIDENCE_STATE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        116,
+        "ezu_geo_feeds",
+        EZU_GEO_FEEDS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

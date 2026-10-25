@@ -29,6 +29,8 @@ mod definition_consumer_impact;
 mod embedding_spec_rpc;
 #[path = "explain_value_rpc.rs"]
 mod explain_value_rpc;
+#[path = "ezu_geo_feed.rs"]
+mod ezu_geo_feed;
 #[path = "fence_binding.rs"]
 mod fence_binding;
 #[path = "graph_explore_rpc.rs"]
@@ -1186,6 +1188,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<RunFenceBindingRequest>,
     ) -> Result<Response<RunFenceBindingResponse>, Status> {
         self.run_fence_binding_once(req).await
+    }
+
+    async fn put_ezu_geo_feed(
+        &self,
+        req: Request<PutEzuGeoFeedRequest>,
+    ) -> Result<Response<PutEzuGeoFeedResponse>, Status> {
+        self.put_ezu_geo_feed_definition(req).await
+    }
+
+    async fn run_ezu_geo_feed(
+        &self,
+        req: Request<RunEzuGeoFeedRequest>,
+    ) -> Result<Response<RunEzuGeoFeedResponse>, Status> {
+        self.run_ezu_geo_feed_once(req).await
     }
 
     async fn describe_object_action(

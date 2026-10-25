@@ -83,6 +83,7 @@ pub mod postgres_document;
 pub mod postgres_embedding_index;
 pub mod postgres_event_stream;
 pub mod postgres_evidence;
+pub mod postgres_ezu_geo_feed;
 pub mod postgres_federation;
 pub mod postgres_fence_binding;
 pub mod postgres_function;

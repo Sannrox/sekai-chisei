@@ -91,7 +91,9 @@ pub fn parse_geospatial_value(raw: &str) -> Result<GeospatialValue, String> {
     parse_geospatial_value_json(raw, true)
 }
 
-fn parse_stored_geospatial_value(raw: &str) -> Option<GeospatialValue> {
+/// Parse a stored `sekai.geospatial-value/v1` property. None when the value
+/// is not an admitted geometry.
+pub fn stored_geospatial_value(raw: &str) -> Option<GeospatialValue> {
     parse_geospatial_value_json(raw, false).ok()
 }
 
@@ -262,7 +264,7 @@ pub fn parse_geospatial_query(
 }
 
 pub fn evaluate_geospatial_match(stored: &str, query: &GeospatialQuery) -> bool {
-    let Some(value) = parse_stored_geospatial_value(stored) else {
+    let Some(value) = stored_geospatial_value(stored) else {
         return false;
     };
     match query.operator {
