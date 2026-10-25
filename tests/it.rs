@@ -157,6 +157,7 @@ const SEPARATE_TARGETS: &[&str] = &[
     "chisei_runtime_db_ratchet",
     "db_signals",
     "dedup_signals",
+    "deploy_kubernetes_manifest",
     "emit_git_version",
     "epistemic_replication_example",
     "evidence_adapters",
@@ -419,5 +420,5 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
         );
     }
     assert_eq!(GROUPED_MODULES.len(), 141);
-    assert_eq!(SEPARATE_TARGETS.len(), 21);
+    assert_eq!(SEPARATE_TARGETS.len(), 22);
 }
