@@ -2681,6 +2681,7 @@ mod tests {
             "RunGovernedTransform",
             "RunGovernedTransformOnBranch",
             "ReplayGovernedTransform",
+            "ShadowGovernedTransform",
         ] {
             assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
         }

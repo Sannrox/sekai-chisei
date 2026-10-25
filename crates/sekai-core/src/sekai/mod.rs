@@ -41,6 +41,7 @@ pub mod export_fingerprint;
 pub use sekai_types::dataset_branch;
 pub use sekai_types::dataset_version;
 pub use sekai_types::transform_replay;
+pub use sekai_types::transform_shadow;
 pub mod decision_ledger;
 pub use sekai_types::receipt_chain;
 pub mod deduplication;

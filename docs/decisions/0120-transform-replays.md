@@ -77,3 +77,18 @@ marking would raise the output's is refused, and sample rows are only shown
 to callers who may read both sides. Replay records have no retention of their
 own; branches are deleted by operators as ADR 0119 describes. Replaying
 actions or agent turns is out of scope.
+
+## Amendment 2026-10-25
+
+#1795 adds shadow runs. A shadow is one candidate replay per run of the
+active revision, pinned to that run's receipt `input_versions` and diffed
+against the output version the run wrote, so both sides read the same
+inputs. A run that writes its output records the output's latest version
+in its own transaction, beside its finish (`output_version_id`;
+PostgreSQL `0119_transform_run_output_version`), so the link needs no
+timestamps; runs from before it are skipped. An input the candidate adds
+is pinned to the version written before the run was admitted. A
+replay record now also keeps that baseline digest in the receipt's scheme
+(`baseline_output_digest`; empty on older records). Shadows run on
+request, never on a schedule or trigger, which keeps compute visible and
+under the quota gate. The summed report is returned, not stored.

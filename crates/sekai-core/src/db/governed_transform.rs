@@ -196,6 +196,10 @@ impl SekaiDb {
              ADD COLUMN input_versions TEXT NOT NULL DEFAULT '{}'",
             [],
         );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_transform_run_finish ADD COLUMN output_version_id TEXT",
+            [],
+        );
         self.conn()
             .execute_batch(
                 "
@@ -734,6 +738,47 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|error| error.to_string())
+    }
+
+    /// The output version the run left, when it wrote its output (#1795).
+    pub fn transform_run_output_version(&self, run_id: &str) -> Result<Option<String>, String> {
+        self.conn()
+            .query_row(
+                "SELECT output_version_id FROM sekai_transform_run_finish WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(|error| error.to_string())
+    }
+
+    /// The newest runs of one transform, newest first.
+    pub fn list_runs_of_governed_transform(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TransformRun>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
+                        last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
+                        lineage_parent, created_at_ms, markings_in, markings_out,
+                        profile, engine, runtime_image, dispatch_status, trigger_cause, trigger_ref,
+                        input_partitions, output_partitions, input_versions
+                 FROM sekai_governed_transform_run
+                 WHERE namespace = ?1 AND transform_id = ?2
+                 ORDER BY created_at_ms DESC, run_id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace, transform_id, limit], map_transform_run)
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
     }
 
     /// Why the run was refused, when it was (#1701).
@@ -1599,6 +1644,7 @@ fn run_governed_transform_tx(
     )
     .map_err(|error| error.to_string())?;
     record_in_process_finish(tx, &run.run_id, started)?;
+    record_run_output_version(tx, &run.run_id, &transform.output_dataset_id)?;
     after_run_committed_tx(tx, &transform, &run, now_ms)?;
     persist_transform_usage_pending_tx(tx, &run.run_id, tenant_id, now_ms)?;
     Ok(run)
@@ -2180,6 +2226,7 @@ fn write_transform_run_tx(
     persist_transform_run(tx, &run)?;
     let compute_ms = compute_since_claim(tx, &run.run_id, now_ms)?;
     record_run_finish(tx, &run.run_id, now_ms, compute_ms)?;
+    record_run_output_version(tx, &run.run_id, &transform.output_dataset_id)?;
     tx.execute(
         "INSERT OR REPLACE INTO sekai_governed_transform_checkpoint
          (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
@@ -2777,6 +2824,25 @@ fn record_run_finish(
             finished_at_ms = excluded.finished_at_ms,
             compute_ms = excluded.compute_ms",
         params![run_id, finished_at_ms, compute_ms],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Records the output version a run that wrote its output left (#1795): the
+/// output's latest version, read in the run's transaction after the write,
+/// so it is the run's own. A shadow diffs against it.
+fn record_run_output_version(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    output_dataset_id: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE sekai_transform_run_finish SET output_version_id = (
+            SELECT version_id FROM sekai_dataset_versions
+            WHERE dataset_id = ?2 ORDER BY seq DESC LIMIT 1)
+         WHERE run_id = ?1",
+        params![run_id, output_dataset_id],
     )
     .map(|_| ())
     .map_err(|error| error.to_string())

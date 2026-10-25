@@ -1728,6 +1728,12 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetTransformReplayResponse>, Status> {
         rpc_data::get_transform_replay(self, req).await
     }
+    async fn shadow_governed_transform(
+        &self,
+        req: Request<ShadowGovernedTransformRequest>,
+    ) -> Result<Response<ShadowGovernedTransformResponse>, Status> {
+        rpc_data::shadow_governed_transform(self, req).await
+    }
     async fn rollback_dataset(
         &self,
         req: Request<RollbackDatasetRequest>,

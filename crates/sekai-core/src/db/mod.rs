@@ -55,6 +55,7 @@ pub mod receipt_chain;
 pub mod source_batch_recovery;
 pub mod sync_scope;
 pub mod transform_replay;
+pub mod transform_shadow;
 #[cfg(any(test, feature = "gateway-test-support"))]
 pub use postgres::ScratchDatabase;
 pub use postgres::off_runtime;

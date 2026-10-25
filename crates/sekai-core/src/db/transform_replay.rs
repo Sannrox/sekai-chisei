@@ -113,6 +113,10 @@ impl RuntimeDb {
                     &partition_keys,
                     rows,
                 ),
+                baseline_output_digest: crate::sekai::governed_transform::dataset_digest(
+                    &partition_keys,
+                    baseline,
+                ),
                 diff: transform_replay::diff_replay(baseline, rows, &key),
                 downstream: downstream.clone(),
                 actor: request.actor.clone(),
