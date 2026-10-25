@@ -1,7 +1,9 @@
 # Chisei PostgreSQL parity
 
 This note closes the Chisei governed-decision and execution PostgreSQL parity
-track (#237). Community PostgreSQL runtime selection is activated by #238.
+track (#237) and the equal-PostgreSQL epic (#1328). Community PostgreSQL
+runtime selection is activated by #238. PostgreSQL is a first-class community
+backend.
 
 ## Outcome
 
@@ -49,18 +51,29 @@ named in
 | Eval / portfolio / policy / gateway audit harnesses | Dual harnesses for existing methods |
 | External-action authorization and permits | PostgreSQL methods + harnesses |
 | Kioku learning lifecycle | PostgreSQL methods + harnesses |
-| Inventory complete capability | This closeout |
+| Inventory complete capability | Parent closeout |
+| Permit redeem, reconcile, and delegation (#1323) | Dual-backend approvals path |
+| Equal-PostgreSQL epic (#1328) | First-class community backend closeout |
 
 ## Still outside this track
 
 - Tenant state, OIDC, and OAuth
 - Host-local permit verification crypto (`verify_for_executor`) — never a
   control-plane dual-backend claim
+- `put_operation_receipt_with_kioku_holdouts` (PlanExecution receipt persist
+  with Kioku holdouts) still fail-closes on PostgreSQL; it is a Chisei store
+  helper, not a shrink-only public RPC
+- Dest-pair `reconcile_missing_execution_evidence` cannot join the Sekai and
+  Chisei stores on one connection and stays fail-closed on PostgreSQL
 
 ## Operator posture
 
-SQLite remains the default community backend. Combined PostgreSQL opens
-`SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
-A single `DATABASE_URL` is retired and refuses boot. Use that dest-pair for dual-backend budget
-reserve/usage, limit projection, policy, execution, Kioku, permit redeem/reconcile, and gateway
-governance (see [configuration.md](configuration.md) and #238).
+SQLite remains the default community backend. PostgreSQL is a first-class
+community choice. Combined PostgreSQL opens `SEKAI_DATABASE_URL` +
+`CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`. A single
+`DATABASE_URL` is retired and refuses boot. Use that dest-pair for
+dual-backend budget reserve/usage, limit projection, policy, execution,
+Kioku, permit redeem/reconcile, and gateway governance (see
+[configuration.md](configuration.md) and #238). Remaining shrink-only admin
+projections (`admin.data-quality`, `admin.learning-change`) fail closed on
+PostgreSQL.

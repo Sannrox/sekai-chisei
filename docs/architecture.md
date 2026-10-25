@@ -398,11 +398,11 @@ definitions, function definitions, generation-fenced leases and guarded object
 mutations, team-namespace bootstrap, principal credentials, coordination and
 work admission, external evidence admission and
 projection, policy attestations, handoffs, retention, scoped content, and
-reconciliation. Known community Postgres fail-closed exceptions include query-time ontology
-entailment,
-governed documents and renditions,
-and (on the Chisei side)
-online permit redeem — see the parity guides.
+reconciliation. Remaining community PostgreSQL fail-closed surfaces are the
+shrink-only list
+[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json)
+(experimental ontology deletes and named admin projections), not the product
+loop. See the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
 RPC to shared backend evidence or an explicit computed/query implementation

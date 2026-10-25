@@ -1,9 +1,10 @@
 # Reusable Sekai PostgreSQL parity
 
-This note closes the parent reusable-Sekai PostgreSQL parity track. Community
-PostgreSQL runtime selection is activated by #238.
+This note closes the parent reusable-Sekai PostgreSQL parity track and the
+equal-PostgreSQL epic (#1328). Community PostgreSQL runtime selection is
+activated by #238.
 [ADR 0080](decisions/0080-dual-community-runtime-storage.md) keeps SQLite as
-the local default and PostgreSQL as the optional community backend.
+the local default and PostgreSQL as a first-class community backend.
 
 ## Outcome
 
@@ -34,8 +35,9 @@ The reusable `sekai.object-security` surface shares immutable policy
 revisions, exact replay, complete atomic activation, and SQL-enforced direct
 read/list predicates across SQLite and PostgreSQL. Purpose authorizations and
 classification lattices (#1321) share the same storage semantics, and a read
-a lattice or a missing purpose denies is denied on both. Normal CI runs SQLite;
-PostgreSQL conformance remains an ignored isolated-database test.
+a lattice or a missing purpose denies is denied on both. Local `cargo test`
+runs SQLite; PostgreSQL conformance runs on every pull request and stays
+`#[ignore]` locally behind `SEKAI_TEST_POSTGRES_URL`.
 `sekai.geospatial-query/v1` is a computed query on that authorized list:
 both backends share the same in-process evaluator after property grants.
 `sekai.source-health/v1` is a computed projection of authorized
@@ -99,14 +101,14 @@ drives the loop through the shipped binary on both backends; the PostgreSQL
 case is ignored and needs `SEKAI_TEST_POSTGRES_URL` for a server the test may
 create a scratch database on.
 
-**Known SQLite-only public paths** (community Postgres fails closed; do not
-treat inventory “complete” as dual-backend for these RPCs) live in the
-shrink-only list
+**Remaining SQLite-only paths** after #1328 (community PostgreSQL fails
+closed; do not treat inventory “complete” as dual-backend for these) live in
+the shrink-only list
 [`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
-Execution-evidence reject and record helpers used by evidence admission share
-SQLite and PostgreSQL persistence (#1318). `SekaiService.SubmitEvidence` is a
-dual-backend RPC; community PostgreSQL conformance remains an ignored
-isolated-database test behind `SEKAI_TEST_POSTGRES_URL`.
+They are experimental ontology deletes and named admin projections, not the
+product loop. Execution-evidence reject and record helpers used by evidence
+admission share SQLite and PostgreSQL persistence (#1318).
+`SekaiService.SubmitEvidence` is a dual-backend RPC.
 Query-time ontology entailment on `RetrieveContext` / `ExpandRelations` runs
 on PostgreSQL too (#1320), with a shared case asserting the same results; see
 [rpc-maturity.md](rpc-maturity.md),
@@ -154,6 +156,14 @@ Evidence is checked in as:
 | #1477 | Versioned client packages |
 | #1478 | Capability-package certifications |
 | #1479 | Governed images and open-table projections |
+| #1316 | Backend support evidence and PostgreSQL conformance on every pull request |
+| #1318 | Execution-evidence rejection and recording |
+| #1319 | Action bindings |
+| #1320 | Entailment retrieval, dataset rows, and one retention path |
+| #1321 | Purpose authorizations and classification lattices |
+| #1322 | Source-webhook key pins and source-type descriptors |
+| #1325 | Governed documents |
+| #1328 | Equal-PostgreSQL closeout: first-class community backend, not partial |
 
 ## Still outside this parent
 
@@ -161,17 +171,23 @@ Evidence is checked in as:
   `docs/postgres-chisei-parity.md`
 - Community PostgreSQL runtime activation (#238) — complete; select with `SEKAI_DB_BACKEND=postgres`
 - Tenant state, tenant RPCs, OIDC, and OAuth
+- Dest-pair `reconcile_missing_execution_evidence` cannot join the Sekai and
+  Chisei stores on one connection and stays fail-closed on PostgreSQL; see
+  the Chisei parity note for PlanExecution receipt holdouts
 
 ## Operator posture
 
-SQLite remains the default community backend. Combined PostgreSQL opens
-`SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
-A single `DATABASE_URL` is retired and refuses boot. Use that dest-pair when you need shared
-multi-replica authority for the dual-backend surfaces above (see
-[configuration.md](configuration.md) and #238). Prefer SQLite when you need
-the SQLite-only paths listed under Outcome.
+SQLite remains the default community backend. PostgreSQL is a first-class
+community choice: Combined PostgreSQL opens `SEKAI_DATABASE_URL` +
+`CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`. A single
+`DATABASE_URL` is retired and refuses boot. Use that dest-pair when you need
+shared multi-replica authority for the dual-backend surfaces above (see
+[configuration.md](configuration.md) and #238). Remaining shrink-only
+surfaces fail closed on PostgreSQL.
 
-Normal CI exercises the object-sync contract against SQLite. Run the ignored
+Every pull request runs PostgreSQL conformance
+(`.github/workflows/postgres-conformance.yml`). Local `cargo test` still
+exercises the object-sync contract against SQLite. Run the ignored
 PostgreSQL conformance and concurrent exact-replay fixtures with an isolated TLS
 database:
 

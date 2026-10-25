@@ -23,8 +23,8 @@ durable-state resolution.
 
 Producer adapters own caller authentication and protocol translation. The gRPC
 adapter also refreshes its process-local grant cache from the lifecycle outcome.
-PostgreSQL community rejection and execution recording remain explicitly
-unsupported rather than implying backend parity.
+Community SQLite and PostgreSQL share rejection and execution recording
+(#1318).
 
 ## Ontology definition
 

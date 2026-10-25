@@ -22,6 +22,28 @@ fn sqlite_only_list_projects_the_real_backend_column() {
 }
 
 #[test]
+fn product_docs_do_not_call_postgres_partial() {
+    let readme = include_str!("../README.md");
+    let context = include_str!("../CONTEXT.md");
+    let architecture = include_str!("../docs/architecture.md");
+    let configuration = include_str!("../docs/configuration.md");
+    for (name, body) in [
+        ("README.md", readme),
+        ("CONTEXT.md", context),
+        ("docs/architecture.md", architecture),
+        ("docs/configuration.md", configuration),
+        ("docs/postgres-sekai-parity.md", SEKAI_PARITY),
+        ("docs/postgres-chisei-parity.md", CHISEI_PARITY),
+    ] {
+        let lower = body.to_ascii_lowercase();
+        assert!(
+            !lower.contains("partial community backend"),
+            "{name} must not describe PostgreSQL as a partial community backend"
+        );
+    }
+}
+
+#[test]
 fn postgres_conformance_runs_on_every_pull_request() {
     let workflow = include_str!("../.github/workflows/postgres-conformance.yml");
     assert!(

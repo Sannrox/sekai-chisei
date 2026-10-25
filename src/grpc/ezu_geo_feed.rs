@@ -1,14 +1,24 @@
-//! Install and run a fenced incremental Ezu geo feed (#1797).
+//! Install and run a fenced incremental Ezu geo feed (#1797) and GeoArrow
+//! backfill (#1798).
 
 use super::action_binding::load_bound_objects;
 use super::fence_binding::EZU_URL_ENV;
 use super::*;
 use crate::sekai::ezu_geo_feed::{
     EzuEntity, EzuField, EzuGeoFeed, EzuGeometry, FEED_RUN_LEASE_MS, FeedSkip, entity_for,
-    expire_entity, feed_lag_ms, keep_whole_mutations, mutation_kind_for_feed, valid_ezu_name,
+    entity_ts_ms, expire_entity, feed_lag_ms, keep_whole_mutations, mutation_kind_for_feed,
+    valid_ezu_name,
 };
+use arrow_array::builder::{BinaryBuilder, Int64Builder, StringBuilder};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_flight::FlightClient;
+use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 const FEED_UNAVAILABLE: &str = "ezu geo feed unavailable";
 const EZU_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -85,6 +95,210 @@ impl EzuEntitySink for EzuHttp {
                 .await
                 .map_err(|_| Status::unavailable("Ezu answered an unreadable upsert"))?;
             outcome_from_json(&body)
+        }
+    }
+}
+
+/// Bulk GeoArrow ingest over Arrow Flight (`DoPut`).
+pub(crate) trait EzuBulkSink {
+    fn put_batch(
+        &self,
+        token: &str,
+        entities: Vec<EzuEntity>,
+    ) -> impl Future<Output = Result<EzuBulkOutcome, Status>> + Send;
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct EzuBulkOutcome {
+    pub inserted: u32,
+    pub updated: u32,
+    pub stale: u32,
+}
+
+/// Outcome counts Ezu returns in each `PutResult.app_metadata`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FlightPutCounts {
+    pub inserted: u64,
+    pub updated: u64,
+    pub stale: u64,
+    pub refused: u64,
+    #[serde(default)]
+    pub first_refusal: Option<String>,
+}
+
+const GEOARROW_EXTENSION: &str = "geoarrow.wkb";
+const GEOARROW_METADATA: &str = r#"{"crs":"OGC:CRS84"}"#;
+const WKB_POINT: u32 = 1;
+const WKB_POLYGON: u32 = 3;
+
+fn geoarrow_schema() -> Schema {
+    let geometry = Field::new("geometry", DataType::Binary, false).with_metadata(HashMap::from([
+        (
+            "ARROW:extension:name".to_string(),
+            GEOARROW_EXTENSION.to_string(),
+        ),
+        (
+            "ARROW:extension:metadata".to_string(),
+            GEOARROW_METADATA.to_string(),
+        ),
+    ]));
+    Schema::new(vec![
+        Field::new("collection", DataType::Utf8, false),
+        Field::new("id", DataType::Utf8, false),
+        geometry,
+        Field::new("ts_ms", DataType::Int64, false),
+        Field::new("speed", DataType::Float64, true),
+        Field::new("heading", DataType::Float64, true),
+        Field::new("ttl_ms", DataType::Int64, true),
+        Field::new("fields", DataType::Utf8, false),
+        Field::new("labels", DataType::Utf8, false),
+    ])
+}
+
+fn geometry_to_wkb(geometry: &EzuGeometry) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(1);
+    match geometry {
+        EzuGeometry::Point { lon, lat } => {
+            out.extend_from_slice(&WKB_POINT.to_le_bytes());
+            out.extend_from_slice(&lon.to_le_bytes());
+            out.extend_from_slice(&lat.to_le_bytes());
+        }
+        EzuGeometry::Polygon { ring } => {
+            out.extend_from_slice(&WKB_POLYGON.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+            for (lon, lat) in ring {
+                out.extend_from_slice(&lon.to_le_bytes());
+                out.extend_from_slice(&lat.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+fn fields_json(fields: &std::collections::BTreeMap<String, EzuField>) -> String {
+    let object: serde_json::Map<String, serde_json::Value> = fields
+        .iter()
+        .map(|(name, value)| {
+            let value = match value {
+                EzuField::Bool(v) => serde_json::Value::Bool(*v),
+                EzuField::Int(v) => serde_json::Value::from(*v),
+                EzuField::Float(v) => serde_json::Number::from_f64(*v)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number),
+                EzuField::Text(v) => serde_json::Value::String(v.clone()),
+            };
+            (name.clone(), value)
+        })
+        .collect();
+    serde_json::Value::Object(object).to_string()
+}
+
+/// `Channel::from_shared` leaves `tls: None`. HTTPS Ezu URLs need native
+/// roots or the Flight put fails while incremental HTTP still works.
+fn ezu_flight_endpoint(base_url: String) -> Result<Endpoint, Status> {
+    let mut endpoint = Channel::from_shared(base_url)
+        .map_err(|_| Status::failed_precondition("Ezu is not configured"))?
+        .connect_timeout(EZU_WRITE_TIMEOUT)
+        .timeout(EZU_WRITE_TIMEOUT);
+    if endpoint.uri().scheme_str() == Some("https") {
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|_| Status::internal("Ezu client unavailable"))?;
+    }
+    Ok(endpoint)
+}
+
+fn geoarrow_batch(entities: &[EzuEntity]) -> Result<RecordBatch, String> {
+    let mut collection = StringBuilder::new();
+    let mut id = StringBuilder::new();
+    let mut geometry = BinaryBuilder::new();
+    let mut ts = Int64Builder::new();
+    let mut ttl = Int64Builder::new();
+    let mut fields = StringBuilder::new();
+    let mut labels = StringBuilder::new();
+    for entity in entities {
+        collection.append_value(&entity.collection);
+        id.append_value(&entity.id);
+        geometry.append_value(geometry_to_wkb(&entity.geometry));
+        ts.append_value(entity.ts_ms);
+        ttl.append_option(entity.ttl_ms);
+        fields.append_value(fields_json(&entity.fields));
+        labels.append_value("[]");
+    }
+    let n = entities.len();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(collection.finish()),
+        Arc::new(id.finish()),
+        Arc::new(geometry.finish()),
+        Arc::new(ts.finish()),
+        Arc::new(arrow_array::Float64Array::from(vec![None; n])),
+        Arc::new(arrow_array::Float64Array::from(vec![None; n])),
+        Arc::new(ttl.finish()),
+        Arc::new(fields.finish()),
+        Arc::new(labels.finish()),
+    ];
+    RecordBatch::try_new(Arc::new(geoarrow_schema()), columns).map_err(|error| error.to_string())
+}
+
+impl EzuBulkSink for EzuHttp {
+    fn put_batch(
+        &self,
+        token: &str,
+        entities: Vec<EzuEntity>,
+    ) -> impl Future<Output = Result<EzuBulkOutcome, Status>> + Send {
+        let base_url = self.base_url.clone();
+        let token = token.to_string();
+        async move {
+            if entities.is_empty() {
+                return Ok(EzuBulkOutcome::default());
+            }
+            let batch = geoarrow_batch(&entities)
+                .map_err(|_| Status::internal("Ezu client unavailable"))?;
+            let channel = ezu_flight_endpoint(base_url)?
+                .connect()
+                .await
+                .map_err(|_| Status::unavailable("Ezu unavailable"))?;
+            let mut client = FlightClient::new(channel);
+            client
+                .add_header("authorization", &format!("Bearer {token}"))
+                .map_err(|_| Status::internal("Ezu client unavailable"))?;
+            let data = FlightDataEncoderBuilder::new()
+                .with_schema(Arc::new(geoarrow_schema()))
+                .build(futures::stream::iter([Ok::<
+                    _,
+                    arrow_flight::error::FlightError,
+                >(batch)]));
+            // Endpoint::timeout ends when response headers arrive; bound the
+            // DoPut body and PutResult stream so a stall still raises the fence.
+            let put = async {
+                client
+                    .do_put(data)
+                    .await
+                    .map_err(|_| Status::unavailable("Ezu unavailable"))?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(|_| Status::unavailable("Ezu unavailable"))
+            };
+            let results = tokio::time::timeout(EZU_WRITE_TIMEOUT, put)
+                .await
+                .map_err(|_| Status::unavailable("Ezu unavailable"))??;
+            let mut outcome = EzuBulkOutcome::default();
+            for result in results {
+                let counts: FlightPutCounts = serde_json::from_slice(&result.app_metadata)
+                    .map_err(|_| Status::unavailable("Ezu answered an unreadable upsert"))?;
+                if counts.refused > 0 {
+                    return Err(Status::failed_precondition(
+                        counts
+                            .first_refusal
+                            .unwrap_or_else(|| "Ezu refused the entity write".into()),
+                    ));
+                }
+                outcome.inserted += counts.inserted as u32;
+                outcome.updated += counts.updated as u32;
+                outcome.stale += counts.stale as u32;
+            }
+            Ok(outcome)
         }
     }
 }
@@ -455,6 +669,233 @@ impl SekaiServiceImpl {
         }
         result
     }
+
+    pub(super) async fn backfill_ezu_geo_feed_once(
+        &self,
+        req: Request<BackfillEzuGeoFeedRequest>,
+    ) -> Result<Response<BackfillEzuGeoFeedResponse>, Status> {
+        self.backfill_ezu_geo_feed_with(req, &EzuHttp::from_env()?)
+            .await
+    }
+
+    /// Captures a namespace watermark, bulk-upserts one page of live objects
+    /// through GeoArrow Flight, then either continues the page or hands the
+    /// incremental cursor to that watermark.
+    pub(super) async fn backfill_ezu_geo_feed_with(
+        &self,
+        req: Request<BackfillEzuGeoFeedRequest>,
+        sink: &impl EzuBulkSink,
+    ) -> Result<Response<BackfillEzuGeoFeedResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let input = req.into_inner();
+        let (feed, _) = self
+            .db
+            .runtime()
+            .get_ezu_geo_feed(input.namespace.trim(), input.feed_id.trim())
+            .map_err(map_feed_store_error)?
+            .ok_or_else(|| Status::not_found(FEED_UNAVAILABLE))?;
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &feed.namespace,
+            true,
+        )?;
+        let caller_runs_feed = principals.iter().any(|principal| principal == &feed.run_as);
+        if !caller_runs_feed
+            && authorize_source_type_namespace_admin(self, &principals, &feed.namespace).is_err()
+        {
+            return Err(Status::permission_denied(FEED_UNAVAILABLE));
+        }
+        if !feed.enabled {
+            return Err(Status::failed_precondition("ezu geo feed is disabled"));
+        }
+        let tenant = crate::sekai::write_freeze::acting_or_registered_tenant(
+            self.db.runtime(),
+            "",
+            &feed.run_as,
+        )
+        .map_err(Status::internal)?
+        .into_owned();
+        recheck_feed_run_as(self, &feed, &tenant)?;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let now = now_millis();
+        if !self
+            .db
+            .runtime()
+            .lease_ezu_geo_feed_run(&feed, &run_id, false, now, now + FEED_RUN_LEASE_MS)
+            .map_err(map_feed_store_error)?
+        {
+            return Err(Status::aborted(
+                "another run of this ezu geo feed is in progress",
+            ));
+        }
+        let (feed, _) = match self
+            .db
+            .runtime()
+            .get_ezu_geo_feed(&feed.namespace, &feed.feed_id)
+            .map_err(map_feed_store_error)?
+        {
+            Some((current, cursor)) if current.revision == feed.revision => (current, cursor),
+            _ => {
+                let _ = self.db.runtime().release_ezu_geo_feed_run(&feed, &run_id);
+                return Err(Status::aborted(
+                    "ezu geo feed changed during the run; run again",
+                ));
+            }
+        };
+        let result: Result<Response<BackfillEzuGeoFeedResponse>, Status> = async {
+            let token = self.ezu_token(&tenant, &feed.run_as)?;
+            let progress = self
+                .db
+                .runtime()
+                .begin_ezu_geo_feed_backfill(&feed, &run_id, now_millis())
+                .map_err(map_feed_store_error)?
+                .ok_or_else(|| Status::aborted("ezu geo feed changed during the run; run again"))?;
+            let limit = feed.backfill_per_run();
+            let now = now_millis();
+            if !self
+                .db
+                .runtime()
+                .lease_ezu_geo_feed_run(&feed, &run_id, true, now, now + FEED_RUN_LEASE_MS)
+                .map_err(map_feed_store_error)?
+            {
+                return Err(Status::aborted(
+                    "ezu geo feed changed during the run; run again",
+                ));
+            }
+            recheck_feed_run_as(self, &feed, &tenant)?;
+            let page = self
+                .db
+                .runtime()
+                .list_ezu_geo_feed_objects(
+                    &feed.namespace,
+                    &feed.object_kind,
+                    &progress.backfill_after_id,
+                    limit,
+                )
+                .map_err(map_feed_store_error)?;
+            let more = page.len() as u32 >= limit;
+            let schema = self
+                .db
+                .runtime()
+                .get_object_type(&feed.object_kind)
+                .map_err(map_feed_store_error)?;
+            let mut property_keys: HashSet<String> = feed.filter_fields.iter().cloned().collect();
+            property_keys.insert(feed.geo_property.clone());
+            let ids: Vec<String> = page.iter().map(|object| object.id.clone()).collect();
+            let visible = load_bound_objects(
+                self,
+                &feed.namespace,
+                &feed.object_kind,
+                &ids,
+                std::slice::from_ref(&feed.run_as),
+                &property_keys,
+            )?;
+            let visible_by_id: HashMap<&str, &domain::Object> = visible
+                .iter()
+                .map(|object| (object.id.as_str(), object))
+                .collect();
+            let ts_ms_seq = i64::try_from(progress.backfill_watermark).unwrap_or(i64::MAX);
+            let mut entities = Vec::new();
+            let mut rejected_geometries = 0u32;
+            let mut errors = 0u32;
+            for object in &page {
+                let Some(visible) = visible_by_id.get(object.id.as_str()) else {
+                    continue;
+                };
+                match entity_for(&feed, visible, schema.as_ref(), ts_ms_seq) {
+                    Ok(mut entity) => {
+                        entity.ts_ms = entity_ts_ms(&feed, ts_ms_seq);
+                        entities.push(entity);
+                    }
+                    Err(FeedSkip::MissingGeo) => {}
+                    Err(FeedSkip::RejectedGeometry) => {
+                        rejected_geometries += 1;
+                        metrics::counter!(
+                            "sekai_ezu_geo_feed_rejected_geometries",
+                            "namespace" => feed.namespace.clone(),
+                            "feed" => feed.feed_id.clone()
+                        )
+                        .increment(1);
+                    }
+                    Err(FeedSkip::InvalidName) => {
+                        errors += 1;
+                        metrics::counter!(
+                            "sekai_ezu_geo_feed_errors",
+                            "namespace" => feed.namespace.clone(),
+                            "feed" => feed.feed_id.clone()
+                        )
+                        .increment(1);
+                    }
+                }
+            }
+            let outcome = sink.put_batch(&token, entities).await?;
+            let writes = outcome.inserted + outcome.updated + outcome.stale;
+            if more {
+                let last_id = page.last().map(|object| object.id.as_str()).unwrap_or("");
+                if !last_id.is_empty()
+                    && !self
+                        .db
+                        .runtime()
+                        .advance_ezu_geo_feed_backfill(&feed, &run_id, last_id, now_millis())
+                        .map_err(map_feed_store_error)?
+                {
+                    return Err(Status::aborted(
+                        "ezu geo feed changed during the run; run again",
+                    ));
+                }
+            } else if !self
+                .db
+                .runtime()
+                .complete_ezu_geo_feed_backfill(&feed, &run_id, now_millis())
+                .map_err(map_feed_store_error)?
+            {
+                return Err(Status::aborted(
+                    "ezu geo feed changed during the run; run again",
+                ));
+            }
+            let through_seq = if more {
+                progress.after_seq
+            } else {
+                progress.after_seq.max(progress.backfill_watermark)
+            };
+            Ok(Response::new(BackfillEzuGeoFeedResponse {
+                feed_revision: feed.revision,
+                through_seq,
+                writes,
+                rejected_geometries,
+                errors,
+                more,
+                backfill_watermark: progress.backfill_watermark,
+            }))
+        }
+        .await;
+        let mut release = true;
+        if result.is_err() {
+            match self
+                .db
+                .runtime()
+                .raise_ezu_geo_feed_write_fence(&feed, &run_id)
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "ezu geo feed write fence not raised after a failed backfill"
+                    );
+                    release = false;
+                }
+            }
+        }
+        if release {
+            if let Err(error) = self.db.runtime().release_ezu_geo_feed_run(&feed, &run_id) {
+                tracing::warn!(error = %error, "ezu geo feed run lease not released");
+            }
+        }
+        result
+    }
 }
 
 enum Apply {
@@ -574,7 +1015,7 @@ mod tests {
     use super::*;
     use crate::sekai::ezu_geo_feed::EZU_GEO_FEED_CONTRACT;
     use crate::sekai::object_schema::{ObjectType, PropertyDef, PropertyType};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
     use tonic::metadata::MetadataValue;
 
@@ -624,6 +1065,52 @@ mod tests {
                     token: token.into(),
                     entity,
                 });
+            }
+            std::future::ready(Ok(outcome))
+        }
+    }
+
+    impl EzuBulkSink for FakeEzu {
+        fn put_batch(
+            &self,
+            token: &str,
+            entities: Vec<EzuEntity>,
+        ) -> impl Future<Output = Result<EzuBulkOutcome, Status>> + Send {
+            assert_eq!(
+                token, self.token,
+                "feed must not write with another tenant token"
+            );
+            let mut outcome = EzuBulkOutcome::default();
+            let mut writes = self.writes.lock().unwrap();
+            for entity in entities {
+                let written = writes
+                    .iter()
+                    .rev()
+                    .find(|stored| {
+                        stored.token == token
+                            && stored.entity.collection == entity.collection
+                            && stored.entity.id == entity.id
+                    })
+                    .map(|stored| {
+                        if stored.entity.ts_ms > entity.ts_ms {
+                            EzuWriteOutcome::Stale
+                        } else {
+                            EzuWriteOutcome::Updated
+                        }
+                    })
+                    .unwrap_or(EzuWriteOutcome::Inserted);
+                match written {
+                    EzuWriteOutcome::Inserted => outcome.inserted += 1,
+                    EzuWriteOutcome::Updated => outcome.updated += 1,
+                    EzuWriteOutcome::Stale => outcome.stale += 1,
+                    EzuWriteOutcome::Refused => {}
+                }
+                if written != EzuWriteOutcome::Stale {
+                    writes.push(Stored {
+                        token: token.into(),
+                        entity,
+                    });
+                }
             }
             std::future::ready(Ok(outcome))
         }
@@ -1265,6 +1752,301 @@ mod tests {
             assert_eq!(run.deletes, 1);
             assert_eq!(last_entity(&ezu.inner, "t1").ttl_ms, None);
             assert_eq!(last_entity(&ezu.inner, "t2").ttl_ms, Some(1));
+        });
+    }
+
+    fn backfill_request() -> Request<BackfillEzuGeoFeedRequest> {
+        let mut request = Request::new(BackfillEzuGeoFeedRequest {
+            namespace: "fleet".into(),
+            feed_id: "trucks".into(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("local"));
+        request
+    }
+
+    fn live_ids(ezu: &FakeEzu) -> BTreeSet<String> {
+        let writes = ezu.writes.lock().unwrap();
+        let mut live = BTreeMap::new();
+        for stored in writes.iter() {
+            live.insert(stored.entity.id.clone(), stored.entity.clone());
+        }
+        live.into_iter()
+            .filter(|(_, entity)| entity.ttl_ms.is_none())
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn backfill_then_edits_match_a_clean_rebuild_and_keep_the_handoff() {
+        crate::provider_credentials::with_test_env("EZU_TOKEN", "ezu-fleet-token", || {
+            let (db, svc) = setup();
+            db.create_object_with_audit(&truck("t1", BERLIN, "idle", "", 10), "local")
+                .unwrap();
+            db.create_object_with_audit(&truck("t2", PARIS, "moving", "", 11), "local")
+                .unwrap();
+            let ezu = FakeEzu {
+                token: "ezu-fleet-token".into(),
+                writes: Mutex::default(),
+            };
+            let first = block_on(svc.backfill_ezu_geo_feed_with(backfill_request(), &ezu))
+                .unwrap()
+                .into_inner();
+            assert!(!first.more);
+            assert_eq!(first.writes, 2);
+            assert!(first.backfill_watermark > 0);
+            assert_eq!(first.through_seq, first.backfill_watermark);
+            db.update_object_with_audit(&truck("t1", PARIS, "moving", "", 20), "local")
+                .unwrap();
+            db.create_object_with_audit(&truck("t3", BERLIN, "idle", "", 21), "local")
+                .unwrap();
+            db.delete_object_with_audit("t2", "local").unwrap();
+            let incremental = block_on(svc.run_ezu_geo_feed_with(run_request(), &ezu))
+                .unwrap()
+                .into_inner();
+            assert_eq!(incremental.writes, 2);
+            assert_eq!(incremental.deletes, 1);
+            let after_edits = live_ids(&ezu);
+            assert_eq!(after_edits, BTreeSet::from(["t1".into(), "t3".into()]));
+            assert_eq!(
+                last_entity(&ezu, "t1").geometry,
+                EzuGeometry::Point {
+                    lon: 2.3522,
+                    lat: 48.8566
+                }
+            );
+
+            let rebuilt = FakeEzu {
+                token: "ezu-fleet-token".into(),
+                writes: Mutex::default(),
+            };
+            let rebuild = block_on(svc.backfill_ezu_geo_feed_with(backfill_request(), &rebuilt))
+                .unwrap()
+                .into_inner();
+            assert!(!rebuild.more);
+            assert_eq!(rebuild.writes, 2);
+            assert_eq!(live_ids(&rebuilt), after_edits);
+            assert_eq!(
+                last_entity(&rebuilt, "t1").geometry,
+                last_entity(&ezu, "t1").geometry
+            );
+        });
+    }
+
+    #[test]
+    fn a_change_during_backfill_is_not_lost_at_handoff() {
+        crate::provider_credentials::with_test_env("EZU_TOKEN", "ezu-fleet-token", || {
+            let (db, svc) = setup();
+            db.put_ezu_geo_feed(
+                &EzuGeoFeed {
+                    contract_version: EZU_GEO_FEED_CONTRACT.into(),
+                    feed_id: "trucks".into(),
+                    namespace: "fleet".into(),
+                    object_kind: "truck".into(),
+                    geo_property: "location".into(),
+                    collection: "trucks".into(),
+                    filter_fields: vec!["status".into()],
+                    run_as: "svc-geo".into(),
+                    max_changes_per_run: 1,
+                    enabled: true,
+                    revision: 0,
+                    write_fence: 0,
+                    created_by: String::new(),
+                    updated_at_ms: 0,
+                },
+                "local",
+                3,
+            )
+            .unwrap();
+            db.create_object_with_audit(&truck("t1", BERLIN, "idle", "", 10), "local")
+                .unwrap();
+            db.create_object_with_audit(&truck("t2", PARIS, "idle", "", 11), "local")
+                .unwrap();
+            let ezu = FakeEzu {
+                token: "ezu-fleet-token".into(),
+                writes: Mutex::default(),
+            };
+            let first = block_on(svc.backfill_ezu_geo_feed_with(backfill_request(), &ezu))
+                .unwrap()
+                .into_inner();
+            assert!(first.more);
+            assert_eq!(first.writes, 1);
+            assert_eq!(first.through_seq, 0);
+            db.create_object_with_audit(&truck("t3", BERLIN, "idle", "", 12), "local")
+                .unwrap();
+            let second = block_on(svc.backfill_ezu_geo_feed_with(backfill_request(), &ezu))
+                .unwrap()
+                .into_inner();
+            assert!(second.more || second.through_seq == first.backfill_watermark);
+            let mut more = second.more;
+            while more {
+                let page = block_on(svc.backfill_ezu_geo_feed_with(backfill_request(), &ezu))
+                    .unwrap()
+                    .into_inner();
+                more = page.more;
+                if !more {
+                    assert_eq!(page.through_seq, first.backfill_watermark);
+                }
+            }
+            let caught = block_on(svc.run_ezu_geo_feed_with(run_request(), &ezu))
+                .unwrap()
+                .into_inner();
+            assert!(caught.writes >= 1);
+            assert!(live_ids(&ezu).contains("t3"));
+        });
+    }
+
+    #[test]
+    fn geoarrow_batches_use_ezu_flight_schema() {
+        let entity = crate::sekai::ezu_geo_feed::entity_for(
+            &EzuGeoFeed {
+                contract_version: EZU_GEO_FEED_CONTRACT.into(),
+                feed_id: "trucks".into(),
+                namespace: "fleet".into(),
+                object_kind: "truck".into(),
+                geo_property: "location".into(),
+                collection: "trucks".into(),
+                filter_fields: vec!["status".into()],
+                run_as: "svc-geo".into(),
+                max_changes_per_run: 0,
+                enabled: true,
+                revision: 1,
+                write_fence: 0,
+                created_by: String::new(),
+                updated_at_ms: 0,
+            },
+            &truck("t1", BERLIN, "idle", "", 10),
+            None,
+            4,
+        )
+        .unwrap();
+        let batch = geoarrow_batch(&[entity]).unwrap();
+        let schema = batch.schema();
+        let names: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "collection",
+                "id",
+                "geometry",
+                "ts_ms",
+                "speed",
+                "heading",
+                "ttl_ms",
+                "fields",
+                "labels"
+            ]
+        );
+        let geometry = schema.field_with_name("geometry").unwrap();
+        assert_eq!(
+            geometry
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some(GEOARROW_EXTENSION)
+        );
+        assert_eq!(
+            geometry
+                .metadata()
+                .get("ARROW:extension:metadata")
+                .map(String::as_str),
+            Some(GEOARROW_METADATA)
+        );
+        let wkb = geometry_to_wkb(&EzuGeometry::Point {
+            lon: 13.405,
+            lat: 52.52,
+        });
+        assert_eq!(wkb[0], 1);
+        assert_eq!(&wkb[1..5], &1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn https_flight_endpoints_enable_tls() {
+        let https = ezu_flight_endpoint("https://ezu.example".into()).unwrap();
+        assert_eq!(https.uri().scheme_str(), Some("https"));
+        let http = ezu_flight_endpoint("http://127.0.0.1:8080".into()).unwrap();
+        assert_eq!(http.uri().scheme_str(), Some("http"));
+    }
+
+    #[test]
+    fn a_failed_backfill_put_does_not_advance_the_page() {
+        crate::provider_credentials::with_test_env("EZU_TOKEN", "ezu-fleet-token", || {
+            let (db, svc) = setup();
+            db.create_object_with_audit(&truck("t1", BERLIN, "idle", "", 10), "local")
+                .unwrap();
+            struct FailBulk;
+            impl EzuBulkSink for FailBulk {
+                fn put_batch(
+                    &self,
+                    _token: &str,
+                    _entities: Vec<EzuEntity>,
+                ) -> impl Future<Output = Result<EzuBulkOutcome, Status>> + Send {
+                    std::future::ready(Err(Status::unavailable("Ezu unavailable")))
+                }
+            }
+            let refused = block_on(svc.backfill_ezu_geo_feed_with(backfill_request(), &FailBulk))
+                .unwrap_err();
+            assert_eq!(refused.code(), tonic::Code::Unavailable);
+            let progress = db
+                .get_ezu_geo_feed_progress("fleet", "trucks")
+                .unwrap()
+                .unwrap();
+            assert!(progress.backfill_active);
+            assert!(progress.backfill_after_id.is_empty());
+            assert_eq!(progress.after_seq, 0);
+            let (feed, _) = db.get_ezu_geo_feed("fleet", "trucks").unwrap().unwrap();
+            assert!(feed.write_fence > 0);
+        });
+    }
+
+    #[test]
+    fn backfill_skips_missing_geo_and_rejected_geometry() {
+        crate::provider_credentials::with_test_env("EZU_TOKEN", "ezu-fleet-token", || {
+            let (db, svc) = setup();
+            db.create_object_with_audit(&truck("t1", BERLIN, "idle", "", 10), "local")
+                .unwrap();
+            db.create_object_with_audit(&truck("t2", "", "idle", "", 11), "local")
+                .unwrap();
+            db.create_object_with_audit(
+                &truck("t3", r#"{"type":"not-geo"}"#, "idle", "", 12),
+                "local",
+            )
+            .unwrap();
+            let ezu = FakeEzu {
+                token: "ezu-fleet-token".into(),
+                writes: Mutex::default(),
+            };
+            let page = block_on(svc.backfill_ezu_geo_feed_with(backfill_request(), &ezu))
+                .unwrap()
+                .into_inner();
+            assert!(!page.more);
+            assert_eq!(page.writes, 1);
+            assert_eq!(page.rejected_geometries, 1);
+            assert_eq!(live_ids(&ezu), BTreeSet::from(["t1".into()]));
+        });
+    }
+
+    #[test]
+    fn a_held_incremental_run_blocks_backfill() {
+        crate::provider_credentials::with_test_env("EZU_TOKEN", "ezu-fleet-token", || {
+            let (db, svc) = setup();
+            let (feed, _) = db.get_ezu_geo_feed("fleet", "trucks").unwrap().unwrap();
+            assert!(
+                db.lease_ezu_geo_feed_run(&feed, "held", false, 1, i64::MAX)
+                    .unwrap()
+            );
+            let ezu = FakeEzu {
+                token: "ezu-fleet-token".into(),
+                writes: Mutex::default(),
+            };
+            let refused =
+                block_on(svc.backfill_ezu_geo_feed_with(backfill_request(), &ezu)).unwrap_err();
+            assert_eq!(refused.code(), tonic::Code::Aborted);
         });
     }
 }

@@ -183,11 +183,10 @@ Definitions without an ACL entry follow the existing world-readable ACL
 default. Once grants exist for a definition, list operations omit it for
 unauthorized principals. Mutations require ontology, schema, or definition
 administration and append a decision to the tamper-evident audit ledger in the
-same transaction as the definition change. On the community SQLite runtime that
-transaction is local SQLite; on community PostgreSQL the public audited
-mutation RPCs fail closed until dual-backend audit parity lands (see
-[architecture.md](architecture.md#persistence) and
-[postgres-sekai-parity.md](postgres-sekai-parity.md)).
+same transaction as the definition change. Community SQLite and PostgreSQL
+share that audited create and apply path. Experimental
+`DeleteOntologyClass` and `DeleteOntologyRelation` stay on the shrink-only
+SQLite-only list (see [postgres-sekai-parity.md](postgres-sekai-parity.md)).
 
 ## Semantic reads
 

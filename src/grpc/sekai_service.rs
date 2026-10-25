@@ -1204,6 +1204,13 @@ impl SekaiService for SekaiServiceImpl {
         self.run_ezu_geo_feed_once(req).await
     }
 
+    async fn backfill_ezu_geo_feed(
+        &self,
+        req: Request<BackfillEzuGeoFeedRequest>,
+    ) -> Result<Response<BackfillEzuGeoFeedResponse>, Status> {
+        self.backfill_ezu_geo_feed_once(req).await
+    }
+
     async fn describe_object_action(
         &self,
         req: Request<DescribeObjectActionRequest>,

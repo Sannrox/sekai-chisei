@@ -154,3 +154,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0130: Data leaves the plane only through a governed export](0130-governed-export.md)
 - [ADR 0131: Watermarked exports carry an export-keyed fingerprint](0131-watermarked-export.md)
 - [ADR 0132: Fenced incremental feed of object geo changes into Ezu](0132-ezu-geo-feed.md)
+- [ADR 0133: GeoArrow backfill for the Ezu geo feed](0133-ezu-geo-feed-backfill.md)

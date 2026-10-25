@@ -76,7 +76,7 @@ lives in the separate [research index](research/README.md).
 - [Governed geospatial queries](geospatial-queries.md) — authorized spatial
   comparison of named property claims after property grants.
 - [Fenced Ezu geo feed](ezu-geo-feed.md) — incremental object geo changes
-  into Ezu under a run lease and durable cursor.
+  and GeoArrow backfill into Ezu under a run lease and durable cursor.
 - [Governed transforms](governed-transforms.md) — in-process dataset JobSpec,
   run receipt, Console, and `sekaictl admin transform`.
 - [Team operations](team-operations.md) — namespace bootstrap and operator
@@ -88,8 +88,8 @@ lives in the separate [research index](research/README.md).
 - [Replica conformance adapter](replica-conformance.md) — bounded callable
   shared-state checks for composed local test harnesses.
 - [PostgreSQL parity: Sekai](postgres-sekai-parity.md) and
-  [Chisei](postgres-chisei-parity.md) — supported dual-backend surfaces and
-  SQLite-only exceptions.
+  [Chisei](postgres-chisei-parity.md) — dual-backend surfaces and the remaining
+  shrink-only SQLite-only list.
 
 ## Graph, ontology, and retrieval
 
