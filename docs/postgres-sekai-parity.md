@@ -129,7 +129,7 @@ Evidence is checked in as:
 | `tests/fixtures/sekai_rpc_inventory/v1.json` | Fail-closed map of every `SekaiService` RPC to evidence |
 | `tests/fixtures/runtime_backend/postgres-sekai-complete-v1.json` | Complete reusable Sekai capability advertisement |
 | `tests/*_backend_conformance.rs` and related harnesses | Shared SQLite/PostgreSQL surface fixtures |
-| `src/db/sekai_rpc_inventory.rs` | Inventory load/validation and complete-capability helper |
+| `crates/sekai-core/src/db/sekai_rpc_inventory.rs` | Inventory load/validation and complete-capability helper |
 
 ## Delivery slices
 

@@ -30,7 +30,7 @@ The inventory covers the consecutive external-action methods in
 [`chisei_service.rs`](../../src/grpc/chisei_service.rs), SQLite permit storage
 in [`external_permit.rs`](../../src/chisei/external_permit.rs), PostgreSQL
 storage in
-[`postgres_external_permit.rs`](../../src/db/postgres_external_permit.rs), and
+[`postgres_external_permit.rs`](../../src/chisei_store/postgres_external_permit.rs), and
 the checked-in
 [`chisei.rpc-inventory/v1`](../../tests/fixtures/chisei_rpc_inventory/v1.json).
 

@@ -33,7 +33,7 @@ projections are the shrink-only list
 | --- | --- |
 | `tests/fixtures/chisei_rpc_inventory/v1.json` | Fail-closed map of every Chisei/LLM RPC |
 | `tests/fixtures/runtime_backend/postgres-chisei-complete-v1.json` | Complete Chisei capability advertisement |
-| `src/db/chisei_rpc_inventory.rs` | Inventory validation and capability helper |
+| `crates/sekai-core/src/db/chisei_rpc_inventory.rs` | Inventory validation and capability helper |
 | `tests/chisei_*_backend_conformance.rs` | Shared SQLite/PostgreSQL harnesses |
 
 `complete_chisei_surfaces` lists surfaces with dual-backend *storage* evidence

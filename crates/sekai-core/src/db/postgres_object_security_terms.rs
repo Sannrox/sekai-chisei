@@ -1,6 +1,6 @@
 //! PostgreSQL storage for purpose authorizations (ADR 0031) and
 //! classification lattices (ADR 0032). Same tables and semantics as SQLite
-//! (`src/db/object_security.rs`): an authorization id is written once and
+//! (`crates/sekai-core/src/db/object_security.rs`): an authorization id is written once and
 //! revoked once, and a namespace keeps one current lattice.
 
 use crate::db::object_security::verify_stored_lattice;

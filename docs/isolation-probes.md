@@ -38,7 +38,7 @@ The target guard is the safety boundary and fails closed:
   with the variable unset or empty, every target is refused;
 - both tenants must be synthetic: their namespace boundaries, read with each
   tenant's own credential, carry `synthetic = true` (see synthetic tenants in
-  `src/sekai/synthetic.rs`). A real tenant is refused;
+  `crates/sekai-core/src/sekai/synthetic.rs`). A real tenant is refused;
 - the probed object must exist in the foreign tenant, read as that tenant, so
   a stale id cannot pass for a denial;
 - the advisory directory must be owner-only, checked before any probe runs.

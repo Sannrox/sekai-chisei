@@ -1,5 +1,5 @@
 //! PostgreSQL storage for object-change Action bindings (ADR 0090). Same
-//! table and semantics as SQLite (`src/sekai/action_binding.rs`). Installs
+//! table and semantics as SQLite (`crates/sekai-core/src/sekai/action_binding.rs`). Installs
 //! serialize on a per-binding advisory lock so concurrent reinstalls each get
 //! their own revision; the cursor write is conditional on the revision, so it
 //! needs none.

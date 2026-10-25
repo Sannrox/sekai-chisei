@@ -1,5 +1,5 @@
 //! PostgreSQL storage for fence bindings (ADR 0121). Same tables and
-//! semantics as SQLite (`src/sekai/fence_binding.rs`). Installs serialize on
+//! semantics as SQLite (`crates/sekai-core/src/sekai/fence_binding.rs`). Installs serialize on
 //! a per-binding advisory lock so concurrent reinstalls each get their own
 //! revision; the cursor write is conditional, so it needs none.
 
