@@ -76,8 +76,8 @@ tenant token and run-lease rules.
 
 ## Consequences
 
-Geo in Ezu is an explicit, opt-in install. Backfill is a later slice
-(#1798). Device position ingest and geo queries inside Chisei stay out.
+Geo in Ezu is an explicit, opt-in install. Backfill is [#1798](0133-ezu-geo-feed-backfill.md).
+Device position ingest and geo queries inside Chisei stay out.
 
 ## Validation
 

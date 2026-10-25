@@ -93,7 +93,7 @@ If you want to deploy or operate the control plane:
 - [Governed geospatial queries](geospatial-queries.md) — authorized point,
   distance, contains, and intersects over named property claims.
 - [Fenced Ezu geo feed](ezu-geo-feed.md) — incremental object geo changes
-  into Ezu under a run lease and durable cursor.
+  and GeoArrow backfill into Ezu under a run lease and durable cursor.
 - [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
   authenticated execution for operator-deployed domain evaluators.
 - [Inbound object sync](object-sync.md) — bounded source batches, durable

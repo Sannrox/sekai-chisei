@@ -2600,6 +2600,26 @@ message RunEzuGeoFeedResponse {
   // The run read a full page; more changes may be waiting.
   bool more = 8;
 }
+// On-demand GeoArrow backfill for an Ezu geo feed (#1798). Captures a
+// namespace change watermark, bulk-upserts live objects of the bound kind
+// through Arrow Flight, then hands the incremental cursor to that watermark
+// so a change between backfill start and complete is not lost.
+message BackfillEzuGeoFeedRequest {
+  string namespace = 1;
+  string feed_id = 2;
+}
+message BackfillEzuGeoFeedResponse {
+  uint64 feed_revision = 1;
+  // Incremental cursor after this page: the captured watermark when the
+  // backfill finished, otherwise the previous cursor.
+  uint64 through_seq = 2;
+  uint32 writes = 3;
+  uint32 rejected_geometries = 4;
+  uint32 errors = 5;
+  // This page was full; more live objects may be waiting.
+  bool more = 6;
+  uint64 backfill_watermark = 7;
+}
 
 // Observational object-bound Action describe/preview (#836).
 // Preview is not a permit. Submit remains SubmitActionInstance.
@@ -4765,6 +4785,7 @@ service SekaiService {
   rpc RunFenceBinding(RunFenceBindingRequest) returns (RunFenceBindingResponse);
   rpc PutEzuGeoFeed(PutEzuGeoFeedRequest) returns (PutEzuGeoFeedResponse);
   rpc RunEzuGeoFeed(RunEzuGeoFeedRequest) returns (RunEzuGeoFeedResponse);
+  rpc BackfillEzuGeoFeed(BackfillEzuGeoFeedRequest) returns (BackfillEzuGeoFeedResponse);
   rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
   rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
   rpc CreatePlanIntent(CreatePlanIntentRequest) returns (CreatePlanIntentResponse);

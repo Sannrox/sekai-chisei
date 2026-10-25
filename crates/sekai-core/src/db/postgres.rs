@@ -195,6 +195,7 @@ const CATALOG_CRITICALITY_OUTBOX_SCHEMA: &str =
 const EXECUTION_EVIDENCE_STATE_SCHEMA: &str =
     include_str!("postgres/0116_execution_evidence_state.sql");
 const EZU_GEO_FEEDS_SCHEMA: &str = include_str!("postgres/0117_ezu_geo_feeds.sql");
+const EZU_GEO_FEED_BACKFILL_SCHEMA: &str = include_str!("postgres/0118_ezu_geo_feed_backfill.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -922,6 +923,12 @@ const MIGRATIONS: &[Migration] = &[
         116,
         "ezu_geo_feeds",
         EZU_GEO_FEEDS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        117,
+        "ezu_geo_feed_backfill",
+        EZU_GEO_FEED_BACKFILL_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

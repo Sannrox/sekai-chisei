@@ -4361,6 +4361,77 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_ezu_geo_feed_progress(
+        &self,
+        namespace: &str,
+        feed_id: &str,
+    ) -> Result<Option<crate::sekai::ezu_geo_feed::EzuGeoFeedProgress>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_ezu_geo_feed_progress(namespace, feed_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_ezu_geo_feed_progress(namespace, feed_id)
+            }),
+        }
+    }
+
+    pub fn begin_ezu_geo_feed_backfill(
+        &self,
+        feed: &crate::sekai::ezu_geo_feed::EzuGeoFeed,
+        run_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<crate::sekai::ezu_geo_feed::EzuGeoFeedProgress>, String> {
+        match self {
+            Self::Sqlite(db) => db.begin_ezu_geo_feed_backfill(feed, run_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.begin_ezu_geo_feed_backfill(feed, run_id, now_ms)
+            }),
+        }
+    }
+
+    pub fn list_ezu_geo_feed_objects(
+        &self,
+        namespace: &str,
+        kind: &str,
+        after_id: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::domain::Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_ezu_geo_feed_objects(namespace, kind, after_id, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_ezu_geo_feed_objects(namespace, kind, after_id, limit)
+            }),
+        }
+    }
+
+    pub fn advance_ezu_geo_feed_backfill(
+        &self,
+        feed: &crate::sekai::ezu_geo_feed::EzuGeoFeed,
+        run_id: &str,
+        after_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.advance_ezu_geo_feed_backfill(feed, run_id, after_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.advance_ezu_geo_feed_backfill(feed, run_id, after_id, now_ms)
+            }),
+        }
+    }
+
+    pub fn complete_ezu_geo_feed_backfill(
+        &self,
+        feed: &crate::sekai::ezu_geo_feed::EzuGeoFeed,
+        run_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.complete_ezu_geo_feed_backfill(feed, run_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.complete_ezu_geo_feed_backfill(feed, run_id, now_ms)
+            }),
+        }
+    }
+
     pub fn decide_parked_action_instance(
         &self,
         decided: &crate::sekai::action_instance::ActionInstance,
