@@ -6,7 +6,7 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/1798 (#1798)
 - Supersedes: none
 - Superseded by: none
-- Related: [ADR 0132](0132-ezu-geo-feed.md)
+- Related: [ADR 0132](0132-ezu-geo-feed.md), #1565
 
 ## Context
 
