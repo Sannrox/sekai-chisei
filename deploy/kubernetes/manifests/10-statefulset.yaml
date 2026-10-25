@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sekai-chisei
+  labels:
+    app: sekai-chisei
+spec:
+  serviceName: sekai-chisei
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sekai-chisei
+  template:
+    metadata:
+      labels:
+        app: sekai-chisei
+    spec:
+      securityContext:
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: data-owner
+          image: ghcr.io/sannrox/sekai-chisei:1.3.0
+          command: ["chown", "-R", "sekai:sekai", "/data"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: sekai-chisei
+          image: ghcr.io/sannrox/sekai-chisei:1.3.0
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: ops
+              containerPort: 9464
+          env:
+            - name: OPS_BIND
+              value: "0.0.0.0"
+            - name: SEKAI_TLS_CERT
+              value: /tls/tls.crt
+            - name: SEKAI_TLS_KEY
+              value: /tls/tls.key
+            - name: SEKAI_DB_PATH
+              value: /data/sekai.db
+            - name: CHISEI_DB_PATH
+              value: /data/chisei.db
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: tls
+          secret:
+            secretName: sekai-chisei-tls
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

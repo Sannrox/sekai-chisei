@@ -229,6 +229,10 @@ path = "tests/resilience_load.rs"
 name = "observability"
 path = "tests/observability.rs"
 
+[[test]]
+name = "deploy_kubernetes_manifest"
+path = "tests/deploy_kubernetes_manifest.rs"
+
 # Dependencies build without debug info in dev and test builds: backtraces
 # and debuggers keep full detail for workspace crates, and each worktree's
 # build directory stays a fraction of the size.

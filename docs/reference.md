@@ -58,6 +58,8 @@ lives in the separate [research index](research/README.md).
   `chisei-plane` processes, wrong-plane rejection, and the authenticated hop.
 - [Docker](docker.md) — container dest-pair Combined boot, image
   `SEKAI_DATA_DIR`, and transport choices.
+- [Kubernetes on minikube](kubernetes-minikube.md) — StatefulSet manifests,
+  TLS secret, and Tenkai `kubernetes-inprocess` apply.
 - [Operator console](operator-console.md) — authenticated browser shell and
   namespace context.
 - [Evaluation-plan operator CLI](evaluation-operator-cli.md) — safe plan
