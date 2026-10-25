@@ -541,9 +541,15 @@ async fn postgres_runs_the_product_loop() {
         ca_cert: sekai.ca_cert.clone(),
     });
     exercise_product_loop(&server).await;
+    // The postgres client builds its own runtime and panics on Drop while this
+    // tokio worker is still driving tasks. Own the pool on a thread that has none.
     let exec = ScratchDatabase::create();
-    crate::evidence_backend_conformance::exercise_execution_recording(
-        &RuntimeDb::Postgres(Arc::new(exec.connect(8))),
-        "loop-postgres",
-    );
+    std::thread::spawn(move || {
+        crate::evidence_backend_conformance::exercise_execution_recording(
+            &RuntimeDb::Postgres(Arc::new(exec.connect(8))),
+            "loop-postgres",
+        );
+    })
+    .join()
+    .expect("execution recording");
 }
