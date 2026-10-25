@@ -1,6 +1,6 @@
 //! `CLAUDE.md` is a compatibility copy of `AGENTS.md`. Keep them identical.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn claude_md_matches_agents_md() {
@@ -137,4 +137,88 @@ fn docs_ontology_provenance_paths_exist() {
         missing.is_empty(),
         "docs/ontology provenance locators must exist: {missing:?}"
     );
+}
+
+/// Current-facing docs still named `src/chisei`, `src/sekai`, or `src/db`
+/// after those modules moved into crates. Research notes and superseded ADRs
+/// stay historical.
+#[test]
+fn current_facing_docs_do_not_name_pre_extract_roots() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for rel in [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CONTRIBUTING.md",
+        "README.md",
+        "sdk/README.md",
+    ] {
+        files.push(root.join(rel));
+    }
+    collect_markdown(&root.join("docs"), &mut files);
+    collect_markdown(&root.join(".agents/skills"), &mut files);
+    let mut stale = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("read markdown");
+        if is_superseded_adr(&path, &text) {
+            continue;
+        }
+        for (idx, line) in text.lines().enumerate() {
+            if line_names_pre_extract_root(line) {
+                stale.push(format!("{}:{}", path.display(), idx + 1));
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "current-facing docs still name pre-extract roots: {stale:?}"
+    );
+}
+
+fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir).expect("read markdown dir");
+    for entry in entries {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("research") {
+                continue;
+            }
+            collect_markdown(&path, out);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(path);
+        }
+    }
+}
+
+fn is_superseded_adr(path: &Path, text: &str) -> bool {
+    if path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        != Some("decisions")
+    {
+        return false;
+    }
+    text.lines().take(12).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("- status:") && lower.contains("superseded")
+    })
+}
+
+fn line_names_pre_extract_root(line: &str) -> bool {
+    const NEEDLES: &[&str] = &["src/chisei", "src/sekai", "src/db", "src/chisei_store"];
+    for needle in NEEDLES {
+        let mut rest = line;
+        while let Some(idx) = rest.find(needle) {
+            let prefix = &rest[..idx];
+            if prefix.ends_with("crates/sekai-core/") || prefix.ends_with("crates/chisei-core/") {
+                rest = &rest[idx + needle.len()..];
+                continue;
+            }
+            return true;
+        }
+    }
+    false
 }
