@@ -5952,8 +5952,13 @@ impl RuntimeDb {
     ) -> Result<Vec<ExecutionEvidenceAlert>, String> {
         match self {
             Self::Sqlite(db) => db.reconcile_missing_execution_evidence(now_ms),
-            // Missing-evidence sweep is not dual-backend yet; callers get no alerts.
-            Self::Postgres(_) => Ok(Vec::new()),
+            // Redemptions live on the Chisei plane; evidence state lives on
+            // Sekai. Dest-pair PostgreSQL cannot join them on one connection,
+            // so do not report an empty success after permit redeem is live.
+            Self::Postgres(_) => Err(
+                "reconcile_missing_execution_evidence is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
         }
     }
 
