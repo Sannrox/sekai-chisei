@@ -440,7 +440,7 @@ impl SekaiServiceImpl {
     /// The bearer for Ezu, resolved as provider `ezu` for the binding's
     /// tenant: its own credential under an enterprise resolver, else the
     /// process `EZU_TOKEN`.
-    fn ezu_token(&self, tenant: &str, run_as: &str) -> Result<String, Status> {
+    pub(crate) fn ezu_token(&self, tenant: &str, run_as: &str) -> Result<String, Status> {
         let context = if tenant.is_empty() {
             crate::provider_credentials::community_machine_context(run_as)
         } else {

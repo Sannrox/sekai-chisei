@@ -75,6 +75,8 @@ lives in the separate [research index](research/README.md).
   fail, missing, and invalid results for versioned quality rules.
 - [Governed geospatial queries](geospatial-queries.md) — authorized spatial
   comparison of named property claims after property grants.
+- [Fenced Ezu geo feed](ezu-geo-feed.md) — incremental object geo changes
+  into Ezu under a run lease and durable cursor.
 - [Governed transforms](governed-transforms.md) — in-process dataset JobSpec,
   run receipt, Console, and `sekaictl admin transform`.
 - [Team operations](team-operations.md) — namespace bootstrap and operator

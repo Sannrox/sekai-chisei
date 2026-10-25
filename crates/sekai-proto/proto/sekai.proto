@@ -2574,6 +2574,32 @@ message RunFenceBindingResponse {
   // The run read a full page; more events may be waiting.
   bool more = 6;
 }
+// Fenced incremental feed of object geo changes into Ezu (#1797).
+// feed_json is the sekai.ezu-geo-feed/v1 document: namespace, object kind,
+// geo property, collection, optional filter fields, and run_as.
+message PutEzuGeoFeedRequest {
+  string feed_json = 1;
+}
+message PutEzuGeoFeedResponse {
+  string feed_json = 1;
+  uint64 revision = 2;
+}
+message RunEzuGeoFeedRequest {
+  string namespace = 1;
+  string feed_id = 2;
+}
+message RunEzuGeoFeedResponse {
+  uint64 feed_revision = 1;
+  uint64 through_seq = 2;
+  uint32 writes = 3;
+  uint32 deletes = 4;
+  uint32 rejected_geometries = 5;
+  uint32 errors = 6;
+  // Age of the oldest change this run read, 0 when there was nothing new.
+  int64 lag_ms = 7;
+  // The run read a full page; more changes may be waiting.
+  bool more = 8;
+}
 
 // Observational object-bound Action describe/preview (#836).
 // Preview is not a permit. Submit remains SubmitActionInstance.
@@ -4737,6 +4763,8 @@ service SekaiService {
   rpc RunActionBinding(RunActionBindingRequest) returns (RunActionBindingResponse);
   rpc PutFenceBinding(PutFenceBindingRequest) returns (PutFenceBindingResponse);
   rpc RunFenceBinding(RunFenceBindingRequest) returns (RunFenceBindingResponse);
+  rpc PutEzuGeoFeed(PutEzuGeoFeedRequest) returns (PutEzuGeoFeedResponse);
+  rpc RunEzuGeoFeed(RunEzuGeoFeedRequest) returns (RunEzuGeoFeedResponse);
   rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
   rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
   rpc CreatePlanIntent(CreatePlanIntentRequest) returns (CreatePlanIntentResponse);
