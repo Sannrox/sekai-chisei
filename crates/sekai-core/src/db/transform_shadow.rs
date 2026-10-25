@@ -79,14 +79,16 @@ impl RuntimeDb {
                     namespace: request.namespace.clone(),
                     transform_id: request.transform_id.clone(),
                     // The run's pins for the inputs the candidate keeps; an
-                    // input it adds reads its version as of the run.
+                    // input it adds reads the version written before the run
+                    // was admitted. A version from the same millisecond may
+                    // be later than the run, so it does not count.
                     input_versions: run
                         .input_versions
                         .iter()
                         .filter(|(dataset_id, _)| candidate_inputs.contains(*dataset_id))
                         .map(|(dataset_id, version)| (dataset_id.clone(), version.clone()))
                         .collect(),
-                    as_of_ms: run.created_at_ms,
+                    as_of_ms: run.created_at_ms - 1,
                     definition_json: request.definition_json.clone(),
                     baseline_version_id: baseline_version_id.clone(),
                     key_column: request.key_column.clone(),
@@ -323,21 +325,22 @@ mod tests {
             report.candidate_definition_digest,
             candidate.definition_digest
         );
-        // Newest run first, each with only the rows the rule changes.
-        let runs: Vec<(&str, &[String])> = report
+        // Each run with only the rows the rule changes. The two runs may
+        // share an admission millisecond, so their order is not asserted.
+        let runs: std::collections::BTreeMap<&str, &[String]> = report
             .runs
             .iter()
             .map(|run| (run.run_id.as_str(), run.changed_keys.as_slice()))
             .collect();
         assert_eq!(
             runs,
-            [
+            std::collections::BTreeMap::from([
                 (
                     second.run_id.as_str(),
                     &["3".to_string(), "4".to_string()][..]
                 ),
                 (first.run_id.as_str(), &["3".to_string()][..]),
-            ]
+            ])
         );
         assert!(report.runs.iter().all(|run| run.skipped.is_empty()));
         assert_eq!(
@@ -396,9 +399,13 @@ mod tests {
         .unwrap();
         data.append_rows(&other, &[row("1", "yes"), row("5", "yes")])
             .unwrap();
+        // Versions and runs carry millisecond times; keep them apart.
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(2));
+        tick();
         let elsewhere = runtime
             .run_governed_transform(&namespace, "t1", false, dataset_version::now_ms())
             .unwrap();
+        tick();
         data.append_rows(&other, &[row("9", "yes")]).unwrap();
         let moved = runtime
             .shadow_governed_transform(

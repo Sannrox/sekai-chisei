@@ -93,7 +93,7 @@ the output version the run left. A run that writes its output records that
 version beside its finish, in its own transaction; runs from before the
 record, or whose version no longer has the run's `output_digest`, are
 reported skipped rather than compared. An input the candidate
-adds reads its version as of the run's admission. The
+adds reads the version written before the run's admission. The
 report lists, per run, rows compared, matched, added, removed and changed
 with the changed keys, and sums them into a match rate with up to 10 sample
 rows. Cost and latency compare the active run's measured compute and

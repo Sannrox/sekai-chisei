@@ -87,7 +87,7 @@ inputs. A run that writes its output records the output's latest version
 in its own transaction, beside its finish (`output_version_id`;
 PostgreSQL `0119_transform_run_output_version`), so the link needs no
 timestamps; runs from before it are skipped. An input the candidate adds
-is pinned to its version as of the run. A
+is pinned to the version written before the run was admitted. A
 replay record now also keeps that baseline digest in the receipt's scheme
 (`baseline_output_digest`; empty on older records). Shadows run on
 request, never on a schedule or trigger, which keeps compute visible and
