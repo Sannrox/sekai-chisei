@@ -264,6 +264,7 @@ fn is_discover_rpc(method: &str) -> bool {
             | "DiscoverCapabilities"
             | "Search"
             | "GetCatalogEntryLineage"
+            | "ListCatalogCriticalityOutbox"
     )
 }
 
@@ -833,6 +834,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "RunAgentShadow"
             | "GetAgentShadowReport"
             | "GetCatalogEntryLineage"
+            | "ListCatalogCriticalityOutbox"
             | "GetDefinitionBranch"
             | "CreateDefinitionBranch"
             | "ApplyDefinitionBranchEdit"
@@ -2107,6 +2109,10 @@ mod tests {
             NamespaceAction::Discover
         );
         assert_eq!(
+            rpc_namespace_action("ListCatalogCriticalityOutbox"),
+            NamespaceAction::Discover
+        );
+        assert_eq!(
             rpc_namespace_action("ListDatasetVersions"),
             NamespaceAction::Discover
         );
@@ -2154,6 +2160,7 @@ mod tests {
             (SpaceRole::Discoverer, "ListSchemaTypes", true),
             (SpaceRole::Discoverer, "ListDatasets", true),
             (SpaceRole::Discoverer, "GetCatalogEntryLineage", true),
+            (SpaceRole::Discoverer, "ListCatalogCriticalityOutbox", true),
             (SpaceRole::Discoverer, "ListDatasetVersions", true),
             (SpaceRole::Discoverer, "GetDatasetVersion", false),
             (SpaceRole::Discoverer, "RollbackDataset", false),

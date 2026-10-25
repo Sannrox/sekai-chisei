@@ -13,7 +13,8 @@
 
 ## Context
 
-#1559 asks for one governed record per dataset, object type and pipeline:
+#1559 asks for one governed record per dataset, object type and pipeline
+(later services, releases and environments in #1688):
 who owns it, how it is tagged, what markings apply and where it comes from.
 Datasets come from mizuchi, pipelines from kako, object types from the
 published ontology. Search ([ADR 0108](0108-permission-aware-search-index.md))
@@ -46,6 +47,12 @@ catalog must not become a second metadata store with its own policy.
    submitter is an owner or the steward. The marking only rises. Curated
    fields are listed in `curated`, and registration keeps their curated
    values.
+
+   Amended by #1688: `declared_criticality` is also curated. Service,
+   release and environment entries bind to the data they reach. Derived
+   criticality is computed from reachable data markings; effective is the
+   higher of declared and derived and is exported through the catalog
+   criticality outbox.
 4. **Markings only rise.** A registration keeps the least marking that
    dominates both the stored and the requested one, under the namespace's
    classification lattice when it has one; markings with no common bound
@@ -81,7 +88,8 @@ catalog must not become a second metadata store with its own policy.
   descriptor). Lineage is derived from those bindings and the transform
   graph; unbound entries have none. A target the caller cannot discover is a
   redacted placeholder. Owner curation (#1686) and service, release and
-  environment entries (#1688) build on this record.
+  environment entries with declared and derived criticality (#1688) build on
+  this record.
 
 ## Alternatives considered
 

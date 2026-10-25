@@ -5815,6 +5815,53 @@ impl RuntimeDb {
         }
     }
 
+    pub fn insert_catalog_criticality_event(
+        &self,
+        event: &crate::sekai::catalog_criticality::CriticalityEvent,
+        expected_updated: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.insert_catalog_criticality_event(event, expected_updated),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.insert_catalog_criticality_event(event, expected_updated)
+            }),
+        }
+    }
+
+    pub fn latest_catalog_criticality_event(
+        &self,
+        entry_id: &str,
+    ) -> Result<Option<crate::sekai::catalog_criticality::CriticalityEvent>, String> {
+        match self {
+            Self::Sqlite(db) => db.latest_catalog_criticality_event(entry_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.latest_catalog_criticality_event(entry_id))
+            }
+        }
+    }
+
+    pub fn list_catalog_criticality_outbox(
+        &self,
+        namespace: &str,
+        page_size: i32,
+        page_token: &str,
+    ) -> Result<
+        (
+            Vec<crate::sekai::catalog_criticality::CriticalityEvent>,
+            String,
+        ),
+        String,
+    > {
+        match self {
+            Self::Sqlite(db) => {
+                db.list_catalog_criticality_outbox(namespace, page_size, page_token)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_catalog_criticality_outbox(namespace, page_size, page_token)
+            }),
+        }
+    }
+
     pub fn reconcile_missing_execution_evidence(
         &self,
         now_ms: i64,

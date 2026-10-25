@@ -331,6 +331,23 @@ fn plan_catalog_curation(
             raised,
         );
     }
+    crate::sekai::catalog_criticality::apply_derived(db, &mut planned).map_err(
+        |error| match error {
+            crate::sekai::catalog::CatalogError::Invalid(message) => {
+                ActionObjectMutationError::InvalidArgument(message)
+            }
+            crate::sekai::catalog::CatalogError::Denied(message) => {
+                ActionObjectMutationError::FailedPrecondition(message)
+            }
+            crate::sekai::catalog::CatalogError::Storage(message) => {
+                ActionObjectMutationError::Internal(message)
+            }
+            crate::sekai::catalog::CatalogError::Conflict
+            | crate::sekai::catalog::CatalogError::Superseded => {
+                ActionObjectMutationError::FailedPrecondition("catalog entry changed".into())
+            }
+        },
+    )?;
     validate_object_write(db, &mut planned, now_ms)?;
     Ok(PlannedObjectMutation::Update(planned, Box::new(existing)))
 }
@@ -490,6 +507,9 @@ fn validate_object_write(
 pub fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_ms: i64) {
     crate::sekai::feedback_package::complete_object_write(db, object, now_ms);
     let _ = crate::sekai::function_document::complete_lineage_write(db, actor, object, now_ms);
+    if object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
+        let _ = crate::sekai::catalog_criticality::sync_outbox(db, object, now_ms);
+    }
 }
 
 pub fn compensate(db: &RuntimeDb, applied: &AppliedObjectMutation, actor: &str) {

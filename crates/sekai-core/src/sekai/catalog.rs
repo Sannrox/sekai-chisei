@@ -1,4 +1,5 @@
-//! Governed catalog entries for datasets, object types and pipelines (#1559).
+//! Governed catalog entries for datasets, object types, pipelines, sources,
+//! services, releases and environments (#1559, #1688).
 //!
 //! An entry is an object of kind `catalog_entry` in the namespace it
 //! describes, so reads, search, facets, markings and ACLs follow the ordinary
@@ -29,6 +30,9 @@ pub enum EntryKind {
     ObjectType,
     Pipeline,
     Source,
+    Service,
+    Release,
+    Environment,
 }
 
 impl EntryKind {
@@ -38,6 +42,9 @@ impl EntryKind {
             "object_type" => Ok(Self::ObjectType),
             "pipeline" => Ok(Self::Pipeline),
             "source" => Ok(Self::Source),
+            "service" => Ok(Self::Service),
+            "release" => Ok(Self::Release),
+            "environment" => Ok(Self::Environment),
             other => Err(format!("unknown catalog entry kind {other:?}")),
         }
     }
@@ -48,7 +55,14 @@ impl EntryKind {
             Self::ObjectType => "object_type",
             Self::Pipeline => "pipeline",
             Self::Source => "source",
+            Self::Service => "service",
+            Self::Release => "release",
+            Self::Environment => "environment",
         }
+    }
+
+    pub fn carries_derived_criticality(self) -> bool {
+        matches!(self, Self::Service | Self::Release | Self::Environment)
     }
 }
 
@@ -152,7 +166,8 @@ impl CatalogBinding {
     }
 
     pub fn matches_entry_kind(&self, entry_kind: EntryKind) -> bool {
-        self.kind.entry_kind() == entry_kind
+        // Services, releases and environments bind to the data they reach.
+        entry_kind.carries_derived_criticality() || self.kind.entry_kind() == entry_kind
     }
 }
 
@@ -497,7 +512,7 @@ pub fn raised_marking(
 
 /// Fields owners and stewards curate (#1686). Once curated, registration
 /// keeps the curated value instead of the source's.
-pub const CURATED_FIELDS: &[&str] = &["description", "owners", "tags"];
+pub const CURATED_FIELDS: &[&str] = &["description", "owners", "tags", "declared_criticality"];
 /// Comma-separated curated fields on an entry.
 const CURATED_PROPERTY: &str = "curated";
 
@@ -560,6 +575,11 @@ pub fn curate(
                 }
                 list.join(",")
             }
+            "declared_criticality" => {
+                crate::sekai::catalog_criticality::Criticality::parse(&value)?
+                    .as_str()
+                    .to_string()
+            }
             OBJECT_CLASSIFICATION_PROPERTY => {
                 let stored = entry
                     .properties
@@ -597,6 +617,7 @@ pub fn curate(
             .properties
             .insert(CURATED_PROPERTY.into(), fields.join(","));
     }
+    crate::sekai::catalog_criticality::refresh_effective(&mut curated);
     Ok(curated)
 }
 
@@ -703,6 +724,9 @@ pub fn register(
                 .insert(CURATED_PROPERTY.into(), curated.join(","));
         }
     }
+    // Derived is computed at this write. A later marking change on reachable
+    // data is picked up the next time this entry is registered or curated.
+    crate::sekai::catalog_criticality::apply_derived(db, &mut entry)?;
     authorize(existing.as_ref(), &mut entry)?;
     // Grant checks may keep a stored value; the result must still carry at
     // least the marking the source asked for.
@@ -720,6 +744,7 @@ pub fn register(
         && existing.name == entry.name
         && existing.properties == entry.properties
     {
+        crate::sekai::catalog_criticality::sync_outbox(db, existing, now_ms)?;
         return Ok(Registered {
             entry: existing.clone(),
             changed: false,
@@ -751,6 +776,9 @@ pub fn register(
             CatalogError::Storage(error)
         }
     })?;
+    // After the object write: a retried identical registration repairs a
+    // lost emit. Admission replay does the same for Action writes.
+    crate::sekai::catalog_criticality::sync_outbox(db, &entry, now_ms)?;
     Ok(Registered {
         entry,
         changed: true,
@@ -1296,5 +1324,109 @@ mod tests {
         let curated = edit("bob", "owners", "dana, alice").unwrap();
         assert_eq!(curated.properties["owners"], "alice,dana");
         assert_eq!(curated.properties["curated"], "owners");
+    }
+
+    #[test]
+    fn service_register_is_idempotent_and_derived_beats_declared() {
+        use crate::sekai::catalog_criticality::{
+            DECLARED_PROPERTY, DERIVED_PROPERTY, EFFECTIVE_PROPERTY,
+        };
+        use crate::sekai::dataset::Dataset;
+        let db = db();
+        db.create_dataset(&Dataset {
+            id: "orders".into(),
+            name: "orders".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        let mut data = registration("orders");
+        data.marking = "confidential".into();
+        data.binding = Some(CatalogBinding {
+            kind: BindingKind::Dataset,
+            target_id: "orders".into(),
+            source_type_descriptor_id: String::new(),
+        });
+        put(&db, data, 1).unwrap();
+        let service = |source_id: &str| CatalogRegistration {
+            entry_kind: EntryKind::Service,
+            source_system: "tenkai".into(),
+            source_id: source_id.into(),
+            display_name: "billing".into(),
+            description: "billing api".into(),
+            marking: String::new(),
+            schema_summary: String::new(),
+            binding: Some(CatalogBinding {
+                kind: BindingKind::Dataset,
+                target_id: "orders".into(),
+                source_type_descriptor_id: String::new(),
+            }),
+            ..registration(source_id)
+        };
+        let first = put(&db, service("billing"), 2).unwrap();
+        assert!(first.changed);
+        assert_eq!(first.entry.properties[DERIVED_PROPERTY], "high");
+        assert_eq!(first.entry.properties[EFFECTIVE_PROPERTY], "high");
+        let again = put(&db, service("billing"), 3).unwrap();
+        assert!(!again.changed);
+        assert_eq!(again.entry.id, first.entry.id);
+        let release = CatalogRegistration {
+            entry_kind: EntryKind::Release,
+            source_id: "billing-1".into(),
+            display_name: "billing-1".into(),
+            binding: Some(CatalogBinding {
+                kind: BindingKind::Dataset,
+                target_id: "orders".into(),
+                source_type_descriptor_id: String::new(),
+            }),
+            ..service("billing-1")
+        };
+        put(&db, release, 4).unwrap();
+        let environment = CatalogRegistration {
+            entry_kind: EntryKind::Environment,
+            source_id: "prod".into(),
+            display_name: "prod".into(),
+            binding: Some(CatalogBinding {
+                kind: BindingKind::Dataset,
+                target_id: "orders".into(),
+                source_type_descriptor_id: String::new(),
+            }),
+            ..service("prod")
+        };
+        put(&db, environment, 5).unwrap();
+        let lowered = curate(
+            &first.entry,
+            "alice",
+            HashMap::from([(DECLARED_PROPERTY.into(), "low".into())]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(lowered.properties[DECLARED_PROPERTY], "low");
+        assert_eq!(lowered.properties[DERIVED_PROPERTY], "high");
+        assert_eq!(lowered.properties[EFFECTIVE_PROPERTY], "high");
+        db.update_object_with_authorized_snapshot(&lowered, Some(&first.entry), "alice", None)
+            .unwrap();
+        crate::sekai::catalog_criticality::sync_outbox(&db, &lowered, 6).unwrap();
+        let (events, _) = db.list_catalog_criticality_outbox("acme", 10, "").unwrap();
+        let billing = events
+            .iter()
+            .filter(|event| event.entry_id == first.entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(billing.len(), 2, "{billing:?}");
+        assert_eq!(billing[1].derived, "high");
+        assert_eq!(billing[1].declared, "");
+        assert_eq!(billing[0].declared, "low");
+        assert_eq!(billing[0].effective, "high");
+        crate::sekai::catalog_criticality::sync_outbox(&db, &lowered, 7).unwrap();
+        let (again, _) = db.list_catalog_criticality_outbox("acme", 10, "").unwrap();
+        assert_eq!(
+            again
+                .iter()
+                .filter(|event| event.entry_id == first.entry.id)
+                .count(),
+            2
+        );
     }
 }
