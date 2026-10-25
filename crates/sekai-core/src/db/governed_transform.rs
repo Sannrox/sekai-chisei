@@ -3541,7 +3541,67 @@ pub fn stamp_object_marking(
     Ok(())
 }
 
-fn list_all_transforms_tx(tx: &Transaction<'_>) -> Result<Vec<GovernedTransform>, String> {
+pub(crate) fn apply_transform_store_edits_sqlite(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    previous: &[crate::sekai::definition_branch::DefinitionMember],
+    next: &[crate::sekai::definition_branch::DefinitionMember],
+    now_ms: i64,
+) -> Result<(), String> {
+    let mut published = list_all_transforms_tx(tx)?;
+    let edits = crate::sekai::definition_package::transform_store_edits(
+        namespace, previous, next, &published,
+    )?;
+    if edits.upserts.is_empty() && edits.deletions.is_empty() {
+        return Ok(());
+    }
+    published.retain(|transform| {
+        transform.namespace != namespace || !edits.deletions.contains(&transform.transform_id)
+    });
+    for transform in &edits.upserts {
+        published.retain(|existing| {
+            existing.namespace != transform.namespace
+                || existing.transform_id != transform.transform_id
+        });
+        published.push(transform.clone());
+    }
+    if let Some(transform) = edits.upserts.first() {
+        refuse_dependency_cycle(&published, transform).map_err(|error| error.message())?;
+    }
+    for transform_id in &edits.deletions {
+        clear_pending_for_transform(tx, namespace, transform_id)?;
+        tx.execute(
+            "DELETE FROM sekai_governed_transform
+             WHERE namespace = ?1 AND transform_id = ?2",
+            params![namespace, transform_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    for transform in &edits.upserts {
+        clear_pending_for_transform(tx, namespace, &transform.transform_id)?;
+        let json = serde_json::to_string(transform).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sekai_governed_transform
+             (namespace, transform_id, definition_json, definition_digest, input_dataset_id, output_dataset_id, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                transform.namespace,
+                transform.transform_id,
+                json,
+                transform.definition_digest,
+                transform.input_dataset_id,
+                transform.output_dataset_id,
+                now_ms
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn list_all_transforms_tx(
+    tx: &Transaction<'_>,
+) -> Result<Vec<GovernedTransform>, String> {
     let mut stmt = tx
         .prepare(
             "SELECT definition_json FROM sekai_governed_transform

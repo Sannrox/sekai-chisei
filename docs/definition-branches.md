@@ -123,9 +123,15 @@ planes as a signed `sekai.definition-package/v1` envelope.
   so the same definitions have the same package digest in every namespace.
   Provenance (source namespace, source revision, export time) is signed with
   the package digest but sits outside it. A package carries definitions only:
-  never objects, datasets, sources, credentials, or run history.
+  never objects, datasets, sources, credentials, or run history. Governed
+  transform definitions are `transform` members (#1799): the document is the
+  JobSpec without `namespace`, `definition_digest`, `schedule`, or `trigger`,
+  so the same pipeline has the same digest in every namespace. Schedule and
+  trigger stay local. Unknown member kinds are refused.
 - **Export** packages a published revision (the head when `revision_digest`
-  is empty). It needs read access to the revision, as `GetDefinitionMember`
+  is empty). The published head overlays the namespace's governed transforms
+  as `transform` members; a historical revision keeps the members it already
+  carries. It needs read access to the revision, as `GetDefinitionMember`
   does, and signs with this plane's key: `SEKAI_DEFINITION_PACKAGE_SIGNING_KEY`
   (file with a 32-byte hex Ed25519 seed) and `SEKAI_DEFINITION_PACKAGE_SIGNER`
   (`identity/key_id`).
@@ -137,11 +143,22 @@ planes as a signed `sekai.definition-package/v1` envelope.
   so of its merge receipt. Import never merges: compatibility, lint, and
   Agent certification gates apply at merge as for any proposal. Auth matches
   rollback: namespace write plus write on every member that would change.
+  Each governed transform's projected output columns must exist on the output
+  object type in the candidate, or in the target when the package does not
+  carry that type; a mismatch is `definition_package_incompatible:
+  transform_output_incompatible` and writes nothing. A store transform that
+  is not a published member is `definition_package_incompatible:
+  transform_store_conflict` so merge cannot overwrite a Put-only pipeline
+  that rollback could not restore. Merge applies those transform members to
+  the namespace's transform store. Unchanged members leave local schedule
+  and trigger in place; a changed member is written without them. Rolling
+  the proposal back restores the previous transform revision.
 - **Refusals** are `FAILED_PRECONDITION` with a named reason, and nothing is
   written: `definition_package_unverified` (unknown, unusable, or wrong
   signature, or no trusted keys configured), `definition_package_tampered`
   (a digest does not match its content), and
-  `definition_package_incompatible` (format, member kind, or member document).
+  `definition_package_incompatible` (format, member kind, member document,
+  transform I/O, or an untracked store transform).
 - Keys are read at call time, so rotating them needs no restart. Without them,
   export and import fail closed.
 

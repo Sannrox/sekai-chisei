@@ -2106,6 +2106,301 @@ async fn definition_package_round_trips_between_namespaces_and_refuses_tampering
 }
 
 #[tokio::test]
+async fn definition_package_round_trips_governed_transforms_and_refuses_output_mismatch() {
+    use super::rpc_definition_package::{
+        PackageSigner, export_definition_package_as, import_definition_package_with,
+        package_keyring_from_json,
+    };
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform, TransformStep};
+    let svc = service();
+    let signer = PackageSigner {
+        identity: "plane-a".into(),
+        key_id: "k1".into(),
+        key: ed25519_dalek::SigningKey::from_bytes(&[5; 32]),
+    };
+    let public_key = signer
+        .key
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let keyring = package_keyring_from_json(&format!(
+        r#"[{{"identity":"plane-a","key_id":"k1","public_key":"{public_key}"}}]"#
+    ))
+    .unwrap();
+    let member = |id: &str, properties: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: id.into(),
+        definition_json: format!(
+            r#"{{"name":"{id}","properties":{properties},"lint_suppressions":[{{"rule":"orphan_object_type","reason":"test fixture"}}]}}"#
+        ),
+        member_digest: String::new(),
+    };
+    let projection = |namespace: &str, columns: &[&str]| {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: namespace.into(),
+            transform_id: "ProjectTickets".into(),
+            input_dataset_id: "tickets".into(),
+            output_dataset_id: "Ticket".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    };
+    let parent = seed_definition_parent(&svc, "tf-a");
+    publish_definition_history_entry(
+        &svc,
+        "tf-a",
+        &parent.revision_digest,
+        "tf-a-1",
+        "tf-a-cs-1",
+        vec![member("Ticket", r#"["title","body"]"#)],
+    )
+    .await;
+    svc.db
+        .runtime()
+        .put_governed_transform(&projection("tf-a", &["title"]), 10)
+        .unwrap();
+    let export = |namespace: &str| {
+        export_definition_package_as(
+            &svc,
+            with_named_principal(
+                ExportDefinitionPackageRequest {
+                    namespace: namespace.into(),
+                    revision_digest: String::new(),
+                },
+                "root",
+            ),
+            &signer,
+        )
+        .unwrap()
+        .into_inner()
+    };
+    let import = |namespace: &str, envelope_json: &str, id: &str| {
+        import_definition_package_with(
+            &svc,
+            with_named_principal(
+                ImportDefinitionPackageRequest {
+                    namespace: namespace.into(),
+                    branch_id: format!("import-{id}"),
+                    proposal_id: format!("import-cs-{id}"),
+                    envelope_json: envelope_json.into(),
+                    idempotency_key: format!("import-{id}"),
+                },
+                "root",
+            ),
+            &keyring,
+        )
+    };
+    let exported = export("tf-a");
+    let envelope: crate::sekai::definition_package::PackageEnvelope =
+        serde_json::from_str(&exported.envelope_json).unwrap();
+    assert!(
+        envelope
+            .package
+            .members
+            .iter()
+            .any(|member| member.kind == "transform" && member.id == "ProjectTickets")
+    );
+    assert!(
+        envelope
+            .package
+            .members
+            .iter()
+            .all(|member| !member.definition_json.contains("tf-a"))
+    );
+
+    let mismatch = crate::sekai::definition_package::sign_package(
+        crate::sekai::definition_package::build_package(
+            crate::sekai::definition_package::members_for_export(
+                [(
+                    "object_type".into(),
+                    "Ticket".into(),
+                    member("Ticket", r#"["title"]"#).definition_json,
+                )],
+                [projection("tf-a", &["title", "priority"])],
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        crate::sekai::definition_package::PackageProvenance {
+            source_namespace: "tf-a".into(),
+            source_revision_digest: exported.package_digest.clone(),
+            exported_at_ms: 1,
+        },
+        "plane-a",
+        "k1",
+        &signer.key,
+    )
+    .unwrap();
+    let refused = import(
+        "tf-bad",
+        &serde_json::to_string(&mismatch).unwrap(),
+        "mismatch",
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains(crate::sekai::definition_package::REFUSAL_TRANSFORM_OUTPUT),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_definition_branch("tf-bad", "import-mismatch")
+            .unwrap()
+            .is_none()
+    );
+
+    let imported = import("tf-b", &exported.envelope_json, "v1")
+        .unwrap()
+        .into_inner();
+    let proposal = imported.proposal.unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "import-cs-v1".into(),
+            idempotency_key: "import-v1-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "import-cs-v1".into(),
+            expected_published_digest: proposal.base_digest.clone(),
+            idempotency_key: "import-v1-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(export("tf-b").package_digest, exported.package_digest);
+    let first_head = svc
+        .db
+        .runtime()
+        .get_published_definition_revision("tf-b")
+        .unwrap()
+        .unwrap()
+        .revision_digest;
+    let installed = svc
+        .db
+        .runtime()
+        .get_governed_transform("tf-b", "ProjectTickets")
+        .unwrap()
+        .unwrap();
+    assert_eq!(installed.steps[0].columns, ["title"]);
+
+    svc.db
+        .runtime()
+        .put_governed_transform(&projection("tf-a", &["title", "body"]), 20)
+        .unwrap();
+    let exported_v2 = export("tf-a");
+    assert_ne!(exported_v2.package_digest, exported.package_digest);
+    let imported_v2 = import("tf-b", &exported_v2.envelope_json, "v2")
+        .unwrap()
+        .into_inner();
+    let proposal_v2 = imported_v2.proposal.unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "import-cs-v2".into(),
+            idempotency_key: "import-v2-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "import-cs-v2".into(),
+            expected_published_digest: proposal_v2.base_digest.clone(),
+            idempotency_key: "import-v2-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.db
+            .runtime()
+            .get_governed_transform("tf-b", "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["title", "body"]
+    );
+
+    let rolled = svc
+        .propose_definition_rollback(with_named_principal(
+            ProposeDefinitionRollbackRequest {
+                namespace: "tf-b".into(),
+                branch_id: "tf-restore".into(),
+                proposal_id: "tf-cs-restore".into(),
+                restore_from_digest: first_head.clone(),
+                migration_plan_digest: String::new(),
+                idempotency_key: "tf-restore-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "tf-cs-restore".into(),
+            idempotency_key: "tf-restore-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "tf-cs-restore".into(),
+            expected_published_digest: rolled.proposal.unwrap().base_digest,
+            idempotency_key: "tf-restore-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.db
+            .runtime()
+            .get_governed_transform("tf-b", "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["title"]
+    );
+}
+
+#[tokio::test]
 async fn propose_definition_rollback_restores_as_descendant_and_gates_live_values() {
     let svc = service();
     let namespace = "rollback-team";

@@ -35,6 +35,11 @@ const KNOWN_MEMBER_KINDS: &[&str] = &[
     "transform",
 ];
 
+/// Package and branch readers refuse any other member kind.
+pub fn member_kind_is_supported(kind: &str) -> bool {
+    KNOWN_MEMBER_KINDS.contains(&kind)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefinitionMemberInput {
     pub member_kind: String,

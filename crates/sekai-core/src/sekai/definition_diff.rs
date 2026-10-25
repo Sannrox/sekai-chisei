@@ -155,7 +155,9 @@ pub fn classify_definition_revision_compatibility(
             .ok_or_else(|| "definition compare encountered an unknown construct".to_string())?;
         inspect_member_constructs(member)?;
         reasons.push(added_member_reason(change));
-        push_unknown_fields(change, member, &mut reasons)?;
+        if !governed_transform_member(member) {
+            push_unknown_fields(change, member, &mut reasons)?;
+        }
     }
     for change in &diff.removed {
         let member = from_map
@@ -176,7 +178,23 @@ pub fn classify_definition_revision_compatibility(
         let to_member = to_map
             .get(&(change.member_kind.clone(), change.member_id.clone()))
             .ok_or_else(|| "definition compare encountered an unknown construct".to_string())?;
-        classify_member_change(change, from_member, to_member, &mut reasons)?;
+        if governed_transform_member(to_member) {
+            reasons.push(reason(
+                DefinitionCompatibilityClass::Conditional,
+                change,
+                "changed_transform",
+                "",
+            ));
+        } else if governed_transform_member(from_member) {
+            reasons.push(reason(
+                DefinitionCompatibilityClass::Breaking,
+                change,
+                "changed_transform",
+                "",
+            ));
+        } else {
+            classify_member_change(change, from_member, to_member, &mut reasons)?;
+        }
     }
     reasons.sort_by(|left, right| {
         (
@@ -424,7 +442,23 @@ fn classify_member_change(
 }
 
 fn inspect_member_constructs(member: &DefinitionMember) -> Result<(), String> {
+    if governed_transform_member(member) {
+        return Ok(());
+    }
     inspect_value_constructs(&parse_definition(&member.definition_json)?)
+}
+
+fn governed_transform_member(member: &DefinitionMember) -> bool {
+    member.member_kind == "transform"
+        && parse_definition(&member.definition_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("contract_version")
+                    .and_then(Value::as_str)
+                    .map(|contract| contract == crate::sekai::governed_transform::CONTRACT_VERSION)
+            })
+            .unwrap_or(false)
 }
 
 /// `owner` names who answers for a member (ontology lint, #1454),
@@ -1146,6 +1180,58 @@ mod tests {
             ]
         );
         require_merge_compatibility(&from, &from_members, &to, &to_members).unwrap();
+    }
+
+    #[test]
+    fn added_governed_transform_stays_conditional() {
+        let ticket = prepared("object_type", "Ticket", r#"{"name":"Ticket"}"#);
+        let transform = prepared(
+            "transform",
+            "ProjectTickets",
+            r#"{"contract_version":"sekai.governed-transform/v1","transform_id":"ProjectTickets","input_dataset_id":"tickets","output_dataset_id":"Ticket","steps":[{"kind":"project","column":"","op":"","value":"","columns":["title"]}],"quality_rule":""}"#,
+        );
+        let from_members = vec![ticket.clone()];
+        let to_members = vec![ticket, transform];
+        let from = revision(&from_members, "");
+        let to = revision(&to_members, "");
+        let report =
+            classify_definition_revision_compatibility(&from, &from_members, &to, &to_members)
+                .unwrap();
+        assert_eq!(report.class, "conditional");
+        assert!(
+            report
+                .reasons
+                .iter()
+                .all(|reason| reason.class != "unknown"),
+            "{report:?}"
+        );
+        require_merge_compatibility(&from, &from_members, &to, &to_members).unwrap();
+    }
+
+    #[test]
+    fn replacing_a_governed_transform_with_a_stub_is_breaking() {
+        let ticket = prepared("object_type", "Ticket", r#"{"name":"Ticket"}"#);
+        let governed = prepared(
+            "transform",
+            "ProjectTickets",
+            r#"{"contract_version":"sekai.governed-transform/v1","transform_id":"ProjectTickets","input_dataset_id":"tickets","output_dataset_id":"Ticket","steps":[{"kind":"project","column":"","op":"","value":"","columns":["title"]}],"quality_rule":""}"#,
+        );
+        let stub = prepared(
+            "transform",
+            "ProjectTickets",
+            r#"{"name":"ProjectTickets"}"#,
+        );
+        let from_members = vec![ticket.clone(), governed];
+        let to_members = vec![ticket, stub];
+        let from = revision(&from_members, "");
+        let to = revision(&to_members, "");
+        let report =
+            classify_definition_revision_compatibility(&from, &from_members, &to, &to_members)
+                .unwrap();
+        assert_eq!(report.class, "breaking");
+        let error =
+            require_merge_compatibility(&from, &from_members, &to, &to_members).unwrap_err();
+        assert_eq!(error, "compatibility_gate:transform");
     }
 
     #[test]

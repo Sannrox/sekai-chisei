@@ -131,14 +131,17 @@ pub(super) fn export_definition_package_as(
         &input.namespace,
         false,
     )?;
+    let published_head = service
+        .db
+        .runtime()
+        .get_published_definition_revision(&input.namespace)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
     let revision_digest = if input.revision_digest.is_empty() {
-        service
-            .db
-            .runtime()
-            .get_published_definition_revision(&input.namespace)
-            .map_err(|_| Status::internal("definition revision unavailable"))?
+        published_head
+            .as_ref()
             .ok_or_else(|| Status::not_found("definition revision unavailable"))?
             .revision_digest
+            .clone()
     } else {
         definition_branch_domain::validate_digest("revision_digest", &input.revision_digest)
             .map_err(Status::invalid_argument)?;
@@ -164,10 +167,26 @@ pub(super) fn export_definition_package_as(
         .runtime()
         .get_definition_members(&input.namespace, &revision.revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?;
+    let overlay_head = published_head
+        .as_ref()
+        .is_some_and(|head| head.revision_digest == revision_digest);
+    let transforms = if overlay_head {
+        service
+            .db
+            .runtime()
+            .list_governed_transforms(&input.namespace)
+            .map_err(|_| Status::internal("governed transforms unavailable"))?
+    } else {
+        Vec::new()
+    };
     let package = package_domain::build_package(
-        members
-            .into_iter()
-            .map(|member| (member.member_kind, member.member_id, member.definition_json)),
+        package_domain::members_for_export(
+            members
+                .into_iter()
+                .map(|member| (member.member_kind, member.member_id, member.definition_json)),
+            transforms,
+        )
+        .map_err(Status::internal)?,
     )
     .map_err(Status::internal)?;
     let envelope = package_domain::sign_package(
@@ -315,7 +334,12 @@ pub(super) fn import_definition_package_with(
         // A fresh namespace cannot hold a replay, so the import is checked
         // here, before the genesis seed. Otherwise the backend checks it after
         // its idempotent replay, inside the write transaction.
-        package_domain::check_importable(&published, &[], &request.members)
+        let store = service
+            .db
+            .runtime()
+            .list_governed_transforms(&request.namespace)
+            .map_err(|_| Status::internal("governed transforms unavailable"))?;
+        package_domain::check_importable(&published, &[], &request.members, &store)
             .map_err(map_definition_write_error)?;
     }
     if needs_genesis {
