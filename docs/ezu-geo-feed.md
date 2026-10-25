@@ -1,11 +1,13 @@
 # Fenced Ezu geo feed
 
-Issue: [#1797](https://github.com/Sannrox/sekai-chisei/issues/1797).
-Decision: [ADR 0132](decisions/0132-ezu-geo-feed.md).
+Issues: [#1797](https://github.com/Sannrox/sekai-chisei/issues/1797),
+[#1798](https://github.com/Sannrox/sekai-chisei/issues/1798).
+Decisions: [ADR 0132](decisions/0132-ezu-geo-feed.md),
+[ADR 0133](decisions/0133-ezu-geo-feed-backfill.md).
 
-`sekai.ezu-geo-feed/v1` projects committed object geo changes into Ezu.
-`PutEzuGeoFeed` and `RunEzuGeoFeed` are experimental; enable
-`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` build feature.
+`sekai.ezu-geo-feed/v1` projects committed object geo into Ezu.
+`PutEzuGeoFeed`, `RunEzuGeoFeed`, and `BackfillEzuGeoFeed` are experimental;
+enable `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` build feature.
 
 A feed is namespace-scoped and names the object kind, geo property, Ezu
 collection, optional filter fields, and the `run_as` service principal whose
@@ -27,10 +29,13 @@ A run rechecks that `run_as` still has namespace write.
 Marked properties (`access_marking`, `_`-prefixed, schema
 `internal`/`sensitive`) are never copied as filter fields.
 
-`SEKAI_EZU_URL` is the Ezu HTTP address. Community `EZU_TOKEN` is the bearer;
-enterprise resolves provider `ezu` per `run_as` tenant. Lag, errors, and
-rejected geometries are `sekai_ezu_geo_feed_lag_ms`,
+`SEKAI_EZU_URL` is the Ezu HTTP and Arrow Flight address. Community
+`EZU_TOKEN` is the bearer; enterprise resolves provider `ezu` per `run_as`
+tenant. Lag, errors, and rejected geometries are `sekai_ezu_geo_feed_lag_ms`,
 `sekai_ezu_geo_feed_errors`, and `sekai_ezu_geo_feed_rejected_geometries`.
 
-Backfill is a later slice. Device position ingest and geo queries inside
-Chisei are out of scope.
+`BackfillEzuGeoFeed` captures the namespace change watermark, bulk-upserts
+live objects of the bound kind through Flight `DoPut` as GeoArrow, then sets
+the incremental cursor to that watermark. A change after capture is applied
+by `RunEzuGeoFeed`. The backfill is re-runnable after Ezu snapshot loss.
+Device position ingest and geo queries inside Chisei are out of scope.

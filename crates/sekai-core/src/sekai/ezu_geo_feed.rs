@@ -1,4 +1,5 @@
-//! Fenced incremental feed of object geo changes into Ezu (#1797).
+//! Fenced incremental feed of object geo changes into Ezu (#1797) and
+//! GeoArrow backfill (#1798).
 //!
 //! A feed is namespace-scoped and names the object kind, geo property, Ezu
 //! collection, optional filter fields, and the service principal whose Ezu
@@ -11,13 +12,17 @@
 //! the replacement, while seq order inside a revision is kept. Two runs
 //! cannot interleave: a second instance cannot take a held lease or advance
 //! the cursor. Marked properties are never copied as filter fields.
+//!
+//! Backfill captures that namespace watermark first, bulk-upserts live
+//! objects of the bound kind, then hands the incremental cursor to the
+//! watermark so a change between capture and complete is not skipped.
 
 use std::collections::BTreeMap;
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::db::sekai::SekaiDb;
+use crate::db::sekai::{SekaiDb, row_to_object};
 use crate::domain::Object;
 use crate::sekai::geospatial::{GeospatialGeometry, stored_geospatial_value};
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
@@ -28,6 +33,8 @@ pub const EZU_GEO_FEED_CONTRACT: &str = "sekai.ezu-geo-feed/v1";
 /// Changes one run consumes when the feed names no cap, and the most it may.
 pub const DEFAULT_CHANGES_PER_RUN: u32 = 100;
 pub const MAX_CHANGES_PER_RUN: u32 = 1_000;
+/// Live objects one backfill page consumes when the feed names no cap.
+pub const DEFAULT_BACKFILL_PER_RUN: u32 = 1_000;
 /// How long a run holds its feed without renewing. A crashed run's lease
 /// lapses and the next run takes over.
 pub const FEED_RUN_LEASE_MS: i64 = 60_000;
@@ -119,6 +126,26 @@ impl EzuGeoFeed {
             self.max_changes_per_run
         }
     }
+
+    /// Objects one backfill page consumes. A named cap is the incremental
+    /// page size so tests can bound both; the default is larger because a
+    /// rebuild walks live objects, not the change stream.
+    pub fn backfill_per_run(&self) -> u32 {
+        if self.max_changes_per_run == 0 {
+            DEFAULT_BACKFILL_PER_RUN
+        } else {
+            self.changes_per_run()
+        }
+    }
+}
+
+/// Durable cursor plus in-flight backfill page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EzuGeoFeedProgress {
+    pub after_seq: u64,
+    pub backfill_watermark: u64,
+    pub backfill_after_id: String,
+    pub backfill_active: bool,
 }
 
 /// Geometry Ezu indexes: a point or a single closed ring.
@@ -405,10 +432,26 @@ impl SekaiDb {
                     run_id TEXT NOT NULL DEFAULT '',
                     run_lease_until_ms INTEGER NOT NULL DEFAULT 0,
                     updated_at_ms INTEGER NOT NULL,
+                    backfill_watermark INTEGER NOT NULL DEFAULT 0,
+                    backfill_after_id TEXT NOT NULL DEFAULT '',
+                    backfill_active INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (namespace, feed_id)
                 );",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        for statement in [
+            "ALTER TABLE sekai_ezu_geo_feeds ADD COLUMN backfill_watermark INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sekai_ezu_geo_feeds ADD COLUMN backfill_after_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sekai_ezu_geo_feeds ADD COLUMN backfill_active INTEGER NOT NULL DEFAULT 0",
+        ] {
+            match self.conn().execute(statement, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                    if message.contains("duplicate column name") => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
     }
 
     /// Installs or replaces a feed. A new revision keeps the cursor, so a
@@ -462,6 +505,9 @@ impl SekaiDb {
                     body_json = excluded.body_json,
                     run_id = '',
                     run_lease_until_ms = 0,
+                    backfill_watermark = 0,
+                    backfill_after_id = '',
+                    backfill_active = 0,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     stored.namespace,
@@ -664,6 +710,199 @@ impl SekaiDb {
                     feed.feed_id,
                     feed.revision as i64,
                     through as i64,
+                    now_ms,
+                    run_id
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Cursor and in-flight backfill page.
+    pub fn get_ezu_geo_feed_progress(
+        &self,
+        namespace: &str,
+        feed_id: &str,
+    ) -> Result<Option<EzuGeoFeedProgress>, String> {
+        self.migrate_ezu_geo_feeds()?;
+        self.conn()
+            .query_row(
+                "SELECT after_seq, backfill_watermark, backfill_after_id, backfill_active
+                 FROM sekai_ezu_geo_feeds WHERE namespace = ?1 AND feed_id = ?2",
+                params![namespace, feed_id],
+                |row| {
+                    Ok(EzuGeoFeedProgress {
+                        after_seq: row.get::<_, i64>(0)?.max(0) as u64,
+                        backfill_watermark: row.get::<_, i64>(1)?.max(0) as u64,
+                        backfill_after_id: row.get(2)?,
+                        backfill_active: row.get::<_, i64>(3)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Starts a backfill page: captures the namespace watermark once, then
+    /// keeps it for later pages of the same rebuild. None when `run_id` does
+    /// not hold the lease of this revision.
+    pub fn begin_ezu_geo_feed_backfill(
+        &self,
+        feed: &EzuGeoFeed,
+        run_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<EzuGeoFeedProgress>, String> {
+        self.migrate_ezu_geo_feeds()?;
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let row: Option<(i64, String, i64, i64, String, i64)> = transaction
+            .query_row(
+                "SELECT after_seq, backfill_after_id, backfill_watermark, backfill_active,
+                        run_id, revision
+                 FROM sekai_ezu_geo_feeds WHERE namespace = ?1 AND feed_id = ?2",
+                params![feed.namespace, feed.feed_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((after_seq, after_id, stored_watermark, active, held_run, revision)) = row else {
+            return Ok(None);
+        };
+        if held_run != run_id || revision != feed.revision as i64 {
+            return Ok(None);
+        }
+        if active != 0 {
+            return Ok(Some(EzuGeoFeedProgress {
+                after_seq: after_seq.max(0) as u64,
+                backfill_watermark: stored_watermark.max(0) as u64,
+                backfill_after_id: after_id,
+                backfill_active: true,
+            }));
+        }
+        let watermark = namespace_change_watermark(&transaction, &feed.namespace)?;
+        transaction
+            .execute(
+                "UPDATE sekai_ezu_geo_feeds
+                 SET backfill_watermark = ?3, backfill_after_id = '', backfill_active = 1,
+                     updated_at_ms = ?4
+                 WHERE namespace = ?1 AND feed_id = ?2 AND run_id = ?5 AND revision = ?6",
+                params![
+                    feed.namespace,
+                    feed.feed_id,
+                    watermark as i64,
+                    now_ms,
+                    run_id,
+                    feed.revision as i64
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(Some(EzuGeoFeedProgress {
+            after_seq: after_seq.max(0) as u64,
+            backfill_watermark: watermark,
+            backfill_after_id: String::new(),
+            backfill_active: true,
+        }))
+    }
+
+    /// Live objects of `kind` in `namespace` after `after_id`, ordered by id.
+    pub fn list_ezu_geo_feed_objects(
+        &self,
+        namespace: &str,
+        kind: &str,
+        after_id: &str,
+        limit: u32,
+    ) -> Result<Vec<Object>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE namespace = ?1 AND kind = ?2 AND id > ?3
+                 ORDER BY id ASC
+                 LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![namespace, kind, after_id, limit as i64],
+                row_to_object,
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Records the last id this backfill page put, only while `run_id` holds
+    /// an active backfill.
+    pub fn advance_ezu_geo_feed_backfill(
+        &self,
+        feed: &EzuGeoFeed,
+        run_id: &str,
+        after_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        self.migrate_ezu_geo_feeds()?;
+        self.conn()
+            .execute(
+                "UPDATE sekai_ezu_geo_feeds
+                 SET backfill_after_id = ?4, updated_at_ms = ?5
+                 WHERE namespace = ?1 AND feed_id = ?2 AND revision = ?3
+                   AND run_id = ?6 AND run_lease_until_ms >= ?5
+                   AND backfill_active = 1",
+                params![
+                    feed.namespace,
+                    feed.feed_id,
+                    feed.revision as i64,
+                    after_id,
+                    now_ms,
+                    run_id
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Hands the incremental cursor to the captured watermark and clears the
+    /// backfill page. Forward only: a cursor already past the watermark stays.
+    /// The snapshot is live objects with geo; pre-watermark removals are not
+    /// expired here. A new or rebuilt Ezu has none. Incremental applies
+    /// changes after the watermark.
+    pub fn complete_ezu_geo_feed_backfill(
+        &self,
+        feed: &EzuGeoFeed,
+        run_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        self.migrate_ezu_geo_feeds()?;
+        self.conn()
+            .execute(
+                "UPDATE sekai_ezu_geo_feeds
+                 SET after_seq = CASE
+                        WHEN after_seq < backfill_watermark THEN backfill_watermark
+                        ELSE after_seq
+                     END,
+                     backfill_active = 0,
+                     backfill_after_id = '',
+                     updated_at_ms = ?4
+                 WHERE namespace = ?1 AND feed_id = ?2 AND revision = ?3
+                   AND run_id = ?5 AND run_lease_until_ms >= ?4
+                   AND backfill_active = 1",
+                params![
+                    feed.namespace,
+                    feed.feed_id,
+                    feed.revision as i64,
                     now_ms,
                     run_id
                 ],
@@ -982,5 +1221,112 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(entity.ts_ms, 2);
+    }
+
+    #[test]
+    fn backfill_captures_a_watermark_pages_by_id_and_hands_off_the_cursor() {
+        backfill_contract(&RuntimeDb::memory(), "fleet");
+    }
+
+    /// Watermark capture, keyset paging, and cursor handoff every backend keeps.
+    pub(crate) fn backfill_contract(db: &RuntimeDb, namespace: &str) {
+        let feed = EzuGeoFeed {
+            namespace: namespace.into(),
+            max_changes_per_run: 1,
+            ..feed()
+        };
+        let stored = db.put_ezu_geo_feed(&feed, "admin", 1).unwrap();
+        let id1 = format!("{namespace}-t1");
+        let id2 = format!("{namespace}-t2");
+        let id3 = format!("{namespace}-t3");
+        let truck_in = |id: &str, geo: &str, status: &str| {
+            let mut object = truck(id, geo, status, "public");
+            object.namespace = namespace.into();
+            object
+        };
+        db.create_object_with_audit(&truck_in(&id1, BERLIN, "idle"), "local")
+            .unwrap();
+        db.create_object_with_audit(&truck_in(&id2, PARIS, "moving"), "local")
+            .unwrap();
+        assert!(
+            db.lease_ezu_geo_feed_run(&stored, "run-a", false, 10, 100)
+                .unwrap()
+        );
+        let first = db
+            .begin_ezu_geo_feed_backfill(&stored, "run-a", 11)
+            .unwrap()
+            .expect("lease holds");
+        assert!(first.backfill_active);
+        assert!(first.backfill_watermark > 0);
+        assert!(first.backfill_after_id.is_empty());
+        let page = db
+            .list_ezu_geo_feed_objects(namespace, "truck", &first.backfill_after_id, 1)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, id1);
+        assert!(
+            db.advance_ezu_geo_feed_backfill(&stored, "run-a", &id1, 12)
+                .unwrap()
+        );
+        let again = db
+            .begin_ezu_geo_feed_backfill(&stored, "run-a", 13)
+            .unwrap()
+            .expect("same rebuild");
+        assert_eq!(again.backfill_watermark, first.backfill_watermark);
+        assert_eq!(again.backfill_after_id, id1);
+        let rest = db
+            .list_ezu_geo_feed_objects(namespace, "truck", &id1, 1)
+            .unwrap();
+        assert_eq!(rest[0].id, id2);
+        db.create_object_with_audit(&truck_in(&id3, BERLIN, "idle"), "local")
+            .unwrap();
+        assert!(
+            db.complete_ezu_geo_feed_backfill(&stored, "run-a", 14)
+                .unwrap()
+        );
+        let progress = db
+            .get_ezu_geo_feed_progress(namespace, "trucks")
+            .unwrap()
+            .unwrap();
+        assert!(!progress.backfill_active);
+        assert_eq!(progress.after_seq, first.backfill_watermark);
+        let mutations = db
+            .list_committed_object_mutations_after(namespace, progress.after_seq, 100)
+            .unwrap();
+        assert!(
+            mutations
+                .iter()
+                .any(|mutation| mutation.change.object_id == id3),
+            "a change after the captured watermark must be visible to incremental"
+        );
+        assert!(
+            !db.complete_ezu_geo_feed_backfill(&stored, "run-a", 15)
+                .unwrap()
+        );
+        db.release_ezu_geo_feed_run(&stored, "run-a").unwrap();
+        assert!(
+            db.lease_ezu_geo_feed_run(&stored, "run-b", false, 16, 200)
+                .unwrap()
+        );
+        assert!(
+            db.begin_ezu_geo_feed_backfill(&stored, "run-b", 17)
+                .unwrap()
+                .unwrap()
+                .backfill_active
+        );
+        let rebuilt = db.put_ezu_geo_feed(&feed, "admin", 18).unwrap();
+        let cleared = db
+            .get_ezu_geo_feed_progress(namespace, "trucks")
+            .unwrap()
+            .unwrap();
+        assert!(!cleared.backfill_active);
+        assert!(cleared.backfill_after_id.is_empty());
+        assert_eq!(cleared.after_seq, first.backfill_watermark);
+        assert!(
+            !db.begin_ezu_geo_feed_backfill(&stored, "run-b", 19)
+                .unwrap()
+                .is_some()
+        );
+        let _ = rebuilt;
     }
 }
