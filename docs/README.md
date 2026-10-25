@@ -39,7 +39,8 @@ If you want to deploy or operate the control plane:
 4. Use the [Docker guide](docker.md) if you want the supported container
    topology. Compose sets Combined dest-pair
    (`SEKAI_DB_PATH`/`CHISEI_DB_PATH`); the image sets `SEKAI_DATA_DIR=/data`,
-   which derives the same pair.
+   which derives the same pair. Use [Kubernetes on minikube](kubernetes-minikube.md)
+   for the Tenkai `kubernetes-inprocess` StatefulSet packaging.
 5. For live operations, see the [operator console](operator-console.md),
    [leases](leases.md), [object security](object-security.md), and
    [PostgreSQL parity](postgres-sekai-parity.md) /
