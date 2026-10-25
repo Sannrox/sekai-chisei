@@ -119,11 +119,12 @@ PostgreSQL implements the reusable community surface set—Sekai, Chisei, gatewa
 governance, and operations health—with shared SQLite/PostgreSQL conformance for
 the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts Combined PostgreSQL on
 `SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL`, and only when migrations and
-capabilities validate. Some public paths remain SQLite-only and fail
-closed on community Postgres (query-time ontology
-entailment and dataset row append/query through `RuntimeDb`). See
-[postgres-sekai-parity.md](postgres-sekai-parity.md) and
-[postgres-chisei-parity.md](postgres-chisei-parity.md). Backend selection does
+capabilities validate. Remaining SQLite-only experimental RPCs and admin
+projections fail closed on community PostgreSQL; they live on the shrink-only
+list in [postgres-sekai-parity.md](postgres-sekai-parity.md) and
+[postgres-chisei-parity.md](postgres-chisei-parity.md). Chisei `PlanExecution`
+and `PlanContentExecution` also fail closed on PostgreSQL (receipt persist
+with Kioku holdouts). Backend selection does
 not enable tenant, OIDC, OAuth, or identity endpoints.
 
 For multi-replica control planes, use a shared backend so budgets, leases, and

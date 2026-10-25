@@ -26,8 +26,10 @@ constrain an operation. It does not replace the agent runtime.
 - **Inspectable outcomes:** retain decisions, normalized usage, lineage,
   verification, action outcomes, and provenance under a durable operation.
 - **Local-first authority:** keep the stable 1.x graph and governance state in
-  SQLite. PostgreSQL is a partial community backend whose supported surfaces
-  are advertised at runtime and fail closed elsewhere.
+  SQLite by default. PostgreSQL is a first-class community backend for the
+  dual-backend inventory; remaining experimental and admin SQLite-only
+  surfaces fail closed, as do Chisei `PlanExecution` and
+  `PlanContentExecution`.
 
 The core product loop is deliberately small:
 
@@ -118,8 +120,8 @@ network-accessible interface.
 
 ## What works today
 
-- SQLite-backed typed-object graph with schemas, links, and datasets, plus
-  optional `SEKAI_DB_BACKEND=postgres` for the reusable community surface (no
+- SQLite-backed typed-object graph with schemas, links, and datasets, or
+  `SEKAI_DB_BACKEND=postgres` for the same reusable community surface (no
   tenant/OIDC). Virtual-table RPCs are experimental (`SEKAI_EXPERIMENTAL_RPCS=1`);
 - namespace-first access control, audit, lineage, and retention primitives;
 - work-unit admission, heartbeat, completion, and reconciliation (experimental

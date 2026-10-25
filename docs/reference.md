@@ -88,8 +88,8 @@ lives in the separate [research index](research/README.md).
 - [Replica conformance adapter](replica-conformance.md) — bounded callable
   shared-state checks for composed local test harnesses.
 - [PostgreSQL parity: Sekai](postgres-sekai-parity.md) and
-  [Chisei](postgres-chisei-parity.md) — supported dual-backend surfaces and
-  SQLite-only exceptions.
+  [Chisei](postgres-chisei-parity.md) — dual-backend surfaces and the remaining
+  shrink-only SQLite-only list.
 
 ## Graph, ontology, and retrieval
 
