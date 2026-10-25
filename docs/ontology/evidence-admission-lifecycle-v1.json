@@ -23,7 +23,7 @@
   "provenance": [
     {
       "subject": "EvidenceAdmissionLifecycle",
-      "source": "src/sekai/evidence_admission_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/evidence_admission_lifecycle.rs",
       "locator": "EvidenceAdmissionLifecycle::admit",
       "confidence": 1.0
     },

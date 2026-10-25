@@ -57,13 +57,13 @@
     },
     {
       "subject": "GuardedObjectMutationAdapter",
-      "source": "src/sekai/object_mutation.rs",
+      "source": "crates/sekai-core/src/sekai/object_mutation.rs",
       "locator": "ObjectMutation::guarded/replay/create/update/delete",
       "confidence": 1.0
     },
     {
       "subject": "DirectObjectMutationAdapter",
-      "source": "src/sekai/object_mutation.rs",
+      "source": "crates/sekai-core/src/sekai/object_mutation.rs",
       "locator": "ObjectMutation::direct/create/update/delete",
       "confidence": 1.0
     },
@@ -75,13 +75,13 @@
     },
     {
       "subject": "selects_guarded_mutation_adapter",
-      "source": "src/sekai/object_mutation.rs",
+      "source": "crates/sekai-core/src/sekai/object_mutation.rs",
       "locator": "ObjectMutation guarded branches",
       "confidence": 1.0
     },
     {
       "subject": "selects_direct_mutation_adapter",
-      "source": "src/sekai/object_mutation.rs",
+      "source": "crates/sekai-core/src/sekai/object_mutation.rs",
       "locator": "ObjectMutation direct branches",
       "confidence": 1.0
     }

@@ -45,7 +45,7 @@
   "provenance": [
     {
       "subject": "ActionWorkLifecycleModule",
-      "source": "src/sekai/action_work_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/action_work_lifecycle.rs",
       "locator": "ActionWorkLifecycle",
       "confidence": 1.0
     },
@@ -57,13 +57,13 @@
     },
     {
       "subject": "ActionWork",
-      "source": "src/sekai/action_effect.rs",
+      "source": "crates/sekai-core/src/sekai/action_effect.rs",
       "locator": "ActionEffect runtime_dispatch claim and acknowledgement methods",
       "confidence": 1.0
     },
     {
       "subject": "ActionWorkPersistenceAdapter",
-      "source": "src/db/runtime_db.rs",
+      "source": "crates/sekai-core/src/db/runtime_db.rs",
       "locator": "list_claimable_action_work/claim_action_work/heartbeat_action_claim/ack_action_work/park_action_work/report_action_claim_event",
       "confidence": 1.0
     },
@@ -75,13 +75,13 @@
     },
     {
       "subject": "governs_action_work",
-      "source": "src/sekai/action_work_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/action_work_lifecycle.rs",
       "locator": "list_claimable/claim/heartbeat/ack/report_event",
       "confidence": 1.0
     },
     {
       "subject": "uses_action_work_persistence_adapter",
-      "source": "src/sekai/action_work_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/action_work_lifecycle.rs",
       "locator": "RuntimeDb calls",
       "confidence": 1.0
     }

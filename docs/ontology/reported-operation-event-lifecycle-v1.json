@@ -11,7 +11,7 @@
   ],
   "provenance": [
     {"subject":"ReportedOperationEventLifecycle","source":"src/grpc/chisei_service/reported_operation_event_lifecycle.rs","locator":"ReportedOperationEventLifecycle/admit","confidence":1.0},
-    {"subject":"CanonicalOperationReceipt","source":"src/chisei/receipt.rs","locator":"OperationReceipt","confidence":1.0},
+    {"subject":"CanonicalOperationReceipt","source":"crates/sekai-domain/src/receipt.rs","locator":"OperationReceipt","confidence":1.0},
     {"subject":"ChiseiGrpcTransportAdapter","source":"src/grpc/chisei_service.rs","locator":"report_operation_event","confidence":1.0},
     {"subject":"delegates_reported_operation_event_to","source":"src/grpc/chisei_service.rs","locator":"ReportedOperationEventLifecycle call site","confidence":1.0},
     {"subject":"appends_to_canonical_operation_receipt","source":"src/grpc/chisei_service/reported_operation_event_lifecycle.rs","locator":"admit/append_operation_receipt_event","confidence":1.0}

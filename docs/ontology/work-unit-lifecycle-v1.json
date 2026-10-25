@@ -34,7 +34,7 @@
   "provenance": [
     {
       "subject": "WorkUnitLifecycleModule",
-      "source": "src/sekai/work_unit_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/work_unit_lifecycle.rs",
       "locator": "WorkUnitLifecycle/create/admit/transition/reconcile",
       "confidence": 1.0
     },
@@ -46,7 +46,7 @@
     },
     {
       "subject": "WorkUnit",
-      "source": "src/sekai/coordination.rs",
+      "source": "crates/sekai-core/src/sekai/coordination.rs",
       "locator": "WorkUnit",
       "confidence": 1.0
     },
@@ -58,7 +58,7 @@
     },
     {
       "subject": "governs_work_unit",
-      "source": "src/sekai/work_unit_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/work_unit_lifecycle.rs",
       "locator": "create/admit/transition/reconcile",
       "confidence": 1.0
     }

@@ -45,7 +45,7 @@
   "provenance": [
     {
       "subject": "CoordinationLeaseLifecycleModule",
-      "source": "src/sekai/lease_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/lease_lifecycle.rs",
       "locator": "LeaseLifecycle",
       "confidence": 1.0
     },
@@ -63,7 +63,7 @@
     },
     {
       "subject": "ObjectBoundLeasePrecondition",
-      "source": "src/sekai/lease_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/lease_lifecycle.rs",
       "locator": "GuardedMutationPrecondition",
       "confidence": 1.0
     },
@@ -75,13 +75,13 @@
     },
     {
       "subject": "validates_guarded_mutation",
-      "source": "src/sekai/lease_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/lease_lifecycle.rs",
       "locator": "LeaseLifecycle::validate_guarded_mutation",
       "confidence": 1.0
     },
     {
       "subject": "is_fenced_by_object_bound_lease",
-      "source": "src/sekai/lease_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/lease_lifecycle.rs",
       "locator": "GuardedMutationTarget",
       "confidence": 1.0
     }

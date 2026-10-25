@@ -21,7 +21,7 @@ accurate behavior during a major docs refactor.
 
 Required:
 
-- A target docs page path, such as `docs/operational-storage.md`.
+- A target docs page path, such as `docs/operations.md`.
 
 Optional:
 
@@ -170,7 +170,7 @@ Run the smallest reliable checks for the touched surface:
 - `git diff --check -- <touched-files>` when in a git worktree.
 - Project formatting/lint for Markdown if configured.
 - Run commands and examples from the page whenever feasible.
-- For Tenkai Rust-adjacent claims, use `verify-change` only when code or tests
+- For sekai-chisei Rust-adjacent claims, use `verify-change` only when code or tests
   also moved; pure prose needs source read-back, not a full cargo suite.
 
 If you cannot verify a behavior-sensitive claim, either remove the claim, mark

@@ -44,7 +44,7 @@
   ],
   "provenance": [
     {"subject":"GovernedSubjectLifecycleModule","source":"src/grpc/chisei_service/governed_subject_lifecycle.rs","locator":"GovernedSubjectLifecycle/evaluate/export_provenance","confidence":1.0},
-    {"subject":"GovernedSubjectEvaluation","source":"src/chisei/governed_subject.rs","locator":"GovernedSubjectEnvelope/GovernedSubjectResult","confidence":1.0},
+    {"subject":"GovernedSubjectEvaluation","source":"crates/chisei-core/src/chisei/governed_subject.rs","locator":"GovernedSubjectEnvelope/GovernedSubjectResult","confidence":1.0},
     {"subject":"GovernedSubjectProvenanceExport","source":"crates/sekai-types/src/governed_subject_provenance.rs","locator":"ExportRecord/ProvenanceEnvelope","confidence":1.0},
     {"subject":"ChiseiGrpcTransportAdapter","source":"src/grpc/chisei_service.rs","locator":"evaluate_governed_subject/export_governed_subject_provenance","confidence":1.0},
     {"subject":"delegates_governed_subject_lifecycle_to","source":"src/grpc/chisei_service.rs","locator":"GovernedSubjectLifecycle call sites","confidence":1.0},
