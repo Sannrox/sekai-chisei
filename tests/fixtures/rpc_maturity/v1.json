@@ -2421,7 +2421,7 @@
       "service": "ChiseiService",
       "rpc": "RedeemExternalActionPermit",
       "storage_path": "chisei.approvals",
-      "real_backend": "sqlite only",
+      "real_backend": "yes",
       "consumer": "example",
       "classification": "stable",
       "product_tier": "advanced"

@@ -471,7 +471,9 @@ fn conflict_alert_count(db: &RuntimeDb, redemption_id: &str) -> i64 {
 /// Admit, reject invalid host identity, record Accepted→Started→OutcomeUnknown,
 /// idempotent re-record, conflict after terminal, and resolve on both backends.
 /// Shared/memory RuntimeDb only: dest-pair SchemaPlane::Sekai has no
-/// `chisei_external_action_redemptions` until permit redeem is dual-backend (#1323).
+/// `chisei_external_action_redemptions` (relocation fence). Redeem lives on
+/// the Chisei dest; dest-pair evidence-to-redemption binding is composition,
+/// not dual-backend redeem (#1323).
 pub(crate) fn exercise_execution_recording(db: &RuntimeDb, prefix: &str) {
     let producer = execution_producer(prefix);
     db.create_object(&Object {

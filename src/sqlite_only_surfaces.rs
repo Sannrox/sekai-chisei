@@ -19,7 +19,7 @@ pub const RUNTIME_DB_SRC: &str = concat!(
     )),
     include_str!("chisei_store/runtime.rs")
 );
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 10;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -438,6 +438,7 @@ mod tests {
         assert!(!list.contains_rpc("SekaiService", "GetClassificationLattice"));
         assert!(!list.contains_rpc("SekaiService", "ListObjectChanges"));
         assert!(!list.contains_rpc("SekaiService", "SubmitEvidence"));
+        assert!(!list.contains_rpc("ChiseiService", "RedeemExternalActionPermit"));
         assert!(!list.contains_rpc("SekaiService", "RegisterSourceTypeDescriptor"));
         assert!(!list.contains_rpc("SekaiService", "DecideActionInstance"));
         assert!(!list.contains_rpc("SekaiService", "AdmitGovernedDocument"));
@@ -583,6 +584,15 @@ mod tests {
                 && !closed.contains("reject_evidence_submission")
                 && !closed.contains("validate_execution_evidence_envelope"),
             "dual-backend execution evidence must not look sqlite-only"
+        );
+        assert!(
+            !closed.contains("redeem_permit")
+                && !closed.contains("redeem_or_reconcile_permit")
+                && !closed.contains("validate_delegation_chain")
+                && !closed.contains("validate_permit_state")
+                && !closed.contains("validate_permit_for_delegation")
+                && !closed.contains("replay_redemption"),
+            "dual-backend permit redeem, reconcile, and delegation must not look sqlite-only"
         );
     }
 }

@@ -11,6 +11,18 @@ impl BudgetHarness for PostgresDb {}
 fn exercise(db: &dyn BudgetHarness, prefix: &str) {
     let scope = format!("{prefix}:project:agent");
     db.budget_set_limit(&scope, "tokens", 100, "daily").unwrap();
+    let limits = db.budget_limits_for_scope(&scope).unwrap();
+    assert!(
+        limits
+            .iter()
+            .any(|(stored_scope, metric, max_amount, period)| {
+                stored_scope == &scope
+                    && metric == "tokens"
+                    && *max_amount == 100
+                    && period == "daily"
+            }),
+        "GetEffectivePolicySummary budget-limit projection must match the stored limit: {limits:?}"
+    );
     db.budget_check_and_reserve_chain(&scope, "tokens", 40, 1_700_000_000_000)
         .unwrap();
     let (used, max, period) = db
@@ -112,4 +124,16 @@ fn postgres_chisei_budget_conformance_and_restart() {
         .budget_usage(&scope, "tokens", 1_700_000_000_000)
         .unwrap();
     assert_eq!((used, max), (55, 100));
+    let limits = restarted.budget_limits_for_scope(&scope).unwrap();
+    assert!(
+        limits
+            .iter()
+            .any(|(stored_scope, metric, max_amount, period)| {
+                stored_scope == &scope
+                    && metric == "tokens"
+                    && *max_amount == 100
+                    && period == "daily"
+            }),
+        "restarted GetEffectivePolicySummary budget-limit projection must match the stored limit: {limits:?}"
+    );
 }

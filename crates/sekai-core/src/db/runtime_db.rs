@@ -5952,8 +5952,7 @@ impl RuntimeDb {
     ) -> Result<Vec<ExecutionEvidenceAlert>, String> {
         match self {
             Self::Sqlite(db) => db.reconcile_missing_execution_evidence(now_ms),
-            // Permit redemption fails closed on PostgreSQL, so no redeemed
-            // action can be waiting for host evidence.
+            // Missing-evidence sweep is not dual-backend yet; callers get no alerts.
             Self::Postgres(_) => Ok(Vec::new()),
         }
     }
