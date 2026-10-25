@@ -949,6 +949,7 @@ impl SekaiDb {
             &published_revision,
             &published_members,
             &request.members,
+            &crate::db::governed_transform::list_all_transforms_tx(&transaction)?,
         )?;
         let proposal = open_replacement_proposal_sqlite(
             &transaction,
@@ -1389,6 +1390,13 @@ impl SekaiDb {
             &published_revision.revision_digest,
             now_ms,
             Some(&published),
+        )?;
+        crate::db::governed_transform::apply_transform_store_edits_sqlite(
+            &transaction,
+            &proposal.namespace,
+            &published_members,
+            &candidate_members,
+            now_ms,
         )?;
         transaction
             .execute(

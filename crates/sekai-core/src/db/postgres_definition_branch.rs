@@ -375,6 +375,7 @@ impl PostgresDb {
             &published_revision,
             &published_members,
             &request.members,
+            &crate::db::postgres_governed_transform::list_all_transforms_pg(&mut transaction)?,
         )?;
         let proposal = open_replacement_proposal_postgres(
             &mut transaction,
@@ -955,6 +956,13 @@ impl PostgresDb {
             &published_revision.revision_digest,
             now_ms,
             Some(&published),
+        )?;
+        crate::db::postgres_governed_transform::apply_transform_store_edits_pg(
+            &mut transaction,
+            &proposal.namespace,
+            &published_members,
+            &candidate_members,
+            now_ms,
         )?;
         transaction
             .execute(

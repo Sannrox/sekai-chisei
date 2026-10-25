@@ -3319,7 +3319,91 @@ fn stamp_run_dispatch_pg(
     crate::db::postgres_receipt_chain::append_transform_run_chain(tx, &run)
 }
 
-fn list_all_transforms_pg(
+pub(crate) fn apply_transform_store_edits_pg(
+    tx: &mut postgres::Transaction<'_>,
+    namespace: &str,
+    previous: &[crate::sekai::definition_branch::DefinitionMember],
+    next: &[crate::sekai::definition_branch::DefinitionMember],
+    now_ms: i64,
+) -> Result<(), String> {
+    let lock_key = advisory_lock_key(&["governed_transform", "graph", namespace]);
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 467))",
+        &[&lock_key],
+    )
+    .map_err(|error| error.to_string())?;
+    let mut published = list_all_transforms_pg(tx)?;
+    let edits = crate::sekai::definition_package::transform_store_edits(
+        namespace, previous, next, &published,
+    )?;
+    if edits.upserts.is_empty() && edits.deletions.is_empty() {
+        return Ok(());
+    }
+    published.retain(|transform| {
+        transform.namespace != namespace || !edits.deletions.contains(&transform.transform_id)
+    });
+    for transform in &edits.upserts {
+        published.retain(|existing| {
+            existing.namespace != transform.namespace
+                || existing.transform_id != transform.transform_id
+        });
+        published.push(transform.clone());
+    }
+    if let Some(transform) = edits.upserts.first() {
+        refuse_dependency_cycle(&published, transform).map_err(|error| error.message())?;
+    }
+    for transform_id in &edits.deletions {
+        tx.execute(
+            "DELETE FROM sekai_transform_trigger_pending
+             WHERE namespace = $1 AND transform_id = $2",
+            &[&namespace as &(dyn ToSql + Sync), transform_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_governed_transform
+             WHERE namespace = $1 AND transform_id = $2",
+            &[&namespace as &(dyn ToSql + Sync), transform_id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    for transform in &edits.upserts {
+        tx.execute(
+            "DELETE FROM sekai_transform_trigger_pending
+             WHERE namespace = $1 AND transform_id = $2",
+            &[
+                &transform.namespace as &(dyn ToSql + Sync),
+                &transform.transform_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        let json = serde_json::to_string(transform).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_governed_transform
+             (namespace, transform_id, definition_json, definition_digest,
+              input_dataset_id, output_dataset_id, created_at_ms)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (namespace, transform_id) DO UPDATE SET
+                definition_json = EXCLUDED.definition_json,
+                definition_digest = EXCLUDED.definition_digest,
+                input_dataset_id = EXCLUDED.input_dataset_id,
+                output_dataset_id = EXCLUDED.output_dataset_id,
+                created_at_ms = EXCLUDED.created_at_ms",
+            &[
+                &transform.namespace,
+                &transform.transform_id,
+                &json,
+                &transform.definition_digest,
+                &transform.input_dataset_id,
+                &transform.output_dataset_id,
+                &now_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn list_all_transforms_pg(
     tx: &mut postgres::Transaction<'_>,
 ) -> Result<Vec<GovernedTransform>, String> {
     tx.query(
