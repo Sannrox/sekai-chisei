@@ -104,10 +104,12 @@ create a scratch database on.
 **Remaining SQLite-only paths** after #1328 (community PostgreSQL fails
 closed; do not treat inventory “complete” as dual-backend for these) live in
 the shrink-only list
-[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
-They are experimental ontology deletes and named admin projections, not the
-product loop. Execution-evidence reject and record helpers used by evidence
-admission share SQLite and PostgreSQL persistence (#1318).
+[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json)
+(experimental ontology deletes and named admin projections) and in the Chisei
+planning RPCs `PlanExecution` / `PlanContentExecution` (see
+[postgres-chisei-parity.md](postgres-chisei-parity.md)). Execution-evidence
+reject and record helpers used by evidence admission share SQLite and
+PostgreSQL persistence (#1318).
 `SekaiService.SubmitEvidence` is a dual-backend RPC.
 Query-time ontology entailment on `RetrieveContext` / `ExpandRelations` runs
 on PostgreSQL too (#1320), with a shared case asserting the same results; see
@@ -172,8 +174,9 @@ Evidence is checked in as:
 - Community PostgreSQL runtime activation (#238) — complete; select with `SEKAI_DB_BACKEND=postgres`
 - Tenant state, tenant RPCs, OIDC, and OAuth
 - Dest-pair `reconcile_missing_execution_evidence` cannot join the Sekai and
-  Chisei stores on one connection and stays fail-closed on PostgreSQL; see
-  the Chisei parity note for PlanExecution receipt holdouts
+  Chisei stores on one connection and stays fail-closed on PostgreSQL
+- Chisei `PlanExecution` and `PlanContentExecution` fail closed on PostgreSQL
+  (receipt persist with Kioku holdouts); see the Chisei parity note
 
 ## Operator posture
 
@@ -183,7 +186,8 @@ community choice: Combined PostgreSQL opens `SEKAI_DATABASE_URL` +
 `DATABASE_URL` is retired and refuses boot. Use that dest-pair when you need
 shared multi-replica authority for the dual-backend surfaces above (see
 [configuration.md](configuration.md) and #238). Remaining shrink-only
-surfaces fail closed on PostgreSQL.
+surfaces fail closed on PostgreSQL, as do Chisei `PlanExecution` and
+`PlanContentExecution`.
 
 Every pull request runs PostgreSQL conformance
 (`.github/workflows/postgres-conformance.yml`). Local `cargo test` still

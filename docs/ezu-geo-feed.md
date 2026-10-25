@@ -1,5 +1,6 @@
 # Fenced Ezu geo feed
 
+Parent epic: [#1565](https://github.com/Sannrox/sekai-chisei/issues/1565).  
 Issues: [#1797](https://github.com/Sannrox/sekai-chisei/issues/1797),
 [#1798](https://github.com/Sannrox/sekai-chisei/issues/1798).
 Decisions: [ADR 0132](decisions/0132-ezu-geo-feed.md),

@@ -122,7 +122,9 @@ the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts Combine
 capabilities validate. Remaining SQLite-only experimental RPCs and admin
 projections fail closed on community PostgreSQL; they live on the shrink-only
 list in [postgres-sekai-parity.md](postgres-sekai-parity.md) and
-[postgres-chisei-parity.md](postgres-chisei-parity.md). Backend selection does
+[postgres-chisei-parity.md](postgres-chisei-parity.md). Chisei `PlanExecution`
+and `PlanContentExecution` also fail closed on PostgreSQL (receipt persist
+with Kioku holdouts). Backend selection does
 not enable tenant, OIDC, OAuth, or identity endpoints.
 
 For multi-replica control planes, use a shared backend so budgets, leases, and

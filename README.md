@@ -28,7 +28,8 @@ constrain an operation. It does not replace the agent runtime.
 - **Local-first authority:** keep the stable 1.x graph and governance state in
   SQLite by default. PostgreSQL is a first-class community backend for the
   dual-backend inventory; remaining experimental and admin SQLite-only
-  surfaces fail closed.
+  surfaces fail closed, as do Chisei `PlanExecution` and
+  `PlanContentExecution`.
 
 The core product loop is deliberately small:
 
