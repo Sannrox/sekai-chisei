@@ -28,9 +28,9 @@ Design Discussion because no public contract or trust boundary changes.
 The inventory covers the consecutive external-action methods in
 [`ChiseiService`](../../proto/chisei.proto), their implementations in
 [`chisei_service.rs`](../../src/grpc/chisei_service.rs), SQLite permit storage
-in [`external_permit.rs`](../../src/chisei/external_permit.rs), PostgreSQL
+in [`external_permit.rs`](../../crates/chisei-core/src/chisei/external_permit.rs), PostgreSQL
 storage in
-[`postgres_external_permit.rs`](../../src/chisei_store/postgres_external_permit.rs), and
+[`postgres_external_permit.rs`](../../crates/chisei-core/src/chisei_store/postgres_external_permit.rs), and
 the checked-in
 [`chisei.rpc-inventory/v1`](../../tests/fixtures/chisei_rpc_inventory/v1.json).
 
