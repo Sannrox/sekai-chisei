@@ -7,7 +7,7 @@ A dataset is generated, not stored. A checked-in definition
 (`chisei.eval-dataset-definition/v1`, under
 `tests/fixtures/evaluation/datasets/`) names a synthetic tenant (generator,
 fixture namespace, seed and size preset, see synthetic tenants in
-`src/sekai/synthetic.rs`) and case templates over its objects:
+`crates/sekai-core/src/sekai/synthetic.rs`) and case templates over its objects:
 
 ```json
 {

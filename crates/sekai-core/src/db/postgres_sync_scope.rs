@@ -1,5 +1,5 @@
 //! PostgreSQL storage for offline sync scopes (#1632). Same tables and
-//! semantics as SQLite (`src/db/sync_scope.rs`).
+//! semantics as SQLite (`crates/sekai-core/src/db/sync_scope.rs`).
 
 use crate::db::postgres::PostgresDb;
 use crate::db::sync_scope::{definition_json, parse_definition};

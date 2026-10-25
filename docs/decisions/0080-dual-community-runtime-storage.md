@@ -63,7 +63,7 @@ different database from the control plane (`data/sekai.db`).
 ## Consequences
 
 Operators keep `SEKAI_DB_BACKEND=sqlite|postgres`. Contributors keep dual
-migrations (SQLite `migrate_*` and `src/db/postgres/00NN_*.sql`) and
+migrations (SQLite `migrate_*` and `crates/sekai-core/src/db/postgres/00NN_*.sql`) and
 shared conformance. A future packaging ADR may pick one local binary;
 until then neither backend is deprecated. Query-engine traits
 (`SEKAI_OBJECT_INDEX_ENGINE`) stay independent of this storage pair.

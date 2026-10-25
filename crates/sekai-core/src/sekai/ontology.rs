@@ -5,7 +5,7 @@
 //! ontology primitives — classes (with inheritance, equivalence, disjointness),
 //! properties, and relations (with domain/range and cardinality) — plus
 //! definition validation, a projection from the existing `SchemaRegistry`, and
-//! SQLite storage. PostgreSQL persistence is in `src/db/postgres_ontology.rs`.
+//! SQLite storage. PostgreSQL persistence is in `crates/sekai-core/src/db/postgres_ontology.rs`.
 //!
 //! Class inheritance and equivalence live here (`kind_satisfies_class`,
 //! `kind_entailment_path`). This module also owns SQLite storage helpers and

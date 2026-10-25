@@ -1,5 +1,5 @@
 //! PostgreSQL storage for dataset branches (ADR 0119). Same tables and
-//! semantics as SQLite (`src/db/dataset_branch.rs`). Every branch mutation
+//! semantics as SQLite (`crates/sekai-core/src/db/dataset_branch.rs`). Every branch mutation
 //! first takes the dataset rows lock that appends, rollback and redaction
 //! use, so they serialize with one another and with retention.
 
@@ -135,7 +135,7 @@ impl PostgresDb {
         Ok((base, expected))
     }
 
-    /// PostgreSQL twin of the SQLite branch run (`src/db/dataset_branch.rs`).
+    /// PostgreSQL twin of the SQLite branch run (`crates/sekai-core/src/db/dataset_branch.rs`).
     pub fn run_governed_transform_on_branch(
         &self,
         namespace: &str,

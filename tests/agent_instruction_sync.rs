@@ -45,4 +45,39 @@ fn agents_md_names_shipped_plane_bin_sources() {
         agents.contains("`fmt-check` is `fmt --all -- --check`"),
         "AGENTS.md must describe the fmt-check alias as it is in .cargo/config.toml"
     );
+    assert!(
+        agents.contains("`src/bin/sekaictl.rs`"),
+        "AGENTS.md must name the operator CLI source that Cargo auto-discovers"
+    );
+    assert!(
+        root.join("src/bin/sekaictl.rs").is_file(),
+        "src/bin/sekaictl.rs must exist"
+    );
+}
+
+#[test]
+fn agents_md_names_every_workspace_crate() {
+    let agents = include_str!("../AGENTS.md");
+    let cargo = include_str!("../Cargo.toml");
+    let start = cargo
+        .find("members = [")
+        .expect("Cargo.toml must declare workspace members");
+    let body = &cargo[start + "members = [".len()..];
+    let end = body.find(']').expect("workspace members list must close");
+    let mut missing = Vec::new();
+    for line in body[..end].lines() {
+        let entry = line.trim().trim_end_matches(',').trim_matches('"');
+        if entry.is_empty() {
+            continue;
+        }
+        let name = entry.rsplit('/').next().expect("crate path has a name");
+        let needle = format!("`{name}`");
+        if !agents.contains(&needle) {
+            missing.push(name.to_string());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "AGENTS.md must name every workspace crate; missing {missing:?}"
+    );
 }

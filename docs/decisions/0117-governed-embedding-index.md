@@ -42,7 +42,7 @@ to be computed, and it outlives the text it came from unless it follows edits.
    the deployment may only embed properties the egress policy lets leave
    (schema classification and the object's external-property list). Any
    other property fails the catch-up closed; it is never dropped silently.
-6. Models sit behind the `Embedder` seam in `sekai-provider`. A failure leaves
+6. Models sit behind the `Embedder` seam in `chisei-provider`. A failure leaves
    the checkpoint where it was, so the next catch-up retries.
 7. Every write to a spec's index (vectors, deletes, resets, checkpoint) is a
    compare-and-bump of a per-spec revision in the same transaction. Two

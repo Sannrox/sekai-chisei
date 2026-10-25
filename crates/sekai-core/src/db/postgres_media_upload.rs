@@ -1,5 +1,5 @@
 //! PostgreSQL storage for media uploads (#1623). Same tables and semantics
-//! as SQLite (`src/db/media_upload.rs`); appends lock the session row, so
+//! as SQLite (`crates/sekai-core/src/db/media_upload.rs`); appends lock the session row, so
 //! two instances never store a chunk at the same offset.
 
 use crate::db::postgres::PostgresDb;
