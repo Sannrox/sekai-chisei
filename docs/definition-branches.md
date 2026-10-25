@@ -366,6 +366,14 @@ cost and latency. No Action is submitted. A namespace that opts in with
 (ADR 0079); the report never certifies. `GetAgentShadowReport` reads the
 stored report. The RPCs are experimental.
 
+Governed transforms gate the same way (#1796). A namespace opts in with
+`ShadowGovernedTransform`'s `require_for_promotion`. From then on, a proposal
+that changes a `transform` member merges only with a stored passing shadow
+report for that candidate against the revision running now. New and removed
+transforms, changes a shadow cannot compare (another output, or
+isolated-process), and rollbacks are exempt. See
+[governed transforms](governed-transforms.md#promotion).
+
 ### Scoped draft authoring
 
 Scoped authenticated contexts can call qualified `sekai.SekaiService`

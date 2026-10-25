@@ -92,3 +92,18 @@ replay record now also keeps that baseline digest in the receipt's scheme
 (`baseline_output_digest`; empty on older records). Shadows run on
 request, never on a schedule or trigger, which keeps compute visible and
 under the quota gate. The summed report is returned, not stored.
+
+## Amendment 2026-10-25 (promotion)
+
+#1796 stores each shadow report (`sekai_transform_shadow_reports`; SQLite,
+and PostgreSQL `0120_transform_shadow_reports`) by id with counts and
+digests, never changed keys or samples. A report passes when it compared at
+least one run. A namespace that opted in (`sekai_transform_shadow_requirements`)
+merges a definition proposal that changes a governed transform only with a
+passing report for that candidate. The candidate is matched by its member
+digest, without schedule or trigger, and against the revision running at
+merge time, inside the merge transaction. New and removed transforms, a
+transform moved to another output dataset or isolated-process on either
+side, and rollbacks are exempt: there
+is nothing a shadow can compare, or the revision was promoted before. History and rollback
+are the definition proposal's.

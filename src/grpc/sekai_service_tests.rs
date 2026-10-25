@@ -2401,6 +2401,292 @@ async fn definition_package_round_trips_governed_transforms_and_refuses_output_m
 }
 
 #[tokio::test]
+async fn transform_promotion_needs_a_passing_shadow_where_required_and_rolls_back() {
+    // #1796: once a namespace requires shadows, a proposal that changes a
+    // governed transform merges only with a passing report for exactly that
+    // candidate against the revision running now. Rollback restores the
+    // previous revision, and the published history shows both changes.
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform, TransformStep};
+    let svc = service();
+    let namespace = "tf-shadow";
+    let projection_to = |columns: &[&str], output: &str| {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: namespace.into(),
+            transform_id: "ProjectTickets".into(),
+            input_dataset_id: "shadow-tickets".into(),
+            output_dataset_id: output.into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    };
+    let projection = |columns: &[&str]| projection_to(columns, "shadow-ticket-out");
+    let member_to = |columns: &[&str], output: &str| DefinitionMemberInput {
+        member_kind: "transform".into(),
+        member_id: "ProjectTickets".into(),
+        definition_json: crate::sekai::definition_package::package_transform_json(&projection_to(
+            columns, output,
+        ))
+        .unwrap(),
+        member_digest: String::new(),
+    };
+    let member = |columns: &[&str]| member_to(columns, "shadow-ticket-out");
+    for id in ["shadow-tickets", "shadow-ticket-out", "shadow-ticket-moved"] {
+        svc.create_dataset(with_named_principal(
+            CreateDatasetRequest {
+                dataset: Some(Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: ["id", "title", "body"]
+                        .map(|name| ColumnDef {
+                            name: name.into(),
+                            r#type: "string".into(),
+                            classification: "public".into(),
+                        })
+                        .to_vec(),
+                    object_id: String::new(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                }),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    let runtime = svc.db.runtime();
+    runtime
+        .append_rows(
+            "shadow-tickets",
+            &[[
+                ("id".to_string(), "1".to_string()),
+                ("title".into(), "t".into()),
+                ("body".into(), "b".into()),
+            ]
+            .into()],
+        )
+        .unwrap();
+    let parent = seed_definition_parent(&svc, namespace);
+    let (first, _) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "tf-sh-1",
+        "tf-sh-cs-1",
+        vec![member(&["id", "title"])],
+    )
+    .await;
+    runtime
+        .run_governed_transform(
+            namespace,
+            "ProjectTickets",
+            false,
+            crate::sekai::dataset_version::now_ms(),
+        )
+        .unwrap();
+    let shadow = |columns: &[&str], require: bool| {
+        svc.shadow_governed_transform(with_named_principal(
+            ShadowGovernedTransformRequest {
+                namespace: namespace.into(),
+                transform_id: "ProjectTickets".into(),
+                definition_json: serde_json::to_string(&projection(columns)).unwrap(),
+                key_column: "id".into(),
+                require_for_promotion: require,
+                ..Default::default()
+            },
+            "root",
+        ))
+    };
+    // Opting in with a shadow of another candidate leaves this one without
+    // a report.
+    let other = shadow(&["id", "body"], true)
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert!(other.passing && !other.id.is_empty());
+    let refused = propose_and_merge_definition(
+        &svc,
+        namespace,
+        &first,
+        "tf-sh-2",
+        "tf-sh-cs-2",
+        vec![member(&["id", "title", "body"])],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::sekai::transform_shadow::REFUSAL_TRANSFORM_SHADOW),
+        "{}",
+        refused.message()
+    );
+    assert_eq!(
+        runtime
+            .get_governed_transform(namespace, "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["id", "title"]
+    );
+    // With a passing report for this candidate, the same proposal merges.
+    let report = shadow(&["id", "title", "body"], false)
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert!(report.passing);
+    assert_eq!(report.runs[0].changed_keys, ["1"]);
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "tf-sh-cs-2".into(),
+                expected_published_digest: first.clone(),
+                idempotency_key: "tf-sh-2-merge-again".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let second = merged.published_revision.unwrap().revision_digest;
+    // A retry of the merge returns its result; the gate does not re-run
+    // against the revision it promoted.
+    let retried = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "tf-sh-cs-2".into(),
+                expected_published_digest: first.clone(),
+                idempotency_key: "tf-sh-2-merge-again".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retried.receipt_id, merged.receipt_id);
+    assert_eq!(
+        runtime
+            .get_governed_transform(namespace, "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["id", "title", "body"]
+    );
+
+    // Rollback restores the previous revision without a new shadow.
+    let rolled = svc
+        .propose_definition_rollback(with_named_principal(
+            ProposeDefinitionRollbackRequest {
+                namespace: namespace.into(),
+                branch_id: "tf-sh-restore".into(),
+                proposal_id: "tf-sh-cs-restore".into(),
+                restore_from_digest: first.clone(),
+                migration_plan_digest: String::new(),
+                idempotency_key: "tf-sh-restore".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "tf-sh-cs-restore".into(),
+            idempotency_key: "tf-sh-restore-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "tf-sh-cs-restore".into(),
+            expected_published_digest: rolled.proposal.unwrap().base_digest,
+            idempotency_key: "tf-sh-restore-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime
+            .get_governed_transform(namespace, "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["id", "title"]
+    );
+    let history = svc
+        .list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: "transform".into(),
+                member_id: "ProjectTickets".into(),
+                page_token: String::new(),
+                page_size: 0,
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let previous: Vec<&str> = history
+        .entries
+        .iter()
+        .map(|entry| entry.previous_published_digest.as_str())
+        .collect();
+    assert_eq!(history.entries.len(), 3, "{history:?}");
+    assert!(previous.contains(&first.as_str()) && previous.contains(&second.as_str()));
+
+    // Moved to another output, the transform is a new pipeline a shadow
+    // cannot compare: it merges without a report.
+    let head = history.entries[0].revision_digest.clone();
+    propose_and_merge_definition(
+        &svc,
+        namespace,
+        &head,
+        "tf-sh-move",
+        "tf-sh-cs-move",
+        vec![member_to(&["id", "title"], "shadow-ticket-moved")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime
+            .get_governed_transform(namespace, "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .output_dataset_id,
+        "shadow-ticket-moved"
+    );
+}
+
+#[tokio::test]
 async fn propose_definition_rollback_restores_as_descendant_and_gates_live_values() {
     let svc = service();
     let namespace = "rollback-team";

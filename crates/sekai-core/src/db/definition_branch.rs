@@ -1396,6 +1396,8 @@ impl SekaiDb {
             &proposal.namespace,
             &published_members,
             &candidate_members,
+            // A rollback restores a revision already promoted (#1796).
+            proposal.restored_from_digest.is_empty(),
             now_ms,
         )?;
         transaction

@@ -9,8 +9,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::governed_transform::GovernedTransform;
 use crate::transform_replay::{MAX_SAMPLES, ReplayRowChange, TransformReplay};
 
+/// A namespace that requires shadows refuses to promote a transform
+/// revision without a passing report for it (#1796).
+pub const REFUSAL_TRANSFORM_SHADOW: &str = "transform_promotion_requires_shadow_report";
 pub const SHADOW_NEEDS_CANDIDATE: &str = "a shadow needs a candidate definition";
 pub const SHADOW_NO_RUNS: &str = "the active revision has no runs to shadow";
 pub const SHADOW_RUN_NOT_FOUND: &str = "a named run is not a run of this transform";
@@ -42,6 +46,9 @@ pub struct ShadowTransform {
     pub key_column: String,
     /// As for a replay: refused if the stored definition changed since.
     pub expected_definition_digest: String,
+    /// Also make the namespace require a passing report before promoting
+    /// any transform revision. Once set, it stays.
+    pub require_for_promotion: bool,
     pub actor: String,
     pub tenant: String,
 }
@@ -83,10 +90,18 @@ pub struct ShadowSample {
 /// A candidate revision against the active one over the shadowed runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TransformShadowReport {
+    /// The stored report's id.
+    pub id: String,
     pub namespace: String,
     pub transform_id: String,
     pub active_definition_digest: String,
     pub candidate_definition_digest: String,
+    /// The candidate as a definition member carries it: without schedule or
+    /// trigger, which stay local. Promotion checks reports by this digest.
+    pub candidate_member_digest: String,
+    /// At least one run was compared. A passing report is evidence for
+    /// promotion; it does not judge the differences.
+    pub passing: bool,
     pub runs: Vec<ShadowRun>,
     /// Totals over the runs that were not skipped.
     pub runs_compared: i64,
@@ -165,7 +180,31 @@ pub fn shadow_report(
         shadow_compute_ms,
         active_latency_ms: mean(active_latencies.iter().sum(), active_latencies.len()),
         shadow_latency_ms: mean(shadow_compute_ms, compared.len()),
+        passing: !compared.is_empty(),
         runs,
+        ..TransformShadowReport::default()
+    }
+}
+
+/// Whether a shadow can compare `candidate` with `active` at all: both run
+/// in-process and write the same output. Promotion gates only changes a
+/// shadow can compare; the rest have no report to require (#1796).
+pub fn shadow_can_compare(active: &GovernedTransform, candidate: &GovernedTransform) -> bool {
+    active.output_dataset_id == candidate.output_dataset_id
+        && !active.is_isolated_process()
+        && !candidate.is_isolated_process()
+}
+
+impl TransformShadowReport {
+    /// The report as stored: counts and digests. Changed keys and sample rows
+    /// are values of the data and are returned, not kept.
+    pub fn without_rows(&self) -> Self {
+        let mut stored = self.clone();
+        stored.samples.clear();
+        for run in &mut stored.runs {
+            run.changed_keys.clear();
+        }
+        stored
     }
 }
 
@@ -173,6 +212,36 @@ pub fn shadow_report(
 mod tests {
     use super::*;
     use crate::transform_replay::ReplayDiff;
+
+    #[test]
+    fn only_in_process_changes_to_the_same_output_can_be_compared() {
+        let transform = GovernedTransform {
+            contract_version: String::new(),
+            namespace: String::new(),
+            transform_id: String::new(),
+            input_dataset_id: String::new(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        };
+        assert!(shadow_can_compare(&transform, &transform));
+        let moved = GovernedTransform {
+            output_dataset_id: "elsewhere".into(),
+            ..transform.clone()
+        };
+        assert!(!shadow_can_compare(&transform, &moved));
+        let isolated = GovernedTransform {
+            isolated_process: Some(Default::default()),
+            ..transform.clone()
+        };
+        assert!(!shadow_can_compare(&transform, &isolated));
+        assert!(!shadow_can_compare(&isolated, &transform));
+    }
 
     fn replay(baseline_rows: i64, added: i64, removed: i64, changed: i64) -> TransformReplay {
         TransformReplay {
@@ -219,7 +288,9 @@ mod tests {
             (10, 20)
         );
         assert_eq!(report.runs.len(), 3);
+        assert!(report.passing);
         let empty = shadow_report("ns", "t", "a", "b", vec![], vec![]);
         assert_eq!((empty.match_rate, empty.shadow_latency_ms), (1.0, 0));
+        assert!(!empty.passing);
     }
 }

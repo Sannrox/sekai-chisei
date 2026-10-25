@@ -3612,6 +3612,7 @@ pub(crate) fn apply_transform_store_edits_sqlite(
     namespace: &str,
     previous: &[crate::sekai::definition_branch::DefinitionMember],
     next: &[crate::sekai::definition_branch::DefinitionMember],
+    shadow_gated: bool,
     now_ms: i64,
 ) -> Result<(), String> {
     let mut published = list_all_transforms_tx(tx)?;
@@ -3620,6 +3621,56 @@ pub(crate) fn apply_transform_store_edits_sqlite(
     )?;
     if edits.upserts.is_empty() && edits.deletions.is_empty() {
         return Ok(());
+    }
+    // #1796: in a namespace that requires shadows, changing a transform
+    // needs a passing shadow report for this candidate against the revision
+    // being replaced, checked here so it is atomic with publication.
+    if shadow_gated {
+        let required = tx
+            .query_row(
+                "SELECT 1 FROM sekai_transform_shadow_requirements WHERE namespace = ?1",
+                params![namespace],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some();
+        for transform in edits.upserts.iter().filter(|_| required) {
+            // A change a shadow cannot compare (another output, or an
+            // isolated-process side) has no report to require, as for a new
+            // transform.
+            let Some(active) = published.iter().find(|existing| {
+                existing.namespace == namespace
+                    && existing.transform_id == transform.transform_id
+                    && crate::sekai::transform_shadow::shadow_can_compare(existing, transform)
+            }) else {
+                continue;
+            };
+            let passing = tx
+                .query_row(
+                    "SELECT 1 FROM sekai_transform_shadow_reports
+                     WHERE namespace = ?1 AND transform_id = ?2
+                       AND active_definition_digest = ?3 AND candidate_member_digest = ?4
+                       AND passing = 1 LIMIT 1",
+                    params![
+                        namespace,
+                        transform.transform_id,
+                        active.definition_digest,
+                        crate::db::transform_shadow::member_digest(transform)
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .is_some();
+            if !passing {
+                return Err(format!(
+                    "{}: {}",
+                    crate::sekai::transform_shadow::REFUSAL_TRANSFORM_SHADOW,
+                    transform.transform_id
+                ));
+            }
+        }
     }
     published.retain(|transform| {
         transform.namespace != namespace || !edits.deletions.contains(&transform.transform_id)

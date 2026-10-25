@@ -196,6 +196,8 @@ const EXECUTION_EVIDENCE_STATE_SCHEMA: &str =
     include_str!("postgres/0116_execution_evidence_state.sql");
 const EZU_GEO_FEEDS_SCHEMA: &str = include_str!("postgres/0117_ezu_geo_feeds.sql");
 const EZU_GEO_FEED_BACKFILL_SCHEMA: &str = include_str!("postgres/0118_ezu_geo_feed_backfill.sql");
+const TRANSFORM_SHADOW_REPORTS_SCHEMA: &str =
+    include_str!("postgres/0120_transform_shadow_reports.sql");
 const TRANSFORM_RUN_OUTPUT_VERSION_SCHEMA: &str =
     include_str!("postgres/0119_transform_run_output_version.sql");
 
@@ -937,6 +939,12 @@ const MIGRATIONS: &[Migration] = &[
         118,
         "transform_run_output_version",
         TRANSFORM_RUN_OUTPUT_VERSION_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        119,
+        "transform_shadow_reports",
+        TRANSFORM_SHADOW_REPORTS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
