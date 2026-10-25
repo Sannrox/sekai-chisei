@@ -59,6 +59,7 @@ mod definition_proposal_adr;
 mod deploy_tenkai_manifest;
 mod dual_runtime_storage_adr;
 mod enterprise_identity_contract;
+mod epistemic_descriptor_proto;
 mod epistemic_federation_conformance;
 mod epistemic_interop_conformance;
 mod epistemic_metadata_conformance;
@@ -230,6 +231,7 @@ const GROUPED_MODULES: &[&str] = &[
     "deploy_tenkai_manifest",
     "dual_runtime_storage_adr",
     "enterprise_identity_contract",
+    "epistemic_descriptor_proto",
     "epistemic_federation_conformance",
     "epistemic_interop_conformance",
     "epistemic_metadata_conformance",
@@ -419,6 +421,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 141);
+    assert_eq!(GROUPED_MODULES.len(), 142);
     assert_eq!(SEPARATE_TARGETS.len(), 22);
 }

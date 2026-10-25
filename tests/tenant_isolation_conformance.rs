@@ -246,7 +246,7 @@ fn community_profile_exposes_no_tenant_or_identity_runtime_surface() {
     }
     let gateway = include_str!("../crates/chisei-gateway/src/gateway.rs");
     let configuration_sources = [
-        include_str!("../src/config.rs"),
+        include_str!("../crates/chisei-core/src/config.rs"),
         gateway,
         include_str!("../crates/chisei-gateway/src/main.rs"),
     ];

@@ -29,20 +29,6 @@ use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 
 pub const DEFAULT_RESERVATION_TTL_MS: i64 = 15 * 60 * 1_000;
 
-impl SekaiCommitLookup for SekaiStore {
-    fn lookup_commit(&self, operation_id: &str) -> Result<Option<SekaiCommitRef>, String> {
-        Ok(self
-            .runtime()
-            .get_action_instance_by_operation_id(operation_id)?
-            .map(|instance| SekaiCommitRef {
-                namespace: instance.namespace,
-                instance_id: instance.instance_id,
-                marking: instance.marking,
-                status: instance.status,
-            }))
-    }
-}
-
 #[derive(Clone)]
 pub struct CrossStoreAdmission {
     chisei: ChiseiStore,

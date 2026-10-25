@@ -1,0 +1,691 @@
+//! Chisei persistence traits over [`ChiseiStore`] (ADR 0083 rule 6).
+//!
+//! Chisei code reaches its own tables through these per-family traits instead
+//! of the backend facade. Each method mirrors the backend method of the same
+//! name and delegates to it unchanged, so SQLite and PostgreSQL behavior,
+//! errors, and idempotency stay exactly as before. Sekai facts are not part of
+//! these traits; Chisei reads them through `crate::chisei::sekai_facts`.
+
+#![allow(clippy::too_many_arguments)]
+
+use ed25519_dalek::VerifyingKey;
+
+use super::ChiseiRuntimeDb;
+use super::ChiseiStore;
+use crate::chisei::eval;
+use crate::chisei::evaluation_execution::EvaluationExecutionIndex;
+use crate::chisei::external_action::{
+    AuthorizationClaim, AuthorizationRecord, ExternalActionRequest,
+};
+use crate::chisei::external_permit::{
+    ExternalPermitPolicy, HostContext, Permit, Redemption, RedemptionTiming,
+};
+use crate::chisei::kioku::{
+    CandidateDerivation, HumanMemoryReview, HumanReviewAction, KiokuCandidateCursor,
+    KiokuEvidenceAuthorizationRequest, KiokuEvidenceLink, KiokuEvidenceReassessmentRequest,
+    KiokuEvidenceReassessmentResult, KiokuMemory, MemoryImpactEvaluation, MemoryLifecycleEvent,
+    MemoryLifecycleSweep, MemoryOutcomeAssignment, MemoryOutcomeObservation,
+    MemoryRetrievalRequest, MemoryValidation, RetrievedMemory,
+};
+use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
+use sekai_core::db::chisei_operation_reservation::OperationReservation;
+use sekai_core::sekai::audit::{Decision, DecisionFilter};
+use sekai_core::sekai::evidence::EvidenceClassification;
+use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent};
+use sekai_types::governed_subject_provenance::ExportRecord;
+
+/// Declares a Chisei persistence trait and implements it for [`ChiseiStore`]
+/// by forwarding each method to the backend method of the same name.
+macro_rules! chisei_store_trait {
+    (
+        $(#[$meta:meta])*
+        pub trait $name:ident {
+            $(fn $method:ident(&self $(, $arg:ident: $ty:ty)* $(,)?) -> $ret:ty;)*
+        }
+    ) => {
+        $(#[$meta])*
+        pub trait $name {
+            $(fn $method(&self $(, $arg: $ty)*) -> $ret;)*
+        }
+
+        impl $name for ChiseiStore {
+            $(fn $method(&self $(, $arg: $ty)*) -> $ret {
+                self.inner.$method($($arg),*)
+            })*
+        }
+    };
+}
+
+/// Decision ledger rows Chisei records. Combined Split writes these to the
+/// Sekai dest (ADR 0083 rule 1); Shared and Chisei-only keep them on `inner`.
+pub trait ChiseiDecisionStore {
+    fn record_decision(&self, decision: &Decision) -> Result<(), String>;
+    fn list_decisions(&self, filter: &DecisionFilter) -> Result<Vec<Decision>, String>;
+    fn get_decision(&self, id: &str) -> Result<Option<Decision>, String>;
+    fn record_decisions_idempotently(&self, decisions: &[Decision]) -> Result<(), String>;
+    fn record_decisions_idempotently_by(
+        &self,
+        decisions: &[Decision],
+        equivalent: impl Fn(&Decision, &Decision) -> bool,
+    ) -> Result<(), String>;
+    fn list_decisions_for_action_namespace(
+        &self,
+        action: &str,
+        namespace: &str,
+    ) -> Result<Vec<Decision>, String>;
+}
+
+impl ChiseiDecisionStore for ChiseiStore {
+    fn record_decision(&self, decision: &Decision) -> Result<(), String> {
+        self.decision_runtime().record_decision(decision)
+    }
+    fn list_decisions(&self, filter: &DecisionFilter) -> Result<Vec<Decision>, String> {
+        self.decision_runtime().list_decisions(filter)
+    }
+    fn get_decision(&self, id: &str) -> Result<Option<Decision>, String> {
+        self.decision_runtime().get_decision(id)
+    }
+    fn record_decisions_idempotently(&self, decisions: &[Decision]) -> Result<(), String> {
+        self.decision_runtime()
+            .record_decisions_idempotently(decisions)
+    }
+    fn record_decisions_idempotently_by(
+        &self,
+        decisions: &[Decision],
+        equivalent: impl Fn(&Decision, &Decision) -> bool,
+    ) -> Result<(), String> {
+        self.decision_runtime()
+            .record_decisions_idempotently_by(decisions, equivalent)
+    }
+    fn list_decisions_for_action_namespace(
+        &self,
+        action: &str,
+        namespace: &str,
+    ) -> Result<Vec<Decision>, String> {
+        self.decision_runtime()
+            .list_decisions_for_action_namespace(action, namespace)
+    }
+}
+
+chisei_store_trait! {
+    /// Budget limits, reservations, usage, and transfers.
+    pub trait ChiseiBudgetStore {
+        fn budget_set_limit_scoped(&self, scope_id: &str, metric: &str, max_amount: i64, period_type: &str, home_site_id: &str, pool_id: &str) -> Result<(), String>;
+        fn budget_set_pool_ceiling(&self, pool_id: &str, metric: &str, max_amount: i64, period_type: &str) -> Result<(), String>;
+        fn budget_check_chain_for_site(&self, scope_id: &str, metric: &str, amount: i64, now_ms: i64, require_home_pin: bool, local_site_id: &str, partition_simulated: bool) -> Result<(), String>;
+        fn budget_check_and_reserve_chain_for_site(&self, scope_id: &str, metric: &str, amount: i64, now_ms: i64, idempotency_key: Option<&str>, require_home_pin: bool, local_site_id: &str, partition_simulated: bool) -> Result<(), String>;
+        fn budget_adjust_chain_for_site(&self, scope_id: &str, metric: &str, delta: i64, now_ms: i64, require_home_pin: bool, local_site_id: &str) -> Result<(), String>;
+        fn budget_assert_home_writable(&self, scope_id: &str, metric: &str, local_site_id: &str) -> Result<(), String>;
+        fn budget_record_idempotent(&self, scope_id: &str, metric: &str, amount: i64, idempotency_key: &str, now_ms: i64) -> Result<bool, String>;
+        fn budget_usage(&self, scope_id: &str, metric: &str, now_ms: i64) -> Result<(i64, i64, String), String>;
+        fn budget_namespace_pressure(&self, namespace: &str, metric: &str, now_ms: i64) -> Result<i32, String>;
+        fn budget_get_transfer(&self, transfer_id: &str) -> Result<Option<sekai_core::db::chisei_budget::BudgetTransferRecord>, String>;
+        fn budget_transfer_capacity(&self, transfer_id: &str, metric: &str, from_scope_id: &str, to_scope_id: &str, amount: i64, actor: &str, now_ms: i64) -> Result<sekai_core::db::chisei_budget::BudgetTransferRecord, String>;
+        fn budget_record_transfer_refused(&self, transfer_id: &str, metric: &str, from_scope_id: &str, to_scope_id: &str, amount: i64, actor: &str, reason: &str, now_ms: i64) -> Result<sekai_core::db::chisei_budget::BudgetTransferRecord, String>;
+        fn budget_limits_for_scope(&self, scope_id: &str) -> Result<Vec<(String, String, i64, String)>, String>;
+        fn budget_set_limit(&self, scope_id: &str, metric: &str, max_amount: i64, period_type: &str) -> Result<(), String>;
+        fn budget_adjust_chain(&self, scope_id: &str, metric: &str, delta: i64, now_ms: i64) -> Result<(), String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Operation receipts and cross-store operation reservations.
+    pub trait ChiseiReceiptStore {
+        fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String>;
+        fn get_operation_receipt(&self, operation_id: &str) -> Result<Option<OperationReceipt>, String>;
+        fn find_operation_receipt_by_request_id(&self, request_id: &str) -> Result<Option<OperationReceipt>, String>;
+        fn put_operation_reservation(&self, reservation: &OperationReservation) -> Result<OperationReservation, String>;
+        fn get_operation_reservation(&self, namespace: &str, operation_id: &str) -> Result<Option<OperationReservation>, String>;
+        fn list_pending_operation_reservations(&self, limit: usize) -> Result<Vec<OperationReservation>, String>;
+        fn append_operation_receipt_event(&self, operation_id: &str, event: OperationReceiptEvent) -> Result<(OperationReceipt, bool), String>;
+        fn find_operation_receipt_by_lookup_request_id(&self, request_id: &str, caller_scope: Option<&str>, initiating_actor: Option<&str>) -> Result<Option<OperationReceipt>, String>;
+        fn list_operation_receipts_in_window(&self, namespace: &str, start_timestamp_ms: i64, end_timestamp_ms: i64, limit: usize) -> Result<Vec<OperationReceipt>, String>;
+        fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String>;
+    }
+}
+
+/// Kioku memories, evidence links, lifecycle, and outcomes.
+///
+/// Combined Split keeps memory rows on the Chisei dest and graph
+/// authorization (namespace objects, grants, evidence submissions) on the
+/// Sekai dest. Callers go through this trait so that split never queries
+/// `sekai_objects` on `chisei.db`.
+pub trait ChiseiKiokuStore {
+    fn insert_kioku_memory(
+        &self,
+        memory: &KiokuMemory,
+        evidence: &[KiokuEvidenceLink],
+    ) -> Result<(), String>;
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String>;
+    fn list_kioku_candidates(
+        &self,
+        namespace: &str,
+        operation_class: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KiokuMemory>, String>;
+    fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String>;
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String>;
+    fn review_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String>;
+    fn disable_kioku_memory(
+        &self,
+        id: &str,
+        version: u32,
+        actor: &str,
+        rationale: &str,
+        recorded_at_ms: i64,
+    ) -> Result<KiokuMemory, String>;
+    fn reassess_kioku_memory(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String>;
+    fn list_kioku_evidence(&self, id: &str, version: u32)
+    -> Result<Vec<KiokuEvidenceLink>, String>;
+    fn list_kioku_lifecycle_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String>;
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String>;
+    fn sweep_kioku_lifecycle(
+        &self,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryLifecycleSweep, String>;
+    fn retrieve_kioku_memories(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String>;
+    fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String>;
+    fn record_kioku_holdout(
+        &self,
+        id: &str,
+        version: u32,
+        operation_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String>;
+    fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String>;
+    fn list_kioku_outcome_assignments(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<MemoryOutcomeAssignment>, String>;
+    fn evaluate_kioku_impact_if_ready(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<Option<MemoryImpactEvaluation>, String>;
+    fn put_operation_receipt_with_kioku_holdouts(
+        &self,
+        receipt: &OperationReceipt,
+        holdouts: &[(String, u32)],
+        actor: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), String>;
+    fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String>;
+    fn authorize_kioku_evidence(
+        &self,
+        request: &KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String>;
+}
+
+impl ChiseiKiokuStore for ChiseiStore {
+    fn insert_kioku_memory(
+        &self,
+        memory: &KiokuMemory,
+        evidence: &[KiokuEvidenceLink],
+    ) -> Result<(), String> {
+        self.inner.insert_kioku_memory(memory, evidence)
+    }
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
+        self.inner.get_kioku_memory(id, version)
+    }
+    fn list_kioku_candidates(
+        &self,
+        namespace: &str,
+        operation_class: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KiokuMemory>, String> {
+        self.inner
+            .list_kioku_candidates(namespace, operation_class, limit)
+    }
+    fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String> {
+        self.inner.produce_kioku_candidate(input)
+    }
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String> {
+        self.inner.validate_kioku_candidate(id, version)
+    }
+    fn review_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String> {
+        if self.shares_graph_with_memory() {
+            return self.inner.review_kioku_candidate(id, version, review);
+        }
+        // Split dests cannot share one Immediate snapshot across files.
+        // Pre-authorize on the Sekai dest, then skip in-tx graph checks.
+        // A two-dest revision protocol is follow-up; shared stores keep
+        // the original in-tx path above.
+        if review.action == HumanReviewAction::Promote
+            && let Some(memory) = self.inner.get_kioku_memory(id, version)?
+        {
+            for basis in &memory.evidence_basis {
+                if basis.source_submission_id.is_empty() {
+                    continue;
+                }
+                self.fact_runtime().authorize_kioku_evidence(
+                    &KiokuEvidenceAuthorizationRequest {
+                        source_submission_id: basis.source_submission_id.clone(),
+                        namespace: memory.namespace.clone(),
+                        memory_classification: memory.classification,
+                        evidence_digest: basis.evidence_digest.clone(),
+                        lifecycle_state: basis.lifecycle_state,
+                        observed_at_ms: basis.observed_at_ms,
+                        actor: review.reviewer.trim().into(),
+                        now_ms: review.reviewed_at_ms,
+                    },
+                )?;
+            }
+        }
+        self.inner
+            .review_kioku_candidate_after_graph_auth(id, version, review)
+    }
+    fn disable_kioku_memory(
+        &self,
+        id: &str,
+        version: u32,
+        actor: &str,
+        rationale: &str,
+        recorded_at_ms: i64,
+    ) -> Result<KiokuMemory, String> {
+        self.inner
+            .disable_kioku_memory(id, version, actor, rationale, recorded_at_ms)
+    }
+    fn reassess_kioku_memory(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String> {
+        authorize_reassessment_on_graph(self, &request)?;
+        self.inner.reassess_kioku_memory_after_graph_auth(request)
+    }
+    fn list_kioku_evidence(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<KiokuEvidenceLink>, String> {
+        self.inner.list_kioku_evidence(id, version)
+    }
+    fn list_kioku_lifecycle_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String> {
+        self.inner.list_kioku_lifecycle_events(id, version)
+    }
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
+        self.inner.record_kioku_lifecycle_event(event)
+    }
+    fn sweep_kioku_lifecycle(
+        &self,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryLifecycleSweep, String> {
+        self.inner.sweep_kioku_lifecycle(actor, now_ms)
+    }
+    fn retrieve_kioku_memories(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        if request.max_results == 0 {
+            return Ok(Vec::new());
+        }
+        self.fact_runtime().authorize_kioku_retrieval(request)?;
+        self.inner.retrieve_kioku_memories_after_graph_auth(request)
+    }
+    fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String> {
+        self.fact_runtime()
+            .kioku_authorized_classification_ceiling(namespace, actor)
+    }
+    fn record_kioku_holdout(
+        &self,
+        id: &str,
+        version: u32,
+        operation_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.inner
+            .record_kioku_holdout(id, version, operation_id, actor, now_ms)
+    }
+    fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String> {
+        self.inner.record_kioku_outcome(observation)
+    }
+    fn list_kioku_outcome_assignments(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<MemoryOutcomeAssignment>, String> {
+        self.inner.list_kioku_outcome_assignments(operation_id)
+    }
+    fn evaluate_kioku_impact_if_ready(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<Option<MemoryImpactEvaluation>, String> {
+        self.inner.evaluate_kioku_impact_if_ready(
+            id,
+            version,
+            minimum_samples_per_arm,
+            regression_threshold,
+            actor,
+            now_ms,
+        )
+    }
+    fn put_operation_receipt_with_kioku_holdouts(
+        &self,
+        receipt: &OperationReceipt,
+        holdouts: &[(String, u32)],
+        actor: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), String> {
+        self.inner.put_operation_receipt_with_kioku_holdouts(
+            receipt,
+            holdouts,
+            actor,
+            recorded_at_ms,
+        )
+    }
+    fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String> {
+        self.inner
+            .list_kioku_candidate_page(namespace, limit, cursor)
+    }
+    fn authorize_kioku_evidence(
+        &self,
+        request: &KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String> {
+        self.fact_runtime().authorize_kioku_evidence(request)
+    }
+}
+
+fn authorize_reassessment_on_graph(
+    store: &ChiseiStore,
+    request: &KiokuEvidenceReassessmentRequest,
+) -> Result<(), String> {
+    let Some(prior) = store
+        .inner
+        .get_kioku_memory(&request.memory_id, request.memory_version)?
+    else {
+        return Ok(());
+    };
+    let prior_evidence = store.inner.list_kioku_evidence(&prior.id, prior.version)?;
+    let baseline_basis = if prior.evidence_basis.is_empty() {
+        prior_evidence
+            .iter()
+            .map(|link| crate::chisei::kioku::KiokuEvidenceBasis {
+                evidence_reference: link.evidence_reference.clone(),
+                evidence_digest: link.evidence_digest.clone(),
+                source_submission_id: String::new(),
+                stance: link.stance,
+                lifecycle_state: sekai_core::sekai::evidence::EvidenceLifecycleState::Available,
+                observed_at_ms: link.observed_at_ms,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        prior.evidence_basis.clone()
+    };
+    let merged_basis = crate::chisei::kioku::merge_evidence_basis(
+        &baseline_basis,
+        &request.evidence_basis,
+        request.now_ms,
+    )?;
+    let ceiling = store
+        .fact_runtime()
+        .kioku_authorized_classification_ceiling(&prior.namespace, &request.actor)?;
+    if prior.classification > ceiling {
+        return Err("memory classification exceeds actor grant".into());
+    }
+    for basis in &merged_basis {
+        if basis.source_submission_id.is_empty() {
+            continue;
+        }
+        store
+            .fact_runtime()
+            .authorize_kioku_evidence(&KiokuEvidenceAuthorizationRequest {
+                source_submission_id: basis.source_submission_id.clone(),
+                namespace: prior.namespace.clone(),
+                memory_classification: prior.classification,
+                evidence_digest: basis.evidence_digest.clone(),
+                lifecycle_state: basis.lifecycle_state,
+                observed_at_ms: basis.observed_at_ms,
+                actor: request.actor.clone(),
+                now_ms: request.now_ms,
+            })?;
+    }
+    Ok(())
+}
+
+chisei_store_trait! {
+    /// External permits, redemptions, delegation, and kill switches.
+    pub trait ChiseiPermitStore {
+        fn put_permit(&self, permit: &Permit, idempotency_key: &str, issued_by: &str) -> Result<Permit, String>;
+        fn put_delegated_permit(&self, permit: &Permit, issued_by: &str) -> Result<Permit, String>;
+        fn redeem_permit(&self, permit: &Permit, context: &HostContext, trusted_key: &VerifyingKey, idempotency_key: &str, execution_id: &str, host_site_id: &str, now_ms: i64) -> Result<Redemption, String>;
+        fn redeem_or_reconcile_permit(&self, permit: &Permit, context: &HostContext, trusted_key: &VerifyingKey, idempotency_key: &str, execution_id: &str, host_site_id: &str, timing: RedemptionTiming) -> Result<Redemption, String>;
+        fn replay_redemption(&self, permit: &Permit, idempotency_key: &str, execution_id: &str) -> Result<Option<Redemption>, String>;
+        fn revoke_permit(&self, handle: &str, actor: &str, reason: &str, now_ms: i64) -> Result<bool, String>;
+        fn validate_permit_state(&self, permit: &Permit) -> Result<(), String>;
+        fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String>;
+        fn set_permit_kill_switch(&self, kind: &str, value: &str, enabled: bool, reason: &str, now_ms: i64) -> Result<bool, String>;
+        fn set_external_permit_policy(&self, policy: &ExternalPermitPolicy, now_ms: i64) -> Result<(), String>;
+        fn replay_permit(&self, authorization_id: &str, idempotency_key: &str) -> Result<Option<Permit>, String>;
+        fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String>;
+        fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// External action authorizations and blast-radius accounting.
+    pub trait ChiseiExternalActionStore {
+        fn claim_external_action_authorization(&self, request: &ExternalActionRequest, request_digest: &str, authorization_id: &str, now_ms: i64) -> Result<AuthorizationClaim, String>;
+        fn put_external_action_authorization(&self, record: &AuthorizationRecord) -> Result<(), String>;
+        fn compare_and_swap_external_action_authorization(&self, expected: &AuthorizationRecord, next: &AuthorizationRecord) -> Result<bool, String>;
+        fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+        fn release_external_action_blast_radius(&self, authorization_id: &str, request: &ExternalActionRequest) -> Result<(), String>;
+        fn abandon_external_action_claim(&self, request: &ExternalActionRequest, request_digest: &str) -> Result<(), String>;
+        fn get_external_action_authorization_by_id(&self, authorization_id: &str) -> Result<Option<AuthorizationRecord>, String>;
+        fn reserve_external_action_blast_radius(&self, authorization_id: &str, request: &ExternalActionRequest, max_mutations: Option<u32>, max_deletes: Option<u32>) -> Result<(), String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Evaluation suites, runs, and iterations.
+    pub trait ChiseiEvalStore {
+        fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String>;
+        fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String>;
+        fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String>;
+        fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String>;
+        fn append_feedback_eval_suite(&self, suite: &eval::Suite) -> Result<(), String>;
+        fn put_eval_run(&self, run: &eval::Run) -> Result<(), String>;
+        fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String>;
+        fn get_latest_eval_run_record_for_gate(&self, suite_id: &str, config_ref: &str, max_timestamp_ms: i64) -> Result<Option<eval::Run>, String>;
+        fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String>;
+        fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String>;
+        fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String>;
+        fn list_eval_iteration_records(&self, suite_id: &str) -> Result<Vec<eval::Iteration>, String>;
+        fn list_all_eval_iteration_records(&self) -> Result<Vec<eval::Iteration>, String>;
+        fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Sample observations awaiting scoring.
+    pub trait ChiseiObservationStore {
+        fn put_sample_observation(&self, obs: &crate::chisei::scoring::SampleObservation) -> Result<(), String>;
+        fn list_unscored_observations(&self, limit: i32) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String>;
+        fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String>;
+        fn delete_observation(&self, request_id: &str) -> Result<(), String>;
+        fn get_sample_observation_in_namespace(&self, request_id: &str, namespace: &str) -> Result<Option<crate::chisei::scoring::SampleObservation>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Portfolio observations, objectives, and routes.
+    pub trait ChiseiPortfolioStore {
+        fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String>;
+        fn portfolio_points(&self, namespace: &str, task_class: &str) -> Result<Vec<FrontierPoint>, String>;
+        fn portfolio_set_objective(&self, objective: &Objective) -> Result<(), String>;
+        fn portfolio_objective(&self, namespace: &str) -> Result<Option<Objective>, String>;
+        fn portfolio_damped_route(&self, namespace: &str, task_class: &str, proposed_model: &str, proposed_prompt_variant: &str, now_ms: i64, force: bool) -> Result<RouteSelection, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Data-quality rules and results.
+    pub trait ChiseiDataQualityStore {
+        fn put_data_quality_rule(&self, record: &crate::chisei::data_quality::DataQualityRule) -> Result<(), String>;
+        fn get_data_quality_rule(&self, namespace: &str, rule_id: &str) -> Result<Option<crate::chisei::data_quality::DataQualityRule>, String>;
+        fn list_data_quality_rules(&self, namespace: Option<&str>) -> Result<Vec<crate::chisei::data_quality::DataQualityRule>, String>;
+        fn put_data_quality_result(&self, record: &crate::chisei::data_quality::DataQualityResult) -> Result<(), String>;
+        fn get_data_quality_result(&self, result_id: &str) -> Result<Option<crate::chisei::data_quality::DataQualityResult>, String>;
+        fn list_data_quality_results(&self, namespace: Option<&str>) -> Result<Vec<crate::chisei::data_quality::DataQualityResult>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Learning-change records.
+    pub trait ChiseiLearningChangeStore {
+        fn put_learning_change(&self, record: &crate::chisei::learning_change::LearningChange) -> Result<(), String>;
+        fn get_learning_change(&self, change_id: &str) -> Result<Option<crate::chisei::learning_change::LearningChange>, String>;
+        fn list_learning_changes(&self, namespace: Option<&str>) -> Result<Vec<crate::chisei::learning_change::LearningChange>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Gunshi allocation state.
+    pub trait ChiseiGunshiStore {
+        fn get_gunshi_allocation_state(&self, namespace: &str) -> Result<Option<String>, String>;
+        fn put_gunshi_allocation_state_cas(&self, namespace: &str, revision_id: &str, changed_at_ms: i64, state_json: &str, expected_revision: Option<&str>) -> Result<bool, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Evaluation manifests, evaluator definitions, plans, and executions.
+    pub trait ChiseiEvaluationStore {
+        fn get_evaluation_manifest(&self, manifest_digest: &str) -> Result<Option<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest>, String>;
+        fn get_evaluation_manifest_for_request(&self, namespace: &str, actor: &str, request_id: &str) -> Result<Option<crate::chisei::evaluation_manifest::EvaluationManifestReplay>, String>;
+        fn get_evaluator_definition(&self, definition_id: &str) -> Result<Option<crate::chisei::evaluation_plan::EvaluatorDefinition>, String>;
+        fn put_evaluator_definition(&self, definition: crate::chisei::evaluation_plan::EvaluatorDefinition, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluatorDefinition, String>;
+        fn set_evaluator_availability(&self, definition_id: &str, state: &str, superseded_by_definition_id: &str, reason: &str, request_id: &str, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluatorAvailability, String>;
+        fn get_evaluation_plan(&self, plan_version_id: &str) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String>;
+        fn put_evaluation_plan(&self, plan: crate::chisei::evaluation_plan::EvaluationPlan, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluationPlan, String>;
+        fn get_evaluation_execution_index(&self, manifest_digest: &str) -> Result<Option<EvaluationExecutionIndex>, String>;
+        fn create_evaluation_execution(&self, index: &EvaluationExecutionIndex, receipt: &OperationReceipt) -> Result<EvaluationExecutionIndex, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Live policy shadow state and reports (#1630).
+    pub trait ChiseiPolicyShadowStore {
+        fn start_policy_shadow(&self, shadow: &crate::chisei::policy_shadow::PolicyShadow) -> Result<(), String>;
+        fn stop_policy_shadow(&self, namespace: &str, shadow_id: Option<&str>, unclaimed_at_ms: Option<i64>) -> Result<bool, String>;
+        fn claim_policy_shadow_activation(&self, namespace: &str, shadow_id: &str, now_ms: i64) -> Result<bool, String>;
+        fn confirm_policy_shadow_activation(&self, namespace: &str, shadow_id: &str, claimed_at_ms: i64, now_ms: i64) -> Result<bool, String>;
+        fn find_policy_shadow(&self, scopes: &[String]) -> Result<Option<crate::chisei::policy_shadow::PolicyShadow>, String>;
+        fn record_policy_shadow_observation(&self, shadow_id: &str, sample: &crate::chisei::policy_shadow::ShadowSample) -> Result<(), String>;
+        fn policy_shadow_report(&self, namespace: &str) -> Result<Option<crate::chisei::policy_shadow::PolicyShadowReport>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Per-namespace model review state and family enablement (#1493).
+    pub trait ChiseiModelReviewStore {
+        fn put_model_review_record(&self, record: &crate::chisei::model_review::ModelReviewRecord) -> Result<(), String>;
+        fn insert_model_review_record_if_absent(&self, record: &crate::chisei::model_review::ModelReviewRecord) -> Result<bool, String>;
+        fn get_model_review_record(&self, namespace: &str, provider: &str, model: &str, artifact_digest: &str) -> Result<Option<crate::chisei::model_review::ModelReviewRecord>, String>;
+        fn list_model_review_records(&self, namespace: &str) -> Result<Vec<crate::chisei::model_review::ModelReviewRecord>, String>;
+        fn put_family_enablement_record(&self, record: &crate::chisei::model_review::FamilyEnablementRecord) -> Result<(), String>;
+        fn insert_family_enablement_record_if_absent(&self, record: &crate::chisei::model_review::FamilyEnablementRecord) -> Result<bool, String>;
+        fn get_family_enablement_record(&self, namespace: &str, region_label: &str, family_id: &str) -> Result<Option<crate::chisei::model_review::FamilyEnablementRecord>, String>;
+        fn list_family_enablement_records(&self, namespace: &str) -> Result<Vec<crate::chisei::model_review::FamilyEnablementRecord>, String>;
+        fn model_review_row_count(&self) -> Result<i64, String>;
+        fn family_enablement_row_count(&self) -> Result<i64, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Signed model-release evidence, trust roots, and feedback (#1396).
+    pub trait ChiseiModelReleaseEvidenceStore {
+        fn put_model_release_trust(&self, roots: &crate::chisei::model_release_evidence::EvaluationTrustRoots, updated_at_ms: i64) -> Result<(), String>;
+        fn get_model_release_trust(&self) -> Result<Option<crate::chisei::model_release_evidence::EvaluationTrustRoots>, String>;
+        fn put_model_runtime_evidence(&self, evidence: &crate::chisei::model_release_evidence::ModelRuntimeEvidence, ingested_at_ms: i64) -> Result<(), String>;
+        fn get_model_runtime_evidence(&self, identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity) -> Result<Option<String>, String>;
+        fn put_model_evaluation_export(&self, evidence: &crate::chisei::model_release_evidence::ModelEvaluationEvidence, exported_at_ms: i64) -> Result<(), String>;
+        fn get_model_evaluation_export(&self, identity: &crate::chisei::model_release_evidence::ModelReleaseIdentity) -> Result<Option<String>, String>;
+        fn put_model_release_feedback(&self, record: &crate::chisei::model_release_evidence::ModelReleaseFeedback) -> Result<(), String>;
+        fn list_model_release_feedback(&self, namespace: &str) -> Result<Vec<crate::chisei::model_release_evidence::ModelReleaseFeedback>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Hosted routing profiles.
+    pub trait ChiseiRoutingProfileStore {
+        fn list_hosted_routing_profiles(&self, namespace: &str) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String>;
+        fn put_hosted_routing_profile(&self, profile: &crate::chisei::routing_profiles::HostedRoutingProfile) -> Result<(), String>;
+        fn revoke_hosted_routing_profile(&self, namespace: &str, profile_id: &str, now_ms: i64) -> Result<bool, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Gateway request aliases and gateway receipts.
+    pub trait ChiseiGatewayStore {
+        fn reserve_gateway_request_alias(&self, caller_scope: &str, request_alias: &str, request_id: &str, operation_id: &str) -> Result<bool, String>;
+        fn claim_gateway_request_alias_dispatch(&self, caller_scope: &str, request_alias: &str, request_id: &str, operation_id: &str, dispatch_token: &str) -> Result<bool, String>;
+        fn find_gateway_receipt_by_logical_operation_id(&self, operation_id: &str, attempt: Option<u32>) -> Result<Option<OperationReceipt>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Evolve task records.
+    pub trait ChiseiEvolveStore {
+        fn list_evolve_task_records(&self) -> Result<Vec<sekai_types::evolve::TaskRecord>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Governed-subject provenance exports.
+    pub trait ChiseiGovernedSubjectStore {
+        fn get_governed_subject_provenance_export(&self, actor: &str, export_id: &str) -> Result<Option<ExportRecord>, String>;
+        fn put_governed_subject_provenance_export(&self, actor: &str, export_id: &str, record: &ExportRecord) -> Result<(ExportRecord, bool), String>;
+    }
+}

@@ -7,13 +7,12 @@ pub mod build_info {
 }
 pub mod capability_codegen;
 pub mod capability_projection;
-pub mod chisei;
-pub mod chisei_store;
+pub use chisei_core::{chisei, chisei_store};
 pub mod compliance_cli;
 pub use sekai_core::compliance_export;
 pub mod compliance_pack;
 pub mod composition;
-pub mod config;
+pub use chisei_core::config;
 pub use chisei_provider::content;
 pub mod federation_cli;
 pub mod federation_network_cli;
@@ -30,7 +29,7 @@ pub mod enterprise_conformance;
 pub mod evaluation_plan_cli;
 pub mod evidence_adapter_catalog;
 pub mod ext;
-pub mod identity_assertion;
+pub use chisei_core::identity_assertion;
 pub mod runtime_token;
 pub mod service_token;
 pub use chisei_provider::gateway_keys;
