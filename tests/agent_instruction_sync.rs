@@ -81,3 +81,60 @@ fn agents_md_names_every_workspace_crate() {
         "AGENTS.md must name every workspace crate; missing {missing:?}"
     );
 }
+
+/// Provenance locators in `docs/ontology/` name current source files.
+/// After crate extracts, `src/chisei/`, `src/sekai/`, and `src/db/` are leftover.
+#[test]
+fn docs_ontology_provenance_paths_exist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("docs/ontology");
+    let mut stale = Vec::new();
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("docs/ontology") {
+        let entry = entry.expect("ontology entry");
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read ontology json");
+        for (idx, line) in text.lines().enumerate() {
+            if line.contains("\"src/chisei/")
+                || line.contains("\"src/chisei_store/")
+                || line.contains("\"src/sekai/")
+                || line.contains("\"src/db/")
+            {
+                stale.push(format!("{}:{}", path.display(), idx + 1));
+            }
+        }
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find('"') {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find('"') else {
+                break;
+            };
+            let quoted = &rest[..end];
+            rest = &rest[end + 1..];
+            let head = quoted.split(';').next().unwrap_or(quoted);
+            if !(head.starts_with("src/")
+                || head.starts_with("crates/")
+                || head.starts_with("docs/"))
+            {
+                continue;
+            }
+            if !(head.ends_with(".rs") || head.ends_with(".md") || head.ends_with(".json")) {
+                continue;
+            }
+            if !root.join(head).is_file() {
+                missing.push(format!("{} -> {quoted}", path.display()));
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "docs/ontology still names pre-extract paths: {stale:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "docs/ontology provenance locators must exist: {missing:?}"
+    );
+}

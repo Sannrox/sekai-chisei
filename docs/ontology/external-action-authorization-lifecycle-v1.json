@@ -34,7 +34,7 @@
   "provenance": [
     {
       "subject": "ExternalActionAuthorizationLifecycleModule",
-      "source": "src/chisei/external_action_lifecycle.rs",
+      "source": "crates/chisei-core/src/chisei/external_action_lifecycle.rs",
       "locator": "AuthorizationPlan/approve_or_deny/cancel/reclaim_expired",
       "confidence": 1.0
     },
@@ -46,7 +46,7 @@
     },
     {
       "subject": "ExternalActionAuthorization",
-      "source": "src/chisei/external_action.rs",
+      "source": "crates/chisei-core/src/chisei/external_action.rs",
       "locator": "AuthorizationRecord",
       "confidence": 1.0
     },
@@ -58,7 +58,7 @@
     },
     {
       "subject": "governs_external_action_authorization",
-      "source": "src/chisei/external_action_lifecycle.rs",
+      "source": "crates/chisei-core/src/chisei/external_action_lifecycle.rs",
       "locator": "AuthorizationPlan/approve_or_deny/cancel/reclaim_expired",
       "confidence": 1.0
     }

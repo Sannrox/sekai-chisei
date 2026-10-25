@@ -11,7 +11,7 @@
   "provenance": [
     {
       "subject": "DeterministicEvaluationExecution",
-      "source": "src/chisei/evaluation_execution.rs",
+      "source": "crates/chisei-core/src/chisei/evaluation_execution.rs",
       "locator": "EvaluationExecutionEngine/execute_node",
       "confidence": 1.0
     },

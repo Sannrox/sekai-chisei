@@ -264,7 +264,7 @@
     {
       "subject": "ChiseiEpistemicDescriptor",
       "source": "sekai-chisei",
-      "locator": "src/chisei/epistemic_descriptor.rs",
+      "locator": "crates/chisei-core/src/chisei/epistemic_descriptor.rs",
       "confidence": 1.0
     },
     {
@@ -276,13 +276,13 @@
     {
       "subject": "ChiseiContextReference",
       "source": "sekai-chisei",
-      "locator": "src/chisei/pipeline.rs",
+      "locator": "crates/chisei-core/src/chisei/pipeline.rs",
       "confidence": 1.0
     },
     {
       "subject": "ChiseiContextAdmissionPolicy",
       "source": "sekai-chisei",
-      "locator": "src/chisei/policy.rs",
+      "locator": "crates/chisei-core/src/chisei/policy.rs",
       "confidence": 1.0
     },
     {
@@ -294,7 +294,7 @@
     {
       "subject": "ChiseiContextAdmissionDecision",
       "source": "sekai-chisei",
-      "locator": "src/chisei/pipeline.rs",
+      "locator": "crates/chisei-core/src/chisei/pipeline.rs",
       "confidence": 1.0
     },
     {
@@ -306,7 +306,7 @@
     {
       "subject": "ChiseiKiokuMemory",
       "source": "sekai-chisei",
-      "locator": "src/chisei/kioku.rs",
+      "locator": "crates/chisei-core/src/chisei/kioku.rs",
       "confidence": 1.0
     },
     {
@@ -318,7 +318,7 @@
     {
       "subject": "ChiseiKiokuEvidenceBasis",
       "source": "sekai-chisei",
-      "locator": "src/chisei/kioku.rs",
+      "locator": "crates/chisei-core/src/chisei/kioku.rs",
       "confidence": 1.0
     },
     {
@@ -330,7 +330,7 @@
     {
       "subject": "SekaiGraphProjectionReference",
       "source": "sekai-chisei",
-      "locator": "src/sekai/retrieval.rs",
+      "locator": "crates/sekai-core/src/sekai/retrieval.rs",
       "confidence": 1.0
     },
     {
@@ -342,7 +342,7 @@
     {
       "subject": "SekaiEvidenceProjectionReference",
       "source": "sekai-chisei",
-      "locator": "src/sekai/evidence_store.rs",
+      "locator": "crates/sekai-core/src/sekai/evidence_store.rs",
       "confidence": 1.0
     }
   ]

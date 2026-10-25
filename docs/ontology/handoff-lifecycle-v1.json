@@ -34,7 +34,7 @@
   "provenance": [
     {
       "subject": "HandoffLifecycleModule",
-      "source": "src/sekai/handoff_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/handoff_lifecycle.rs",
       "locator": "HandoffLifecycle/create/revoke",
       "confidence": 1.0
     },
@@ -58,7 +58,7 @@
     },
     {
       "subject": "governs_handoff_manifest",
-      "source": "src/sekai/handoff_lifecycle.rs",
+      "source": "crates/sekai-core/src/sekai/handoff_lifecycle.rs",
       "locator": "create/revoke",
       "confidence": 1.0
     }

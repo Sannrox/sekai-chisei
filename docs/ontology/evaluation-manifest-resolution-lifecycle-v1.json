@@ -46,7 +46,7 @@
     },
     {
       "subject": "ResolvedEvaluationManifest",
-      "source": "src/chisei/evaluation_manifest.rs",
+      "source": "crates/chisei-core/src/chisei/evaluation_manifest.rs",
       "locator": "ResolvedEvaluationManifest",
       "confidence": 1.0
     },
