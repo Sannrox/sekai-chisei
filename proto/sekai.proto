@@ -2135,6 +2135,69 @@ message ReplayGovernedTransformResponse { TransformReplay replay = 1; }
 // The stored record: counts and digests, without changed keys or samples.
 message GetTransformReplayRequest { string id = 1; }
 message GetTransformReplayResponse { TransformReplay replay = 1; }
+// Shadow a candidate transform revision against the active one (#1795):
+// one candidate replay per run of the active revision, on the input
+// versions that run pinned, diffed against the output version it wrote.
+// Writes only replay branches. Experimental.
+message ShadowGovernedTransformRequest {
+  string namespace = 1;
+  string transform_id = 2;
+  // The candidate definition (JSON); it keeps the namespace, id and output.
+  string definition_json = 3;
+  // Runs of the active revision to shadow; default its newest runs.
+  repeated string run_ids = 4;
+  // How many newest runs when run_ids is empty: 0 is 10, at most 25.
+  uint32 limit = 5;
+  // The row key; default as for a replay.
+  string key_column = 6;
+}
+message ShadowRunComparison {
+  string run_id = 1;
+  // Empty when the run was not replayed.
+  string replay_id = 2;
+  string branch = 3;
+  // The output version the active run wrote.
+  string baseline_version_id = 4;
+  // Why the run is not in the totals; empty when it is.
+  string skipped = 5;
+  int64 rows_compared = 6;
+  int64 rows_matched = 7;
+  int64 rows_added = 8;
+  int64 rows_removed = 9;
+  int64 rows_changed = 10;
+  repeated string changed_keys = 11;
+  optional int64 active_compute_ms = 12;
+  optional int64 active_latency_ms = 13;
+  // The candidate replay, start to commit; in-process, so also its compute.
+  int64 shadow_ms = 14;
+}
+message ShadowRowSample {
+  string run_id = 1;
+  ReplayRowChange change = 2;
+}
+message TransformShadowReport {
+  string namespace = 1;
+  string transform_id = 2;
+  string active_definition_digest = 3;
+  string candidate_definition_digest = 4;
+  repeated ShadowRunComparison runs = 5;
+  // Totals over the runs that were not skipped.
+  int64 runs_compared = 6;
+  int64 rows_compared = 7;
+  int64 rows_matched = 8;
+  int64 rows_added = 9;
+  int64 rows_removed = 10;
+  int64 rows_changed = 11;
+  // rows_matched / rows_compared; 1 when nothing was compared.
+  double match_rate = 12;
+  repeated ShadowRowSample samples = 13;
+  int64 active_compute_ms = 14;
+  int64 shadow_compute_ms = 15;
+  // Mean per compared run.
+  int64 active_latency_ms = 16;
+  int64 shadow_latency_ms = 17;
+}
+message ShadowGovernedTransformResponse { TransformShadowReport report = 1; }
 
 message DatasetHealthCheck {
   string dataset_id = 1;
@@ -4744,6 +4807,7 @@ service SekaiService {
   rpc RunGovernedTransformOnBranch(RunGovernedTransformOnBranchRequest) returns (RunGovernedTransformOnBranchResponse);
   rpc ReplayGovernedTransform(ReplayGovernedTransformRequest) returns (ReplayGovernedTransformResponse);
   rpc GetTransformReplay(GetTransformReplayRequest) returns (GetTransformReplayResponse);
+  rpc ShadowGovernedTransform(ShadowGovernedTransformRequest) returns (ShadowGovernedTransformResponse);
   rpc PutDatasetHealthCheck(PutDatasetHealthCheckRequest) returns (PutDatasetHealthCheckResponse);
   rpc ListDatasetHealthChecks(ListDatasetHealthChecksRequest) returns (ListDatasetHealthChecksResponse);
   rpc ListDatasetHealthResults(ListDatasetHealthResultsRequest) returns (ListDatasetHealthResultsResponse);

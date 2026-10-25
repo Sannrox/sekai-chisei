@@ -761,6 +761,29 @@ impl RuntimeDb {
     }
 
     /// When the run finished and how long it computed (#1651).
+    pub fn transform_run_output_version(&self, run_id: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_run_output_version(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_run_output_version(run_id))
+            }
+        }
+    }
+
+    pub fn list_runs_of_governed_transform(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_runs_of_governed_transform(namespace, transform_id, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_runs_of_governed_transform(namespace, transform_id, limit)
+            }),
+        }
+    }
+
     pub fn transform_run_finish(&self, run_id: &str) -> Result<Option<(i64, Option<i64>)>, String> {
         match self {
             Self::Sqlite(db) => db.transform_run_finish(run_id),

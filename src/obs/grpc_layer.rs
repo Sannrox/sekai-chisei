@@ -244,6 +244,7 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "RunGovernedTransformOnBranch"
                 | "ReplayGovernedTransform"
                 | "GetTransformReplay"
+                | "ShadowGovernedTransform"
                 | "GetGovernedFactVersion"
                 | "ResolveInvariantSet"
                 | "ListSchemaTypes"

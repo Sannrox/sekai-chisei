@@ -2367,6 +2367,19 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ShadowGovernedTransform",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/transform_shadow.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutDatasetHealthCheck",
       "kind": "persistent",
       "surfaces": [

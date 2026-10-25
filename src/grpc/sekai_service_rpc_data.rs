@@ -5067,36 +5067,41 @@ pub(super) async fn run_governed_transform_on_branch(
     }))
 }
 
-/// Replay a transform over pinned input versions (#1585). Admitted like a
-/// branch run (credential admin, namespace tenant, transform quota gate);
-/// the caller must read every input, the stored and candidate alike, and
-/// write the output, where the replay branch is created.
-pub(super) async fn replay_governed_transform(
+/// What a replay or shadow was admitted with.
+struct ReplayAdmission {
+    stored: crate::sekai::governed_transform::GovernedTransform,
+    actor: String,
+    tenant: String,
+    owner_ctx: Option<crate::enterprise::AuthenticatedContext>,
+}
+
+/// Admit a replay of `namespace`/`transform_id`, as stored or as
+/// `definition_json`, like a branch run (credential admin, namespace
+/// tenant); the caller must read every input, the stored and candidate
+/// alike, and write the output, where the replay branch is created. The
+/// owner context is whom the transform quota gate charges.
+fn admit_replay<T: 'static>(
     service: &SekaiServiceImpl,
-    req: Request<ReplayGovernedTransformRequest>,
-) -> Result<Response<ReplayGovernedTransformResponse>, Status> {
-    let principals = caller_principals(&req);
+    req: &Request<T>,
+    namespace: &str,
+    transform_id: &str,
+    definition_json: &str,
+) -> Result<ReplayAdmission, Status> {
+    let principals = caller_principals(req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
-    let input = req.get_ref().clone();
+    let tenant_context = request_tenant_context(service.db.runtime(), req)?;
     if let Some(context) = tenant_context.as_ref() {
-        enforce_namespace_tenant_context(
-            service.db.runtime(),
-            Some(context),
-            &input.namespace,
-            true,
-        )?;
+        enforce_namespace_tenant_context(service.db.runtime(), Some(context), namespace, true)?;
     }
     let stored = service
         .db
         .runtime()
-        .get_governed_transform(&input.namespace, &input.transform_id)
+        .get_governed_transform(namespace, transform_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("governed transform not found"))?;
-    let transform =
-        crate::db::transform_replay::candidate_or_stored(&stored, &input.definition_json)
-            .map_err(Status::invalid_argument)?;
+    let transform = crate::db::transform_replay::candidate_or_stored(&stored, definition_json)
+        .map_err(Status::invalid_argument)?;
     let mut readable: Vec<String> = stored
         .input_bindings()
         .into_iter()
@@ -5106,9 +5111,9 @@ pub(super) async fn replay_governed_transform(
     readable.sort();
     readable.dedup();
     for dataset_id in &readable {
-        branch_caller(service, &req, dataset_id, false)?;
+        branch_caller(service, req, dataset_id, false)?;
     }
-    let (actor, tenant) = branch_caller(service, &req, &transform.output_dataset_id, true)?;
+    let (actor, tenant) = branch_caller(service, req, &transform.output_dataset_id, true)?;
     // The run, its branch and the diff samples carry whole rows, including
     // fields of older versions; property read grants are not applied to
     // them, so any dataset under enforced grants is refused.
@@ -5135,7 +5140,7 @@ pub(super) async fn replay_governed_transform(
         match service
             .db
             .runtime()
-            .transform_quota_owner(&input.namespace, &input.transform_id)
+            .transform_quota_owner(namespace, transform_id)
             .map_err(Status::internal)?
         {
             Some(tenant_id) => Some(crate::provider_credentials::tenant_context(
@@ -5144,50 +5149,183 @@ pub(super) async fn replay_governed_transform(
             None => tenant_context.clone(),
         }
     };
+    Ok(ReplayAdmission {
+        stored,
+        actor,
+        tenant,
+        owner_ctx,
+    })
+}
+
+/// Run `work` under one transform quota admission for `owner_ctx`: kept on
+/// success, given back on failure.
+fn with_transform_quota<R>(
+    service: &SekaiServiceImpl,
+    owner_ctx: Option<&crate::enterprise::AuthenticatedContext>,
+    admission_id: String,
+    work: impl FnOnce() -> Result<R, String>,
+) -> Result<R, Status> {
     let quota = service.quota_runtime();
     let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let held = admit_tenant_transform(quota.as_ref(), &gate, owner_ctx, &admission_id, false)?;
+    match work() {
+        Ok(result) => {
+            release_tenant_transform(service.db.runtime(), &gate, &admission_id, held.as_ref())?;
+            Ok(result)
+        }
+        Err(error) => {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            Err(branch_status(error))
+        }
+    }
+}
+
+/// Replay a transform over pinned input versions (#1585), admitted as
+/// [`admit_replay`] says.
+pub(super) async fn replay_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<ReplayGovernedTransformRequest>,
+) -> Result<Response<ReplayGovernedTransformResponse>, Status> {
+    let input = req.get_ref().clone();
+    let admission = admit_replay(
+        service,
+        &req,
+        &input.namespace,
+        &input.transform_id,
+        &input.definition_json,
+    )?;
     let admission_id = format!(
         "transform-replay:{}:{}:{}",
         input.namespace,
         input.transform_id,
         uuid::Uuid::new_v4()
     );
-    let held = admit_tenant_transform(
-        quota.as_ref(),
-        &gate,
-        owner_ctx.as_ref(),
-        &admission_id,
-        false,
-    )?;
-    let result = service.db.runtime().replay_governed_transform(
-        &crate::sekai::transform_replay::ReplayTransform {
-            namespace: input.namespace,
-            transform_id: input.transform_id,
-            input_versions: input.input_versions.into_iter().collect(),
-            as_of_ms: input.as_of_ms,
-            definition_json: input.definition_json,
-            baseline_version_id: input.baseline_version_id,
-            key_column: input.key_column,
-            // The definition whose inputs and output were checked above.
-            expected_definition_digest: stored.definition_digest.clone(),
-            actor,
-            tenant,
-        },
-        now_millis(),
-    );
-    let replay = match result {
-        Ok(replay) => {
-            release_tenant_transform(service.db.runtime(), &gate, &admission_id, held.as_ref())?;
-            replay
-        }
-        Err(error) => {
-            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
-            return Err(branch_status(error));
-        }
-    };
+    let replay = with_transform_quota(service, admission.owner_ctx.as_ref(), admission_id, || {
+        service.db.runtime().replay_governed_transform(
+            &crate::sekai::transform_replay::ReplayTransform {
+                namespace: input.namespace,
+                transform_id: input.transform_id,
+                input_versions: input.input_versions.into_iter().collect(),
+                as_of_ms: input.as_of_ms,
+                definition_json: input.definition_json,
+                baseline_version_id: input.baseline_version_id,
+                key_column: input.key_column,
+                // The definition whose inputs and output were checked.
+                expected_definition_digest: admission.stored.definition_digest.clone(),
+                actor: admission.actor,
+                tenant: admission.tenant,
+            },
+            now_millis(),
+        )
+    })?;
     Ok(Response::new(ReplayGovernedTransformResponse {
         replay: Some(to_proto_replay(replay)),
     }))
+}
+
+/// Shadow a candidate revision against the active one (#1795): admitted as
+/// a replay of the candidate, under one transform quota admission for all
+/// the runs it replays.
+pub(super) async fn shadow_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<ShadowGovernedTransformRequest>,
+) -> Result<Response<ShadowGovernedTransformResponse>, Status> {
+    let input = req.get_ref().clone();
+    if input.definition_json.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            crate::sekai::transform_shadow::SHADOW_NEEDS_CANDIDATE,
+        ));
+    }
+    let admission = admit_replay(
+        service,
+        &req,
+        &input.namespace,
+        &input.transform_id,
+        &input.definition_json,
+    )?;
+    let admission_id = format!(
+        "transform-shadow:{}:{}:{}",
+        input.namespace,
+        input.transform_id,
+        uuid::Uuid::new_v4()
+    );
+    let report = with_transform_quota(service, admission.owner_ctx.as_ref(), admission_id, || {
+        service.db.runtime().shadow_governed_transform(
+            &crate::sekai::transform_shadow::ShadowTransform {
+                namespace: input.namespace,
+                transform_id: input.transform_id,
+                definition_json: input.definition_json,
+                run_ids: input.run_ids,
+                limit: input.limit as usize,
+                key_column: input.key_column,
+                expected_definition_digest: admission.stored.definition_digest.clone(),
+                actor: admission.actor,
+                tenant: admission.tenant,
+            },
+            now_millis(),
+        )
+    })?;
+    Ok(Response::new(ShadowGovernedTransformResponse {
+        report: Some(to_proto_shadow_report(report)),
+    }))
+}
+
+fn to_proto_shadow_report(
+    report: crate::sekai::transform_shadow::TransformShadowReport,
+) -> TransformShadowReport {
+    TransformShadowReport {
+        namespace: report.namespace,
+        transform_id: report.transform_id,
+        active_definition_digest: report.active_definition_digest,
+        candidate_definition_digest: report.candidate_definition_digest,
+        runs: report
+            .runs
+            .into_iter()
+            .map(|run| ShadowRunComparison {
+                run_id: run.run_id,
+                replay_id: run.replay_id,
+                branch: run.branch,
+                baseline_version_id: run.baseline_version_id,
+                skipped: run.skipped,
+                rows_compared: run.rows_compared,
+                rows_matched: run.rows_matched,
+                rows_added: run.rows_added,
+                rows_removed: run.rows_removed,
+                rows_changed: run.rows_changed,
+                changed_keys: run.changed_keys,
+                active_compute_ms: run.active_compute_ms,
+                active_latency_ms: run.active_latency_ms,
+                shadow_ms: run.shadow_ms,
+            })
+            .collect(),
+        runs_compared: report.runs_compared,
+        rows_compared: report.rows_compared,
+        rows_matched: report.rows_matched,
+        rows_added: report.rows_added,
+        rows_removed: report.rows_removed,
+        rows_changed: report.rows_changed,
+        match_rate: report.match_rate,
+        samples: report
+            .samples
+            .into_iter()
+            .map(|sample| ShadowRowSample {
+                run_id: sample.run_id,
+                change: Some(to_proto_row_change(sample.change)),
+            })
+            .collect(),
+        active_compute_ms: report.active_compute_ms,
+        shadow_compute_ms: report.shadow_compute_ms,
+        active_latency_ms: report.active_latency_ms,
+        shadow_latency_ms: report.shadow_latency_ms,
+    }
+}
+
+fn to_proto_row_change(change: crate::sekai::transform_replay::ReplayRowChange) -> ReplayRowChange {
+    ReplayRowChange {
+        key: change.key,
+        before: change.before.into_iter().collect(),
+        after: change.after.into_iter().collect(),
+    }
 }
 
 /// A replay record, for a caller of its tenant who may read its output and
@@ -5258,15 +5396,7 @@ fn to_proto_replay(replay: crate::sekai::transform_replay::TransformReplay) -> T
             rows_removed: diff.rows_removed,
             rows_changed: diff.rows_changed,
             changed_keys: diff.changed_keys,
-            samples: diff
-                .samples
-                .into_iter()
-                .map(|change| ReplayRowChange {
-                    key: change.key,
-                    before: change.before.into_iter().collect(),
-                    after: change.after.into_iter().collect(),
-                })
-                .collect(),
+            samples: diff.samples.into_iter().map(to_proto_row_change).collect(),
             reproduced,
         }),
         downstream: replay

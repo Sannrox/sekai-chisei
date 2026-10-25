@@ -139,6 +139,10 @@ pub struct TransformReplay {
     /// The replay output's digest in the run receipt's scheme, comparable
     /// with a run's `output_digest`.
     pub output_digest: String,
+    /// The baseline's digest in the same scheme: equal to the `output_digest`
+    /// of the run that wrote the baseline version. Empty on older records.
+    #[serde(default)]
+    pub baseline_output_digest: String,
     pub diff: ReplayDiff,
     pub downstream: Vec<DownstreamImpact>,
     pub actor: String,

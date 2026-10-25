@@ -244,6 +244,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.RunGovernedTransformOnBranch` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ReplayGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetTransformReplay` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ShadowGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutDatasetHealthCheck` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListDatasetHealthChecks` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListDatasetHealthResults` | `sekai.datasets` | yes | none | `experimental` |

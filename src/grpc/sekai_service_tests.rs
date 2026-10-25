@@ -27080,6 +27080,118 @@ async fn transform_replay_rpc_reproduces_and_needs_read_on_every_input() {
     );
 }
 
+#[tokio::test]
+async fn transform_shadow_rpc_reports_changed_rows_and_needs_admin() {
+    let svc = service();
+    for id in ["shadow-in", "shadow-out"] {
+        svc.create_dataset(with_named_principal(
+            CreateDatasetRequest {
+                dataset: Some(Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: ["id", "keep"]
+                        .map(|name| ColumnDef {
+                            name: name.into(),
+                            r#type: "string".into(),
+                            classification: "public".into(),
+                        })
+                        .to_vec(),
+                    object_id: String::new(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                }),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    let runtime = svc.db.runtime();
+    let rows: Vec<HashMap<String, String>> = [("1", "yes"), ("2", "maybe")]
+        .map(|(id, keep)| {
+            [
+                ("id".to_string(), id.to_string()),
+                ("keep".into(), keep.into()),
+            ]
+            .into()
+        })
+        .to_vec();
+    runtime.append_rows("shadow-in", &rows).unwrap();
+    let transform = |op: &str, value: &str| {
+        crate::sekai::governed_transform::GovernedTransform {
+            contract_version: crate::sekai::governed_transform::CONTRACT_VERSION.into(),
+            namespace: "shadows".into(),
+            transform_id: "keep".into(),
+            input_dataset_id: "shadow-in".into(),
+            output_dataset_id: "shadow-out".into(),
+            steps: vec![crate::sekai::governed_transform::TransformStep {
+                kind: "filter".into(),
+                column: "keep".into(),
+                op: op.into(),
+                value: value.into(),
+                columns: Vec::new(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    };
+    runtime
+        .put_governed_transform(&transform("eq", "yes"), 10)
+        .unwrap();
+    let run = runtime
+        .run_governed_transform(
+            "shadows",
+            "keep",
+            false,
+            crate::sekai::dataset_version::now_ms(),
+        )
+        .unwrap();
+    let request = |principal: &str, definition_json: String| {
+        with_named_principal(
+            ShadowGovernedTransformRequest {
+                namespace: "shadows".into(),
+                transform_id: "keep".into(),
+                definition_json,
+                key_column: "id".into(),
+                ..Default::default()
+            },
+            principal,
+        )
+    };
+    let candidate = serde_json::to_string(&transform("neq", "no")).unwrap();
+    let refused = svc
+        .shadow_governed_transform(request("analyst", candidate.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (tonic::Code::PermissionDenied, "credential admin required")
+    );
+    let empty = svc
+        .shadow_governed_transform(request("root", String::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+    let report = svc
+        .shadow_governed_transform(request("root", candidate))
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert_eq!(report.runs.len(), 1);
+    assert_eq!(report.runs[0].run_id, run.run_id);
+    assert_eq!(report.runs[0].changed_keys, ["2"]);
+    assert_eq!((report.rows_compared, report.rows_matched), (2, 1));
+    assert_eq!(report.samples[0].change.as_ref().unwrap().key, "2");
+}
+
 fn catalog_request(source_id: &str) -> RegisterCatalogEntryRequest {
     RegisterCatalogEntryRequest {
         namespace: "warehouse".into(),

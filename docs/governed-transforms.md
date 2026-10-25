@@ -57,7 +57,8 @@ The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `ListGovernedTransformRuns`, `ListClaimableTransformWork`,
 `ClaimTransformWork`, `HeartbeatTransformClaim`, `ReadTransformRunInputs`,
 `WriteTransformRunResult`, `ApplyStreamingTransformBatch`, `TickGovernedTransforms`,
-`GetTransformOutputState`, `CancelGovernedTransformRun`) are `experimental`:
+`GetTransformOutputState`, `CancelGovernedTransformRun`,
+`ShadowGovernedTransform`) are `experimental`:
 start the plane with `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
 feature. See [rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities`
 reports `sekai.transforms.projection`, `sekai.transforms.analytical`,
@@ -79,6 +80,35 @@ The analytical profile runs SQL in a private in-memory SQLite connection
 (bundled rusqlite). Default bounds: 64 MiB and 5 seconds. Over-budget runs
 fail with `transform_budget_time` or `transform_budget_memory` and leave the
 previous output readable. Example: `cargo run --example analytical_transform`.
+
+## Shadow runs
+
+Experimental `ShadowGovernedTransform` tries a candidate revision beside
+the active one on the inputs the active revision actually ran on (#1795).
+For each named run of the active revision, or its newest runs (10 by
+default, at most 25, among the transform's newest 500 runs), it replays the candidate pinned to that run's
+`input_versions` on a fresh `replay-` branch of the output
+([ADR 0120](decisions/0120-transform-replays.md)) and diffs the result with
+the output version the run left. A run that writes its output records that
+version beside its finish, in its own transaction; runs from before the
+record, or whose version no longer has the run's `output_digest`, are
+reported skipped rather than compared. An input the candidate
+adds reads its version as of the run's admission. The
+report lists, per run, rows compared, matched, added, removed and changed
+with the changed keys, and sums them into a match rate with up to 10 sample
+rows. Cost and latency compare the active run's measured compute and
+admission-to-finish time with the candidate replay's time. Runs of another
+revision, without pinned inputs, quarantined or not finished are skipped
+with a reason, as is a run whose replay fails; earlier replays stay
+committed and charged.
+
+A shadow writes only replay branches and replay records. It never writes
+the output dataset, objects, checkpoints or run history, and starts no
+Actions or downstream runs. Nothing runs on a schedule or trigger: a shadow
+runs when it is requested. It is admitted like a replay, under one
+transform quota admission. The report is returned, not stored; each
+replay's record is stored, and its branch is deleted when it is no longer
+needed.
 
 ## Measured usage
 
