@@ -30,7 +30,7 @@ both stores.
 
 ## Decision
 
-1. **Sekai never depends on Chisei.** Code under `src/sekai` does not name
+1. **Sekai never depends on Chisei.** Code under `crates/sekai-core/src/sekai` does not name
    `crate::chisei::*`, Chisei store handles, or Chisei SQL.
 2. **Sekai owns the ports Chisei fills.** Cross-plane behavior Sekai needs
    (budget on Action admission and workflow steps, System One fill
@@ -49,8 +49,9 @@ both stores.
 5. **Shared vocabulary lives in Sekai.** The decision record and filter, the
    hash-chained decision-ledger append, `RiskClass`, `ActionPolicy`, the
    object schema, evidence and capacity vocabularies, the parameter schema
-   validator, and the duplicate-key JSON check move from `src/chisei` to
-   `src/sekai`. There is no neutral kernel.
+   validator, and the duplicate-key JSON check move from
+   `crates/chisei-core/src/chisei` to `crates/sekai-core/src/sekai`. There is
+   no neutral kernel.
 6. **Adapters live on the dependent side.** Mapping Sekai roles, grants,
    Action types, and evidence into Chisei types is Chisei or composition
    code. `crates/chisei-core/src/chisei/sekai_principal.rs` and
