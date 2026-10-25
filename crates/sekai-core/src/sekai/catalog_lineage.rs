@@ -12,6 +12,7 @@ use crate::sekai::catalog::{
     BindingKind, CATALOG_ENTRY_KIND, CatalogBinding, CatalogError, binding_from_entry,
 };
 use crate::sekai::governed_transform::GovernedTransform;
+use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 
 pub const DEFAULT_LINEAGE_DEPTH: usize = 8;
 pub const MAX_LINEAGE_DEPTH: usize = 8;
@@ -161,6 +162,103 @@ pub fn walk_lineage(
             String::new()
         },
     })
+}
+
+fn is_data_entry(entry: &Object) -> bool {
+    matches!(
+        entry.properties.get("entry_kind").map(String::as_str),
+        Some("dataset" | "object_type" | "pipeline" | "source")
+    )
+}
+
+fn marking_of(entry: &Object) -> Option<String> {
+    entry
+        .properties
+        .get(OBJECT_CLASSIFICATION_PROPERTY)
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
+/// Markings on data reachable from `start` through its binding and the
+/// transform graph. Service, release and environment entries are skipped so
+/// a service's own marking does not feed its derived criticality.
+pub fn reachable_data_markings(
+    db: &RuntimeDb,
+    start: &Object,
+) -> Result<Vec<String>, CatalogError> {
+    let Some(start_binding) = binding_from_entry(start) else {
+        return Ok(Vec::new());
+    };
+    let entries = list_catalog_entries(db, &start.namespace)?;
+    let transforms = db
+        .list_governed_transforms(&start.namespace)
+        .map_err(CatalogError::Storage)?;
+    let datasets = db.list_datasets().map_err(CatalogError::Storage)?;
+    let mut type_links = Vec::new();
+    for dataset in &datasets {
+        for (namespace, kind) in db
+            .dataset_bindings(&dataset.id)
+            .map_err(CatalogError::Storage)?
+        {
+            if namespace == start.namespace {
+                type_links.push((dataset.id.clone(), kind));
+            }
+        }
+    }
+    let mut source_datasets = Vec::new();
+    for entry in &entries {
+        let Some(binding) = binding_from_entry(entry) else {
+            continue;
+        };
+        if binding.kind != BindingKind::Source {
+            continue;
+        }
+        let Some(lineage) = db
+            .get_source_identity_lineage(&start.namespace, &binding.target_id)
+            .map_err(CatalogError::Storage)?
+        else {
+            continue;
+        };
+        source_datasets.push((binding.target_id, lineage.dataset_id));
+    }
+    let start_core = CoreRef {
+        kind: start_binding.kind,
+        id: start_binding.target_id.clone(),
+    };
+    let graph = LineageGraph {
+        entries: &entries,
+        transforms: &transforms,
+        type_links: &type_links,
+        source_datasets: &source_datasets,
+    };
+    let mut markings = Vec::new();
+    for entry in entries_for(&start_core, &entries) {
+        if is_data_entry(entry)
+            && let Some(marking) = marking_of(entry)
+        {
+            markings.push(marking);
+        }
+    }
+    for direction in [Direction::Upstream, Direction::Downstream] {
+        for node in collect_direction(
+            &start_core,
+            direction,
+            // Interactive lineage stays at MAX_LINEAGE_DEPTH; derived
+            // criticality walks the whole reachable graph (cycles skipped).
+            usize::MAX,
+            &graph,
+            &|_| true,
+            &|_| true,
+        ) {
+            if let Some(entry) = node.entry
+                && is_data_entry(&entry)
+                && let Some(marking) = marking_of(&entry)
+            {
+                markings.push(marking);
+            }
+        }
+    }
+    Ok(markings)
 }
 
 #[derive(Clone, Copy)]

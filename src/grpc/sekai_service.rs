@@ -941,6 +941,13 @@ impl SekaiService for SekaiServiceImpl {
         catalog_rpc::get_catalog_entry_lineage(self, req).await
     }
 
+    async fn list_catalog_criticality_outbox(
+        &self,
+        req: Request<ListCatalogCriticalityOutboxRequest>,
+    ) -> Result<Response<ListCatalogCriticalityOutboxResponse>, Status> {
+        catalog_rpc::list_catalog_criticality_outbox(self, req).await
+    }
+
     async fn query_object_policy_audit(
         &self,
         req: Request<QueryObjectPolicyAuditRequest>,

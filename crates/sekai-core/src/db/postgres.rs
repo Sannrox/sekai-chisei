@@ -190,6 +190,8 @@ const EXPORT_FINGERPRINTS_SCHEMA: &str =
 const EXPORT_DELIVERY_SCHEMA: &str = include_str!("postgres/0113_sekai_export_delivery.sql");
 const CONSUMER_VIOLATION_DELIVERIES_SCHEMA: &str =
     include_str!("postgres/0114_consumer_violation_deliveries.sql");
+const CATALOG_CRITICALITY_OUTBOX_SCHEMA: &str =
+    include_str!("postgres/0115_catalog_criticality_outbox.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -899,6 +901,12 @@ const MIGRATIONS: &[Migration] = &[
         113,
         "consumer_violation_deliveries",
         CONSUMER_VIOLATION_DELIVERIES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        114,
+        "catalog_criticality_outbox",
+        CATALOG_CRITICALITY_OUTBOX_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

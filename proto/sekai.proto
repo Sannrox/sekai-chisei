@@ -1610,7 +1610,7 @@ message GetOntologyChangelogResponse {
 // kind `catalog_entry`, read and searched under the ordinary read policy.
 message RegisterCatalogEntryRequest {
   string namespace = 1;
-  // dataset | object_type | pipeline | source
+  // dataset | object_type | pipeline | source | service | release | environment
   string entry_kind = 2;
   string source_system = 3;
   string source_id = 4;
@@ -1657,6 +1657,32 @@ message GetCatalogEntryLineageResponse {
   repeated CatalogLineageNode upstream = 2;
   repeated CatalogLineageNode downstream = 3;
   string next_page_token = 4;
+}
+// Derived and declared criticality exported for the delivery plane (#1688).
+// Discover on the namespace. Events for entries the caller cannot read
+// are omitted. The payload carries criticality, not markings.
+message ListCatalogCriticalityOutboxRequest {
+  string namespace = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+message CatalogCriticalityEvent {
+  string event_id = 1;
+  string namespace = 2;
+  string entry_id = 3;
+  string entry_kind = 4;
+  string source_system = 5;
+  string source_id = 6;
+  string declared = 7;
+  string derived = 8;
+  string effective = 9;
+  string evidence_digest = 10;
+  int64 created_at_ms = 11;
+  int64 seq = 12;
+}
+message ListCatalogCriticalityOutboxResponse {
+  repeated CatalogCriticalityEvent events = 1;
+  string next_page_token = 2;
 }
 message ObjectPolicyAuditEvent {
   string event_id = 1;
@@ -4596,6 +4622,7 @@ service SekaiService {
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
   rpc RegisterCatalogEntry(RegisterCatalogEntryRequest) returns (RegisterCatalogEntryResponse);
   rpc GetCatalogEntryLineage(GetCatalogEntryLineageRequest) returns (GetCatalogEntryLineageResponse);
+  rpc ListCatalogCriticalityOutbox(ListCatalogCriticalityOutboxRequest) returns (ListCatalogCriticalityOutboxResponse);
   rpc CreateObjectComment(CreateObjectCommentRequest) returns (CreateObjectCommentResponse);
   rpc UpdateObjectComment(UpdateObjectCommentRequest) returns (UpdateObjectCommentResponse);
   rpc ListObjectComments(ListObjectCommentsRequest) returns (ListObjectCommentsResponse);

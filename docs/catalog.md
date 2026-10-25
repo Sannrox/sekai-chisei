@@ -1,8 +1,10 @@
 # Data catalog
 
-Catalog entries describe datasets, object types and pipelines: owners,
-steward, tags, marking, schema summary, freshness and status. They are
-experimental; `RegisterCatalogEntry` and `GetCatalogEntryLineage` need
+Catalog entries describe datasets, object types, pipelines, sources, services,
+releases and environments: owners, steward, tags, marking, schema summary,
+freshness and status. They are
+experimental; `RegisterCatalogEntry`, `GetCatalogEntryLineage` and
+`ListCatalogCriticalityOutbox` need
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature (see
 [rpc-maturity.md](rpc-maturity.md)).
 The design is [ADR 0122](decisions/0122-governed-catalog-entries.md).
@@ -10,7 +12,8 @@ The design is [ADR 0122](decisions/0122-governed-catalog-entries.md).
 ## Reading
 
 An entry is an object of kind `catalog_entry` in the namespace it describes,
-with properties `entry_kind` (`dataset`, `object_type`, `pipeline` or `source`),
+with properties `entry_kind` (`dataset`, `object_type`, `pipeline`, `source`,
+`service`, `release` or `environment`),
 `source_system`, `source_id`, `description`, `owners`, `steward`, `tags`,
 `access_marking`, `schema_summary`, `freshness_ms` and `status` (`active` or
 `deprecated`). Read and find entries with the ordinary object RPCs and
@@ -39,12 +42,14 @@ policy; in an activated namespace without one, entries are unreadable.
 
 ## Curation
 
-Owners and the steward curate an entry's `description`, `tags` and `owners`
-through a governed Action (#1686): an Action type with `object_kind:
-catalog_entry` and `object_mutation: update`, whose parameters are the
-entry's `object_id` and the fields to set (`tags` and `owners` as
-comma-separated lists). The Action is admitted, receipted and audited like
-any other; the write is an object update carrying the Action's operation id.
+Owners and the steward curate an entry's `description`, `tags`, `owners` and
+`declared_criticality` through a governed Action (#1686, #1688): an Action
+type with `object_kind: catalog_entry` and `object_mutation: update`, whose
+parameters are the entry's `object_id` and the fields to set (`tags` and
+`owners` as comma-separated lists; `declared_criticality` as `low`,
+`medium`, `high` or `critical`). The Action is admitted, receipted and
+audited like any other; the write is an object update carrying the Action's
+operation id.
 
 - Only a principal listed in `owners`, or the `steward`, may curate; anyone
   else is refused. The submitter must still pass the Action type's submit
@@ -83,4 +88,18 @@ discover is a redacted placeholder: kind only, no id, name or marking. Search
 counts and facets still omit hidden entries. Registration of a new binding
 needs the same discover access `ListDatasets` uses for that target.
 
-Not yet covered: service, release and environment entries (#1688).
+## Services, releases and environments
+
+Service, release and environment entries register like any other kind, keyed
+by the source's stable id. They may bind to the dataset, object type,
+transform or source they reach. Derived criticality is the highest of
+`low < medium < high < critical` implied by markings on reachable data
+(`public` → `low`, `internal` → `medium`, `confidential` → `high`,
+`restricted` → `critical`). Declared criticality is curated. Effective is
+the higher of the two; a lower declared value does not lower it. Lowering
+effective follows the audited declassify path on the reachable data.
+
+Each change to declared, derived or effective appends one outbox event
+(`sekai.catalog-criticality/v1`) with a content digest and no markings.
+`ListCatalogCriticalityOutbox` is Discover on the namespace and omits events
+for entries the caller cannot read.

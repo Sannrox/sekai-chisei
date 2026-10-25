@@ -346,6 +346,122 @@ pub(super) async fn get_catalog_entry_lineage(
     }))
 }
 
+pub(super) async fn list_catalog_criticality_outbox(
+    service: &SekaiServiceImpl,
+    req: Request<ListCatalogCriticalityOutboxRequest>,
+) -> Result<Response<ListCatalogCriticalityOutboxResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let db = service.db.runtime();
+    let tenant_context = request_tenant_context(db, &req)?;
+    let purpose = request_purpose_presentation(&req, &principals);
+    let policy_context = principal_policy_context(&req);
+    let input = req.into_inner();
+    require_canonical_source_namespace(&input.namespace)?;
+    enforce_namespace_tenant_context_for(
+        db,
+        tenant_context.as_ref(),
+        &input.namespace,
+        crate::enterprise::NamespaceAction::Discover,
+    )?;
+    check_team_namespace(db, &principals, &input.namespace, false)?;
+    let page_size =
+        crate::sekai::catalog_criticality::clamp_page_size(input.page_size).map_err(|error| {
+            match error {
+                CatalogError::Invalid(message) => Status::invalid_argument(message),
+                other => Status::internal(format!("{other:?}")),
+            }
+        })?;
+    let mut page_token = input.page_token;
+    let mut visible = Vec::new();
+    loop {
+        let (events, next) = db
+            .list_catalog_criticality_outbox(&input.namespace, page_size, &page_token)
+            .map_err(Status::internal)?;
+        for event in events {
+            let Some(entry) = db
+                .get_object(&event.entry_id)
+                .map_err(|_| Status::internal("catalog entry unavailable"))?
+            else {
+                continue;
+            };
+            if entry.kind != catalog::CATALOG_ENTRY_KIND || entry.namespace != input.namespace {
+                continue;
+            }
+            if !object_is_visible_for_purpose(
+                db,
+                &service.security,
+                &entry,
+                &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Read,
+                purpose.as_ref(),
+            ) {
+                continue;
+            }
+            let projected = match service.resolve_computed_for_response_with_policy(
+                entry,
+                &principals,
+                Some(&policy_context),
+                tenant_context.as_ref(),
+                purpose.as_ref(),
+            ) {
+                Ok(object) => object,
+                Err(status) if status.code() == tonic::Code::PermissionDenied => continue,
+                Err(status) => return Err(status),
+            };
+            if projected
+                .properties
+                .get("source_system")
+                .map(String::as_str)
+                != Some(event.source_system.as_str())
+                || projected.properties.get("source_id").map(String::as_str)
+                    != Some(event.source_id.as_str())
+            {
+                continue;
+            }
+            visible.push(CatalogCriticalityEvent {
+                event_id: event.event_id,
+                namespace: event.namespace,
+                entry_id: event.entry_id,
+                entry_kind: event.entry_kind,
+                source_system: event.source_system,
+                source_id: event.source_id,
+                declared: event.declared,
+                derived: event.derived,
+                effective: event.effective,
+                evidence_digest: event.evidence_digest,
+                created_at_ms: event.created_at_ms,
+                seq: event.seq,
+            });
+            if visible.len() >= page_size as usize {
+                break;
+            }
+        }
+        if visible.len() >= page_size as usize || next.is_empty() {
+            break;
+        }
+        page_token = next;
+    }
+    let next_page_token = if visible.len() < page_size as usize {
+        String::new()
+    } else {
+        visible
+            .last()
+            .map(|event| {
+                crate::sekai::catalog_criticality::encode_page_token(
+                    event.created_at_ms,
+                    &event.event_id,
+                )
+            })
+            .unwrap_or_default()
+    };
+    Ok(Response::new(ListCatalogCriticalityOutboxResponse {
+        events: visible,
+        next_page_token,
+    }))
+}
+
 /// Discover access for a bound core artifact. Datasets use the same bar as
 /// `ListDatasets`; other kinds are namespace-scoped existence plus live/published.
 fn binding_discoverable_for_caller(

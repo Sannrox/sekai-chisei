@@ -67,6 +67,7 @@ pub mod postgres_audit;
 pub mod postgres_authorization;
 pub mod postgres_budget;
 pub mod postgres_capability_package;
+pub mod postgres_catalog_criticality;
 pub mod postgres_chisei_reservation;
 pub mod postgres_client_package;
 pub mod postgres_connector_certification;

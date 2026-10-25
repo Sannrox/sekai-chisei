@@ -1761,6 +1761,22 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ListCatalogCriticalityOutbox",
+      "kind": "query",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/catalog_criticality.rs",
+        "src/grpc/catalog_rpc.rs",
+        "docs/catalog.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "BeginMediaUpload",
       "kind": "persistent",
       "surfaces": [
