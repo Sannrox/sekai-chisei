@@ -149,4 +149,7 @@ SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
 SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
 SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
   cargo test --locked -p sekai-core --lib -- --ignored --test-threads=1 postgres || status=$?
+SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
+SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
+  cargo test --locked -p chisei-core --lib -- --ignored --test-threads=1 postgres || status=$?
 exit "$status"

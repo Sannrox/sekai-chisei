@@ -17,7 +17,10 @@ pub const RUNTIME_DB_SRC: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/crates/sekai-core/src/db/runtime_db.rs"
     )),
-    include_str!("chisei_store/runtime.rs")
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/chisei-core/src/chisei_store/runtime.rs"
+    ))
 );
 pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 9;
 
