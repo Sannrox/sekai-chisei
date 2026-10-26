@@ -155,3 +155,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0131: Watermarked exports carry an export-keyed fingerprint](0131-watermarked-export.md)
 - [ADR 0132: Fenced incremental feed of object geo changes into Ezu](0132-ezu-geo-feed.md)
 - [ADR 0133: GeoArrow backfill for the Ezu geo feed](0133-ezu-geo-feed-backfill.md)
+- [ADR 0134: Federated queries return only suppressed aggregates](0134-federated-aggregate-queries.md)
