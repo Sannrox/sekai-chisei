@@ -29175,6 +29175,151 @@ async fn changes_without_a_recorded_writer_read_as_unattributed() {
 }
 
 #[tokio::test]
+async fn a_tenant_scoped_device_syncs_its_tenant_namespace_only() {
+    // #1836: a device-bound assertion issued for one tenant defines a scope
+    // and syncs inside that tenant's namespace with its proof, and is refused
+    // in another tenant's namespace and without the proof.
+    use crate::sekai::sync_scope::SYNC_CONTRACT;
+    use base64::Engine as _;
+    use ed25519_dalek::Signer as _;
+    let svc = enterprise_service();
+    for (id, namespace) in [("wo-1", "allowed"), ("wo-x", "denied")] {
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: "WorkOrder".into(),
+                name: id.into(),
+                namespace: namespace.into(),
+                external_id: String::new(),
+                properties: HashMap::from([("site".to_string(), "north".to_string())]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+    let request = |message: &[u8], method: &str, nonce: &str, signed: bool| {
+        let digest = crate::identity_assertion::request_digest(
+            &format!("/sekai.SekaiService/{method}"),
+            message,
+        );
+        let mut context = test_tenant_context();
+        context.device = Some(crate::enterprise::AuthenticatedDevice {
+            id: "device-11".into(),
+            public_key: key.verifying_key().to_bytes(),
+            assertion_nonce: nonce.into(),
+            wipe: false,
+        });
+        let proof = signed.then(|| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                key.sign(&crate::identity_assertion::device_proof_input(
+                    nonce, &digest,
+                ))
+                .to_bytes(),
+            )
+        });
+        (context, proof)
+    };
+    fn wrap<T>(
+        message: T,
+        (context, proof): (crate::enterprise::AuthenticatedContext, Option<String>),
+    ) -> Request<T> {
+        let mut req = with_named_principal(message, "subject-a");
+        if let Some(proof) = proof {
+            req.metadata_mut()
+                .insert("x-sekai-device-proof", proof.parse().unwrap());
+        }
+        req.extensions_mut().insert(context);
+        req
+    }
+    let put = |namespace: &str| PutSyncScopeRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: namespace.into(),
+        scope_id: "north".into(),
+        kind: "WorkOrder".into(),
+        property_filters: vec![],
+        link: None,
+        max_objects: 10,
+        max_offline_age_ms: 0,
+    };
+    let snapshot = |namespace: &str| ReadSyncSnapshotRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: namespace.into(),
+        scope_id: "north".into(),
+        page_token: String::new(),
+        limit: 0,
+    };
+
+    let own = put("allowed");
+    svc.put_sync_scope(wrap(
+        own.clone(),
+        request(&own.encode_to_vec(), "PutSyncScope", "n-1", true),
+    ))
+    .await
+    .unwrap();
+    let read = snapshot("allowed");
+    let page = svc
+        .read_sync_snapshot(wrap(
+            read.clone(),
+            request(&read.encode_to_vec(), "ReadSyncSnapshot", "n-2", true),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        page.objects
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect::<Vec<_>>(),
+        ["wo-1"]
+    );
+    let deltas = ReadSyncDeltasRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "allowed".into(),
+        scope_id: "north".into(),
+        cursor: page.cursor.clone(),
+        limit: 0,
+    };
+    svc.read_sync_deltas(wrap(
+        deltas.clone(),
+        request(&deltas.encode_to_vec(), "ReadSyncDeltas", "n-3", true),
+    ))
+    .await
+    .unwrap();
+
+    // Another tenant's namespace is refused, with the proof.
+    let other = put("denied");
+    let refused = svc
+        .put_sync_scope(wrap(
+            other.clone(),
+            request(&other.encode_to_vec(), "PutSyncScope", "n-4", true),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused.code(),
+            tonic::Code::PermissionDenied | tonic::Code::NotFound
+        ),
+        "{refused:?}"
+    );
+    // Without the proof, the device-bound context is refused.
+    let unsigned = svc
+        .read_sync_snapshot(wrap(
+            read.clone(),
+            request(&read.encode_to_vec(), "ReadSyncSnapshot", "n-5", false),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unsigned.code(),
+        tonic::Code::Unauthenticated,
+        "{unsigned:?}"
+    );
+}
+
+#[tokio::test]
 async fn sync_needs_the_device_proof_and_a_revoked_device_gets_only_wipe() {
     // #1634: a device-bound credential syncs only with its device's proof
     // over each request, and a revoked device's wipe assertion gets a wipe

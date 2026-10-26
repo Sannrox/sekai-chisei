@@ -295,8 +295,8 @@ OIDC/OAuth behavior, and enterprise composition are not part of the community
 runtime.
 
 The current injection seam admits enterprise credentials only to the
-namespace-aware object, link, lease, traversal, and object-change RPCs that
-invoke the authorization hook. Other Sekai and all Chisei RPCs fail closed for
+namespace-aware object, link, lease, traversal, object-change, and offline
+sync (#1836) RPCs that invoke the authorization hook. Other Sekai and all Chisei RPCs fail closed for
 enterprise-scoped credentials. Action execution and approval resumption also
 remain unavailable until an enterprise composition can persist and re-derive
 the authenticated approval identity.

@@ -61,3 +61,13 @@ Unit tests cover:
 - a missing proof on a device-bound context, which is refused;
 - a replayed device-bound assertion, which is refused;
 - unknown fields in the claim and unusable keys, which are refused.
+
+## Amendment 2026-10-26
+
+#1836 admits `PutSyncScope`, `ReadSyncSnapshot` and `ReadSyncDeltas` for
+enterprise-scoped contexts, so a device-bound assertion issued for one tenant
+can sync. Each call enforces the caller's tenant on the scope's namespace, as
+other namespace RPCs do; another tenant's namespace is refused. A device-bound
+context still needs the device's proof on every call, and a wipe-only
+assertion still gets only `wipe_required`. Scopes stay owned by the principal
+that defined them.

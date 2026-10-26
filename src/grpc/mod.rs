@@ -283,6 +283,11 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
                 | "ExplainDerivation"
                 | "CompareDefinitionRevisions"
                 | "QueryObjectPolicyAudit"
+                // Offline sync (#1836) needs namespace read: a scope is the
+                // caller's own definition, not namespace data.
+                | "PutSyncScope"
+                | "ReadSyncSnapshot"
+                | "ReadSyncDeltas"
         )
     {
         crate::enterprise::NamespaceAction::Write
@@ -851,6 +856,12 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ResolveInvariantSet"
             | "SubmitActionInstance"
             | "DecideActionInstance"
+            // Offline sync (#1836): each call enforces the caller's tenant on
+            // the scope's namespace, and a device-bound context still needs
+            // its device's proof (ADR 0126).
+            | "PutSyncScope"
+            | "ReadSyncSnapshot"
+            | "ReadSyncDeltas"
             // Plans (#1675) and their review (#1678): handlers enforce the
             // tenant context per namespace.
             | "CreatePlanIntent"
@@ -2661,6 +2672,20 @@ mod tests {
             "sekai.SekaiService",
             "CloseDefinitionProposal"
         ));
+    }
+
+    #[test]
+    fn scoped_contexts_reach_offline_sync_with_read_scope() {
+        // Admitted for scoped contexts, and classified as reads, so a
+        // `sekai.read` device assertion passes the credential-scope check.
+        for method in ["PutSyncScope", "ReadSyncSnapshot", "ReadSyncDeltas"] {
+            assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
+            assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
+            assert_eq!(
+                rpc_namespace_action(method),
+                crate::enterprise::NamespaceAction::Read
+            );
+        }
     }
 
     #[test]
