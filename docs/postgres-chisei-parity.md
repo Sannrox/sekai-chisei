@@ -55,9 +55,11 @@ named in
 | Permit redeem, reconcile, and delegation (#1323) | Dual-backend approvals path |
 | Equal-PostgreSQL epic (#1328) | First-class community backend closeout |
 
+Tenant state, OIDC and OAuth are not Sekai-owned on any backend (ADR 0099,
+#1613); tenant authority comes from the identity extension on either one.
+
 ## Still outside this track
 
-- Tenant state, OIDC, and OAuth
 - Host-local permit verification crypto (`verify_for_executor`) — never a
   control-plane dual-backend claim
 - `PlanExecution` and `PlanContentExecution` fail closed on PostgreSQL:

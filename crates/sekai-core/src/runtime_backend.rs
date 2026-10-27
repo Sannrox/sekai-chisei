@@ -305,38 +305,59 @@ impl RuntimeBackend {
                     capabilities,
                 })
             }
-            BackendIdentity::Postgres => {
-                let url = config
-                    .postgres_url
-                    .as_deref()
-                    .ok_or("PostgreSQL backend requires a database URL")?;
-                let postgres = if let Some(ca_path) = config.postgres_ca_cert_path.as_deref() {
-                    let certificate = std::fs::read(ca_path)
-                        .map_err(|error| format!("read SEKAI_POSTGRES_CA_CERT: {error}"))?;
-                    PostgresDb::connect_with_ca_certificate_for_plane(
-                        url,
-                        config.postgres_max_connections,
-                        &certificate,
-                        config.schema_plane,
-                    )?
-                } else {
-                    PostgresDb::connect_for_plane(
-                        url,
-                        config.postgres_max_connections,
-                        config.schema_plane,
-                    )?
-                };
-                let migration_version = postgres.latest_migration_version()?;
-                let capabilities = community_postgres_capabilities(Some(migration_version))?;
-                capabilities.validate_required(COMMUNITY_REQUIRED_SURFACES)?;
-                reject_tenant_surfaces(&capabilities)?;
-                postgres.ping()?;
-                Ok(Self {
-                    db: Arc::new(RuntimeDb::Postgres(Arc::new(postgres))),
-                    capabilities,
-                })
-            }
+            BackendIdentity::Postgres => Self::open_postgres(&config, None),
         }
+    }
+
+    /// PostgreSQL runtime with an optional enterprise identity extension
+    /// (#1613), as [`Self::from_sqlite_with_enterprise_extension`] is for
+    /// SQLite. `config` must select PostgreSQL. Startup still refuses
+    /// populated legacy tenant state: tenant authority comes only from the
+    /// extension (ADR 0099).
+    pub fn from_postgres_with_enterprise_extension(
+        config: RuntimeBackendConfig,
+        extension: Option<std::sync::Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    ) -> Result<Self, String> {
+        if config.backend != BackendIdentity::Postgres {
+            return Err("from_postgres_with_enterprise_extension needs a PostgreSQL config".into());
+        }
+        Self::open_postgres(&config, extension)
+    }
+
+    fn open_postgres(
+        config: &RuntimeBackendConfig,
+        extension: Option<std::sync::Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    ) -> Result<Self, String> {
+        let url = config
+            .postgres_url
+            .as_deref()
+            .ok_or("PostgreSQL backend requires a database URL")?;
+        let postgres = if let Some(ca_path) = config.postgres_ca_cert_path.as_deref() {
+            let certificate = std::fs::read(ca_path)
+                .map_err(|error| format!("read SEKAI_POSTGRES_CA_CERT: {error}"))?;
+            PostgresDb::connect_with_ca_certificate_for_plane(
+                url,
+                config.postgres_max_connections,
+                &certificate,
+                config.schema_plane,
+            )?
+        } else {
+            PostgresDb::connect_for_plane(
+                url,
+                config.postgres_max_connections,
+                config.schema_plane,
+            )?
+        }
+        .with_enterprise_extension(extension);
+        let migration_version = postgres.latest_migration_version()?;
+        let capabilities = community_postgres_capabilities(Some(migration_version))?;
+        capabilities.validate_required(COMMUNITY_REQUIRED_SURFACES)?;
+        reject_tenant_surfaces(&capabilities)?;
+        postgres.ping()?;
+        Ok(Self {
+            db: Arc::new(RuntimeDb::Postgres(Arc::new(postgres))),
+            capabilities,
+        })
     }
 
     /// SQLite runtime with an optional enterprise identity extension.

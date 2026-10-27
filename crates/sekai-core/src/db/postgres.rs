@@ -198,6 +198,8 @@ const EZU_GEO_FEEDS_SCHEMA: &str = include_str!("postgres/0117_ezu_geo_feeds.sql
 const EZU_GEO_FEED_BACKFILL_SCHEMA: &str = include_str!("postgres/0118_ezu_geo_feed_backfill.sql");
 const TRANSFORM_SHADOW_REPORTS_SCHEMA: &str =
     include_str!("postgres/0120_transform_shadow_reports.sql");
+const DROP_LEGACY_TENANT_STATE_SCHEMA: &str =
+    include_str!("postgres/0121_drop_legacy_tenant_state.sql");
 const TRANSFORM_RUN_OUTPUT_VERSION_SCHEMA: &str =
     include_str!("postgres/0119_transform_run_output_version.sql");
 
@@ -947,9 +949,19 @@ const MIGRATIONS: &[Migration] = &[
         TRANSFORM_SHADOW_REPORTS_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        120,
+        "drop_legacy_tenant_state",
+        DROP_LEGACY_TENANT_STATE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
+
+fn legacy_tenant_state_message() -> String {
+    "legacy PostgreSQL tenant state detected; Sekai owns no tenant state on any backend (ADR 0099). Back up the database and move tenant records to the identity extension (docs/tenant-migration.md) before starting this version; no legacy tenant data was changed".into()
+}
 
 /// Runs `work` where the synchronous PostgreSQL client may block.
 ///
@@ -1030,6 +1042,9 @@ pub struct PostgresDb {
     plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
     schema_plane: SchemaPlane,
     pub search_maintenance: Mutex<()>,
+    /// Identity extension an enterprise assembly injects (#1613), as on
+    /// SQLite; `None` on the community runtime.
+    enterprise_extension: Option<std::sync::Arc<dyn crate::enterprise::EnterpriseExtension>>,
 }
 
 impl std::fmt::Debug for PostgresDb {
@@ -1132,10 +1147,89 @@ impl PostgresDb {
             plane: std::sync::OnceLock::new(),
             schema_plane,
             search_maintenance: Mutex::new(()),
+            enterprise_extension: None,
         };
+        // Refuse populated legacy tenant state before any migration runs, so
+        // it is reported and left as it is.
+        db.reject_legacy_tenant_state()?;
         db.migrate()?;
         crate::db::schema_plane::reject_populated_foreign_postgres(&db, schema_plane)?;
         Ok(db)
+    }
+
+    /// This store with `extension` installed (#1613).
+    pub fn with_enterprise_extension(
+        mut self,
+        extension: Option<std::sync::Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    ) -> Self {
+        self.enterprise_extension = extension;
+        self
+    }
+
+    pub fn enterprise_extension(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::enterprise::EnterpriseExtension>> {
+        self.enterprise_extension.as_ref()
+    }
+
+    /// Fails when legacy tenant, membership or namespace-ownership rows, or
+    /// tenant-bound credentials, are present (ADR 0099). Reads only.
+    fn reject_legacy_tenant_state(&self) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let tables = [
+            "sekai_tenants",
+            "sekai_tenant_requests",
+            "sekai_tenant_memberships",
+            "sekai_namespace_ownership",
+        ];
+        for table in tables {
+            let exists: bool = connection
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                .map_err(|error| error.to_string())?
+                .get(0);
+            if exists {
+                // A replica finishing migration 120 can drop the table between
+                // the two statements; dropped means it held nothing.
+                let populated = match connection
+                    .query_one(&format!("SELECT EXISTS (SELECT 1 FROM {table})"), &[])
+                {
+                    Ok(row) => row.get::<_, bool>(0),
+                    Err(error)
+                        if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) =>
+                    {
+                        false
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                if populated {
+                    return Err(legacy_tenant_state_message());
+                }
+            }
+        }
+        // The columns of the credential table this connection resolves, not
+        // of one in another schema.
+        let credentials_scoped: bool = connection
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute
+                 WHERE attrelid = to_regclass('sekai_principal_credentials')
+                   AND attname = 'tenant_id' AND NOT attisdropped)",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if credentials_scoped {
+            let populated: bool = connection
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM sekai_principal_credentials WHERE tenant_id <> '')",
+                    &[],
+                )
+                .map_err(|error| error.to_string())?
+                .get(0);
+            if populated {
+                return Err(legacy_tenant_state_message());
+            }
+        }
+        Ok(())
     }
 
     pub fn ping(&self) -> Result<(), String> {
@@ -1607,6 +1701,23 @@ impl ScratchDatabase {
                 PostgresDb::connect_with_ca_certificate_for_plane(&self.url, 4, pem, schema_plane)
             }
             None => PostgresDb::connect_for_plane(&self.url, 4, schema_plane),
+        })
+    }
+
+    /// A plain client on the scratch database that runs no migrations and
+    /// no startup checks, for inspecting a store that refuses to start.
+    #[cfg(test)]
+    fn connect_unchecked(&self) -> postgres::Client {
+        off_runtime(|| {
+            let mut builder = TlsConnector::builder();
+            if let Some(pem) = &self.ca_certificate {
+                builder.add_root_certificate(Certificate::from_pem(pem).expect("test CA"));
+            }
+            let tls = MakeTlsConnector::new(builder.build().expect("TLS connector"));
+            secure_config(&self.url)
+                .expect("scratch URL")
+                .connect(tls)
+                .expect("connect scratch database")
         })
     }
 
@@ -2102,12 +2213,10 @@ mod tests {
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
     fn reusable_credentials_exclude_tenant_rows() {
-        let _guard = POSTGRES_MIGRATION_TEST
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let db = test_database();
-        reset_database(&db);
-        db.migrate().unwrap();
+        // Its own database: a tenant-bound credential makes the next
+        // connect refuse to start (#1613), so it must not touch the shared one.
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
         db.connection()
             .unwrap()
             .execute(
@@ -2128,6 +2237,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// #1613: a fresh store drops the legacy tenant tables, and a store that
+    /// still holds legacy tenant rows refuses to start, leaving them as they are.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn legacy_tenant_tables_are_dropped_and_populated_ones_refuse_startup() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        let exists = |db: &PostgresDb, table: &str| -> bool {
+            db.connection()
+                .unwrap()
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                .unwrap()
+                .get(0)
+        };
+        for table in [
+            "sekai_tenants",
+            "sekai_tenant_requests",
+            "sekai_tenant_memberships",
+            "sekai_namespace_ownership",
+        ] {
+            assert!(!exists(&db, table), "{table} survived the migration");
+        }
+        // A database carried over with tenant rows is refused before any
+        // migration, and the rows are not changed.
+        db.connection()
+            .unwrap()
+            .batch_execute(
+                "CREATE TABLE sekai_tenants (id TEXT PRIMARY KEY);
+                 INSERT INTO sekai_tenants (id) VALUES ('tenant-a');",
+            )
+            .unwrap();
+        drop(db);
+        let error = scratch.connect_for_plane(SchemaPlane::Shared).unwrap_err();
+        assert!(error.contains("legacy PostgreSQL tenant state"), "{error}");
+        assert!(error.contains("docs/tenant-migration.md"), "{error}");
+        let mut admin = scratch.connect_unchecked();
+        let rows: i64 = admin
+            .query_one("SELECT count(*) FROM sekai_tenants", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 1);
     }
 
     #[test]

@@ -167,12 +167,17 @@ Evidence is checked in as:
 | #1325 | Governed documents |
 | #1328 | Equal-PostgreSQL closeout: first-class community backend, not partial |
 
+Tenant state, tenant RPCs, OIDC and OAuth are not Sekai-owned on any backend
+(ADR 0099, #1613). Both runtimes take the same identity extension: SQLite with
+`RuntimeBackend::from_sqlite_with_enterprise_extension` and PostgreSQL with
+`RuntimeBackend::from_postgres_with_enterprise_extension`. Tenant isolation
+holds at the gRPC boundary on both. See [tenant migration](tenant-migration.md).
+
 ## Still outside this parent
 
 - Chisei governed-decision and execution persistence (#237) — closed; see
   `docs/postgres-chisei-parity.md`
 - Community PostgreSQL runtime activation (#238) — complete; select with `SEKAI_DB_BACKEND=postgres`
-- Tenant state, tenant RPCs, OIDC, and OAuth
 - Dest-pair `reconcile_missing_execution_evidence` cannot join the Sekai and
   Chisei stores on one connection and stays fail-closed on PostgreSQL
 - Chisei `PlanExecution` and `PlanContentExecution` fail closed on PostgreSQL
