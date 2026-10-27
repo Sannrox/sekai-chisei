@@ -1,0 +1,142 @@
+{
+  "version": "game-ontology.policy-pack/v1",
+  "package": "game-ontology/v1",
+  "rules": [
+    {
+      "rule": "spending_caps",
+      "description": "Each treasury spend is at most 500 metal. Treasuries live in their own namespace, so its Action budget admits at most 2 spends per day."
+    },
+    {
+      "rule": "no_attacks_on_allies",
+      "description": "Attacks and invasions only target planets whose diplomacy is hostile."
+    },
+    {
+      "rule": "invasion_approval",
+      "description": "An invasion parks until the admiral grants it. The submitter never decides their own invasion."
+    },
+    {
+      "rule": "spy_only_visibility",
+      "description": "Reports marked spy-only are visible only to principals cleared for spy-only."
+    }
+  ],
+  "action_policies": [
+    {
+      "scope": "project:game-spend",
+      "default": "allow"
+    },
+    {
+      "scope": "project:game-attacks",
+      "default": "allow"
+    },
+    {
+      "scope": "project:game-invasions",
+      "default": "require_approval"
+    }
+  ],
+  "action_types": [
+    {
+      "namespace": "game-treasury",
+      "type_id": "game.treasury.spend",
+      "version": "1",
+      "description": "Spend metal from a treasury (game reference workload).",
+      "parameter_schema_json": {
+        "type": "object",
+        "properties": {
+          "object_id": {"type": "string"},
+          "spend": {"type": "integer", "minimum": 1, "maximum": 500}
+        },
+        "required": ["object_id", "spend"],
+        "additionalProperties": false
+      },
+      "allowed_effect_kinds": ["notify"],
+      "policy_scope": "game-spend",
+      "object_kind": "treasury",
+      "object_mutation": "update"
+    },
+    {
+      "namespace": "game",
+      "type_id": "game.planet.attack",
+      "version": "1",
+      "description": "Attack a planet (game reference workload).",
+      "parameter_schema_json": {
+        "type": "object",
+        "properties": {
+          "object_id": {"type": "string"},
+          "attacked_by": {"type": "string"}
+        },
+        "required": ["object_id", "attacked_by"],
+        "additionalProperties": false
+      },
+      "allowed_effect_kinds": ["notify"],
+      "policy_scope": "game-attacks",
+      "object_kind": "planet",
+      "object_mutation": "update",
+      "submission_criteria": [
+        {
+          "criterion_id": "target_is_hostile",
+          "kind": "property_equals",
+          "property": "diplomacy",
+          "value": "hostile"
+        }
+      ]
+    },
+    {
+      "namespace": "game",
+      "type_id": "game.planet.invade",
+      "version": "1",
+      "description": "Invade a planet (game reference workload).",
+      "parameter_schema_json": {
+        "type": "object",
+        "properties": {
+          "object_id": {"type": "string"},
+          "occupied_by": {"type": "string"}
+        },
+        "required": ["object_id", "occupied_by"],
+        "additionalProperties": false
+      },
+      "allowed_effect_kinds": ["notify"],
+      "policy_scope": "game-invasions",
+      "object_kind": "planet",
+      "object_mutation": "update",
+      "approvers": ["admiral"],
+      "submission_criteria": [
+        {
+          "criterion_id": "target_is_hostile",
+          "kind": "property_equals",
+          "property": "diplomacy",
+          "value": "hostile"
+        }
+      ]
+    }
+  ],
+  "action_budgets": [
+    {
+      "subject": "action:governed/project:game-treasury",
+      "metric": "tokens",
+      "period_type": "daily",
+      "max": 2
+    }
+  ],
+  "classification_lattice": {
+    "contract_version": "sekai.classification-lattice/v1",
+    "namespace": "game",
+    "tokens": ["public", "internal", "confidential", "restricted", "spy-only"],
+    "parents": [
+      {"child": "public", "parent": "internal"},
+      {"child": "internal", "parent": "confidential"},
+      {"child": "confidential", "parent": "restricted"},
+      {"child": "internal", "parent": "spy-only"}
+    ],
+    "incomparable": [
+      {"left": "restricted", "right": "spy-only"}
+    ]
+  },
+  "clearances": [
+    {"principal": "commander", "classification_ceiling": "restricted"},
+    {"principal": "admiral", "classification_ceiling": "restricted"},
+    {"principal": "spy", "classification_ceiling": "spy-only"}
+  ],
+  "markings": [
+    {"class": "Report", "access_marking": "spy-only"}
+  ]
+}
