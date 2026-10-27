@@ -20,6 +20,11 @@ fields, the lattice is `sekai.classification-lattice/v1`, and routes are
 `reference_packages.rs` checks both against the package, and
 `tests/game_governance_pack.rs` applies them to the server and shows one
 allowed and one refused case per rule.
+`tests/game_ai_players.rs` plays two AI players on one seed, one governed by
+the pack and one in a namespace without its rules, through scripted alliance
+betrayal, treasury drain and unapproved invasion scenarios. Model replies are
+recorded in `tests/fixtures/game_players/` and replayed, so runs make no live
+model calls.
 
 | Rule | Expressed as |
 | --- | --- |
