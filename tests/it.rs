@@ -68,7 +68,6 @@ mod experimental_rpc_operator_docs;
 mod federation_backend_conformance;
 mod federation_network_adr;
 mod game_reference_actions;
-mod game_soak;
 mod gateway_http_smoke;
 mod geospatial_query_adr;
 mod governed_fact_backend_conformance;
@@ -243,7 +242,6 @@ const GROUPED_MODULES: &[&str] = &[
     "federation_backend_conformance",
     "federation_network_adr",
     "game_reference_actions",
-    "game_soak",
     "gateway_http_smoke",
     "geospatial_query_adr",
     "governed_fact_backend_conformance",
@@ -427,6 +425,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 145);
+    assert_eq!(GROUPED_MODULES.len(), 144);
     assert_eq!(SEPARATE_TARGETS.len(), 22);
 }
