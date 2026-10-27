@@ -100,6 +100,7 @@ mod object_security_value_instance_adr;
 mod object_set_adr;
 mod object_sync_backend_conformance;
 mod ollama_e2e;
+mod ontology_export;
 mod open_table_backend_conformance;
 mod operation_correlation_adr;
 mod parked_work_backend_conformance;
@@ -276,6 +277,7 @@ const GROUPED_MODULES: &[&str] = &[
     "open_table_backend_conformance",
     "operation_correlation_adr",
     "parked_work_backend_conformance",
+    "ontology_export",
     "partitioned_transform_io_adr",
     "perf_gate_cli",
     "performance_manifest",
