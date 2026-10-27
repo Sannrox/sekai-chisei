@@ -2455,7 +2455,7 @@ fn row_to_principal_credential(
 }
 
 fn legacy_tenant_state_message() -> String {
-    "legacy SQLite tenant state detected; this community runtime is tenant-free. Back up the database and export/migrate tenant records to the PostgreSQL enterprise distribution before starting this version; no legacy tenant data was changed".into()
+    "legacy SQLite tenant state detected; Sekai owns no tenant state on any backend (ADR 0099). Back up the database and move tenant records to the identity extension (docs/tenant-migration.md) before starting this version; no legacy tenant data was changed".into()
 }
 
 fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {

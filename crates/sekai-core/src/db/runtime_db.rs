@@ -2103,7 +2103,7 @@ impl RuntimeDb {
     pub fn enterprise_extension(&self) -> Option<&Arc<dyn crate::enterprise::EnterpriseExtension>> {
         match self {
             Self::Sqlite(db) => db.enterprise_extension(),
-            Self::Postgres(_) => None,
+            Self::Postgres(db) => db.enterprise_extension(),
         }
     }
 

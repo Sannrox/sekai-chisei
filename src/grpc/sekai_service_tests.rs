@@ -93,6 +93,12 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
         SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
             .unwrap(),
     ));
+    assert_extension_derives_context(&db);
+}
+
+/// The installed extension, not request metadata, decides principal and
+/// tenant, and authorizes the namespace; shared by both backends.
+fn assert_extension_derives_context(db: &RuntimeDb) {
     let mut request = Request::new(());
     request
         .extensions_mut()
@@ -124,7 +130,7 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
         "x-sekai-tenant-id",
         MetadataValue::from_static("attacker-tenant"),
     );
-    let tenant = request_tenant_context(&db, &request).unwrap().unwrap();
+    let tenant = request_tenant_context(db, &request).unwrap().unwrap();
     assert_eq!(caller_principals(&request), ["subject-a"]);
     assert_eq!(
         tenant
@@ -133,9 +139,9 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
             .map(|context| context.tenant_id.as_str()),
         Some("tenant-test")
     );
-    assert!(enforce_namespace_tenant_context(&db, Some(&tenant), "allowed", false).is_ok());
+    assert!(enforce_namespace_tenant_context(db, Some(&tenant), "allowed", false).is_ok());
     assert_eq!(
-        enforce_namespace_tenant_context(&db, Some(&tenant), "denied", true)
+        enforce_namespace_tenant_context(db, Some(&tenant), "denied", true)
             .unwrap_err()
             .code(),
         tonic::Code::PermissionDenied
@@ -32807,7 +32813,34 @@ async fn a_reused_export_definition_id_does_not_deliver_another_owners_artifact(
 /// of another tenant before reading or writing it.
 #[tokio::test]
 async fn admitted_tenant_rpcs_refuse_another_tenants_namespace() {
-    let svc = enterprise_service();
+    tenant_rpcs_refuse_another_tenants_namespace(&enterprise_service()).await;
+}
+
+/// #1613: a PostgreSQL runtime holds the identity extension as SQLite does,
+/// so the same tenant isolation holds at the gRPC boundary.
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+fn postgres_admitted_tenant_rpcs_refuse_another_tenants_namespace() {
+    let scratch = crate::db::ScratchDatabase::create();
+    let postgres = scratch
+        .connect()
+        .with_enterprise_extension(Some(Arc::new(TestEnterpriseExtension)));
+    let db = Arc::new(RuntimeDb::Postgres(Arc::new(postgres)));
+    assert_extension_derives_context(&db);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+                db.clone(),
+            ));
+            tenant_rpcs_refuse_another_tenants_namespace(&svc).await;
+        });
+    drop(db);
+}
+
+async fn tenant_rpcs_refuse_another_tenants_namespace(svc: &SekaiServiceImpl) {
     let ns = || "denied".to_string();
     let mut codes = Vec::new();
     macro_rules! probe {

@@ -301,9 +301,10 @@ enterprise-scoped credentials. Action execution and approval resumption also
 remain unavailable until an enterprise composition can persist and re-derive
 the authenticated approval identity.
 
-SQLite startup detects populated legacy tenant tables or tenant-bound
-credentials before normal migrations. It fails without changing them and
-directs the operator to [Migrating legacy SQLite tenant state](tenant-migration.md).
+SQLite and PostgreSQL startup detect populated legacy tenant tables or
+tenant-bound credentials before normal migrations. They fail without changing
+them and direct the operator to [Migrating legacy tenant state](tenant-migration.md).
+An empty legacy PostgreSQL tenant schema is dropped by migration 120.
 
 ## Trust boundaries
 
