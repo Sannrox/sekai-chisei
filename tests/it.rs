@@ -429,6 +429,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 145);
+    assert_eq!(GROUPED_MODULES.len(), 146);
     assert_eq!(SEPARATE_TARGETS.len(), 22);
 }
