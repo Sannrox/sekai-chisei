@@ -257,8 +257,8 @@
   "provenance": [
     {
       "subject": "Player",
-      "source": "hoshi-ontology/v1",
-      "locator": "chisei-api:1.3.0",
+      "source": "game-ontology/v1",
+      "locator": "examples/game-ontology/game-v1.json",
       "confidence": 1.0
     }
   ]

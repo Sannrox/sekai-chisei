@@ -1,7 +1,7 @@
 //! The game reference workload as a synthetic tenant domain (#1616).
 //!
-//! [`GameWorkload`] builds a tenant from the pinned `hoshi-ontology/v1`
-//! package (`examples/hoshi-ontology/`): players own planets, fleets are
+//! [`GameWorkload`] builds a tenant from the `game-ontology/v1`
+//! package (`examples/game-ontology/`): players own planets, fleets are
 //! stationed at planets, and players ally. It runs through the same
 //! [`generate`](super::synthetic::generate) and [`apply`](super::synthetic::apply)
 //! as every domain, so it shares the presets, determinism, markings,
@@ -21,10 +21,10 @@ use crate::sekai::synthetic::{
     standard_principals,
 };
 
-/// The pinned package the classes and relations come from.
+/// The package the classes and relations come from.
 const PACKAGE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../examples/hoshi-ontology/hoshi-v1.json"
+    "/../../examples/game-ontology/game-v1.json"
 ));
 const STANCES: &[&str] = &["parked", "patrol", "transit"];
 const DISPOSITIONS: &[&str] = &["friendly", "neutral", "hostile"];
@@ -44,7 +44,7 @@ fn class_description(class: &str) -> String {
                     .and_then(|entry| entry["description"].as_str().map(str::to_string))
             })
         })
-        .unwrap_or_else(|| format!("{class} (hoshi-ontology/v1)"))
+        .unwrap_or_else(|| format!("{class} (game-ontology/v1)"))
 }
 
 fn coordinates(index: usize) -> String {
@@ -278,7 +278,7 @@ mod tests {
         }
         let types = GameWorkload.object_types();
         assert_eq!(types[0].description, class_description("Player"));
-        assert!(!types[0].description.contains("hoshi-ontology/v1"));
+        assert!(!types[0].description.contains("game-ontology/v1"));
     }
 
     #[test]
