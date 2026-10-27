@@ -125,6 +125,47 @@ payloads, or secret-bearing environment dumps. New fixtures must remain
 synthetic or demonstrably sanitized, and metric names and labels must contain
 bounded identifiers rather than request content.
 
+## Game soak
+
+`game-soak` drives the game reference workload against a running deployment
+through public gRPC only. Deterministic bots, seeded from the synthetic
+generator's `Rng`, each command a disjoint share of the tenant's fleets and
+propose governed `game.fleet.order` Actions. Every round, intake delivers the
+round's battle reports as one registered-source `ApplySourceBatch` and appends
+them to a dataset, and a governed analytical transform rebuilds per-fleet
+statistics from it; each run names the previous run as its lineage parent.
+The paths interleave one call at a time, and each rate divides by the time
+spent in that path's calls. The same seed gives the same Action sequence and
+the same action digest in every run and namespace.
+
+Start a test deployment with experimental RPCs enabled (source descriptors,
+team namespaces, and transforms are experimental), then run the harness
+against its Unix socket. Setup uses the local operator socket and creates
+per-bot and intake credentials through gRPC:
+
+```bash
+cargo build --release --bin sekai-chisei --bin game-soak
+SEKAI_SOCKET=/tmp/soak/sekai.sock SEKAI_DB_PATH=/tmp/soak/sekai.db \
+CHISEI_DB_PATH=/tmp/soak/chisei.db SEKAI_EXPERIMENTAL_RPCS=1 GRPC_PORT=0 \
+  ./target/release/sekai-chisei &
+SEKAI_BENCH_HARDWARE="$(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.memsize) bytes RAM" \
+SEKAI_BENCH_OS="$(sw_vers -productName) $(sw_vers -productVersion)" \
+SEKAI_BENCH_RUSTC="$(rustc --version)" \
+SEKAI_BENCH_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+SEKAI_BENCH_PROFILE=release \
+./target/release/game-soak --target /tmp/soak/sekai.sock --seed 1626 \
+  --bots 4 --rounds 300 --batch-records 50 --out benchmarks/game-soak
+```
+
+The metadata variables are mandatory, as for the benchmark suite; the core
+count is read from the machine. The harness writes `report.json` and
+`report.md` into `--out`; neither names a host, user, or path. Each run uses a
+fresh namespace (override with `--namespace`), so one deployment can be soaked
+repeatedly. A run fails if any proposal is not applied, any batch is not
+committed, or the statistics lineage breaks. `benchmarks/game-soak/` holds a
+generated report from a fresh SQLite deployment; it records one machine and is
+not a service-level objective.
+
 ## Measured before/after results
 
 Results for the consolidation sequence in Issues #94–#98.

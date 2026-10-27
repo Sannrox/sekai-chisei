@@ -33,6 +33,7 @@ pub use chisei_core::identity_assertion;
 pub mod runtime_token;
 pub mod service_token;
 pub use chisei_provider::gateway_keys;
+pub mod game_soak;
 pub mod gateway_report;
 pub mod gateway_setup;
 pub mod governed_subject_cli;
