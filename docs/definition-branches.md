@@ -118,8 +118,9 @@ candidate holds exactly the given members on top of the published head, like
 a package import without a signature. It is what
 `sekaictl ontology import` calls. The proposal records `source_commit` (7 to
 64 lowercase hex digits), and the response carries the diff preview and the
-compatibility classification of the published head against the candidate.
-Every grant is checked before the first write.
+compatibility classification of the published head against the candidate,
+and the lint findings the candidate introduces, as `GetDefinitionProposal`
+reports them (#1619). Every grant is checked before the first write.
 
 ### Signed definition packages (#1700)
 

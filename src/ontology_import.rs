@@ -11,8 +11,11 @@
 //! The request names the published revision the tree was compared with, and
 //! the server refuses it if another proposal merged since, so an import never
 //! reverts a concurrent change. The server checks every grant before its first
-//! write, so a refused import creates no branch. The proposal records the source commit and goes through
-//! the normal review and merge gates; import never merges. The marking
+//! write, so a refused import creates no branch. The proposal records the
+//! source commit and goes through the normal review and merge gates; import
+//! never merges. The response carries the lint findings the candidate
+//! introduces (#1619), the same ones review sees; an unsuppressed error
+//! finding blocks the merge. The marking
 //! lattice (`markings/lattice.json`) is not imported: it is not governed by
 //! proposals.
 
@@ -26,7 +29,7 @@ use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
     DefinitionMemberInput, DefinitionRevisionCompatibility, DefinitionRevisionDiff,
-    ImportDefinitionTreeRequest,
+    ImportDefinitionTreeRequest, OntologyLintFinding,
 };
 use crate::ontology_export::{
     CREDENTIAL_PLACEHOLDER, LAYOUT_VERSION, Tree, build_tree, decode, is_hashed_stem, member_path,
@@ -51,6 +54,10 @@ pub struct ImportProposal {
     pub proposal_id: String,
     pub preview: DefinitionRevisionDiff,
     pub compatibility: DefinitionRevisionCompatibility,
+    /// What the candidate introduces under ontology lint (#1619); an error
+    /// finding blocks the merge.
+    pub lint_findings: Vec<OntologyLintFinding>,
+    pub lint_complete: bool,
 }
 
 /// What an import did.
@@ -201,6 +208,8 @@ pub async fn import(
         proposal_id,
         preview: response.preview.unwrap_or_default(),
         compatibility: response.compatibility.unwrap_or_default(),
+        lint_findings: response.lint_findings,
+        lint_complete: response.lint_complete,
     })))
 }
 

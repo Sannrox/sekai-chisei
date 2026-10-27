@@ -1,9 +1,10 @@
 //! `sekaictl ontology import` through the shipped binaries (#1618).
 
 use sekai_chisei::grpc::pb::sekai::{
-    DefinitionMemberInput, EnsureTeamNamespaceRequest, GetDefinitionBranchRequest,
-    GetDefinitionProposalRequest, GetPublishedDefinitionRevisionRequest,
-    ImportDefinitionTreeRequest,
+    ApproveDefinitionProposalRequest, DefinitionMemberInput, EnsureTeamNamespaceRequest,
+    GetDefinitionBranchRequest, GetDefinitionProposalRequest,
+    GetPublishedDefinitionRevisionRequest, ImportDefinitionTreeRequest,
+    MergeDefinitionProposalRequest,
 };
 use tonic::Code;
 
@@ -237,4 +238,88 @@ async fn a_reused_commit_and_a_stale_tree_are_refused() {
         .unwrap_err();
     assert_eq!(stale.code(), Code::FailedPrecondition, "{stale}");
     assert!(!branch_exists(&server, "import-fffffff").await);
+}
+
+/// An imported tree is linted like any proposal (#1619): a type no consumer
+/// references is reported by import, carried on the proposal, and blocks the
+/// merge; a reasoned suppression clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_imported_orphan_type_is_reported_and_cannot_merge() {
+    let server = LoopServer::spawn(&Backend::Sqlite);
+    let dir = tempfile::tempdir().unwrap();
+    publish(
+        &server,
+        "import-a",
+        vec![("object_type".into(), "incident".into(), INCIDENT.into())],
+    )
+    .await;
+    let tree = dir.path().join("tree");
+    export(&server, "import-a", &tree);
+    // A new type nothing consumes and no suppression covers.
+    std::fs::write(
+        tree.join("object_type/orphan.json"),
+        "{\n  \"name\": \"orphan\",\n  \"properties\": [\n    \"title\"\n  ]\n}\n",
+    )
+    .unwrap();
+
+    let output = import(&server, &tree, "1111111");
+    assert!(output.contains("1 blocking the merge"), "{output}");
+    assert!(
+        output.contains("error orphan_object_type object_type/orphan"),
+        "{output}"
+    );
+
+    let mut sekai = server.sekai().await;
+    let proposal = sekai
+        .get_definition_proposal(GetDefinitionProposalRequest {
+            namespace: "import-a".into(),
+            proposal_id: "import-1111111".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("proposal: {error}\n{}", server.logs()))
+        .into_inner();
+    assert!(
+        proposal
+            .lint_findings
+            .iter()
+            .any(|finding| finding.rule == "orphan_object_type"
+                && finding.subject_id == "orphan"
+                && finding.severity == "error"
+                && !finding.suppressed),
+        "the proposal carries the finding: {:?}",
+        proposal.lint_findings
+    );
+    sekai
+        .approve_definition_proposal(ApproveDefinitionProposalRequest {
+            namespace: "import-a".into(),
+            proposal_id: "import-1111111".into(),
+            idempotency_key: "approve-1111111".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("approve: {error}\n{}", server.logs()));
+    let head = published_head(&server).await;
+    let refused = sekai
+        .merge_definition_proposal(MergeDefinitionProposalRequest {
+            namespace: "import-a".into(),
+            proposal_id: "import-1111111".into(),
+            idempotency_key: "merge-1111111".into(),
+            expected_published_digest: head,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(
+        refused.message().contains("definition_lint_gate"),
+        "{refused}"
+    );
+
+    // With a reasoned suppression the same type imports without a blocking
+    // finding.
+    std::fs::write(
+        tree.join("object_type/orphan.json"),
+        "{\n  \"lint_suppressions\": [\n    {\n      \"reason\": \"staged for a consumer\",\n      \"rule\": \"orphan_object_type\"\n    }\n  ],\n  \"name\": \"orphan\",\n  \"properties\": [\n    \"title\"\n  ]\n}\n",
+    )
+    .unwrap();
+    let output = import(&server, &tree, "2222222");
+    assert!(output.contains("0 blocking the merge"), "{output}");
 }

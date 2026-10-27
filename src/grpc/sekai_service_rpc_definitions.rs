@@ -698,9 +698,32 @@ pub(super) async fn get_definition_proposal(
         &proposal.candidate_digest,
         false,
     )?;
-    // The lint findings the candidate introduces over the base (#1687),
-    // judged on the consumers this caller may see; the merge gate judges
-    // the same on every consumer.
+    let (lint_findings, lint_complete) = proposal_lint_findings(
+        service,
+        &principals,
+        &policy_context,
+        purpose.as_ref(),
+        tenant_context.as_ref(),
+        &proposal,
+    )?;
+    Ok(Response::new(GetDefinitionProposalResponse {
+        proposal: Some(to_proto_definition_proposal(&proposal)),
+        lint_findings,
+        lint_complete,
+    }))
+}
+
+/// The lint findings `proposal`'s candidate introduces over its base
+/// (#1687), judged on the consumers this caller may see, and whether that
+/// view was complete. The merge gate judges the same on every consumer.
+pub(super) fn proposal_lint_findings(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    proposal: &definition_proposal_domain::DefinitionProposal,
+) -> Result<(Vec<OntologyLintFinding>, bool), Status> {
     let db = service.db.runtime();
     let members = |digest: &str| {
         db.get_definition_members(&proposal.namespace, digest)
@@ -708,30 +731,26 @@ pub(super) async fn get_definition_proposal(
     };
     let (bindings, lint_complete) = visible_lint_objects(
         service,
-        &principals,
-        &policy_context,
-        purpose.as_ref(),
-        tenant_context.as_ref(),
+        principals,
+        policy_context,
+        purpose,
+        tenant_context,
         crate::sekai::definition_consumer_impact::BINDING_KIND,
         Some(&proposal.namespace),
         MAX_LINT_OBJECTS,
     )?;
     let (consumed, consumed_properties) =
         crate::sekai::ontology_lint::consumer_references(&bindings);
-    let lint_findings = crate::sekai::ontology_lint::introduced_findings(
+    let findings = crate::sekai::ontology_lint::introduced_findings(
         &members(&proposal.base_digest)?,
         &members(&proposal.candidate_digest)?,
         &consumed,
         &consumed_properties,
     );
-    Ok(Response::new(GetDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
-        lint_findings: lint_findings
-            .into_iter()
-            .map(lint_finding_to_proto)
-            .collect(),
+    Ok((
+        findings.into_iter().map(lint_finding_to_proto).collect(),
         lint_complete,
-    }))
+    ))
 }
 fn refuse_proposal_creator(
     proposal: &definition_proposal_domain::DefinitionProposal,

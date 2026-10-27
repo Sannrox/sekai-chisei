@@ -347,6 +347,11 @@ environments is the same import run against each one.
 - **Fails closed.** Every grant (namespace write, and schema, ontology or
   Action admin for each member the import changes or removes) is checked
   before the first write, so a refused import creates no branch.
+- **Lint.** The command prints the ontology lint findings the candidate
+  introduces (#1619), the same ones `GetDefinitionProposal` shows. An
+  unsuppressed error finding, such as a type nothing consumes, blocks the
+  merge (`definition_lint_gate`); fix it, or add a `lint_suppressions` entry
+  with a reason to the definition file and import again.
 - **Never merges.** The proposal goes through the normal review, lint and
   merge gates.
 - The marking lattice in `markings/lattice.json` is not imported: it is not
