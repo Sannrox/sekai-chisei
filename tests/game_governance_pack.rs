@@ -31,11 +31,11 @@ const PACKAGE: &str = include_str!("../examples/game-ontology/game-v1.json");
 const PACK: &str = include_str!("../examples/game-ontology/policy-pack-v1.json");
 const ROUTING: &str = include_str!("../examples/game-ontology/routing-v1.json");
 
-fn pack() -> Value {
+pub(crate) fn pack() -> Value {
     serde_json::from_str(PACK).expect("policy pack json")
 }
 
-fn strings(value: &Value) -> Vec<String> {
+pub(crate) fn strings(value: &Value) -> Vec<String> {
     value
         .as_array()
         .map(|items| {
@@ -47,7 +47,7 @@ fn strings(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn write_json(dir: &std::path::Path, name: &str, value: &Value) -> String {
+pub(crate) fn write_json(dir: &std::path::Path, name: &str, value: &Value) -> String {
     let path = dir.join(name);
     std::fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
     path.to_str().unwrap().to_string()
@@ -79,7 +79,7 @@ fn ontology() -> Value {
 }
 
 /// The namespace the pack registers `type_id` in.
-fn type_namespace(type_id: &str) -> String {
+pub(crate) fn type_namespace(type_id: &str) -> String {
     pack()["action_types"]
         .as_array()
         .unwrap()
@@ -124,15 +124,21 @@ fn seeds() -> [Value; 2] {
 }
 
 /// A server with the policy pack applied, and a token per workload role.
-struct GovernedGame {
-    server: LoopServer,
-    sekai: SekaiServiceClient<GatewayClient>,
-    tokens: HashMap<&'static str, String>,
+pub(crate) struct GovernedGame {
+    pub(crate) server: LoopServer,
+    pub(crate) sekai: SekaiServiceClient<GatewayClient>,
+    pub(crate) tokens: HashMap<&'static str, String>,
 }
 
 impl GovernedGame {
     async fn start() -> Self {
-        let server = LoopServer::spawn(&Backend::Sqlite);
+        Self::start_with_env(&[]).await
+    }
+
+    /// Like [`Self::start`], with extra server environment such as a model
+    /// endpoint.
+    pub(crate) async fn start_with_env(env: &[(&str, &str)]) -> Self {
+        let server = LoopServer::spawn_with_env(&Backend::Sqlite, env);
         let logs = || server.logs();
         let pack = pack();
         let files = tempfile::tempdir().unwrap();
@@ -301,7 +307,7 @@ impl GovernedGame {
             .unwrap_or_else(|error| panic!("submit {key}: {error}\n{}", self.server.logs()))
     }
 
-    async fn property(&self, id: &str, property: &str) -> String {
+    pub(crate) async fn property(&self, id: &str, property: &str) -> String {
         self.sekai
             .clone()
             .get_object(GetObjectRequest { id: id.into() })
