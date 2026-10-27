@@ -29,8 +29,10 @@ GitHub state unless the maintainer explicitly authorizes that action.
    security checks when access is available. Do not run live-provider tests
    without intentional prerequisites. Complete when evidence is current for the
    target commit.
-5. Draft concise user-facing release notes. Put upgrade and migration actions
-   before internal implementation detail. Credit contributors through GitHub's
+5. Draft concise user-facing release notes from
+   `bash scripts/changelog-draft.sh <version>`, edit the section into
+   `CHANGELOG.md`, and commit it with the version bump. Put upgrade and
+   migration actions before internal implementation detail. Credit contributors through GitHub's
    generated notes rather than maintaining a manual ledger.
 6. Report go/no-go. A release is `go` only when required checks pass, no known
    blocker remains, and rollback/upgrade implications are explicit.
