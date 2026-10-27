@@ -68,6 +68,7 @@ mod experimental_rpc_operator_docs;
 mod federation_backend_conformance;
 mod federation_network_adr;
 mod game_ai_players;
+mod game_demo_report;
 mod game_governance_pack;
 mod game_reference_actions;
 mod game_soak;
@@ -246,6 +247,7 @@ const GROUPED_MODULES: &[&str] = &[
     "federation_backend_conformance",
     "federation_network_adr",
     "game_ai_players",
+    "game_demo_report",
     "game_governance_pack",
     "game_reference_actions",
     "game_soak",
@@ -433,6 +435,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 148);
+    assert_eq!(GROUPED_MODULES.len(), 149);
     assert_eq!(SEPARATE_TARGETS.len(), 22);
 }

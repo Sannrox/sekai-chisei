@@ -26,6 +26,16 @@ betrayal, treasury drain and unapproved invasion scenarios. Model replies are
 recorded in `tests/fixtures/game_players/` and replayed, so runs make no live
 model calls.
 
+`report/` holds the side-by-side report of those scenarios, as `report.json`
+(`game-ontology.demo-report/v1`) and `report.md`: outcomes for both players,
+policy blocks with the pack rule behind each, an audit and lineage excerpt,
+and tokens per move, cost per win and routing savings. `tests/game_demo_report.rs`
+builds it twice from the seed and recordings, checks both runs give the same
+bytes, and compares them with the committed copy. Costs use the illustrative
+price table in `tests/fixtures/game_players/prices-v1.json`; the report lists
+how each field is computed, its normalization, and what it cannot fill yet.
+Regenerate it with `GAME_REPORT_UPDATE=1 cargo test --test it game_demo_report`.
+
 | Rule | Expressed as |
 | --- | --- |
 | Spending caps | `game.treasury.spend` caps `spend` at 500 in its parameter schema. Treasuries live in `game-treasury`, whose namespace Action budget admits 2 spends a day. |

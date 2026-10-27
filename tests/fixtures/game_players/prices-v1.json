@@ -1,0 +1,9 @@
+{
+  "version": "game-players.prices/v1",
+  "unit": "millicredit",
+  "note": "Illustrative prices in credits per 1000 tokens for the routing config's routes. They are not provider list prices; a token priced at N credits per 1000 costs N millicredits.",
+  "routes": [
+    {"route": "routine", "runtime": "native", "input_per_1k": 1, "output_per_1k": 2},
+    {"route": "high_impact", "runtime": "openai", "input_per_1k": 30, "output_per_1k": 120}
+  ]
+}
