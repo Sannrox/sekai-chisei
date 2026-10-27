@@ -4161,6 +4161,10 @@ message ImportDefinitionTreeResponse {
   DefinitionRevisionDiff preview = 2;
   // Published head against the candidate, reported before merge.
   DefinitionRevisionCompatibility compatibility = 3;
+  // Lint findings the candidate introduces, as GetDefinitionProposal reports
+  // them (#1619); an error finding blocks the merge.
+  repeated OntologyLintFinding lint_findings = 4;
+  bool lint_complete = 5;
 }
 
 message ProposeDefinitionRollbackRequest {

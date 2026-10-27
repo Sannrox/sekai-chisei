@@ -961,6 +961,8 @@ fn print_import_outcome(namespace: &str, outcome: &crate::ontology_import::Impor
         proposal_id,
         preview,
         compatibility,
+        lint_findings,
+        lint_complete,
     } = proposal.as_ref();
     println!("{namespace}: opened proposal {proposal_id}");
     for (change, members) in [
@@ -985,6 +987,35 @@ fn print_import_outcome(namespace: &str, outcome: &crate::ontology_import::Impor
             } else {
                 format!(" ({})", reason.property)
             }
+        );
+    }
+    // The merge gate refuses an unsuppressed error finding (#1687).
+    let blocking = lint_findings
+        .iter()
+        .filter(|finding| finding.severity == "error" && !finding.suppressed)
+        .count();
+    println!(
+        "lint: {} finding(s), {blocking} blocking the merge{}",
+        lint_findings.len(),
+        if *lint_complete {
+            ""
+        } else {
+            " (judged on the consumers you may see)"
+        }
+    );
+    for finding in lint_findings {
+        println!(
+            "  {} {} {}/{}{}: {}",
+            finding.severity,
+            finding.rule,
+            finding.subject_kind,
+            finding.subject_id,
+            if finding.suppressed {
+                " (suppressed)"
+            } else {
+                ""
+            },
+            finding.detail
         );
     }
 }

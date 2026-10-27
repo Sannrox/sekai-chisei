@@ -493,6 +493,8 @@ pub(super) async fn import_definition_tree(
 ) -> Result<Response<ImportDefinitionTreeResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let policy_context = principal_policy_context(&req);
+    let purpose = request_purpose_presentation(&req, &principals);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
@@ -530,11 +532,22 @@ pub(super) async fn import_definition_tree(
             expected_published_digest: Some(input.expected_published_digest),
         },
     )?;
+    // The same findings review and the merge gate see (#1619).
+    let (lint_findings, lint_complete) = super::rpc_definitions::proposal_lint_findings(
+        service,
+        &principals,
+        &policy_context,
+        purpose.as_ref(),
+        tenant_context.as_ref(),
+        &opened.proposal,
+    )?;
     Ok(Response::new(ImportDefinitionTreeResponse {
         proposal: Some(to_proto_definition_proposal(&opened.proposal)),
         preview: Some(to_proto_definition_revision_diff(&opened.preview)),
         compatibility: Some(to_proto_definition_revision_compatibility(
             &opened.compatibility,
         )),
+        lint_findings,
+        lint_complete,
     }))
 }
