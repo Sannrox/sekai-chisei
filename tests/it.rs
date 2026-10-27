@@ -67,6 +67,7 @@ mod evidence_backend_conformance;
 mod experimental_rpc_operator_docs;
 mod federation_backend_conformance;
 mod federation_network_adr;
+mod game_reference_actions;
 mod gateway_http_smoke;
 mod geospatial_query_adr;
 mod governed_fact_backend_conformance;
@@ -74,7 +75,6 @@ mod governed_image_adr;
 mod governed_image_backend_conformance;
 mod graph_backend_conformance;
 mod guarded_mutation_backend_conformance;
-mod hoshi_reference_actions;
 mod host_executor_permit_conformance;
 mod hosted_provider_smoke;
 mod identity_assertion_conformance;
@@ -241,6 +241,7 @@ const GROUPED_MODULES: &[&str] = &[
     "experimental_rpc_operator_docs",
     "federation_backend_conformance",
     "federation_network_adr",
+    "game_reference_actions",
     "gateway_http_smoke",
     "geospatial_query_adr",
     "governed_fact_backend_conformance",
@@ -248,7 +249,6 @@ const GROUPED_MODULES: &[&str] = &[
     "governed_image_backend_conformance",
     "graph_backend_conformance",
     "guarded_mutation_backend_conformance",
-    "hoshi_reference_actions",
     "host_executor_permit_conformance",
     "hosted_provider_smoke",
     "identity_assertion_conformance",

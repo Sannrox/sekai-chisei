@@ -1,7 +1,7 @@
 //! Governed Action scenarios against the game reference workload (#1624).
 //!
-//! The Fleet and Planet classes come from the pinned `hoshi-ontology/v1`
-//! package under `examples/hoshi-ontology/`. Everything else goes through
+//! The Fleet and Planet classes come from the `game-ontology/v1` package
+//! under `examples/game-ontology/`. Everything else goes through
 //! the shipped binary's public surfaces: the operator CLI for ontology,
 //! seed, credentials and policies, and gRPC for Actions. Four scenarios: an
 //! allowed proposal, a proposal refused by its policy, a move applied only
@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 use crate::product_loop_backend_conformance::{Backend, LoopServer, bearer};
 
-const PACKAGE: &str = include_str!("../examples/hoshi-ontology/hoshi-v1.json");
-const NAMESPACE: &str = "hoshi";
+const PACKAGE: &str = include_str!("../examples/game-ontology/game-v1.json");
+const NAMESPACE: &str = "game";
 
 /// The pinned package's Fleet and Planet classes and their `stationed-at`
 /// relation, as the operator CLI's ontology document.
@@ -36,7 +36,7 @@ fn fleet_ontology() -> Value {
             "description": found["description"],
             "mapped_kind": name.to_lowercase(),
             "ensure_kind": true,
-            "kind_description": format!("{name} (hoshi-ontology/v1)"),
+            "kind_description": format!("{name} (game-ontology/v1)"),
         })
     };
     let relation = package["relations"]
@@ -89,7 +89,7 @@ fn fleet_action(
         namespace: NAMESPACE.into(),
         type_id: type_id.into(),
         version: "1".into(),
-        description: format!("{type_id} (hoshi reference workload)"),
+        description: format!("{type_id} (game reference workload)"),
         parameter_schema_json: json!({
             "type": "object",
             "properties": {"object_id": {"type": "string"}, property: {"type": "string"}},
@@ -108,7 +108,7 @@ fn fleet_action(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn hoshi_fleet_actions_follow_their_policies() {
+async fn game_fleet_actions_follow_their_policies() {
     let server = LoopServer::spawn(&Backend::Sqlite);
     let logs = || server.logs();
     let files = tempfile::tempdir().unwrap();
@@ -144,9 +144,9 @@ async fn hoshi_fleet_actions_follow_their_policies() {
     let admiral = server.token("admiral");
     // An Action type's `policy_scope` resolves as the `project:` scope.
     for (scope, default) in [
-        ("project:hoshi-orders", "allow"),
-        ("project:hoshi-raids", "deny"),
-        ("project:hoshi-moves", "require_approval"),
+        ("project:game-orders", "allow"),
+        ("project:game-raids", "deny"),
+        ("project:game-moves", "require_approval"),
     ] {
         server.sekaictl_ok(&[
             "admin",
@@ -161,9 +161,9 @@ async fn hoshi_fleet_actions_follow_their_policies() {
         ]);
     }
     for type_def in [
-        fleet_action("hoshi.fleet.orders", "hoshi-orders", "orders", &[]),
-        fleet_action("hoshi.fleet.raid", "hoshi-raids", "orders", &[]),
-        fleet_action("hoshi.fleet.move", "hoshi-moves", "planet", &["admiral"]),
+        fleet_action("game.fleet.orders", "game-orders", "orders", &[]),
+        fleet_action("game.fleet.raid", "game-raids", "orders", &[]),
+        fleet_action("game.fleet.move", "game-moves", "planet", &["admiral"]),
     ] {
         sekai
             .put_governed_action_type(PutGovernedActionTypeRequest {
@@ -208,7 +208,7 @@ async fn hoshi_fleet_actions_follow_their_policies() {
     // 1. An allowed proposal is admitted and applied.
     let allowed = sekai
         .submit_action_instance(submit(
-            "hoshi.fleet.orders",
+            "game.fleet.orders",
             "scout-patrol",
             json!({"object_id": "f-scout", "orders": "patrol"}),
         ))
@@ -224,7 +224,7 @@ async fn hoshi_fleet_actions_follow_their_policies() {
     //    writes nothing.
     let refused = sekai
         .submit_action_instance(submit(
-            "hoshi.fleet.raid",
+            "game.fleet.raid",
             "strike-raid",
             json!({"object_id": "f-strike", "orders": "raid"}),
         ))
@@ -243,7 +243,7 @@ async fn hoshi_fleet_actions_follow_their_policies() {
     // 3. A move parks on proposal and applies only once the approver grants.
     let parked = sekai
         .submit_action_instance(submit(
-            "hoshi.fleet.move",
+            "game.fleet.move",
             "main-to-ally",
             json!({"object_id": "f-main", "planet": "p-ally"}),
         ))
@@ -280,7 +280,7 @@ async fn hoshi_fleet_actions_follow_their_policies() {
     for (key, planet) in [("contested-ally", "p-ally"), ("contested-rim", "p-rim")] {
         let instance = sekai
             .submit_action_instance(submit(
-                "hoshi.fleet.move",
+                "game.fleet.move",
                 key,
                 json!({"object_id": "f-contested", "planet": planet}),
             ))
