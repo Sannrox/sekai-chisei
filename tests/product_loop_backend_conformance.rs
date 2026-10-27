@@ -57,6 +57,12 @@ pub(crate) struct LoopServer {
 
 impl LoopServer {
     pub(crate) fn spawn(backend: &Backend) -> Self {
+        Self::spawn_with_env(backend, &[])
+    }
+
+    /// Like [`Self::spawn`], with extra server environment such as provider
+    /// availability for routing tests.
+    pub(crate) fn spawn_with_env(backend: &Backend, env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("sekai.sock");
         let log_path = dir.path().join("sekai.log");
@@ -77,6 +83,7 @@ impl LoopServer {
             .env_remove("OLLAMA_URL")
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
+            .envs(env.iter().copied())
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
             .stderr(Stdio::from(log));
         match backend {
@@ -176,7 +183,9 @@ impl LoopServer {
         SekaiServiceClient::new(connect_sekai(&self.socket_str()).await.expect("connect"))
     }
 
-    async fn chisei(&self) -> ChiseiServiceClient<sekai_chisei::grpc::client::GatewayClient> {
+    pub(crate) async fn chisei(
+        &self,
+    ) -> ChiseiServiceClient<sekai_chisei::grpc::client::GatewayClient> {
         ChiseiServiceClient::new(connect_sekai(&self.socket_str()).await.expect("connect"))
     }
 

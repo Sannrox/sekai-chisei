@@ -1,0 +1,32 @@
+{
+  "version": "game-ontology.routing/v1",
+  "package": "game-ontology/v1",
+  "routes": [
+    {
+      "route": "routine",
+      "namespace": "game",
+      "allowed_runtimes": ["native"],
+      "allowed_models": ["native-default"],
+      "default_runtime": "native",
+      "default_model": "native-default",
+      "enabled_families": ["native"]
+    },
+    {
+      "route": "high_impact",
+      "namespace": "game-high-impact",
+      "allowed_runtimes": ["openai"],
+      "allowed_models": ["gpt-5.5"],
+      "default_runtime": "openai",
+      "default_model": "gpt-5.5",
+      "enabled_families": ["openai"]
+    }
+  ],
+  "budgets": [
+    {"window": "turn", "route": "routine", "metric": "tokens", "period_type": "daily", "max": 4000},
+    {"window": "turn", "route": "routine", "metric": "requests", "period_type": "daily", "max": 6},
+    {"window": "turn", "route": "high_impact", "metric": "tokens", "period_type": "daily", "max": 8000},
+    {"window": "turn", "route": "high_impact", "metric": "requests", "period_type": "daily", "max": 2},
+    {"window": "day", "metric": "tokens", "period_type": "daily", "max": 40000},
+    {"window": "day", "metric": "requests", "period_type": "daily", "max": 40}
+  ]
+}
