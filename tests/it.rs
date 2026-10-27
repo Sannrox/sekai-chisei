@@ -67,6 +67,8 @@ mod evidence_backend_conformance;
 mod experimental_rpc_operator_docs;
 mod federation_backend_conformance;
 mod federation_network_adr;
+mod game_reference_actions;
+mod game_soak;
 mod gateway_http_smoke;
 mod geospatial_query_adr;
 mod governed_fact_backend_conformance;
@@ -74,7 +76,6 @@ mod governed_image_adr;
 mod governed_image_backend_conformance;
 mod graph_backend_conformance;
 mod guarded_mutation_backend_conformance;
-mod hoshi_reference_actions;
 mod host_executor_permit_conformance;
 mod hosted_provider_smoke;
 mod identity_assertion_conformance;
@@ -100,6 +101,7 @@ mod object_security_value_instance_adr;
 mod object_set_adr;
 mod object_sync_backend_conformance;
 mod ollama_e2e;
+mod ontology_export;
 mod open_table_backend_conformance;
 mod operation_correlation_adr;
 mod parked_work_backend_conformance;
@@ -109,6 +111,7 @@ mod performance_manifest;
 mod policy_decision_pdp;
 mod postgres_bind_hygiene;
 mod product_loop_backend_conformance;
+mod reference_workload_sharing;
 mod relation_cardinality_adr;
 mod relational_source_family_adr;
 mod replica_conformance_adapter;
@@ -239,6 +242,8 @@ const GROUPED_MODULES: &[&str] = &[
     "experimental_rpc_operator_docs",
     "federation_backend_conformance",
     "federation_network_adr",
+    "game_reference_actions",
+    "game_soak",
     "gateway_http_smoke",
     "geospatial_query_adr",
     "governed_fact_backend_conformance",
@@ -246,7 +251,6 @@ const GROUPED_MODULES: &[&str] = &[
     "governed_image_backend_conformance",
     "graph_backend_conformance",
     "guarded_mutation_backend_conformance",
-    "hoshi_reference_actions",
     "host_executor_permit_conformance",
     "hosted_provider_smoke",
     "identity_assertion_conformance",
@@ -275,12 +279,14 @@ const GROUPED_MODULES: &[&str] = &[
     "open_table_backend_conformance",
     "operation_correlation_adr",
     "parked_work_backend_conformance",
+    "ontology_export",
     "partitioned_transform_io_adr",
     "perf_gate_cli",
     "performance_manifest",
     "policy_decision_pdp",
     "postgres_bind_hygiene",
     "product_loop_backend_conformance",
+    "reference_workload_sharing",
     "relation_cardinality_adr",
     "relational_source_family_adr",
     "replica_conformance_adapter",
@@ -421,6 +427,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 142);
+    assert_eq!(GROUPED_MODULES.len(), 145);
     assert_eq!(SEPARATE_TARGETS.len(), 22);
 }

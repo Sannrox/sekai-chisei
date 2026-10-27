@@ -248,7 +248,7 @@ pull request body, which becomes the squash commit; at release,
   (`docs/isolation-probes.md`, #1621).
 
 - The game reference workload is a synthetic tenant domain (`GameWorkload`):
-  its kinds and links come from the pinned `hoshi-ontology/v1` package
+  its kinds and links come from the `game-ontology/v1` package
   (players own planets, fleets are stationed at planets, players ally), and
   it runs through the same `generate` and `apply` as every domain, with
   seeded markings, principals and governed fleet orders (#1616).

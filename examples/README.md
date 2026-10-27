@@ -27,16 +27,16 @@ cargo test --locked --test epistemic_replication_example
 See [the fixture walkthrough](../docs/epistemic-replication-example.md) for the
 exact commands and the bounded report fields.
 
-## hoshi-ontology
+## game-ontology
 
-[hoshi-ontology/](hoshi-ontology/README.md) pins the game reference workload's
-`hoshi-ontology/v1` package by digest. CI validates it like any ontology
-package and runs governed Action scenarios against its Fleet and Planet
-classes through the public gRPC API.
+[game-ontology/](game-ontology/README.md) holds the game reference workload's
+`game-ontology/v1` package. CI validates it like any ontology package and runs
+governed Action scenarios against its Fleet and Planet classes through the
+public gRPC API.
 
 ```bash
 cargo test --locked -p sekai-ontology --test reference_packages
-cargo test --locked --test it hoshi_reference
+cargo test --locked --test it game_reference
 ```
 
 ## analytical_transform
