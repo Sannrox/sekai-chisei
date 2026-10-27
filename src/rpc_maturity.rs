@@ -569,17 +569,55 @@ mod tests {
         );
     }
 
+    const DOCS_UPDATE_ENV: &str = "RPC_MATURITY_DOCS_UPDATE";
+
+    /// `docs` with the table between the row markers rendered from `table`,
+    /// one row per entry in fixture order. Prose outside the markers is kept.
+    fn render_docs_table(docs: &str, table: &RpcMaturityTable) -> String {
+        const START: &str = "<!-- rpc-maturity-rows -->";
+        const END: &str = "<!-- /rpc-maturity-rows -->";
+        let start = docs.find(START).expect("row marker") + START.len();
+        let end = docs.find(END).expect("closing row marker");
+        let mut rows = String::from(
+            "\n\n| RPC | Storage path | Real backend | Known consumer | Classification |\n\
+             | --- | --- | --- | --- | --- |\n",
+        );
+        for entry in &table.entries {
+            rows.push_str(&format!(
+                "| `{}.{}` | `{}` | {} | {} | `{}` |\n",
+                entry.service,
+                entry.rpc,
+                entry.storage_path,
+                entry.real_backend,
+                entry.consumer,
+                entry.classification.as_str()
+            ));
+        }
+        rows.push('\n');
+        format!("{}{rows}{}", &docs[..start], &docs[end..])
+    }
+
+    /// The docs table is generated from the fixture; lanes edit only the
+    /// fixture and regenerate with `RPC_MATURITY_DOCS_UPDATE=1`.
     #[test]
-    fn docs_table_matches_fixture_and_proto() {
+    fn docs_table_is_rendered_from_the_fixture() {
         let table = RpcMaturityTable::load().expect("maturity table");
-        let docs = parse_docs_rpcs(MATURITY_DOCS).expect("docs rows");
-        let fixture: BTreeSet<_> = table
-            .entries
-            .iter()
-            .map(|entry| rpc_key(&entry.service, &entry.rpc))
-            .collect();
-        assert_eq!(docs, fixture);
-        assert_eq!(docs, proto_rpc_keys().expect("proto keys"));
+        let rendered = render_docs_table(MATURITY_DOCS, &table);
+        if std::env::var_os(DOCS_UPDATE_ENV).is_some() {
+            let path =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/rpc-maturity.md");
+            std::fs::write(path, rendered).expect("write docs/rpc-maturity.md");
+            return;
+        }
+        assert!(
+            rendered == MATURITY_DOCS,
+            "docs/rpc-maturity.md table is stale; regenerate with \
+             {DOCS_UPDATE_ENV}=1 cargo test -p sekai-chisei --lib rpc_maturity::tests::docs_table"
+        );
+        assert_eq!(
+            parse_docs_rpcs(MATURITY_DOCS).expect("docs rows"),
+            proto_rpc_keys().expect("proto keys")
+        );
     }
 
     #[test]
