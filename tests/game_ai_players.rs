@@ -50,7 +50,7 @@ const ROUTING: &str = include_str!("../examples/game-ontology/routing-v1.json");
 const RESPONSES_PATH: &str = "tests/fixtures/game_players/responses-v1.json";
 const RESPONSES: &str = include_str!("fixtures/game_players/responses-v1.json");
 const RESPONSES_VERSION: &str = "game-players.responses/v1";
-const SEED: u64 = 1855;
+pub(crate) const SEED: u64 = 1855;
 /// The ungoverned player's namespace, for both its model calls and Actions.
 const FREE: &str = "game-free";
 /// Both players act as the pack's acting agent.
@@ -83,14 +83,14 @@ struct ReplayState {
 
 /// A loopback OpenAI-compatible endpoint that answers from the recordings.
 /// It keys on the last user message, which is the player's prompt.
-struct Replay {
+pub(crate) struct Replay {
     url: String,
     state: ReplayState,
     shutdown: watch::Sender<bool>,
 }
 
 impl Replay {
-    async fn spawn(upstream: Option<(String, String)>) -> Self {
+    pub(crate) async fn spawn(upstream: Option<(String, String)>) -> Self {
         let recordings: Recordings = serde_json::from_str(RESPONSES).expect("responses json");
         assert_eq!(recordings.version, RESPONSES_VERSION);
         // Recording starts empty, so every reply comes from the live model.
@@ -249,13 +249,13 @@ async fn record(url: &str, model: &str, prompt: &str) -> String {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Scenario {
+pub(crate) enum Scenario {
     AllianceBetrayal,
     TreasuryDrain,
     UnapprovedInvasion,
 }
 
-const SCENARIOS: [Scenario; 3] = [
+pub(crate) const SCENARIOS: [Scenario; 3] = [
     Scenario::AllianceBetrayal,
     Scenario::TreasuryDrain,
     Scenario::UnapprovedInvasion,
@@ -304,9 +304,9 @@ impl Scenario {
 }
 
 /// What one player does with one decision.
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "verdict", rename_all = "snake_case")]
-enum Verdict {
+pub(crate) enum Verdict {
     Applied,
     /// A submission criterion refused it; `rule` is its criterion id.
     Denied {
@@ -325,19 +325,38 @@ enum Verdict {
 }
 
 #[derive(Serialize, Debug)]
-struct Turn {
-    decision: Value,
-    verdict: Verdict,
+pub(crate) struct Turn {
+    pub(crate) decision: Value,
+    pub(crate) verdict: Verdict,
+    /// The model call's request id and the submitted Action, for reading
+    /// their audit records afterwards. Generated ids stay out of the digest.
+    #[serde(skip)]
+    pub(crate) request_id: String,
+    #[serde(skip)]
+    pub(crate) submission: Option<Submission>,
+}
+
+/// One submitted Action. A submission refused at admission has no instance.
+#[derive(Debug, Clone)]
+pub(crate) struct Submission {
+    pub(crate) type_id: &'static str,
+    pub(crate) operation_id: String,
+    pub(crate) instance_id: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
-struct Outcome {
-    scenario: String,
-    governed: Vec<Turn>,
-    ungoverned: Vec<Turn>,
+pub(crate) struct Outcome {
+    pub(crate) scenario: String,
+    pub(crate) governed: Vec<Turn>,
+    pub(crate) ungoverned: Vec<Turn>,
     /// The property each Action writes, on each player's target afterwards.
-    governed_effect: String,
-    ungoverned_effect: String,
+    pub(crate) governed_effect: String,
+    pub(crate) ungoverned_effect: String,
+    /// The objects and property behind the effects, governed first.
+    #[serde(skip)]
+    pub(crate) targets: [String; 2],
+    #[serde(skip)]
+    pub(crate) property: &'static str,
 }
 
 /// Where one player's model calls and Actions go, and its copy of the world.
@@ -402,7 +421,7 @@ fn ungoverned_types() -> Vec<Value> {
 
 /// A server with the policy pack, the routine route, and the ungoverned
 /// namespace, with model calls served by `replay`.
-async fn start(replay: &Replay) -> GovernedGame {
+pub(crate) async fn start(replay: &Replay) -> GovernedGame {
     let game = GovernedGame::start_with_env(&[("NATIVE_LLM_URL", &replay.url)]).await;
     let logs = || game.server.logs();
     let files = tempfile::tempdir().unwrap();
@@ -542,7 +561,12 @@ async fn decide(game: &GovernedGame, seat: &Seat, request_id: &str, prompt: &str
 }
 
 /// Submits the decision as the seat's Action, through the same RPC for both.
-async fn act(game: &GovernedGame, seat: &Seat, key: &str, decision: &Value) -> Verdict {
+async fn act(
+    game: &GovernedGame,
+    seat: &Seat,
+    key: &str,
+    decision: &Value,
+) -> (Verdict, Option<Submission>) {
     let planet = || (seat.object)(decision["planet"].as_str().unwrap_or_default());
     let (type_id, parameters) = match decision["action"].as_str() {
         Some("attack") => (
@@ -557,8 +581,9 @@ async fn act(game: &GovernedGame, seat: &Seat, key: &str, decision: &Value) -> V
             "game.treasury.spend",
             json!({"object_id": (seat.object)("t-main"), "spend": decision["amount"]}),
         ),
-        _ => return Verdict::Held,
+        _ => return (Verdict::Held, None),
     };
+    let operation_id = format!("operation-{key}");
     let submitted = game
         .sekai
         .clone()
@@ -570,31 +595,42 @@ async fn act(game: &GovernedGame, seat: &Seat, key: &str, decision: &Value) -> V
                 version: "1".into(),
                 parameters_json: parameters.to_string(),
                 idempotency_key: key.into(),
-                request_id: format!("operation-{key}"),
+                request_id: operation_id.clone(),
                 ..Default::default()
             },
         ))
         .await;
-    match submitted.map(|response| response.into_inner().instance.unwrap()) {
-        Ok(instance) => match instance.status.as_str() {
-            "admitted" => Verdict::Applied,
-            "denied" => Verdict::Denied {
-                rule: instance.deny_reason,
-            },
-            "parked" => Verdict::Parked {
-                policy: instance.policy_decision,
-            },
-            other => panic!("{key}: unexpected status {other}: {instance:?}"),
+    let mut submission = Submission {
+        type_id,
+        operation_id,
+        instance_id: None,
+    };
+    let instance = match submitted {
+        Ok(response) => response.into_inner().instance.unwrap(),
+        Err(status) => {
+            let verdict = Verdict::Refused {
+                code: format!("{:?}", status.code()),
+                message: status.message().into(),
+            };
+            return (verdict, Some(submission));
+        }
+    };
+    submission.instance_id = Some(instance.instance_id.clone());
+    let verdict = match instance.status.as_str() {
+        "admitted" => Verdict::Applied,
+        "denied" => Verdict::Denied {
+            rule: instance.deny_reason,
         },
-        Err(status) => Verdict::Refused {
-            code: format!("{:?}", status.code()),
-            message: status.message().into(),
+        "parked" => Verdict::Parked {
+            policy: instance.policy_decision,
         },
-    }
+        other => panic!("{key}: unexpected status {other}: {instance:?}"),
+    };
+    (verdict, Some(submission))
 }
 
 /// Plays `scenario` for both seats, turn by turn on the same prompts.
-async fn play(game: &GovernedGame, seed: u64, scenario: Scenario) -> Outcome {
+pub(crate) async fn play(game: &GovernedGame, seed: u64, scenario: Scenario) -> Outcome {
     let name = format!("{scenario:?}");
     let mut turns: BTreeMap<&str, Vec<Turn>> = BTreeMap::new();
     let seats = [governed_seat(), ungoverned_seat()];
@@ -602,11 +638,13 @@ async fn play(game: &GovernedGame, seed: u64, scenario: Scenario) -> Outcome {
         for seat in &seats {
             let key = format!("{name}-{}-{index}", seat.name);
             let decision = decide(game, seat, &key, prompt).await;
-            let verdict = act(game, seat, &key, &decision).await;
-            turns
-                .entry(seat.name)
-                .or_default()
-                .push(Turn { decision, verdict });
+            let (verdict, submission) = act(game, seat, &key, &decision).await;
+            turns.entry(seat.name).or_default().push(Turn {
+                decision,
+                verdict,
+                request_id: key,
+                submission,
+            });
         }
     }
     let (target, property) = match scenario {
@@ -621,6 +659,8 @@ async fn play(game: &GovernedGame, seed: u64, scenario: Scenario) -> Outcome {
         ungoverned_effect: game.property(&ungoverned, property).await,
         governed: turns.remove("governed").unwrap(),
         ungoverned: turns.remove("ungoverned").unwrap(),
+        targets: [governed, ungoverned],
+        property,
     }
 }
 
