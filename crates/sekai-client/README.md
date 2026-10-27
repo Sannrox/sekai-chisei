@@ -55,7 +55,9 @@ connections do not depend on an operating-system CA bundle. Hosts that need
 the platform certificate store can use `--no-default-features --features
 tls-native-roots`; enabling both root features is also supported. A configured
 PEM CA certificate is added to the selected roots through
-`ClientConfig::with_tls_ca_certificate`.
+`ClientConfig::with_tls_ca_certificate`. Callers bound to their own PKI can add
+`ClientConfig::without_builtin_roots` so only that CA is trusted; construction
+then fails if no CA certificate is configured.
 
 For registry publication, release a compatible `sekai-proto` version before
 `sekai-client`; workspace builds resolve the local path, while registry
