@@ -48,7 +48,7 @@ Coverage:
 | ObjectType / schema | supported | Sekai | `SekaiService.CreateSchemaType` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/domain-v1.json` |
 | Ontology class | supported | Sekai | `SekaiService.CreateOntologyClass` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/domain-v1.json` |
 | Ontology relation | supported | Sekai | `SekaiService.CreateOntologyRelation` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/domain-v1.json` |
-| Definition branch edit | experimental | Sekai | `SekaiService.ApplyDefinitionBranchEdit` | [definition-branches.md](definition-branches.md) | `src/sekai/definition_branch.rs` |
+| Definition branch edit | experimental | Sekai | `SekaiService.ApplyDefinitionBranchEdit` | [definition-branches.md](definition-branches.md) | `crates/sekai-core/src/sekai/definition_branch.rs` |
 | Object seed | supported | Sekai | `SekaiService.CreateObject` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/seed-v1.json` |
 | Link seed | supported | Sekai | `SekaiService.CreateLink` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/seed-v1.json` |
 | Plan execution | supported | Chisei | `ChiseiService.PlanExecution` | [architecture.md](architecture.md) | `sdk/typescript/client.test.ts` |
@@ -59,7 +59,7 @@ Coverage:
 | Derivation explanation | supported | Sekai | `SekaiService.ExplainDerivation` | [ontology.md](ontology.md) | `tests/sekaictl_semantic_reads.rs` |
 | Quality-trend report | supported | Chisei | `ChiseiService.GetQualityTrend` | [evaluation-quality-trends.md](evaluation-quality-trends.md) | `sdk/typescript/client.ts` |
 | Native capability catalog | supported | Sekai | `SekaiService.DiscoverCapabilities` | [capability-catalog.md](capability-catalog.md) | `src/capability_codegen.rs` |
-| Client-package record | supported | Sekai | `SekaiService` via `sekaictl admin sdk-packages` | [sdk-packages.md](sdk-packages.md) | `src/sekai/client_package.rs` |
+| Client-package record | supported | Sekai | `SekaiService` via `sekaictl admin sdk-packages` | [sdk-packages.md](sdk-packages.md) | `crates/sekai-core/src/sekai/client_package.rs` |
 | Compatibility matrix (#873) | supported | Interface | `compatibility.json` via `sekaictl admin compatibility` | [sdk-packages.md](sdk-packages.md) | `src/compatibility_matrix.rs` |
 | Public RPC maturity (#871) | supported | Interface | `SekaiService.DiscoverCapabilities` | [rpc-maturity.md](rpc-maturity.md) | `src/rpc_maturity.rs` |
 | Provider-profile matrix | supported | Gateway | HTTP `chisei.provider-capabilities/v1` | [capability-catalog.md](capability-catalog.md) | `crates/chisei-gateway/src/gateway.rs` |
@@ -111,7 +111,7 @@ The MCP host allowlists `GetObject`, `EvaluateObjectSet`,
 
 | Surface | Rust | TypeScript | Python | SQLite | PostgreSQL |
 | --- | --- | --- | --- | --- | --- |
-| Context / expand / explain | `sekaictl ontology context`, `expand`, `explain` | generated HTTP client | generated HTTP client | yes | asserted-only (entailment fails `FAILED_PRECONDITION`; discovery reports `supports_entailment=0`) |
+| Context / expand / explain | `sekaictl ontology context`, `expand`, `explain` | generated HTTP client | generated HTTP client | yes | yes (entailment since #1320) |
 | Ontology apply (class / relation) | `sekaictl ontology apply` | not a typed helper | not a typed helper | yes | yes |
 | Object / link seed | `sekaictl ontology seed` | `runCoreLoop` | `run_core_loop` | yes | yes |
 | Plan / receipt | `sekaictl ontology run` | `runCoreLoop` | `run_core_loop` | yes | see [postgres-chisei-parity.md](postgres-chisei-parity.md) |

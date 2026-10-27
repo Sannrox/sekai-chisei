@@ -478,7 +478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Some(
                 "apply" | "export" | "seed" | "run" | "first-run" | "context" | "expand"
-                | "explain",
+                | "explain" | "lint",
             ) => {
                 sekai_chisei::launch::load_local_env();
                 sekai_chisei::ontology_product_cli::run_ontology_product_command(

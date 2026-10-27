@@ -42,7 +42,7 @@ to be computed, and it outlives the text it came from unless it follows edits.
    the deployment may only embed properties the egress policy lets leave
    (schema classification and the object's external-property list). Any
    other property fails the catch-up closed; it is never dropped silently.
-6. Models sit behind the `Embedder` seam in `sekai-provider`. A failure leaves
+6. Models sit behind the `Embedder` seam in `chisei-provider`. A failure leaves
    the checkpoint where it was, so the next catch-up retries.
 7. Every write to a spec's index (vectors, deletes, resets, checkpoint) is a
    compare-and-bump of a per-spec revision in the same transaction. Two
@@ -65,5 +65,20 @@ to be computed, and it outlives the text it came from unless it follows edits.
 ## Consequences
 
 Both community backends store the same three tables (chunks, checkpoints,
-rebuilds). A route-backed embedder, a spec registry and the search API over
-vectors are separate changes.
+rebuilds). The search API over vectors is a separate change.
+
+Amended by #1609: specs are stored per namespace (`sekai_embedding_specs`)
+and name a hosted catalog route as their model. Combined mode runs catch-up
+on a schedule over every stored spec, admitting each route as hosted
+execution does; the route is external unless its origin is loopback. See
+[embedding-index.md](../embedding-index.md).
+
+Amended by #1582: vector search is exact over the chunk table, filtered by
+the compiled read policy before the candidate cap, so recall is 1.0. The
+10^6-vector check is a latency budget; an ANN index is added behind
+`SearchIndex::vector_candidates` only if measured latency fails it. Hybrid
+`Search` fuses text and vector candidates under one named profile,
+`late_fusion.rrf/v1` (reciprocal rank fusion, k = 60). An embedded HNSW index
+was rejected for now (no measured need), and so were PostgreSQL-only vectors
+(they leave SQLite without vector search). See
+[search.md](../search.md#hybrid-search).

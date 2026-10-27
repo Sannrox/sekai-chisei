@@ -1,5 +1,4 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
-
 #[path = "action_binding.rs"]
 mod action_binding;
 #[path = "authorized_link_mutation.rs"]
@@ -10,18 +9,44 @@ mod authorized_query_lifecycle;
 mod capability_discovery;
 #[path = "catalog_invocation.rs"]
 mod catalog_invocation;
+#[path = "catalog_rpc.rs"]
+mod catalog_rpc;
 #[path = "computed_response.rs"]
 mod computed_response;
+#[path = "data_export_rpc.rs"]
+mod data_export_rpc;
+use data_export_rpc::{
+    EXPORT_BATCH, ExportCaller, ExportStream, ExportWriter, PreparedExport, export_grantee,
+    run_export,
+};
+#[path = "definition_bundle_apply_rpc.rs"]
+mod definition_bundle_apply_rpc;
+#[path = "definition_change_bundle_rpc.rs"]
+mod definition_change_bundle_rpc;
 #[path = "definition_consumer_impact.rs"]
 mod definition_consumer_impact;
+#[path = "embedding_spec_rpc.rs"]
+mod embedding_spec_rpc;
+#[path = "explain_value_rpc.rs"]
+mod explain_value_rpc;
+#[path = "ezu_geo_feed.rs"]
+mod ezu_geo_feed;
+#[path = "fence_binding.rs"]
+mod fence_binding;
 #[path = "graph_explore_rpc.rs"]
 mod graph_explore_rpc;
+#[path = "media_upload_rpc.rs"]
+mod media_upload_rpc;
 #[path = "object_change_subscription.rs"]
 mod object_change_subscription;
+#[path = "object_comment_rpc.rs"]
+mod object_comment_rpc;
 #[path = "object_mutation_lifecycle.rs"]
 mod object_mutation_lifecycle;
 #[path = "object_set_query.rs"]
 mod object_set_query;
+#[path = "ontology_changelog_rpc.rs"]
+mod ontology_changelog_rpc;
 #[path = "ontology_definition_lifecycle.rs"]
 mod ontology_definition_lifecycle;
 #[path = "schema_definition_lifecycle.rs"]
@@ -30,14 +55,22 @@ mod schema_definition_lifecycle;
 mod scored_knowledge_admission;
 #[path = "search_rpc.rs"]
 mod search_rpc;
+#[path = "sync_scope_rpc.rs"]
+mod sync_scope_rpc;
 #[cfg(test)]
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
 };
+#[path = "sekai_service_db_work.rs"]
+mod db_work;
+#[path = "ontology_health_rpc.rs"]
+mod ontology_health_rpc;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
 #[path = "sekai_service_support_access.rs"]
 mod support_access;
+#[path = "trust_score_rpc.rs"]
+mod trust_score_rpc;
 use support_access::*;
 #[path = "sekai_service_support_mapping.rs"]
 mod support_mapping;
@@ -55,6 +88,8 @@ mod rpc_actions;
 mod rpc_coordination;
 #[path = "sekai_service_rpc_data.rs"]
 mod rpc_data;
+#[path = "sekai_service_rpc_definition_package.rs"]
+mod rpc_definition_package;
 #[path = "sekai_service_rpc_definitions.rs"]
 mod rpc_definitions;
 #[path = "sekai_service_rpc_leases.rs"]
@@ -85,7 +120,6 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain;
-use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::action_work_lifecycle::{
@@ -135,6 +169,7 @@ use crate::sekai::work_unit_lifecycle::{
 use crate::sekai::{
     audit, compute, coordination, dataset, function, ontology, retrieval, security, semantic,
 };
+use sekai_domain::gateway_keys::hash_gateway_key;
 use uuid::Uuid;
 
 use self::catalog_invocation::CatalogInvocation;
@@ -142,21 +177,10 @@ use self::object_mutation_lifecycle::{
     GuardedCreateObjectRequest, GuardedDeleteObjectRequest, GuardedUpdateObjectRequest,
 };
 use self::schema_definition_lifecycle::{
-    SchemaDefinitionLifecycle, SchemaDefinitionLifecycleError,
+    SchemaDefinitionLifecycle, map_schema_definition_lifecycle_error,
 };
 
 const REDACTED_VALUE: &str = "[redacted]";
-
-fn map_schema_definition_lifecycle_error(error: SchemaDefinitionLifecycleError) -> Status {
-    match error {
-        SchemaDefinitionLifecycleError::Unavailable(error) => Status::internal(error),
-        SchemaDefinitionLifecycleError::InvalidDefinition(error)
-        | SchemaDefinitionLifecycleError::InvalidComputedProperty(error) => {
-            Status::invalid_argument(error)
-        }
-        SchemaDefinitionLifecycleError::Persistence(error) => Status::internal(error),
-    }
-}
 
 #[derive(Clone)]
 pub struct SekaiServiceImpl {
@@ -179,244 +203,15 @@ pub struct SekaiServiceImpl {
     pub(super) dry_run_host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
     /// User grants intersect the agent ceiling at claim and apply (#1563).
     pub(super) enforce_agent_ceiling: bool,
+    /// Embeds hybrid Search queries (#1582); none refuses hybrid mode.
+    pub(super) embedding_route: Option<crate::composition::embedding_catch_up::EmbeddingRoute>,
 }
 
-fn db_work_limiter(db: &crate::db::store::SekaiStore) -> Arc<tokio::sync::Semaphore> {
-    let permits = db.runtime().connection_pool_max().max(1) as usize;
-    Arc::new(tokio::sync::Semaphore::new(permits))
-}
-
-impl SekaiServiceImpl {
-    /// Run store work on the blocking pool, bounded by the connection pool.
-    pub(super) async fn spawn_db<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> Result<T, Status> + Send + 'static,
-    ) -> Result<T, Status> {
-        let permit = self
-            .db_work
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Status::unavailable("database worker closed"))?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work()
-        })
-        .await
-        .unwrap_or_else(|_| Err(Status::unavailable("database worker cancelled")))
-    }
-
-    pub fn new(db: crate::db::store::SekaiStore) -> Self {
-        Self::new_with_gateway_schema_principals(db, Vec::new())
-    }
-
-    pub fn new_with_gateway_schema_principals(
-        db: crate::db::store::SekaiStore,
-        gateway_schema_principals: Vec<String>,
-    ) -> Self {
-        let security = Arc::new(SecurityChecker::new());
-        let grants = db.runtime().list_all_grants().unwrap_or_default();
-        security.load(&grants);
-        let schema_definitions = SchemaDefinitionLifecycle::load(db.runtime_arc());
-        let object_query_cursor_key = db
-            .runtime()
-            .object_query_cursor_key()
-            .expect("initialize durable object query cursor key");
-        let db_work = db_work_limiter(&db);
-        Self {
-            db,
-            security,
-            db_work,
-            schema_definitions,
-            gateway_schema_principals,
-            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
-            object_query_cursor_key,
-            object_index_engine: crate::sekai::object_index_engine::ObjectIndexEngineKind::from_env(
-            ),
-            object_index_dual_read:
-                crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
-            object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
-            cross_store: None,
-            runtime_token_authority: None,
-            dry_run_host: None,
-            enforce_agent_ceiling: false,
-        }
-    }
-
-    /// Registered so wrong-plane Sekai RPCs can return FAILED_PRECONDITION
-    /// without requiring Sekai tables on a Chisei-only dest.
-    pub fn wrong_plane_placeholder(db: crate::db::store::SekaiStore) -> Self {
-        let schema_definitions = SchemaDefinitionLifecycle::empty(db.runtime_arc());
-        let db_work = db_work_limiter(&db);
-        Self {
-            db,
-            security: Arc::new(SecurityChecker::new()),
-            db_work,
-            schema_definitions,
-            gateway_schema_principals: Vec::new(),
-            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
-            object_query_cursor_key: [0u8; 32],
-            object_index_engine: crate::sekai::object_index_engine::ObjectIndexEngineKind::from_env(
-            ),
-            object_index_dual_read:
-                crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
-            object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
-            cross_store: None,
-            runtime_token_authority: None,
-            dry_run_host: None,
-            enforce_agent_ceiling: false,
-        }
-    }
-
-    /// Mint runtime tokens in Action work claim responses with `authority`,
-    /// the same key the authentication boundary verifies them with.
-    pub fn with_runtime_token_authority(
-        mut self,
-        authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
-    ) -> Self {
-        self.runtime_token_authority = authority;
-        self
-    }
-
-    pub fn with_agent_ceiling(mut self, enforce: bool) -> Self {
-        self.enforce_agent_ceiling = enforce;
-        self
-    }
-
-    pub fn with_dry_run_host(
-        mut self,
-        host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
-    ) -> Self {
-        self.dry_run_host = host;
-        self
-    }
-
-    pub fn with_cross_store_admission(
-        mut self,
-        clerk: std::sync::Arc<crate::composition::cross_store_admission::CrossStoreAdmission>,
-    ) -> Self {
-        self.cross_store = Some(clerk);
-        self
-    }
-
-    /// Budget and usage live on the Chisei store in a split layout.
-    pub(crate) fn quota_runtime(&self) -> std::sync::Arc<crate::db::runtime_db::RuntimeDb> {
-        self.cross_store
-            .as_ref()
-            .map(|clerk| clerk.chisei_runtime_arc())
-            .unwrap_or_else(|| self.db.runtime_arc())
-    }
-
-    pub fn with_site_id(mut self, site_id: impl Into<String>) -> Self {
-        self.site_id = site_id.into();
-        self
-    }
-
-    fn catalog_metadata_value(req: &Request<impl prost::Message>, key: &str) -> Option<String> {
-        req.metadata()
-            .get(key)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    }
-
-    /// MCP link tools send `x-sekai-capability` as `sekai.links.get` /
-    /// `sekai.links.create`. Direct gRPC and the HTTP gateway also carry
-    /// `x-sekai-namespace`; only the MCP tools bind object ids to it.
-    fn mcp_link_session_namespace(req: &Request<impl prost::Message>) -> Option<String> {
-        match Self::catalog_metadata_value(req, "x-sekai-capability").as_deref() {
-            Some("sekai.links.get") | Some("sekai.links.create") => {
-                Self::catalog_metadata_value(req, "x-sekai-namespace")
-            }
-            _ => None,
-        }
-    }
-
-    /// Begin a receipt-attributed catalog invocation for a semantic capability.
-    /// Returns `None` when the caller did not send `x-sekai-capability` (direct RPC).
-    /// Live discovery is rechecked; a previously observed catalog is never a grant.
-    fn begin_semantic_catalog_invocation<'a>(
-        &'a self,
-        req: &Request<impl prost::Message + 'static>,
-        expected_capability: &str,
-        namespace: &str,
-        principals: &[String],
-    ) -> Result<Option<(String, CatalogInvocation<'a>)>, Status> {
-        let Some(capability_name) = Self::catalog_metadata_value(req, "x-sekai-capability") else {
-            return Ok(None);
-        };
-        let catalog_namespace = Self::catalog_metadata_value(req, "x-sekai-namespace")
-            .unwrap_or_else(|| namespace.to_string());
-        if catalog_namespace.is_empty() {
-            return Err(Status::invalid_argument(
-                "catalog semantic invocation requires namespace",
-            ));
-        }
-        if catalog_namespace != namespace && !namespace.is_empty() {
-            return Err(Status::invalid_argument(
-                "catalog namespace metadata must match request namespace",
-            ));
-        }
-        let namespace = if namespace.is_empty() {
-            catalog_namespace.as_str()
-        } else {
-            namespace
-        };
-        let operation_id = Self::catalog_metadata_value(req, "x-sekai-operation-id")
-            .unwrap_or_else(|| format!("catalog-invocation-{}", Uuid::new_v4().simple()));
-        let catalog_version = Self::catalog_metadata_value(req, "x-sekai-catalog-version");
-        let actor = principals.first().cloned().unwrap_or_default();
-
-        let tenant_context = request_tenant_context(self.db.runtime(), req)?;
-        let visible = self
-            .discoverable_capabilities(namespace, principals, tenant_context.as_ref())?
-            .into_iter()
-            .any(|entry| entry.name == capability_name && capability_name == expected_capability);
-        if !visible {
-            CatalogInvocation::record_refusal(
-                self.db.runtime(),
-                &operation_id,
-                namespace,
-                &actor,
-                &capability_name,
-                catalog_version.as_deref(),
-                "capability_unavailable",
-            )?;
-            return Err(Status::failed_precondition("capability unavailable"));
-        }
-
-        let invocation = CatalogInvocation::begin(
-            self.db.runtime(),
-            operation_id.clone(),
-            namespace,
-            actor,
-            capability_name,
-            catalog_version,
-        )?;
-        Ok(Some((operation_id, invocation)))
-    }
-}
+#[path = "sekai_service_construct.rs"]
+mod construct;
 
 const DEFAULT_LIST_LIMIT: i32 = domain::DEFAULT_LIST_LIMIT;
 const MAX_LIST_LIMIT: i32 = domain::MAX_LIST_LIMIT;
-
-/// Internal governance object kinds that must never be created, mutated, read,
-/// or listed through the generic object CRUD RPCs. They hold policy and
-/// blast-radius counters and are managed only through dedicated RPCs plus
-/// server-internal DB paths.
-const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
-    action_policy::ACTION_POLICY_KIND,
-    action_policy::BLAST_RADIUS_KIND,
-    // Retired pre-1.0 state is purged on startup, so this name must never be
-    // reusable through generic CRUD.
-    "action_approval",
-    crate::domain::KIND_CAPABILITY,
-    crate::domain::KIND_EXTERNAL_EVIDENCE,
-    governed_fact_domain::PROFILE_KIND,
-    governed_fact_domain::FACT_KIND,
-    governed_fact_domain::WAIVER_KIND,
-];
 
 const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
 
@@ -425,6 +220,114 @@ impl SekaiService for SekaiServiceImpl {
     type ReadTransformRunInputsStream = Pin<
         Box<dyn futures_util::Stream<Item = Result<ReadTransformRunInputsResponse, Status>> + Send>,
     >;
+    type ExportDatasetVersionStream = ExportStream;
+    type ExportObjectSetStream = ExportStream;
+    type FetchExportArtifactStream = ExportStream;
+
+    async fn grant_namespace_export(
+        &self,
+        req: Request<GrantNamespaceExportRequest>,
+    ) -> Result<Response<GrantNamespaceExportResponse>, Status> {
+        self.grant_namespace_export_rpc(req).await
+    }
+
+    async fn revoke_namespace_export(
+        &self,
+        req: Request<RevokeNamespaceExportRequest>,
+    ) -> Result<Response<RevokeNamespaceExportResponse>, Status> {
+        self.revoke_namespace_export_rpc(req).await
+    }
+
+    async fn export_object_set(
+        &self,
+        req: Request<ExportObjectSetRequest>,
+    ) -> Result<Response<Self::ExportObjectSetStream>, Status> {
+        self.export_object_set_rpc(req).await
+    }
+
+    async fn export_dataset_version(
+        &self,
+        req: Request<ExportDatasetVersionRequest>,
+    ) -> Result<Response<Self::ExportDatasetVersionStream>, Status> {
+        self.export_dataset_version_rpc(req).await
+    }
+
+    async fn put_export_definition(
+        &self,
+        req: Request<PutExportDefinitionRequest>,
+    ) -> Result<Response<PutExportDefinitionResponse>, Status> {
+        self.put_export_definition_rpc(req).await
+    }
+
+    async fn get_export_definition(
+        &self,
+        req: Request<GetExportDefinitionRequest>,
+    ) -> Result<Response<GetExportDefinitionResponse>, Status> {
+        self.get_export_definition_rpc(req).await
+    }
+
+    async fn delete_export_definition(
+        &self,
+        req: Request<DeleteExportDefinitionRequest>,
+    ) -> Result<Response<DeleteExportDefinitionResponse>, Status> {
+        self.delete_export_definition_rpc(req).await
+    }
+
+    async fn run_export_definition(
+        &self,
+        req: Request<RunExportDefinitionRequest>,
+    ) -> Result<Response<RunExportDefinitionResponse>, Status> {
+        self.run_export_definition_rpc(req).await
+    }
+
+    async fn list_deliverable_export_artifacts(
+        &self,
+        req: Request<ListDeliverableExportArtifactsRequest>,
+    ) -> Result<Response<ListDeliverableExportArtifactsResponse>, Status> {
+        self.list_deliverable_export_artifacts_rpc(req).await
+    }
+
+    async fn fetch_export_artifact(
+        &self,
+        req: Request<FetchExportArtifactRequest>,
+    ) -> Result<Response<Self::FetchExportArtifactStream>, Status> {
+        self.fetch_export_artifact_rpc(req).await
+    }
+
+    async fn acknowledge_export_delivery(
+        &self,
+        req: Request<AcknowledgeExportDeliveryRequest>,
+    ) -> Result<Response<AcknowledgeExportDeliveryResponse>, Status> {
+        self.acknowledge_export_delivery_rpc(req).await
+    }
+
+    async fn get_export_receipt(
+        &self,
+        req: Request<GetExportReceiptRequest>,
+    ) -> Result<Response<GetExportReceiptResponse>, Status> {
+        self.get_export_receipt_rpc(req).await
+    }
+
+    async fn put_export_fingerprint_policy(
+        &self,
+        req: Request<PutExportFingerprintPolicyRequest>,
+    ) -> Result<Response<PutExportFingerprintPolicyResponse>, Status> {
+        self.put_export_fingerprint_policy_rpc(req).await
+    }
+
+    async fn get_export_fingerprint_policy(
+        &self,
+        req: Request<GetExportFingerprintPolicyRequest>,
+    ) -> Result<Response<GetExportFingerprintPolicyResponse>, Status> {
+        self.get_export_fingerprint_policy_rpc(req).await
+    }
+
+    async fn trace_export(
+        &self,
+        req: Request<TraceExportRequest>,
+    ) -> Result<Response<TraceExportResponse>, Status> {
+        self.trace_export_rpc(req).await
+    }
 
     async fn acquire_lease(
         &self,
@@ -473,6 +376,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetSourceSyncStateRequest>,
     ) -> Result<Response<GetSourceSyncStateResponse>, Status> {
         rpc_leases::get_source_sync_state(self, req).await
+    }
+
+    async fn list_source_batch_transactions(
+        &self,
+        req: Request<ListSourceBatchTransactionsRequest>,
+    ) -> Result<Response<ListSourceBatchTransactionsResponse>, Status> {
+        rpc_leases::list_source_batch_transactions(self, req).await
     }
 
     async fn register_source_type_descriptor(
@@ -529,6 +439,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DryRunAgentRequest>,
     ) -> Result<Response<DryRunAgentResponse>, Status> {
         rpc_definitions::dry_run_agent(self, req).await
+    }
+
+    async fn run_agent_shadow(
+        &self,
+        req: Request<RunAgentShadowRequest>,
+    ) -> Result<Response<RunAgentShadowResponse>, Status> {
+        rpc_definitions::run_agent_shadow(self, req).await
+    }
+
+    async fn get_agent_shadow_report(
+        &self,
+        req: Request<GetAgentShadowReportRequest>,
+    ) -> Result<Response<GetAgentShadowReportResponse>, Status> {
+        rpc_definitions::get_agent_shadow_report(self, req).await
     }
 
     async fn get_definition_branch(
@@ -601,6 +525,20 @@ impl SekaiService for SekaiServiceImpl {
         rpc_definitions::propose_definition_rollback(self, req).await
     }
 
+    async fn export_definition_package(
+        &self,
+        req: Request<ExportDefinitionPackageRequest>,
+    ) -> Result<Response<ExportDefinitionPackageResponse>, Status> {
+        rpc_definition_package::export_definition_package(self, req).await
+    }
+
+    async fn import_definition_package(
+        &self,
+        req: Request<ImportDefinitionPackageRequest>,
+    ) -> Result<Response<ImportDefinitionPackageResponse>, Status> {
+        rpc_definition_package::import_definition_package(self, req).await
+    }
+
     async fn compare_definition_revisions(
         &self,
         req: Request<CompareDefinitionRevisionsRequest>,
@@ -608,11 +546,74 @@ impl SekaiService for SekaiServiceImpl {
         rpc_definitions::compare_definition_revisions(self, req).await
     }
 
+    async fn get_ontology_changelog(
+        &self,
+        req: Request<GetOntologyChangelogRequest>,
+    ) -> Result<Response<GetOntologyChangelogResponse>, Status> {
+        ontology_changelog_rpc::get_ontology_changelog(self, req).await
+    }
+
     async fn report_definition_consumer_impact(
         &self,
         req: Request<ReportDefinitionConsumerImpactRequest>,
     ) -> Result<Response<ReportDefinitionConsumerImpactResponse>, Status> {
         rpc_definitions::report_definition_consumer_impact(self, req).await
+    }
+
+    async fn get_ontology_lint_report(
+        &self,
+        req: Request<GetOntologyLintReportRequest>,
+    ) -> Result<Response<GetOntologyLintReportResponse>, Status> {
+        rpc_definitions::get_ontology_lint_report(self, req).await
+    }
+
+    async fn get_ontology_health(
+        &self,
+        req: Request<GetOntologyHealthRequest>,
+    ) -> Result<Response<GetOntologyHealthResponse>, Status> {
+        ontology_health_rpc::get_ontology_health(self, req).await
+    }
+
+    async fn record_ontology_health_snapshot(
+        &self,
+        req: Request<RecordOntologyHealthSnapshotRequest>,
+    ) -> Result<Response<RecordOntologyHealthSnapshotResponse>, Status> {
+        ontology_health_rpc::record_ontology_health_snapshot(self, req).await
+    }
+
+    async fn list_ontology_health_trend(
+        &self,
+        req: Request<ListOntologyHealthTrendRequest>,
+    ) -> Result<Response<ListOntologyHealthTrendResponse>, Status> {
+        ontology_health_rpc::list_ontology_health_trend(self, req).await
+    }
+
+    async fn generate_definition_change_bundle(
+        &self,
+        req: Request<GenerateDefinitionChangeBundleRequest>,
+    ) -> Result<Response<GenerateDefinitionChangeBundleResponse>, Status> {
+        self.generate_visible_definition_change_bundle(req).await
+    }
+
+    async fn dry_run_definition_change_bundle(
+        &self,
+        req: Request<DryRunDefinitionChangeBundleRequest>,
+    ) -> Result<Response<DryRunDefinitionChangeBundleResponse>, Status> {
+        rpc_data::dry_run_definition_change_bundle(self, req).await
+    }
+
+    async fn apply_definition_change_bundle(
+        &self,
+        req: Request<ApplyDefinitionChangeBundleRequest>,
+    ) -> Result<Response<ApplyDefinitionChangeBundleResponse>, Status> {
+        definition_bundle_apply_rpc::apply_definition_change_bundle(self, req).await
+    }
+
+    async fn get_definition_bundle_apply(
+        &self,
+        req: Request<GetDefinitionBundleApplyRequest>,
+    ) -> Result<Response<GetDefinitionBundleApplyResponse>, Status> {
+        definition_bundle_apply_rpc::get_definition_bundle_apply(self, req).await
     }
 
     async fn classify_definition_revision_compatibility(
@@ -788,11 +789,165 @@ impl SekaiService for SekaiServiceImpl {
         rpc_objects::get_classification_lattice(self, req).await
     }
 
+    async fn put_embedding_spec(
+        &self,
+        req: Request<PutEmbeddingSpecRequest>,
+    ) -> Result<Response<PutEmbeddingSpecResponse>, Status> {
+        embedding_spec_rpc::put_embedding_spec(self, req).await
+    }
+
+    async fn list_embedding_specs(
+        &self,
+        req: Request<ListEmbeddingSpecsRequest>,
+    ) -> Result<Response<ListEmbeddingSpecsResponse>, Status> {
+        embedding_spec_rpc::list_embedding_specs(self, req).await
+    }
+
+    async fn delete_embedding_spec(
+        &self,
+        req: Request<DeleteEmbeddingSpecRequest>,
+    ) -> Result<Response<DeleteEmbeddingSpecResponse>, Status> {
+        embedding_spec_rpc::delete_embedding_spec(self, req).await
+    }
+
     async fn simulate_object_policy_change(
         &self,
         req: Request<SimulateObjectPolicyChangeRequest>,
     ) -> Result<Response<SimulateObjectPolicyChangeResponse>, Status> {
         rpc_objects::simulate_object_policy_change(self, req).await
+    }
+
+    async fn query_counterfactual_view(
+        &self,
+        req: Request<QueryCounterfactualViewRequest>,
+    ) -> Result<Response<QueryCounterfactualViewResponse>, Status> {
+        rpc_objects::query_counterfactual_view(self, req).await
+    }
+
+    async fn put_trust_scoring_rule(
+        &self,
+        req: Request<PutTrustScoringRuleRequest>,
+    ) -> Result<Response<PutTrustScoringRuleResponse>, Status> {
+        trust_score_rpc::put_trust_scoring_rule(self, req).await
+    }
+
+    async fn get_trust_scoring_rule(
+        &self,
+        req: Request<GetTrustScoringRuleRequest>,
+    ) -> Result<Response<GetTrustScoringRuleResponse>, Status> {
+        trust_score_rpc::get_trust_scoring_rule(self, req).await
+    }
+
+    async fn score_object_trust(
+        &self,
+        req: Request<ScoreObjectTrustRequest>,
+    ) -> Result<Response<ScoreObjectTrustResponse>, Status> {
+        trust_score_rpc::score_object_trust(self, req).await
+    }
+
+    async fn begin_media_upload(
+        &self,
+        req: Request<BeginMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        media_upload_rpc::begin_media_upload(self, req).await
+    }
+
+    async fn upload_media_chunk(
+        &self,
+        req: Request<UploadMediaChunkRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        media_upload_rpc::upload_media_chunk(self, req).await
+    }
+
+    async fn complete_media_upload(
+        &self,
+        req: Request<CompleteMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        media_upload_rpc::complete_media_upload(self, req).await
+    }
+
+    async fn get_media_upload(
+        &self,
+        req: Request<GetMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        media_upload_rpc::get_media_upload(self, req).await
+    }
+
+    async fn read_media(
+        &self,
+        req: Request<ReadMediaRequest>,
+    ) -> Result<Response<ReadMediaResponse>, Status> {
+        media_upload_rpc::read_media(self, req).await
+    }
+
+    async fn put_sync_scope(
+        &self,
+        req: Request<PutSyncScopeRequest>,
+    ) -> Result<Response<SyncScopeResponse>, Status> {
+        sync_scope_rpc::put_sync_scope(self, req).await
+    }
+
+    async fn read_sync_snapshot(
+        &self,
+        req: Request<ReadSyncSnapshotRequest>,
+    ) -> Result<Response<ReadSyncSnapshotResponse>, Status> {
+        sync_scope_rpc::read_sync_snapshot(self, req).await
+    }
+
+    async fn read_sync_deltas(
+        &self,
+        req: Request<ReadSyncDeltasRequest>,
+    ) -> Result<Response<ReadSyncDeltasResponse>, Status> {
+        sync_scope_rpc::read_sync_deltas(self, req).await
+    }
+
+    async fn create_object_comment(
+        &self,
+        req: Request<CreateObjectCommentRequest>,
+    ) -> Result<Response<CreateObjectCommentResponse>, Status> {
+        object_comment_rpc::create_object_comment(self, req).await
+    }
+
+    async fn update_object_comment(
+        &self,
+        req: Request<UpdateObjectCommentRequest>,
+    ) -> Result<Response<UpdateObjectCommentResponse>, Status> {
+        object_comment_rpc::update_object_comment(self, req).await
+    }
+
+    async fn list_object_comments(
+        &self,
+        req: Request<ListObjectCommentsRequest>,
+    ) -> Result<Response<ListObjectCommentsResponse>, Status> {
+        object_comment_rpc::list_object_comments(self, req).await
+    }
+
+    async fn list_comment_mentions(
+        &self,
+        req: Request<ListCommentMentionsRequest>,
+    ) -> Result<Response<ListCommentMentionsResponse>, Status> {
+        object_comment_rpc::list_comment_mentions(self, req).await
+    }
+
+    async fn register_catalog_entry(
+        &self,
+        req: Request<RegisterCatalogEntryRequest>,
+    ) -> Result<Response<RegisterCatalogEntryResponse>, Status> {
+        catalog_rpc::register_catalog_entry(self, req).await
+    }
+
+    async fn get_catalog_entry_lineage(
+        &self,
+        req: Request<GetCatalogEntryLineageRequest>,
+    ) -> Result<Response<GetCatalogEntryLineageResponse>, Status> {
+        catalog_rpc::get_catalog_entry_lineage(self, req).await
+    }
+
+    async fn list_catalog_criticality_outbox(
+        &self,
+        req: Request<ListCatalogCriticalityOutboxRequest>,
+    ) -> Result<Response<ListCatalogCriticalityOutboxResponse>, Status> {
+        catalog_rpc::list_catalog_criticality_outbox(self, req).await
     }
 
     async fn query_object_policy_audit(
@@ -1021,6 +1176,41 @@ impl SekaiService for SekaiServiceImpl {
         self.run_action_binding_once(req).await
     }
 
+    async fn put_fence_binding(
+        &self,
+        req: Request<PutFenceBindingRequest>,
+    ) -> Result<Response<PutFenceBindingResponse>, Status> {
+        self.put_fence_binding_definition(req).await
+    }
+
+    async fn run_fence_binding(
+        &self,
+        req: Request<RunFenceBindingRequest>,
+    ) -> Result<Response<RunFenceBindingResponse>, Status> {
+        self.run_fence_binding_once(req).await
+    }
+
+    async fn put_ezu_geo_feed(
+        &self,
+        req: Request<PutEzuGeoFeedRequest>,
+    ) -> Result<Response<PutEzuGeoFeedResponse>, Status> {
+        self.put_ezu_geo_feed_definition(req).await
+    }
+
+    async fn run_ezu_geo_feed(
+        &self,
+        req: Request<RunEzuGeoFeedRequest>,
+    ) -> Result<Response<RunEzuGeoFeedResponse>, Status> {
+        self.run_ezu_geo_feed_once(req).await
+    }
+
+    async fn backfill_ezu_geo_feed(
+        &self,
+        req: Request<BackfillEzuGeoFeedRequest>,
+    ) -> Result<Response<BackfillEzuGeoFeedResponse>, Status> {
+        self.backfill_ezu_geo_feed_once(req).await
+    }
+
     async fn describe_object_action(
         &self,
         req: Request<DescribeObjectActionRequest>,
@@ -1033,6 +1223,55 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<PreviewObjectActionRequest>,
     ) -> Result<Response<PreviewObjectActionResponse>, Status> {
         rpc_actions::preview_object_action(self, req).await
+    }
+
+    async fn create_plan_intent(
+        &self,
+        req: Request<CreatePlanIntentRequest>,
+    ) -> Result<Response<CreatePlanIntentResponse>, Status> {
+        rpc_actions::create_plan_intent(self, req).await
+    }
+
+    async fn propose_plan(
+        &self,
+        req: Request<ProposePlanRequest>,
+    ) -> Result<Response<ProposePlanResponse>, Status> {
+        rpc_actions::propose_plan(self, req).await
+    }
+
+    async fn simulate_plan(
+        &self,
+        req: Request<SimulatePlanRequest>,
+    ) -> Result<Response<SimulatePlanResponse>, Status> {
+        rpc_actions::simulate_plan(self, req).await
+    }
+
+    async fn get_plan(
+        &self,
+        req: Request<GetPlanRequest>,
+    ) -> Result<Response<GetPlanResponse>, Status> {
+        rpc_actions::get_plan(self, req).await
+    }
+
+    async fn submit_plan_review(
+        &self,
+        req: Request<SubmitPlanReviewRequest>,
+    ) -> Result<Response<SubmitPlanReviewResponse>, Status> {
+        rpc_actions::submit_plan_review(self, req).await
+    }
+
+    async fn decide_plan_review(
+        &self,
+        req: Request<DecidePlanReviewRequest>,
+    ) -> Result<Response<DecidePlanReviewResponse>, Status> {
+        rpc_actions::decide_plan_review(self, req).await
+    }
+
+    async fn execute_action_plan(
+        &self,
+        req: Request<ExecuteActionPlanRequest>,
+    ) -> Result<Response<ExecuteActionPlanResponse>, Status> {
+        rpc_actions::execute_action_plan(self, req).await
     }
 
     async fn get_action_instance(
@@ -1435,6 +1674,66 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetDatasetVersionResponse>, Status> {
         rpc_data::get_dataset_version(self, req).await
     }
+    async fn create_dataset_branch(
+        &self,
+        req: Request<CreateDatasetBranchRequest>,
+    ) -> Result<Response<CreateDatasetBranchResponse>, Status> {
+        rpc_data::create_dataset_branch(self, req).await
+    }
+    async fn list_dataset_branches(
+        &self,
+        req: Request<ListDatasetBranchesRequest>,
+    ) -> Result<Response<ListDatasetBranchesResponse>, Status> {
+        rpc_data::list_dataset_branches(self, req).await
+    }
+    async fn delete_dataset_branch(
+        &self,
+        req: Request<DeleteDatasetBranchRequest>,
+    ) -> Result<Response<DeleteDatasetBranchResponse>, Status> {
+        rpc_data::delete_dataset_branch(self, req).await
+    }
+    async fn compare_dataset_branch(
+        &self,
+        req: Request<CompareDatasetBranchRequest>,
+    ) -> Result<Response<CompareDatasetBranchResponse>, Status> {
+        rpc_data::compare_dataset_branch(self, req).await
+    }
+    async fn propose_dataset_branch_merge(
+        &self,
+        req: Request<ProposeDatasetBranchMergeRequest>,
+    ) -> Result<Response<ProposeDatasetBranchMergeResponse>, Status> {
+        rpc_data::propose_dataset_branch_merge(self, req).await
+    }
+    async fn merge_dataset_branch(
+        &self,
+        req: Request<MergeDatasetBranchRequest>,
+    ) -> Result<Response<MergeDatasetBranchResponse>, Status> {
+        rpc_data::merge_dataset_branch(self, req).await
+    }
+    async fn run_governed_transform_on_branch(
+        &self,
+        req: Request<RunGovernedTransformOnBranchRequest>,
+    ) -> Result<Response<RunGovernedTransformOnBranchResponse>, Status> {
+        rpc_data::run_governed_transform_on_branch(self, req).await
+    }
+    async fn replay_governed_transform(
+        &self,
+        req: Request<ReplayGovernedTransformRequest>,
+    ) -> Result<Response<ReplayGovernedTransformResponse>, Status> {
+        rpc_data::replay_governed_transform(self, req).await
+    }
+    async fn get_transform_replay(
+        &self,
+        req: Request<GetTransformReplayRequest>,
+    ) -> Result<Response<GetTransformReplayResponse>, Status> {
+        rpc_data::get_transform_replay(self, req).await
+    }
+    async fn shadow_governed_transform(
+        &self,
+        req: Request<ShadowGovernedTransformRequest>,
+    ) -> Result<Response<ShadowGovernedTransformResponse>, Status> {
+        rpc_data::shadow_governed_transform(self, req).await
+    }
     async fn rollback_dataset(
         &self,
         req: Request<RollbackDatasetRequest>,
@@ -1470,6 +1769,18 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListDatasetAlertsRequest>,
     ) -> Result<Response<ListDatasetAlertsResponse>, Status> {
         rpc_data::list_dataset_alerts(self, req).await
+    }
+    async fn list_consumer_violation_notifications(
+        &self,
+        req: Request<ListConsumerViolationNotificationsRequest>,
+    ) -> Result<Response<ListConsumerViolationNotificationsResponse>, Status> {
+        rpc_data::list_consumer_violation_notifications(self, req).await
+    }
+    async fn acknowledge_consumer_violation_notification(
+        &self,
+        req: Request<AcknowledgeConsumerViolationNotificationRequest>,
+    ) -> Result<Response<AcknowledgeConsumerViolationNotificationResponse>, Status> {
+        rpc_data::acknowledge_consumer_violation_notification(self, req).await
     }
     async fn create_virtual_table(
         &self,
@@ -1544,6 +1855,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_data::list_object_changes(self, req).await
     }
 
+    async fn explain_value(
+        &self,
+        req: Request<ExplainValueRequest>,
+    ) -> Result<Response<ExplainValueResponse>, Status> {
+        explain_value_rpc::explain_value(self, req).await
+    }
+
     async fn get_attestation(
         &self,
         req: Request<GetAttestationRequest>,
@@ -1606,7 +1924,6 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<crate::grpc::pb::sekai::ListEvidenceAdaptersResponse>, Status> {
         rpc_data::list_evidence_adapters(self, req).await
     }
-
     async fn submit_evidence(
         &self,
         req: Request<SubmitEvidenceRequest>,
@@ -1633,51 +1950,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetProvenanceReportRequest>,
     ) -> Result<Response<GetProvenanceReportResponse>, Status> {
         rpc_data::get_provenance_report(self, req).await
-    }
-}
-
-type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
-
-#[async_trait::async_trait]
-impl KnowledgeWriter for SekaiServiceImpl {
-    async fn write_knowledge(
-        &self,
-        request: &KnowledgeWriteRequest,
-    ) -> Result<KnowledgeWriteOutcome, String> {
-        scored_knowledge_admission::admit(self, request).await
-    }
-}
-
-#[cfg(test)]
-mod spawn_db_tests {
-    use super::*;
-    use crate::db::store::SekaiStore;
-    use std::time::Duration;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn spawn_db_does_not_block_the_tokio_worker() {
-        let service = SekaiServiceImpl::new(SekaiStore::memory());
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let blocking = service.spawn_db(move || {
-            let _ = started_tx.send(());
-            release_rx
-                .recv()
-                .map_err(|_| Status::internal("release signal closed"))?;
-            Ok(())
-        });
-        let probe = async {
-            started_rx.await.expect("blocking work started");
-            tokio::task::yield_now().await;
-            let _ = release_tx.send(());
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let (result, ()) = tokio::join!(blocking, probe);
-            result
-        })
-        .await
-        .expect("spawn_db blocked the Tokio worker")
-        .unwrap();
     }
 }
 

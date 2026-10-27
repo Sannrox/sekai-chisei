@@ -200,9 +200,8 @@ that gate. See [governed-transforms.md](governed-transforms.md),
 [ADR 0102](decisions/0102-isolated-process-transform-profile.md).
 
 Asserted graph retrieval is available on both reusable community backends.
-Query-time ontology entailment is currently SQLite-only; PostgreSQL advertises
-the unsupported backend value and the RPC fails closed with
-`FAILED_PRECONDITION` rather than returning a partial ontology snapshot.
+Query-time ontology entailment runs on both backends (#1320) from the same
+authorization-filtered ontology snapshot.
 The experimental scenario overlay was removed in 1.0; see
 [#660](research/660-hypothetical-overlay.md).
 
@@ -225,10 +224,8 @@ schema miss records `lookup_refusal` on the operation receipt and continues on
 the normal model path (`answer_path=model_path`). Lookup reads the Sekai store,
 not the Chisei store. `chisei-plane` requires `SEKAI_ENDPOINT` at boot; a
 process that reaches Sekai only over the gRPC hop records
-`sekai_read_unsupported`. The S2 traversal path also
-refuses PostgreSQL entailment because the native community runtime has no
-authorization-filtered ontology snapshot there; callers may use asserted-only
-retrieval. Lookup evaluation occurs after execution namespace authorization and
+`sekai_read_unsupported`. The S2 traversal path reads the same
+authorization-filtered ontology snapshot for entailment on both backends. Lookup evaluation occurs after execution namespace authorization and
 before provider selection, residency, egress, or model payload preparation.
 Free-form natural-language substitution is out of scope. Fixture suite (hit /
 incomplete / cross-namespace / ACL / truncation) and dual-run structural
@@ -277,6 +274,15 @@ planned receipt's `route` event records `routing_profile_id`, `routing_mode`,
 and `routing_profile_pinned`, so an unpinned plan still records the route it
 took. This catalog is not the gateway's `chisei.provider-capabilities/v1`
 matrix, and the two are not interchangeable.
+
+### Live policy shadow (#1630)
+
+`ChiseiService.StartPolicyShadow`, `GetPolicyShadowReport`, and
+`StopPolicyShadow` (experimental) evaluate a candidate namespace route policy
+beside the active one on live resolutions under contract
+`chisei.policy-shadow/v1`. Only the active decision takes effect.
+`SetNamespacePolicy` refuses the shadowed candidate until its report passes.
+See [policy-dry-run.md](policy-dry-run.md#live-shadow).
 
 ### Model review state (#1493)
 
@@ -457,6 +463,17 @@ different one. Approve and merge stay off MCP. The server still refuses
 `ApproveDefinitionProposal` and `MergeDefinitionProposal` from the agent
 principal that created the proposal, including when that principal holds
 changed-member admin.
+
+### Hybrid search tool
+
+`tools/list` also returns `sekai.search.query` → `Search` (#1683), whose RPC
+stays `experimental` and gated by `SEKAI_EXPERIMENTAL_RPCS`. The call binds the
+session namespace, searches objects only, and runs hybrid unless `input.mode`
+is `text`. Only `text`, `kinds`, `page_size`, `page_token`, `text_weight` and
+`vector_weight` cross the adapter. It returns object references (type, id,
+fused score, and the highlighted fields of the caller's live projection) in
+the RPC's order and paging, under the same read policy and the
+`late_fusion.rrf/v1` profile, and never vectors. See [search.md](search.md).
 
 The SDK bindings under `sdk/` consume the same serialized projection. TypeScript
 `getQualityTrend` and Python `get_quality_trend` send `chisei.quality.read` and

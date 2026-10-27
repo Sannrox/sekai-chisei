@@ -18,40 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::HeaderMap;
 
+pub use sekai_obs::correlation::Stage;
+
 /// Caller-supplied cross-plane operation identity. Opaque; never derived
 /// from request content. Distinct from the generated [`CorrelationId`].
 pub const OPERATION_METADATA: &str = "x-sekai-operation-id";
 pub const SPAN_OPERATION_FIELD: &str = "sekai.operation_id";
-
-/// Stage of work a span describes. Closed so span names stay bounded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Stage {
-    Operation,
-    Attempt,
-    ProviderRequest,
-    Persistence,
-    EvidenceProjection,
-}
-
-impl Stage {
-    pub const ALL: &'static [Stage] = &[
-        Stage::Operation,
-        Stage::Attempt,
-        Stage::ProviderRequest,
-        Stage::Persistence,
-        Stage::EvidenceProjection,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Stage::Operation => "operation",
-            Stage::Attempt => "attempt",
-            Stage::ProviderRequest => "provider_request",
-            Stage::Persistence => "persistence",
-            Stage::EvidenceProjection => "evidence_projection",
-        }
-    }
-}
 
 /// An opaque correlation id.
 ///
@@ -211,19 +183,5 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(OPERATION_METADATA, "op with space".parse().unwrap());
         assert!(caller_operation_id(&headers).is_err());
-    }
-
-    #[test]
-    fn stage_vocabulary_is_closed_and_snake_case() {
-        assert_eq!(Stage::ALL.len(), 5);
-        let distinct: BTreeSet<&str> = Stage::ALL.iter().map(|s| s.as_str()).collect();
-        assert_eq!(distinct.len(), Stage::ALL.len(), "duplicate stage name");
-        for stage in Stage::ALL {
-            let name = stage.as_str();
-            assert!(
-                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                "stage {name} is not snake_case"
-            );
-        }
     }
 }

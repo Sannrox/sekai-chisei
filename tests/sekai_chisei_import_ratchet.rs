@@ -1,15 +1,19 @@
 //! Ratchet for ADR 0096 rule 1: Sekai never depends on Chisei.
 //!
-//! Scans `src/sekai` for `crate::chisei::<module>` paths and compares them
-//! with `ALLOWED`, the edges that existed when ADR 0096 was accepted. A new
-//! edge fails; so does an allowlisted edge that no longer exists, which keeps
-//! the list shrinking until it is empty and the rule is absolute.
+//! Scans `crates/sekai-core/src/sekai` and `crates/sekai-core/src/db` for
+//! `crate::chisei::<module>` and `crate::chisei_store` paths and compares them
+//! with `ALLOWED`. A new edge fails; so does an allowlisted edge that no longer
+//! exists, which keeps the list shrinking until it is empty and the rule is
+//! absolute.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
 const NEEDLE: &str = "crate::chisei";
+
+/// Sekai persistence crate; none of these modules may name Chisei.
+const SEKAI_DIRS: &[&str] = &["crates/sekai-core/src/sekai", "crates/sekai-core/src/db"];
 
 /// `<file> <chisei module>` pairs still waiting to move (ADR 0096 disposition
 /// table). Remove an entry in the change that removes the edge.
@@ -18,7 +22,9 @@ const ALLOWED: &[&str] = &[];
 #[test]
 fn sekai_chisei_imports_only_shrink() {
     let mut found = BTreeSet::new();
-    collect(Path::new("src/sekai"), &mut found);
+    for dir in SEKAI_DIRS {
+        collect(Path::new(dir), &mut found);
+    }
     let allowed: BTreeSet<String> = ALLOWED.iter().map(|edge| edge.to_string()).collect();
 
     let added: Vec<_> = found.difference(&allowed).collect();
@@ -61,7 +67,14 @@ fn chisei_modules(source: &str) -> Vec<String> {
     let mut modules = Vec::new();
     for (start, _) in source.match_indices(NEEDLE) {
         let rest = &source[start + NEEDLE.len()..];
-        // `crate::chisei_principal` and similar are other modules, not Chisei.
+        // Chisei persistence is Chisei; `crate::chisei_principal` and
+        // similar are other modules.
+        if let Some(after) = rest.strip_prefix("_store")
+            && !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        {
+            modules.push("chisei_store".into());
+            continue;
+        }
         if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
@@ -94,4 +107,8 @@ fn grouped_and_bare_chisei_paths_are_reported() {
     );
     assert_eq!(chisei_modules("use crate::chisei;"), ["*"]);
     assert!(chisei_modules("use crate::chisei_principal::Map;").is_empty());
+    assert_eq!(
+        chisei_modules("use crate::chisei_store::ChiseiStore;"),
+        ["chisei_store"]
+    );
 }

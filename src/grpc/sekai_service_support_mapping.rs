@@ -1,4 +1,7 @@
 use super::*;
+use crate::ext::*;
+
+pub(super) type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
 
 pub(super) fn read_limit_offset(limit: i32, offset: i32) -> Result<(i32, i32), Status> {
     if offset < 0 {
@@ -365,7 +368,7 @@ pub(super) fn redact_object_change_values(
         },
         changed_by: change.changed_by,
         timestamp: change.timestamp,
-        operation_id: String::new(),
+        ..Default::default()
     }
 }
 pub(super) fn to_proto_link(l: &domain::Link) -> Link {
@@ -683,6 +686,26 @@ pub(super) fn schema_object_id(kind: &str) -> String {
 pub(super) fn action_object_id(name: &str) -> String {
     format!("action:{name}")
 }
+/// Internal governance object kinds that must never be created, mutated, read,
+/// or listed through the generic object CRUD RPCs. They hold policy and
+/// blast-radius counters and are managed only through dedicated RPCs plus
+/// server-internal DB paths.
+pub(super) const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
+    action_policy::ACTION_POLICY_KIND,
+    action_policy::BLAST_RADIUS_KIND,
+    // Retired pre-1.0 state is purged on startup, so this name must never be
+    // reusable through generic CRUD.
+    "action_approval",
+    crate::domain::KIND_CAPABILITY,
+    crate::domain::KIND_EXTERNAL_EVIDENCE,
+    governed_fact_domain::PROFILE_KIND,
+    governed_fact_domain::FACT_KIND,
+    governed_fact_domain::WAIVER_KIND,
+    crate::sekai::trust_score::TRUST_SCORING_RULE_KIND,
+    crate::sekai::object_comment::OBJECT_COMMENT_KIND,
+    crate::sekai::media_upload::MEDIA_KIND,
+];
+
 pub(super) fn is_reserved_governance_kind(kind: &str) -> bool {
     RESERVED_GOVERNANCE_KINDS.contains(&kind)
 }
@@ -891,6 +914,23 @@ pub(super) fn to_proto_health_result(
         detail: result.detail.clone(),
         judged_at_ms: result.judged_at_ms,
         quarantined: result.quarantined,
+    }
+}
+
+pub(super) fn to_proto_violation_notification(
+    delivery: &crate::sekai::consumer_violation::ViolationDelivery,
+    evidence: String,
+) -> ConsumerViolationNotification {
+    ConsumerViolationNotification {
+        event_id: delivery.event_id.clone(),
+        kind: delivery.kind.clone(),
+        namespace: delivery.namespace.clone(),
+        member_kind: delivery.member_kind.clone(),
+        member_id: delivery.member_id.clone(),
+        rule_id: delivery.rule_id.clone(),
+        evidence,
+        created_at_ms: delivery.created_at_ms,
+        acknowledged_at_ms: delivery.acknowledged_at_ms,
     }
 }
 

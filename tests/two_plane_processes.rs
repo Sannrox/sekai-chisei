@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use sekai_chisei::db::store::SekaiStore;
-use sekai_chisei::gateway_keys::hash_gateway_key;
 use sekai_chisei::grpc::pb::chisei::GetOperationReceiptRequest;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{GetActionInstanceRequest, SubmitActionInstanceRequest};
 use sekai_chisei::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType};
+use sekai_domain::gateway_keys::hash_gateway_key;
 use tempfile::tempdir;
 
 const TOKEN: &str = "plane-hop-token";
@@ -382,6 +382,7 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer:
                 evidence_submission_ids: Vec::new(),
                 request_id: "op-plane-deny".into(),
                 ontology_digest: String::new(),
+                offline: None,
             }),
             "wrong-token",
         ))
@@ -399,6 +400,7 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer:
             evidence_submission_ids: Vec::new(),
             request_id: "op-plane-ok".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -462,6 +464,7 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer:
             evidence_submission_ids: Vec::new(),
             request_id: "op-wrong".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();

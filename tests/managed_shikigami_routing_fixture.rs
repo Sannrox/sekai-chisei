@@ -50,11 +50,11 @@ fn fixture() -> ConformanceFixture {
 
 fn evidence_source(path: &str) -> &'static str {
     match path {
-        "crates/sekai-provider/src/llm/anthropic.rs" => {
-            include_str!("../crates/sekai-provider/src/llm/anthropic.rs")
+        "crates/chisei-provider/src/llm/anthropic.rs" => {
+            include_str!("../crates/chisei-provider/src/llm/anthropic.rs")
         }
-        "crates/sekai-provider/src/llm/openai.rs" => {
-            include_str!("../crates/sekai-provider/src/llm/openai.rs")
+        "crates/chisei-provider/src/llm/openai.rs" => {
+            include_str!("../crates/chisei-provider/src/llm/openai.rs")
         }
         "src/grpc/chisei_service.rs" => include_str!("../src/grpc/chisei_service.rs"),
         "src/grpc/chisei_service_tests.rs" => include_str!("../src/grpc/chisei_service_tests.rs"),

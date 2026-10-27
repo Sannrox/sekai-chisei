@@ -30,111 +30,8 @@ impl SekaiServiceImpl {
             purpose: purpose.as_ref(),
         };
         let inner = req.into_inner();
-        let descriptor = parse_object_set_descriptor(
-            inner
-                .descriptor
-                .ok_or_else(|| Status::invalid_argument("object-set descriptor required"))?,
-        )?;
-        enforce_namespace_tenant_context(
-            self.db.runtime(),
-            tenant_context.as_ref(),
-            &descriptor.namespace,
-            false,
-        )?;
-        check_team_namespace(self.db.runtime(), &principals, &descriptor.namespace, false)?;
-        authorize_source_sync_namespace(
-            self,
-            &principals,
-            tenant_context.as_ref(),
-            &descriptor.namespace,
-            false,
-        )?;
-        if is_reserved_governance_kind(&descriptor.kind)
-            || descriptor
-                .traversal
-                .as_ref()
-                .is_some_and(|traversal| is_reserved_governance_kind(&traversal.far_kind))
-        {
-            return Err(Status::not_found("object set unavailable"));
-        }
-        let published = self
-            .db
-            .runtime()
-            .get_published_definition_revision(&descriptor.namespace)
-            .map_err(|_| Status::internal("definition revision unavailable"))?
-            .ok_or_else(|| {
-                Status::failed_precondition("object set definition revision is stale")
-            })?;
-        authorize_definition_revision(
-            self,
-            &principals,
-            &published.namespace,
-            &published.revision_digest,
-            true,
-        )?;
-        let members = self
-            .db
-            .runtime()
-            .get_definition_members(&published.namespace, &published.revision_digest)
-            .map_err(|_| Status::internal("definition revision unavailable"))?;
-        let bound = descriptor
-            .prepare(&published.revision_digest, &members)
-            .map_err(map_object_set_error)?;
-        {
-            let schema = self
-                .schema_definitions
-                .snapshot()
-                .map_err(map_schema_definition_lifecycle_error)?;
-            let mut queried_properties = bound
-                .filter
-                .property_filters
-                .iter()
-                .map(|property_filter| property_filter.key.clone())
-                .collect::<Vec<_>>();
-            if let Some(order_property) = queried_order_property(&bound.filter.order_by) {
-                queried_properties.push(order_property);
-            }
-            if let Some(aggregation) = &bound.descriptor.aggregation
-                && !aggregation.group_by.is_empty()
-            {
-                queried_properties.push(aggregation.group_by.clone());
-            }
-            ensure_property_query_allowed(
-                &schema,
-                &principals,
-                tenant_context.as_ref(),
-                bound.filter.kind.as_deref().unwrap_or_default(),
-                queried_properties.clone(),
-            )?;
-            ensure_property_grant_query_allowed(
-                self.db.runtime(),
-                bound.filter.namespace.as_deref(),
-                bound.filter.kind.as_deref(),
-                queried_properties,
-            )?;
-            if let Some(aggregation) = &bound.descriptor.aggregation
-                && !aggregation.property.is_empty()
-            {
-                let hops = crate::sekai::object_set::resolved_hops(&bound.descriptor);
-                let leaf_kind = hops
-                    .last()
-                    .map(|hop| hop.far_kind.as_str())
-                    .unwrap_or(bound.descriptor.kind.as_str());
-                ensure_property_query_allowed(
-                    &schema,
-                    &principals,
-                    tenant_context.as_ref(),
-                    leaf_kind,
-                    [aggregation.property.clone()],
-                )?;
-                ensure_property_grant_query_allowed(
-                    self.db.runtime(),
-                    Some(bound.descriptor.namespace.as_str()),
-                    Some(leaf_kind),
-                    [aggregation.property.as_str()],
-                )?;
-            }
-        }
+        let bound =
+            self.authorize_object_set_read(&principals, tenant_context.as_ref(), inner.descriptor)?;
         let principal_context_digest =
             crate::sekai::purpose_authorization::purpose_bound_context_digest(
                 &policy_context
@@ -260,6 +157,121 @@ impl SekaiServiceImpl {
 }
 
 impl SekaiServiceImpl {
+    /// The read checks every object-set read passes: tenant, team and
+    /// namespace read, read of the published definition, and the property
+    /// query rules for the properties it filters, orders or groups by.
+    /// Returns the set bound to the published revision.
+    pub(super) fn authorize_object_set_read(
+        &self,
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+        descriptor: Option<ObjectSetDescriptor>,
+    ) -> Result<crate::sekai::object_set::BoundObjectSet, Status> {
+        let descriptor = parse_object_set_descriptor(
+            descriptor.ok_or_else(|| Status::invalid_argument("object-set descriptor required"))?,
+        )?;
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context,
+            &descriptor.namespace,
+            false,
+        )?;
+        check_team_namespace(self.db.runtime(), principals, &descriptor.namespace, false)?;
+        authorize_source_sync_namespace(
+            self,
+            principals,
+            tenant_context,
+            &descriptor.namespace,
+            false,
+        )?;
+        if is_reserved_governance_kind(&descriptor.kind)
+            || descriptor
+                .traversal
+                .as_ref()
+                .is_some_and(|traversal| is_reserved_governance_kind(&traversal.far_kind))
+        {
+            return Err(Status::not_found("object set unavailable"));
+        }
+        let published = self
+            .db
+            .runtime()
+            .get_published_definition_revision(&descriptor.namespace)
+            .map_err(|_| Status::internal("definition revision unavailable"))?
+            .ok_or_else(|| {
+                Status::failed_precondition("object set definition revision is stale")
+            })?;
+        authorize_definition_revision(
+            self,
+            principals,
+            &published.namespace,
+            &published.revision_digest,
+            true,
+        )?;
+        let members = self
+            .db
+            .runtime()
+            .get_definition_members(&published.namespace, &published.revision_digest)
+            .map_err(|_| Status::internal("definition revision unavailable"))?;
+        let bound = descriptor
+            .prepare(&published.revision_digest, &members)
+            .map_err(map_object_set_error)?;
+        {
+            let schema = self
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
+            let mut queried_properties = bound
+                .filter
+                .property_filters
+                .iter()
+                .map(|property_filter| property_filter.key.clone())
+                .collect::<Vec<_>>();
+            if let Some(order_property) = queried_order_property(&bound.filter.order_by) {
+                queried_properties.push(order_property);
+            }
+            if let Some(aggregation) = &bound.descriptor.aggregation
+                && !aggregation.group_by.is_empty()
+            {
+                queried_properties.push(aggregation.group_by.clone());
+            }
+            ensure_property_query_allowed(
+                &schema,
+                principals,
+                tenant_context,
+                bound.filter.kind.as_deref().unwrap_or_default(),
+                queried_properties.clone(),
+            )?;
+            ensure_property_grant_query_allowed(
+                self.db.runtime(),
+                bound.filter.namespace.as_deref(),
+                bound.filter.kind.as_deref(),
+                queried_properties,
+            )?;
+            if let Some(aggregation) = &bound.descriptor.aggregation
+                && !aggregation.property.is_empty()
+            {
+                let hops = crate::sekai::object_set::resolved_hops(&bound.descriptor);
+                let leaf_kind = hops
+                    .last()
+                    .map(|hop| hop.far_kind.as_str())
+                    .unwrap_or(bound.descriptor.kind.as_str());
+                ensure_property_query_allowed(
+                    &schema,
+                    principals,
+                    tenant_context,
+                    leaf_kind,
+                    [aggregation.property.clone()],
+                )?;
+                ensure_property_grant_query_allowed(
+                    self.db.runtime(),
+                    Some(bound.descriptor.namespace.as_str()),
+                    Some(leaf_kind),
+                    [aggregation.property.as_str()],
+                )?;
+            }
+        }
+        Ok(bound)
+    }
     fn evaluate_indexed_object_set(
         &self,
         bound: &BoundObjectSet,
@@ -1151,6 +1163,189 @@ fn map_object_set_error(error: ObjectSetError) -> Status {
         ObjectSetError::Stale(message) => Status::failed_precondition(message),
         ObjectSetError::Unsupported(message) => Status::invalid_argument(message),
         ObjectSetError::LimitExceeded(message) => Status::failed_precondition(message),
+    }
+}
+
+impl SekaiServiceImpl {
+    /// Streams an object set as CSV or JSON Lines. The caller passes every
+    /// read check of EvaluateObjectSet and holds an active export grant on
+    /// the namespace; rows and properties are what a read would return. The
+    /// receipt is written before the first byte; an export that does not
+    /// finish (a dropped client, an error) leaves it aborted.
+    pub(super) async fn export_object_set_rpc(
+        &self,
+        req: Request<ExportObjectSetRequest>,
+    ) -> Result<Response<ExportStream>, Status> {
+        let caller = ExportCaller::from_request(self, &req)?;
+        let inner = req.into_inner();
+        let prepared = self.prepare_object_set_export(
+            caller,
+            inner.descriptor,
+            inner.properties,
+            &inner.format,
+        )?;
+        Ok(Response::new(run_export(
+            self.db.runtime().clone(),
+            prepared,
+        )))
+    }
+
+    /// What `caller` may export of this source, checked now: the export's
+    /// receipt source, its header, and the row writer to run.
+    pub(super) fn prepare_object_set_export(
+        &self,
+        caller: ExportCaller,
+        descriptor: Option<ObjectSetDescriptor>,
+        properties: Vec<String>,
+        format: &str,
+    ) -> Result<PreparedExport, Status> {
+        use crate::sekai::data_export::{ExportFormat, ExportSource, RowEncoder};
+        let ExportCaller {
+            principals,
+            policy_context,
+            purpose,
+            tenant_context,
+        } = caller;
+        let inner = ExportObjectSetRequest {
+            descriptor,
+            properties,
+            format: format.into(),
+        };
+        let format = ExportFormat::parse(&inner.format)
+            .ok_or_else(|| Status::invalid_argument("format must be csv or jsonl"))?;
+        let encoder = RowEncoder::new(format, inner.properties.clone(), true)
+            .map_err(Status::invalid_argument)?;
+        let bound =
+            self.authorize_object_set_read(&principals, tenant_context.as_ref(), inner.descriptor)?;
+        let namespace = bound.descriptor.namespace.clone();
+        // Fail closed: reading a set never entitles taking it out.
+        let granted_via = export_grantee(
+            self.db.runtime(),
+            &principals,
+            &namespace,
+            "object_set",
+            &bound.descriptor.kind,
+        )?;
+        let plan = crate::sekai::export_fingerprint::namespace_plan(self.db.runtime(), &namespace)
+            .map_err(Status::internal)?;
+        let fingerprint_properties = plan
+            .as_ref()
+            .map(crate::sekai::export_fingerprint::FingerprintPlan::properties)
+            .unwrap_or_default();
+        let fingerprint_group_size = if plan.is_some() {
+            crate::sekai::export_fingerprint::FINGERPRINT_GROUP_SIZE as u32
+        } else {
+            0
+        };
+        // The receipt names who asked; the grant that allowed it is evidence.
+        let actor = principals[0].clone();
+        if bound.descriptor.aggregation.is_some()
+            || !crate::sekai::object_set::resolved_hops(&bound.descriptor).is_empty()
+            || self
+                .db
+                .runtime()
+                .get_object_type_datasource(&namespace, &bound.descriptor.kind)
+                .map_err(Status::internal)?
+                .is_some()
+        {
+            return Err(Status::unimplemented(
+                "export covers object sets of one stored kind, without traversal or aggregation",
+            ));
+        }
+        let source = ExportSource {
+            namespace,
+            source_kind: "object_set",
+            source_id: bound.descriptor.kind.clone(),
+            source_version: bound.query_digest.clone(),
+            definition_digest: bound.descriptor.definition_digest.clone(),
+            format,
+            columns: inner.properties,
+            granted_via,
+            fingerprint_properties,
+            fingerprint_group_size,
+        };
+        let mut filter = bound.filter;
+        filter.offset = 0;
+        let service = self.clone();
+        let db = self.db.runtime().clone();
+        Ok(PreparedExport {
+            actor,
+            source,
+            header: encoder.header(),
+            rows: Box::new(move |writer: &std::cell::RefCell<ExportWriter>| {
+                let export_id = writer.borrow().operation_id().to_string();
+                let mut sink = crate::sekai::export_fingerprint::FingerprintSink::new(
+                    export_id, encoder, plan,
+                );
+                // Rows are resolved per batch exactly as a read projects them.
+                let mut batch = Vec::with_capacity(EXPORT_BATCH);
+                let mut connected = true;
+                {
+                    let emit = |batch: &mut Vec<domain::Object>,
+                                sink: &mut crate::sekai::export_fingerprint::FingerprintSink|
+                     -> Result<bool, Status> {
+                        let markings: Vec<String> = batch
+                            .iter()
+                            .map(|object| {
+                                crate::sekai::markings::object_marking_token(object)
+                                    .unwrap_or("")
+                                    .to_string()
+                            })
+                            .collect();
+                        let resolved = service.resolve_computed_for_responses_with_policy(
+                            std::mem::take(batch),
+                            &principals,
+                            Some(&policy_context),
+                            tenant_context.as_ref(),
+                            purpose.as_ref(),
+                        )?;
+                        let mut writer = writer.borrow_mut();
+                        for (object, marking) in resolved.iter().zip(markings) {
+                            let encoded = sink
+                                .push(&object.id, &marking, object.properties.clone())
+                                .map_err(Status::invalid_argument)?;
+                            for row in encoded {
+                                if !writer.write(row, 1) {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        Ok(true)
+                    };
+                    for_each_visible_object(
+                        &db,
+                        &filter,
+                        &principals,
+                        &policy_context,
+                        purpose.as_ref(),
+                        tenant_context.as_ref(),
+                        &mut |object| {
+                            batch.push(object);
+                            if batch.len() == EXPORT_BATCH {
+                                connected = emit(&mut batch, &mut sink)?;
+                            }
+                            Ok(connected)
+                        },
+                        // A long scan over rows the caller may not see still
+                        // renews the lease, and stops once it is lost.
+                        &mut || writer.borrow_mut().keep_alive(),
+                    )?;
+                    if connected {
+                        connected = emit(&mut batch, &mut sink)?;
+                    }
+                }
+                if !connected {
+                    return Ok(false);
+                }
+                let mut writer = writer.borrow_mut();
+                for row in sink.finish() {
+                    if !writer.write(row, 1) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }),
+        })
     }
 }
 

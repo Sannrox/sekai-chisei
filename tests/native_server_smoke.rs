@@ -1028,6 +1028,39 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
         .into_inner();
     assert_eq!(inbox.instances.len(), 1);
     assert_eq!(inbox.instances[0].instance_id, parked.instance_id);
+    // #1771: the instances each caller may decide, by the rule a decision
+    // applies. The named approver's list holds the parked instance; the
+    // submitter's, a namespace member's without approver authority, and the
+    // operator socket's are empty, and each refusal below agrees.
+    let decidable = || ListActionInstancesRequest {
+        namespace: "demo".into(),
+        decidable_by_caller: true,
+        ..Default::default()
+    };
+    let approvers_inbox = sekai
+        .list_action_instances(bearer(&approver, decidable()))
+        .await
+        .unwrap_or_else(|error| panic!("list decidable: {error}\n{}", server.logs()))
+        .into_inner();
+    assert_eq!(approvers_inbox.instances.len(), 1);
+    let listed = &approvers_inbox.instances[0];
+    assert_eq!(listed.instance_id, parked.instance_id);
+    assert_eq!(listed.principal, "alice-agent");
+    assert_eq!(listed.type_id, "incident.acknowledge");
+    for token in [&submitter, &foreign] {
+        let none = sekai
+            .list_action_instances(bearer(token, decidable()))
+            .await
+            .unwrap_or_else(|error| panic!("list decidable: {error}\n{}", server.logs()))
+            .into_inner();
+        assert!(none.instances.is_empty());
+    }
+    let local_inbox = sekai
+        .list_action_instances(decidable())
+        .await
+        .unwrap_or_else(|error| panic!("list decidable: {error}\n{}", server.logs()))
+        .into_inner();
+    assert!(local_inbox.instances.is_empty());
 
     // The operator socket's self-asserted identity cannot approve (#1140).
     let local = sekai
@@ -1074,6 +1107,13 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
     assert_eq!(admitted.status, "admitted");
     assert_eq!(admitted.decided_by, "bob-approver");
     assert_eq!(admitted.instance_id, parked.instance_id);
+    // Decided, it leaves the approver's list.
+    let decided_inbox = sekai
+        .list_action_instances(bearer(&approver, decidable()))
+        .await
+        .unwrap_or_else(|error| panic!("list decidable: {error}\n{}", server.logs()))
+        .into_inner();
+    assert!(decided_inbox.instances.is_empty());
 
     let stored = sekai
         .get_action_instance(bearer(

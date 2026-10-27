@@ -10,7 +10,12 @@ set -euo pipefail
 
 CLI="${SEKAI_CONTAINER_CLI:-docker}"
 CONTAINER_NAME="sekai-postgres-conformance-$$"
-POSTGRES_PORT="${SEKAI_TEST_POSTGRES_PORT:-55433}"
+# An ephemeral host port, so two lanes on one machine never share one (#1554).
+free_port() {
+  command -v python3 >/dev/null || { echo "python3 is required to pick an ephemeral PostgreSQL port" >&2; exit 1; }
+  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+POSTGRES_PORT="${SEKAI_TEST_POSTGRES_PORT:-$(free_port)}"
 POSTGRES_IMAGE="${SEKAI_TEST_POSTGRES_IMAGE:-docker.io/library/postgres:16-alpine}"
 case "$CLI" in
   docker) REMOVE_FLAG=--rm ;;
@@ -66,6 +71,7 @@ openssl x509 -req -days 1 \
 chmod 600 "$CERTIFICATE_DIR/server.key"
 
 # hostssl only: a plaintext connection is refused by the server itself.
+start_container() {
 "$CLI" run --detach "$REMOVE_FLAG" \
   --name "$CONTAINER_NAME" \
   --publish "127.0.0.1:${POSTGRES_PORT}:5432" \
@@ -86,6 +92,23 @@ chmod 600 "$CERTIFICATE_DIR/server.key"
         -c ssl_cert_file=/tmp/server.crt \
         -c ssl_key_file=/tmp/server.key \
         -c hba_file=/tmp/pg_hba.conf' >/dev/null
+}
+# The picked port can be taken before the container binds it; try a fresh
+# one, under a fresh name, unless the port was set explicitly.
+base_name="$CONTAINER_NAME"
+for attempt in 1 2 3 4 5; do
+  CONTAINER_NAME="$base_name-$attempt"
+  if start_container; then
+    break
+  fi
+  # A failed start can leave the named container behind; drop it.
+  "$CLI" rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  if [[ -n "${SEKAI_TEST_POSTGRES_PORT:-}" || "$attempt" == 5 ]]; then
+    echo "could not start PostgreSQL on 127.0.0.1:$POSTGRES_PORT" >&2
+    exit 1
+  fi
+  POSTGRES_PORT="$(free_port)"
+done
 
 ready=0
 for _ in $(seq 1 60); do
@@ -117,7 +140,16 @@ status=0
 SEKAI_TEST_POSTGRES_URL="$base/sekai_conformance" \
   cargo test --locked --no-fail-fast --test it -- --ignored --test-threads=1 \
     backend_conformance postgres || status=$?
+# Root crate keeps Chisei/composition PostgreSQL tests; Sekai persistence
+# tests live in sekai-core. Run the packages one after another against the
+# same database so they do not collide.
 SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
 SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
   cargo test --locked --lib -- --ignored --test-threads=1 postgres || status=$?
+SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
+SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
+  cargo test --locked -p sekai-core --lib -- --ignored --test-threads=1 postgres || status=$?
+SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
+SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
+  cargo test --locked -p chisei-core --lib -- --ignored --test-threads=1 postgres || status=$?
 exit "$status"

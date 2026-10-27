@@ -655,6 +655,175 @@ pub(super) async fn list_dataset_alerts(
         alerts: alerts.iter().map(to_proto_dataset_alert).collect(),
     }))
 }
+
+pub(super) async fn list_consumer_violation_notifications(
+    service: &SekaiServiceImpl,
+    req: Request<ListConsumerViolationNotificationsRequest>,
+) -> Result<Response<ListConsumerViolationNotificationsResponse>, Status> {
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    let page_size = crate::sekai::consumer_violation::clamp_page_size(inner.page_size)
+        .map_err(Status::invalid_argument)?;
+    let mut page_token = inner.page_token;
+    let mut notifications = Vec::new();
+    let mut next_page_token = String::new();
+    loop {
+        let remaining = page_size.saturating_sub(notifications.len() as i32);
+        if remaining == 0 {
+            break;
+        }
+        let (deliveries, storage_next) = service
+            .db
+            .runtime()
+            .list_consumer_violation_deliveries(
+                &crate::sekai::consumer_violation::ListViolationDeliveries {
+                    recipients: principals.clone(),
+                    page_token,
+                    page_size: remaining,
+                    include_acknowledged: inner.include_acknowledged,
+                },
+            )
+            .map_err(Status::invalid_argument)?;
+        if deliveries.is_empty() {
+            break;
+        }
+        let mut filled = false;
+        for (index, delivery) in deliveries.iter().enumerate() {
+            if tenant_hides_violation_namespace(
+                service,
+                tenant_context.as_ref(),
+                &delivery.namespace,
+            ) {
+                continue;
+            }
+            let evidence = visible_violation_evidence(
+                service,
+                &principals,
+                tenant_context.as_ref(),
+                delivery,
+            )?;
+            notifications.push(to_proto_violation_notification(delivery, evidence));
+            if notifications.len() == page_size as usize {
+                let more = deliveries[index + 1..].iter().any(|item| {
+                    !tenant_hides_violation_namespace(
+                        service,
+                        tenant_context.as_ref(),
+                        &item.namespace,
+                    )
+                }) || !storage_next.is_empty();
+                if more {
+                    next_page_token = crate::sekai::consumer_violation::encode_page_token(
+                        delivery.created_at_ms,
+                        &delivery.event_id,
+                        &delivery.recipient,
+                    );
+                }
+                filled = true;
+                break;
+            }
+        }
+        if filled || storage_next.is_empty() {
+            break;
+        }
+        page_token = storage_next;
+    }
+    Ok(Response::new(ListConsumerViolationNotificationsResponse {
+        notifications,
+        next_page_token,
+    }))
+}
+
+fn tenant_hides_violation_namespace(
+    service: &SekaiServiceImpl,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+) -> bool {
+    tenant_context.is_some_and(|context| {
+        enforce_namespace_tenant_context(service.db.runtime(), Some(context), namespace, false)
+            .is_err()
+    })
+}
+
+pub(super) async fn acknowledge_consumer_violation_notification(
+    service: &SekaiServiceImpl,
+    req: Request<AcknowledgeConsumerViolationNotificationRequest>,
+) -> Result<Response<AcknowledgeConsumerViolationNotificationResponse>, Status> {
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    if inner.event_id.trim().is_empty() {
+        return Err(Status::invalid_argument("event_id required"));
+    }
+    let existing = service
+        .db
+        .runtime()
+        .get_consumer_violation_delivery(&principals, &inner.event_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("notification not found"))?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &existing.namespace,
+            false,
+        )?;
+    }
+    let now_ms = crate::sekai::dataset_version::now_ms();
+    let delivery = service
+        .db
+        .runtime()
+        .acknowledge_consumer_violation(&principals, &inner.event_id, now_ms)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("notification not found"))?;
+    let evidence =
+        visible_violation_evidence(service, &principals, tenant_context.as_ref(), &delivery)?;
+    Ok(Response::new(
+        AcknowledgeConsumerViolationNotificationResponse {
+            notification: Some(to_proto_violation_notification(&delivery, evidence)),
+        },
+    ))
+}
+
+fn visible_violation_evidence(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    delivery: &crate::sekai::consumer_violation::ViolationDelivery,
+) -> Result<String, Status> {
+    let runtime = service.db.runtime();
+    let object_id = match delivery.kind.as_str() {
+        crate::sekai::consumer_violation::KIND_QUALITY => {
+            crate::chisei::data_quality::dataset_object_id(&delivery.namespace, &delivery.member_id)
+        }
+        _ => match runtime
+            .get_dataset(&delivery.member_id)
+            .map_err(Status::internal)?
+        {
+            Some(dataset) if !dataset.object_id.is_empty() => dataset.object_id,
+            _ => return Ok(String::new()),
+        },
+    };
+    let Some(object) = runtime.get_object(&object_id).map_err(Status::internal)? else {
+        return Ok(String::new());
+    };
+    let allowed = object_is_visible_for(
+        runtime,
+        &service.security,
+        &object,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+    );
+    Ok(if allowed {
+        delivery.evidence.clone()
+    } else {
+        String::new()
+    })
+}
+
 pub(super) async fn create_virtual_table(
     service: &SekaiServiceImpl,
     req: Request<CreateVirtualTableRequest>,
@@ -1207,6 +1376,51 @@ pub(super) async fn list_decisions(
     .collect();
     Ok(Response::new(ListDecisionsResponse { decisions }))
 }
+/// Read access to a live object's change history: its namespace and
+/// collaboration scope, active read policy and marking. A denial reads as
+/// missing. `operation` names the marking audit entry.
+pub(super) fn authorize_live_object_history(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object: &crate::domain::Object,
+    operation: &str,
+) -> Result<(), Status> {
+    enforce_collaboration_namespace(
+        service.db.runtime(),
+        tenant_context,
+        &object.namespace,
+        false,
+    )
+    .map_err(|_| Status::not_found("not found"))?;
+    if !collaboration_object_permitted(
+        service.db.runtime(),
+        tenant_context,
+        object,
+        crate::enterprise::NamespaceAction::Read,
+    )? {
+        return Err(Status::not_found("not found"));
+    }
+    if evaluate_active_object_policy(
+        service.db.runtime(),
+        object,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+        None,
+    )? == Some(false)
+    {
+        return Err(Status::not_found("not found"));
+    }
+    enforce_object_marking_access(
+        service.db.runtime(),
+        object,
+        principals,
+        &format!("{operation}:{}", object.id),
+    )?;
+    Ok(())
+}
+
 pub(super) async fn list_object_changes(
     service: &SekaiServiceImpl,
     req: Request<ListObjectChangesRequest>,
@@ -1214,11 +1428,6 @@ pub(super) async fn list_object_changes(
     let principals = caller_principals(&req);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     require_authenticated(&principals)?;
-    if service.db.runtime().backend_name() == "postgres" {
-        return Err(Status::unavailable(
-            "list_visible_object_changes is unavailable on the PostgreSQL community runtime",
-        ));
-    }
     let inner = req.into_inner();
     check_object_namespace_access(service.db.runtime(), &principals, &inner.object_id, false)?;
     check_read(&service.security, &inner.object_id, &principals)?;
@@ -1228,40 +1437,21 @@ pub(super) async fn list_object_changes(
         .get_object(&inner.object_id)
         .map_err(Status::internal)?;
     match object.as_ref() {
-        Some(object) => {
-            enforce_collaboration_namespace(
-                service.db.runtime(),
-                tenant_context.as_ref(),
-                &object.namespace,
-                false,
-            )
-            .map_err(|_| Status::not_found("not found"))?;
-            if !collaboration_object_permitted(
-                service.db.runtime(),
-                tenant_context.as_ref(),
-                object,
-                crate::enterprise::NamespaceAction::Read,
-            )? {
-                return Err(Status::not_found("not found"));
-            }
-            if evaluate_active_object_policy(
-                service.db.runtime(),
-                object,
-                &principals,
-                tenant_context.as_ref(),
-                crate::sekai::object_security::ObjectSecurityOperation::Read,
-                None,
-            )? == Some(false)
-            {
-                return Err(Status::not_found("not found"));
-            }
-            enforce_object_marking_access(
-                service.db.runtime(),
-                object,
-                &principals,
-                &format!("list_object_changes:{}", object.id),
-            )?;
+        // Reserved governance objects, such as comments, carry their own read
+        // rules; their raw history is for credential admins only.
+        Some(object)
+            if is_reserved_governance_kind(&object.kind)
+                && require_credential_admin(&principals).is_err() =>
+        {
+            return Err(Status::not_found("not found"));
         }
+        Some(object) => authorize_live_object_history(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            object,
+            "list_object_changes",
+        )?,
         None if tenant_context.is_some() => {
             return Err(Status::not_found("not found"));
         }
@@ -1312,13 +1502,6 @@ pub(super) async fn list_object_changes(
             .map_err(|_| Status::unavailable("object authorization unavailable"))?,
         None => None,
     };
-    let operation_id = crate::sekai::operation_correlation::operation_ids_for_objects(
-        service.db.runtime(),
-        &[inner.object_id.clone()].into_iter().collect(),
-    )
-    .map_err(Status::internal)?
-    .remove(&inner.object_id)
-    .unwrap_or_default();
     let changes = match visible_collaboration_history_page(
         service.db.runtime(),
         tenant_context.as_ref(),
@@ -1335,6 +1518,16 @@ pub(super) async fn list_object_changes(
     }
     .into_iter()
     .map(|change| {
+        // Each change carries the operation (#1689) and writer (#1690)
+        // stored with it; a row without a writer reads as unattributed.
+        let operation_id = change.operation_id.clone();
+        let writer_kind = if change.writer_kind.is_empty() {
+            crate::sekai::audit::WRITER_UNATTRIBUTED.to_string()
+        } else {
+            change.writer_kind.clone()
+        };
+        let writer_ref = change.writer_ref.clone();
+        let receipt_id = change.receipt_id.clone();
         let mut mapped = if let Some(kind) = object_kind.as_deref() {
             redact_object_change_values(
                 change,
@@ -1354,10 +1547,13 @@ pub(super) async fn list_object_changes(
                 new_value: change.new_value,
                 changed_by: change.changed_by,
                 timestamp: change.timestamp,
-                operation_id: String::new(),
+                ..Default::default()
             }
         };
-        mapped.operation_id = operation_id.clone();
+        mapped.operation_id = operation_id;
+        mapped.writer_kind = writer_kind;
+        mapped.writer_ref = writer_ref;
+        mapped.receipt_id = receipt_id;
         mapped
     })
     .collect();
@@ -2287,10 +2483,14 @@ pub(super) async fn run_governed_transform(
         }
     }
     Ok(Response::new(RunGovernedTransformResponse {
-        run: Some(to_proto_transform_run(
+        run: Some(with_run_outcome(
+            service,
             &run,
-            caller_can_read_run_datasets(service, &principals, &run),
-        )),
+            to_proto_transform_run(
+                &run,
+                caller_can_read_run_datasets(service, &principals, &run),
+            ),
+        )?),
     }))
 }
 pub(super) async fn get_governed_transform_run(
@@ -2319,7 +2519,11 @@ pub(super) async fn get_governed_transform_run(
     check_team_namespace(service.db.runtime(), &principals, &run.namespace, false)?;
     let reveal = caller_can_read_run_datasets(service, &principals, &run);
     Ok(Response::new(GetGovernedTransformRunResponse {
-        run: Some(to_proto_transform_run(&run, reveal)),
+        run: Some(with_run_outcome(
+            service,
+            &run,
+            to_proto_transform_run(&run, reveal),
+        )?),
     }))
 }
 pub(super) async fn list_governed_transforms(
@@ -2374,9 +2578,9 @@ pub(super) async fn list_governed_transform_runs(
         .iter()
         .map(|run| {
             let reveal = caller_can_read_run_datasets(service, &principals, run);
-            to_proto_transform_run(run, reveal)
+            with_run_outcome(service, run, to_proto_transform_run(run, reveal))
         })
-        .collect();
+        .collect::<Result<_, Status>>()?;
     Ok(Response::new(ListGovernedTransformRunsResponse { runs }))
 }
 pub(super) async fn list_claimable_transform_work(
@@ -2454,6 +2658,36 @@ pub(super) async fn claim_transform_work(
                         "local",
                     ))
                 };
+                // A terminal refusal ends the run before any admission (#1701).
+                if let Some(refusal) = extension_refusal(service, owner.as_ref(), &work) {
+                    match service.db.runtime().refuse_transform_claim(
+                        &work.run_id,
+                        &work.claim_owner,
+                        work.claim_generation,
+                        &work.fencing_token,
+                        &refusal,
+                        now_millis(),
+                    ) {
+                        Ok(()) => release_failed_transform_quota(
+                            service.db.runtime(),
+                            quota.clone(),
+                            std::slice::from_ref(&work.run_id),
+                        )?,
+                        // Another claimant moved the run on: it owns the run
+                        // and its quota now.
+                        Err(error)
+                            if error == crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM => {
+                        }
+                        Err(error) => return Err(Status::internal(error)),
+                    }
+                    if targeted {
+                        return Err(Status::failed_precondition(format!(
+                            "isolated-process run refused: {}",
+                            refusal.code
+                        )));
+                    }
+                    continue;
+                }
                 let prior_admission = if work.claim_generation > 1 {
                     match service.db.runtime().reclaim_transform_quota_hold(
                         &work.run_id,
@@ -2871,7 +3105,11 @@ pub(super) async fn write_transform_run_result(
             }
         }
         return Ok(Response::new(WriteTransformRunResultResponse {
-            run: Some(to_proto_transform_run(&run, true)),
+            run: Some(with_run_outcome(
+                service,
+                &run,
+                to_proto_transform_run(&run, true),
+            )?),
         }));
     }
     // Hold consume and TenantQuotaGate.complete stay on separate stores.
@@ -2918,10 +3156,14 @@ pub(super) async fn write_transform_run_result(
         ack_transform_usage_pending(service.db.runtime(), &run.run_id)?;
     }
     Ok(Response::new(WriteTransformRunResultResponse {
-        run: Some(to_proto_transform_run(
+        run: Some(with_run_outcome(
+            service,
             &run,
-            caller_can_read_run_datasets(service, &principals, &run),
-        )),
+            to_proto_transform_run(
+                &run,
+                caller_can_read_run_datasets(service, &principals, &run),
+            ),
+        )?),
     }))
 }
 
@@ -3199,6 +3441,53 @@ fn admit_claimed_isolated_process(
         reclaim,
     )
 }
+
+/// The extension's terminal refusal of this claim, if any, bounded and with
+/// secret-like text withheld before it is stored on the run.
+fn extension_refusal(
+    service: &SekaiServiceImpl,
+    owner: Option<&crate::enterprise::AuthenticatedContext>,
+    work: &crate::sekai::governed_transform::TransformWork,
+) -> Option<crate::enterprise::IsolatedProcessRefusal> {
+    let extension = service.db.runtime().enterprise_extension()?;
+    let refusal = extension.refuse_isolated_process_job(
+        owner?,
+        &crate::enterprise::IsolatedProcessJob {
+            run_id: work.run_id.clone(),
+            namespace: work.namespace.clone(),
+            estimated_seconds: DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
+        },
+    )?;
+    // Each detail is checked as the `name=value` pair it reads as, and a
+    // credential-like name is refused whatever its value.
+    let secret = crate::sekai::object_sync::contains_secret_like_text(&refusal.code)
+        || refusal.details.iter().any(|(key, value)| {
+            credential_like_name(key)
+                || crate::sekai::object_sync::contains_secret_like_text(value)
+                || crate::sekai::object_sync::contains_secret_like_text(&format!("{key}={value}"))
+        });
+    Some(if secret || refusal.validate().is_err() {
+        crate::enterprise::IsolatedProcessRefusal {
+            code: REFUSAL_REASON_WITHHELD.into(),
+            details: Default::default(),
+        }
+    } else {
+        refusal
+    })
+}
+
+/// A refusal detail name that suggests a credential rather than a usage figure.
+fn credential_like_name(name: &str) -> bool {
+    name.split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "token" | "credential" | "key" | "authorization" | "bearer"
+        )
+    })
+}
+
+/// Stored in place of a refusal that is malformed or carries secret-like text.
+const REFUSAL_REASON_WITHHELD: &str = "reason_withheld";
 
 fn admit_extension_isolated_process(
     service: &SekaiServiceImpl,
@@ -3508,6 +3797,7 @@ fn load_transform_run_or_preview(
         .map_err(transform_work_status)?
         .ok_or_else(|| Status::not_found("admitted transform not found"))?;
     Ok(crate::sekai::governed_transform::TransformRun {
+        input_versions: Default::default(),
         run_id: run_id.to_string(),
         namespace: transform.namespace,
         transform_id: transform.transform_id,
@@ -3535,7 +3825,7 @@ fn load_transform_run_or_preview(
     })
 }
 
-fn preview_column_allowlist(
+pub(super) fn preview_column_allowlist(
     service: &SekaiServiceImpl,
     dataset: &crate::sekai::dataset::Dataset,
 ) -> Result<Option<Vec<String>>, Status> {
@@ -3782,7 +4072,7 @@ fn from_proto_isolated(
     })
 }
 
-fn caller_can_read_run_datasets(
+pub(super) fn caller_can_read_run_datasets(
     service: &SekaiServiceImpl,
     principals: &[String],
     run: &crate::sekai::governed_transform::TransformRun,
@@ -3853,6 +4143,37 @@ fn to_proto_partition(
     }
 }
 
+/// `proto` with what the run's side records hold: the refusal of a refused
+/// run (#1701), and when a finished run finished and how long it computed
+/// (#1651).
+fn with_run_outcome(
+    service: &SekaiServiceImpl,
+    run: &crate::sekai::governed_transform::TransformRun,
+    mut proto: TransformRun,
+) -> Result<TransformRun, Status> {
+    if run.dispatch_status == crate::sekai::governed_transform::TRANSFORM_RUN_REFUSED {
+        proto.refusal = service
+            .db
+            .runtime()
+            .transform_run_refusal(&run.run_id)
+            .map_err(Status::internal)?
+            .map(|refusal| TransformRunRefusal {
+                code: refusal.code,
+                details: refusal.details.into_iter().collect(),
+            });
+    }
+    if let Some((finished_at_ms, compute_ms)) = service
+        .db
+        .runtime()
+        .transform_run_finish(&run.run_id)
+        .map_err(Status::internal)?
+    {
+        proto.finished_at_ms = Some(finished_at_ms);
+        proto.compute_seconds = compute_ms.map(|ms| ms as f64 / 1000.0);
+    }
+    Ok(proto)
+}
+
 fn to_proto_transform_run(
     run: &crate::sekai::governed_transform::TransformRun,
     reveal_partition_keys: bool,
@@ -3890,6 +4211,10 @@ fn to_proto_transform_run(
             .iter()
             .map(|partition| to_proto_partition(partition, reveal_partition_keys))
             .collect(),
+        refusal: None,
+        finished_at_ms: None,
+        compute_seconds: None,
+        input_versions: run.input_versions.clone().into_iter().collect(),
     }
 }
 
@@ -3913,6 +4238,11 @@ pub(super) async fn tick_governed_transforms(
     let quota = service.quota_runtime();
     let mut runs = runtime
         .tick_governed_transforms(now_ms)
+        .map_err(Status::internal)?;
+    let export_service = service.clone();
+    tokio::task::spawn_blocking(move || export_service.tick_export_schedules(now_ms))
+        .await
+        .map_err(|_| Status::internal("export schedule tick failed"))?
         .map_err(Status::internal)?;
     let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
     for (run_id, _, _, generation) in runtime
@@ -3996,9 +4326,9 @@ pub(super) async fn tick_governed_transforms(
         .iter()
         .map(|run| {
             let reveal = caller_can_read_run_datasets(service, &principals, run);
-            to_proto_transform_run(run, reveal)
+            with_run_outcome(service, run, to_proto_transform_run(run, reveal))
         })
-        .collect();
+        .collect::<Result<_, Status>>()?;
     Ok(Response::new(TickGovernedTransformsResponse { runs }))
 }
 
@@ -4070,10 +4400,14 @@ pub(super) async fn cancel_governed_transform_run(
         false,
     )?;
     Ok(Response::new(CancelGovernedTransformRunResponse {
-        run: Some(to_proto_transform_run(
+        run: Some(with_run_outcome(
+            service,
             &run,
-            caller_can_read_run_datasets(service, &principals, &run),
-        )),
+            to_proto_transform_run(
+                &run,
+                caller_can_read_run_datasets(service, &principals, &run),
+            ),
+        )?),
     }))
 }
 
@@ -4384,4 +4718,1061 @@ pub(super) async fn delete_governed_document(
     Ok(Response::new(DeleteGovernedDocumentResponse {
         document: Some(to_proto_document(&document)),
     }))
+}
+
+// Dataset branches (ADR 0119). The tenant always comes from the caller's
+// authenticated context; another tenant's branch reads as missing.
+
+pub(super) fn branch_status(error: String) -> Status {
+    use crate::sekai::dataset_branch as branch;
+    match error.as_str() {
+        branch::BRANCH_NOT_FOUND | branch::PROPOSAL_NOT_FOUND => Status::not_found(error),
+        branch::BRANCH_EXISTS => Status::already_exists(error),
+        branch::BRANCH_NAME_INVALID => Status::invalid_argument(error),
+        branch::PROPOSAL_SELF_MERGE => Status::permission_denied(error),
+        branch::PROPOSAL_NOT_OPEN
+        | branch::PROPOSAL_STALE_PARENT
+        | branch::PROPOSAL_STALE_BRANCH
+        | branch::BRANCH_RUN_ISOLATED
+        | branch::BRANCH_RUN_RAISES_MARKING => Status::failed_precondition(error),
+        _ if error.starts_with("branch run") => Status::failed_precondition(error),
+        _ => map_dataset_version_error(error),
+    }
+}
+
+fn context_tenant(context: Option<&RequestEnterpriseContext>) -> String {
+    context
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.clone())
+        .unwrap_or_default()
+}
+
+/// The caller, its tenant, and the dataset after the read or write check.
+pub(super) fn branch_caller<T: 'static>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    dataset_id: &str,
+    write: bool,
+) -> Result<(String, String), Status> {
+    let principals = caller_principals(req);
+    require_authenticated(&principals)?;
+    let context = request_tenant_context(service.db.runtime(), req)?;
+    let tenant = context_tenant(context.as_ref());
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    // The bound object's namespace must be one the authenticated context
+    // may read or write, whatever ACL grants the caller also holds.
+    if let Some(context) = context.as_ref()
+        && !dataset.object_id.is_empty()
+        && let Some(object) = service
+            .db
+            .runtime()
+            .get_object(&dataset.object_id)
+            .map_err(Status::internal)?
+    {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &object.namespace,
+            write,
+        )?;
+    }
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        write,
+    )?;
+    let actor = principals
+        .first()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    Ok((actor, tenant))
+}
+
+fn to_proto_branch(branch: crate::sekai::dataset_branch::DatasetBranch) -> DatasetBranch {
+    DatasetBranch {
+        dataset_id: branch.dataset_id,
+        name: branch.name,
+        base_version_id: branch.base_version_id,
+        written: branch.written,
+        created_by: branch.created_by,
+        created_at_ms: branch.created_at_ms,
+    }
+}
+
+fn to_proto_proposal(
+    proposal: crate::sekai::dataset_branch::DatasetBranchProposal,
+) -> DatasetBranchProposal {
+    DatasetBranchProposal {
+        id: proposal.id,
+        dataset_id: proposal.dataset_id,
+        branch: proposal.branch,
+        parent_version_id: proposal.parent_version_id,
+        branch_digest: proposal.branch_digest,
+        proposer: proposal.proposer,
+        status: proposal.status,
+        merged_by: proposal.merged_by,
+        merged_version_id: proposal.merged_version_id,
+        receipt_id: proposal.receipt_id,
+        created_at_ms: proposal.created_at_ms,
+        merged_at_ms: proposal.merged_at_ms,
+    }
+}
+
+use crate::sekai::dataset_branch::BUNDLE_BRANCH_PREFIX;
+
+fn refuse_reserved_branch_name(name: &str) -> Result<(), Status> {
+    if name.starts_with(BUNDLE_BRANCH_PREFIX) {
+        return Err(Status::invalid_argument(format!(
+            "dataset branch names starting with {BUNDLE_BRANCH_PREFIX} are reserved for change bundle dry runs"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) async fn create_dataset_branch(
+    service: &SekaiServiceImpl,
+    req: Request<CreateDatasetBranchRequest>,
+) -> Result<Response<CreateDatasetBranchResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    refuse_reserved_branch_name(&req.get_ref().name)?;
+    let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
+    let inner = req.into_inner();
+    let branch = service
+        .db
+        .runtime()
+        .create_dataset_branch(&crate::sekai::dataset_branch::CreateDatasetBranch {
+            dataset_id,
+            name: inner.name,
+            from_version_id: inner.from_version_id,
+            actor,
+            tenant,
+        })
+        .map_err(branch_status)?;
+    Ok(Response::new(CreateDatasetBranchResponse {
+        branch: Some(to_proto_branch(branch)),
+    }))
+}
+
+pub(super) async fn list_dataset_branches(
+    service: &SekaiServiceImpl,
+    req: Request<ListDatasetBranchesRequest>,
+) -> Result<Response<ListDatasetBranchesResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (_, tenant) = branch_caller(service, &req, &dataset_id, false)?;
+    let branches = service
+        .db
+        .runtime()
+        .list_dataset_branches(&dataset_id)
+        .map_err(branch_status)?
+        .into_iter()
+        .filter(|branch| branch.tenant == tenant)
+        .map(to_proto_branch)
+        .collect();
+    Ok(Response::new(ListDatasetBranchesResponse { branches }))
+}
+
+pub(super) async fn delete_dataset_branch(
+    service: &SekaiServiceImpl,
+    req: Request<DeleteDatasetBranchRequest>,
+) -> Result<Response<DeleteDatasetBranchResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (_, tenant) = branch_caller(service, &req, &dataset_id, true)?;
+    let name = req.into_inner().name;
+    service
+        .db
+        .runtime()
+        .delete_dataset_branch(&dataset_id, &name, &tenant)
+        .map_err(branch_status)?;
+    Ok(Response::new(DeleteDatasetBranchResponse {}))
+}
+
+pub(super) async fn compare_dataset_branch(
+    service: &SekaiServiceImpl,
+    req: Request<CompareDatasetBranchRequest>,
+) -> Result<Response<CompareDatasetBranchResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (_, tenant) = branch_caller(service, &req, &dataset_id, false)?;
+    let name = req.into_inner().name;
+    let diff = service
+        .db
+        .runtime()
+        .compare_dataset_branch(&dataset_id, &name, &tenant)
+        .map_err(branch_status)?;
+    Ok(Response::new(CompareDatasetBranchResponse {
+        columns_added: diff.columns_added,
+        columns_removed: diff.columns_removed,
+        parent_rows: diff.parent_rows,
+        branch_rows: diff.branch_rows,
+        parent_digest: diff.parent_digest,
+        branch_digest: diff.branch_digest,
+    }))
+}
+
+pub(super) async fn propose_dataset_branch_merge(
+    service: &SekaiServiceImpl,
+    req: Request<ProposeDatasetBranchMergeRequest>,
+) -> Result<Response<ProposeDatasetBranchMergeResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    // A dry-run branch is a preview: applying a bundle is a later, governed
+    // step, and its copied fields carry no classification to merge under.
+    if req.get_ref().name.starts_with(BUNDLE_BRANCH_PREFIX) {
+        return Err(Status::failed_precondition(
+            "definition change bundle dry-run branches are not merged",
+        ));
+    }
+    let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
+    let proposal = service
+        .db
+        .runtime()
+        .propose_dataset_branch(&crate::sekai::dataset_branch::ProposeDatasetBranch {
+            expected_incarnation: None,
+            dataset_id,
+            branch: req.into_inner().name,
+            actor,
+            tenant,
+        })
+        .map_err(branch_status)?;
+    Ok(Response::new(ProposeDatasetBranchMergeResponse {
+        proposal: Some(to_proto_proposal(proposal)),
+    }))
+}
+
+pub(super) async fn merge_dataset_branch(
+    service: &SekaiServiceImpl,
+    req: Request<MergeDatasetBranchRequest>,
+) -> Result<Response<MergeDatasetBranchResponse>, Status> {
+    let dataset_id = req.get_ref().dataset_id.clone();
+    let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
+    let inner = req.into_inner();
+    // A bundle branch merges only through its approved definition proposal,
+    // which checks the bundle's column rules at the merge.
+    if let Ok(proposal) = service
+        .db
+        .runtime()
+        .get_dataset_branch_proposal(&dataset_id, &inner.proposal_id)
+        && proposal.branch.starts_with(BUNDLE_BRANCH_PREFIX)
+    {
+        return Err(Status::failed_precondition(
+            "definition change bundle branches merge only through ApplyDefinitionChangeBundle",
+        ));
+    }
+    let proposal = service
+        .db
+        .runtime()
+        .merge_dataset_branch(&crate::sekai::dataset_branch::MergeDatasetBranch {
+            dataset_id,
+            proposal_id: inner.proposal_id,
+            actor,
+            tenant,
+            reason: inner.reason,
+        })
+        .map_err(branch_status)?;
+    Ok(Response::new(MergeDatasetBranchResponse {
+        proposal: Some(to_proto_proposal(proposal)),
+    }))
+}
+
+/// Admitted like a parent run (credential admin, namespace tenant, transform
+/// quota gate). A successful run keeps its request charge; a branch run
+/// leaves no run receipt, so no usage row is recorded.
+pub(super) async fn run_governed_transform_on_branch(
+    service: &SekaiServiceImpl,
+    req: Request<RunGovernedTransformOnBranchRequest>,
+) -> Result<Response<RunGovernedTransformOnBranchResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let actor = principals.first().cloned().unwrap_or_default();
+    let input = req.into_inner();
+    refuse_reserved_branch_name(&input.branch)?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &input.namespace,
+            true,
+        )?;
+    }
+    // Charge the caller's tenant, or for a tenantless operator the stored
+    // quota owner, as a parent run does. Branch ownership stays with the
+    // caller's tenant.
+    let owner_ctx = if tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .is_some()
+    {
+        tenant_context.clone()
+    } else {
+        match service
+            .db
+            .runtime()
+            .transform_quota_owner(&input.namespace, &input.transform_id)
+            .map_err(Status::internal)?
+        {
+            Some(tenant_id) => Some(crate::provider_credentials::tenant_context(
+                &tenant_id, "local",
+            )),
+            None => tenant_context.clone(),
+        }
+    };
+    let quota = service.quota_runtime();
+    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let admission_id = format!(
+        "transform-branch-run:{}:{}:{}:{}",
+        input.namespace,
+        input.transform_id,
+        input.branch,
+        now_millis()
+    );
+    let held = admit_tenant_transform(
+        quota.as_ref(),
+        &gate,
+        owner_ctx.as_ref(),
+        &admission_id,
+        false,
+    )?;
+    let result = service.db.runtime().run_governed_transform_on_branch(
+        &input.namespace,
+        &input.transform_id,
+        &input.branch,
+        &actor,
+        &context_tenant(tenant_context.as_ref()),
+        now_millis(),
+    );
+    // A run that wrote its branch keeps its request charge; a failed one is
+    // refunded.
+    let run = match result {
+        Ok(run) => {
+            release_tenant_transform(service.db.runtime(), &gate, &admission_id, held.as_ref())?;
+            run
+        }
+        Err(error) => {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            return Err(branch_status(error));
+        }
+    };
+    Ok(Response::new(RunGovernedTransformOnBranchResponse {
+        output_dataset_id: run.output_dataset_id,
+        rows_written: run.rows_written,
+        branch_inputs: run.branch_inputs,
+        markings_out: run.markings_out,
+    }))
+}
+
+/// What a replay or shadow was admitted with.
+struct ReplayAdmission {
+    stored: crate::sekai::governed_transform::GovernedTransform,
+    actor: String,
+    tenant: String,
+    owner_ctx: Option<crate::enterprise::AuthenticatedContext>,
+}
+
+/// Admit a replay of `namespace`/`transform_id`, as stored or as
+/// `definition_json`, like a branch run (credential admin, namespace
+/// tenant); the caller must read every input, the stored and candidate
+/// alike, and write the output, where the replay branch is created. The
+/// owner context is whom the transform quota gate charges.
+fn admit_replay<T: 'static>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    namespace: &str,
+    transform_id: &str,
+    definition_json: &str,
+) -> Result<ReplayAdmission, Status> {
+    let principals = caller_principals(req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), req)?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(service.db.runtime(), Some(context), namespace, true)?;
+    }
+    let stored = service
+        .db
+        .runtime()
+        .get_governed_transform(namespace, transform_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("governed transform not found"))?;
+    let transform = crate::db::transform_replay::candidate_or_stored(&stored, definition_json)
+        .map_err(Status::invalid_argument)?;
+    let mut readable: Vec<String> = stored
+        .input_bindings()
+        .into_iter()
+        .chain(transform.input_bindings())
+        .map(|(_, dataset_id)| dataset_id)
+        .collect();
+    readable.sort();
+    readable.dedup();
+    for dataset_id in &readable {
+        branch_caller(service, req, dataset_id, false)?;
+    }
+    let (actor, tenant) = branch_caller(service, req, &transform.output_dataset_id, true)?;
+    // The run, its branch and the diff samples carry whole rows, including
+    // fields of older versions; property read grants are not applied to
+    // them, so any dataset under enforced grants is refused.
+    for dataset_id in readable.iter().chain([&transform.output_dataset_id]) {
+        let dataset = service
+            .db
+            .runtime()
+            .get_dataset(dataset_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("dataset not found"))?;
+        if preview_column_allowlist(service, &dataset)?.is_some() {
+            return Err(Status::failed_precondition(
+                crate::sekai::transform_replay::REPLAY_PROPERTY_RESTRICTED,
+            ));
+        }
+    }
+    let owner_ctx = if tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .is_some()
+    {
+        tenant_context.clone()
+    } else {
+        match service
+            .db
+            .runtime()
+            .transform_quota_owner(namespace, transform_id)
+            .map_err(Status::internal)?
+        {
+            Some(tenant_id) => Some(crate::provider_credentials::tenant_context(
+                &tenant_id, "local",
+            )),
+            None => tenant_context.clone(),
+        }
+    };
+    Ok(ReplayAdmission {
+        stored,
+        actor,
+        tenant,
+        owner_ctx,
+    })
+}
+
+/// Run `work` under one transform quota admission for `owner_ctx`: kept on
+/// success, given back on failure.
+fn with_transform_quota<R>(
+    service: &SekaiServiceImpl,
+    owner_ctx: Option<&crate::enterprise::AuthenticatedContext>,
+    admission_id: String,
+    work: impl FnOnce() -> Result<R, String>,
+) -> Result<R, Status> {
+    let quota = service.quota_runtime();
+    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let held = admit_tenant_transform(quota.as_ref(), &gate, owner_ctx, &admission_id, false)?;
+    match work() {
+        Ok(result) => {
+            release_tenant_transform(service.db.runtime(), &gate, &admission_id, held.as_ref())?;
+            Ok(result)
+        }
+        Err(error) => {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            Err(branch_status(error))
+        }
+    }
+}
+
+/// Replay a transform over pinned input versions (#1585), admitted as
+/// [`admit_replay`] says.
+pub(super) async fn replay_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<ReplayGovernedTransformRequest>,
+) -> Result<Response<ReplayGovernedTransformResponse>, Status> {
+    let input = req.get_ref().clone();
+    let admission = admit_replay(
+        service,
+        &req,
+        &input.namespace,
+        &input.transform_id,
+        &input.definition_json,
+    )?;
+    let admission_id = format!(
+        "transform-replay:{}:{}:{}",
+        input.namespace,
+        input.transform_id,
+        uuid::Uuid::new_v4()
+    );
+    let replay = with_transform_quota(service, admission.owner_ctx.as_ref(), admission_id, || {
+        service.db.runtime().replay_governed_transform(
+            &crate::sekai::transform_replay::ReplayTransform {
+                namespace: input.namespace,
+                transform_id: input.transform_id,
+                input_versions: input.input_versions.into_iter().collect(),
+                as_of_ms: input.as_of_ms,
+                definition_json: input.definition_json,
+                baseline_version_id: input.baseline_version_id,
+                key_column: input.key_column,
+                // The definition whose inputs and output were checked.
+                expected_definition_digest: admission.stored.definition_digest.clone(),
+                actor: admission.actor,
+                tenant: admission.tenant,
+            },
+            now_millis(),
+        )
+    })?;
+    Ok(Response::new(ReplayGovernedTransformResponse {
+        replay: Some(to_proto_replay(replay)),
+    }))
+}
+
+/// Shadow a candidate revision against the active one (#1795): admitted as
+/// a replay of the candidate, under one transform quota admission for all
+/// the runs it replays.
+pub(super) async fn shadow_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<ShadowGovernedTransformRequest>,
+) -> Result<Response<ShadowGovernedTransformResponse>, Status> {
+    let input = req.get_ref().clone();
+    if input.definition_json.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            crate::sekai::transform_shadow::SHADOW_NEEDS_CANDIDATE,
+        ));
+    }
+    let admission = admit_replay(
+        service,
+        &req,
+        &input.namespace,
+        &input.transform_id,
+        &input.definition_json,
+    )?;
+    let admission_id = format!(
+        "transform-shadow:{}:{}:{}",
+        input.namespace,
+        input.transform_id,
+        uuid::Uuid::new_v4()
+    );
+    let report = with_transform_quota(service, admission.owner_ctx.as_ref(), admission_id, || {
+        service.db.runtime().shadow_governed_transform(
+            &crate::sekai::transform_shadow::ShadowTransform {
+                namespace: input.namespace,
+                transform_id: input.transform_id,
+                definition_json: input.definition_json,
+                run_ids: input.run_ids,
+                limit: input.limit as usize,
+                key_column: input.key_column,
+                expected_definition_digest: admission.stored.definition_digest.clone(),
+                require_for_promotion: input.require_for_promotion,
+                actor: admission.actor,
+                tenant: admission.tenant,
+            },
+            now_millis(),
+        )
+    })?;
+    Ok(Response::new(ShadowGovernedTransformResponse {
+        report: Some(to_proto_shadow_report(report)),
+    }))
+}
+
+fn to_proto_shadow_report(
+    report: crate::sekai::transform_shadow::TransformShadowReport,
+) -> TransformShadowReport {
+    TransformShadowReport {
+        namespace: report.namespace,
+        transform_id: report.transform_id,
+        active_definition_digest: report.active_definition_digest,
+        candidate_definition_digest: report.candidate_definition_digest,
+        runs: report
+            .runs
+            .into_iter()
+            .map(|run| ShadowRunComparison {
+                run_id: run.run_id,
+                replay_id: run.replay_id,
+                branch: run.branch,
+                baseline_version_id: run.baseline_version_id,
+                skipped: run.skipped,
+                rows_compared: run.rows_compared,
+                rows_matched: run.rows_matched,
+                rows_added: run.rows_added,
+                rows_removed: run.rows_removed,
+                rows_changed: run.rows_changed,
+                changed_keys: run.changed_keys,
+                active_compute_ms: run.active_compute_ms,
+                active_latency_ms: run.active_latency_ms,
+                shadow_ms: run.shadow_ms,
+            })
+            .collect(),
+        runs_compared: report.runs_compared,
+        rows_compared: report.rows_compared,
+        rows_matched: report.rows_matched,
+        rows_added: report.rows_added,
+        rows_removed: report.rows_removed,
+        rows_changed: report.rows_changed,
+        match_rate: report.match_rate,
+        samples: report
+            .samples
+            .into_iter()
+            .map(|sample| ShadowRowSample {
+                run_id: sample.run_id,
+                change: Some(to_proto_row_change(sample.change)),
+            })
+            .collect(),
+        active_compute_ms: report.active_compute_ms,
+        shadow_compute_ms: report.shadow_compute_ms,
+        active_latency_ms: report.active_latency_ms,
+        shadow_latency_ms: report.shadow_latency_ms,
+        id: report.id,
+        candidate_member_digest: report.candidate_member_digest,
+        passing: report.passing,
+    }
+}
+
+fn to_proto_row_change(change: crate::sekai::transform_replay::ReplayRowChange) -> ReplayRowChange {
+    ReplayRowChange {
+        key: change.key,
+        before: change.before.into_iter().collect(),
+        after: change.after.into_iter().collect(),
+    }
+}
+
+/// A replay record, for a caller of its tenant who may read its output and
+/// every input; another tenant's reads as missing.
+pub(super) async fn get_transform_replay(
+    service: &SekaiServiceImpl,
+    req: Request<GetTransformReplayRequest>,
+) -> Result<Response<GetTransformReplayResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let missing = || Status::not_found(crate::sekai::transform_replay::REPLAY_NOT_FOUND);
+    let replay = service
+        .db
+        .runtime()
+        .get_transform_replay(&req.get_ref().id)
+        .map_err(Status::internal)?
+        .ok_or_else(missing)?;
+    let (_, tenant) = branch_caller(service, &req, &replay.output_dataset_id, false)?;
+    if tenant != replay.tenant {
+        return Err(missing());
+    }
+    for input in &replay.inputs {
+        branch_caller(service, &req, &input.dataset_id, false)?;
+    }
+    Ok(Response::new(GetTransformReplayResponse {
+        replay: Some(to_proto_replay(replay)),
+    }))
+}
+
+fn to_proto_replay(replay: crate::sekai::transform_replay::TransformReplay) -> TransformReplay {
+    let reproduced = replay.diff.reproduced();
+    let diff = replay.diff;
+    TransformReplay {
+        id: replay.id,
+        namespace: replay.namespace,
+        transform_id: replay.transform_id,
+        output_dataset_id: replay.output_dataset_id,
+        branch: replay.branch,
+        inputs: replay
+            .inputs
+            .into_iter()
+            .map(|input| ReplayInput {
+                alias: input.alias,
+                dataset_id: input.dataset_id,
+                version_id: input.version_id,
+                rows: input.rows,
+                digest: input.digest,
+                columns: input.columns,
+            })
+            .collect(),
+        definition_digest: replay.definition_digest,
+        candidate: replay.candidate,
+        engine_version: replay.engine_version,
+        as_of_ms: replay.as_of_ms,
+        baseline_version_id: replay.baseline_version_id,
+        non_deterministic: replay.non_deterministic,
+        markings_out: replay.markings_out,
+        output_digest: replay.output_digest,
+        diff: Some(ReplayDiff {
+            key_column: diff.key_column,
+            columns_added: diff.columns_added,
+            columns_removed: diff.columns_removed,
+            baseline_rows: diff.baseline_rows,
+            replay_rows: diff.replay_rows,
+            baseline_digest: diff.baseline_digest,
+            replay_digest: diff.replay_digest,
+            rows_added: diff.rows_added,
+            rows_removed: diff.rows_removed,
+            rows_changed: diff.rows_changed,
+            changed_keys: diff.changed_keys,
+            samples: diff.samples.into_iter().map(to_proto_row_change).collect(),
+            reproduced,
+        }),
+        downstream: replay
+            .downstream
+            .into_iter()
+            .map(|impact| ReplayDownstream {
+                dataset_id: impact.dataset_id,
+                via_transform: impact.via_transform,
+                object_types: impact.object_types,
+            })
+            .collect(),
+        actor: replay.actor,
+        created_at_ms: replay.created_at_ms,
+    }
+}
+
+/// Dry run of a definition change bundle's backfill (#1692, ADR 0125): per
+/// object type with a backfill and a backing dataset, the backfill runs on a
+/// branch named for the bundle digest, forked from the dataset's latest
+/// version, never on the dataset itself. The branch rows are a pure function
+/// of the bundle and the fork, so a rerun, a retry after a crash, or a
+/// concurrent call converges on the same rows.
+pub(super) async fn dry_run_definition_change_bundle(
+    service: &SekaiServiceImpl,
+    req: Request<DryRunDefinitionChangeBundleRequest>,
+) -> Result<Response<DryRunDefinitionChangeBundleResponse>, Status> {
+    use crate::sekai::definition_change_bundle::generate_change_bundle;
+    const MAX_SAMPLES: usize = 5;
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let purpose = request_purpose_presentation(&req, &principals);
+    let input = req.get_ref().clone();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    let (from, from_members, to, to_members) = load_authorized_definition_revisions(
+        service,
+        &principals,
+        &input.namespace,
+        &input.from_revision_digest,
+        &input.to_revision_digest,
+    )?;
+    let bundle = generate_change_bundle(
+        &from,
+        &from_members,
+        &to,
+        &to_members,
+        &super::definition_change_bundle_rpc::hints_from_proto(input.hints.clone()),
+    )
+    .map_err(Status::invalid_argument)?;
+    if !input.bundle_digest.is_empty() && input.bundle_digest != bundle.bundle_digest {
+        return Err(Status::failed_precondition(
+            "definition_change_bundle_changed: the regenerated bundle has another digest",
+        ));
+    }
+    let branch_name = bundle_branch_name(&bundle.bundle_digest);
+    let (backings, unbacked, _) = bundle_backings(service, &input.namespace, &bundle)?;
+    let mut runs = Vec::new();
+    for (object_type, source) in &backings {
+        let dataset_id = source.dataset_id.as_str();
+        let dataset = service
+            .db
+            .runtime()
+            .get_dataset(dataset_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("dataset not found"))?;
+        let (base, expected) = fill_bundle_branch(
+            service,
+            &req,
+            &bundle,
+            object_type,
+            source,
+            &branch_name,
+            &std::collections::BTreeSet::new(),
+        )?;
+        let changed = base
+            .iter()
+            .zip(&expected)
+            .filter(|(before, after)| before != after)
+            .collect::<Vec<_>>();
+        // The rows are governed by the dataset's bound object: samples only
+        // for a caller who may read it under the full object read policy
+        // (namespace, ACL, marking, active security policy with the
+        // request's purpose).
+        let readable = match dataset.object_id.as_str() {
+            "" => true,
+            object_id => service
+                .db
+                .runtime()
+                .get_object(object_id)
+                .map_err(Status::internal)?
+                .is_some_and(|object| {
+                    object_is_visible_for_purpose(
+                        service.db.runtime(),
+                        &service.security,
+                        &object,
+                        &principals,
+                        tenant_context.as_ref(),
+                        crate::sekai::object_security::ObjectSecurityOperation::Read,
+                        purpose.as_ref(),
+                    )
+                }),
+        };
+        runs.push(DefinitionBackfillDryRun {
+            object_type: object_type.clone(),
+            dataset_id: dataset_id.into(),
+            branch: branch_name.clone(),
+            rows: expected.len() as i64,
+            rows_changed: changed.len() as i64,
+            samples: if readable {
+                changed
+                    .iter()
+                    .take(MAX_SAMPLES)
+                    .map(|(before, after)| DefinitionBackfillSample {
+                        key: before.get(&source.key_column).cloned().unwrap_or_default(),
+                        before: (*before).clone().into_iter().collect(),
+                        after: (*after).clone().into_iter().collect(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            samples_withheld: !readable,
+        });
+    }
+    Ok(Response::new(DryRunDefinitionChangeBundleResponse {
+        bundle_digest: bundle.bundle_digest,
+        runs,
+        unbacked_object_types: unbacked,
+    }))
+}
+
+/// The reserved dataset branch a bundle's backfill is written to.
+pub(super) fn bundle_branch_name(bundle_digest: &str) -> String {
+    let digest_hex = bundle_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(bundle_digest);
+    format!(
+        "{BUNDLE_BRANCH_PREFIX}{}",
+        &digest_hex[..digest_hex.len().min(24)]
+    )
+}
+
+/// Backed object types with their datasources, the unbacked ones, and every
+/// backfilled object type's datasource as read (none when unregistered): one
+/// snapshot, so a plan and its fingerprints never come from two reads.
+pub(super) type BundleBackings = (
+    Vec<(
+        String,
+        crate::sekai::object_type_index::ObjectTypeDatasource,
+    )>,
+    Vec<String>,
+    std::collections::BTreeMap<
+        String,
+        Option<crate::sekai::object_type_index::ObjectTypeDatasource>,
+    >,
+);
+
+/// The object types a bundle backfills with the datasource backing each,
+/// and those with no dataset to run on (none registered, or edits-only). A
+/// dataset backing any other object type, in any namespace, is refused: one
+/// branch holds one object type's backfill, and a rename could drop a column
+/// another binding reads.
+pub(super) fn bundle_backings(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    bundle: &crate::sekai::definition_change_bundle::DefinitionChangeBundle,
+) -> Result<BundleBackings, Status> {
+    let object_types = bundle
+        .backfill
+        .iter()
+        .map(|assignment| assignment.object_type.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut backings = Vec::new();
+    let mut unbacked = Vec::new();
+    let mut snapshot = std::collections::BTreeMap::new();
+    for object_type in object_types {
+        let registered = service
+            .db
+            .runtime()
+            .get_object_type_datasource(namespace, &object_type)
+            .map_err(Status::internal)?;
+        snapshot.insert(object_type.clone(), registered.clone());
+        let source =
+            registered.filter(|source| !source.edits_only && !source.dataset_id.is_empty());
+        let Some(source) = source else {
+            unbacked.push(object_type);
+            continue;
+        };
+        let bindings = service
+            .db
+            .runtime()
+            .dataset_bindings(&source.dataset_id)
+            .map_err(Status::internal)?;
+        if bindings
+            .iter()
+            .any(|(bound_namespace, kind)| bound_namespace != namespace || kind != &object_type)
+        {
+            return Err(Status::failed_precondition(
+                "definition_change_bundle_shared_dataset: another object type is backed by the same dataset",
+            ));
+        }
+        backings.push((object_type, source));
+    }
+    Ok((backings, unbacked, snapshot))
+}
+
+/// Fill a bundle's branch of one backing dataset (#1692): create it from the
+/// dataset's latest version if missing, then write the backfill once. Returns
+/// the base rows and the branch rows. The base read, backfill and write share
+/// one storage transaction fenced on the branch incarnation and serialized
+/// with redaction; a branch already written is returned as it stands.
+pub(super) fn fill_bundle_branch<T: 'static>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    bundle: &crate::sekai::definition_change_bundle::DefinitionChangeBundle,
+    object_type: &str,
+    source: &crate::sekai::object_type_index::ObjectTypeDatasource,
+    branch_name: &str,
+    owned: &std::collections::BTreeSet<String>,
+) -> Result<
+    (
+        crate::sekai::dataset_branch::BranchRows,
+        crate::sekai::dataset_branch::BranchRows,
+    ),
+    Status,
+> {
+    use crate::sekai::definition_change_bundle::apply_backfill;
+    let dataset_id = source.dataset_id.as_str();
+    let (actor, tenant) = branch_caller(service, req, dataset_id, true)?;
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("dataset not found"))?;
+    // Rows are written and sampled whole; property read grants are not
+    // applied to them, so a dataset under enforced grants is refused, as for
+    // replays.
+    if preview_column_allowlist(service, &dataset)?.is_some() {
+        return Err(Status::failed_precondition(
+            crate::sekai::transform_replay::REPLAY_PROPERTY_RESTRICTED,
+        ));
+    }
+    let find = || {
+        service
+            .db
+            .runtime()
+            .list_dataset_branches(dataset_id)
+            .map(|branches| {
+                branches
+                    .into_iter()
+                    .find(|branch| branch.name == branch_name && branch.tenant == tenant)
+            })
+            .map_err(branch_status)
+    };
+    let branch = match find()? {
+        Some(branch) => branch,
+        None => match service.db.runtime().create_dataset_branch(
+            &crate::sekai::dataset_branch::CreateDatasetBranch {
+                dataset_id: dataset_id.into(),
+                name: branch_name.into(),
+                from_version_id: String::new(),
+                actor: actor.clone(),
+                tenant: tenant.clone(),
+            },
+        ) {
+            Ok(branch) => branch,
+            Err(error) if error == crate::sekai::dataset_branch::BRANCH_EXISTS => find()?
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "the bundle's branch name is held by another tenant",
+                    )
+                })?,
+            Err(error) => return Err(branch_status(error)),
+        },
+    };
+    let column = |property: &str| {
+        source
+            .property_mapping
+            .get(property)
+            .cloned()
+            .unwrap_or_else(|| property.to_string())
+    };
+    service
+        .db
+        .runtime()
+        .fill_dataset_branch_from_base(
+            dataset_id,
+            branch_name,
+            &branch.incarnation,
+            &|columns, base| {
+                // Checked against the column definitions read in the fill's
+                // transaction, so a concurrent reclassification cannot slip in
+                // between.
+                check_backfill_columns(
+                    bundle,
+                    object_type,
+                    columns,
+                    &source.key_column,
+                    column,
+                    owned,
+                )?;
+                Ok(apply_backfill(bundle, object_type, base, column))
+            },
+        )
+        .map_err(|error| {
+            if error == crate::sekai::dataset_branch::BRANCH_CHANGED {
+                Status::aborted(error)
+            } else if error.starts_with("definition_change_bundle_") {
+                Status::failed_precondition(error)
+            } else {
+                branch_status(error)
+            }
+        })
+}
+
+/// Checks a backfill against the dataset's column definitions as stored in
+/// the fill's transaction (#1692). It only writes columns the dataset does
+/// not define (so never the key), or that an apply of this bundle defined
+/// itself (`owned`, #1693): a changed identifier or field, even an
+/// empty one filled in, would let filtered redaction or erasure miss the
+/// row. It copies only from columns classified public: redaction finds
+/// values by column definition, and a copy under a new name would escape it.
+pub(super) fn check_backfill_columns(
+    bundle: &crate::sekai::definition_change_bundle::DefinitionChangeBundle,
+    object_type: &str,
+    columns: &[crate::sekai::dataset::ColumnDef],
+    key_column: &str,
+    column: impl Fn(&str) -> String,
+    owned: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let definition = |name: &str| columns.iter().find(|definition| definition.name == name);
+    for assignment in bundle
+        .backfill
+        .iter()
+        .filter(|a| a.object_type == object_type)
+    {
+        let target = column(&assignment.property);
+        // A column this bundle defined may be filled again only while it is
+        // still classified as the bundle defined it: a reclassified (perhaps
+        // redacted) column is never overwritten by a refill.
+        let refillable = |name: &str| {
+            owned.contains(name)
+                && definition(name).is_some_and(|defined| {
+                    matches!(
+                        defined.classification.trim().to_ascii_lowercase().as_str(),
+                        "" | "public"
+                    )
+                })
+        };
+        if target == key_column || (definition(&target).is_some() && !refillable(&target)) {
+            return Err(format!(
+                "definition_change_bundle_overwrites_column: {target} already holds data"
+            ));
+        }
+        if assignment.mode == "copy" {
+            let source = column(&assignment.source);
+            let classification = definition(&source)
+                .map(|definition| definition.classification.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(classification.as_str(), "" | "public") {
+                return Err(format!(
+                    "definition_change_bundle_classified_copy: column {source} is classified {classification}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }

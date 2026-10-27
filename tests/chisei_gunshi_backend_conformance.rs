@@ -1,7 +1,7 @@
 //! Shared SQLite/PostgreSQL conformance for Gunshi allocation state (#1474).
 
+use sekai_chisei::chisei_store::{ChiseiGunshiStore, ChiseiStore};
 use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::db::store::{ChiseiGunshiStore, ChiseiStore};
 
 fn exercise(store: &ChiseiStore, prefix: &str) {
     let namespace = format!("{prefix}-sales");

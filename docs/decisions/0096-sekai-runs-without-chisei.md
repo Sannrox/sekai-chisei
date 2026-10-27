@@ -30,7 +30,7 @@ both stores.
 
 ## Decision
 
-1. **Sekai never depends on Chisei.** Code under `src/sekai` does not name
+1. **Sekai never depends on Chisei.** Code under `crates/sekai-core/src/sekai` does not name
    `crate::chisei::*`, Chisei store handles, or Chisei SQL.
 2. **Sekai owns the ports Chisei fills.** Cross-plane behavior Sekai needs
    (budget on Action admission and workflow steps, System One fill
@@ -49,12 +49,14 @@ both stores.
 5. **Shared vocabulary lives in Sekai.** The decision record and filter, the
    hash-chained decision-ledger append, `RiskClass`, `ActionPolicy`, the
    object schema, evidence and capacity vocabularies, the parameter schema
-   validator, and the duplicate-key JSON check move from `src/chisei` to
-   `src/sekai`. There is no neutral kernel.
+   validator, and the duplicate-key JSON check move from
+   `crates/chisei-core/src/chisei` to `crates/sekai-core/src/sekai`. There is
+   no neutral kernel.
 6. **Adapters live on the dependent side.** Mapping Sekai roles, grants,
    Action types, and evidence into Chisei types is Chisei or composition
-   code. `src/chisei/sekai_principal.rs` and `src/chisei/sekai_projection.rs`
-   hold the mappings. Store methods that name `RuntimeDb` live in
+   code. `crates/chisei-core/src/chisei/sekai_principal.rs` and
+   `crates/chisei-core/src/chisei/sekai_projection.rs` hold the mappings.
+   Store methods that name `RuntimeDb` live in
    `src/composition/sekai_principal.rs`.
 
 ### Disposition of current Sekai -> Chisei edges
@@ -65,7 +67,7 @@ both stores.
 | `budget::BudgetTracker` in Action admission, describe preview, and workflow steps | Sekai-owned budget port, implemented by Chisei (rule 2). |
 | `system_one_action` fill provenance and proposed parameters | Sekai-owned proposal port; System One stays a Chisei Function (rule 2, ADR 0084). |
 | `receipt`, `external_action`, `external_permit` in admission, work lifecycle, execution evidence, peer import, and workflow steps | Sekai receipts and permits stand alone; Chisei decision fields attach through a Sekai-owned extension (rule 2). |
-| `principal`, `epistemic_descriptor` in `chisei_principal.rs` and `chisei_projection.rs` | Mapping moved to `src/chisei/sekai_principal.rs` and `src/chisei/sekai_projection.rs`; store methods that name `RuntimeDb` moved to `src/composition/sekai_principal.rs` (rule 6). |
+| `principal`, `epistemic_descriptor` in `chisei_principal.rs` and `chisei_projection.rs` | Mapping moved to `crates/chisei-core/src/chisei/sekai_principal.rs` and `crates/chisei-core/src/chisei/sekai_projection.rs`; store methods that name `RuntimeDb` moved to `src/composition/sekai_principal.rs` (rule 6). |
 
 `tests/sekai_chisei_import_ratchet.rs` holds today's edges as an allowlist
 that may only shrink.
@@ -105,6 +107,6 @@ separate `chisei-plane` process is kept ([ADR 0098](0098-keep-chisei-plane-proce
 ## Validation
 
 - The ratchet allowlist reaches zero and becomes a hard rule.
-- No `src/chisei` code handles a missing Sekai.
+- No `crates/chisei-core` code handles a missing Sekai.
 - Combined and split configurations pass the existing plane tests; a Chisei
   process without `SEKAI_ENDPOINT` refuses to boot.

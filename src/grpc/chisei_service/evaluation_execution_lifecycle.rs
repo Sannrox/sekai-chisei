@@ -7,7 +7,8 @@
 //! ordering, and terminal process-state cleanup.
 
 use super::*;
-use crate::db::store::{ChiseiEvaluationStore, ChiseiReceiptStore};
+use crate::chisei_store::{ChiseiEvaluationStore, ChiseiReceiptStore};
+use crate::ext::*;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -15,7 +16,7 @@ use std::sync::{
 use tokio::sync::Mutex as AsyncMutex;
 
 pub(crate) struct EvaluationExecutionLifecycle {
-    db: crate::db::store::ChiseiStore,
+    db: crate::chisei_store::ChiseiStore,
     budget: Arc<BudgetTracker>,
     evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
     stochastic_evaluator_registry: Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
@@ -25,8 +26,24 @@ pub(crate) struct EvaluationExecutionLifecycle {
 }
 
 impl EvaluationExecutionLifecycle {
+    /// The evaluator registries and budget executions run on, for eval
+    /// dataset runs.
+    pub(crate) fn registries(
+        &self,
+    ) -> (
+        Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
+        Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
+        Arc<BudgetTracker>,
+    ) {
+        (
+            self.evaluator_registry.clone(),
+            self.stochastic_evaluator_registry.clone(),
+            self.budget.clone(),
+        )
+    }
+
     pub(super) fn new(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         budget: Arc<BudgetTracker>,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
         stochastic_evaluator_registry: Arc<
@@ -343,6 +360,16 @@ impl EvaluationExecutionLifecycle {
         })
         .await
         .map_err(|error| Status::internal(format!("evaluation worker failed: {error}")))?
+    }
+
+    /// Whether a stochastic policy may send to its provider under the
+    /// configured egress allowlist; eval dataset runs check it before any case.
+    pub(crate) fn stochastic_egress_allowed(
+        &self,
+        policy: &crate::chisei::evaluation_plan::StochasticEvaluatorPolicy,
+    ) -> bool {
+        policy.egress_policy != evaluation_plan_domain::STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL
+            || crate::chisei::privacy::provider_safe_to_send(&policy.provider, &self.safe_providers)
     }
 
     fn stochastic_egress_reasons(
@@ -749,7 +776,8 @@ mod tests {
 
     #[test]
     fn process_state_is_shared_per_manifest() {
-        let db = crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::memory()));
+        let db =
+            crate::chisei_store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::memory()));
         let lifecycle = EvaluationExecutionLifecycle::new(
             db.clone(),
             Arc::new(BudgetTracker::new(db)),

@@ -7,6 +7,7 @@
 
 mod action_approval_adr;
 mod action_binding_adr;
+mod action_binding_backend_conformance;
 mod action_governance_backend_conformance;
 mod agent_instruction_sync;
 mod autonomous_envelope_adr;
@@ -29,6 +30,7 @@ mod chisei_model_release_evidence_backend_conformance;
 mod chisei_model_review_backend_conformance;
 mod chisei_plane_process_adr;
 mod chisei_policy_backend_conformance;
+mod chisei_policy_shadow_backend_conformance;
 mod chisei_portfolio_backend_conformance;
 mod chisei_postgres_inventory_conformance;
 mod chisei_routing_profile_backend_conformance;
@@ -46,6 +48,7 @@ mod coordination_backend_conformance;
 mod data_dir_store_layout;
 mod data_quality_rule_adr;
 mod dataset_health_backend_conformance;
+mod dataset_rows_backend_conformance;
 mod decision_backend_conformance;
 mod definition_branch_backend_conformance;
 mod definition_consumer_impact_adr;
@@ -56,6 +59,7 @@ mod definition_proposal_adr;
 mod deploy_tenkai_manifest;
 mod dual_runtime_storage_adr;
 mod enterprise_identity_contract;
+mod epistemic_descriptor_proto;
 mod epistemic_federation_conformance;
 mod epistemic_interop_conformance;
 mod epistemic_metadata_conformance;
@@ -84,6 +88,7 @@ mod model_release_evidence_adr;
 mod namespace_model_review_adr;
 mod namespace_object_generation_adr;
 mod native_server_smoke;
+mod object_change_operation_backend_conformance;
 mod object_change_subscription_adr;
 mod object_log_host_adr;
 mod object_log_identity_adr;
@@ -154,6 +159,7 @@ const SEPARATE_TARGETS: &[&str] = &[
     "chisei_runtime_db_ratchet",
     "db_signals",
     "dedup_signals",
+    "deploy_kubernetes_manifest",
     "emit_git_version",
     "epistemic_replication_example",
     "evidence_adapters",
@@ -174,6 +180,7 @@ const SEPARATE_TARGETS: &[&str] = &[
 const GROUPED_MODULES: &[&str] = &[
     "action_approval_adr",
     "action_binding_adr",
+    "action_binding_backend_conformance",
     "action_governance_backend_conformance",
     "agent_instruction_sync",
     "autonomous_envelope_adr",
@@ -196,6 +203,7 @@ const GROUPED_MODULES: &[&str] = &[
     "chisei_model_review_backend_conformance",
     "chisei_plane_process_adr",
     "chisei_policy_backend_conformance",
+    "chisei_policy_shadow_backend_conformance",
     "chisei_portfolio_backend_conformance",
     "chisei_postgres_inventory_conformance",
     "chisei_routing_profile_backend_conformance",
@@ -213,6 +221,7 @@ const GROUPED_MODULES: &[&str] = &[
     "data_dir_store_layout",
     "data_quality_rule_adr",
     "dataset_health_backend_conformance",
+    "dataset_rows_backend_conformance",
     "decision_backend_conformance",
     "definition_branch_backend_conformance",
     "definition_consumer_impact_adr",
@@ -223,6 +232,7 @@ const GROUPED_MODULES: &[&str] = &[
     "deploy_tenkai_manifest",
     "dual_runtime_storage_adr",
     "enterprise_identity_contract",
+    "epistemic_descriptor_proto",
     "epistemic_federation_conformance",
     "epistemic_interop_conformance",
     "epistemic_metadata_conformance",
@@ -251,6 +261,7 @@ const GROUPED_MODULES: &[&str] = &[
     "namespace_model_review_adr",
     "namespace_object_generation_adr",
     "native_server_smoke",
+    "object_change_operation_backend_conformance",
     "object_change_subscription_adr",
     "object_log_host_adr",
     "object_log_identity_adr",
@@ -412,6 +423,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 138);
-    assert_eq!(SEPARATE_TARGETS.len(), 21);
+    assert_eq!(GROUPED_MODULES.len(), 143);
+    assert_eq!(SEPARATE_TARGETS.len(), 22);
 }

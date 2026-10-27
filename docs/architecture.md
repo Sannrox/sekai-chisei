@@ -134,8 +134,8 @@ enrichment, budgets, egress decisions, approval requirements, model/runtime
 routing, evaluation gates, outcome attribution, and learning rules.
 
 The LLM provider adapters execute calls but do not own these decisions.
-Provider-specific behavior stays behind the `sekai-provider` crate. The
-`chisei-gateway` crate depends on `sekai-proto`, `sekai-provider`, and
+Provider-specific behavior stays behind the `chisei-provider` crate. The
+`chisei-gateway` crate depends on `sekai-proto`, `chisei-provider`, and
 `sekai-admin-client` among workspace packages; governed decisions and durable
 mutations cross the gRPC contract instead of reaching into control-plane
 implementation modules.
@@ -295,15 +295,16 @@ OIDC/OAuth behavior, and enterprise composition are not part of the community
 runtime.
 
 The current injection seam admits enterprise credentials only to the
-namespace-aware object, link, lease, traversal, and object-change RPCs that
-invoke the authorization hook. Other Sekai and all Chisei RPCs fail closed for
+namespace-aware object, link, lease, traversal, object-change, and offline
+sync (#1836) RPCs that invoke the authorization hook. Other Sekai and all Chisei RPCs fail closed for
 enterprise-scoped credentials. Action execution and approval resumption also
 remain unavailable until an enterprise composition can persist and re-derive
 the authenticated approval identity.
 
-SQLite startup detects populated legacy tenant tables or tenant-bound
-credentials before normal migrations. It fails without changing them and
-directs the operator to [Migrating legacy SQLite tenant state](tenant-migration.md).
+SQLite and PostgreSQL startup detect populated legacy tenant tables or
+tenant-bound credentials before normal migrations. They fail without changing
+them and direct the operator to [Migrating legacy tenant state](tenant-migration.md).
+An empty legacy PostgreSQL tenant schema is dropped by migration 120.
 
 ## Trust boundaries
 
@@ -319,7 +320,9 @@ see [ADR 0078](decisions/0078-audience-bound-assertions.md). The live
 `SEKAI_ASSERTION_ISSUER`, `SEKAI_ASSERTION_AUDIENCE`, and
 `SEKAI_ASSERTION_HMAC_KEY` are set together. Partial config is refused.
 No authority configured stays community behavior. Caller-selected tenant
-headers fail closed.
+headers fail closed. An assertion may bind a device with an optional
+`device` claim; protected RPCs then require the device's per-request proof
+(`x-sekai-device-proof`, [ADR 0126](decisions/0126-device-bound-assertions.md)).
 
 - Namespace and object access control apply when data is read or mutated.
 - Gateway virtual keys and control-plane credentials identify principals; raw
@@ -346,13 +349,11 @@ version, validity window, nonce, and online-redemption mode. Hosts must verify
 the configured issuer and key, every binding, their advertised enforcement
 capabilities, and current resource preconditions immediately before execution.
 
-Online redemption consumes an invocation in the same SQLite transaction that
-records its audit decision. Community PostgreSQL fails closed on
-`redeem_permit` / `redeem_or_reconcile_permit` until dual-backend redeem
-parity lands; hosts that need online redeem should use SQLite (or an enterprise
-backend that implements redeem). Request, permit, redemption, and execution IDs
-stay distinct, and an idempotency key makes an ambiguous retry return the
-original redemption. Revocation and action/executor/harness/namespace/signing-key
+Online redemption consumes an invocation in the same store transaction that
+records its audit decision. Community PostgreSQL persists redeem, reconcile,
+and delegation-chain validation with the SQLite path. Request, permit,
+redemption, and execution IDs stay distinct, and an idempotency key makes an
+ambiguous retry return the original redemption. Revocation and action/executor/harness/namespace/signing-key
 kill switches stop future redemption without removing issuance or redemption
 history. They cannot undo an effect that already started. The control plane
 does not claim exactly-once external effects: redemption proves consumed
@@ -398,11 +399,12 @@ definitions, function definitions, generation-fenced leases and guarded object
 mutations, team-namespace bootstrap, principal credentials, coordination and
 work admission, external evidence admission and
 projection, policy attestations, handoffs, retention, scoped content, and
-reconciliation. Known community Postgres fail-closed exceptions include query-time ontology
-entailment,
-governed documents and renditions,
-and (on the Chisei side)
-online permit redeem — see the parity guides.
+reconciliation. Remaining community PostgreSQL fail-closed surfaces are the
+shrink-only list
+[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json)
+(experimental ontology deletes and named admin projections) plus Chisei
+`PlanExecution` / `PlanContentExecution` (receipt persist with Kioku
+holdouts). See the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
 RPC to shared backend evidence or an explicit computed/query implementation

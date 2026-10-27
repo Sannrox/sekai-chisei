@@ -6,6 +6,7 @@ use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEve
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
+use crate::ext::*;
 
 pub const MAX_STATISTICS_WINDOW_MS: i64 = 366 * 24 * 60 * 60 * 1000;
 const MAX_STATISTICS_RECEIPTS: usize = 4096;

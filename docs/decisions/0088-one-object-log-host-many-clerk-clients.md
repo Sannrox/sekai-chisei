@@ -93,7 +93,7 @@ from a second, and fail closed on mismatch.
 
 mikura `v0.2.0` (pinned by #1111) ships `mikura-host` with its versioned
 JSON-lines wire contract, which satisfies the release prerequisite above. The
-clerk adapter (`src/sekai/object_log_host.rs`) is its client:
+clerk adapter (`crates/sekai-core/src/sekai/object_log_host.rs`) is its client:
 
 - `SEKAI_OBJECT_LOG_HOST` routes object-log admits (append plus generation
   read) through the host.

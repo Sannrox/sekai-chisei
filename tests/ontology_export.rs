@@ -67,6 +67,8 @@ async fn publish(server: &LoopServer, namespace: &str, members: Vec<(String, Str
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: format!("{namespace}-propose"),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         })
         .await
         .unwrap_or_else(|error| panic!("propose: {error}\n{}", server.logs()));
@@ -175,7 +177,9 @@ async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
             (
                 "object_type".into(),
                 "incident".into(),
-                r#"{"name":"incident","properties":["severity","title"],"required":["title"],"access_marking":"confidential"}"#.into(),
+                // A reasoned suppression lets the lint gate publish a type no
+                // consumer references.
+                r#"{"name":"incident","properties":["severity","title"],"required":["title"],"access_marking":"confidential","lint_suppressions":[{"rule":"orphan_object_type","reason":"export fixture"}]}"#.into(),
             ),
             (
                 "link_type".into(),

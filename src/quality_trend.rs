@@ -13,6 +13,7 @@ use crate::chisei::evaluation_execution::{
 use crate::chisei::evaluation_manifest::{ResolvedEvaluationManifest, ResolvedEvaluationNode};
 use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, ReceiptEventKind};
 use crate::db::runtime_db::RuntimeDb;
+use crate::ext::*;
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

@@ -49,19 +49,19 @@
   "provenance": [
     {
       "subject": "ExternalPermitPersistenceModule",
-      "source": "src/db/chisei_external_permit.rs",
+      "source": "crates/chisei-core/src/chisei_store/chisei_external_permit.rs",
       "locator": "ChiseiExternalPermitBackend",
       "confidence": 1.0
     },
     {
       "subject": "ExternalPermitRevocation",
-      "source": "src/chisei/external_permit.rs",
+      "source": "crates/chisei-core/src/chisei/external_permit.rs",
       "locator": "SekaiDb::revoke_permit",
       "confidence": 1.0
     },
     {
       "subject": "ImmutableAuditDecision",
-      "source": "src/sekai/audit.rs",
+      "source": "crates/sekai-core/src/sekai/audit.rs",
       "locator": "Decision",
       "confidence": 1.0
     },
@@ -79,7 +79,7 @@
     },
     {
       "subject": "atomically_records_revocation",
-      "source": "src/chisei/external_permit.rs",
+      "source": "crates/chisei-core/src/chisei/external_permit.rs",
       "locator": "SekaiDb::revoke_permit transaction",
       "confidence": 1.0
     },

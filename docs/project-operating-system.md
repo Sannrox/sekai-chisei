@@ -113,9 +113,10 @@ creating a second project-management tree.
 
 | Path | Owner | Purpose |
 | --- | --- | --- |
-| `src/sekai/` | Sekai maintainers | Durable graph, audit, lineage, security, evidence, coordination, and memory primitives. |
-| `src/chisei/` | Chisei maintainers | Policy, budget, routing, approval, evaluation, and learning decisions. |
-| `crates/sekai-provider/` | Provider maintainers | Provider registry, provider-specific execution, pricing, and shared receipt contracts. |
+| `crates/sekai-core/` | Sekai maintainers | Durable graph, audit, lineage, security, evidence, coordination, persistence, and memory primitives. |
+| `crates/chisei-core/` | Chisei maintainers | Policy, budget, routing, approval, evaluation, learning, and Chisei persistence. |
+| `src/composition/` | Both-plane maintainers | Code that needs both stores (ADR 0092). |
+| `crates/chisei-provider/` | Provider maintainers | Chisei provider registry, provider-specific execution, pricing, and routing. |
 | `crates/chisei-gateway/` | Gateway maintainers | Compatible HTTP egress proxy, setup/report clients, and gateway-local observability. |
 | `src/grpc/`, `proto/` | API maintainers | Transport implementations and public native contracts. |
 | `adapters/` | Integration owners | Domain-neutral external evidence adapters; not core ontology. |
@@ -334,6 +335,29 @@ Local isolation protects lanes that share a machine; it is not a claim.
   A lane commits and publishes its own branch from its own worktree; that is
   not a shared mutation. Nobody holds a slot across implementation, test runs,
   or a remote wait.
+- Builds and tests are isolated per lane (#1554):
+  - **Cargo:** each worktree builds into its own `target/`, the default with
+    no `target-dir` in `.cargo/config.toml`. Two lanes sharing a
+    `CARGO_TARGET_DIR` wait on Cargo's exclusive lock and overwrite each
+    other's test binaries; set it only to a path inside the lane's worktree.
+  - **SQLite:** in-memory stores hold one connection. A nested checkout on
+    one thread panics at once rather than waiting on the pool.
+    `--test-threads=1` serializes tests inside one process; it does not
+    isolate two agents.
+  - **Files and ports:** tests open `:memory:` or unique temp paths and bind
+    `127.0.0.1:0`. Tests that start the server pass `GRPC_PORT` from a free
+    port (or a socket) and clear `OPS_PORT` and `SEKAI_HTTP_PORT`, so the
+    defaults 50051, 9464 and 50080 are never bound by a test.
+  - **PostgreSQL:** the PostgreSQL scripts start their own container on an
+    ephemeral host port unless `SEKAI_TEST_POSTGRES_PORT` is set. One
+    `SEKAI_TEST_POSTGRES_URL` serves one process at a time.
+    `ScratchDatabase` users create and drop a unique database per test.
+    Tests that read the URL directly share its database and are not
+    parallel-safe across processes. List them with
+    `git grep -l 'SEKAI_TEST_POSTGRES_URL' -- src crates/sekai-core tests | xargs grep -L ScratchDatabase`.
+    Some of them reset the whole schema (`reset_database` in
+    `crates/sekai-core/src/db/postgres.rs`). Run them only through
+    `scripts/postgres-conformance.sh`, which gives each run its own server.
 
 ### Limits, collisions, and landing
 
@@ -345,6 +369,26 @@ Parallel lanes must not collide. Collision surfaces in this repository are
 `proto/`, SQLite versus PostgreSQL migrations, gateway versus native gRPC,
 and the same crate or ownership boundary. Lanes that would both change one of
 these surfaces run in sequence, not in parallel.
+
+Shared files that every lane used to touch are kept out of the way:
+
+- `CHANGELOG.md` is release-owned. Pull Requests do not edit it; the
+  release-note context goes in the Pull Request body, which becomes the
+  squash commit. At release, `scripts/changelog-draft.sh` lists the merged
+  changes since the last tag for the release owner to write up;
+- RPC fixture tests check the fixtures against the proto, not a hardcoded
+  total, so adding an RPC touches only its fixture rows;
+- `compatibility.json` is release-owned: the release workflow generates it
+  from the tagged tree and attaches it to the release, so no Pull Request
+  carries the proto digest;
+- a PostgreSQL migration takes the number `scripts/next-migration.sh`
+  prints, and is renumbered with it when another lane lands one first. Two
+  lanes adding one both append to the migration list, so the second shows a
+  conflict instead of merging a duplicate number.
+
+`main` does not require a branch to be up to date before it merges: the
+required checks must pass on the Pull Request head, and a lane refreshes only
+for a conflict or a failing gate.
 
 A lane publishes its first Verified commit to the claim branch as a draft Pull
 Request that closes the Issue and may list public lane fields only: claim

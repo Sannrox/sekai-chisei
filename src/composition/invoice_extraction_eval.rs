@@ -199,7 +199,7 @@ mod tests {
             minimum_mean_score_micros: INVOICE_EXTRACTION_THRESHOLD_MICROS,
             expected_label: INVOICE_EXTRACTION_EXPECTED_VENDOR,
             host: host(),
-            budget: FunctionBudget::default(),
+            budget: FunctionBudget::for_tests(),
         })
         .unwrap()
     }

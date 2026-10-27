@@ -1,0 +1,3954 @@
+use r2d2::{CustomizeConnection, Pool, PooledConnection};
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::functions::FunctionFlags;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+static NEXT_MEMORY_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static MEMORY_CONN_HELD: RefCell<BTreeSet<u64>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+pub struct SqliteConn {
+    inner: PooledConnection<SqliteConnectionManager>,
+    memory_pool_id: Option<u64>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for SqliteConn {
+    fn drop(&mut self) {
+        if let Some(pool_id) = self.memory_pool_id {
+            MEMORY_CONN_HELD.with(|held| {
+                held.borrow_mut().remove(&pool_id);
+            });
+        }
+    }
+}
+
+impl Deref for SqliteConn {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.inner
+    }
+}
+
+impl DerefMut for SqliteConn {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.inner
+    }
+}
+
+use crate::obs::labels::{Outcome, Subsystem, WaitKind};
+use crate::obs::signals;
+
+use crate::domain::{
+    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, is_valid_property_key,
+};
+use crate::sekai::object_security::PrincipalPolicyContext;
+
+pub const DEFAULT_SQLITE_POOL_MAX: u32 = 16;
+
+pub struct SekaiDb {
+    pool: Pool<SqliteConnectionManager>,
+    enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    persistent: bool,
+    memory_pool_id: u64,
+    plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
+    pub search_maintenance: Mutex<()>,
+}
+
+#[derive(Debug)]
+struct SqliteConnectionSetup;
+
+impl CustomizeConnection<Connection, rusqlite::Error> for SqliteConnectionSetup {
+    fn on_acquire(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
+        conn.busy_timeout(Duration::from_secs(5))?;
+        register_sql_helpers(conn)
+    }
+}
+
+fn register_sql_helpers(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.create_scalar_function(
+        "is_numeric_text",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let value: Option<String> = ctx.get(0).ok();
+            Ok(value
+                .as_deref()
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .map(|value| value.is_finite())
+                .unwrap_or(false))
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalCredential {
+    pub id: String,
+    pub principal: String,
+    pub token_hash: String,
+    pub status: String,
+    pub created: i64,
+    pub rotated_at: i64,
+    pub revoked_at: i64,
+    pub tenant_id: String,
+}
+
+impl SekaiDb {
+    fn drop_legacy_action_types(&self) -> Result<(), String> {
+        self.conn()
+            .execute_batch(
+                "DROP TABLE IF EXISTS sekai_action_types;
+                 DELETE FROM sekai_grants
+                   WHERE object_id IN (SELECT id FROM sekai_objects WHERE kind='action_approval');
+                 DELETE FROM sekai_links
+                   WHERE from_id IN (SELECT id FROM sekai_objects WHERE kind='action_approval')
+                      OR to_id IN (SELECT id FROM sekai_objects WHERE kind='action_approval');
+                 DELETE FROM sekai_objects WHERE kind='action_approval';",
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn new(path: &str) -> Result<Self, String> {
+        Self::new_for_plane(path, crate::db::schema_plane::SchemaPlane::Shared)
+    }
+
+    pub fn new_for_plane(
+        path: &str,
+        schema_plane: crate::db::schema_plane::SchemaPlane,
+    ) -> Result<Self, String> {
+        Self::new_with_pool_max_for_plane(path, DEFAULT_SQLITE_POOL_MAX, schema_plane)
+    }
+
+    pub fn new_with_pool_max(path: &str, pool_max: u32) -> Result<Self, String> {
+        Self::new_with_pool_max_for_plane(
+            path,
+            pool_max,
+            crate::db::schema_plane::SchemaPlane::Shared,
+        )
+    }
+
+    pub fn new_with_pool_max_for_plane(
+        path: &str,
+        pool_max: u32,
+        schema_plane: crate::db::schema_plane::SchemaPlane,
+    ) -> Result<Self, String> {
+        Self::open(path, pool_max, None, schema_plane)
+    }
+
+    pub fn new_with_enterprise_extension(
+        path: &str,
+        enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    ) -> Result<Self, String> {
+        Self::open(
+            path,
+            DEFAULT_SQLITE_POOL_MAX,
+            enterprise_extension,
+            crate::db::schema_plane::SchemaPlane::Shared,
+        )
+    }
+
+    fn open(
+        path: &str,
+        pool_max: u32,
+        enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
+        schema_plane: crate::db::schema_plane::SchemaPlane,
+    ) -> Result<Self, String> {
+        crate::sekai::transform_engine::install_engine_allocator();
+        let persistent = path != ":memory:";
+        if persistent && pool_max == 0 {
+            return Err("SQLite pool size must be greater than zero".into());
+        }
+        let manager = if persistent {
+            std::fs::create_dir_all(
+                std::path::Path::new(path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(".")),
+            )
+            .ok();
+            if std::path::Path::new(path).exists() {
+                let conn =
+                    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .map_err(|error| error.to_string())?;
+                Self::reject_legacy_tenant_state(&conn)?;
+            }
+            let conn = Connection::open(path).map_err(|e| e.to_string())?;
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| e.to_string())?;
+            drop(conn);
+            SqliteConnectionManager::file(path)
+        } else {
+            SqliteConnectionManager::memory()
+        };
+        // Separate in-memory SQLite connections do not share state. Keep the
+        // embedded test backend single-connection while allowing persistent
+        // databases to serve concurrent readers and writers.
+        let max_size = if persistent { pool_max } else { 1 };
+        let pool = Pool::builder()
+            .max_size(max_size)
+            .connection_customizer(Box::new(SqliteConnectionSetup))
+            .build(manager)
+            .map_err(|e| e.to_string())?;
+        let memory_pool_id = if persistent {
+            0
+        } else {
+            NEXT_MEMORY_POOL_ID.fetch_add(1, Ordering::Relaxed)
+        };
+        let db = Self {
+            pool,
+            enterprise_extension,
+            persistent,
+            memory_pool_id,
+            plane: std::sync::OnceLock::new(),
+            search_maintenance: Mutex::new(()),
+        };
+        db.migrate_for_plane(schema_plane)?;
+        Ok(db)
+    }
+
+    pub fn pool_max_size(&self) -> u32 {
+        self.pool.max_size()
+    }
+
+    /// Labels this pool's checkout signals with the store plane it serves.
+    /// Unlabeled pools report as Shared.
+    pub fn set_pool_plane(&self, plane: crate::obs::labels::PoolPlane) {
+        let _ = self.plane.set(plane);
+    }
+
+    fn pool_plane(&self) -> crate::obs::labels::PoolPlane {
+        self.plane
+            .get()
+            .copied()
+            .unwrap_or(crate::obs::labels::PoolPlane::Shared)
+    }
+
+    pub fn conn(&self) -> SqliteConn {
+        let started = Instant::now();
+        // In-memory pools are single-connection. A nested checkout from the
+        // same thread waits forever on the default 30s timeout loop. Fail
+        // immediately so a missed `drop` cannot hang a test for tens of minutes.
+        // Other threads may legitimately wait for the connection.
+        if !self.persistent
+            && MEMORY_CONN_HELD.with(|held| held.borrow().contains(&self.memory_pool_id))
+        {
+            panic!(
+                "nested SQLite checkout on the single-connection in-memory pool; \
+                 drop the outer connection before calling another store method"
+            );
+        }
+        loop {
+            match self.pool.get() {
+                Ok(conn) => {
+                    signals::record_db_wait(
+                        WaitKind::ConnectionAcquire,
+                        Outcome::Ok,
+                        started.elapsed(),
+                    );
+                    self.observe_pool_saturation(started.elapsed());
+                    let memory_pool_id = if self.persistent {
+                        None
+                    } else {
+                        MEMORY_CONN_HELD.with(|held| {
+                            held.borrow_mut().insert(self.memory_pool_id);
+                        });
+                        Some(self.memory_pool_id)
+                    };
+                    return SqliteConn {
+                        inner: conn,
+                        memory_pool_id,
+                        _not_send: PhantomData,
+                    };
+                }
+                Err(error) => {
+                    // r2d2 blocks for `connection_timeout` (30s by default)
+                    // before yielding an error, so this records once per
+                    // failed wait rather than spinning.
+                    signals::record_db_wait(
+                        WaitKind::ConnectionAcquire,
+                        Outcome::Timeout,
+                        started.elapsed(),
+                    );
+                    signals::record_pool_checkout(
+                        self.pool_plane(),
+                        Outcome::Timeout,
+                        started.elapsed(),
+                        1.0,
+                    );
+                    tracing::error!(%error, "database connection pool unavailable; retrying");
+                }
+            }
+        }
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+
+    #[cfg(feature = "gateway-test-support")]
+    #[doc(hidden)]
+    pub fn gateway_test_execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.conn()
+            .execute_batch(sql)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Sample pool utilization at acquisition time.
+    ///
+    /// Sampling here rather than on a timer keeps the gauge tied to real demand
+    /// and avoids a background task for a value nobody reads while idle.
+    fn observe_pool_saturation(&self, waited: std::time::Duration) {
+        let state = self.pool.state();
+        let max_size = self.pool.max_size();
+        if max_size == 0 {
+            return;
+        }
+        let in_use = state.connections.saturating_sub(state.idle_connections);
+        let ratio = f64::from(in_use) / f64::from(max_size);
+        signals::set_saturation(Subsystem::Persistence, ratio);
+        signals::record_pool_checkout(self.pool_plane(), Outcome::Ok, waited, ratio);
+    }
+
+    pub fn db_lock_poisoned_total(&self) -> u64 {
+        crate::obs::metrics::db_lock_poisoned_total()
+    }
+
+    pub fn migrate_all(&self) -> Result<(), String> {
+        self.migrate_for_plane(crate::db::schema_plane::SchemaPlane::Shared)
+    }
+
+    fn migrate_for_plane(&self, plane: crate::db::schema_plane::SchemaPlane) -> Result<(), String> {
+        self.migrate_decision_ledger(plane)?;
+        self.migrate_operation_receipts()?;
+        if plane.includes_sekai() {
+            self.migrate_sekai_families()?;
+        }
+        if plane.includes_chisei() {
+            self.migrate_chisei_families()?;
+        }
+        crate::db::schema_plane::reject_populated_foreign_sqlite(self, plane)
+    }
+
+    fn migrate_sekai_families(&self) -> Result<(), String> {
+        self.migrate()?;
+        self.migrate_grants()?;
+        self.migrate_write_freeze()?;
+        self.migrate_principal_credentials()?;
+        self.migrate_audit()?;
+        self.migrate_object_sync()?;
+        self.migrate_definition_branches()?;
+        self.migrate_service_principals()?;
+        self.migrate_object_security()?;
+        self.migrate_ledger()?;
+        self.migrate_retention()?;
+        self.migrate_attestations()?;
+        self.migrate_task_observations()?;
+        self.migrate_evidence()?;
+        self.migrate_deduplication()?;
+        self.migrate_schema_types()?;
+        self.migrate_ontology()?;
+        self.migrate_coordination()?;
+        self.migrate_leases()?;
+        self.migrate_datasets()?;
+        self.migrate_object_type_index()?;
+        self.migrate_search_index()?;
+        self.migrate_embedding_index()?;
+        self.migrate_media_uploads()?;
+        self.migrate_sync_scopes()?;
+        self.migrate_governed_transforms()?;
+        self.migrate_functions()?;
+        self.migrate_handoffs()?;
+        self.drop_legacy_action_types()?;
+        self.migrate_governed_action_types()?;
+        self.migrate_action_instances()?;
+        self.migrate_decision_memory()?;
+        self.migrate_action_effects()?;
+        // Sekai-owned, as their PostgreSQL migrations are.
+        self.migrate_action_plans()?;
+        self.migrate_export_grants()?;
+        self.migrate_ontology_health_trends()?;
+        self.migrate_catalog_criticality_outbox()?;
+        Ok(())
+    }
+
+    fn migrate_chisei_families(&self) -> Result<(), String> {
+        self.migrate_chisei()?;
+        self.migrate_receipt_chain()?;
+        self.migrate_evaluation_plans()?;
+        self.migrate_evaluation_manifests()?;
+        self.migrate_evaluation_executions()?;
+        self.migrate_learning_changes()?;
+        self.migrate_data_quality_rules()?;
+        self.migrate_governed_subject_provenance()?;
+        self.migrate_kioku()?;
+        self.migrate_budget()?;
+        self.migrate_portfolio()?;
+        self.migrate_routing_profiles()?;
+        self.migrate_model_review()?;
+        self.migrate_policy_shadow()?;
+        self.migrate_eval_runs()?;
+        self.migrate_model_release_evidence()?;
+        self.migrate_usage_ledger()?;
+        self.ensure_external_permit_tables()?;
+        self.ensure_external_action_tables()?;
+        Ok(())
+    }
+
+    fn migrate(&self) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sekai_objects (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                namespace TEXT NOT NULL DEFAULT '',
+                external_id TEXT NOT NULL DEFAULT '',
+                properties TEXT NOT NULL DEFAULT '{}',
+                created INTEGER NOT NULL,
+                updated INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_objects_kind ON sekai_objects(kind);
+            CREATE INDEX IF NOT EXISTS idx_objects_external_id ON sekai_objects(external_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_objects_observation_external_id
+                ON sekai_objects(namespace, external_id)
+                WHERE kind = 'feedback_observation' AND external_id <> '';
+            CREATE TABLE IF NOT EXISTS sekai_links (
+                id TEXT PRIMARY KEY,
+                from_id TEXT NOT NULL,
+                to_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                created INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_links_from ON sekai_links(from_id, relation);
+            CREATE INDEX IF NOT EXISTS idx_links_to ON sekai_links(to_id, relation);
+            CREATE TABLE IF NOT EXISTS sekai_namespace_object_generation (
+                namespace TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS trg_sekai_objects_namespace_generation_insert
+            AFTER INSERT ON sekai_objects
+            BEGIN
+                INSERT INTO sekai_namespace_object_generation(namespace, generation)
+                VALUES (NEW.namespace, 1)
+                ON CONFLICT(namespace) DO UPDATE SET generation = generation + 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_sekai_objects_namespace_generation_update
+            AFTER UPDATE ON sekai_objects
+            BEGIN
+                INSERT INTO sekai_namespace_object_generation(namespace, generation)
+                VALUES (NEW.namespace, 1)
+                ON CONFLICT(namespace) DO UPDATE SET generation = generation + 1;
+                INSERT INTO sekai_namespace_object_generation(namespace, generation)
+                SELECT OLD.namespace, 1 WHERE OLD.namespace IS NOT NEW.namespace
+                ON CONFLICT(namespace) DO UPDATE SET generation = generation + 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_sekai_objects_namespace_generation_delete
+            AFTER DELETE ON sekai_objects
+            BEGIN
+                INSERT INTO sekai_namespace_object_generation(namespace, generation)
+                VALUES (OLD.namespace, 1)
+                ON CONFLICT(namespace) DO UPDATE SET generation = generation + 1;
+            END;
+            INSERT INTO sekai_namespace_object_generation(namespace, generation)
+            SELECT namespace, COUNT(*)
+            FROM sekai_objects
+            GROUP BY namespace
+            ON CONFLICT(namespace) DO NOTHING;",
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn migrate_principal_credentials(&self) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sekai_principal_credentials (
+                id TEXT PRIMARY KEY,
+                principal TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created INTEGER NOT NULL,
+                rotated_at INTEGER NOT NULL DEFAULT 0,
+                revoked_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_principal_credentials_token_hash ON sekai_principal_credentials(token_hash);
+            CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_principal ON sekai_principal_credentials(principal);
+            CREATE TABLE IF NOT EXISTS sekai_peer_trust_roots (
+                namespace TEXT NOT NULL,
+                site_identity TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                public_key_hex TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (namespace, site_identity, key_id)
+            );
+            CREATE TABLE IF NOT EXISTS sekai_peer_imports (
+                import_id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                imported_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sekai_peer_imports_namespace
+                ON sekai_peer_imports(namespace, imported_at_ms);
+            CREATE TABLE IF NOT EXISTS sekai_federation_local_site (
+                site_id TEXT PRIMARY KEY,
+                key_id TEXT NOT NULL,
+                public_key_hex TEXT NOT NULL,
+                region TEXT,
+                residency_data_classes_json TEXT NOT NULL,
+                registered_by TEXT NOT NULL,
+                registered_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sekai_federation_peers (
+                local_site_id TEXT NOT NULL,
+                peer_site_id TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                membership TEXT NOT NULL,
+                health TEXT NOT NULL,
+                joined_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (local_site_id, peer_site_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sekai_federation_peers_membership
+                ON sekai_federation_peers(membership, health);
+            CREATE TABLE IF NOT EXISTS sekai_federation_namespace_grants (
+                grant_id TEXT PRIMARY KEY,
+                peer_site_id TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                revoked INTEGER NOT NULL,
+                granted_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sekai_federation_namespace_grants_peer
+                ON sekai_federation_namespace_grants(peer_site_id, namespace, revoked);
+            CREATE TABLE IF NOT EXISTS sekai_federation_snapshot_exports (
+                snapshot_digest TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                exported_at_ms INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_federation_snapshot_exports_sequence
+                ON sekai_federation_snapshot_exports(namespace, sequence);
+            CREATE TABLE IF NOT EXISTS sekai_federation_snapshot_sequences (
+                namespace TEXT PRIMARY KEY,
+                next_sequence INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sekai_federation_snapshot_imports (
+                import_id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                peer_site_id TEXT NOT NULL,
+                snapshot_digest TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                imported_at_ms INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_federation_snapshot_imports_digest
+                ON sekai_federation_snapshot_imports(peer_site_id, namespace, snapshot_digest);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_federation_snapshot_imports_sequence
+                ON sekai_federation_snapshot_imports(peer_site_id, namespace, sequence);
+            CREATE TABLE IF NOT EXISTS sekai_federation_snapshot_facts (
+                import_id TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                fact_json TEXT NOT NULL,
+                PRIMARY KEY (import_id, object_id)
+            );
+            CREATE TABLE IF NOT EXISTS sekai_federation_conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_federation_conflicts_object
+                ON sekai_federation_conflicts(namespace, object_id);
+            CREATE TABLE IF NOT EXISTS sekai_federation_revocations (
+                revocation_id TEXT PRIMARY KEY,
+                subject_kind TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_federation_revocations_subject
+                ON sekai_federation_revocations(subject_kind, subject_id);",
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn reject_legacy_tenant_state(conn: &Connection) -> Result<(), String> {
+        let tables = [
+            "sekai_tenants",
+            "sekai_tenant_requests",
+            "sekai_tenant_memberships",
+            "sekai_namespace_ownership",
+        ];
+        for table in tables {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if exists {
+                let populated: bool = conn
+                    .query_row(
+                        &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if populated {
+                    return Err(legacy_tenant_state_message());
+                }
+            }
+        }
+
+        let credential_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sekai_principal_credentials')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if credential_table {
+            let has_tenant_column = conn
+                .prepare("PRAGMA table_info(sekai_principal_credentials)")
+                .and_then(|mut statement| {
+                    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+                    Ok(rows
+                        .filter_map(Result::ok)
+                        .any(|column| column == "tenant_id"))
+                })
+                .map_err(|error| error.to_string())?;
+            if has_tenant_column {
+                let populated: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sekai_principal_credentials WHERE tenant_id<>'' LIMIT 1)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if populated {
+                    return Err(legacy_tenant_state_message());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enterprise_extension(&self) -> Option<&Arc<dyn crate::enterprise::EnterpriseExtension>> {
+        self.enterprise_extension.as_ref()
+    }
+
+    pub fn ping(&self) -> Result<(), String> {
+        let conn = self.conn();
+        conn.query_row("SELECT 1", [], |_| Ok(()))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_principal_credential(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PrincipalCredential>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE token_hash = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+            params![token_hash],
+            row_to_principal_credential,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn principal_credentials_activity_epoch(&self) -> Result<i64, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT COALESCE(MAX(value), 0) FROM (
+                SELECT COALESCE(created, 0) AS value FROM sekai_principal_credentials
+                UNION ALL
+                SELECT COALESCE(rotated_at, 0) AS value FROM sekai_principal_credentials
+                UNION ALL
+                SELECT COALESCE(revoked_at, 0) AS value FROM sekai_principal_credentials
+            )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn create_principal_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<PrincipalCredential, String> {
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                principal,
+                token_hash,
+                "active",
+                now,
+                now,
+                0_i64,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.to_string(),
+            token_hash: token_hash.to_string(),
+            status: "active".to_string(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+            tenant_id: String::new(),
+        })
+    }
+
+    pub fn create_managed_team_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<PrincipalCredential, String> {
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sekai_team_principals (principal, created) VALUES (?1, ?2)",
+            params![principal, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,'active',?4,?4,0)",
+            params![id, principal, token_hash, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.to_string(),
+            token_hash: token_hash.to_string(),
+            status: "active".into(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+            tenant_id: String::new(),
+        })
+    }
+
+    pub fn rotate_principal_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+    ) -> Result<PrincipalCredential, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        let mut active_stmt = tx
+            .prepare(
+                "SELECT id FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?;
+        let active_id = active_stmt
+            .query_row(params![principal], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        drop(active_stmt);
+        if let Some(active) = &active_id {
+            tx.execute(
+                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE id=?2",
+                params![now, active],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                principal,
+                token_hash,
+                "active",
+                now,
+                now,
+                0_i64
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.to_string(),
+            token_hash: token_hash.to_string(),
+            status: "active".to_string(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+            tenant_id: String::new(),
+        })
+    }
+
+    pub fn rotate_managed_team_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+    ) -> Result<PrincipalCredential, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sekai_team_principals (principal, created) VALUES (?1, ?2)",
+            params![principal, now],
+        )
+        .map_err(|e| e.to_string())?;
+        let revoked = tx
+            .execute(
+                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE principal=?2 AND status='active'",
+                params![now, principal],
+            )
+            .map_err(|e| e.to_string())?;
+        if revoked == 0 {
+            return Err(format!("no active credential for {principal:?}"));
+        }
+        tx.execute(
+            "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,'active',?4,?4,0)",
+            params![id, principal, token_hash, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.to_string(),
+            token_hash: token_hash.to_string(),
+            status: "active".into(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+            tenant_id: String::new(),
+        })
+    }
+
+    pub fn revoke_principal_credential(
+        &self,
+        principal: &str,
+    ) -> Result<Option<PrincipalCredential>, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?;
+        let credential: Option<PrincipalCredential> = stmt
+            .query_row(params![principal], row_to_principal_credential)
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(credential) = &credential {
+            conn.execute(
+                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE id=?2",
+                params![now, credential.id],
+            )
+            .map_err(|e| e.to_string())?;
+            let revoked = PrincipalCredential {
+                status: "revoked".to_string(),
+                revoked_at: now,
+                ..credential.clone()
+            };
+            return Ok(Some(revoked));
+        }
+        Ok(None)
+    }
+
+    pub fn list_credentials(
+        &self,
+        principal: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<PrincipalCredential>, String> {
+        let conn = self.conn();
+        let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE 1=1".to_string();
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(principal) = principal {
+            sql.push_str(&format!(" AND principal = ?{}", args.len() + 1));
+            args.push(Box::new(principal.to_string()));
+        }
+        if let Some(status) = status {
+            sql.push_str(&format!(" AND status = ?{}", args.len() + 1));
+            args.push(Box::new(status.to_string()));
+        }
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|arg| arg.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), row_to_principal_credential)
+            .map_err(|e| e.to_string())?;
+        let parsed: Result<Vec<_>, rusqlite::Error> = rows.collect();
+        parsed.map_err(|e| e.to_string())
+    }
+
+    pub fn list_active_credentials(&self) -> Result<Vec<PrincipalCredential>, String> {
+        self.list_credentials(None, Some("active"))
+    }
+
+    pub fn list_unbound_credentials(
+        &self,
+        principal: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<PrincipalCredential>, String> {
+        self.list_credentials(principal, status)
+    }
+
+    pub fn create_object(&self, o: &Object) -> Result<(), String> {
+        insert_object(&self.conn(), o)
+    }
+
+    pub fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+            params![id],
+            row_to_object,
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn get_object_with_policy_context(
+        &self,
+        id: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Option<Object>, String> {
+        let context = context.clone().normalized();
+        let subjects = context.sql_subjects();
+        let scopes = context.sql_scopes();
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id=?1{}",
+                    sqlite_object_security_filter(1)
+                ),
+                params![id, subjects, scopes],
+                row_to_object,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Loads a bounded set of caller-visible objects selected by a change feed.
+    pub fn list_objects_by_ids_with_policy_context(
+        &self,
+        ids: &[String],
+        principals: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        const MAX_IDS_PER_QUERY: usize = 500;
+        let mut ids = ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = MAX_IDS_PER_QUERY.min(
+            999usize
+                .saturating_sub(principals.len())
+                .saturating_sub(2)
+                .max(1),
+        );
+        let mut objects = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(batch_size) {
+            let id_placeholders = (1..=batch.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let (visibility_filter, visibility_params) =
+                build_visibility_filter(principals, batch.len());
+            let (policy_filter, policy_params) = build_sqlite_object_security_filter(
+                Some(context),
+                batch.len() + visibility_params.len(),
+            )?;
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = batch
+                .iter()
+                .cloned()
+                .map(|id| Box::new(id) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            params.extend(visibility_params);
+            params.extend(policy_params);
+            let params = params
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<&dyn rusqlite::types::ToSql>>();
+            let sql = format!(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE id IN ({id_placeholders}){visibility_filter}{policy_filter}
+                 ORDER BY id ASC"
+            );
+            let conn = self.conn();
+            let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params.as_slice(), row_to_object)
+                .map_err(|error| error.to_string())?;
+            objects.extend(
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(objects)
+    }
+
+    pub fn update_object(&self, o: &Object) -> Result<(), String> {
+        if self.update_object_with_existing(o)?.is_none() {
+            return Err("not found".into());
+        }
+        Ok(())
+    }
+
+    pub fn update_object_with_existing(&self, o: &Object) -> Result<Option<Object>, String> {
+        if o.external_id.starts_with("namespace:") && o.kind != "namespace" {
+            return Err("namespace:* external IDs are reserved for namespace boundaries".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let before = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+                params![o.id],
+                row_to_object,
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if before.is_none() {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(None);
+        }
+        if before
+            .as_ref()
+            .is_some_and(|existing| existing.namespace != o.namespace)
+        {
+            return Err("object namespace is immutable".into());
+        }
+        if before
+            .as_ref()
+            .is_some_and(|existing| existing.kind != o.kind)
+        {
+            crate::sekai::ontology::validate_object_kind_change(&tx, &o.id, &o.kind)?;
+        }
+        let props = crate::domain::storage_properties_json(&o.properties)?;
+        tx.execute(
+            "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
+            params![o.id, o.kind, o.name, o.namespace, o.external_id, props, o.updated],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(before)
+    }
+
+    pub fn delete_object(&self, id: &str) -> Result<(), String> {
+        self.delete_object_with_existing(id)?;
+        Ok(())
+    }
+
+    /// Remove an object and its change rows so an aborted create can reuse the id.
+    pub fn abort_unreceipted_object_create(&self, id: &str) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_object_changes WHERE object_id = ?1",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn delete_object_with_existing(&self, id: &str) -> Result<Option<Object>, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let before = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+                params![id],
+                row_to_object,
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_links WHERE from_id = ?1 OR to_id = ?1",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(before)
+    }
+
+    pub fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        let mut effective_filter = filter.clone();
+        if effective_filter.limit <= 0 {
+            effective_filter.limit = MAX_LIST_LIMIT;
+        }
+        if effective_filter.offset < 0 {
+            effective_filter.offset = 0;
+        }
+        self.list_objects_page(&effective_filter)
+    }
+
+    pub fn list_all_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        let mut effective_filter = filter.clone();
+        effective_filter.limit = i32::MAX;
+        self.list_objects_page(&effective_filter)
+    }
+
+    /// One unfiltered page (no principal, marking, or policy filter) without `excluded_kinds`.
+    pub fn list_objects_excluding_kinds(
+        &self,
+        filter: &ListFilter,
+        excluded_kinds: &[&str],
+    ) -> Result<Vec<Object>, String> {
+        let conn = self.conn();
+        Self::list_objects_page_on_conn(&conn, filter, excluded_kinds)
+    }
+
+    fn list_objects_page(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        let conn = self.conn();
+        Self::list_objects_page_on_conn(&conn, filter, &[])
+    }
+
+    fn list_objects_page_on_conn(
+        conn: &Connection,
+        filter: &ListFilter,
+        excluded_kinds: &[&str],
+    ) -> Result<Vec<Object>, String> {
+        let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
+        let kind_exclusion = crate::domain::excluded_kinds_sql("kind", excluded_kinds)?;
+        let effective_limit = if filter.limit == i32::MAX {
+            i32::MAX
+        } else if filter.limit <= 0 {
+            MAX_LIST_LIMIT
+        } else {
+            filter.limit.min(MAX_LIST_LIMIT)
+        };
+        let mut sql = list_objects_select_sql(
+            &format!("FROM sekai_objects{}{}", query.where_sql, kind_exclusion),
+            filter.order_by.as_str(),
+            filter.descending,
+            &mut query.params,
+        )?;
+        sql.push_str(&format!(
+            " LIMIT ?{} OFFSET ?{}",
+            query.params.len() + 1,
+            query.params.len() + 2
+        ));
+        query.params.push(Box::new(effective_limit));
+        query.params.push(Box::new(filter.offset.max(0)));
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                query
+                    .params
+                    .iter()
+                    .map(|value| value.as_ref())
+                    .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                    .as_slice(),
+                row_to_object,
+            )
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn list_objects_with_total(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<(Vec<Object>, i32), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let objects = Self::list_objects_page_on_conn(&tx, filter, &[])?;
+        let query = build_list_query(filter).map_err(|e| e.to_string())?;
+        let total = tx
+            .query_row(
+                &query.count_sql,
+                query
+                    .params
+                    .iter()
+                    .map(|v| v.as_ref())
+                    .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                    .as_slice(),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((objects, total.min(i32::MAX as i64) as i32))
+    }
+
+    pub fn list_objects_with_total_for_principals(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+    ) -> Result<(Vec<Object>, i32), String> {
+        self.list_objects_with_total_for_principals_and_markings(
+            filter,
+            principals,
+            excluded_kinds,
+            None,
+            false,
+            true,
+            None,
+        )
+    }
+
+    pub fn list_objects_with_total_for_policy_context(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<(Vec<Object>, i32), String> {
+        self.list_objects_with_total_for_principals_and_markings(
+            filter,
+            principals,
+            excluded_kinds,
+            None,
+            false,
+            true,
+            Some(context),
+        )
+    }
+
+    /// List object rows for the text adapter after applying ACL, namespace,
+    /// and classification visibility in SQL. This keeps denied marking rows
+    /// out of the bounded public corpus scan rather than filtering them after
+    /// a deadline/page cutoff.
+    pub fn list_objects_with_text_visibility(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        allowed_markings: &[&str],
+        trusted: bool,
+    ) -> Result<(Vec<Object>, i32), String> {
+        self.list_objects_with_total_for_principals_and_markings(
+            filter,
+            principals,
+            excluded_kinds,
+            Some(allowed_markings),
+            trusted,
+            true,
+            None,
+        )
+    }
+
+    /// Count-free page for the authorization-built text corpus. The collector
+    /// advances by page length and does not need a full visible total for every
+    /// page; avoiding that count keeps the shared request budget useful.
+    pub fn list_objects_with_text_visibility_page(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        allowed_markings: &[&str],
+        trusted: bool,
+    ) -> Result<Vec<Object>, String> {
+        self.list_objects_with_total_for_principals_and_markings(
+            filter,
+            principals,
+            excluded_kinds,
+            Some(allowed_markings),
+            trusted,
+            false,
+            None,
+        )
+        .map(|(objects, _)| objects)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn list_objects_with_total_for_principals_and_markings(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        allowed_markings: Option<&[&str]>,
+        trusted: bool,
+        include_total: bool,
+        policy_context: Option<&PrincipalPolicyContext>,
+    ) -> Result<(Vec<Object>, i32), String> {
+        let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
+        // Static (no-bind) exclusion of internal governance kinds so pagination
+        // and totals are computed over the visible set. Kinds are internal
+        // constants; a non-conforming kind fails the query closed rather than
+        // being silently dropped (which would re-open the read-surface leak).
+        let kind_exclusion = crate::domain::excluded_kinds_sql("kind", excluded_kinds)?;
+        // Keep visibility, marking, and order-by params disjoint to avoid
+        // placeholder collisions for both list and count queries.
+        let (visibility_filter, mut visibility_params) =
+            build_visibility_filter(principals, query.params.len());
+        query.params.append(&mut visibility_params);
+        let (marking_filter, mut marking_params) =
+            build_marking_visibility_filter(allowed_markings, trusted, query.params.len());
+        query.params.append(&mut marking_params);
+        let (policy_filter, mut policy_params) =
+            build_sqlite_object_security_filter(policy_context, query.params.len())?;
+        query.params.append(&mut policy_params);
+        let effective_limit = if filter.limit == i32::MAX {
+            i32::MAX
+        } else if filter.limit <= 0 {
+            MAX_LIST_LIMIT
+        } else {
+            filter.limit.min(MAX_LIST_LIMIT)
+        };
+        let mut list_sql = list_objects_select_sql(
+            &format!(
+                "FROM sekai_objects{}{}{}{}{}",
+                query.where_sql, visibility_filter, marking_filter, policy_filter, kind_exclusion
+            ),
+            filter.order_by.as_str(),
+            filter.descending,
+            &mut query.params,
+        )?;
+        list_sql.push_str(&format!(
+            " LIMIT ?{} OFFSET ?{}",
+            query.params.len() + 1,
+            query.params.len() + 2
+        ));
+        query.params.push(Box::new(effective_limit));
+        query.params.push(Box::new(filter.offset.max(0)));
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let objects: Vec<Object> = {
+            let mut stmt = tx.prepare(&list_sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    query
+                        .params
+                        .iter()
+                        .map(|v| v.as_ref())
+                        .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                        .as_slice(),
+                    row_to_object,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        if !include_total {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok((objects, 0));
+        }
+        let (count_visibility_filter, count_visibility_params) =
+            build_visibility_filter_for_count_query(principals, query.where_param_count);
+        let (count_marking_filter, count_marking_params) = build_marking_visibility_filter(
+            allowed_markings,
+            trusted,
+            query.where_param_count + count_visibility_params.len(),
+        );
+        let (count_policy_filter, count_policy_params) = build_sqlite_object_security_filter(
+            policy_context,
+            query.where_param_count + count_visibility_params.len() + count_marking_params.len(),
+        )?;
+        let mut count_params: Vec<&dyn rusqlite::types::ToSql> = query
+            .params
+            .iter()
+            .take(query.where_param_count)
+            .map(|v| v.as_ref())
+            .collect();
+        count_params.extend(
+            count_visibility_params
+                .iter()
+                .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
+        );
+        let total = tx
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM sekai_objects{}{}{}{}{}",
+                    query.where_sql,
+                    count_visibility_filter,
+                    count_marking_filter,
+                    count_policy_filter,
+                    kind_exclusion
+                ),
+                {
+                    count_params.extend(
+                        count_marking_params
+                            .iter()
+                            .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
+                    );
+                    count_params.extend(
+                        count_policy_params
+                            .iter()
+                            .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
+                    );
+                    count_params.as_slice()
+                },
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((objects, total.min(i32::MAX as i64) as i32))
+    }
+
+    pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<Object>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE external_id = ?1",
+            params![external_id],
+            row_to_object,
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn find_all_by_external_id(&self, external_id: &str) -> Result<Vec<Object>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE external_id = ?1 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![external_id], row_to_object)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn find_all_by_external_ids_in_namespace(
+        &self,
+        namespace: &str,
+        external_ids: &[String],
+    ) -> Result<Vec<Object>, String> {
+        if external_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json = serde_json::to_string(external_ids).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE namespace = ?1
+                   AND external_id IN (SELECT value FROM json_each(?2))
+                 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![namespace, ids_json], row_to_object)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn find_all_by_external_id_with_policy_context(
+        &self,
+        external_id: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        let (subjects, scopes) = policy_context_json(context)?;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE external_id = ?1{} ORDER BY id",
+                sqlite_object_security_filter(1)
+            ))
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![external_id, subjects, scopes], row_to_object)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn find_by_property(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Vec<Object>, String> {
+        if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err("invalid property key".into());
+        }
+        let conn = self.conn();
+        let json_path = format!("$.{}", key);
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE kind = ?1 AND json_extract(properties, ?2) = ?3"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![kind, json_path, value], row_to_object)
+            .map_err(|e| e.to_string())?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn find_by_property_with_policy_context(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err("invalid property key".into());
+        }
+        let (subjects, scopes) = policy_context_json(context)?;
+        let conn = self.conn();
+        let json_path = format!("$.{}", key);
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE kind = ?1 AND json_extract(properties, ?2) = ?3{}",
+                sqlite_object_security_filter(3)
+            ))
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(
+            params![kind, json_path, value, subjects, scopes],
+            row_to_object,
+        )
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn create_link(&self, l: &Link) -> Result<(), String> {
+        let mut conn = self.conn();
+        // IMMEDIATE takes the write lock before the ontology check counts
+        // links, so concurrent admissions cannot both pass a maximum (ADR 0087).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sekai_links WHERE id = ?1)",
+                params![l.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if exists {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        crate::sekai::ontology::validate_link_constraint(
+            &transaction,
+            &l.from_id,
+            &l.to_id,
+            &l.relation,
+        )?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
+                params![l.id, l.from_id, l.to_id, l.relation, l.created],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn create_link_once(&self, l: &Link) -> Result<bool, String> {
+        let mut conn = self.conn();
+        // IMMEDIATE takes the write lock before the ontology check counts
+        // links, so concurrent admissions cannot both pass a maximum (ADR 0087).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        crate::sekai::ontology::validate_link_constraint(
+            &transaction,
+            &l.from_id,
+            &l.to_id,
+            &l.relation,
+        )?;
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
+                params![l.id, l.from_id, l.to_id, l.relation, l.created],
+            )
+            .map_err(|error| error.to_string())?
+            == 1;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
+    }
+
+    pub fn create_link_with_authorized_endpoints(
+        &self,
+        l: &Link,
+        expected_from: &Object,
+        expected_to: &Object,
+        from_generation: Option<&str>,
+        to_generation: Option<&str>,
+        fail_if_exists: bool,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        // IMMEDIATE takes the write lock before the ontology check counts
+        // links, so concurrent admissions cannot both pass a maximum (ADR 0087).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        require_authorized_link_endpoints(
+            &transaction,
+            expected_from,
+            expected_to,
+            from_generation,
+            to_generation,
+        )?;
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sekai_links WHERE id = ?1)",
+                params![l.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if exists {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(!fail_if_exists);
+        }
+        crate::sekai::ontology::validate_link_constraint(
+            &transaction,
+            &l.from_id,
+            &l.to_id,
+            &l.relation,
+        )?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
+                params![l.id, l.from_id, l.to_id, l.relation, l.created],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    pub fn delete_link(&self, id: &str) -> Result<(), String> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        transaction
+            .execute("DELETE FROM sekai_links WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_link_with_authorized_endpoints(
+        &self,
+        id: &str,
+        expected_from: &Object,
+        expected_to: &Object,
+        from_generation: Option<&str>,
+        to_generation: Option<&str>,
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        require_authorized_link_endpoints(
+            &transaction,
+            expected_from,
+            expected_to,
+            from_generation,
+            to_generation,
+        )?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM sekai_links WHERE id = ?1 AND from_id = ?2 AND to_id = ?3",
+                params![id, expected_from.id, expected_to.id],
+            )
+            .map_err(|e| e.to_string())?;
+        if deleted != 1 {
+            return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_link(&self, id: &str) -> Result<Option<Link>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(Link {
+                    id: row.get(0)?,
+                    from_id: row.get(1)?,
+                    to_id: row.get(2)?,
+                    relation: row.get(3)?,
+                    created: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn list_links_by_relation(&self, relation: &str) -> Result<Vec<Link>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links
+                 WHERE relation = ?1 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![relation], |row| {
+                Ok(Link {
+                    id: row.get(0)?,
+                    from_id: row.get(1)?,
+                    to_id: row.get(2)?,
+                    relation: row.get(3)?,
+                    created: row.get(4)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn get_links(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+    ) -> Result<Vec<Link>, String> {
+        // Static SQL variants keep statement text cacheable; prepare_cached avoids
+        // recompiling the same adjacency lookup on every traverse/lineage/retrieval hop.
+        let sql = match (dir, relation.is_empty()) {
+            (Direction::Outgoing, true) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE from_id = ?1"
+            }
+            (Direction::Outgoing, false) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE from_id = ?1 AND relation = ?2"
+            }
+            (Direction::Incoming, true) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE to_id = ?1"
+            }
+            (Direction::Incoming, false) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE to_id = ?1 AND relation = ?2"
+            }
+        };
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let mut rows = if relation.is_empty() {
+            stmt.query(params![object_id]).map_err(|e| e.to_string())?
+        } else {
+            stmt.query(params![object_id, relation])
+                .map_err(|e| e.to_string())?
+        };
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            results.push(row_to_link(row).map_err(|e| e.to_string())?);
+        }
+        Ok(results)
+    }
+
+    pub fn get_links_limited(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        limit: usize,
+    ) -> Result<Vec<Link>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = match (dir, relation.is_empty()) {
+            (Direction::Outgoing, true) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE from_id = ?1 ORDER BY relation, id, from_id, to_id LIMIT ?2"
+            }
+            (Direction::Outgoing, false) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE from_id = ?1 AND relation = ?2 ORDER BY relation, id, from_id, to_id LIMIT ?3"
+            }
+            (Direction::Incoming, true) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE to_id = ?1 ORDER BY relation, id, from_id, to_id LIMIT ?2"
+            }
+            (Direction::Incoming, false) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE to_id = ?1 AND relation = ?2 ORDER BY relation, id, from_id, to_id LIMIT ?3"
+            }
+        };
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(sql)
+            .map_err(|error| error.to_string())?;
+        let rows = if relation.is_empty() {
+            stmt.query_map(params![object_id, limit], row_to_link)
+                .map_err(|error| error.to_string())?
+        } else {
+            stmt.query_map(params![object_id, relation, limit], row_to_link)
+                .map_err(|error| error.to_string())?
+        };
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn get_linked_objects(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+    ) -> Result<Vec<Object>, String> {
+        let links = self.get_links(object_id, relation, dir)?;
+        let mut objects = Vec::new();
+        for link in &links {
+            let target_id = match dir {
+                Direction::Outgoing => &link.to_id,
+                Direction::Incoming => &link.from_id,
+            };
+            if let Ok(Some(obj)) = self.get_object(target_id) {
+                objects.push(obj);
+            }
+        }
+        Ok(objects)
+    }
+
+    pub fn get_links_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Link>, String> {
+        self.get_links_with_policy_context_limited(object_id, relation, dir, context, None)
+    }
+
+    /// [`Self::get_links_with_policy_context`] reading at most `limit` rows.
+    pub fn get_links_with_policy_context_limited(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+        limit: Option<usize>,
+    ) -> Result<Vec<Link>, String> {
+        let (subjects, scopes) = policy_context_json(context)?;
+        let neighbor = match dir {
+            Direction::Outgoing => "l.to_id",
+            Direction::Incoming => "l.from_id",
+        };
+        let root = match dir {
+            Direction::Outgoing => "l.from_id",
+            Direction::Incoming => "l.to_id",
+        };
+        let start_param = if relation.is_empty() { 1 } else { 2 };
+        let mut sql = format!(
+            "SELECT l.id, l.from_id, l.to_id, l.relation, l.created
+             FROM sekai_links l
+             JOIN sekai_objects ON sekai_objects.id = {neighbor}
+             WHERE {root} = ?1"
+        );
+        if !relation.is_empty() {
+            sql.push_str(" AND l.relation = ?2");
+        }
+        sql.push_str(&sqlite_object_security_filter(start_param));
+        if let Some(limit) = limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = if relation.is_empty() {
+            stmt.query_map(params![object_id, subjects, scopes], row_to_link)
+                .map_err(|e| e.to_string())?
+        } else {
+            stmt.query_map(params![object_id, relation, subjects, scopes], row_to_link)
+                .map_err(|e| e.to_string())?
+        };
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_linked_objects_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        let (subjects, scopes) = policy_context_json(context)?;
+        let neighbor = match dir {
+            Direction::Outgoing => "l.to_id",
+            Direction::Incoming => "l.from_id",
+        };
+        let root = match dir {
+            Direction::Outgoing => "l.from_id",
+            Direction::Incoming => "l.to_id",
+        };
+        let start_param = if relation.is_empty() { 1 } else { 2 };
+        let mut sql = format!(
+            "SELECT sekai_objects.id, sekai_objects.kind, sekai_objects.name, sekai_objects.namespace,
+                    sekai_objects.external_id, sekai_objects.properties, sekai_objects.created, sekai_objects.updated
+             FROM sekai_links l
+             JOIN sekai_objects ON sekai_objects.id = {neighbor}
+             WHERE {root} = ?1"
+        );
+        if !relation.is_empty() {
+            sql.push_str(" AND l.relation = ?2");
+        }
+        sql.push_str(&sqlite_object_security_filter(start_param));
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = if relation.is_empty() {
+            stmt.query_map(params![object_id, subjects, scopes], row_to_object)
+                .map_err(|e| e.to_string())?
+        } else {
+            stmt.query_map(
+                params![object_id, relation, subjects, scopes],
+                row_to_object,
+            )
+            .map_err(|e| e.to_string())?
+        };
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn require_authorized_link_endpoints(
+    conn: &Connection,
+    expected_from: &Object,
+    expected_to: &Object,
+    from_generation: Option<&str>,
+    to_generation: Option<&str>,
+) -> Result<(), String> {
+    crate::sekai::audit::require_sqlite_policy_generation(
+        conn,
+        &expected_from.namespace,
+        from_generation,
+    )?;
+    crate::sekai::audit::require_sqlite_policy_generation(
+        conn,
+        &expected_to.namespace,
+        to_generation,
+    )?;
+    let from = conn
+        .query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+            params![expected_from.id],
+            row_to_object,
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.to_string())?;
+    let to = conn
+        .query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+            params![expected_to.id],
+            row_to_object,
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.to_string())?;
+    if !from.persisted_state_matches(expected_from) || !to.persisted_state_matches(expected_to) {
+        return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+    }
+    Ok(())
+}
+
+/// Insert one object on `conn`, so a caller can write it in the same
+/// transaction as related rows. Refuses reserved boundary ids and ids with
+/// audit history.
+pub fn insert_object(conn: &rusqlite::Connection, o: &Object) -> Result<(), String> {
+    if o.external_id.starts_with("namespace:") && o.kind != "namespace" {
+        return Err("namespace:* external IDs are reserved for namespace boundaries".into());
+    }
+    let historical_changes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = ?1",
+            params![o.id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if historical_changes > 0 {
+        return Err("object IDs with audit history cannot be reused".into());
+    }
+    let props = crate::domain::storage_properties_json(&o.properties)?;
+    conn.execute(
+        "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![o.id, o.kind, o.name, o.namespace, o.external_id, props, o.created, o.updated],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn row_to_object(row: &rusqlite::Row) -> rusqlite::Result<Object> {
+    let id: String = row.get(0)?;
+    let props_str: String = row.get(5)?;
+    // Fail closed like Postgres: corrupt properties must not become `{}`
+    // (empty maps soften action_policy / namespace_policy / team_managed).
+    let properties: HashMap<String, String> =
+        serde_json::from_str(&props_str).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid properties for object {id}: {error}"),
+                )),
+            )
+        })?;
+    Ok(Object {
+        id,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        namespace: row.get(3)?,
+        external_id: row.get(4)?,
+        properties,
+        created: row.get(6)?,
+        updated: row.get(7)?,
+    })
+}
+
+struct ListQueryParts {
+    where_sql: String,
+    params: Vec<Box<dyn rusqlite::types::ToSql>>,
+    count_sql: String,
+    where_param_count: usize,
+}
+
+fn build_list_query(filter: &ListFilter) -> Result<ListQueryParts, String> {
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut where_parts: Vec<String> = Vec::new();
+
+    if let Some(kind) = &filter.kind {
+        where_parts.push(format!("kind = ?{}", params.len() + 1));
+        params.push(Box::new(kind.clone()));
+    }
+    if let Some(name) = &filter.name {
+        where_parts.push(format!("name = ?{}", params.len() + 1));
+        params.push(Box::new(name.clone()));
+    }
+    if let Some(namespace) = &filter.namespace {
+        where_parts.push(format!("namespace = ?{}", params.len() + 1));
+        params.push(Box::new(namespace.clone()));
+    }
+
+    for property_filter in &filter.property_filters {
+        let condition = build_property_filter_condition(property_filter, &mut params)?;
+        where_parts.push(condition);
+    }
+
+    for interface_name in &filter.interface_filter {
+        where_parts.push(format!(
+            "EXISTS (
+                SELECT 1 FROM sekai_object_types
+                WHERE sekai_object_types.kind = sekai_objects.kind
+                  AND EXISTS (
+                    SELECT 1 FROM json_each(sekai_object_types.implements_json)
+                    WHERE json_each.value = ?{}
+                  )
+            )",
+            params.len() + 1
+        ));
+        params.push(Box::new(interface_name.clone()));
+    }
+
+    let where_sql = if where_parts.is_empty() {
+        " WHERE 1 = 1".to_string()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+    let where_param_count = params.len();
+
+    let count_sql = format!("SELECT COUNT(*) FROM sekai_objects{}", where_sql);
+
+    Ok(ListQueryParts {
+        where_sql,
+        params,
+        count_sql,
+        where_param_count,
+    })
+}
+
+fn build_visibility_filter(
+    principals: &[&str],
+    start_param: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    build_visibility_filter_internal(principals, start_param)
+}
+
+fn build_visibility_filter_for_count_query(
+    principals: &[&str],
+    start_param: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    build_visibility_filter_internal(principals, start_param)
+}
+
+fn build_visibility_filter_internal(
+    principals: &[&str],
+    start_param: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let privileged = principals
+        .iter()
+        .any(|principal| matches!(*principal, "root" | "local"));
+    let effective_principals: Vec<&str> = principals
+        .iter()
+        .copied()
+        .filter(|principal| !principal.is_empty() && principal != &"anonymous")
+        .collect();
+    if effective_principals.is_empty() {
+        return (
+            " AND NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id)
+             AND NOT EXISTS (
+                 SELECT 1 FROM sekai_objects team_namespace
+                 WHERE team_namespace.kind = 'namespace'
+                   AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
+                   AND (
+                        json_valid(team_namespace.properties) = 0
+                        OR json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                   )
+             )"
+            .to_string(),
+            Vec::new(),
+        );
+    }
+
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let principal_placeholders = effective_principals
+        .iter()
+        .enumerate()
+        .map(|(idx, principal)| {
+            let param_idx = start_param + idx + 1;
+            params.push(Box::new((*principal).to_string()));
+            format!("?{param_idx}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let team_namespace_filter = if privileged {
+        String::new()
+    } else {
+        // Corrupt boundary properties fail closed as team-managed so listing
+        // cannot treat a broken isolation marker as an open namespace.
+        format!(
+            " AND (
+                NOT EXISTS (
+                    SELECT 1 FROM sekai_objects team_namespace
+                    WHERE team_namespace.kind = 'namespace'
+                      AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
+                      AND (
+                        json_valid(team_namespace.properties) = 0
+                        OR json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM sekai_objects team_namespace
+                    JOIN sekai_grants team_grant ON team_grant.object_id = team_namespace.id
+                    WHERE team_namespace.kind = 'namespace'
+                      AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
+                      AND (
+                        json_valid(team_namespace.properties) = 0
+                        OR json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                      )
+                      AND team_grant.principal IN ({principal_placeholders})
+                      AND (team_grant.not_after_ms = 0 OR team_grant.not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
+                )
+            )"
+        )
+    };
+
+    (
+        format!(
+            " AND (NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id) OR EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id AND principal IN ({principal_placeholders}) AND (not_after_ms = 0 OR not_after_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)))){team_namespace_filter}"
+        ),
+        params,
+    )
+}
+
+fn build_marking_visibility_filter(
+    allowed_markings: Option<&[&str]>,
+    trusted: bool,
+    start_param: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let Some(allowed_markings) = allowed_markings else {
+        return (String::new(), Vec::new());
+    };
+    if trusted {
+        return (String::new(), Vec::new());
+    }
+    // Unknown/empty markings are legacy domain values and are treated as
+    // unmarked by `object_classification`; only the closed v1 lattice needs a
+    // clearance predicate here.
+    let marking_expr = "LOWER(TRIM(json_extract(sekai_objects.properties, '$.access_marking')))";
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut sql = format!(
+        " AND ({marking_expr} IS NULL OR {marking_expr} = '' OR {marking_expr} NOT IN ('public','internal','confidential','restricted')"
+    );
+    if !allowed_markings.is_empty() {
+        let placeholders = allowed_markings
+            .iter()
+            .enumerate()
+            .map(|(offset, marking)| {
+                params.push(Box::new((*marking).to_string()));
+                format!("?{}", start_param + offset + 1)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" OR {marking_expr} IN ({placeholders})"));
+    }
+    sql.push(')');
+    (sql, params)
+}
+
+fn policy_context_json(context: &PrincipalPolicyContext) -> Result<(String, String), String> {
+    let context = context.clone().normalized();
+    let subjects = context.sql_subjects();
+    let scopes = context.sql_scopes();
+    Ok((subjects, scopes))
+}
+
+fn build_sqlite_object_security_filter(
+    context: Option<&PrincipalPolicyContext>,
+    start_param: usize,
+) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>), String> {
+    let Some(context) = context else {
+        return Ok((String::new(), Vec::new()));
+    };
+    let context = context.clone().normalized();
+    let subjects = context.sql_subjects();
+    let scopes = context.sql_scopes();
+    Ok((
+        sqlite_object_security_filter(start_param),
+        vec![Box::new(subjects), Box::new(scopes)],
+    ))
+}
+
+pub fn sqlite_object_security_filter(start_param: usize) -> String {
+    let subjects = start_param + 1;
+    let scopes = start_param + 2;
+    format!(
+        " AND (
+            NOT EXISTS (
+                SELECT 1 FROM sekai_object_security_activations activation
+                WHERE activation.namespace = sekai_objects.namespace
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM json_each(?{subjects}) authority
+                WHERE NOT EXISTS (
+                SELECT 1
+                FROM sekai_object_security_active_policies active
+                JOIN sekai_object_security_rules rule
+                  ON rule.namespace=active.namespace
+                 AND rule.revision_digest=active.revision_digest
+                WHERE active.namespace=sekai_objects.namespace
+                  AND active.kind=sekai_objects.kind
+                  AND rule.operation='read'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM sekai_object_security_predicates predicate
+                    WHERE predicate.namespace=rule.namespace
+                      AND predicate.revision_digest=rule.revision_digest
+                      AND predicate.rule_index=rule.rule_index
+                      AND CASE predicate.predicate_kind
+                        WHEN 'allow_all' THEN 0
+                        WHEN 'subject_equals_property' THEN NOT EXISTS (
+                            SELECT 1 FROM json_each(authority.value) subject
+                            WHERE subject.value=json_extract(
+                                sekai_objects.properties, '$.' || predicate.property_key
+                            )
+                        )
+                        WHEN 'required_scope_equals' THEN NOT EXISTS (
+                            SELECT 1 FROM json_each(json_extract(?{scopes}, '$[' || authority.key || ']')) scope
+                            WHERE scope.value=predicate.fixed_value
+                        )
+                        WHEN 'property_equals' THEN
+                            COALESCE(json_extract(
+                                sekai_objects.properties, '$.' || predicate.property_key
+                            ), '') <> predicate.fixed_value
+                        ELSE 1
+                      END
+                  )
+                )
+            )
+        )"
+    )
+}
+
+fn build_property_filter_condition(
+    filter: &PropertyFilter,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> Result<String, String> {
+    if !is_valid_property_key(&filter.key) {
+        return Err("invalid property key".into());
+    }
+
+    let op = filter.op.to_lowercase();
+    let path = format!("$.{}", filter.key);
+    let mut make_path_expr = || {
+        let path_param = format!("?{}", params.len() + 1);
+        params.push(Box::new(path.clone()));
+        format!("json_extract(properties, {path_param})")
+    };
+
+    match op.as_str() {
+        "eq" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            params.push(Box::new(filter.value.clone()));
+            Ok(format!("{path_expr} = {value_param}"))
+        }
+        "ne" | "neq" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            params.push(Box::new(filter.value.clone()));
+            // ne/neq intentionally match only objects with an explicit property value and
+            // do not include rows where the JSON path resolves to NULL.
+            Ok(format!("{path_expr} != {value_param}"))
+        }
+        "contains" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            params.push(Box::new(format!(
+                "%{}%",
+                escape_like_pattern(&filter.value)
+            )));
+            Ok(format!("{path_expr} LIKE {value_param} ESCAPE '\\'"))
+        }
+        "prefix" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            params.push(Box::new(format!("{}%", escape_like_pattern(&filter.value))));
+            Ok(format!("{path_expr} LIKE {value_param} ESCAPE '\\'"))
+        }
+        "in" => {
+            let values: Vec<&str> = filter
+                .value
+                .split(',')
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .collect();
+            if values.is_empty() {
+                return Ok("0 = 1".into());
+            }
+            let path_expr = make_path_expr();
+            let mut in_parts = Vec::new();
+            for value in values {
+                let value_param = format!("?{}", params.len() + 1);
+                in_parts.push(value_param);
+                params.push(Box::new(value.to_string()));
+            }
+            Ok(format!(
+                "{path_expr} IN ({})",
+                in_parts.into_iter().collect::<Vec<_>>().join(",")
+            ))
+        }
+        "gt" | "gte" | "lt" | "lte" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            let compare = match op.as_str() {
+                "gt" => ">",
+                "gte" => ">=",
+                "lt" => "<",
+                "lte" => "<=",
+                _ => unreachable!(),
+            };
+            params.push(Box::new(filter.value.clone()));
+            Ok(build_numeric_or_text_expr(
+                &path_expr,
+                &value_param,
+                compare,
+            ))
+        }
+        _ => Err(format!("unsupported property operator: {}", filter.op)),
+    }
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn build_numeric_or_text_expr(left_expr: &str, value_param: &str, compare: &str) -> String {
+    format!(
+        "((is_numeric_text({left_expr}) AND is_numeric_text({value_param}) AND CAST({left_expr} AS REAL) {compare} CAST({value_param} AS REAL)) OR ((NOT is_numeric_text({left_expr}) OR NOT is_numeric_text({value_param})) AND {left_expr} {compare} {value_param}))"
+    )
+}
+
+const LIST_OBJECT_COLUMNS: &str =
+    "id, kind, name, namespace, external_id, properties, created, updated";
+
+fn property_value_order_sql(value_expr: &str, descending: bool) -> String {
+    let direction = if descending { "DESC" } else { "ASC" };
+    format!(
+        " ORDER BY CASE WHEN {value_expr} IS NULL THEN 1 ELSE 0 END, CASE WHEN is_numeric_text({value_expr}) THEN 0 ELSE 1 END, CASE WHEN is_numeric_text({value_expr}) THEN CAST({value_expr} AS REAL) ELSE CAST(NULL AS REAL) END {direction}, CASE WHEN is_numeric_text({value_expr}) THEN '' ELSE {value_expr} END {direction}, id ASC"
+    )
+}
+
+/// List SELECT that extracts a property sort key once per matching row.
+fn list_objects_select_sql(
+    from_and_where: &str,
+    order_by: &str,
+    descending: bool,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> Result<String, String> {
+    if let Some(key) = order_by.strip_prefix("property:") {
+        if !is_valid_property_key(key) {
+            return Err(format!("invalid property key: {key}"));
+        }
+        params.push(Box::new(format!("$.{key}")));
+        let path_expr = format!("?{}", params.len());
+        let order_sql = property_value_order_sql("sort_v", descending);
+        return Ok(format!(
+            "WITH listed AS MATERIALIZED (SELECT {LIST_OBJECT_COLUMNS}, json_extract(properties, {path_expr}) AS sort_v {from_and_where}) SELECT {LIST_OBJECT_COLUMNS} FROM listed{order_sql}"
+        ));
+    }
+    let mut sql = format!("SELECT {LIST_OBJECT_COLUMNS} {from_and_where}");
+    if let Some(order_sql) = build_order_by_sql(order_by, descending)? {
+        sql.push_str(&order_sql);
+    }
+    Ok(sql)
+}
+
+fn build_order_by_sql(order_by: &str, descending: bool) -> Result<Option<String>, String> {
+    if order_by.is_empty() {
+        return Ok(Some(" ORDER BY id ASC".to_string()));
+    }
+    let direction = if descending { "DESC" } else { "ASC" };
+    let order_sql = match order_by {
+        "name" => {
+            format!(" ORDER BY name {direction}, id ASC")
+        }
+        "created" => {
+            format!(" ORDER BY created {direction}, id ASC")
+        }
+        "updated" => {
+            format!(" ORDER BY updated {direction}, id ASC")
+        }
+        _ if order_by.starts_with("property:") => {
+            return Err("property order_by must use list_objects_select_sql".into());
+        }
+        _ => {
+            return Err(format!("unsupported order_by: {order_by}"));
+        }
+    };
+    Ok(Some(order_sql))
+}
+
+fn row_to_principal_credential(
+    row: &rusqlite::Row,
+) -> Result<PrincipalCredential, rusqlite::Error> {
+    Ok(PrincipalCredential {
+        id: row.get(0)?,
+        principal: row.get(1)?,
+        token_hash: row.get(2)?,
+        status: row.get(3)?,
+        created: row.get(4)?,
+        rotated_at: row.get(5)?,
+        revoked_at: row.get(6)?,
+        tenant_id: String::new(),
+    })
+}
+
+fn legacy_tenant_state_message() -> String {
+    "legacy SQLite tenant state detected; Sekai owns no tenant state on any backend (ADR 0099). Back up the database and move tenant records to the identity extension (docs/tenant-migration.md) before starting this version; no legacy tenant data was changed".into()
+}
+
+fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {
+    Ok(Link {
+        id: row.get(0)?,
+        from_id: row.get(1)?,
+        to_id: row.get(2)?,
+        relation: row.get(3)?,
+        created: row.get(4)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sekai::security;
+    use std::path::PathBuf;
+
+    fn test_db() -> SekaiDb {
+        SekaiDb::new(":memory:").unwrap()
+    }
+
+    /// #1554: the single in-memory connection cannot be checked out twice on
+    /// one thread. That fails at once instead of waiting on the pool until
+    /// an external kill.
+    #[test]
+    #[should_panic(expected = "nested SQLite checkout")]
+    fn nested_in_memory_checkout_fails_at_once() {
+        let db = test_db();
+        let _outer = db.conn();
+        let _inner = db.conn();
+    }
+
+    /// Opening an in-memory store runs every migration family, dataset
+    /// health included, without a nested checkout.
+    #[test]
+    fn in_memory_store_migrates_without_a_nested_checkout() {
+        let db = test_db();
+        assert!(db.list_datasets().unwrap().is_empty());
+        let _held = db.conn();
+    }
+
+    #[test]
+    fn nested_memory_checkout_fails_fast() {
+        let db = test_db();
+        let started = Instant::now();
+        let _outer = db.conn();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = db.conn();
+        }));
+        assert!(
+            panicked.is_err(),
+            "nested checkout must fail instead of waiting on the single-connection pool"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "nested checkout waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sekai-chisei-{name}-{}-{}.db",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ))
+    }
+
+    fn table_columns(db: &SekaiDb, table: &str) -> Vec<String> {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn namespace_listing_query_plan_is_pinned() {
+        let db = test_db();
+        let conn = db.conn();
+        let mut statement = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE namespace = ?1
+                 ORDER BY id ASC
+                 LIMIT 16",
+            )
+            .unwrap();
+        let plan = statement
+            .query_map(["benchmark"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("sqlite_autoindex_sekai_objects_1")),
+            "unexpected namespace listing plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn migrate_all_upgrades_previous_schema_fixture() {
+        let path = temp_db_path("upgrade");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sekai_work_units (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    target_object_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    requested_spec TEXT NOT NULL DEFAULT '',
+                    scope_id TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    timeout_seconds INTEGER NOT NULL DEFAULT 0,
+                    heartbeat_ttl_seconds INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    admitted_at INTEGER NOT NULL DEFAULT 0,
+                    started_at INTEGER NOT NULL DEFAULT 0,
+                    finished_at INTEGER NOT NULL DEFAULT 0,
+                    last_heartbeat_at INTEGER NOT NULL DEFAULT 0,
+                    failure_reason TEXT NOT NULL DEFAULT '',
+                    cancel_reason TEXT NOT NULL DEFAULT '',
+                    owner_principal TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE chisei_eval_iterations (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    suite_id TEXT NOT NULL,
+                    changed_file TEXT NOT NULL,
+                    diff_hash TEXT NOT NULL,
+                    parent_iteration_id TEXT NOT NULL,
+                    baseline_run_id TEXT NOT NULL,
+                    candidate_run_id TEXT NOT NULL,
+                    delta REAL NOT NULL,
+                    regressed INTEGER NOT NULL,
+                    created INTEGER NOT NULL
+                );
+                CREATE TABLE chisei_sample_observations (
+                    request_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL DEFAULT '',
+                    spec TEXT NOT NULL DEFAULT '',
+                    resolved_model TEXT NOT NULL DEFAULT '',
+                    output_content TEXT NOT NULL DEFAULT '',
+                    sample_reason TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    stop_reason TEXT NOT NULL DEFAULT '',
+                    timestamp INTEGER NOT NULL,
+                    scored INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE sekai_task_observations (
+                    request_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    component_id TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    packages_json TEXT NOT NULL DEFAULT '[]',
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (request_id, component_id)
+                );
+                CREATE TABLE sekai_task_observation_baselines (
+                    component_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    task_total INTEGER NOT NULL,
+                    task_succeeded INTEGER NOT NULL,
+                    consecutive_failures INTEGER NOT NULL,
+                    created INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.migrate_all().unwrap();
+
+        let work_unit_columns = table_columns(&db, "sekai_work_units");
+        assert!(work_unit_columns.contains(&"creator_principal".to_string()));
+        assert!(work_unit_columns.contains(&"idempotency_key".to_string()));
+        assert!(work_unit_columns.contains(&"updated_at".to_string()));
+
+        let iteration_columns = table_columns(&db, "chisei_eval_iterations");
+        assert!(iteration_columns.contains(&"namespace".to_string()));
+
+        let observation_columns = table_columns(&db, "chisei_sample_observations");
+        assert!(observation_columns.contains(&"attempts".to_string()));
+
+        let task_observation_columns = table_columns(&db, "sekai_task_observations");
+        assert!(task_observation_columns.contains(&"component_id".to_string()));
+
+        let baseline_columns = table_columns(&db, "sekai_task_observation_baselines");
+        assert!(baseline_columns.contains(&"task_succeeded".to_string()));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn new_fails_for_garbage_db_file() {
+        let path = temp_db_path("garbage");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+
+        let err = match SekaiDb::new(path.to_str().unwrap()) {
+            Ok(_) => panic!("garbage database unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(!err.trim().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_database_uses_wal_and_five_second_busy_timeout() {
+        let path = temp_db_path("wal");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+
+        {
+            let conn = db.conn();
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            let busy_timeout_ms: i64 = conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            assert_eq!(busy_timeout_ms, 5000);
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn make_obj(id: &str, kind: &str, name: &str) -> Object {
+        Object {
+            id: id.into(),
+            kind: kind.into(),
+            name: name.into(),
+            namespace: "default".into(),
+            external_id: format!("{}:{}", kind, name),
+            properties: HashMap::new(),
+            created: 1000,
+            updated: 1000,
+        }
+    }
+
+    fn make_obj_with_property(id: &str, kind: &str, name: &str, key: &str, value: &str) -> Object {
+        let mut obj = make_obj(id, kind, name);
+        obj.properties.insert(key.into(), value.into());
+        obj
+    }
+
+    #[test]
+    fn test_crud_object() {
+        let db = test_db();
+        let mut obj = make_obj("o1", "namespace", "my-namespace");
+        obj.properties.insert("language".into(), "rust".into());
+        db.create_object(&obj).unwrap();
+
+        let got = db.get_object("o1").unwrap().unwrap();
+        assert_eq!(got.name, "my-namespace");
+        assert_eq!(got.properties["language"], "rust");
+
+        obj.name = "renamed".into();
+        obj.updated = 2000;
+        db.update_object(&obj).unwrap();
+        let got = db.get_object("o1").unwrap().unwrap();
+        assert_eq!(got.name, "renamed");
+
+        db.delete_object("o1").unwrap();
+        assert!(db.get_object("o1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_list_and_find() {
+        let db = test_db();
+        db.create_object(&make_obj("r1", "namespace", "alpha"))
+            .unwrap();
+        db.create_object(&make_obj("r2", "namespace", "beta"))
+            .unwrap();
+        db.create_object(&make_obj("c1", "component", "comp"))
+            .unwrap();
+
+        let all = db.list_objects(&ListFilter::default()).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let namespaces = db
+            .list_objects(&ListFilter {
+                kind: Some("namespace".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(namespaces.len(), 2);
+
+        let found = db.find_by_external_id("namespace:alpha").unwrap();
+        assert_eq!(found.unwrap().id, "r1");
+    }
+
+    #[test]
+    fn test_list_objects_filters_by_interface() {
+        use crate::sekai::schema::{InterfaceDef, ObjectType, PropertyDef, PropertyType};
+
+        let db = test_db();
+        db.upsert_interface(&InterfaceDef {
+            name: "RiskScored".into(),
+            description: "Risk scored".into(),
+            properties: vec![],
+            is_builtin: false,
+        })
+        .unwrap();
+        db.upsert_interface(&InterfaceDef {
+            name: "Governed".into(),
+            description: "Governed".into(),
+            properties: vec![],
+            is_builtin: false,
+        })
+        .unwrap();
+        db.upsert_object_type(&ObjectType {
+            kind: "model".into(),
+            description: "Model".into(),
+            properties: vec![PropertyDef {
+                name: "risk_score".into(),
+                prop_type: PropertyType::Float,
+                required: false,
+                description: String::new(),
+                enum_values: vec![],
+                link_kind: String::new(),
+                compute_expr: String::new(),
+                classification: crate::sekai::schema::default_property_classification(),
+                struct_fields: vec![],
+            }],
+            is_builtin: false,
+            implements: vec!["RiskScored".into(), "Governed".into()],
+        })
+        .unwrap();
+        db.upsert_object_type(&ObjectType {
+            kind: "component".into(),
+            description: "Component".into(),
+            properties: vec![],
+            is_builtin: false,
+            implements: vec!["Governed".into()],
+        })
+        .unwrap();
+        db.create_object(&make_obj("m1", "model", "model")).unwrap();
+        db.create_object(&make_obj("c1", "component", "component"))
+            .unwrap();
+
+        let (objects, total) = db
+            .list_objects_with_total(&ListFilter {
+                interface_filter: vec!["RiskScored".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(objects[0].id, "m1");
+
+        let (objects, total) = db
+            .list_objects_with_total(&ListFilter {
+                interface_filter: vec!["RiskScored".into(), "Governed".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(objects[0].id, "m1");
+    }
+
+    #[test]
+    fn malformed_object_row_returns_error_without_poisoning_connection() {
+        let db = test_db();
+        db.create_object(&make_obj("good", "namespace", "good"))
+            .unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO sekai_objects
+                 (id, kind, name, namespace, external_id, properties, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    "bad",
+                    "namespace",
+                    "bad",
+                    "default",
+                    "namespace:bad",
+                    "{}",
+                    "not-an-integer",
+                    1000_i64,
+                ),
+            )
+            .unwrap();
+        }
+
+        assert!(db.get_object("bad").is_err());
+        assert!(db.find_by_external_id("namespace:bad").is_err());
+
+        let good = db.get_object("good").unwrap().unwrap();
+        assert_eq!(good.id, "good");
+    }
+
+    fn insert_corrupt_object_properties(db: &SekaiDb, id: &str, kind: &str, external_id: &str) {
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO sekai_objects
+             (id, kind, name, namespace, external_id, properties, created, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (id, kind, id, "acme", external_id, "{not-json", 1_i64, 1_i64),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn corrupt_object_properties_fail_closed_with_object_id() {
+        let db = test_db();
+        insert_corrupt_object_properties(&db, "policy-bad", "action_policy", "action_policy:ns");
+        let err = db.get_object("policy-bad").unwrap_err();
+        assert!(
+            err.contains("invalid properties for object policy-bad"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("{not-json"),
+            "error must not leak corrupt payload: {err}"
+        );
+    }
+
+    #[test]
+    fn corrupt_action_policy_object_properties_fail_closed() {
+        let db = test_db();
+        insert_corrupt_object_properties(
+            &db,
+            "action-policy-bad",
+            "action_policy",
+            "action_policy:agent:codex",
+        );
+        let err = db.get_action_policy("agent:codex").unwrap_err();
+        assert!(
+            err.contains("invalid properties for object action-policy-bad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn corrupt_namespace_policy_object_properties_fail_closed() {
+        let db = test_db();
+        insert_corrupt_object_properties(
+            &db,
+            "ns-policy-bad",
+            "namespace_policy",
+            "namespace_policy:acme",
+        );
+        let err = db.find_by_external_id("namespace_policy:acme").unwrap_err();
+        assert!(
+            err.contains("invalid properties for object ns-policy-bad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn corrupt_team_managed_namespace_properties_fail_closed() {
+        let db = test_db();
+        insert_corrupt_object_properties(&db, "ns-acme", "namespace", "namespace:acme");
+        db.create_object(&make_obj("secret", "note", "secret"))
+            .unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "UPDATE sekai_objects SET namespace = 'acme' WHERE id = 'secret'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let err = db.find_namespace_boundary("acme").unwrap_err();
+        assert!(
+            err.contains("invalid properties for object ns-acme"),
+            "unexpected error: {err}"
+        );
+
+        let (visible, _) = db
+            .list_objects_with_total_for_principals(
+                &ListFilter {
+                    kind: Some("note".into()),
+                    namespace: Some("acme".into()),
+                    ..Default::default()
+                },
+                &["alice"],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            visible.is_empty(),
+            "corrupt team boundary must not open namespace listing: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn pooled_connection_is_returned_after_unwind() {
+        let db = test_db();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _conn = db.conn();
+            panic!("unwind while holding pooled connection");
+        }));
+        assert!(panicked.is_err());
+
+        db.ping().unwrap();
+    }
+
+    #[test]
+    fn persistent_database_uses_a_multi_connection_pool() {
+        let path = std::env::temp_dir().join(format!("sekai-pool-{}.db", Uuid::new_v4()));
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(db.pool.max_size(), 16);
+        let first = db.conn();
+        let second = db.conn();
+        first.query_row("SELECT 1", [], |_| Ok(())).unwrap();
+        second.query_row("SELECT 1", [], |_| Ok(())).unwrap();
+        drop((first, second, db));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    }
+
+    #[test]
+    fn list_objects_with_total_for_principals_orders_by_property_with_visibility_filter() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "alice-only",
+            "widget",
+            "widget-alice",
+            "tier",
+            "20",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "bob-only",
+            "widget",
+            "widget-bob",
+            "tier",
+            "30",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "public",
+            "widget",
+            "widget-public",
+            "tier",
+            "10",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "no-tier",
+            "widget",
+            "widget-no-tier",
+            "region",
+            "us",
+        ))
+        .unwrap();
+
+        db.create_grant(&security::Grant {
+            id: format!("grant-{}", Uuid::new_v4().simple()),
+            object_id: "alice-only".to_string(),
+            principal: "alice".to_string(),
+            role: security::Role::Viewer,
+            created: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        db.create_grant(&security::Grant {
+            id: format!("grant-{}", Uuid::new_v4().simple()),
+            object_id: "bob-only".to_string(),
+            principal: "bob".to_string(),
+            role: security::Role::Viewer,
+            created: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let (ordered, total) = db
+            .list_objects_with_total_for_principals(
+                &ListFilter {
+                    kind: Some("widget".into()),
+                    order_by: "property:tier".into(),
+                    ..Default::default()
+                },
+                &["alice"],
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(total, 3);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].id, "public");
+        assert_eq!(ordered[1].id, "alice-only");
+        assert_eq!(ordered[2].id, "no-tier");
+    }
+
+    #[test]
+    fn property_order_extracts_json_once() {
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let sql = list_objects_select_sql(
+            "FROM sekai_objects WHERE kind = ?1",
+            "property:tier",
+            false,
+            &mut params,
+        )
+        .unwrap();
+        assert_eq!(sql.matches("json_extract").count(), 1, "{sql}");
+        assert!(sql.contains("MATERIALIZED"), "{sql}");
+        assert!(sql.contains("AS sort_v"), "{sql}");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn test_links() {
+        let db = test_db();
+        db.create_object(&make_obj("r1", "namespace", "my-namespace"))
+            .unwrap();
+        db.create_object(&make_obj("c1", "component", "comp"))
+            .unwrap();
+
+        let link = Link {
+            id: "l1".into(),
+            from_id: "r1".into(),
+            to_id: "c1".into(),
+            relation: "contains".into(),
+            created: 1000,
+        };
+        db.create_link(&link).unwrap();
+
+        let links = db
+            .get_links("r1", "contains", &Direction::Outgoing)
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].to_id, "c1");
+
+        let all_outgoing = db.get_links("r1", "", &Direction::Outgoing).unwrap();
+        assert_eq!(all_outgoing.len(), 1);
+        assert_eq!(all_outgoing[0].relation, "contains");
+
+        let limited = db
+            .get_links_limited("r1", "contains", &Direction::Outgoing, 1)
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].to_id, "c1");
+
+        let limited_all = db
+            .get_links_limited("c1", "", &Direction::Incoming, 1)
+            .unwrap();
+        assert_eq!(limited_all.len(), 1);
+        assert_eq!(limited_all[0].from_id, "r1");
+
+        let objs = db
+            .get_linked_objects("r1", "contains", &Direction::Outgoing)
+            .unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0].name, "comp");
+
+        let incoming = db
+            .get_linked_objects("c1", "contains", &Direction::Incoming)
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].name, "my-namespace");
+
+        db.delete_link("l1").unwrap();
+        let links = db
+            .get_links("r1", "contains", &Direction::Outgoing)
+            .unwrap();
+        assert_eq!(links.len(), 0);
+    }
+
+    #[test]
+    fn authorized_link_create_rejects_stale_endpoint_snapshot() {
+        let db = test_db();
+        let from = make_obj("r1", "namespace", "my-namespace");
+        let to = make_obj("c1", "component", "comp");
+        db.create_object(&from).unwrap();
+        db.create_object(&to).unwrap();
+        let mut stale = from.clone();
+        stale.name = "other".into();
+        let err = db
+            .create_link_with_authorized_endpoints(
+                &Link {
+                    id: "l1".into(),
+                    from_id: from.id.clone(),
+                    to_id: to.id.clone(),
+                    relation: "contains".into(),
+                    created: 1000,
+                },
+                &stale,
+                &to,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err, crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION);
+        db.create_link_with_authorized_endpoints(
+            &Link {
+                id: "l1".into(),
+                from_id: from.id.clone(),
+                to_id: to.id.clone(),
+                relation: "contains".into(),
+                created: 1000,
+            },
+            &from,
+            &to,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut changed = to.clone();
+        changed.name = "renamed".into();
+        db.update_object(&changed).unwrap();
+        let err = db
+            .delete_link_with_authorized_endpoints("l1", &from, &to, None, None)
+            .unwrap_err();
+        assert_eq!(err, crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION);
+        db.update_object(&to).unwrap();
+        db.delete_link("l1").unwrap();
+        db.create_link(&Link {
+            id: "l1".into(),
+            from_id: to.id.clone(),
+            to_id: from.id.clone(),
+            relation: "contains".into(),
+            created: 1001,
+        })
+        .unwrap();
+        let err = db
+            .delete_link_with_authorized_endpoints("l1", &from, &to, None, None)
+            .unwrap_err();
+        assert_eq!(err, crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION);
+    }
+
+    #[test]
+    fn list_objects_with_property_filters_and_ordering() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "a", "widget", "widget-a", "tier", "2",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "b", "widget", "widget-b", "tier", "10",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "c", "widget", "widget-c", "tier", "4",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "d", "widget", "widget-d", "region", "us",
+        ))
+        .unwrap();
+
+        let matches = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("widget".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "tier".into(),
+                    op: "gt".into(),
+                    value: "1".into(),
+                }],
+                order_by: "property:tier".into(),
+                descending: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].id, "a");
+        assert_eq!(matches[1].id, "c");
+        assert_eq!(matches[2].id, "b");
+
+        let matches_desc = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("widget".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "tier".into(),
+                    op: "gt".into(),
+                    value: "1".into(),
+                }],
+                order_by: "property:tier".into(),
+                descending: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(matches_desc.len(), 3);
+        assert_eq!(matches_desc[0].id, "b");
+        assert_eq!(matches_desc[1].id, "c");
+        assert_eq!(matches_desc[2].id, "a");
+
+        let total = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("widget".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "tier".into(),
+                    op: "gt".into(),
+                    value: "1".into(),
+                }],
+                order_by: "property:tier".into(),
+                descending: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .1;
+        assert_eq!(total, 3);
+
+        let missing_last = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("widget".into()),
+                order_by: "property:region".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(missing_last[0].id, "d");
+    }
+
+    #[test]
+    fn list_objects_filter_string_and_in_operators() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "x",
+            "component",
+            "a",
+            "status",
+            "todo",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "y",
+            "component",
+            "b",
+            "status",
+            "done",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "z",
+            "component",
+            "c",
+            "status",
+            "blocked",
+        ))
+        .unwrap();
+
+        let all = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "status".into(),
+                    op: "in".into(),
+                    value: "todo,done".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|obj| obj.id == "x"));
+        assert!(all.iter().any(|obj| obj.id == "y"));
+
+        let count = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "status".into(),
+                    op: "contains".into(),
+                    value: "do".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .1;
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn list_objects_property_filter_in_with_empty_values_returns_empty_without_error() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "x",
+            "component",
+            "a",
+            "status",
+            "todo",
+        ))
+        .unwrap();
+
+        let count = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "status".into(),
+                    op: "in".into(),
+                    value: ",  ,".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .1;
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn list_objects_contains_escapes_like_wildcards() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "a",
+            "component",
+            "a",
+            "status",
+            "a%b",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "b",
+            "component",
+            "b",
+            "status",
+            "aXb",
+        ))
+        .unwrap();
+
+        let filtered = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "status".into(),
+                    op: "contains".into(),
+                    value: "a%b".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "a");
+    }
+
+    #[test]
+    fn list_all_objects_returns_all_matching_results() {
+        let db = test_db();
+        for i in 0..1105 {
+            db.create_object(&make_obj(
+                &format!("obj-{i}"),
+                "widget",
+                &format!("widget-{i}"),
+            ))
+            .unwrap();
+        }
+
+        let objects = db
+            .list_all_objects(&ListFilter {
+                kind: Some("widget".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(objects.len(), 1105);
+    }
+
+    #[test]
+    fn list_objects_combined_property_filters_and_pagination() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property("a", "service", "s-a", "tier", "10"))
+            .unwrap();
+        db.create_object(&make_obj_with_property("b", "service", "s-b", "tier", "20"))
+            .unwrap();
+        db.create_object(&make_obj_with_property("c", "service", "s-c", "tier", "20"))
+            .unwrap();
+        db.create_object(&make_obj_with_property(
+            "d", "service", "s-d", "status", "ready",
+        ))
+        .unwrap();
+
+        let filtered = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("service".into()),
+                property_filters: vec![
+                    PropertyFilter {
+                        key: "tier".into(),
+                        op: "gte".into(),
+                        value: "10".into(),
+                    },
+                    PropertyFilter {
+                        key: "tier".into(),
+                        op: "lte".into(),
+                        value: "20".into(),
+                    },
+                ],
+                order_by: "name".into(),
+                limit: 2,
+                offset: 0,
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|obj| obj.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        let second_page = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("service".into()),
+                property_filters: vec![
+                    PropertyFilter {
+                        key: "tier".into(),
+                        op: "gte".into(),
+                        value: "10".into(),
+                    },
+                    PropertyFilter {
+                        key: "tier".into(),
+                        op: "lte".into(),
+                        value: "20".into(),
+                    },
+                ],
+                order_by: "name".into(),
+                limit: 2,
+                offset: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        let results = second_page.0;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "c");
+        assert_eq!(second_page.1, 3);
+    }
+
+    #[test]
+    fn list_objects_parameterized_values_are_safe() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "o1",
+            "component",
+            "safe",
+            "name",
+            "trusted",
+        ))
+        .unwrap();
+
+        let matches = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "name".into(),
+                    op: "eq".into(),
+                    value: "x'; DROP TABLE sekai_objects; --".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(matches.0.len(), 0);
+        assert_eq!(matches.1, 0);
+    }
+
+    #[test]
+    fn principal_credentials_round_trip() {
+        let db = test_db();
+        let _credential = db
+            .create_principal_credential("alice", "hash-alice", 1)
+            .unwrap();
+        let active = db.list_active_credentials().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].principal, "alice");
+        assert_eq!(active[0].status, "active");
+
+        let rotated = db
+            .rotate_principal_credential("alice", "hash-alice-2")
+            .unwrap();
+        assert_eq!(rotated.principal, "alice");
+
+        let all = db.list_credentials(Some("alice"), None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|c| c.status == "revoked"));
+
+        let revoked = db.revoke_principal_credential("alice").unwrap();
+        assert!(revoked.is_some());
+        let active = db.list_active_credentials().unwrap();
+        assert!(active.is_empty());
+        assert!(matches!(
+            db.list_credentials(Some("alice"), Some("revoked"))
+                .unwrap()
+                .len(),
+            2..=2
+        ));
+    }
+
+    #[test]
+    fn fresh_sqlite_database_contains_no_tenant_schema() {
+        let db = test_db();
+        let conn = db.conn();
+        let tenant_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sekai_tenants','sekai_tenant_requests','sekai_tenant_memberships','sekai_namespace_ownership')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tenant_tables, 0);
+        drop(conn);
+        assert!(
+            !table_columns(&db, "sekai_principal_credentials")
+                .iter()
+                .any(|column| column == "tenant_id")
+        );
+    }
+
+    #[test]
+    fn startup_removes_pre_v1_legacy_action_state() {
+        let path = temp_db_path("legacy-actions");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE sekai_action_types (name TEXT PRIMARY KEY);
+                 INSERT INTO sekai_action_types (name) VALUES ('legacy');",
+            )
+            .unwrap();
+        db.create_object(&Object {
+            id: "approval-legacy".into(),
+            kind: "action_approval".into(),
+            name: "legacy".into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        drop(db);
+
+        let reopened = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let legacy_table_count: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sekai_action_types'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_table_count, 0);
+        assert!(reopened.get_object("approval-legacy").unwrap().is_none());
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_rejects_legacy_tenant_state_without_mutating_it() {
+        let path = temp_db_path("legacy-tenant-state");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sekai_tenants (id TEXT PRIMARY KEY);
+             INSERT INTO sekai_tenants (id) VALUES ('tenant_legacy');",
+        )
+        .unwrap();
+        drop(conn);
+        let error = SekaiDb::new(path.to_str().unwrap()).err().unwrap();
+        assert!(error.contains("legacy SQLite tenant state detected"));
+        assert!(error.contains("Back up the database"));
+        let conn = Connection::open(&path).unwrap();
+        let retained: String = conn
+            .query_row("SELECT id FROM sekai_tenants", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, "tenant_legacy");
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(journal_mode, "wal");
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn user_tables(db: &SekaiDb) -> Vec<String> {
+        let conn = db.conn();
+        crate::db::schema_plane::sqlite_user_tables(&conn).unwrap()
+    }
+
+    #[test]
+    fn fresh_sekai_store_omits_chisei_tables() {
+        let path = temp_db_path("plane-sekai");
+        let db = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let tables = user_tables(&db);
+        assert!(tables.iter().any(|table| table == "sekai_objects"));
+        assert!(tables.iter().any(|table| table == "sekai_decisions"));
+        assert!(
+            tables
+                .iter()
+                .any(|table| table == "chisei_operation_receipts")
+        );
+        assert!(
+            tables
+                .iter()
+                .all(|table| !table.starts_with("chisei_") || table == "chisei_operation_receipts"),
+            "{tables:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fresh_chisei_store_omits_sekai_fact_tables() {
+        let path = temp_db_path("plane-chisei");
+        let db = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .unwrap();
+        let tables = user_tables(&db);
+        assert!(tables.iter().any(|table| table == "sekai_decisions"));
+        assert!(tables.iter().any(|table| table == "chisei_budget_limits"));
+        assert!(tables.iter().any(|table| table == "chisei_usage_events"));
+        assert!(
+            !tables.iter().any(|table| table == "sekai_objects"),
+            "{tables:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sekai_dest_reopens_with_plane_local_receipts() {
+        let path = temp_db_path("sekai-receipts");
+        let db = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_operation_receipts
+                 (operation_id, namespace, receipt_json, updated_at)
+                 VALUES ('admit-1', 'governed_action_instance', '{}', 1)",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sekai_dest_upgrades_legacy_receipt_columns_before_indexes() {
+        let path = temp_db_path("legacy-receipts");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chisei_operation_receipts (
+                    operation_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO chisei_operation_receipts
+                (operation_id, namespace, receipt_json, updated_at)
+                VALUES ('legacy-1', 'governed_action_instance', '{}', 1);",
+            )
+            .unwrap();
+        }
+        let db = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let columns = table_columns(&db, "chisei_operation_receipts");
+        for required in [
+            "request_id",
+            "lookup_request_id",
+            "initiating_actor",
+            "caller_scope",
+            "alias_retired",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == required),
+                "missing {required} in {columns:?}"
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_opens_when_foreign_tables_are_empty() {
+        let path = temp_db_path("dual-empty");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        drop(db);
+        // Shared migrate seeds Sekai retention policies. Chisei families stay
+        // empty, so a Sekai-only open of that dual file is the empty-foreign case.
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_opens_as_chisei_when_only_retention_seeds_exist() {
+        let path = temp_db_path("dual-chisei-seeds");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        drop(db);
+        // Pre-split Chisei dests ran Shared migrate and still carry the three
+        // default retention rows. Those are not operator data.
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_as_chisei_when_custom_retention_policy_exists() {
+        let path = temp_db_path("dual-chisei-custom-retention");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_retention_policies
+                 (dataset, namespace, data_class, retention_days, updated)
+                 VALUES ('audit', 'legal', '', 30, 1)",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .err()
+        .expect("custom retention policies must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_as_chisei_when_retention_days_were_changed() {
+        let path = temp_db_path("dual-chisei-retention-days");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_retention_policies SET retention_days = 30 WHERE dataset = 'audit'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .err()
+        .expect("modified global retention days must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_opens_as_chisei_with_historical_startup_artifacts() {
+        let path = temp_db_path("dual-chisei-startup");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO sekai_object_security_runtime_secrets (name, secret_value)
+                 VALUES ('object_query_cursor_hmac', 'historical-hmac');
+                 INSERT INTO sekai_principal_credentials
+                 (id, principal, token_hash, status, created, rotated_at, revoked_at)
+                 VALUES ('cred-gateway', 'chisei-gateway', 'hash', 'active', 1, 1, 0);",
+            )
+            .unwrap();
+        drop(db);
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_as_chisei_when_other_runtime_secret_exists() {
+        let path = temp_db_path("dual-chisei-other-secret");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_object_security_runtime_secrets (name, secret_value)
+                 VALUES ('operator-secret', 'value')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .err()
+        .expect("operator secrets must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_as_chisei_when_other_principal_credential_exists() {
+        let path = temp_db_path("dual-chisei-other-cred");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_principal_credentials
+                 (id, principal, token_hash, status, created, rotated_at, revoked_at)
+                 VALUES ('cred-alice', 'alice', 'hash', 'active', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .err()
+        .expect("operator credentials must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_when_foreign_tables_hold_rows() {
+        let path = temp_db_path("dual-populated");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                 VALUES ('user:missed', 1, 'daily')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .err()
+        .expect("populated foreign tables must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_opens_after_relocate_fence() {
+        let path = temp_db_path("dual-fenced");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                 VALUES ('user:leftover', 1, 'daily');
+                 CREATE TABLE IF NOT EXISTS sekai_store_cutover (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation INTEGER NOT NULL,
+                    fence_raised INTEGER NOT NULL,
+                    raised_at_ms INTEGER NOT NULL,
+                    pairing_epoch INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms)
+                 VALUES (1, 1, 1, 0);",
+            )
+            .unwrap();
+        drop(db);
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+}

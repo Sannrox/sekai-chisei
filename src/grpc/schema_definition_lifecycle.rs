@@ -216,6 +216,20 @@ fn log_kind_errors(errors: &std::collections::HashMap<String, String>) {
     }
 }
 
+/// The gRPC status of a schema definition lifecycle failure.
+pub(super) fn map_schema_definition_lifecycle_error(
+    error: SchemaDefinitionLifecycleError,
+) -> tonic::Status {
+    match error {
+        SchemaDefinitionLifecycleError::Unavailable(error) => tonic::Status::internal(error),
+        SchemaDefinitionLifecycleError::InvalidDefinition(error)
+        | SchemaDefinitionLifecycleError::InvalidComputedProperty(error) => {
+            tonic::Status::invalid_argument(error)
+        }
+        SchemaDefinitionLifecycleError::Persistence(error) => tonic::Status::internal(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

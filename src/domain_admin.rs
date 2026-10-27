@@ -14,6 +14,7 @@ use crate::chisei::usage_ledger::{UsageAggregate, UsageUnit};
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::enterprise::{AuthenticatedContext, SecretValue};
+use crate::ext::*;
 use crate::provider_credentials::{
     MemoryTenantProviderCredentialResolver, ProviderCredentialRef,
     TenantProviderCredentialResolver, resolution_failure_message,
@@ -121,7 +122,7 @@ impl DomainAdminSurface {
         Self {
             invitations: Arc::new(MemoryInvitationHooks::new()),
             entitlements: Arc::new(EntitlementRegistry::new()),
-            quotas: TenantQuotaGate::new(crate::db::store::ChiseiStore::from_shared_runtime(
+            quotas: TenantQuotaGate::new(crate::chisei_store::ChiseiStore::from_shared_runtime(
                 Arc::new(RuntimeDb::Sqlite(db.clone())),
             )),
             credentials: Arc::new(MemoryTenantProviderCredentialResolver::new()),

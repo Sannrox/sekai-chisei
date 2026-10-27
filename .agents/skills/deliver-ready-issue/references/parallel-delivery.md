@@ -93,6 +93,14 @@ Lane brief
 - on a shared machine, fetch --prune, worktree add/remove, branch delete, and
   merge are lead-only; commit and publish only your own branch from your own
   worktree. Never enter the primary checkout or another lane's worktree.
+- build and test in isolation: Cargo writes to this worktree's own `target/`
+  (leave `CARGO_TARGET_DIR` unset, or set it inside this worktree; a shared
+  one makes the second lane wait on Cargo's lock). Tests bind ports at `:0`
+  and use `:memory:` or unique temp paths. Run PostgreSQL conformance through
+  `scripts/postgres-conformance.sh`, which starts its own container on an
+  ephemeral port; never point two lanes at one `SEKAI_TEST_POSTGRES_URL`.
+  `--test-threads=1` does not isolate two agents. A test at 0% CPU is stuck
+  on a lock, not slow: stop it and report, do not raise the timeout.
 - stop and report instead of continuing when: a dependency turns out to be
   open, the Issue needs a split, you need a reserved surface, verification
   needs a service that is unavailable, or the ceiling would be exceeded.

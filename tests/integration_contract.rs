@@ -13,7 +13,7 @@ const CHISEI_PROTO: &str = include_str!("../proto/chisei.proto");
 const ONTOLOGY_CLI: &str = include_str!("../src/ontology_product_cli.rs");
 const SDK_TS: &str = include_str!("../sdk/typescript/client.ts");
 const SDK_PY: &str = include_str!("../sdk/python/sekai_client.py");
-const RUNTIME_DB: &str = include_str!("../src/db/runtime_db.rs");
+const RUNTIME_DB: &str = include_str!("../crates/sekai-core/src/db/runtime_db.rs");
 
 fn rows() -> Vec<Vec<String>> {
     let start = DOC
@@ -283,7 +283,7 @@ fn advertised_loop_sources_exist() {
         "src/ontology_product_cli.rs",
         "sdk/typescript/client.ts",
         "sdk/python/sekai_client.py",
-        "src/db/runtime_db.rs",
+        "crates/sekai-core/src/db/runtime_db.rs",
     ] {
         assert!(Path::new(rel).exists(), "missing {rel}");
         assert!(!fs::read_to_string(rel).unwrap().is_empty(), "{rel} empty");

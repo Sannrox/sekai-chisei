@@ -26,8 +26,34 @@ Every report carries one of:
   evaluated
 
 Zero visible dependents is not proof of zero impact. Hidden consumer
-names, paths, counts, and locators stay undisclosed. The report does not
-authorize publication.
+names, paths, counts, and locators of advisory bindings stay undisclosed.
+An advisory report does not authorize or block publication.
+
+## Blocking bindings
+
+A consumer may set the property `blocking` to `true` on its binding (the
+declaration digest then covers the flag). A blocking binding:
+
+- is disclosed to producers: impact reports include it whatever the caller
+  can see, marked `blocking`;
+- blocks publishing: `MergeDefinitionProposal` fails with
+  `FAILED_PRECONDITION` (`definition_publish_blocked`) when the revision
+  would remove or change a member or property it depends on, naming each
+  blocking binding;
+- does not block a proposal created with `major_revision: true` once that
+  proposal is approved and merged; the flag is part of the approved
+  proposal digest.
+
+A blocking binding with a stale digest does not block.
+
+## Violation notifications
+
+A freshness or quality violation writes one durable delivery per
+`(recipient, event)` at commit for digest-fresh bindings of that dataset.
+`ListConsumerViolationNotifications` is caller-scoped and paged.
+`AcknowledgeConsumerViolationNotification` acknowledges the caller's row.
+Evidence is stored in full and omitted at read when the caller cannot read
+the dataset. Email and webhooks stay out of the core.
 
 See [ADR 0067](decisions/0067-definition-consumer-impact.md) and
 Discussion [863](https://github.com/Sannrox/sekai-chisei/discussions/863).

@@ -1,4 +1,6 @@
 use super::*;
+use sekai_chisei::chisei_store::ChiseiRuntimeDb;
+use sekai_chisei::ext::ChiseiSekaiDbExt;
 
 const DEFAULT_CONTEXT_ADMISSION_POLICY_JSON: &str = r#"{"contract_version":"chisei.context-admission/v1","default_action":"include","unknown_action":"hold_out","rules":[]}"#;
 
@@ -3320,7 +3322,7 @@ async fn spawn_control_plane_from_db(
 ) -> (String, Arc<RuntimeDb>) {
     let sekai_store = sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone());
     let sekai_svc = SekaiServiceImpl::new(sekai_store.clone());
-    let chisei_store = sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db.clone());
+    let chisei_store = sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(db.clone());
     let _ = sekai_chisei::chisei::model_review::enable_registry_provider_families(&chisei_store);
     let chisei_svc = ChiseiServiceImpl::new(chisei_store, config)
         .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(
@@ -3386,9 +3388,9 @@ async fn seed_regressed_namespace(target: &str, db: &Arc<RuntimeDb>, namespace: 
         }))
         .await
         .unwrap();
-    let eval = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
-        db.clone(),
-    ));
+    let eval = EvalStore::with_db(
+        sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(db.clone()),
+    );
     eval.put_suite(InternalEvalSuite {
         id: "gateway-suite".to_string(),
         name: "Gateway suite".to_string(),

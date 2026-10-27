@@ -62,11 +62,6 @@ impl SekaiServiceImpl {
         let mut ontology_source_rows = 0u32;
         let mut ontology_source_truncated = false;
         let ontology = if reasoning_mode == retrieval::ReasoningMode::Entailment {
-            if self.db.runtime().backend_name() == "postgres" {
-                return Err(Status::failed_precondition(
-                    "sekai.context.retrieve entailment is unavailable on the PostgreSQL community runtime; use asserted_only",
-                ));
-            }
             let mut classes = match self.db.runtime().list_readable_ontology_classes(
                 principals,
                 reasoning_deadline,

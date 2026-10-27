@@ -11,8 +11,18 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SQLITE_ONLY_SURFACES_CONTRACT: &str = "sekai.sqlite-only-surfaces/v1";
 pub const SQLITE_ONLY_SURFACES_JSON: &str =
     include_str!("../tests/fixtures/sqlite_only_surfaces/v1.json");
-pub const RUNTIME_DB_SRC: &str = include_str!("db/runtime_db.rs");
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 20;
+/// `RuntimeDb` source: Sekai methods plus the Chisei-typed methods in `chisei_store`.
+pub const RUNTIME_DB_SRC: &str = concat!(
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sekai-core/src/db/runtime_db.rs"
+    )),
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/chisei-core/src/chisei_store/runtime.rs"
+    ))
+);
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,31 +140,37 @@ impl SqliteOnlySurfaces {
 /// and does not call `off_runtime`. Those methods fail closed or return empty
 /// on community PostgreSQL.
 pub fn postgres_fail_closed_methods(runtime_db_src: &str) -> BTreeSet<String> {
-    let Some(impl_at) = runtime_db_src.find("impl RuntimeDb {") else {
-        return BTreeSet::new();
-    };
-    let src = &runtime_db_src[impl_at..];
     let mut methods = BTreeSet::new();
-    let mut search_from = 0usize;
-    while let Some(rel) = src[search_from..].find("\n    pub") {
-        let start = search_from + rel;
-        let header = &src[start..];
-        let Some(name) = parse_method_name(header) else {
-            search_from = start + 1;
+    for marker in [
+        "impl RuntimeDb {",
+        "impl ChiseiRuntimeDb for RuntimeDb {",
+        "impl EvalRunRuntimeDbExt for crate::db::runtime_db::RuntimeDb {",
+    ] {
+        let Some(impl_at) = runtime_db_src.find(marker) else {
             continue;
         };
-        let Some(brace) = header.find('{') else {
-            break;
-        };
-        let body_start = start + brace;
-        let Some(body_end) = matching_brace_end(src, body_start) else {
-            break;
-        };
-        let body = &src[body_start..body_end];
-        if body.contains("Self::Postgres(_)") && !body.contains("off_runtime") {
-            methods.insert(name);
+        let src = &runtime_db_src[impl_at..];
+        let mut search_from = 0usize;
+        while let Some(rel) = src[search_from..].find("\n    ") {
+            let start = search_from + rel;
+            let header = &src[start..];
+            let Some(name) = parse_method_name(header) else {
+                search_from = start + 1;
+                continue;
+            };
+            let Some(brace) = header.find('{') else {
+                break;
+            };
+            let body_start = start + brace;
+            let Some(body_end) = matching_brace_end(src, body_start) else {
+                break;
+            };
+            let body = &src[body_start..body_end];
+            if body.contains("Self::Postgres(_)") && !body.contains("off_runtime") {
+                methods.insert(name);
+            }
+            search_from = body_end;
         }
-        search_from = body_end;
     }
     methods
 }
@@ -162,7 +178,8 @@ pub fn postgres_fail_closed_methods(runtime_db_src: &str) -> BTreeSet<String> {
 fn parse_method_name(header: &str) -> Option<String> {
     let rest = header
         .strip_prefix("\n    pub fn ")
-        .or_else(|| header.strip_prefix("\n    pub(crate) fn "))?;
+        .or_else(|| header.strip_prefix("\n    pub(crate) fn "))
+        .or_else(|| header.strip_prefix("\n    fn "))?;
     let name: String = rest
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -227,14 +244,9 @@ pub fn listed_methods_are_fail_closed(
 /// RuntimeDb methods a public RPC handler reaches besides `pascal_to_snake(rpc)`.
 ///
 /// Same-name methods stay implied. This table is the evidence CI uses when a
-/// fail-closed helper is not named after the RPC (`ListObjectChanges` calls
-/// `list_visible_object_changes`, not `list_object_changes`).
+/// fail-closed helper is not named after the RPC (`SubmitEvidence` calls
+/// `record_execution_evidence`, not `submit_evidence`).
 pub const RPC_HANDLER_EVIDENCE_METHODS: &[(&str, &str, &[&str])] = &[
-    (
-        "SekaiService",
-        "ListObjectChanges",
-        &["list_visible_object_changes"],
-    ),
     (
         "SekaiService",
         "SubmitEvidence",
@@ -423,9 +435,13 @@ mod tests {
         unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC).unwrap();
         real_backend_matches_list(&table, MATURITY_DOCS, &list).unwrap();
         assert_eq!(list.surfaces.len(), SQLITE_ONLY_SURFACE_LIMIT);
-        assert!(list.contains_rpc("SekaiService", "PutPurposeAuthorization"));
-        assert!(list.contains_rpc("SekaiService", "ListObjectChanges"));
-        assert!(list.contains_rpc("SekaiService", "SubmitEvidence"));
+        assert!(list.contains_rpc("SekaiService", "DeleteOntologyClass"));
+        assert!(!list.contains_rpc("SekaiService", "AppendRows"));
+        assert!(!list.contains_rpc("SekaiService", "PutPurposeAuthorization"));
+        assert!(!list.contains_rpc("SekaiService", "GetClassificationLattice"));
+        assert!(!list.contains_rpc("SekaiService", "ListObjectChanges"));
+        assert!(!list.contains_rpc("SekaiService", "SubmitEvidence"));
+        assert!(!list.contains_rpc("ChiseiService", "RedeemExternalActionPermit"));
         assert!(!list.contains_rpc("SekaiService", "RegisterSourceTypeDescriptor"));
         assert!(!list.contains_rpc("SekaiService", "DecideActionInstance"));
         assert!(!list.contains_rpc("SekaiService", "AdmitGovernedDocument"));
@@ -436,12 +452,12 @@ mod tests {
         let list = SqliteOnlySurfaces::load().expect("list");
         let table = RpcMaturityTable::load().expect("table");
         let tampered = MATURITY_DOCS.replace(
-            "| `SekaiService.PutPurposeAuthorization` | `sekai.object-security` | sqlite only |",
-            "| `SekaiService.PutPurposeAuthorization` | `sekai.object-security` | yes |",
+            "| `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | sqlite only |",
+            "| `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | yes |",
         );
         let error = real_backend_matches_list(&table, &tampered, &list)
             .expect_err("mislabeled row must fail");
-        assert!(error.contains("PutPurposeAuthorization"), "{error}");
+        assert!(error.contains("DeleteOntologyClass"), "{error}");
         assert!(error.contains("docs"), "{error}");
     }
 
@@ -450,10 +466,10 @@ mod tests {
         let table = RpcMaturityTable::load().expect("table");
         let mut list = SqliteOnlySurfaces::load().expect("list");
         list.surfaces
-            .retain(|surface| surface.id != "SekaiService.PutPurposeAuthorization");
+            .retain(|surface| surface.id != "SekaiService.DeleteOntologyClass");
         let error = unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC)
             .expect_err("unlisted sqlite-only RPC must fail");
-        assert!(error.contains("PutPurposeAuthorization"), "{error}");
+        assert!(error.contains("DeleteOntologyClass"), "{error}");
     }
 
     #[test]
@@ -461,21 +477,20 @@ mod tests {
         let table = RpcMaturityTable::load().expect("table");
         let mut list = SqliteOnlySurfaces::load().expect("list");
         list.surfaces
-            .retain(|surface| surface.id != "SekaiService.ListObjectChanges");
+            .retain(|surface| surface.id != "SekaiService.DeleteOntologyRelation");
         let error = unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC)
             .expect_err("aliased sqlite-only RPC must fail");
-        assert!(error.contains("ListObjectChanges"), "{error}");
+        assert!(error.contains("DeleteOntologyRelation"), "{error}");
     }
 
     #[test]
-    fn unlisted_execution_evidence_rpc_fails() {
-        let table = RpcMaturityTable::load().expect("table");
-        let mut list = SqliteOnlySurfaces::load().expect("list");
-        list.surfaces
-            .retain(|surface| surface.id != "SekaiService.SubmitEvidence");
-        let error = unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC)
-            .expect_err("execution-evidence sqlite-only RPC must fail");
-        assert!(error.contains("SubmitEvidence"), "{error}");
+    fn submit_evidence_is_dual_backend() {
+        let list = SqliteOnlySurfaces::load().expect("list");
+        assert!(!list.contains_rpc("SekaiService", "SubmitEvidence"));
+        let closed = postgres_fail_closed_methods(RUNTIME_DB_SRC);
+        assert!(!closed.contains("record_execution_evidence"));
+        assert!(!closed.contains("reject_evidence_submission"));
+        assert!(!closed.contains("validate_execution_evidence_envelope"));
     }
 
     #[test]
@@ -494,9 +509,11 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_scanner_sees_purpose_and_skips_object_security() {
+    fn fail_closed_scanner_sees_ontology_deletes_and_skips_object_security() {
         let closed = postgres_fail_closed_methods(RUNTIME_DB_SRC);
-        assert!(closed.contains("put_purpose_authorization"));
+        assert!(closed.contains("delete_ontology_class_with_audit"));
+        assert!(!closed.contains("append_rows"));
+        assert!(!closed.contains("put_purpose_authorization"));
         assert!(
             !closed.contains("put_source_type_descriptor"),
             "dual-backend descriptors must not look sqlite-only"
@@ -564,6 +581,21 @@ mod tests {
                 && !closed.contains("put_open_table_snapshot")
                 && !closed.contains("get_open_table_snapshot"),
             "dual-backend open-table projections must not look sqlite-only"
+        );
+        assert!(
+            !closed.contains("record_execution_evidence")
+                && !closed.contains("reject_evidence_submission")
+                && !closed.contains("validate_execution_evidence_envelope"),
+            "dual-backend execution evidence must not look sqlite-only"
+        );
+        assert!(
+            !closed.contains("redeem_permit")
+                && !closed.contains("redeem_or_reconcile_permit")
+                && !closed.contains("validate_delegation_chain")
+                && !closed.contains("validate_permit_state")
+                && !closed.contains("validate_permit_for_delegation")
+                && !closed.contains("replay_redemption"),
+            "dual-backend permit redeem, reconcile, and delegation must not look sqlite-only"
         );
     }
 }

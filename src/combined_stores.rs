@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use postgres::Config as PostgresConfig;
 
+use crate::chisei_store::{ChiseiStore, split_shared_runtime};
 use crate::db::runtime_db::RuntimeDb;
-use crate::db::store::{ChiseiStore, SekaiStore, split_shared_runtime};
+use crate::db::store::SekaiStore;
 use crate::runtime_backend::{
     BackendIdentity, COMMUNITY_REQUIRED_SURFACES, RuntimeBackend, RuntimeBackendConfig,
 };
@@ -91,31 +92,9 @@ pub fn default_sekai_sqlite_path() -> String {
         .unwrap_or_else(|| data_dir_file(&data_dir(), SEKAI_STORE_FILE))
 }
 
-/// Retired single-store variables (ADR 0083 decision 7).
-pub const LEGACY_STORE_ENV: [&str; 3] = ["DB_PATH", "DATABASE_URL", "SEKAI_SHARED_STORE"];
-
-/// Refuse a retired single-store variable with migration guidance.
-pub fn refuse_legacy_store_env() -> Result<(), String> {
-    let set: Vec<&str> = LEGACY_STORE_ENV
-        .into_iter()
-        .filter(|name| optional_trimmed_env(name).is_some())
-        .collect();
-    if set.is_empty() {
-        Ok(())
-    } else {
-        Err(legacy_store_guidance(&set))
-    }
-}
-
-/// Operator guidance for retired single-store variables.
-pub fn legacy_store_guidance(set: &[&str]) -> String {
-    format!(
-        "{} {} no longer supported: the single shared store is retired. Unset {} and use SEKAI_DATA_DIR (default ./data, derives sekai.db and chisei.db), SEKAI_DB_PATH and CHISEI_DB_PATH (SQLite), or SEKAI_DATABASE_URL and CHISEI_DATABASE_URL with SEKAI_DB_BACKEND=postgres. Move an existing single store first with `sekaictl admin store relocate --source <old> --sekai <old> --chisei <new>`",
-        set.join(", "),
-        if set.len() == 1 { "is" } else { "are" },
-        if set.len() == 1 { "it" } else { "them" },
-    )
-}
+pub use crate::runtime_backend::{
+    LEGACY_STORE_ENV, legacy_store_guidance, refuse_legacy_store_env,
+};
 
 pub const SEKAI_POOL_ENV: &str = "SEKAI_POSTGRES_SEKAI_CONNECTIONS";
 pub const CHISEI_POOL_ENV: &str = "SEKAI_POSTGRES_CHISEI_CONNECTIONS";
@@ -723,7 +702,7 @@ pub(crate) fn optional_trimmed_env(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::store::ChiseiDecisionStore;
+    use crate::chisei_store::ChiseiDecisionStore;
 
     fn sqlite_pair(sekai: &str, chisei: &str) -> CombinedStoreSources {
         CombinedStoreSources {

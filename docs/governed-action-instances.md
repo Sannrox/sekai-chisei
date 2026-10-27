@@ -47,6 +47,164 @@ unavailable shape. A visible failing criterion is named on preview and on
 submit `deny_reason`. Compensation is explicit `unsupported` unless a type
 already stores a supported contract.
 
+## Intents, plans and simulations
+
+Issue: [#1675](https://github.com/Sannrox/sekai-chisei/issues/1675), layer 1 of
+[#1460](https://github.com/Sannrox/sekai-chisei/issues/1460).
+
+The RPCs:
+
+- `CreatePlanIntent` stores a goal with constraints.
+- `ProposePlan` stores an ordered list of steps for it, each an Action type,
+  version, existing object and parameters. A plan is not a DAG. The preview
+  path is object-bound, so steps are updates.
+- `SimulatePlan` runs every step through the preview path above, as the
+  caller and under the caller's object read policy. It stores the result
+  with the plan. Per step, that result is:
+  - the preview outcome;
+  - the policy, approval and budget decisions;
+  - the object revision the step was simulated against;
+  - the object effect the Action would write: the properties it sets or
+    changes. An object that changes while the step is planned simulates as
+    `stale`.
+
+  A step that needs approval still shows its effect, once its parameters
+  pass the type's schema.
+- `GetPlan` reads it all back.
+
+A simulation applies nothing and writes no instance or receipt. Its digest
+covers the canonical plan and every step's prediction, including object
+revisions, but no ids or times. Re-simulating an unchanged world gives the
+same digest, and a changed precondition gives a different one. Every
+simulation is kept under its own id.
+
+Creates and simulations are idempotent by caller-supplied id. A retry
+returns the stored record, and another body under a stored id is
+`ALREADY_EXISTS`. Creating and simulating need the same submit authorization
+as admission. Reading needs namespace read. A step whose object the reader
+may not see keeps only its position and Action type, in the plan and in
+every simulation. A step the simulator may not see simulates as
+`unavailable`.
+
+### Plan review
+
+Issue: [#1678](https://github.com/Sannrox/sekai-chisei/issues/1678), layer 2 of
+[#1460](https://github.com/Sannrox/sekai-chisei/issues/1460). A plan is
+reviewed as one bundle, not one Action at a time.
+
+- `SubmitPlanReview` submits a plan, bound to one of its stored simulations,
+  as one review item. Only the planner submits it, under the same submit
+  authorization as creating the plan. The item names the queues its steps route to, as their Action types
+  would place a parked instance of each. Each plan is reviewed once. A retry
+  returns the stored item, and another simulation for a submitted plan is
+  `ALREADY_EXISTS`: a changed world needs a new plan.
+- `DecidePlanReview` records one decision, `grant` or `deny`, for the whole
+  plan. The decision is bound to the plan id and the simulation digest, which
+  the request must repeat (`plan_review_digest_mismatch` otherwise). The
+  decider passes the gates of `DecideActionInstance`: one credentialed subject,
+  space approval in a tenant (a space approver, not an editor), and not the
+  planner. They
+  must also be able to decide every step as a single parked Action: read its
+  object, be one of its type's approvers (or a namespace administrator when it
+  names none), and be the reviewer the step's queue placement would allow.
+  When any step fails this check, the first such step is named
+  (`plan_review_step_not_decidable: step <index> (<type>)`) and nothing is
+  recorded. There is no partial approval.
+- The same decision again replays (`replay`); the other decision is
+  `plan_review_already_decided`. The first decision of two concurrent ones
+  wins.
+- `GetPlan` returns the review with the plan. Routing can depend on
+  parameters, so the review names only the queues of steps the reader may
+  see.
+
+A denied plan never executes. Execution is the next layer. It goes through
+`SubmitActionInstance` with idempotency key (plan id, step index) and
+rechecks authority per step.
+
+## Executing an approved plan
+
+Issue: [#1679](https://github.com/Sannrox/sekai-chisei/issues/1679), layer 3 of
+[#1460](https://github.com/Sannrox/sekai-chisei/issues/1460).
+
+`ExecuteActionPlan` runs a granted plan, and its planner calls it. Each step is
+submitted with idempotency key `plan:{plan_id}:step:{index}` under the
+planner's live request, so it gets the checks the planner's own
+`SubmitActionInstance` gets: namespace and enterprise authorization,
+service-principal scope, shared-space resource tenant, write freezes and
+markings. A step its policy parks is then granted as the plan's approver
+through the same path as `DecideActionInstance`. Nothing bypasses policy,
+budgets or markings.
+
+Before every step:
+
+- The approver's authority over the step is rechecked by subject: entitled
+  for the type (named approver or namespace admin), able to decide its
+  queue placement, still authorized for the namespace through the
+  enterprise extension's subject revalidation (failing closed where it
+  cannot), and able to read its object under its object policy, grants and
+  markings. A grant made under a space-scoped credential rests on a space
+  approval role only that credential carries. It cannot be revalidated, so
+  such a plan stops with `approver_authority_revoked` before its first step. The planner's submit authority and read are rechecked
+  from the live request.
+- An infrastructure failure or an admission still in flight leaves the plan
+  running, and a later call retries under the same key.
+- The step is simulated again as the planner. The plan stops when the
+  prediction differs from the approved simulation (outcome, reason, policy,
+  approval, budget). It also stops when the object's revision is neither the
+  approved one nor, for an object an earlier step wrote, the revision that
+  write produced.
+
+The checked revision travels into admission, which refuses the write unless
+the object still has it. The check uses the same read the guarded write
+applies against, or the read the parked digest is taken from. A later step
+on the same object expects the revision that write itself produced.
+
+A stopped plan records `stop_reason` and `stopped_at_step`:
+`plan_not_approved`, `approver_authority_revoked`, `simulation_changed`,
+`step_refused` or `step_instance_mismatch` (the instance under a step's key
+is not the planned submission). Later steps never run, and completed steps are not
+compensated.
+
+Progress is durable, one record per plan. A run first takes a two-minute
+claim on the record, written by compare-and-set, before anything is
+submitted. A concurrent call finds the live claim and returns the record
+untouched, and a crashed run's claim lapses for the next run to take over.
+The claim is renewed right before every submit and grant, so a run that
+lost it submits nothing. Idempotency keys and the revision checked inside
+admission keep a run that paused longer than the lease after renewing from
+applying a step twice or over a changed object. A replay that finds the
+same key's admission still in flight leaves the plan running for a retry,
+however long it has been in flight: its age proves no crash.
+Recovering an admission a crash interrupted before its receipt is #1786.
+So does an authority or simulation check that cannot complete because a
+store or dependency failed; only a refusal stops the plan.
+Stopping first closes the stopped step's unused key with a denied record
+(with no parameters), only while the stopping run still owns the claim, so
+a run that lost its claim cannot still submit that step. The plan's grant
+of a parked step holds only under its live claim; a parked step a stopped
+plan leaves stays an ordinary parked Action, decided under the usual
+checks. If the step was admitted first, the plan stays running for the
+next run to record it.
+Each step's
+operation id is a digest of the namespace and step key, so identically
+named plans in two namespaces never collide. Where credentials are in use, an approver who no longer holds an active
+credential stops the plan. A revoked authority is caught no later than a plain `SubmitActionInstance`
+would catch it. `ExecuteActionPlan` answers under the
+caller's current object visibility, like `GetPlan`. A restarted executor resumes at the next
+step. A step submitted before a crash is found by its idempotency key. It
+must match the planned submission (principal, type, version, parameters),
+and admission's replay completes it without applying it again. A parked
+step is granted only while its object is at the expected revision and its
+re-simulation predicts what was approved. The
+grant itself refuses an object changed since parking, so the parked state
+is the approved one. Namespace-admin entitlement is resolved on every check
+and right before each grant. Its produced
+revision is then unknown, so a later step on the same object stops rather
+than trust a fresh read. `GetPlan` returns the execution with each
+step's Action instance and operation id. A step the reader may not see
+keeps only its index. PostgreSQL migration `0105_sekai_plan_executions`
+holds the record.
+
 ## Admission flow
 
 1. Authenticate; require team namespace write for the target namespace.
@@ -142,7 +300,13 @@ admission. Parameter values stay out of audit and receipt evidence. See
 A parked instance waits for one decision through `DecideActionInstance`
 ([ADR 0089](decisions/0089-park-and-decide-action-instances.md)).
 Describe and preview still never grant. `ListActionInstances` with
-`status=parked` is the inbox.
+`status=parked` is the inbox. With `decidable_by_caller` it lists only the
+parked instances the caller may decide (#1771), by the rule a decision
+applies: a credentialed decider, space approval, the namespace tenant,
+marking clearance, entitlement and review-queue placement. Those checks
+replace the namespace read check, as they do for a decision. An instance
+the caller may not decide is absent, and a caller who may decide nothing
+gets an empty list.
 
 - **Who decides.** A principal listed in the type's `approvers`, or, when the
   type declares none, a namespace administrator. The submitter never decides
@@ -190,10 +354,56 @@ receipt's `approval_decided` event after `DecideActionInstance`. A denied
 approval ends `denied` with `denied_by_approver`. The old denial is not
 emitted anymore.
 
+## Markings
+
+An instance carries the marking it was derived from (#1706): the least upper
+bound, under the namespace lattice, of the markings of the object its
+`object_id` parameter names, the object a binding submitted it for, and the
+binding's own `markings` (action and fence bindings). Admission reads them;
+an unknown or incomparable token refuses the submit. A binding's source
+object that no longer exists (a delete event) can no longer show its
+marking, so it counts as the namespace lattice's top (`restricted` without a
+lattice): a delete-triggered Action is never marked below the object it
+came from, and its `run_as` needs that clearance.
+
+- A submitter, or a binding's `run_as`, must be cleared for the marking the
+  instance would carry; otherwise the submit is refused (`access denied`, or
+  the binding's `access_denied` skip) before anything is admitted.
+- `GetActionInstance`, `ListActionInstances`, `SubmitActionInstance`
+  responses, the instance's effects, `ClaimActionWork` (and its heartbeat and
+  acknowledgement, so a revoked clearance stops a held claim) and
+  `DecideActionInstance` need clearance for the marking. Without it the
+  instance reads as missing (a decision is refused as `access denied`), and
+  an idempotent replay of a marked submit returns `NotFound`.
+- The receipt records the marking on its intent (`access_marking`), and so
+  do the distinct-store reservation receipt once it names the committed
+  instance and the commit projection Chisei builds from a lookup.
+  `GetOperationReceipt` asks Sekai whether the caller is cleared for any
+  receipt carrying a marking; a denial reads as missing. A Chisei plane that reaches Sekai over the remote fact
+  port cannot ask, so marked Action receipts are unreadable there until
+  remote clearance evaluation exists; unmarked receipts are unaffected.
+- An object the Action creates or updates carries the least upper bound of
+  its own marking, the marking a parameter sets, and the instance's, so an
+  Action can neither write below what it was derived from nor lower an
+  object's marking. An update applies only if the object is unchanged since
+  the Action planned it; otherwise the submit fails and can be retried.
+
+## Offline submissions
+
+A device that prepared an Action while disconnected submits it with `offline` ([ADR 0127](decisions/0127-offline-governed-actions.md), #1580).
+
+- **What it carries:** `prepared_at_ms`, `base_updated_ms` (the object's `updated` when the device read it), `base_properties` and an optional `lease_id`. `base_properties` lists each field the Action writes as the device saw it: its properties, and `name` when it renames. Every written field needs its base under every rule, and an unset value means the field was absent. It is a list rather than a map, so the request re-encodes to exactly the bytes the device proof signed.
+- **Type:** the Action type must update an object.
+- **Device:** the request must come with a device-bound assertion and the device's proof over it, in `x-sekai-device-proof` ([ADR 0126](decisions/0126-device-bound-assertions.md)). The plane records the device id from the assertion.
+- **Decision:** criteria, policy and budget are decided at arrival. If the object changed past the base, the type's `offline_conflict` rule decides. A conflict denies the instance with `deny_reason` `offline_conflict` and sets `conflict` to the object, its base and current versions, and the differing properties. If the object changes again between that check and the write, the submit fails and can be sent again.
+- **Retry and receipt:** `offline` is part of the request digest, so a retry with the same idempotency key returns the stored outcome. The receipt's intent event records `offline`, `offline_prepared_at_ms`, `offline_base_updated_ms`, `offline_device_id`, `offline_lease_id`, and any conflict.
+
 ## Dual-backend
 
 SQLite migrate-on-use and PostgreSQL migration
-`0021_governed_action_instances`.
+`0021_governed_action_instances`. Plans, intents and simulations use PostgreSQL
+migration `0100_sekai_action_plans`, and plan reviews
+`0102_sekai_plan_reviews`.
 
 ## Non-goals
 

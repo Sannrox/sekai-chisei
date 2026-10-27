@@ -284,7 +284,7 @@ async fn grpc_chat_round_trip_with_local_ollama() {
     let server = tokio::spawn(async move {
         Server::builder()
             .add_service(ChiseiServiceServer::new({
-                let chisei_store = sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db);
+                let chisei_store = sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(db);
                 let _ = sekai_chisei::chisei::model_review::enable_registry_provider_families(
                     &chisei_store,
                 );
@@ -427,7 +427,7 @@ async fn delegation_chain_keeps_private_context_local() {
         Server::builder()
             .add_service(ChiseiServiceServer::new({
                 let chisei_store =
-                    sekai_chisei::db::store::ChiseiStore::from_shared_runtime(server_db);
+                    sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(server_db);
                 let _ = sekai_chisei::chisei::model_review::enable_registry_provider_families(
                     &chisei_store,
                 );

@@ -5,6 +5,7 @@
 //! authority, and each namespace must pass the usual tenant check.
 
 use super::*;
+use crate::ext::*;
 use crate::sekai::service_principal::ServicePrincipalRegistration;
 
 /// Registry admin: `root`/`local` or an admin grant on `service_principals`.

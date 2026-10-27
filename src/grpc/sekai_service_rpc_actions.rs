@@ -76,7 +76,16 @@ pub(super) async fn list_governed_action_types(
 ) -> Result<Response<ListGovernedActionTypesResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
+    // A tenant assertion lists only its own tenant's namespace (#1777).
+    // Listing reads; Action administration is checked below.
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )?;
     check_team_namespace(service.db.runtime(), &principals, &inner.namespace, true)?;
     check_action_admin(
         &service.security,
@@ -126,6 +135,9 @@ pub(super) async fn set_governed_action_type_enabled(
         r#type: Some(to_proto_governed_action_type(&stored)),
     }))
 }
+/// The gRPC path a device proof over a submit covers.
+pub(crate) const SUBMIT_ACTION_INSTANCE_PATH: &str = "/sekai.SekaiService/SubmitActionInstance";
+
 pub(super) async fn submit_action_instance(
     service: &SekaiServiceImpl,
     req: Request<SubmitActionInstanceRequest>,
@@ -143,6 +155,19 @@ pub(super) async fn submit_action_instance(
     );
     let catalog_capability = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-capability");
     let catalog_namespace = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-namespace");
+    // A device-bound credential proves possession of its device key on
+    // every submit; an offline submission requires one (#1580, ADR 0126).
+    crate::grpc::require_device_proof(
+        &req,
+        SUBMIT_ACTION_INSTANCE_PATH,
+        req.get_ref().offline.is_some(),
+    )?;
+    let device_id = req
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+        .and_then(|context| context.device.as_ref())
+        .map(|device| device.id.clone())
+        .unwrap_or_default();
     let mut inner = req.into_inner();
     let namespace = inner.namespace.trim().to_string();
     if namespace.is_empty() {
@@ -208,6 +233,7 @@ pub(super) async fn submit_action_instance(
         crate::enterprise::NamespaceAction::Write,
     )
     .unwrap_or_default();
+    let namespace_for_gate = namespace.clone();
     let admission_request = ActionInstanceAdmissionRequest {
         namespace,
         type_id: inner.type_id,
@@ -224,6 +250,14 @@ pub(super) async fn submit_action_instance(
             .and_then(|context| context.act.clone()),
         budget_already_reserved: false,
         resource_tenant,
+        binding_markings: Vec::new(),
+        source_object_id: String::new(),
+        marking_gate: submitter_marking_gate(service, &principals, &namespace_for_gate),
+        expected_object_revision: String::new(),
+        offline: inner
+            .offline
+            .map(|offline| from_proto_offline_submission(offline, device_id))
+            .transpose()?,
     };
     let tenant = acting_tenant(tenant_context.as_ref());
     let machine_credential = freeze_machine_credential(tenant_context.as_ref());
@@ -257,6 +291,11 @@ pub(super) async fn submit_action_instance(
             ActionInstanceAdmissionError::Internal(message) => Status::internal(message),
         })
     })?;
+    // The response carries the stored instance, which on a replay another
+    // principal may have submitted; a marked one needs clearance (#1706).
+    if !action_instance_passes_marking(service, &principals, &outcome.instance)? {
+        return Err(Status::not_found("action instance not found"));
+    }
     Ok(Response::new(SubmitActionInstanceResponse {
         instance: Some(to_proto_action_instance(&outcome.instance)),
         replay: outcome.replay,
@@ -302,6 +341,11 @@ pub(super) async fn decide_action_instance(
         false,
     )
     .map_err(|_| access_denied())?;
+    // A decider must be cleared for a marked instance (#1706); otherwise it
+    // is refused like any other, disclosing nothing.
+    if !action_instance_passes_marking(service, &principals, &instance)? {
+        return Err(access_denied());
+    }
     // ADR 0089: a named approver decides on authentication, tenant, and
     // entitlement alone; namespace Write is not required (#1146). The
     // namespace-admin fallback checks its own standing below.
@@ -320,6 +364,7 @@ pub(super) async fn decide_action_instance(
                 delegating_actor: tenant_context
                     .as_ref()
                     .and_then(|context| context.act.clone()),
+                execution_claim: None,
             },
             &decider,
             now_millis(),
@@ -405,6 +450,9 @@ pub(super) async fn preview_object_action(
                 error,
             ),
         ) => return Err(Status::invalid_argument(error)),
+        Err(crate::sekai::action_describe_preview::ObjectActionProjectionError::Store(_)) => {
+            return Err(Status::internal("object action store unavailable"));
+        }
     };
     let clerk = service.cross_store.as_ref();
     let budget = clerk.and_then(|clerk| clerk.budget_port());
@@ -447,7 +495,7 @@ pub(super) async fn preview_object_action(
             .get_object_type(&object.kind)
             .ok()
             .flatten();
-        let client = sekai_provider::system_one::TypeSafeClient::from_env()
+        let client = chisei_provider::system_one::TypeSafeClient::from_env()
             .map_err(Status::failed_precondition)?;
         let (filled, record) = crate::chisei::system_one_action::fill_proposed_parameters(
             &type_def,
@@ -675,6 +723,9 @@ pub(super) async fn list_action_instances(
     service: &SekaiServiceImpl,
     req: Request<ListActionInstancesRequest>,
 ) -> Result<Response<ListActionInstancesResponse>, Status> {
+    if req.get_ref().decidable_by_caller {
+        return list_decidable_action_instances(service, req);
+    }
     let principals = caller_principals(&req);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let policy_context = principal_policy_context(&req);
@@ -752,7 +803,167 @@ pub(super) async fn list_action_instances(
     Ok(Response::new(ListActionInstancesResponse { instances }))
 }
 
-fn authorize_action_instance_visibility(
+/// The parked instances the caller may decide (#1771), by the checks
+/// `DecideActionInstance` applies: a credentialed decider, space approval
+/// and the namespace tenant for the request, then per instance marking
+/// clearance and `may_decide`. A caller who could decide nothing gets an
+/// empty list, so an instance's existence is never revealed.
+fn list_decidable_action_instances(
+    service: &SekaiServiceImpl,
+    req: Request<ListActionInstancesRequest>,
+) -> Result<Response<ListActionInstancesResponse>, Status> {
+    let none = || Ok(Response::new(ListActionInstancesResponse::default()));
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    if req.get_ref().namespace.trim().is_empty() {
+        return Err(Status::invalid_argument("namespace required"));
+    }
+    if tenant_context
+        .as_ref()
+        .is_some_and(|context| context.authorize_space_approval().is_err())
+    {
+        return none();
+    }
+    let Some(decider) = credentialed_decider(&req, &principals) else {
+        return none();
+    };
+    let inner = req.into_inner();
+    if enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )
+    .is_err()
+    {
+        return none();
+    }
+    let runtime = service.db.runtime();
+    let _ = crate::sekai::action_instance_admission::ActionInstanceAdmission::new(runtime, None)
+        .escalate_due(&inner.namespace, now_millis());
+    let deciders = vec![decider.clone()];
+    let decider_is_namespace_admin =
+        authorize_source_type_namespace_admin(service, &deciders, &inner.namespace).is_ok();
+    let type_id = Some(inner.type_id.as_str()).filter(|type_id| !type_id.trim().is_empty());
+    let limit = (if inner.limit == 0 {
+        100
+    } else {
+        inner.limit as usize
+    })
+    .clamp(1, 500);
+    let mut types = HashMap::new();
+    let mut offset = 0;
+    let mut instances = Vec::new();
+    loop {
+        let stored = runtime
+            .list_action_instances_page(
+                &inner.namespace,
+                type_id,
+                Some(crate::sekai::action_instance::STATUS_PARKED),
+                100,
+                offset,
+            )
+            .map_err(Status::internal)?;
+        let exhausted = stored.len() < 100;
+        offset += stored.len();
+        for instance in &stored {
+            let key = (instance.type_id.clone(), instance.version.clone());
+            if !types.contains_key(&key) {
+                let type_def = runtime
+                    .get_governed_action_type(&instance.namespace, &key.0, &key.1)
+                    .map_err(Status::internal)?;
+                types.insert(key.clone(), type_def);
+            }
+            let Some(type_def) = &types[&key] else {
+                continue;
+            };
+            if action_instance_passes_marking(service, &deciders, instance)?
+                && crate::sekai::action_instance_admission::may_decide(
+                    type_def,
+                    instance,
+                    &decider,
+                    &deciders,
+                    decider_is_namespace_admin,
+                )
+            {
+                instances.push(to_proto_action_instance(instance));
+                if instances.len() == limit {
+                    break;
+                }
+            }
+        }
+        if exhausted || instances.len() == limit {
+            break;
+        }
+    }
+    Ok(Response::new(ListActionInstancesResponse { instances }))
+}
+
+/// Whether `principals` are cleared for `instance`'s marking; unmarked
+/// instances always are.
+pub(super) fn action_instance_passes_marking(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    instance: &crate::sekai::action_instance::ActionInstance,
+) -> Result<bool, Status> {
+    cleared_for_marking(service, principals, &instance.namespace, &instance.marking)
+}
+
+/// Whether `principals` are cleared for `marking` in `namespace`, judged as
+/// an object carrying it there, so the lattice, clearances and trusted
+/// principals apply unchanged. An empty marking always is.
+pub(super) fn cleared_for_marking(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    marking: &str,
+) -> Result<bool, Status> {
+    cleared_for_marking_in(service.db.runtime(), principals, namespace, marking)
+}
+
+fn cleared_for_marking_in(
+    db: &RuntimeDb,
+    principals: &[String],
+    namespace: &str,
+    marking: &str,
+) -> Result<bool, Status> {
+    if marking.trim().is_empty() {
+        return Ok(true);
+    }
+    let carrier = domain::Object {
+        id: "action-instance-marking".into(),
+        kind: "action_instance".into(),
+        name: "action-instance-marking".into(),
+        namespace: namespace.to_string(),
+        external_id: String::new(),
+        properties: std::collections::HashMap::from([(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+            marking.to_string(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    object_passes_marking(db, &carrier, principals)
+}
+
+/// The clearance gate admission checks against the marking it derives
+/// (#1706): one cannot act on what one may not read.
+pub(super) fn submitter_marking_gate(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+) -> crate::sekai::action_instance_admission::MarkingGate {
+    let db = service.db.runtime_arc();
+    let principals = principals.to_vec();
+    let namespace = namespace.to_string();
+    crate::sekai::action_instance_admission::MarkingGate::new(move |marking| {
+        cleared_for_marking_in(&db, &principals, &namespace, marking)
+            .map_err(|status| status.message().to_string())
+    })
+}
+
+pub(super) fn authorize_action_instance_visibility(
     service: &SekaiServiceImpl,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
@@ -774,6 +985,11 @@ fn authorize_action_instance_visibility(
         });
     if !entitled {
         return Err(denied());
+    }
+    // A marked instance (#1706) needs clearance for its marking, exactly as a
+    // marked object would; without it the instance reads as missing.
+    if !action_instance_passes_marking(service, principals, instance)? {
+        return Err(Status::not_found("action instance not found"));
     }
     if let Some(object_id) = action_instance_target_object_id(&instance.parameters_json) {
         let target_exists = service
@@ -1113,7 +1329,28 @@ fn authorize_claimed_work_call(
         &effect.namespace,
         true,
     )?;
-    enforce_service_principal_effect_type(service, tenant_context, effect)
+    enforce_service_principal_effect_type(service, tenant_context, effect)?;
+    require_cleared_for_effect(service, principals, effect)
+}
+
+/// Work of a marked instance is claimed, renewed and acknowledged only by
+/// hosts cleared for its marking (#1706), so a revoked clearance also stops
+/// a held claim; to others the effect is missing.
+fn require_cleared_for_effect(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    effect: &crate::sekai::action_effect::ActionEffect,
+) -> Result<(), Status> {
+    if let Some(instance) = service
+        .db
+        .runtime()
+        .get_action_instance(&effect.instance_id)
+        .map_err(Status::internal)?
+        && !action_instance_passes_marking(service, principals, &instance)?
+    {
+        return Err(Status::not_found("action effect not found"));
+    }
+    Ok(())
 }
 
 pub(super) async fn claim_action_work(
@@ -1148,6 +1385,7 @@ pub(super) async fn claim_action_work(
         true,
     )?;
     enforce_service_principal_effect_type(service, tenant_context.as_ref(), &existing)?;
+    require_cleared_for_effect(service, &principals, &existing)?;
     let actor = principals.first().cloned().unwrap_or_default();
     let now = now_millis();
     let claimed = ActionWorkLifecycle::new(service.db.runtime())
@@ -1340,7 +1578,8 @@ pub(super) async fn ack_action_work(
                 origin_agent,
             ));
         }
-        crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)?;
+        crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)
+            .map_err(crate::grpc::write_freeze_status)?;
     }
     let now = now_millis();
     let acked = ActionWorkLifecycle::new(service.db.runtime())
@@ -1492,6 +1731,889 @@ fn credentialed_decider<T>(req: &Request<T>, principals: &[String]) -> Option<St
             Some(subject.clone())
         }
         _ => None,
+    }
+}
+
+// --- Intents, proposed plans and simulations (#1675) ---
+
+fn plan_status(error: crate::sekai::action_plan::PlanError) -> Status {
+    use crate::sekai::action_plan::PlanError;
+    match error {
+        PlanError::Invalid(message) => Status::invalid_argument(message),
+        PlanError::NotFound => Status::not_found("plan or intent not found"),
+        PlanError::Conflict => Status::already_exists("a different record is stored under that id"),
+        PlanError::Store(message) => Status::internal(message),
+    }
+}
+
+fn plan_intent_to_proto(intent: crate::sekai::action_plan::PlanIntent) -> PlanIntent {
+    PlanIntent {
+        namespace: intent.namespace,
+        intent_id: intent.intent_id,
+        goal: intent.goal,
+        constraints: intent.constraints,
+        planner: intent.planner,
+        created_at_ms: intent.created_at_ms,
+    }
+}
+
+fn plan_to_proto(plan: crate::sekai::action_plan::ProposedPlan) -> ProposedPlan {
+    ProposedPlan {
+        namespace: plan.namespace,
+        plan_id: plan.plan_id,
+        intent_id: plan.intent_id,
+        planner: plan.planner,
+        steps: plan
+            .steps
+            .into_iter()
+            .map(|step| PlanStep {
+                type_id: step.type_id,
+                version: step.version,
+                object_id: step.object_id,
+                parameters_json: step.parameters_json,
+            })
+            .collect(),
+        created_at_ms: plan.created_at_ms,
+    }
+}
+
+fn plan_simulation_to_proto(
+    simulation: crate::sekai::action_plan::PlanSimulation,
+) -> PlanSimulation {
+    PlanSimulation {
+        namespace: simulation.namespace,
+        plan_id: simulation.plan_id,
+        simulation_id: simulation.simulation_id,
+        digest: simulation.digest,
+        simulated_by: simulation.simulated_by,
+        simulated_at_ms: simulation.simulated_at_ms,
+        steps: simulation
+            .steps
+            .into_iter()
+            .map(|step| PlanStepSimulation {
+                index: step.index,
+                object_id: step.object_id,
+                object_revision: step.object_revision,
+                outcome: step.outcome,
+                reason_code: step.reason_code,
+                policy_decision: step.policy_decision,
+                approval_state: step.approval_state,
+                budget_decision: step.budget_decision,
+                failing_criterion: step.failing_criterion,
+                effect: step.effect.map(|effect| PlanStepEffect {
+                    object_id: effect.object_id,
+                    object_kind: effect.object_kind,
+                    mutation: effect.mutation,
+                    changed_properties: effect.changed_properties,
+                }),
+            })
+            .collect(),
+    }
+}
+
+/// Records an intent for the caller, who must be able to submit Actions in
+/// the namespace.
+pub(super) async fn create_plan_intent(
+    service: &SekaiServiceImpl,
+    req: Request<CreatePlanIntentRequest>,
+) -> Result<Response<CreatePlanIntentResponse>, Status> {
+    let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let planner = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let intent = crate::sekai::action_plan::create_intent(
+        service.db.runtime(),
+        crate::sekai::action_plan::PlanIntent {
+            namespace: inner.namespace,
+            intent_id: inner.intent_id,
+            goal: inner.goal,
+            constraints: inner.constraints,
+            planner,
+            created_at_ms: now_millis(),
+        },
+    )
+    .map_err(plan_status)?;
+    Ok(Response::new(CreatePlanIntentResponse {
+        intent: Some(plan_intent_to_proto(intent)),
+    }))
+}
+
+pub(super) async fn propose_plan(
+    service: &SekaiServiceImpl,
+    req: Request<ProposePlanRequest>,
+) -> Result<Response<ProposePlanResponse>, Status> {
+    let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let planner = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let plan = crate::sekai::action_plan::propose_plan(
+        service.db.runtime(),
+        crate::sekai::action_plan::ProposedPlan {
+            namespace: inner.namespace,
+            plan_id: inner.plan_id,
+            intent_id: inner.intent_id,
+            planner,
+            steps: inner
+                .steps
+                .into_iter()
+                .map(|step| crate::sekai::action_plan::PlanStep {
+                    type_id: step.type_id,
+                    version: step.version,
+                    object_id: step.object_id,
+                    parameters_json: step.parameters_json,
+                })
+                .collect(),
+            created_at_ms: now_millis(),
+        },
+    )
+    .map_err(plan_status)?;
+    Ok(Response::new(ProposePlanResponse {
+        plan: Some(plan_to_proto(plan)),
+    }))
+}
+
+/// Runs every step through the PreviewObjectAction path as the caller,
+/// under the caller's object read policy. Applies nothing.
+pub(super) async fn simulate_plan(
+    service: &SekaiServiceImpl,
+    req: Request<SimulatePlanRequest>,
+) -> Result<Response<SimulatePlanResponse>, Status> {
+    let principals = caller_principals(&req);
+    let policy_context = principal_policy_context(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let actor = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let clerk = service.cross_store.as_ref();
+    let fallback_proposal = crate::chisei::system_one_action::SystemOneProposal;
+    let proposal: &dyn crate::sekai::action_ports::ActionProposalPort = match clerk {
+        Some(clerk) => clerk.proposal_port(),
+        None => &fallback_proposal,
+    };
+    // Refusals read as not visible; a store failure stays an error.
+    let visible = |object_id: &str| match visible_action_object(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &policy_context,
+        &inner.namespace,
+        object_id,
+        crate::enterprise::NamespaceAction::Read,
+    ) {
+        Ok(object) => Ok(Some(object)),
+        Err(status) if status.code() == tonic::Code::Internal => Err(status.message().to_owned()),
+        Err(_) => Ok(None),
+    };
+    let simulation = crate::sekai::action_plan::simulate_plan(
+        service.db.runtime(),
+        &crate::sekai::action_plan::SimulationContext {
+            actor: &actor,
+            budget: clerk.and_then(|clerk| clerk.budget_port()),
+            proposal: Some(proposal),
+            policy_context: Some(&policy_context),
+            visible_object: &visible,
+            now_ms: now_millis(),
+        },
+        &inner.namespace,
+        &inner.plan_id,
+        &inner.simulation_id,
+    )
+    .map_err(plan_status)?;
+    Ok(Response::new(SimulatePlanResponse {
+        simulation: Some(plan_simulation_to_proto(simulation)),
+    }))
+}
+
+/// Reads a plan with its intent and simulations. A step whose object the
+/// caller may not read keeps only its position and Action type.
+pub(super) async fn get_plan(
+    service: &SekaiServiceImpl,
+    req: Request<GetPlanRequest>,
+) -> Result<Response<GetPlanResponse>, Status> {
+    let principals = caller_principals(&req);
+    let policy_context = principal_policy_context(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    require_authenticated(&principals)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &inner.namespace, false)?;
+    let may_read = |object_id: &str| {
+        visible_action_object(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &policy_context,
+            &inner.namespace,
+            object_id,
+            crate::enterprise::NamespaceAction::Read,
+        )
+        .is_ok()
+    };
+    let view = crate::sekai::action_plan::read_plan(
+        service.db.runtime(),
+        &inner.namespace,
+        &inner.plan_id,
+        &may_read,
+    )
+    .map_err(plan_status)?;
+    // read_plan clears the object of every step the reader may not see.
+    let hidden: Vec<bool> = view
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.object_id.is_empty())
+        .collect();
+    Ok(Response::new(GetPlanResponse {
+        intent: Some(plan_intent_to_proto(view.intent)),
+        plan: Some(plan_to_proto(view.plan)),
+        simulations: view
+            .simulations
+            .into_iter()
+            .map(plan_simulation_to_proto)
+            .collect(),
+        // Routing can depend on parameters, so the review names only the
+        // queues of steps the reader may see.
+        review: service
+            .db
+            .runtime()
+            .get_plan_review(&inner.namespace, &inner.plan_id)
+            .map_err(Status::internal)?
+            .map(|review| plan_review_to_proto(review, |index| hidden[index])),
+        execution: service
+            .db
+            .runtime()
+            .get_plan_execution(&inner.namespace, &inner.plan_id)
+            .map_err(Status::internal)?
+            .map(|execution| {
+                plan_execution_to_proto(execution, |index| {
+                    hidden.get(index).copied().unwrap_or(true)
+                })
+            }),
+    }))
+}
+
+/// The review, naming the queues of the steps not `hidden`.
+fn plan_review_to_proto(
+    review: crate::sekai::plan_review::PlanReview,
+    hidden: impl Fn(usize) -> bool,
+) -> PlanReview {
+    PlanReview {
+        queue_ids: review.queue_ids(hidden),
+        namespace: review.namespace,
+        plan_id: review.plan_id,
+        simulation_id: review.simulation_id,
+        simulation_digest: review.simulation_digest,
+        submitted_by: review.submitted_by,
+        submitted_at_ms: review.submitted_at_ms,
+        decision: review.decision,
+        decided_by: review.decided_by,
+        reason: review.reason,
+        decided_at_ms: review.decided_at_ms,
+    }
+}
+
+fn review_status(error: crate::sekai::plan_review::ReviewError) -> Status {
+    use crate::sekai::action_instance_admission::DECISION_ACCESS_DENIED;
+    use crate::sekai::plan_review::{
+        REVIEW_ALREADY_DECIDED, REVIEW_DIGEST_MISMATCH, REVIEW_STEP_NOT_DECIDABLE, ReviewError,
+    };
+    match error {
+        ReviewError::Plan(error) => plan_status(error),
+        ReviewError::AccessDenied => Status::permission_denied(DECISION_ACCESS_DENIED),
+        ReviewError::StepNotDecidable { index, type_id } => Status::permission_denied(format!(
+            "{REVIEW_STEP_NOT_DECIDABLE}: step {index} ({type_id}) is beyond the decider's authority"
+        )),
+        ReviewError::DigestMismatch => Status::failed_precondition(format!(
+            "{REVIEW_DIGEST_MISMATCH}: the review is bound to another simulation"
+        )),
+        ReviewError::AlreadyDecided => Status::failed_precondition(format!(
+            "{REVIEW_ALREADY_DECIDED}: the plan was decided otherwise"
+        )),
+    }
+}
+
+/// Submits a simulated plan to review as one bundle item, bound to one of
+/// its stored simulations. Only the planner submits, and must still be able
+/// to submit Actions in the namespace.
+pub(super) async fn submit_plan_review(
+    service: &SekaiServiceImpl,
+    req: Request<SubmitPlanReviewRequest>,
+) -> Result<Response<SubmitPlanReviewResponse>, Status> {
+    let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let submitter = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let review = crate::sekai::plan_review::submit_review(
+        service.db.runtime(),
+        &inner.namespace,
+        &inner.plan_id,
+        &inner.simulation_id,
+        &submitter,
+        now_millis(),
+    )
+    .map_err(review_status)?;
+    Ok(Response::new(SubmitPlanReviewResponse {
+        // The planner wrote every step's parameters.
+        review: Some(plan_review_to_proto(review, |_| false)),
+    }))
+}
+
+/// Decides a submitted plan as a whole. The decider passes the same gates
+/// as `DecideActionInstance` and must be able to decide every step as a
+/// single parked Action: read its object, be one of its type's approvers
+/// (or a namespace administrator when it names none), and belong to the
+/// review queue placement the step would get.
+pub(super) async fn decide_plan_review(
+    service: &SekaiServiceImpl,
+    req: Request<DecidePlanReviewRequest>,
+) -> Result<Response<DecidePlanReviewResponse>, Status> {
+    use crate::sekai::action_instance_admission::DECISION_ACCESS_DENIED;
+
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let policy_context = principal_policy_context(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    if let Some(context) = tenant_context.as_ref() {
+        context
+            .authorize_space_approval()
+            .map_err(extension_status)?;
+    }
+    let access_denied = || Status::permission_denied(DECISION_ACCESS_DENIED);
+    let decider = credentialed_decider(&req, &principals).ok_or_else(access_denied)?;
+    let deciders = vec![decider.clone()];
+    let inner = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        false,
+    )
+    .map_err(|_| access_denied())?;
+    let now = now_millis();
+    let decider_check = plan_step_decider(
+        service,
+        &decider,
+        &deciders,
+        tenant_context.as_ref(),
+        &policy_context,
+        true,
+        now,
+    );
+    // At decision time a check that cannot complete refuses; the decider
+    // retries.
+    let may_decide = |plan: &crate::sekai::action_plan::ProposedPlan,
+                      step: &crate::sekai::action_plan::PlanStep| {
+        decider_check(plan, step).unwrap_or(false)
+    };
+    let (review, replay) = crate::sekai::plan_review::decide_review(
+        service.db.runtime(),
+        &inner.namespace,
+        &inner.plan_id,
+        &crate::sekai::plan_review::ReviewDecision {
+            simulation_digest: &inner.simulation_digest,
+            decision: inner.decision.trim(),
+            reason: &inner.reason,
+            in_space: tenant_context
+                .as_ref()
+                .is_some_and(|context| context.space.is_some()),
+        },
+        &decider,
+        &may_decide,
+        now,
+    )
+    .map_err(review_status)?;
+    Ok(Response::new(DecidePlanReviewResponse {
+        // A decider may read every step's object, or nothing is decided.
+        review: Some(plan_review_to_proto(review, |_| false)),
+        replay,
+    }))
+}
+
+/// Refused (`Ok(false)`) or not determinable (`Err`, a dependency failed):
+/// only a refusal is final.
+fn refused_or_unavailable(status: &Status) -> Result<bool, String> {
+    if status.code() == tonic::Code::Internal || status.code() == tonic::Code::Unavailable {
+        Err(status.message().to_owned())
+    } else {
+        Ok(false)
+    }
+}
+
+/// Whether `decider` could decide a plan step as a single parked Action:
+/// entitled for its type (a named approver, else a namespace admin), able
+/// to decide its review queue placement, and able to read its object. Used
+/// to decide a plan review (#1678) and rechecked before each executed step
+/// (#1679).
+fn plan_step_decider<'a>(
+    service: &'a SekaiServiceImpl,
+    decider: &'a str,
+    deciders: &'a [String],
+    tenant_context: Option<&'a RequestEnterpriseContext>,
+    policy_context: &'a crate::sekai::object_security::PrincipalPolicyContext,
+    decider_has_request: bool,
+    now: i64,
+) -> impl Fn(
+    &crate::sekai::action_plan::ProposedPlan,
+    &crate::sekai::action_plan::PlanStep,
+) -> Result<bool, String>
++ 'a {
+    move |plan, step| {
+        // Resolved on every check: a revoked admin stops being entitled.
+        let decider_is_namespace_admin =
+            match authorize_source_type_namespace_admin(service, deciders, &plan.namespace) {
+                Ok(_) => true,
+                Err(status) => refused_or_unavailable(&status)?,
+            };
+        let Some(type_def) = service.db.runtime().get_governed_action_type(
+            &plan.namespace,
+            &step.type_id,
+            &step.version,
+        )?
+        else {
+            return Ok(false);
+        };
+        let entitled = if type_def.approvers.is_empty() {
+            decider_is_namespace_admin
+        } else {
+            type_def
+                .approvers
+                .iter()
+                .any(|approver| approver == decider)
+        };
+        let placement = crate::sekai::review_queue::place(
+            &type_def.review_queue,
+            &step.parameters_json,
+            now,
+            &plan.planner,
+            &type_def.approvers,
+        );
+        if !entitled
+            || !crate::sekai::review_queue::reviewer_may_decide(
+                &type_def.review_queue,
+                &placement,
+                decider,
+            )
+        {
+            return Ok(false);
+        }
+        if decider_has_request {
+            return match visible_action_object(
+                service,
+                deciders,
+                tenant_context,
+                policy_context,
+                &plan.namespace,
+                &step.object_id,
+                crate::enterprise::NamespaceAction::Read,
+            ) {
+                Ok(_) => Ok(true),
+                Err(status) => refused_or_unavailable(&status),
+            };
+        }
+        // Without the decider's request (a plan running for its planner),
+        // their current enterprise namespace authority is revalidated by
+        // subject and their object read is checked by subject: the object
+        // under their own object policy, then grants and markings for them.
+        // An extension that cannot revalidate leaves the plan to retry; it
+        // never runs on unchecked authority.
+        // In a credentialed community deployment the decider must still hold
+        // an active credential: revoking it revokes their approvals.
+        if service.db.runtime().enterprise_extension().is_none() {
+            let active = service.db.runtime().list_active_credentials()?;
+            if !active.is_empty()
+                && !active
+                    .iter()
+                    .any(|credential| credential.principal == decider)
+            {
+                return Ok(false);
+            }
+        }
+        if let Some(extension) = service.db.runtime().enterprise_extension() {
+            match extension.authorize_delegating_principal(
+                decider,
+                &plan.namespace,
+                crate::enterprise::NamespaceAction::Read,
+            ) {
+                Ok(()) => {}
+                Err(crate::enterprise::ExtensionError::Unavailable(reason)) => return Err(reason),
+                Err(_) => return Ok(false),
+            }
+        }
+        runtime_object_visible_to(
+            service,
+            deciders,
+            policy_context,
+            &plan.namespace,
+            &step.object_id,
+        )
+    }
+}
+
+/// Whether `principals` may read the object `object_id` of `namespace`, by
+/// subject alone: its object policy for them, then grants and markings.
+/// For a principal with no request in hand; a store failure is `Err`.
+fn runtime_object_visible_to(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    namespace: &str,
+    object_id: &str,
+) -> Result<bool, String> {
+    let Some(object) = service
+        .db
+        .runtime()
+        .get_object_with_policy_context(object_id, policy_context)?
+    else {
+        return Ok(false);
+    };
+    if object.namespace != namespace {
+        return Ok(false);
+    }
+    match require_visible_object_contents(
+        service.db.runtime(),
+        &service.security,
+        object,
+        principals,
+        None,
+        &format!("plan_execution:{object_id}"),
+        None,
+    ) {
+        Ok(_) => Ok(true),
+        Err(status) => refused_or_unavailable(&status),
+    }
+}
+
+fn plan_execution_to_proto(
+    execution: crate::sekai::plan_execution::PlanExecution,
+    hidden: impl Fn(usize) -> bool,
+) -> PlanExecution {
+    PlanExecution {
+        namespace: execution.namespace,
+        plan_id: execution.plan_id,
+        simulation_id: execution.simulation_id,
+        simulation_digest: execution.simulation_digest,
+        status: execution.status,
+        next_step: execution.next_step,
+        steps: execution
+            .steps
+            .into_iter()
+            .map(|step| {
+                if hidden(step.index as usize) {
+                    PlanStepExecution {
+                        index: step.index,
+                        ..PlanStepExecution::default()
+                    }
+                } else {
+                    PlanStepExecution {
+                        index: step.index,
+                        instance_id: step.instance_id,
+                        operation_id: step.operation_id,
+                        status: step.status,
+                    }
+                }
+            })
+            .collect(),
+        stop_reason: execution.stop_reason,
+        stopped_at_step: execution.stopped_at_step,
+        started_by: execution.started_by,
+        updated_at_ms: execution.updated_at_ms,
+    }
+}
+
+/// Executes a granted plan for its planner (#1679), who calls it. Every
+/// step is submitted with the checks the planner's own SubmitActionInstance
+/// gets from this request; parked steps are granted by the plan's approver,
+/// whose authority over each step is rechecked. Nothing bypasses policy.
+pub(super) async fn execute_action_plan(
+    service: &SekaiServiceImpl,
+    req: Request<ExecuteActionPlanRequest>,
+) -> Result<Response<ExecuteActionPlanResponse>, Status> {
+    use crate::sekai::action_instance_admission::{
+        ActionInstanceAdmission, ActionInstanceAdmissionRequest, ActionInstanceDecisionRequest,
+    };
+
+    let principals = caller_principals(&req);
+    let policy_context = principal_policy_context(&req);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    // The planner runs their own plan, with the checks their own
+    // SubmitActionInstance would get, from this live request.
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &inner.namespace,
+        true,
+    )?;
+    let planner = authorize_action_instance_submit(service, &principals, &inner.namespace)?;
+    let runtime = service.db.runtime();
+    let not_found = || Status::not_found("plan not found");
+    let plan = runtime
+        .get_plan(&inner.namespace, &inner.plan_id)
+        .map_err(Status::internal)?
+        .filter(|plan| plan.planner == planner)
+        .ok_or_else(not_found)?;
+    let review = runtime
+        .get_plan_review(&inner.namespace, &inner.plan_id)
+        .map_err(Status::internal)?
+        .ok_or_else(not_found)?;
+    // The grant's approver decides the parked steps; an undecided or denied
+    // review stops the plan in the executor.
+    let approver = review.decided_by.clone();
+    // A grant made under a space-scoped credential rests on an approval role
+    // only that credential carries; it cannot be revalidated here.
+    let approver_space_unverifiable = review.decided_in_space;
+    let approvers = vec![approver.clone()];
+    let now = now_millis();
+    let tenant = acting_tenant(tenant_context.as_ref());
+    let machine_credential = freeze_machine_credential(tenant_context.as_ref());
+    let resource_tenant = shared_space_resource_tenant(
+        runtime,
+        tenant_context.as_ref(),
+        &inner.namespace,
+        crate::enterprise::NamespaceAction::Write,
+    )
+    .unwrap_or_default();
+    let submit = |step: &crate::sekai::action_plan::PlanStep,
+                  key: &str,
+                  expected_revision: &str| {
+        let request = ActionInstanceAdmissionRequest {
+            namespace: inner.namespace.clone(),
+            type_id: step.type_id.clone(),
+            version: step.version.clone(),
+            parameters_json: step.parameters_json.clone(),
+            idempotency_key: key.into(),
+            evidence_submission_ids: Vec::new(),
+            // Unique across namespaces (the key is namespace-scoped):
+            // a digest, so no delimiter in a name can make two collide.
+            request_id: format!(
+                "plan:{:x}",
+                sha2::Sha256::digest(
+                    serde_json::to_vec(&(&inner.namespace, key)).unwrap_or_default()
+                )
+            ),
+            ontology_digest: String::new(),
+            autonomous_envelope_id: String::new(),
+            policy_context: policy_context.clone(),
+            delegating_actor: tenant_context
+                .as_ref()
+                .and_then(|context| context.act.clone()),
+            budget_already_reserved: false,
+            resource_tenant: resource_tenant.clone(),
+            binding_markings: Vec::new(),
+            source_object_id: String::new(),
+            marking_gate: submitter_marking_gate(service, &principals, &inner.namespace),
+            expected_object_revision: expected_revision.into(),
+            offline: None,
+        };
+        let outcome = match &service.cross_store {
+            // Read when admitted: a run spans many steps.
+            Some(clerk) => clerk.admit(request, &planner, now_millis(), tenant, machine_credential),
+            None => ActionInstanceAdmission::new(runtime, None)
+                .with_proposal(Some(&crate::chisei::system_one_action::SystemOneProposal))
+                .with_tenant(tenant)
+                .with_machine_credential(machine_credential)
+                .admit(request, &planner, now_millis()),
+        };
+        outcome
+            .map(|outcome| (outcome.instance, outcome.object_revision))
+            .map_err(admission_port_error)
+    };
+    let decide = |instance: &crate::sekai::action_instance::ActionInstance, holder: &str| {
+        use crate::sekai::plan_execution::PortError;
+        match action_instance_passes_marking(service, &approvers, instance) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(PortError::Refused(
+                    "approver is not cleared for the step".into(),
+                ));
+            }
+            Err(_) => return Err(PortError::Unavailable),
+        }
+        // Resolved right before the grant.
+        let decider_is_namespace_admin =
+            match authorize_source_type_namespace_admin(service, &approvers, &inner.namespace) {
+                Ok(_) => true,
+                Err(status) => {
+                    refused_or_unavailable(&status).map_err(|_| PortError::Unavailable)?
+                }
+            };
+        ActionInstanceAdmission::new(runtime, None)
+            .decide(
+                ActionInstanceDecisionRequest {
+                    instance_id: instance.instance_id.clone(),
+                    decision: crate::sekai::action_instance::DECISION_GRANT.into(),
+                    reason: format!("plan {} approved", inner.plan_id),
+                    decider_principals: approvers.clone(),
+                    decider_is_namespace_admin,
+                    delegating_actor: None,
+                    // The store grants only while this run owns the plan.
+                    execution_claim: Some(crate::sekai::action_instance::ExecutionClaim {
+                        plan_id: inner.plan_id.clone(),
+                        holder: holder.into(),
+                    }),
+                },
+                &approver,
+                now_millis(),
+            )
+            .map(|outcome| (outcome.instance, outcome.object_revision))
+            .map_err(admission_port_error)
+    };
+    // The approver's authority over each step, by subject: entitled for the
+    // type, able to decide its queue placement, able to read its object.
+    let approver_policy = crate::sekai::object_security::PrincipalPolicyContext {
+        subjects: approvers.clone(),
+        ..Default::default()
+    };
+    let subject_decider = plan_step_decider(
+        service,
+        &approver,
+        &approvers,
+        None,
+        &approver_policy,
+        false,
+        now,
+    );
+    let approver_may_decide =
+        |plan: &crate::sekai::action_plan::ProposedPlan,
+         step: &crate::sekai::action_plan::PlanStep| {
+            if approver_space_unverifiable {
+                return Ok(false);
+            }
+            subject_decider(plan, step)
+        };
+    // Rechecked per fresh step, as SubmitActionInstance checks per call:
+    // namespace write, and a service principal's live Action-type scope.
+    let planner_may_submit = |step: &crate::sekai::action_plan::PlanStep| {
+        let checks = [
+            enforce_namespace_tenant_context(
+                runtime,
+                tenant_context.as_ref(),
+                &inner.namespace,
+                true,
+            ),
+            authorize_action_instance_submit(service, &principals, &inner.namespace).map(|_| ()),
+            enforce_service_principal_action_type(runtime, tenant_context.as_ref(), &step.type_id),
+        ];
+        for check in checks {
+            if let Err(status) = check {
+                return refused_or_unavailable(&status);
+            }
+        }
+        Ok(true)
+    };
+    // Refusals read as not visible; a store failure stays an error.
+    let visible = |object_id: &str| match visible_action_object(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &policy_context,
+        &inner.namespace,
+        object_id,
+        crate::enterprise::NamespaceAction::Read,
+    ) {
+        Ok(object) => Ok(Some(object)),
+        Err(status) if status.code() == tonic::Code::Internal => Err(status.message().to_owned()),
+        Err(_) => Ok(None),
+    };
+    let clerk = service.cross_store.as_ref();
+    let fallback_proposal = crate::chisei::system_one_action::SystemOneProposal;
+    let proposal: &dyn crate::sekai::action_ports::ActionProposalPort = match clerk {
+        Some(clerk) => clerk.proposal_port(),
+        None => &fallback_proposal,
+    };
+    let ports = crate::sekai::plan_execution::ExecutionPorts {
+        submit: &submit,
+        decide: &decide,
+        approver_may_decide: &approver_may_decide,
+        planner_may_submit: &planner_may_submit,
+        clock: &now_millis,
+        // Steps are simulated again as the planner, as the approved
+        // simulation predicted them.
+        simulation: crate::sekai::action_plan::SimulationContext {
+            actor: &planner,
+            budget: clerk.and_then(|clerk| clerk.budget_port()),
+            proposal: Some(proposal),
+            policy_context: Some(&policy_context),
+            visible_object: &visible,
+            now_ms: now,
+        },
+    };
+    let execution = match crate::sekai::plan_execution::execute_plan(
+        runtime,
+        &ports,
+        &inner.namespace,
+        &inner.plan_id,
+        &planner,
+    ) {
+        Ok(execution) => execution,
+        Err(crate::sekai::plan_execution::ExecutionError::Superseded(current)) => *current,
+        Err(crate::sekai::plan_execution::ExecutionError::Plan(error)) => {
+            return Err(plan_status(error));
+        }
+    };
+    // Under the caller's current visibility, as GetPlan shows it.
+    let hidden: Vec<bool> = plan
+        .steps
+        .iter()
+        .map(|step| !matches!(visible(&step.object_id), Ok(Some(_))))
+        .collect();
+    Ok(Response::new(ExecuteActionPlanResponse {
+        execution: Some(plan_execution_to_proto(execution, |index| {
+            hidden.get(index).copied().unwrap_or(true)
+        })),
+    }))
+}
+
+/// A replay that finds the same key's admission still in flight is worth
+/// retrying; anything else refuses the step.
+fn admission_port_error(
+    error: crate::sekai::action_instance_admission::ActionInstanceAdmissionError,
+) -> crate::sekai::plan_execution::PortError {
+    use crate::sekai::action_instance_admission::ActionInstanceAdmissionError;
+    match error {
+        // A lost claim: the run that took over owns the step; this one's
+        // save would fail.
+        ActionInstanceAdmissionError::FailedPrecondition(message)
+            if message.contains("still in progress")
+                || message
+                    == crate::sekai::action_instance_admission::PLAN_EXECUTION_CLAIM_LOST =>
+        {
+            crate::sekai::plan_execution::PortError::InProgress
+        }
+        // An infrastructure failure, not a refusal: the step is retried
+        // under the same key later.
+        ActionInstanceAdmissionError::Internal(_) => {
+            crate::sekai::plan_execution::PortError::Unavailable
+        }
+        other => crate::sekai::plan_execution::PortError::Refused(format!("{other:?}")),
     }
 }
 

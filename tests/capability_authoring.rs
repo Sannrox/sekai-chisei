@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use sekai_chisei::chisei::eval::{CaseResult, EvalStore, Run};
 use sekai_chisei::chisei::evolve::TaskRecord;
+use sekai_chisei::chisei_store::ChiseiStore;
 use sekai_chisei::composition::capability::{
     CapabilityGateError, CapabilityObservation, CapabilityRegistryError,
     author_capability_proposals, gate_capability_proposal, list_capability_versions,
@@ -9,7 +10,6 @@ use sekai_chisei::composition::capability::{
 };
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
-use sekai_chisei::db::store::ChiseiStore;
 
 fn observation(
     id: &str,

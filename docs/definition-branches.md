@@ -63,8 +63,10 @@ The server does not automatically merge it.
 `CreateDefinitionProposal` pins the current published head as `base_digest`
 and the branch head as `candidate_digest`. Optional `eval_plan_digests` are
 frozen Chisei dependencies; `named_foreign_digests` may be recorded but never
-enter the published member map. Creating a proposal does not move the
-published head.
+enter the published member map. Optional `migration_plan_digest` names the
+[change bundle](definition-change-bundles.md#apply) the proposal migrates by;
+it is part of the approved proposal digest, so `ApplyDefinitionChangeBundle`
+runs only that bundle. Creating a proposal does not move the published head.
 
 `ApproveDefinitionProposal` records a live approval on an open proposal.
 An agent principal that created the proposal cannot approve or merge it,
@@ -108,6 +110,57 @@ or datasets still carry, merge without a pinned `migration_plan_digest` fails
 `definition_rollback_requires_migration_plan`. The pin is a digest, not an
 executed fact migration; `ExecuteDefinitionFactMigration` still requires the
 TO revision to already be the published head.
+
+### Signed definition packages (#1700)
+
+`ExportDefinitionPackage` and `ImportDefinitionPackage` (experimental, behind
+`SEKAI_EXPERIMENTAL_RPCS=1`) move published definitions between namespaces or
+planes as a signed `sekai.definition-package/v1` envelope.
+
+- **Format.** Each member is `kind`, `id`, and canonical `definition_json`.
+  Its member digest covers kind, id, and those bytes, without the namespace.
+  Members are sorted, and the package digest is SHA-256 over the member list,
+  so the same definitions have the same package digest in every namespace.
+  Provenance (source namespace, source revision, export time) is signed with
+  the package digest but sits outside it. A package carries definitions only:
+  never objects, datasets, sources, credentials, or run history. Governed
+  transform definitions are `transform` members (#1799): the document is the
+  JobSpec without `namespace`, `definition_digest`, `schedule`, or `trigger`,
+  so the same pipeline has the same digest in every namespace. Schedule and
+  trigger stay local. Unknown member kinds are refused.
+- **Export** packages a published revision (the head when `revision_digest`
+  is empty). The published head overlays the namespace's governed transforms
+  as `transform` members; a historical revision keeps the members it already
+  carries. It needs read access to the revision, as `GetDefinitionMember`
+  does, and signs with this plane's key: `SEKAI_DEFINITION_PACKAGE_SIGNING_KEY`
+  (file with a 32-byte hex Ed25519 seed) and `SEKAI_DEFINITION_PACKAGE_SIGNER`
+  (`identity/key_id`).
+- **Import** verifies the envelope against `SEKAI_DEFINITION_PACKAGE_TRUSTED_KEYS`
+  (JSON array of `{"identity", "key_id", "public_key"}`), recomputes every
+  digest, then opens a branch and proposal whose candidate holds exactly the
+  package members. Target members absent from the package are removals. The
+  proposal records `source_package_digest`, which is part of its digest and
+  so of its merge receipt. Import never merges: compatibility, lint, and
+  Agent certification gates apply at merge as for any proposal. Auth matches
+  rollback: namespace write plus write on every member that would change.
+  Each governed transform's projected output columns must exist on the output
+  object type in the candidate, or in the target when the package does not
+  carry that type; a mismatch is `definition_package_incompatible:
+  transform_output_incompatible` and writes nothing. A store transform that
+  is not a published member is `definition_package_incompatible:
+  transform_store_conflict` so merge cannot overwrite a Put-only pipeline
+  that rollback could not restore. Merge applies those transform members to
+  the namespace's transform store. Unchanged members leave local schedule
+  and trigger in place; a changed member is written without them. Rolling
+  the proposal back restores the previous transform revision.
+- **Refusals** are `FAILED_PRECONDITION` with a named reason, and nothing is
+  written: `definition_package_unverified` (unknown, unusable, or wrong
+  signature, or no trusted keys configured), `definition_package_tampered`
+  (a digest does not match its content), and
+  `definition_package_incompatible` (format, member kind, member document,
+  transform I/O, or an untracked store transform).
+- Keys are read at call time, so rotating them needs no restart. Without them,
+  export and import fail closed.
 
 `CompareDefinitionRevisions` takes two revision digests in one namespace. It
 reauthorizes every member on both revisions, then reports added, removed, and
@@ -305,6 +358,22 @@ stored as an eval run marked `dry_run` and cannot bind
 Route admission and budget are checked once; a failure is returned, not
 retried. The RPC is experimental.
 
+`RunAgentShadow` replays durably recorded trigger envelopes through
+`DryRunAgent` against an active revision and a candidate. There is no live
+trigger path and no cron. The report lists proposed-Action differences with
+cost and latency. No Action is submitted. A namespace that opts in with
+`require_for_promotion` needs a passing report in addition to certification
+(ADR 0079); the report never certifies. `GetAgentShadowReport` reads the
+stored report. The RPCs are experimental.
+
+Governed transforms gate the same way (#1796). A namespace opts in with
+`ShadowGovernedTransform`'s `require_for_promotion`. From then on, a proposal
+that changes a `transform` member merges only with a stored passing shadow
+report for that candidate against the revision running now. New and removed
+transforms, changes a shadow cannot compare (another output, or
+isolated-process), and rollbacks are exempt. See
+[governed transforms](governed-transforms.md#promotion).
+
 ### Scoped draft authoring
 
 Scoped authenticated contexts can call qualified `sekai.SekaiService`
@@ -330,3 +399,29 @@ Scoped contexts can also call qualified `GetDefinitionProposal`,
 administration, approval, expected-published-digest, and ADR 0079 certification
 checks apply; `CloseDefinitionProposal` is not available to scoped contexts. See
 [ADR 0111](decisions/0111-scoped-definition-proposals.md).
+
+#### Drafting from a conversation
+
+An agent that interviews a domain expert drafts through the same calls
+(#1461). Each drafted member names the conversation turn it came from in an
+optional `source_turn` string inside `definition_json`, for example
+`"source_turn":"interview-7#turn-3"`. It must be non-empty, at most 256
+bytes, with no control characters or surrounding whitespace. The reference
+is opaque to the core: it is part of the member's content and digest, stays
+with the member through publication, and changing it is a compatible change
+(`changed_source_turn`). Markings are drafted as `access_marking` on the
+member they protect. Agent members do not take `source_turn`: the Agent
+document contract is strict, so an Agent definition carrying it is refused.
+
+Before proposing, the agent can lint the draft with `GetOntologyLintReport`
+and `branch_id` ([ontology lint](ontology-lint.md)). The draft is then an
+ordinary proposal: diffed, approved by someone other than its author, and
+merged. A principal without namespace write is refused when it creates the
+branch, and one without member administration when it edits.
+
+## Lint gate
+
+A merge is refused when the candidate introduces an unsuppressed error-level
+[ontology lint](ontology-lint.md#proposal-gate) finding (#1687), such as an
+object type no consumer references. `GetDefinitionProposal` lists the
+findings the candidate introduces.

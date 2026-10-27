@@ -90,6 +90,19 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ListSourceBatchTransactions",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/object_sync_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "RegisterSourceTypeDescriptor",
       "kind": "persistent",
       "surfaces": [
@@ -285,6 +298,32 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "RunAgentShadow",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "crates/sekai-core/src/sekai/agent_shadow.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetAgentShadowReport",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "crates/sekai-core/src/sekai/agent_shadow.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetPublishedDefinitionRevision",
       "kind": "persistent",
       "surfaces": [
@@ -324,6 +363,32 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ExportDefinitionPackage",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/sekai_service_rpc_definition_package.rs",
+        "crates/sekai-core/src/sekai/definition_package.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ImportDefinitionPackage",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_rpc_definition_package.rs",
+        "tests/definition_branch_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "CompareDefinitionRevisions",
       "kind": "persistent",
       "surfaces": [
@@ -341,13 +406,147 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/definition_consumer_impact.rs",
+        "crates/sekai-core/src/sekai/definition_consumer_impact.rs",
         "src/grpc/definition_consumer_impact.rs",
         "docs/definition-consumer-impact.md"
       ],
       "durable_dependencies": [
         "sekai.definition-branch",
         "sekai.graph"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetOntologyLintReport",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ontology_lint.rs",
+        "src/grpc/sekai_service_rpc_definitions.rs",
+        "docs/ontology-lint.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.graph"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetOntologyHealth",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ontology_health.rs",
+        "src/grpc/ontology_health_rpc.rs",
+        "docs/ontology-health.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "RecordOntologyHealthSnapshot",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.ontology-definitions"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ontology_health_trend.rs",
+        "src/grpc/ontology_health_rpc.rs",
+        "docs/ontology-health.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ListOntologyHealthTrend",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ontology_health_trend.rs",
+        "src/grpc/ontology_health_rpc.rs",
+        "docs/ontology-health.md"
+      ],
+      "durable_dependencies": [
+        "sekai.ontology-definitions",
+        "sekai.definition-branch",
+        "sekai.graph",
+        "sekai.datasets"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GenerateDefinitionChangeBundle",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/definition_change_bundle.rs",
+        "src/grpc/definition_change_bundle_rpc.rs",
+        "docs/definition-change-bundles.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.graph"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "DryRunDefinitionChangeBundle",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/definition_change_bundle.rs",
+        "src/grpc/sekai_service_rpc_data.rs",
+        "docs/definition-change-bundles.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.datasets"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ApplyDefinitionChangeBundle",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/definition_bundle_apply.rs",
+        "src/grpc/definition_bundle_apply_rpc.rs",
+        "docs/definition-change-bundles.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.datasets"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetDefinitionBundleApply",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch",
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/definition_bundle_apply.rs",
+        "src/grpc/definition_bundle_apply_rpc.rs",
+        "docs/definition-change-bundles.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.datasets"
       ],
       "product_tier": "advanced"
     },
@@ -455,7 +654,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/object_set.rs",
+        "crates/sekai-core/src/sekai/object_set.rs",
         "src/grpc/object_set_query.rs",
         "docs/object-set.md"
       ],
@@ -465,13 +664,260 @@
       "product_tier": "core"
     },
     {
+      "rpc": "GrantNamespaceExport",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RevokeNamespaceExport",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ExportObjectSet",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ExportDatasetVersion",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.dataset",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetExportReceipt",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "PutExportFingerprintPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/export_fingerprint.rs",
+        "crates/sekai-core/src/sekai/data_export_store.rs",
+        "docs/governed-export.md",
+        "docs/decisions/0131-watermarked-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetExportFingerprintPolicy",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/export_fingerprint.rs",
+        "crates/sekai-core/src/sekai/data_export_store.rs",
+        "docs/governed-export.md",
+        "docs/decisions/0131-watermarked-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "TraceExport",
+      "kind": "query",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/export_fingerprint.rs",
+        "crates/sekai-core/src/sekai/data_export_store.rs",
+        "docs/governed-export.md",
+        "docs/decisions/0131-watermarked-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "PutExportDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetExportDefinition",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DeleteExportDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RunExportDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListDeliverableExportArtifacts",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "FetchExportArtifact",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "AcknowledgeExportDelivery",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/data_export.rs",
+        "crates/sekai-core/src/sekai/data_export_artifact_store.rs",
+        "docs/governed-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "RegisterObjectTypeDatasource",
       "kind": "persistent",
       "surfaces": [
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/object_type_index.rs"
+        "crates/sekai-core/src/db/object_type_index.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -485,7 +931,7 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/object_type_index.rs"
+        "crates/sekai-core/src/db/object_type_index.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -499,7 +945,7 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/object_type_index.rs"
+        "crates/sekai-core/src/db/object_type_index.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -515,7 +961,7 @@
       ],
       "evidence": [
         "src/grpc/search_rpc.rs",
-        "src/db/search_index.rs"
+        "crates/sekai-core/src/db/search_index.rs"
       ],
       "durable_dependencies": [
         "sekai.graph",
@@ -532,11 +978,59 @@
       ],
       "evidence": [
         "src/grpc/search_rpc.rs",
-        "src/db/search_index.rs"
+        "crates/sekai-core/src/db/search_index.rs"
       ],
       "durable_dependencies": [
         "sekai.graph",
         "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "PutEmbeddingSpec",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/embedding_spec_rpc.rs",
+        "crates/sekai-core/src/db/embedding_index.rs",
+        "crates/sekai-core/src/db/postgres_embedding_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListEmbeddingSpecs",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/embedding_spec_rpc.rs",
+        "crates/sekai-core/src/db/embedding_index.rs",
+        "crates/sekai-core/src/db/postgres_embedding_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DeleteEmbeddingSpec",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/embedding_spec_rpc.rs",
+        "crates/sekai-core/src/db/embedding_index.rs",
+        "crates/sekai-core/src/db/postgres_embedding_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
       ],
       "product_tier": "experimental"
     },
@@ -547,7 +1041,7 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/object_type_index.rs"
+        "crates/sekai-core/src/db/object_type_index.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -561,8 +1055,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -576,8 +1070,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -591,8 +1085,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -606,8 +1100,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -621,8 +1115,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -636,8 +1130,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -651,8 +1145,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -666,8 +1160,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -681,8 +1175,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -696,8 +1190,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -712,9 +1206,9 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/sekai/streaming_transform_apply.rs",
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/sekai/streaming_transform_apply.rs",
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.graph"
@@ -728,8 +1222,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -743,8 +1237,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -758,8 +1252,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -773,8 +1267,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs",
-        "src/db/postgres_governed_transform.rs"
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -788,9 +1282,9 @@
         "sekai.governed-document"
       ],
       "evidence": [
-        "src/sekai/document.rs",
-        "src/db/document_store.rs",
-        "src/db/postgres_document.rs"
+        "crates/sekai-core/src/sekai/document.rs",
+        "crates/sekai-core/src/db/document_store.rs",
+        "crates/sekai-core/src/db/postgres_document.rs"
       ],
       "durable_dependencies": [
         "sekai.governed-document"
@@ -804,9 +1298,9 @@
         "sekai.governed-document"
       ],
       "evidence": [
-        "src/sekai/document.rs",
-        "src/db/document_store.rs",
-        "src/db/postgres_document.rs"
+        "crates/sekai-core/src/sekai/document.rs",
+        "crates/sekai-core/src/db/document_store.rs",
+        "crates/sekai-core/src/db/postgres_document.rs"
       ],
       "durable_dependencies": [
         "sekai.governed-document"
@@ -820,9 +1314,9 @@
         "sekai.governed-document"
       ],
       "evidence": [
-        "src/sekai/document.rs",
-        "src/db/document_store.rs",
-        "src/db/postgres_document.rs"
+        "crates/sekai-core/src/sekai/document.rs",
+        "crates/sekai-core/src/db/document_store.rs",
+        "crates/sekai-core/src/db/postgres_document.rs"
       ],
       "durable_dependencies": [
         "sekai.governed-document"
@@ -836,9 +1330,9 @@
         "sekai.governed-document"
       ],
       "evidence": [
-        "src/sekai/document.rs",
-        "src/db/document_store.rs",
-        "src/db/postgres_document.rs"
+        "crates/sekai-core/src/sekai/document.rs",
+        "crates/sekai-core/src/db/document_store.rs",
+        "crates/sekai-core/src/db/postgres_document.rs"
       ],
       "durable_dependencies": [
         "sekai.governed-document"
@@ -852,9 +1346,9 @@
         "sekai.governed-document"
       ],
       "evidence": [
-        "src/sekai/document.rs",
-        "src/db/document_store.rs",
-        "src/db/postgres_document.rs"
+        "crates/sekai-core/src/sekai/document.rs",
+        "crates/sekai-core/src/db/document_store.rs",
+        "crates/sekai-core/src/db/postgres_document.rs"
       ],
       "durable_dependencies": [
         "sekai.governed-document"
@@ -868,9 +1362,9 @@
         "sekai.governed-document"
       ],
       "evidence": [
-        "src/sekai/document.rs",
-        "src/db/document_store.rs",
-        "src/db/postgres_document.rs"
+        "crates/sekai-core/src/sekai/document.rs",
+        "crates/sekai-core/src/db/document_store.rs",
+        "crates/sekai-core/src/db/postgres_document.rs"
       ],
       "durable_dependencies": [
         "sekai.governed-document"
@@ -884,9 +1378,9 @@
         "sekai.governed-document"
       ],
       "evidence": [
-        "src/sekai/document.rs",
-        "src/db/document_store.rs",
-        "src/db/postgres_document.rs"
+        "crates/sekai-core/src/sekai/document.rs",
+        "crates/sekai-core/src/db/document_store.rs",
+        "crates/sekai-core/src/db/postgres_document.rs"
       ],
       "durable_dependencies": [
         "sekai.governed-document"
@@ -898,7 +1392,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/object_change_subscription.rs",
+        "crates/sekai-core/src/sekai/object_change_subscription.rs",
         "src/grpc/object_change_subscription.rs",
         "docs/object-change-subscriptions.md"
       ],
@@ -1002,6 +1496,20 @@
         "tests/object_security_backend_conformance.rs"
       ],
       "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "QueryCounterfactualView",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/counterfactual.rs",
+        "src/grpc/sekai_service_rpc_objects.rs",
+        "docs/object-security.md"
+      ],
+      "durable_dependencies": [
+        "sekai.object-security"
+      ],
       "product_tier": "core"
     },
     {
@@ -1117,6 +1625,270 @@
       "product_tier": "core"
     },
     {
+      "rpc": "PutTrustScoringRule",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetTrustScoringRule",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ScoreObjectTrust",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/trust_score.rs",
+        "src/grpc/trust_score_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "CreateObjectComment",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/object_comment.rs",
+        "src/grpc/object_comment_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "UpdateObjectComment",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/object_comment.rs",
+        "src/grpc/object_comment_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListObjectComments",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/object_comment.rs",
+        "src/grpc/object_comment_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListCommentMentions",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/object_comment.rs",
+        "src/grpc/object_comment_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetOntologyChangelog",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ontology_changelog.rs",
+        "src/grpc/ontology_changelog_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.definitions"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RegisterCatalogEntry",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/catalog.rs",
+        "src/grpc/catalog_rpc.rs",
+        "docs/decisions/0122-governed-catalog-entries.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetCatalogEntryLineage",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/catalog.rs",
+        "crates/sekai-core/src/sekai/catalog_lineage.rs",
+        "src/grpc/catalog_rpc.rs",
+        "docs/catalog.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.datasets",
+        "sekai.definition-branch",
+        "sekai.object-sync"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListCatalogCriticalityOutbox",
+      "kind": "query",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/catalog_criticality.rs",
+        "src/grpc/catalog_rpc.rs",
+        "docs/catalog.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "BeginMediaUpload",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "UploadMediaChunk",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "CompleteMediaUpload",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetMediaUpload",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReadMedia",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "PutSyncScope",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/sync_scope.rs",
+        "src/grpc/sync_scope_rpc.rs",
+        "docs/decisions/0124-offline-sync-scopes.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReadSyncSnapshot",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/sync_scope.rs",
+        "src/grpc/sync_scope_rpc.rs",
+        "docs/decisions/0124-offline-sync-scopes.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReadSyncDeltas",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/sync_scope.rs",
+        "src/grpc/sync_scope_rpc.rs",
+        "docs/decisions/0124-offline-sync-scopes.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExpandNeighborhood",
       "kind": "persistent",
       "surfaces": [
@@ -1145,7 +1917,7 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/sekai/retrieval.rs"
+        "crates/sekai-core/src/sekai/retrieval.rs"
       ],
       "durable_dependencies": [
         "sekai.graph",
@@ -1160,7 +1932,7 @@
       "surfaces": [],
       "evidence": [
         "src/grpc/sekai_service.rs",
-        "src/sekai/retrieval.rs"
+        "crates/sekai-core/src/sekai/retrieval.rs"
       ],
       "durable_dependencies": [
         "sekai.graph",
@@ -1175,7 +1947,7 @@
       "surfaces": [],
       "evidence": [
         "src/grpc/sekai_service.rs",
-        "src/sekai/retrieval.rs"
+        "crates/sekai-core/src/sekai/retrieval.rs"
       ],
       "durable_dependencies": [
         "sekai.graph",
@@ -1371,7 +2143,7 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/sekai/function.rs"
+        "crates/sekai-core/src/sekai/function.rs"
       ],
       "durable_dependencies": [
         "sekai.function-definitions"
@@ -1478,6 +2250,136 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "CreateDatasetBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListDatasetBranches",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DeleteDatasetBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "CompareDatasetBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ProposeDatasetBranchMerge",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "MergeDatasetBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RunGovernedTransformOnBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/dataset_branch.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReplayGovernedTransform",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/transform_replay.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetTransformReplay",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/transform_replay.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ShadowGovernedTransform",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/transform_shadow.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutDatasetHealthCheck",
       "kind": "persistent",
       "surfaces": [
@@ -1537,6 +2439,32 @@
       ],
       "evidence": [
         "tests/dataset_health_backend_conformance.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListConsumerViolationNotifications",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_tests.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "AcknowledgeConsumerViolationNotification",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_tests.rs",
         "src/grpc/sekai_service.rs"
       ],
       "durable_dependencies": [],
@@ -1621,7 +2549,7 @@
         "sekai.authorization"
       ],
       "evidence": [
-        "src/sekai/write_freeze.rs"
+        "crates/sekai-core/src/sekai/write_freeze.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1633,7 +2561,7 @@
         "sekai.authorization"
       ],
       "evidence": [
-        "src/sekai/write_freeze.rs"
+        "crates/sekai-core/src/sekai/write_freeze.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1691,6 +2619,19 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ExplainValue",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit",
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/explain_value_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetAttestation",
       "kind": "persistent",
       "surfaces": [
@@ -1736,7 +2677,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/governed_action_type.rs"
+        "crates/sekai-core/src/sekai/governed_action_type.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1748,7 +2689,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/governed_action_type.rs"
+        "crates/sekai-core/src/sekai/governed_action_type.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1760,7 +2701,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/governed_action_type.rs"
+        "crates/sekai-core/src/sekai/governed_action_type.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1772,7 +2713,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/governed_action_type.rs"
+        "crates/sekai-core/src/sekai/governed_action_type.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1784,7 +2725,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_instance.rs"
+        "crates/sekai-core/src/sekai/action_instance.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1796,7 +2737,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_binding.rs"
+        "crates/sekai-core/src/sekai/action_binding.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1808,7 +2749,67 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_binding.rs"
+        "crates/sekai-core/src/sekai/action_binding.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "PutFenceBinding",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/fence_binding.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "RunFenceBinding",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/fence_binding.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "PutEzuGeoFeed",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ezu_geo_feed.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "RunEzuGeoFeed",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ezu_geo_feed.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "BackfillEzuGeoFeed",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ezu_geo_feed.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1820,7 +2821,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_instance_admission.rs"
+        "crates/sekai-core/src/sekai/action_instance_admission.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1830,7 +2831,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/action_describe_preview.rs",
+        "crates/sekai-core/src/sekai/action_describe_preview.rs",
         "src/grpc/sekai_service.rs",
         "docs/governed-action-instances.md"
       ],
@@ -1844,7 +2845,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/action_describe_preview.rs",
+        "crates/sekai-core/src/sekai/action_describe_preview.rs",
         "src/grpc/sekai_service.rs",
         "docs/governed-action-instances.md"
       ],
@@ -1854,13 +2855,111 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "CreatePlanIntent",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_plan.rs",
+        "crates/sekai-core/src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ProposePlan",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_plan.rs",
+        "crates/sekai-core/src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "SimulatePlan",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_plan.rs",
+        "crates/sekai-core/src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetPlan",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_plan.rs",
+        "crates/sekai-core/src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [
+        "sekai.audit"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "SubmitPlanReview",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/plan_review.rs",
+        "crates/sekai-core/src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "DecidePlanReview",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/plan_review.rs",
+        "crates/sekai-core/src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ExecuteActionPlan",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/plan_execution.rs",
+        "crates/sekai-core/src/sekai/action_plan_store.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetActionInstance",
       "kind": "persistent",
       "surfaces": [
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_instance.rs"
+        "crates/sekai-core/src/sekai/action_instance.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1872,7 +2971,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_instance.rs"
+        "crates/sekai-core/src/sekai/action_instance.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1884,7 +2983,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_effect.rs"
+        "crates/sekai-core/src/sekai/action_effect.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1897,7 +2996,7 @@
       ],
       "evidence": [
         "src/grpc/sekai_service.rs",
-        "src/sekai/action_effect.rs"
+        "crates/sekai-core/src/sekai/action_effect.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1909,7 +3008,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_effect.rs"
+        "crates/sekai-core/src/sekai/action_effect.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1921,7 +3020,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_effect.rs"
+        "crates/sekai-core/src/sekai/action_effect.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1933,7 +3032,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_effect.rs"
+        "crates/sekai-core/src/sekai/action_effect.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1945,7 +3044,7 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_effect.rs"
+        "crates/sekai-core/src/sekai/action_effect.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1957,8 +3056,8 @@
         "sekai.audit"
       ],
       "evidence": [
-        "src/sekai/action_effect.rs",
-        "src/db/postgres_action_effect.rs"
+        "crates/sekai-core/src/sekai/action_effect.rs",
+        "crates/sekai-core/src/db/postgres_action_effect.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -2060,7 +3159,7 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/sekai/lineage.rs"
+        "crates/sekai-core/src/sekai/lineage.rs"
       ],
       "durable_dependencies": [
         "sekai.graph",

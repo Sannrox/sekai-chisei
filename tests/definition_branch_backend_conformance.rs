@@ -17,8 +17,8 @@ use sekai_chisei::sekai::definition_diff::{
 };
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
-    CreateDefinitionProposal, MergeDefinitionProposal, ProposeDefinitionRollback, STATUS_CLOSED,
-    STATUS_MERGED, STATUS_OPEN,
+    CreateDefinitionProposal, MergeDefinitionProposal, ProposeDefinitionImport,
+    ProposeDefinitionRollback, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
 };
 
 fn member(namespace: &str, member_id: &str, definition_json: &str) -> DefinitionMemberInput {
@@ -255,6 +255,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         eval_plan_digests: vec![eval_digest.clone()],
         named_foreign_digests: vec![foreign_digest.clone()],
         idempotency_key: "propose-1".into(),
+        major_revision: false,
+        migration_plan_digest: String::new(),
     };
     let created = db
         .create_definition_proposal(&propose, "author", 4)
@@ -276,6 +278,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         proposal_id: "cs-1".into(),
         expected_published_digest: parent_digest.clone(),
         idempotency_key: "merge-missing".into(),
+        expected_dataset_versions: Vec::new(),
+        expected_datasources: Vec::new(),
     };
     assert!(
         db.merge_definition_proposal(&merge, "author", 6)
@@ -317,6 +321,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         proposal_id: "cs-1".into(),
         expected_published_digest: parent_digest.clone(),
         idempotency_key: "merge-stale".into(),
+        expected_dataset_versions: Vec::new(),
+        expected_datasources: Vec::new(),
     };
     assert!(
         db.merge_definition_proposal(&stale_merge, "author", 9)
@@ -380,6 +386,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         eval_plan_digests: vec![digest('e')],
         named_foreign_digests: vec![digest('f')],
         idempotency_key: "propose-2".into(),
+        major_revision: false,
+        migration_plan_digest: String::new(),
     };
     db.create_definition_proposal(&second_propose, "author", 13)
         .unwrap();
@@ -400,6 +408,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
                 proposal_id: "cs-2".into(),
                 expected_published_digest: second.revision.revision_digest.clone(),
                 idempotency_key: "merge-stale-head".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "author",
             15,
@@ -419,6 +429,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         proposal_id: "cs-2".into(),
         expected_published_digest: parent_digest.clone(),
         idempotency_key: "merge-2".into(),
+        expected_dataset_versions: Vec::new(),
+        expected_datasources: Vec::new(),
     };
     let merged = db
         .merge_definition_proposal(&merge_request, "author", 16)
@@ -510,6 +522,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
                 proposal_id: "cs-1".into(),
                 expected_published_digest: parent_digest.clone(),
                 idempotency_key: "merge-closed".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "author",
             20,
@@ -954,6 +968,8 @@ fn exercise_coordinated_artifact_merge(db: &dyn DefinitionBranchBackend, namespa
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-four".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "author",
         4,
@@ -976,6 +992,8 @@ fn exercise_coordinated_artifact_merge(db: &dyn DefinitionBranchBackend, namespa
                 proposal_id: "cs-four".into(),
                 expected_published_digest: parent_digest.clone(),
                 idempotency_key: "merge-four".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "author",
             6,
@@ -1033,6 +1051,8 @@ fn exercise_named_compatibility_gate_refusal(db: &dyn DefinitionBranchBackend, n
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-gate".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "author",
         4,
@@ -1055,6 +1075,8 @@ fn exercise_named_compatibility_gate_refusal(db: &dyn DefinitionBranchBackend, n
                 proposal_id: "cs-gate".into(),
                 expected_published_digest: parent_digest.clone(),
                 idempotency_key: "merge-gate".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "author",
             6,
@@ -1149,6 +1171,8 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "agent-propose".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "author",
         7,
@@ -1171,6 +1195,8 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
                 proposal_id: "agent-proposal".into(),
                 expected_published_digest: parent.clone(),
                 idempotency_key: "agent-merge".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "author",
             9,
@@ -1206,6 +1232,8 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
                 proposal_id: "agent-proposal".into(),
                 expected_published_digest: parent.clone(),
                 idempotency_key: "agent-merge-failed".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "author",
             9,
@@ -1224,6 +1252,8 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
                 proposal_id: "agent-proposal".into(),
                 expected_published_digest: parent.clone(),
                 idempotency_key: "agent-merge-stale".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "author",
             9,
@@ -1258,6 +1288,8 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
                 proposal_id: "agent-proposal".into(),
                 expected_published_digest: parent.clone(),
                 idempotency_key: "agent-merge-regressed".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "author",
             9,
@@ -1274,6 +1306,8 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
             proposal_id: "agent-proposal".into(),
             expected_published_digest: parent.clone(),
             idempotency_key: "agent-merge-certified".into(),
+            expected_dataset_versions: Vec::new(),
+            expected_datasources: Vec::new(),
         },
         "author",
         10,
@@ -1470,6 +1504,8 @@ fn exercise_definition_rollback(db: &dyn DefinitionBranchBackend, namespace: &st
                 proposal_id: "rb-cs-restore".into(),
                 expected_published_digest: second.clone(),
                 idempotency_key: "rb-restore-merge".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "merger",
             23,
@@ -1494,6 +1530,68 @@ fn exercise_definition_rollback(db: &dyn DefinitionBranchBackend, namespace: &st
     assert_eq!(
         member_set(db, namespace, &published.revision_digest),
         member_set(db, namespace, &first)
+    );
+}
+
+/// Import opens a proposal holding exactly the given members: missing
+/// target members are removals, the package digest is pinned, and a retry
+/// replays the same proposal.
+fn exercise_definition_import(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let published = seed_ticket(db, namespace, r#"{"name":"Ticket","properties":["title"]}"#);
+    let incoming = typed_member(
+        namespace,
+        "ontology_class",
+        "TicketClass",
+        r#"{"name":"TicketClass"}"#,
+    )
+    .prepare(namespace)
+    .unwrap();
+    let request = ProposeDefinitionImport {
+        namespace: namespace.into(),
+        branch_id: "pkg-import".into(),
+        proposal_id: "pkg-cs-import".into(),
+        source_package_digest: digest('e'),
+        members: vec![incoming.clone()],
+        expected_published_digest: published.clone(),
+        idempotency_key: "pkg-import-1".into(),
+    };
+    let DefinitionWriteResult::CreateProposal { proposal } = db
+        .propose_definition_import(&request, "author", 20)
+        .unwrap()
+    else {
+        panic!("expected import proposal");
+    };
+    assert_eq!(proposal.status, STATUS_OPEN);
+    assert_eq!(proposal.base_digest, published);
+    assert_eq!(proposal.source_package_digest, digest('e'));
+    assert_eq!(
+        member_set(db, namespace, &proposal.candidate_digest),
+        vec![(
+            incoming.member_kind.clone(),
+            incoming.member_id.clone(),
+            incoming.member_digest.clone()
+        )]
+    );
+    let DefinitionWriteResult::CreateProposal { proposal: replayed } = db
+        .propose_definition_import(&request, "author", 21)
+        .unwrap()
+    else {
+        panic!("expected replayed import proposal");
+    };
+    assert_eq!(replayed, proposal);
+    let stale = ProposeDefinitionImport {
+        proposal_id: "pkg-cs-stale".into(),
+        branch_id: "pkg-stale".into(),
+        expected_published_digest: digest('d'),
+        idempotency_key: "pkg-import-stale".into(),
+        ..request
+    };
+    let refused = db
+        .propose_definition_import(&stale, "author", 22)
+        .unwrap_err();
+    assert!(
+        refused.starts_with("stale_published_definition_head"),
+        "{refused}"
     );
 }
 
@@ -1548,6 +1646,8 @@ fn exercise_rollback_live_values(
                 proposal_id: "rb-live-cs".into(),
                 expected_published_digest: second.clone(),
                 idempotency_key: "rb-live-merge".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "merger",
             42,
@@ -1589,6 +1689,8 @@ fn exercise_rollback_live_values(
                 proposal_id: "rb-live-cs-plan".into(),
                 expected_published_digest: second.clone(),
                 idempotency_key: "rb-live-plan-merge".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "merger",
             45,
@@ -1658,6 +1760,8 @@ fn publish_revision(
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: format!("{branch_id}-propose"),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "author",
         t + 2,
@@ -1680,6 +1784,8 @@ fn publish_revision(
                 proposal_id: proposal_id.into(),
                 expected_published_digest: parent_digest.into(),
                 idempotency_key: format!("{branch_id}-merge"),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
             },
             "merger",
             t + 4,
@@ -1873,6 +1979,7 @@ fn sqlite_definition_branch_backend_conformance() {
     exercise_named_compatibility_gate_refusal(&SekaiDb::new(":memory:").unwrap(), "sqlite-gate");
     exercise_published_revision_history(&SekaiDb::new(":memory:").unwrap(), "sqlite-history");
     exercise_definition_rollback(&SekaiDb::new(":memory:").unwrap(), "sqlite-rollback");
+    exercise_definition_import(&SekaiDb::new(":memory:").unwrap(), "sqlite-import");
     {
         let db = SekaiDb::new(":memory:").unwrap();
         let namespace = "sqlite-rollback-live";
@@ -1915,6 +2022,7 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_named_compatibility_gate_refusal(db.as_ref(), &format!("{prefix}-gate"));
     exercise_published_revision_history(db.as_ref(), &format!("{prefix}-history"));
     exercise_definition_rollback(db.as_ref(), &format!("{prefix}-rollback"));
+    exercise_definition_import(db.as_ref(), &format!("{prefix}-import"));
     {
         let namespace = format!("{prefix}-rollback-live");
         exercise_rollback_live_values(db.as_ref(), &namespace, || {

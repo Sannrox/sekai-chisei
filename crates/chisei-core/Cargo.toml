@@ -1,0 +1,60 @@
+[package]
+name = "chisei-core"
+version = "1.3.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Chisei policy, budget, routing, evaluation, pipeline, and persistence."
+repository = "https://github.com/Sannrox/sekai-chisei"
+
+[features]
+default = []
+gateway-test-support = ["sekai-core/gateway-test-support"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.23"
+chisei-provider = { version = "1.0.0", path = "../chisei-provider" }
+futures-util = "0.3"
+http = "1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = "2"
+hmac = "0.12"
+metrics = "0.24"
+postgres = { version = "0.19", default-features = false, features = [
+    "with-chrono-0_4",
+    "with-serde_json-1",
+    "with-uuid-1",
+] }
+rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "limits"] }
+sekai-core = { version = "1.3.0", path = "../sekai-core" }
+sekai-domain = { version = "1.1.0", path = "../sekai-domain" }
+sekai-obs = { version = "1.1.0", path = "../sekai-obs" }
+sekai-types = { version = "1.0.0", path = "../sekai-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+sekai-core = { version = "1.3.0", path = "../sekai-core", features = ["gateway-test-support"] }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }

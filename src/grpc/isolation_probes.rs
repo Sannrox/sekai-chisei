@@ -111,7 +111,7 @@ const CATALOGUE: &[Probe] = &[
         bypass: "document extraction wrote objects without action policy or write check",
         expected_denial: "refused",
         tests: &[(
-            "src/sekai/function_document.rs",
+            "crates/sekai-core/src/sekai/function_document.rs",
             "allowed_extract_is_refused_by_the_write_authorization",
         )],
     },
@@ -130,7 +130,7 @@ const CATALOGUE: &[Probe] = &[
         expected_denial: "refused",
         tests: &[
             (
-                "src/sekai/action_work_lifecycle.rs",
+                "crates/sekai-core/src/sekai/action_work_lifecycle.rs",
                 "apply_refuses_when_action_instance_is_missing",
             ),
             (
@@ -157,8 +157,14 @@ fn source(file: &str) -> &'static str {
         PROBES_FILE => include_str!("isolation_probes.rs"),
         SEKAI_TESTS => include_str!("sekai_service_tests.rs"),
         CHISEI_TESTS => include_str!("chisei_service_tests.rs"),
-        "src/sekai/function_document.rs" => include_str!("../sekai/function_document.rs"),
-        "src/sekai/action_work_lifecycle.rs" => include_str!("../sekai/action_work_lifecycle.rs"),
+        "crates/sekai-core/src/sekai/function_document.rs" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/sekai-core/src/sekai/function_document.rs"
+        )),
+        "crates/sekai-core/src/sekai/action_work_lifecycle.rs" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/sekai-core/src/sekai/action_work_lifecycle.rs"
+        )),
         other => panic!("catalogue names an unknown source file {other}"),
     }
 }
@@ -280,6 +286,11 @@ async fn isolation_probe_1140_only_one_credentialed_subject_decides() {
                 delegating_actor: None,
                 budget_already_reserved: false,
                 resource_tenant: String::new(),
+                binding_markings: Vec::new(),
+                source_object_id: String::new(),
+                marking_gate: Default::default(),
+                expected_object_revision: String::new(),
+                offline: None,
             },
             &editor,
             2_000_000_000_000,

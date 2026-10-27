@@ -5,10 +5,11 @@
 //! measured path is the gRPC service implementation, not a parallel copy.
 
 use crate::chisei::budget::{BudgetTracker, PeriodType};
+use crate::chisei_store::ChiseiStore;
 use crate::composition::cross_store_admission::CrossStoreAdmission;
 use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
-use crate::db::store::{ChiseiStore, SekaiStore};
+use crate::db::store::SekaiStore;
 use crate::domain::{Link, Object};
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
@@ -626,6 +627,7 @@ impl ObjectPathHarness {
                 evidence_submission_ids: vec![],
                 request_id: format!("req-{step}"),
                 ontology_digest: String::new(),
+                offline: None,
             },
             READER,
         )))?;
@@ -1076,6 +1078,7 @@ fn seed_action_type(db: &RuntimeDb, namespace: &str) -> Result<(), String> {
         declared_effect_kinds: vec![],
         system_one: None,
         review_queue: Default::default(),
+        last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
     };
     db.put_governed_action_type(type_def, READER, 1).map(|_| ())
 }

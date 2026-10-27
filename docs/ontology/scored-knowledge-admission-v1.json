@@ -11,8 +11,8 @@
   ],
   "provenance": [
     {"subject":"ScoredKnowledgeAdmission","source":"src/grpc/scored_knowledge_admission.rs","locator":"admit","confidence":1.0},
-    {"subject":"GovernedLearningRecord","source":"src/sekai/learning.rs","locator":"record_learning","confidence":1.0},
-    {"subject":"KnowledgeWriter","source":"src/chisei/scoring.rs","locator":"KnowledgeWriter","confidence":1.0},
+    {"subject":"GovernedLearningRecord","source":"crates/sekai-core/src/sekai/learning.rs","locator":"record_learning","confidence":1.0},
+    {"subject":"KnowledgeWriter","source":"crates/chisei-core/src/chisei/scoring.rs","locator":"KnowledgeWriter","confidence":1.0},
     {"subject":"delegates_scored_knowledge_admission_to","source":"src/grpc/sekai_service.rs","locator":"KnowledgeWriter implementation","confidence":1.0},
     {"subject":"creates_governed_learning_record","source":"src/grpc/scored_knowledge_admission.rs","locator":"record_learning call","confidence":1.0}
   ]

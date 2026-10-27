@@ -132,6 +132,21 @@ the last committed cursor. The reset preserves the existing source binding,
 type revision, object identity, and lineage. Batches from an older generation
 cannot advance the replacement generation.
 
+### Batch history
+
+`ListSourceBatchTransactions` (experimental, #1699; rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled) pages through one binding's batch transactions, newest first by
+`opened_at_ms` and then `transaction_id`, so a connector or operator can
+reconcile what was committed, denied or quarantined. It returns the
+`SourceBatchTransaction` metadata only, never the batch payload. A page holds
+at most 100 transactions (`page_size` 0 or above 100 means 100), and
+`next_page_token` is an opaque keyset cursor bound to the binding: batches
+applied between pages are newer than every page already read, so they neither
+repeat nor shift later pages. It is authorized exactly as `GetSourceSyncState`,
+and a caller that call refuses is refused here with the same status. Progress
+still comes from `GetSourceSyncState`, never from history.
+
 ### Ordered-feed failure and recovery
 
 - Exact replay of a committed batch returns the stored result without another
@@ -270,6 +285,19 @@ There is no operator endpoint that force-commits, edits, discards, or skips an
 open transaction or ordered range. Recovery is exact replay, an authorized
 next-generation snapshot after `recovery_required`, or database repair from
 authoritative evidence.
+
+A producer that no longer holds the exact batch replays it from the plane's
+copy (#1766). `RuntimeDb::resume_open_source_batch(namespace,
+source_instance, type_digest, producer, now_ms)` re-applies the stored body of
+the binding's open transaction. It succeeds or fails exactly as replaying the
+identical batch would, and with nothing open it is a no-op. Concurrent
+resumes commit once. `RuntimeDb::abort_open_source_batch(..., reason, ...)`
+closes an open transaction that can no longer become valid as `ABORTED`
+(`aborted_by_producer: <reason>`). The checkpoint stays where it was, and the
+binding takes a fresh batch again. Both act only for the producer that opened
+the transaction (`open_transaction_producer_mismatch` otherwise), and both
+are idempotent. They are library calls for in-process connectors and
+replacement processes, not operator endpoints.
 
 ## Identity and deletion
 

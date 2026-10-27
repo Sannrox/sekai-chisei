@@ -309,6 +309,7 @@ impl WritebackProfile {
                     evidence_submission_ids: vec![],
                     request_id: permit.operation_id.clone(),
                     ontology_digest: String::new(),
+                    offline: None,
                 },
                 actor,
             )?)

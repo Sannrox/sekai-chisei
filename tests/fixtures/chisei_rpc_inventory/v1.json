@@ -14,8 +14,8 @@
       "evidence": [
         "tests/chisei_external_action_backend_conformance.rs",
         "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
+        "crates/chisei-core/src/chisei_store/postgres_external_action.rs",
+        "crates/chisei-core/src/chisei_store/postgres_external_permit.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -28,7 +28,7 @@
       ],
       "evidence": [
         "tests/chisei_evaluation_execution_backend_conformance.rs",
-        "src/db/postgres_evaluation_execution.rs"
+        "crates/chisei-core/src/chisei_store/postgres_evaluation_execution.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -42,7 +42,7 @@
       ],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs",
         "tests/chisei_gateway_audit_backend_conformance.rs"
       ],
       "durable_dependencies": [],
@@ -54,10 +54,10 @@
       "surfaces": [],
       "evidence": [
         "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs",
+        "crates/sekai-core/src/db/postgres_budget.rs",
         "tests/chisei_policy_backend_conformance.rs",
         "tests/graph_backend_conformance.rs",
-        "src/chisei/gateway_decide.rs"
+        "crates/chisei-core/src/chisei/gateway_decide.rs"
       ],
       "durable_dependencies": [
         "chisei.policy",
@@ -72,9 +72,9 @@
         "chisei.execution"
       ],
       "evidence": [
-        "src/chisei/governed_subject.rs",
+        "crates/chisei-core/src/chisei/governed_subject.rs",
         "src/grpc/chisei_service.rs",
-        "src/db/postgres_chisei_receipts.rs",
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs",
         "docs/governed-subjects.md"
       ],
       "durable_dependencies": [],
@@ -89,7 +89,7 @@
       "evidence": [
         "src/grpc/chisei_service/content_execution.rs",
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
@@ -102,8 +102,47 @@
       ],
       "evidence": [
         "tests/chisei_evaluation_execution_backend_conformance.rs",
-        "src/db/postgres_evaluation_execution.rs",
-        "src/chisei/evaluation_execution.rs"
+        "crates/chisei-core/src/chisei_store/postgres_evaluation_execution.rs",
+        "crates/chisei-core/src/chisei/evaluation_execution.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RunEvalDataset",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei_store/eval_run.rs",
+        "crates/chisei-core/src/chisei/eval_run.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "CompareEvalDatasetRuns",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei_store/eval_run.rs",
+        "crates/chisei-core/src/chisei/eval_compare.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListEvalDatasetRunTrend",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei_store/eval_run.rs",
+        "crates/chisei-core/src/chisei/eval_compare.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -116,7 +155,7 @@
       ],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
@@ -131,8 +170,8 @@
         "crates/sekai-types/src/governed_subject_provenance.rs",
         "src/grpc/chisei_service.rs",
         "tests/chisei_governed_subject_provenance_backend_conformance.rs",
-        "src/db/governed_subject_provenance.rs",
-        "src/db/postgres_governed_subject_provenance.rs"
+        "crates/sekai-core/src/db/governed_subject_provenance.rs",
+        "crates/sekai-core/src/db/postgres_governed_subject_provenance.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -151,12 +190,51 @@
       "product_tier": "core"
     },
     {
+      "rpc": "StartPolicyShadow",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_policy_shadow_backend_conformance.rs",
+        "crates/chisei-core/src/chisei_store/policy_shadow.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetPolicyShadowReport",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_policy_shadow_backend_conformance.rs",
+        "crates/chisei-core/src/chisei_store/policy_shadow.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "StopPolicyShadow",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_policy_shadow_backend_conformance.rs",
+        "crates/chisei-core/src/chisei_store/policy_shadow.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetEvaluationGateEvidence",
       "kind": "query",
       "surfaces": [],
       "evidence": [
         "src/grpc/chisei_service.rs",
-        "src/chisei/eval.rs",
+        "crates/chisei-core/src/chisei/eval.rs",
         "docs/evaluation-gate-evidence.md"
       ],
       "durable_dependencies": [
@@ -169,9 +247,9 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs",
-        "src/db/postgres_gunshi.rs",
+        "crates/chisei-core/src/chisei/gunshi_auto.rs",
+        "crates/chisei-core/src/chisei_store/chisei.rs",
+        "crates/sekai-core/src/db/postgres_gunshi.rs",
         "tests/chisei_gunshi_backend_conformance.rs"
       ],
       "durable_dependencies": [
@@ -202,7 +280,7 @@
       ],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
@@ -227,8 +305,8 @@
       "surfaces": [],
       "evidence": [
         "src/grpc/chisei_service.rs",
-        "src/db/chisei.rs",
-        "src/db/postgres_eval.rs"
+        "crates/chisei-core/src/chisei_store/chisei.rs",
+        "crates/chisei-core/src/chisei_store/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.observations"
@@ -241,10 +319,10 @@
       "surfaces": [],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs",
         "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs",
-        "src/db/postgres_gunshi.rs",
+        "crates/chisei-core/src/chisei_store/postgres_kioku.rs",
+        "crates/sekai-core/src/db/postgres_gunshi.rs",
         "tests/chisei_gunshi_backend_conformance.rs"
       ],
       "durable_dependencies": [
@@ -261,7 +339,7 @@
       ],
       "evidence": [
         "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs"
+        "crates/chisei-core/src/chisei_store/postgres_kioku.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -273,9 +351,9 @@
       "evidence": [
         "src/grpc/chisei_service/content_execution.rs",
         "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs",
+        "crates/sekai-core/src/db/postgres_budget.rs",
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs",
         "tests/chisei_policy_backend_conformance.rs"
       ],
       "durable_dependencies": [
@@ -290,7 +368,7 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/chisei/routing_profiles.rs"
+        "crates/chisei-core/src/chisei/routing_profiles.rs"
       ],
       "durable_dependencies": [
         "chisei.policy"
@@ -305,7 +383,7 @@
       ],
       "evidence": [
         "tests/chisei_routing_profile_backend_conformance.rs",
-        "src/db/postgres_routing_profile.rs"
+        "crates/chisei-core/src/chisei_store/postgres_routing_profile.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -318,7 +396,7 @@
       ],
       "evidence": [
         "tests/chisei_routing_profile_backend_conformance.rs",
-        "src/db/postgres_routing_profile.rs"
+        "crates/chisei-core/src/chisei_store/postgres_routing_profile.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -331,8 +409,8 @@
       ],
       "evidence": [
         "tests/chisei_model_release_evidence_backend_conformance.rs",
-        "src/db/postgres_model_release_evidence.rs",
-        "src/chisei/model_release_evidence.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_release_evidence.rs",
+        "crates/chisei-core/src/chisei/model_release_evidence.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -345,8 +423,8 @@
       ],
       "evidence": [
         "tests/chisei_model_release_evidence_backend_conformance.rs",
-        "src/db/postgres_model_release_evidence.rs",
-        "src/chisei/model_release_evidence.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_release_evidence.rs",
+        "crates/chisei-core/src/chisei/model_release_evidence.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -357,8 +435,8 @@
       "surfaces": [],
       "evidence": [
         "tests/chisei_model_release_evidence_backend_conformance.rs",
-        "src/db/postgres_model_release_evidence.rs",
-        "src/chisei/model_release_evidence.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_release_evidence.rs",
+        "crates/chisei-core/src/chisei/model_release_evidence.rs"
       ],
       "durable_dependencies": [
         "chisei.policy"
@@ -373,8 +451,8 @@
       ],
       "evidence": [
         "tests/chisei_model_release_evidence_backend_conformance.rs",
-        "src/db/postgres_model_release_evidence.rs",
-        "src/chisei/model_release_evidence.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_release_evidence.rs",
+        "crates/chisei-core/src/chisei/model_release_evidence.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -387,8 +465,8 @@
       ],
       "evidence": [
         "tests/chisei_model_release_evidence_backend_conformance.rs",
-        "src/db/postgres_model_release_evidence.rs",
-        "src/chisei/model_release_evidence.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_release_evidence.rs",
+        "crates/chisei-core/src/chisei/model_release_evidence.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -401,7 +479,7 @@
       ],
       "evidence": [
         "tests/chisei_model_review_backend_conformance.rs",
-        "src/db/postgres_model_review.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_review.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -414,7 +492,7 @@
       ],
       "evidence": [
         "tests/chisei_model_review_backend_conformance.rs",
-        "src/db/postgres_model_review.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_review.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -425,7 +503,7 @@
       "surfaces": [],
       "evidence": [
         "tests/chisei_model_review_backend_conformance.rs",
-        "src/db/postgres_model_review.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_review.rs"
       ],
       "durable_dependencies": [
         "chisei.policy"
@@ -440,7 +518,7 @@
       ],
       "evidence": [
         "tests/chisei_model_review_backend_conformance.rs",
-        "src/db/postgres_model_review.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_review.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -453,7 +531,7 @@
       ],
       "evidence": [
         "tests/chisei_model_review_backend_conformance.rs",
-        "src/db/postgres_model_review.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_review.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -464,7 +542,7 @@
       "surfaces": [],
       "evidence": [
         "tests/chisei_model_review_backend_conformance.rs",
-        "src/db/postgres_model_review.rs"
+        "crates/chisei-core/src/chisei_store/postgres_model_review.rs"
       ],
       "durable_dependencies": [
         "chisei.policy"
@@ -477,9 +555,9 @@
       "surfaces": [],
       "evidence": [
         "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs",
+        "crates/sekai-core/src/db/postgres_budget.rs",
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs",
         "tests/chisei_policy_backend_conformance.rs",
         "tests/graph_backend_conformance.rs"
       ],
@@ -498,8 +576,8 @@
       ],
       "evidence": [
         "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs",
-        "src/chisei/evaluation_plan.rs"
+        "crates/chisei-core/src/chisei_store/postgres_evaluation_plan.rs",
+        "crates/chisei-core/src/chisei/evaluation_plan.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -512,8 +590,8 @@
       ],
       "evidence": [
         "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs",
-        "src/chisei/evaluation_plan.rs"
+        "crates/chisei-core/src/chisei_store/postgres_evaluation_plan.rs",
+        "crates/chisei-core/src/chisei/evaluation_plan.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -526,7 +604,7 @@
       ],
       "evidence": [
         "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs"
+        "crates/sekai-core/src/db/postgres_budget.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
@@ -540,8 +618,8 @@
       "evidence": [
         "tests/chisei_external_action_backend_conformance.rs",
         "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
+        "crates/chisei-core/src/chisei_store/postgres_external_action.rs",
+        "crates/chisei-core/src/chisei_store/postgres_external_permit.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -554,7 +632,7 @@
       ],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
@@ -567,8 +645,8 @@
       ],
       "evidence": [
         "tests/chisei_evaluation_manifest_backend_conformance.rs",
-        "src/db/postgres_evaluation_manifest.rs",
-        "src/chisei/evaluation_manifest.rs"
+        "crates/chisei-core/src/chisei_store/postgres_evaluation_manifest.rs",
+        "crates/chisei-core/src/chisei/evaluation_manifest.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -581,7 +659,7 @@
       ],
       "evidence": [
         "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs"
+        "crates/chisei-core/src/chisei_store/postgres_kioku.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -594,7 +672,7 @@
       ],
       "evidence": [
         "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs"
+        "crates/sekai-core/src/db/postgres_budget.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
@@ -608,8 +686,8 @@
       "evidence": [
         "tests/chisei_external_action_backend_conformance.rs",
         "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
+        "crates/chisei-core/src/chisei_store/postgres_external_action.rs",
+        "crates/chisei-core/src/chisei_store/postgres_external_permit.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -621,9 +699,9 @@
         "chisei.learning"
       ],
       "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs",
-        "src/db/postgres_gunshi.rs",
+        "crates/chisei-core/src/chisei/gunshi_auto.rs",
+        "crates/chisei-core/src/chisei_store/chisei.rs",
+        "crates/sekai-core/src/db/postgres_gunshi.rs",
         "tests/chisei_gunshi_backend_conformance.rs"
       ],
       "durable_dependencies": [],
@@ -651,8 +729,8 @@
       "evidence": [
         "tests/chisei_external_action_backend_conformance.rs",
         "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
+        "crates/chisei-core/src/chisei_store/postgres_external_action.rs",
+        "crates/chisei-core/src/chisei_store/postgres_external_permit.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -675,14 +753,14 @@
   ],
   "evidence_harnesses": [
     "docs/postgres-chisei-parity.md",
-    "src/db/postgres_budget.rs",
-    "src/db/postgres_chisei_receipts.rs",
-    "src/db/postgres_eval.rs",
-    "src/db/postgres_external_action.rs",
-    "src/db/postgres_external_permit.rs",
-    "src/db/postgres_gunshi.rs",
-    "src/db/postgres_kioku.rs",
-    "src/db/postgres_portfolio.rs",
+    "crates/sekai-core/src/db/postgres_budget.rs",
+    "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs",
+    "crates/chisei-core/src/chisei_store/postgres_eval.rs",
+    "crates/chisei-core/src/chisei_store/postgres_external_action.rs",
+    "crates/chisei-core/src/chisei_store/postgres_external_permit.rs",
+    "crates/sekai-core/src/db/postgres_gunshi.rs",
+    "crates/chisei-core/src/chisei_store/postgres_kioku.rs",
+    "crates/chisei-core/src/chisei_store/postgres_portfolio.rs",
     "tests/chisei_budget_backend_conformance.rs",
     "tests/chisei_eval_backend_conformance.rs",
     "tests/chisei_evaluation_plan_backend_conformance.rs",
@@ -705,8 +783,8 @@
       "evidence": [
         "tests/chisei_external_action_backend_conformance.rs",
         "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
+        "crates/chisei-core/src/chisei_store/postgres_external_action.rs",
+        "crates/chisei-core/src/chisei_store/postgres_external_permit.rs"
       ],
       "note": "dual-backend harness proven"
     },
@@ -714,7 +792,7 @@
       "surface": "chisei.budget",
       "evidence": [
         "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs"
+        "crates/sekai-core/src/db/postgres_budget.rs"
       ],
       "note": "dual-backend harness proven"
     },
@@ -723,8 +801,8 @@
       "evidence": [
         "tests/chisei_eval_backend_conformance.rs",
         "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_eval.rs",
-        "src/db/postgres_evaluation_plan.rs"
+        "crates/chisei-core/src/chisei_store/postgres_eval.rs",
+        "crates/chisei-core/src/chisei_store/postgres_evaluation_plan.rs"
       ],
       "note": "dual-backend harness proven"
     },
@@ -732,7 +810,7 @@
       "surface": "chisei.execution",
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
+        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs"
       ],
       "note": "dual-backend harness proven"
     },
@@ -740,9 +818,9 @@
       "surface": "chisei.learning",
       "evidence": [
         "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs",
+        "crates/chisei-core/src/chisei_store/postgres_kioku.rs",
         "tests/chisei_gunshi_backend_conformance.rs",
-        "src/db/postgres_gunshi.rs"
+        "crates/sekai-core/src/db/postgres_gunshi.rs"
       ],
       "note": "dual-backend harness proven"
     },
@@ -750,7 +828,7 @@
       "surface": "chisei.observations",
       "evidence": [
         "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
+        "crates/chisei-core/src/chisei_store/postgres_eval.rs"
       ],
       "note": "dual-backend harness proven"
     },
@@ -766,7 +844,7 @@
       "surface": "chisei.portfolio",
       "evidence": [
         "tests/chisei_portfolio_backend_conformance.rs",
-        "src/db/postgres_portfolio.rs"
+        "crates/chisei-core/src/chisei_store/postgres_portfolio.rs"
       ],
       "note": "dual-backend harness proven"
     },

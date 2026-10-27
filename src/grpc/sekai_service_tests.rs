@@ -1,4 +1,5 @@
 use super::*;
+use crate::ext::*;
 use std::collections::HashMap;
 use tonic::metadata::MetadataValue;
 
@@ -46,6 +47,7 @@ impl crate::enterprise::EnterpriseExtension for TestEnterpriseExtension {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: 100,
+            device: None,
         })
     }
 
@@ -91,6 +93,12 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
         SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
             .unwrap(),
     ));
+    assert_extension_derives_context(&db);
+}
+
+/// The installed extension, not request metadata, decides principal and
+/// tenant, and authorizes the namespace; shared by both backends.
+fn assert_extension_derives_context(db: &RuntimeDb) {
     let mut request = Request::new(());
     request
         .extensions_mut()
@@ -113,6 +121,7 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: 100,
+            device: None,
         });
     request
         .metadata_mut()
@@ -121,7 +130,7 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
         "x-sekai-tenant-id",
         MetadataValue::from_static("attacker-tenant"),
     );
-    let tenant = request_tenant_context(&db, &request).unwrap().unwrap();
+    let tenant = request_tenant_context(db, &request).unwrap().unwrap();
     assert_eq!(caller_principals(&request), ["subject-a"]);
     assert_eq!(
         tenant
@@ -130,9 +139,9 @@ fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
             .map(|context| context.tenant_id.as_str()),
         Some("tenant-test")
     );
-    assert!(enforce_namespace_tenant_context(&db, Some(&tenant), "allowed", false).is_ok());
+    assert!(enforce_namespace_tenant_context(db, Some(&tenant), "allowed", false).is_ok());
     assert_eq!(
-        enforce_namespace_tenant_context(&db, Some(&tenant), "denied", true)
+        enforce_namespace_tenant_context(db, Some(&tenant), "denied", true)
             .unwrap_err()
             .code(),
         tonic::Code::PermissionDenied
@@ -184,7 +193,7 @@ fn enterprise_rejects_community_credentials_on_every_rpc() {
     )));
     db.create_principal_credential(
         "machine-a",
-        &crate::gateway_keys::hash_gateway_key("machine-token"),
+        &sekai_domain::gateway_keys::hash_gateway_key("machine-token"),
         1,
     )
     .unwrap();
@@ -296,6 +305,7 @@ fn test_tenant_context() -> crate::enterprise::AuthenticatedContext {
         issuer: "https://issuer.test".into(),
         resource: "https://sekai.test".into(),
         expires_at: 100,
+        device: None,
     }
 }
 
@@ -749,6 +759,7 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
         scopes: vec!["sekai.read".into()],
         expires_at: chrono::Utc::now().timestamp() + 60,
         nonce: nonce.into(),
+        device: None,
     };
     let request = |token: &str, method: &'static str| {
         let mut req = Request::new(());
@@ -772,6 +783,75 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
             },
         )
     };
+    // A device-bound assertion is refused by every RPC that checks no
+    // device proof, so a copied one authenticates nothing there.
+    let device_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let bound = IdentityAssertion {
+        device: Some(crate::identity_assertion::DeviceClaim {
+            id: "device-7".into(),
+            ed25519_pub: base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                device_key.verifying_key().as_bytes(),
+            ),
+            wipe: false,
+        }),
+        ..claims("device-bound")
+    };
+    let refused = interceptor
+        .call(request(
+            &authority.sign(&bound).unwrap(),
+            "GetPublishedDefinitionRevision",
+        ))
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+    assert!(refused.message().contains("device proofs"), "{refused:?}");
+    // An RPC that checks the proof itself lets it through to its handler.
+    let bound_submit = IdentityAssertion {
+        nonce: "device-bound-submit".into(),
+        scopes: vec!["sekai.read".into(), "sekai.write".into()],
+        ..bound.clone()
+    };
+    let passed = interceptor.call(request(
+        &authority.sign(&bound_submit).unwrap(),
+        "SubmitActionInstance",
+    ));
+    assert!(passed.is_ok(), "{:?}", passed.err());
+    // A revoked device's wipe assertion reaches only the sync reads.
+    let wipe = IdentityAssertion {
+        nonce: "device-wipe".into(),
+        device: bound_submit
+            .device
+            .clone()
+            .map(|device| crate::identity_assertion::DeviceClaim {
+                wipe: true,
+                ..device
+            }),
+        ..bound_submit.clone()
+    };
+    let refused = interceptor
+        .call(request(
+            &authority.sign(&wipe).unwrap(),
+            "SubmitActionInstance",
+        ))
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{refused:?}");
+    let wipe_sync = IdentityAssertion {
+        nonce: "device-wipe-sync".into(),
+        ..wipe.clone()
+    };
+    // The wipe gate passes it on. (Enterprise-scoped credentials do not
+    // reach sync at all yet; that exposure is a separate decision.)
+    let sync = interceptor.call(request(
+        &authority.sign(&wipe_sync).unwrap(),
+        "ReadSyncDeltas",
+    ));
+    assert!(
+        !sync
+            .as_ref()
+            .is_err_and(|status| status.message().contains("must wipe")),
+        "{:?}",
+        sync.err()
+    );
     let token = authority.sign(&claims("valid")).unwrap();
     let authenticated = interceptor
         .call(request(&token, "GetPublishedDefinitionRevision"))
@@ -1266,6 +1346,8 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1434,6 +1516,8 @@ async fn definition_proposal_close_rechecks_member_admin() {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1513,6 +1597,8 @@ async fn definition_proposal_merge_accepts_one_live_approval() {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "propose-1".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1599,6 +1685,8 @@ async fn definition_proposal_rpc_publishes_or_rejects_without_partial_head_move(
             eval_plan_digests: vec![format!("sha256:{}", "e".repeat(64))],
             named_foreign_digests: vec![format!("sha256:{}", "f".repeat(64))],
             idempotency_key: "propose-1".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1719,6 +1807,26 @@ async fn publish_definition_history_entry(
     proposal_id: &str,
     upserts: Vec<DefinitionMemberInput>,
 ) -> (String, String) {
+    let merged =
+        propose_and_merge_definition(svc, namespace, parent, branch_id, proposal_id, upserts)
+            .await
+            .unwrap();
+    (
+        merged.published_revision.unwrap().revision_digest,
+        merged.receipt_id,
+    )
+}
+
+/// Opens, approves and merges a proposal as `root`; returns the merge
+/// outcome.
+async fn propose_and_merge_definition(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    parent: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    upserts: Vec<DefinitionMemberInput>,
+) -> Result<MergeDefinitionProposalResponse, Status> {
     svc.create_definition_branch(with_named_principal(
         CreateDefinitionBranchRequest {
             namespace: namespace.into(),
@@ -1756,6 +1864,8 @@ async fn publish_definition_history_entry(
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: format!("{branch_id}-propose"),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -1771,23 +1881,815 @@ async fn publish_definition_history_entry(
     ))
     .await
     .unwrap();
-    let merged = svc
-        .merge_definition_proposal(with_named_principal(
-            MergeDefinitionProposalRequest {
-                namespace: namespace.into(),
-                proposal_id: proposal_id.into(),
-                expected_published_digest: parent.into(),
-                idempotency_key: format!("{branch_id}-merge"),
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: proposal_id.into(),
+            expected_published_digest: parent.into(),
+            idempotency_key: format!("{branch_id}-merge"),
+        },
+        "root",
+    ))
+    .await
+    .map(Response::into_inner)
+}
+
+#[tokio::test]
+async fn definition_package_round_trips_between_namespaces_and_refuses_tampering() {
+    use super::rpc_definition_package::{
+        PackageSigner, export_definition_package_as, import_definition_package_with,
+        package_keyring_from_json,
+    };
+    let svc = service();
+    let signer = PackageSigner {
+        identity: "plane-a".into(),
+        key_id: "k1".into(),
+        key: ed25519_dalek::SigningKey::from_bytes(&[3; 32]),
+    };
+    let public_key = signer
+        .key
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let keyring = package_keyring_from_json(&format!(
+        r#"[{{"identity":"plane-a","key_id":"k1","public_key":"{public_key}"}}]"#
+    ))
+    .unwrap();
+    let member = |id: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: id.into(),
+        definition_json: format!(
+            r#"{{"name":"{id}","properties":["title"],"lint_suppressions":[{{"rule":"orphan_object_type","reason":"test fixture"}}]}}"#
+        ),
+        member_digest: String::new(),
+    };
+
+    // Source namespace: two definitions plus an object holding data.
+    let parent = seed_definition_parent(&svc, "pkg-a");
+    publish_definition_history_entry(
+        &svc,
+        "pkg-a",
+        &parent.revision_digest,
+        "pkg-a-1",
+        "pkg-a-cs-1",
+        vec![member("Ticket"), member("Incident")],
+    )
+    .await;
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(Object {
+            id: "ticket-1".into(),
+            kind: "Ticket".into(),
+            name: "ticket".into(),
+            namespace: "pkg-a".into(),
+            external_id: "ticket:1".into(),
+            properties: HashMap::from([("title".into(), "object-data-marker".into())]),
+            created: 0,
+            updated: 0,
+        }),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+    let export = |namespace: &str| {
+        export_definition_package_as(
+            &svc,
+            with_named_principal(
+                ExportDefinitionPackageRequest {
+                    namespace: namespace.into(),
+                    revision_digest: String::new(),
+                },
+                "root",
+            ),
+            &signer,
+        )
+        .unwrap()
+        .into_inner()
+    };
+    let exported = export("pkg-a");
+    assert!(!exported.envelope_json.contains("object-data-marker"));
+
+    // A tampered member is refused by name, and nothing is created.
+    let tampered = exported
+        .envelope_json
+        .replace(r#"\"name\":\"Ticket\""#, r#"\"name\":\"Tickey\""#);
+    assert_ne!(tampered, exported.envelope_json);
+    let import = |namespace: &str, envelope_json: &str, id: &str| {
+        import_definition_package_with(
+            &svc,
+            with_named_principal(
+                ImportDefinitionPackageRequest {
+                    namespace: namespace.into(),
+                    branch_id: format!("import-{id}"),
+                    proposal_id: format!("import-cs-{id}"),
+                    envelope_json: envelope_json.into(),
+                    idempotency_key: format!("import-{id}"),
+                },
+                "root",
+            ),
+            &keyring,
+        )
+    };
+    let refused = import("pkg-b", &tampered, "tampered").unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::sekai::definition_package::REFUSAL_TAMPERED),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_definition_branch("pkg-b", "import-tampered")
+            .unwrap()
+            .is_none()
+    );
+
+    // A signed package with a malformed member document writes nothing.
+    let malformed = crate::sekai::definition_package::sign_package(
+        crate::sekai::definition_package::build_package([(
+            "object_type".to_string(),
+            "Ticket".to_string(),
+            r#"{"name":"Ticket","properties":123}"#.to_string(),
+        )])
+        .unwrap(),
+        crate::sekai::definition_package::PackageProvenance {
+            source_namespace: "pkg-a".into(),
+            source_revision_digest: exported.package_digest.clone(),
+            exported_at_ms: 1,
+        },
+        "plane-a",
+        "k1",
+        &signer.key,
+    )
+    .unwrap();
+    let refused = import(
+        "pkg-c",
+        &serde_json::to_string(&malformed).unwrap(),
+        "malformed",
+    )
+    .unwrap_err();
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::sekai::definition_package::REFUSAL_INCOMPATIBLE),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_published_definition_revision("pkg-c")
+            .unwrap()
+            .is_none()
+    );
+
+    // The target has a definition the package lacks: it shows as a removal.
+    let parent = seed_definition_parent(&svc, "pkg-b");
+    publish_definition_history_entry(
+        &svc,
+        "pkg-b",
+        &parent.revision_digest,
+        "pkg-b-1",
+        "pkg-b-cs-1",
+        vec![member("Ticket"), member("Legacy")],
+    )
+    .await;
+    let imported = import("pkg-b", &exported.envelope_json, "ok")
+        .unwrap()
+        .into_inner();
+    let proposal = imported.proposal.unwrap();
+    assert_eq!(proposal.source_package_digest, exported.package_digest);
+    assert_eq!(imported.source_namespace, "pkg-a");
+    assert_eq!(imported.signer_identity, "plane-a");
+    let preview = imported.preview.unwrap();
+    assert!(
+        preview
+            .removed
+            .iter()
+            .any(|change| change.member_id == "Legacy")
+    );
+    assert!(
+        preview
+            .added
+            .iter()
+            .any(|change| change.member_id == "Incident")
+    );
+
+    // Reviewed and merged as usual; B then exports the same package digest.
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: "pkg-b".into(),
+            proposal_id: "import-cs-ok".into(),
+            idempotency_key: "import-ok-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "pkg-b".into(),
+            proposal_id: "import-cs-ok".into(),
+            expected_published_digest: proposal.base_digest.clone(),
+            idempotency_key: "import-ok-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(export("pkg-b").package_digest, exported.package_digest);
+    // A lost-response retry after the merge replays the original proposal.
+    let replayed = import("pkg-b", &exported.envelope_json, "ok")
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(replayed.proposal_digest, proposal.proposal_digest);
+}
+
+#[tokio::test]
+async fn definition_package_round_trips_governed_transforms_and_refuses_output_mismatch() {
+    use super::rpc_definition_package::{
+        PackageSigner, export_definition_package_as, import_definition_package_with,
+        package_keyring_from_json,
+    };
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform, TransformStep};
+    let svc = service();
+    let signer = PackageSigner {
+        identity: "plane-a".into(),
+        key_id: "k1".into(),
+        key: ed25519_dalek::SigningKey::from_bytes(&[5; 32]),
+    };
+    let public_key = signer
+        .key
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let keyring = package_keyring_from_json(&format!(
+        r#"[{{"identity":"plane-a","key_id":"k1","public_key":"{public_key}"}}]"#
+    ))
+    .unwrap();
+    let member = |id: &str, properties: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: id.into(),
+        definition_json: format!(
+            r#"{{"name":"{id}","properties":{properties},"lint_suppressions":[{{"rule":"orphan_object_type","reason":"test fixture"}}]}}"#
+        ),
+        member_digest: String::new(),
+    };
+    let projection = |namespace: &str, columns: &[&str]| {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: namespace.into(),
+            transform_id: "ProjectTickets".into(),
+            input_dataset_id: "tickets".into(),
+            output_dataset_id: "Ticket".into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    };
+    let parent = seed_definition_parent(&svc, "tf-a");
+    publish_definition_history_entry(
+        &svc,
+        "tf-a",
+        &parent.revision_digest,
+        "tf-a-1",
+        "tf-a-cs-1",
+        vec![member("Ticket", r#"["title","body"]"#)],
+    )
+    .await;
+    svc.db
+        .runtime()
+        .put_governed_transform(&projection("tf-a", &["title"]), 10)
+        .unwrap();
+    let export = |namespace: &str| {
+        export_definition_package_as(
+            &svc,
+            with_named_principal(
+                ExportDefinitionPackageRequest {
+                    namespace: namespace.into(),
+                    revision_digest: String::new(),
+                },
+                "root",
+            ),
+            &signer,
+        )
+        .unwrap()
+        .into_inner()
+    };
+    let import = |namespace: &str, envelope_json: &str, id: &str| {
+        import_definition_package_with(
+            &svc,
+            with_named_principal(
+                ImportDefinitionPackageRequest {
+                    namespace: namespace.into(),
+                    branch_id: format!("import-{id}"),
+                    proposal_id: format!("import-cs-{id}"),
+                    envelope_json: envelope_json.into(),
+                    idempotency_key: format!("import-{id}"),
+                },
+                "root",
+            ),
+            &keyring,
+        )
+    };
+    let exported = export("tf-a");
+    let envelope: crate::sekai::definition_package::PackageEnvelope =
+        serde_json::from_str(&exported.envelope_json).unwrap();
+    assert!(
+        envelope
+            .package
+            .members
+            .iter()
+            .any(|member| member.kind == "transform" && member.id == "ProjectTickets")
+    );
+    assert!(
+        envelope
+            .package
+            .members
+            .iter()
+            .all(|member| !member.definition_json.contains("tf-a"))
+    );
+
+    let mismatch = crate::sekai::definition_package::sign_package(
+        crate::sekai::definition_package::build_package(
+            crate::sekai::definition_package::members_for_export(
+                [(
+                    "object_type".into(),
+                    "Ticket".into(),
+                    member("Ticket", r#"["title"]"#).definition_json,
+                )],
+                [projection("tf-a", &["title", "priority"])],
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        crate::sekai::definition_package::PackageProvenance {
+            source_namespace: "tf-a".into(),
+            source_revision_digest: exported.package_digest.clone(),
+            exported_at_ms: 1,
+        },
+        "plane-a",
+        "k1",
+        &signer.key,
+    )
+    .unwrap();
+    let refused = import(
+        "tf-bad",
+        &serde_json::to_string(&mismatch).unwrap(),
+        "mismatch",
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains(crate::sekai::definition_package::REFUSAL_TRANSFORM_OUTPUT),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_definition_branch("tf-bad", "import-mismatch")
+            .unwrap()
+            .is_none()
+    );
+
+    let imported = import("tf-b", &exported.envelope_json, "v1")
+        .unwrap()
+        .into_inner();
+    let proposal = imported.proposal.unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "import-cs-v1".into(),
+            idempotency_key: "import-v1-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "import-cs-v1".into(),
+            expected_published_digest: proposal.base_digest.clone(),
+            idempotency_key: "import-v1-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(export("tf-b").package_digest, exported.package_digest);
+    let first_head = svc
+        .db
+        .runtime()
+        .get_published_definition_revision("tf-b")
+        .unwrap()
+        .unwrap()
+        .revision_digest;
+    let installed = svc
+        .db
+        .runtime()
+        .get_governed_transform("tf-b", "ProjectTickets")
+        .unwrap()
+        .unwrap();
+    assert_eq!(installed.steps[0].columns, ["title"]);
+
+    svc.db
+        .runtime()
+        .put_governed_transform(&projection("tf-a", &["title", "body"]), 20)
+        .unwrap();
+    let exported_v2 = export("tf-a");
+    assert_ne!(exported_v2.package_digest, exported.package_digest);
+    let imported_v2 = import("tf-b", &exported_v2.envelope_json, "v2")
+        .unwrap()
+        .into_inner();
+    let proposal_v2 = imported_v2.proposal.unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "import-cs-v2".into(),
+            idempotency_key: "import-v2-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "import-cs-v2".into(),
+            expected_published_digest: proposal_v2.base_digest.clone(),
+            idempotency_key: "import-v2-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.db
+            .runtime()
+            .get_governed_transform("tf-b", "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["title", "body"]
+    );
+
+    let rolled = svc
+        .propose_definition_rollback(with_named_principal(
+            ProposeDefinitionRollbackRequest {
+                namespace: "tf-b".into(),
+                branch_id: "tf-restore".into(),
+                proposal_id: "tf-cs-restore".into(),
+                restore_from_digest: first_head.clone(),
+                migration_plan_digest: String::new(),
+                idempotency_key: "tf-restore-1".into(),
             },
             "root",
         ))
         .await
         .unwrap()
         .into_inner();
-    (
-        merged.published_revision.unwrap().revision_digest,
-        merged.receipt_id,
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "tf-cs-restore".into(),
+            idempotency_key: "tf-restore-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "tf-b".into(),
+            proposal_id: "tf-cs-restore".into(),
+            expected_published_digest: rolled.proposal.unwrap().base_digest,
+            idempotency_key: "tf-restore-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.db
+            .runtime()
+            .get_governed_transform("tf-b", "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["title"]
+    );
+}
+
+#[tokio::test]
+async fn transform_promotion_needs_a_passing_shadow_where_required_and_rolls_back() {
+    // #1796: once a namespace requires shadows, a proposal that changes a
+    // governed transform merges only with a passing report for exactly that
+    // candidate against the revision running now. Rollback restores the
+    // previous revision, and the published history shows both changes.
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform, TransformStep};
+    let svc = service();
+    let namespace = "tf-shadow";
+    let projection_to = |columns: &[&str], output: &str| {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: namespace.into(),
+            transform_id: "ProjectTickets".into(),
+            input_dataset_id: "shadow-tickets".into(),
+            output_dataset_id: output.into(),
+            steps: vec![TransformStep {
+                kind: "project".into(),
+                column: String::new(),
+                op: String::new(),
+                value: String::new(),
+                columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    };
+    let projection = |columns: &[&str]| projection_to(columns, "shadow-ticket-out");
+    let member_to = |columns: &[&str], output: &str| DefinitionMemberInput {
+        member_kind: "transform".into(),
+        member_id: "ProjectTickets".into(),
+        definition_json: crate::sekai::definition_package::package_transform_json(&projection_to(
+            columns, output,
+        ))
+        .unwrap(),
+        member_digest: String::new(),
+    };
+    let member = |columns: &[&str]| member_to(columns, "shadow-ticket-out");
+    for id in ["shadow-tickets", "shadow-ticket-out", "shadow-ticket-moved"] {
+        svc.create_dataset(with_named_principal(
+            CreateDatasetRequest {
+                dataset: Some(Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: ["id", "title", "body"]
+                        .map(|name| ColumnDef {
+                            name: name.into(),
+                            r#type: "string".into(),
+                            classification: "public".into(),
+                        })
+                        .to_vec(),
+                    object_id: String::new(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                }),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    let runtime = svc.db.runtime();
+    runtime
+        .append_rows(
+            "shadow-tickets",
+            &[[
+                ("id".to_string(), "1".to_string()),
+                ("title".into(), "t".into()),
+                ("body".into(), "b".into()),
+            ]
+            .into()],
+        )
+        .unwrap();
+    let parent = seed_definition_parent(&svc, namespace);
+    let (first, _) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "tf-sh-1",
+        "tf-sh-cs-1",
+        vec![member(&["id", "title"])],
     )
+    .await;
+    runtime
+        .run_governed_transform(
+            namespace,
+            "ProjectTickets",
+            false,
+            crate::sekai::dataset_version::now_ms(),
+        )
+        .unwrap();
+    let shadow = |columns: &[&str], require: bool| {
+        svc.shadow_governed_transform(with_named_principal(
+            ShadowGovernedTransformRequest {
+                namespace: namespace.into(),
+                transform_id: "ProjectTickets".into(),
+                definition_json: serde_json::to_string(&projection(columns)).unwrap(),
+                key_column: "id".into(),
+                require_for_promotion: require,
+                ..Default::default()
+            },
+            "root",
+        ))
+    };
+    // Opting in with a shadow of another candidate leaves this one without
+    // a report.
+    let other = shadow(&["id", "body"], true)
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert!(other.passing && !other.id.is_empty());
+    let refused = propose_and_merge_definition(
+        &svc,
+        namespace,
+        &first,
+        "tf-sh-2",
+        "tf-sh-cs-2",
+        vec![member(&["id", "title", "body"])],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::sekai::transform_shadow::REFUSAL_TRANSFORM_SHADOW),
+        "{}",
+        refused.message()
+    );
+    assert_eq!(
+        runtime
+            .get_governed_transform(namespace, "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["id", "title"]
+    );
+    // With a passing report for this candidate, the same proposal merges.
+    let report = shadow(&["id", "title", "body"], false)
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert!(report.passing);
+    assert_eq!(report.runs[0].changed_keys, ["1"]);
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "tf-sh-cs-2".into(),
+                expected_published_digest: first.clone(),
+                idempotency_key: "tf-sh-2-merge-again".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let second = merged.published_revision.unwrap().revision_digest;
+    // A retry of the merge returns its result; the gate does not re-run
+    // against the revision it promoted.
+    let retried = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "tf-sh-cs-2".into(),
+                expected_published_digest: first.clone(),
+                idempotency_key: "tf-sh-2-merge-again".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retried.receipt_id, merged.receipt_id);
+    assert_eq!(
+        runtime
+            .get_governed_transform(namespace, "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["id", "title", "body"]
+    );
+
+    // Rollback restores the previous revision without a new shadow.
+    let rolled = svc
+        .propose_definition_rollback(with_named_principal(
+            ProposeDefinitionRollbackRequest {
+                namespace: namespace.into(),
+                branch_id: "tf-sh-restore".into(),
+                proposal_id: "tf-sh-cs-restore".into(),
+                restore_from_digest: first.clone(),
+                migration_plan_digest: String::new(),
+                idempotency_key: "tf-sh-restore".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "tf-sh-cs-restore".into(),
+            idempotency_key: "tf-sh-restore-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "tf-sh-cs-restore".into(),
+            expected_published_digest: rolled.proposal.unwrap().base_digest,
+            idempotency_key: "tf-sh-restore-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime
+            .get_governed_transform(namespace, "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .columns,
+        ["id", "title"]
+    );
+    let history = svc
+        .list_published_definition_revisions(with_named_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace: namespace.into(),
+                member_kind: "transform".into(),
+                member_id: "ProjectTickets".into(),
+                page_token: String::new(),
+                page_size: 0,
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let previous: Vec<&str> = history
+        .entries
+        .iter()
+        .map(|entry| entry.previous_published_digest.as_str())
+        .collect();
+    assert_eq!(history.entries.len(), 3, "{history:?}");
+    assert!(previous.contains(&first.as_str()) && previous.contains(&second.as_str()));
+
+    // Moved to another output, the transform is a new pipeline a shadow
+    // cannot compare: it merges without a report.
+    let head = history.entries[0].revision_digest.clone();
+    propose_and_merge_definition(
+        &svc,
+        namespace,
+        &head,
+        "tf-sh-move",
+        "tf-sh-cs-move",
+        vec![member_to(&["id", "title"], "shadow-ticket-moved")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime
+            .get_governed_transform(namespace, "ProjectTickets")
+            .unwrap()
+            .unwrap()
+            .output_dataset_id,
+        "shadow-ticket-moved"
+    );
 }
 
 #[tokio::test]
@@ -2358,6 +3260,8 @@ async fn list_published_definition_revisions_chains_filters_and_paginates() {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "hist-drop-class-propose".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         },
         "root",
     ))
@@ -2521,6 +3425,96 @@ fn redigest_source_batch(batch: &mut SourceBatch) {
     let mut domain = from_proto_source_batch(batch.clone()).unwrap();
     domain.batch_digest.clear();
     batch.batch_digest = domain.canonical_digest().unwrap();
+}
+
+#[tokio::test]
+async fn source_batch_history_pages_newest_first_and_is_authorized_like_sync_state() {
+    let svc = service();
+    let namespace = "sync-history";
+    let producer = "connector/github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    let mut cursor = String::new();
+    let mut applied = Vec::new();
+    for n in 0..3 {
+        let next = format!("cursor:{n}");
+        let page = source_batch(namespace, producer, &cursor, &next, &format!("batch-{n}"));
+        let result = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest { batch: Some(page) },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let transaction = result.transaction.unwrap();
+        applied.push((transaction.opened_at_ms, transaction.transaction_id));
+        cursor = next;
+    }
+    // The documented order: newest first, ties broken by transaction id.
+    applied.sort_by(|a, b| b.cmp(a));
+    let applied: Vec<String> = applied.into_iter().map(|(_, id)| id).collect();
+    let request = |page_token: &str, page_size: u32| ListSourceBatchTransactionsRequest {
+        namespace: namespace.into(),
+        source_instance: "acme/ops".into(),
+        type_digest: SOURCE_TYPE_DIGEST.into(),
+        page_size,
+        page_token: page_token.into(),
+    };
+    let ids = |response: &ListSourceBatchTransactionsResponse| {
+        response
+            .transactions
+            .iter()
+            .map(|transaction| transaction.transaction_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let first = svc
+        .list_source_batch_transactions(with_named_principal(request("", 2), producer))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.found);
+    assert_eq!(ids(&first), applied[..2]);
+    assert!(!first.next_page_token.is_empty());
+    let second = svc
+        .list_source_batch_transactions(with_named_principal(
+            request(&first.next_page_token, 2),
+            producer,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&second), applied[2..]);
+    assert!(second.next_page_token.is_empty());
+
+    let malformed = svc
+        .list_source_batch_transactions(with_named_principal(request("not-a-token", 2), producer))
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+
+    // A caller GetSourceSyncState refuses is refused here with the same status.
+    let outsider = "connector/outsider";
+    let sync = svc
+        .get_source_sync_state(with_named_principal(
+            GetSourceSyncStateRequest {
+                namespace: namespace.into(),
+                source_instance: "acme/ops".into(),
+                type_digest: SOURCE_TYPE_DIGEST.into(),
+            },
+            outsider,
+        ))
+        .await
+        .unwrap_err();
+    let history = svc
+        .list_source_batch_transactions(with_named_principal(request("", 0), outsider))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (history.code(), history.message()),
+        (sync.code(), sync.message())
+    );
 }
 
 #[tokio::test]
@@ -5242,6 +6236,7 @@ fn discoverer_context(subject: &str) -> crate::enterprise::AuthenticatedContext 
         issuer: "https://issuer.test".into(),
         resource: "https://sekai.test".into(),
         expires_at: i64::MAX,
+        device: None,
     }
 }
 
@@ -5840,6 +6835,507 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
         .collect();
     assert_eq!(late.len(), 2);
     assert_eq!(late[1].state, "resolved");
+}
+
+fn dataset_consumer_binding(
+    id: &str,
+    owner: &str,
+    namespace: &str,
+    dataset_id: &str,
+) -> domain::Object {
+    use crate::sekai::definition_consumer_impact::{
+        BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+    };
+    let mut binding = DefinitionConsumerBinding {
+        contract_version: BINDING_CONTRACT.into(),
+        owner: owner.into(),
+        resource_identity: format!("app:{id}"),
+        namespace: namespace.into(),
+        member_kind: "dataset".into(),
+        member_id: dataset_id.into(),
+        property: String::new(),
+        declaration_digest: String::new(),
+        source_locator: format!("{id}.rs"),
+        blocking: false,
+    };
+    binding.declaration_digest = binding_digest(&binding);
+    domain::Object {
+        id: id.into(),
+        kind: BINDING_KIND.into(),
+        name: id.into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:{id}"),
+        properties: HashMap::from([
+            ("contract_version".into(), binding.contract_version),
+            ("owner".into(), binding.owner),
+            ("resource_identity".into(), binding.resource_identity),
+            ("member_kind".into(), binding.member_kind),
+            ("member_id".into(), binding.member_id),
+            ("property".into(), binding.property),
+            ("declaration_digest".into(), binding.declaration_digest),
+            ("source_locator".into(), binding.source_locator),
+        ]),
+        created: 1,
+        updated: 1,
+    }
+}
+
+#[tokio::test]
+async fn freshness_violations_notify_bound_consumers_and_hide_unread_evidence() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "notify-orders-obj".into(),
+            kind: "dataset".into(),
+            name: "orders".into(),
+            namespace: "notify".into(),
+            external_id: "notify:orders".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let alice_grant = security::Grant {
+        id: "notify-alice-read".into(),
+        object_id: "notify-orders-obj".into(),
+        principal: "alice".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&alice_grant).unwrap();
+    svc.security.add_grant(&alice_grant);
+    let tester_grant = security::Grant {
+        id: "notify-tester-write".into(),
+        object_id: "notify-orders-obj".into(),
+        principal: "tester".into(),
+        role: security::Role::Admin,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&tester_grant).unwrap();
+    svc.security.add_grant(&tester_grant);
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-alice",
+            "alice",
+            "notify",
+            "notify-orders",
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-bob",
+            "bob",
+            "notify",
+            "notify-orders",
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-carol",
+            "carol",
+            "notify",
+            "other-dataset",
+        ))
+        .unwrap();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "notify-orders".into(),
+            name: "orders".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: "notify-orders-obj".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.put_dataset_health_check(with_principal(PutDatasetHealthCheckRequest {
+        check: Some(DatasetHealthCheck {
+            dataset_id: "notify-orders".into(),
+            check_id: "fresh".into(),
+            kind: "freshness".into(),
+            max_age_ms: 10,
+            min_rows: 0,
+            max_rows: 0,
+            columns: Vec::new(),
+            predicate: Vec::new(),
+            blocking: false,
+            every_ms: 0,
+            tenant: String::new(),
+            space: String::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "notify-orders".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v1".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let created = svc
+        .db
+        .runtime()
+        .list_dataset_versions("notify-orders")
+        .unwrap()
+        .into_iter()
+        .map(|version| version.created_at_ms)
+        .max()
+        .unwrap();
+    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
+        dataset_id: "notify-orders".into(),
+        now_ms: created.saturating_add(10_000),
+    }))
+    .await
+    .unwrap();
+
+    let alice = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(alice.notifications.len(), 1);
+    assert_eq!(alice.notifications[0].kind, "freshness");
+    assert_eq!(alice.notifications[0].member_id, "notify-orders");
+    assert!(
+        !alice.notifications[0].evidence.is_empty(),
+        "a reader sees the freshness detail"
+    );
+
+    let bob = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(bob.notifications.len(), 1);
+    assert!(
+        bob.notifications[0].evidence.is_empty(),
+        "a bound consumer without read access does not see evidence"
+    );
+
+    let carol = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "carol",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(carol.notifications.is_empty());
+
+    let event_id = alice.notifications[0].event_id.clone();
+    svc.acknowledge_consumer_violation_notification(with_named_principal(
+        AcknowledgeConsumerViolationNotificationRequest {
+            event_id: event_id.clone(),
+        },
+        "alice",
+    ))
+    .await
+    .unwrap();
+    let after = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(after.notifications.is_empty());
+    let bob_ack = svc
+        .acknowledge_consumer_violation_notification(with_named_principal(
+            AcknowledgeConsumerViolationNotificationRequest { event_id },
+            "carol",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(bob_ack.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn quality_evidence_is_authorized_on_the_namespaced_object() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "notify-orders-obj".into(),
+            kind: "dataset".into(),
+            name: "orders".into(),
+            namespace: "notify".into(),
+            external_id: "notify:orders".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let alice_grant = security::Grant {
+        id: "notify-alice-read".into(),
+        object_id: "notify-orders-obj".into(),
+        principal: "alice".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&alice_grant).unwrap();
+    svc.security.add_grant(&alice_grant);
+    let tester_grant = security::Grant {
+        id: "notify-tester-write".into(),
+        object_id: "notify-orders-obj".into(),
+        principal: "tester".into(),
+        role: security::Role::Admin,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&tester_grant).unwrap();
+    svc.security.add_grant(&tester_grant);
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "notify-orders".into(),
+            name: "orders".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: "notify-orders-obj".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-alice",
+            "alice",
+            "quality",
+            "notify-orders",
+        ))
+        .unwrap();
+    let quality_object = crate::chisei::data_quality::dataset_object_id("quality", "notify-orders");
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: quality_object.clone(),
+            kind: "dataset".into(),
+            name: "notify-orders".into(),
+            namespace: "quality".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let quality_owner = security::Grant {
+        id: "quality-tester-read".into(),
+        object_id: quality_object.clone(),
+        principal: "tester".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&quality_owner).unwrap();
+    svc.security.add_grant(&quality_owner);
+    let event_id = crate::sekai::consumer_violation::quality_event_id("result-1");
+    svc.db
+        .runtime()
+        .emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+            kind: crate::sekai::consumer_violation::KIND_QUALITY,
+            namespace: "quality",
+            member_id: "notify-orders",
+            event_id: &event_id,
+            rule_id: "orders-count",
+            evidence: "sha256:quality-receipt",
+            now_ms: 40,
+        })
+        .unwrap();
+
+    let hidden = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(hidden.notifications.len(), 1);
+    assert!(
+        hidden.notifications[0].evidence.is_empty(),
+        "runtime dataset ACL must not disclose quality evidence"
+    );
+
+    let quality_grant = security::Grant {
+        id: "quality-alice-read".into(),
+        object_id: quality_object,
+        principal: "alice".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&quality_grant).unwrap();
+    svc.security.add_grant(&quality_grant);
+    let shown = svc
+        .list_consumer_violation_notifications(with_named_principal(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(shown.notifications[0].evidence, "sha256:quality-receipt");
+}
+
+#[tokio::test]
+async fn consumer_violation_list_page_token_omits_tenant_filtered_events() {
+    let svc = enterprise_service();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-allowed-new",
+            "subject-a",
+            "allowed",
+            "ds-allowed-new",
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-allowed-old",
+            "subject-a",
+            "allowed",
+            "ds-allowed-old",
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&dataset_consumer_binding(
+            "bind-denied",
+            "subject-a",
+            "denied",
+            "ds-denied",
+        ))
+        .unwrap();
+    let hidden = crate::sekai::consumer_violation::quality_event_id("hidden");
+    let visible_new = crate::sekai::consumer_violation::quality_event_id("visible-new");
+    let visible_old = crate::sekai::consumer_violation::quality_event_id("visible-old");
+    svc.db
+        .runtime()
+        .emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+            kind: crate::sekai::consumer_violation::KIND_QUALITY,
+            namespace: "denied",
+            member_id: "ds-denied",
+            event_id: &hidden,
+            rule_id: "hidden-rule",
+            evidence: "hidden-evidence",
+            now_ms: 30,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+            kind: crate::sekai::consumer_violation::KIND_QUALITY,
+            namespace: "allowed",
+            member_id: "ds-allowed-new",
+            event_id: &visible_new,
+            rule_id: "visible-new-rule",
+            evidence: "visible-new-evidence",
+            now_ms: 20,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .emit_consumer_violation(&crate::sekai::consumer_violation::EmitViolation {
+            kind: crate::sekai::consumer_violation::KIND_QUALITY,
+            namespace: "allowed",
+            member_id: "ds-allowed-old",
+            event_id: &visible_old,
+            rule_id: "visible-old-rule",
+            evidence: "visible-old-evidence",
+            now_ms: 10,
+        })
+        .unwrap();
+
+    let first = svc
+        .list_consumer_violation_notifications(with_tenant_context(
+            ListConsumerViolationNotificationsRequest {
+                page_token: String::new(),
+                page_size: 1,
+                include_acknowledged: false,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.notifications.len(), 1);
+    assert_eq!(first.notifications[0].event_id, visible_new);
+    assert_eq!(first.notifications[0].namespace, "allowed");
+    assert!(
+        !first.next_page_token.is_empty(),
+        "a later visible delivery must remain reachable"
+    );
+    assert!(
+        !first.next_page_token.contains(&hidden),
+        "a page token must not encode a tenant-filtered event"
+    );
+
+    let second = svc
+        .list_consumer_violation_notifications(with_tenant_context(
+            ListConsumerViolationNotificationsRequest {
+                page_token: first.next_page_token,
+                page_size: 1,
+                include_acknowledged: false,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.notifications.len(), 1);
+    assert_eq!(second.notifications[0].event_id, visible_old);
+    assert_eq!(second.notifications[0].namespace, "allowed");
+    assert!(second.next_page_token.is_empty());
+    assert!(!second.next_page_token.contains(&hidden));
 }
 
 #[tokio::test]
@@ -6858,6 +8354,7 @@ async fn noop_update_does_not_record_audit_change() {
 
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].field, "_created");
+    assert_eq!(changes[0].writer_kind, "direct");
 }
 
 #[tokio::test]
@@ -7520,6 +9017,8 @@ async fn governed_action_type_registry_put_get_list_disable() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+        last_writer_wins_properties: Vec::new(),
+        offline_conflict: String::new(),
     };
     let put = svc
         .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
@@ -7623,7 +9122,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
         SekaiDb::new(":memory:").unwrap(),
     )));
     let sekai_store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
-    let chisei_store = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let chisei_store = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
     let budget = Arc::new(BudgetTracker::new(chisei_store.clone()));
     budget
         .set_limit("action:governed", 1, PeriodType::Daily)
@@ -7664,6 +9163,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+        last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
     };
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(type_def),
@@ -7683,6 +9183,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec!["ev-1".into()],
             request_id: "req-1".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -7717,6 +9218,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec!["ev-1".into()],
             request_id: "req-1".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -7735,6 +9237,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec![],
             request_id: "req-1".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();
@@ -7761,6 +9264,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             type_id: "review.intake".into(),
             status: STATUS_ADMITTED.into(),
             limit: 10,
+            decidable_by_caller: false,
         }))
         .await
         .unwrap()
@@ -7779,6 +9283,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec![],
             request_id: "req-budget".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();
@@ -7814,6 +9319,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             evidence_submission_ids: vec![],
             request_id: "req-policy".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -7872,6 +9378,8 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             review_threshold: 0,
             review_pool: vec![],
             review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(),
+            offline_conflict: String::new(),
         }),
         request_id: "put-validated-action".into(),
     }))
@@ -7921,6 +9429,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
                 evidence_submission_ids: vec![],
                 request_id: format!("request-{key}"),
                 ontology_digest: String::new(),
+                offline: None,
             }))
             .await
             .unwrap_err();
@@ -7949,6 +9458,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             evidence_submission_ids: vec![],
             request_id: "request-duplicate-key".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();
@@ -7973,6 +9483,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             evidence_submission_ids: vec![],
             request_id: "request-valid".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -8025,6 +9536,7 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-nul".into(),
     }))
@@ -8041,6 +9553,7 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
             evidence_submission_ids: vec![],
             request_id: "req-nul".into(),
             ontology_digest: String::new(),
+            offline: None,
         }))
         .await
         .unwrap_err();
@@ -8260,6 +9773,7 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-record".into(),
     }))
@@ -8278,6 +9792,7 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
             evidence_submission_ids: Vec::new(),
             request_id: "operation-record-grpc".into(),
             ontology_digest: digest.into(),
+            offline: None,
         }))
         .await
         .unwrap()
@@ -8346,6 +9861,7 @@ async fn submit_action_instance_propagates_one_operation_identity() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-record-corr".into(),
     }))
@@ -8365,6 +9881,7 @@ async fn submit_action_instance_propagates_one_operation_identity() {
                 evidence_submission_ids: Vec::new(),
                 request_id: operation_id.into(),
                 ontology_digest: digest.into(),
+                offline: None,
             },
             operation_id,
         ))
@@ -8397,6 +9914,10 @@ async fn submit_action_instance_propagates_one_operation_identity() {
         .iter()
         .find(|change| !change.operation_id.is_empty())
         .expect("object-change event");
+    // The Action instance wrote it, under its operation receipt (#1690).
+    assert_eq!(object_change.writer_kind, "action_instance");
+    assert!(!object_change.writer_ref.is_empty());
+    assert_eq!(object_change.receipt_id, operation_id);
     crate::sekai::operation_correlation::OperationCarriers {
         span: span_operation_id(&logs, operation_id),
         receipt: receipt.operation_id,
@@ -8421,6 +9942,7 @@ async fn submit_action_instance_rejects_mismatched_operation_header() {
                 evidence_submission_ids: Vec::new(),
                 request_id: "op-a".into(),
                 ontology_digest: String::new(),
+                offline: None,
             },
             "op-b",
         ))
@@ -8488,6 +10010,7 @@ async fn describe_and_preview_object_action_are_observational() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-update".into(),
     }))
@@ -8666,6 +10189,7 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-triage".into(),
     }))
@@ -8740,7 +10264,7 @@ async fn preview_records_typesafe_egress_after_admission() {
     let app = axum::Router::new().route(
         "/v1/systemone",
         axum::routing::post(|| async {
-            axum::Json(sekai_provider::system_one::SystemOneResponse {
+            axum::Json(chisei_provider::system_one::SystemOneResponse {
                 model: "jev-1.13.0".into(),
                 answers: [(
                     "department".into(),
@@ -8758,9 +10282,9 @@ async fn preview_records_typesafe_egress_after_admission() {
         axum::serve(listener, app).await.unwrap();
     });
     unsafe {
-        std::env::set_var(sekai_provider::system_one::API_KEY_ENV, "test-key");
+        std::env::set_var(chisei_provider::system_one::API_KEY_ENV, "test-key");
         std::env::set_var(
-            sekai_provider::system_one::BASE_URL_ENV,
+            chisei_provider::system_one::BASE_URL_ENV,
             format!("http://{addr}/v1/systemone"),
         );
     }
@@ -8797,6 +10321,7 @@ async fn preview_records_typesafe_egress_after_admission() {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-triage-fill".into(),
     }))
@@ -8847,8 +10372,8 @@ async fn preview_records_typesafe_egress_after_admission() {
         0
     );
     unsafe {
-        std::env::remove_var(sekai_provider::system_one::API_KEY_ENV);
-        std::env::remove_var(sekai_provider::system_one::BASE_URL_ENV);
+        std::env::remove_var(chisei_provider::system_one::API_KEY_ENV);
+        std::env::remove_var(chisei_provider::system_one::BASE_URL_ENV);
     }
 }
 
@@ -8861,7 +10386,7 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
     let app = axum::Router::new().route(
         "/v1/systemone",
         axum::routing::post(|| async {
-            axum::Json(sekai_provider::system_one::SystemOneResponse {
+            axum::Json(chisei_provider::system_one::SystemOneResponse {
                 model: "jev-1.13.0".into(),
                 answers: [(
                     "dept-name".into(),
@@ -8879,9 +10404,9 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
         axum::serve(listener, app).await.unwrap();
     });
     unsafe {
-        std::env::set_var(sekai_provider::system_one::API_KEY_ENV, "test-key");
+        std::env::set_var(chisei_provider::system_one::API_KEY_ENV, "test-key");
         std::env::set_var(
-            sekai_provider::system_one::BASE_URL_ENV,
+            chisei_provider::system_one::BASE_URL_ENV,
             format!("http://{addr}/v1/systemone"),
         );
     }
@@ -8927,6 +10452,7 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
             review_threshold: 0,
             review_pool: vec![],
             review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-triage-invalid-fill".into(),
     }))
@@ -8960,8 +10486,8 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
             .is_empty()
     );
     unsafe {
-        std::env::remove_var(sekai_provider::system_one::API_KEY_ENV);
-        std::env::remove_var(sekai_provider::system_one::BASE_URL_ENV);
+        std::env::remove_var(chisei_provider::system_one::API_KEY_ENV);
+        std::env::remove_var(chisei_provider::system_one::BASE_URL_ENV);
     }
 }
 
@@ -10105,6 +11631,8 @@ async fn grant_and_audit_rpcs_round_trip() {
             new_value: "b".into(),
             changed_by: "tester".into(),
             timestamp: 11,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 
@@ -12877,11 +14405,116 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
     .unwrap();
 }
 
-/// #1149: community PostgreSQL advertises no query-time entailment, serves
-/// the asserted-only mode, and fails the entailment mode closed.
+/// Query-time entailment over the seeded graph: whether discovery advertises
+/// it, and the ids `RetrieveContext` returns for an ontology superclass of the
+/// widget kind, asserted-only and then entailed. Run on both backends (#1320).
+async fn entailment_case(svc: &SekaiServiceImpl) -> (u64, Vec<String>, Vec<String>) {
+    seed_semantic_catalog_graph(svc).await;
+    for class in [
+        OntologyClass {
+            name: "Thing".into(),
+            description: "anything".into(),
+            ..Default::default()
+        },
+        OntologyClass {
+            name: "WidgetClass".into(),
+            description: "semantic widget".into(),
+            mapped_kind: "widget".into(),
+            superclasses: vec!["Thing".into()],
+            ..Default::default()
+        },
+    ] {
+        svc.create_ontology_class(with_named_principal(
+            CreateOntologyClassRequest { class: Some(class) },
+            "tester",
+        ))
+        .await
+        .unwrap();
+    }
+    let discovered = svc
+        .discover_capabilities(with_named_principal(
+            DiscoverCapabilitiesRequest {
+                namespace: "acme".into(),
+                page_size: 200,
+                product_tier_filter: "all".into(),
+                ..Default::default()
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let supports = discovered
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == semantic::CAPABILITY_RETRIEVE_CONTEXT)
+        .and_then(|entry| {
+            entry
+                .limits
+                .iter()
+                .find(|limit| limit.name == "supports_entailment")
+        })
+        .map(|limit| limit.value)
+        .unwrap();
+    let retrieve = |mode: &str| RetrieveContextRequest {
+        roots: vec![ContextRoot {
+            object_id: "sem-root".into(),
+            ..Default::default()
+        }],
+        relations: vec!["contains".into()],
+        direction: "outgoing".into(),
+        max_depth: 1,
+        kind_filter: vec!["Thing".into()],
+        reasoning_mode: mode.into(),
+        ..Default::default()
+    };
+    let mut ids = Vec::new();
+    for mode in ["asserted_only", "entailment"] {
+        let mut found: Vec<String> = svc
+            .retrieve_context(with_named_principal(retrieve(mode), "alice"))
+            .await
+            .unwrap()
+            .into_inner()
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.object.unwrap().id)
+            .collect();
+        found.sort();
+        ids.push(found);
+    }
+    let entailed = ids.pop().unwrap();
+    (supports, ids.pop().unwrap(), entailed)
+}
+
+/// What both backends must return for [`entailment_case`]: entailment is
+/// advertised, no object is asserted to be a `Thing`, and entailment adds the
+/// visible widget but never the one alice may not read.
+fn assert_entailment_case((supports, asserted, entailed): (u64, Vec<String>, Vec<String>)) {
+    assert_eq!(supports, 1);
+    assert!(
+        !asserted.contains(&"sem-allowed".to_string()),
+        "{asserted:?}"
+    );
+    assert!(
+        entailed.contains(&"sem-allowed".to_string()),
+        "{entailed:?}"
+    );
+    assert!(
+        !entailed.contains(&"sem-denied".to_string()),
+        "{entailed:?}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_query_time_entailment_matches_the_shared_case() {
+    assert_entailment_case(entailment_case(&service()).await);
+}
+
+/// #1320: community PostgreSQL serves query-time entailment with the same
+/// results as SQLite.
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
-fn postgres_semantic_discovery_is_honest_about_entailment() {
+fn postgres_query_time_entailment_matches_the_shared_case() {
     let scratch = crate::db::ScratchDatabase::create();
     let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
     tokio::runtime::Builder::new_multi_thread()
@@ -12892,66 +14525,7 @@ fn postgres_semantic_discovery_is_honest_about_entailment() {
             let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
                 db.clone(),
             ));
-            seed_semantic_catalog_graph(&svc).await;
-            let discovered = svc
-                .discover_capabilities(with_named_principal(
-                    DiscoverCapabilitiesRequest {
-                        namespace: "acme".into(),
-                        page_size: 200,
-                        product_tier_filter: "all".into(),
-                        ..Default::default()
-                    },
-                    "alice",
-                ))
-                .await
-                .unwrap()
-                .into_inner();
-            for name in [
-                semantic::CAPABILITY_EXPAND_RELATIONS,
-                semantic::CAPABILITY_RETRIEVE_CONTEXT,
-                semantic::CAPABILITY_EXPLAIN_DERIVATION,
-            ] {
-                let entry = discovered
-                    .capabilities
-                    .iter()
-                    .find(|entry| entry.name == name)
-                    .unwrap_or_else(|| panic!("missing semantic capability {name}"));
-                let limits = entry
-                    .limits
-                    .iter()
-                    .map(|limit| (limit.name.as_str(), limit.value))
-                    .collect::<HashMap<_, _>>();
-                assert_eq!(limits.get("supports_entailment"), Some(&0), "{name}");
-                assert_eq!(limits.get("supports_asserted_only"), Some(&1), "{name}");
-            }
-            let expand = |mode: &str| ExpandRelationsRequest {
-                namespace: "acme".into(),
-                root: Some(ContextRoot {
-                    object_id: "sem-root".into(),
-                    ..Default::default()
-                }),
-                relations: vec!["contains".into()],
-                direction: "outgoing".into(),
-                max_depth: 2,
-                reasoning_mode: mode.into(),
-                ..Default::default()
-            };
-            let asserted = svc
-                .expand_relations(with_named_principal(expand("asserted_only"), "alice"))
-                .await
-                .unwrap()
-                .into_inner();
-            assert!(
-                asserted
-                    .candidates
-                    .iter()
-                    .any(|candidate| candidate.object.as_ref().unwrap().id == "sem-root")
-            );
-            let entailment = svc
-                .expand_relations(with_named_principal(expand("entailment"), "alice"))
-                .await
-                .unwrap_err();
-            assert_eq!(entailment.code(), tonic::Code::FailedPrecondition);
+            assert_entailment_case(entailment_case(&svc).await);
         });
     drop(db);
 }
@@ -13674,6 +15248,8 @@ fn intake_action_type(object_kind: &str) -> GovernedActionType {
         review_threshold: 0,
         review_pool: vec![],
         review_agent_reviewers: vec![],
+        last_writer_wins_properties: Vec::new(),
+        offline_conflict: String::new(),
     }
 }
 
@@ -13872,6 +15448,7 @@ async fn capability_discovery_omits_denied_action_and_catalog_submit_fails_close
         evidence_submission_ids: vec![],
         request_id: "req-catalog".into(),
         ontology_digest: String::new(),
+        offline: None,
     };
     let stale_version = svc
         .submit_action_instance(with_catalog_action(
@@ -14081,6 +15658,7 @@ async fn capability_discovery_rechecks_native_submit_type_id() {
         evidence_submission_ids: vec![],
         request_id: "req-native-submit".into(),
         ontology_digest: String::new(),
+        offline: None,
     };
     let admitted = svc
         .submit_action_instance(with_catalog_action(
@@ -14403,6 +15981,7 @@ async fn scoped_published_definition_read_crosses_the_server_transport() {
             scopes: vec!["sekai.read".into()],
             expires_at: chrono::Utc::now().timestamp() + 30,
             nonce: nonce.into(),
+            device: None,
         };
         let bearer = authority.sign(&claims("transport-read")).unwrap();
         let mut request = Request::new(GetPublishedDefinitionRevisionRequest {
@@ -14599,6 +16178,7 @@ async fn agent_definition_member_read_crosses_server_transport() {
         scopes: vec!["sekai.read".into()],
         expires_at: chrono::Utc::now().timestamp() + 30,
         nonce: uuid::Uuid::new_v4().to_string(),
+        device: None,
     };
     let request = |assertion: &IdentityAssertion, namespace: &str, digest: &str, id: &str| {
         let mut request = Request::new(GetDefinitionMemberRequest {
@@ -15554,6 +17134,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         scopes: vec!["sekai.read".into(), "sekai.write".into()],
         expires_at: chrono::Utc::now().timestamp() + 30,
         nonce: uuid::Uuid::new_v4().to_string(),
+        device: None,
     };
     let claims = || assertion("subject-a");
     let reviewer = || assertion("reviewer");
@@ -15804,6 +17385,8 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         eval_plan_digests: vec![],
         named_foreign_digests: vec![],
         idempotency_key: "publish-proposal".into(),
+        major_revision: false,
+        migration_plan_digest: String::new(),
     };
     read_only.nonce = uuid::Uuid::new_v4().to_string();
     let mut foreign_proposal = propose.clone();
@@ -16166,6 +17749,7 @@ async fn scoped_transform_preview_and_reads_cross_server_transport() {
             scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
             expires_at: chrono::Utc::now().timestamp() + 30,
             nonce: uuid::Uuid::new_v4().to_string(),
+            device: None,
         };
         let mut request = Request::new(body);
         request.metadata_mut().insert(
@@ -16427,6 +18011,7 @@ async fn scoped_put_governed_transform_requires_namespace_write_and_readable_dat
             scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
             expires_at: chrono::Utc::now().timestamp() + 30,
             nonce: uuid::Uuid::new_v4().to_string(),
+            device: None,
         };
         let mut request = Request::new(body);
         request.metadata_mut().insert(
@@ -16639,6 +18224,7 @@ async fn community_human_session_put_still_requires_credential_admin() {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: 100,
+            device: None,
         });
     let denied = svc.put_governed_transform(req).await.unwrap_err();
     assert_eq!(
@@ -16777,6 +18363,9 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         agent_action: false,
         admission_tenant: String::new(),
         resource_tenant: String::new(),
+        marking: String::new(),
+        conflict: None,
+        offline: None,
     }
 }
 
@@ -16928,6 +18517,8 @@ async fn delegated_service_intersects_acl_properties_and_marking_clearance() {
             new_value: "private value".into(),
             changed_by: "service-a".into(),
             timestamp: 1,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     for (actor, expected_value) in [(None, "private value"), (Some("human-a"), REDACTED_VALUE)] {
@@ -17416,8 +19007,9 @@ fn guest_access_needs_explicit_extension_opt_in() {
     shared.sort_unstable();
     assert_eq!(shared, ["allowed", "allowed", "denied"]);
     assert_eq!(outcome("allowed"), ["denied"]);
-    assert!(decisions.iter().any(|decision| decision.evidence["space"] == "space-a"
-        && decision.outcome == "denied"));
+    assert!(decisions
+        .iter()
+        .any(|decision| decision.evidence["space"] == "space-a" && decision.outcome == "denied"));
     assert!(
         decisions
             .iter()
@@ -18609,6 +20201,8 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "classified note".into(),
             changed_by: "owner".into(),
             timestamp: 1,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18620,6 +20214,8 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "internal".into(),
             changed_by: "owner".into(),
             timestamp: 2,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18631,6 +20227,8 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "public note".into(),
             changed_by: "owner".into(),
             timestamp: 3,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
 
@@ -18685,6 +20283,8 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "confidential".into(),
             changed_by: "owner".into(),
             timestamp: 4,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18696,6 +20296,8 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "later classified".into(),
             changed_by: "owner".into(),
             timestamp: 5,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let after_raise = svc
@@ -18716,6 +20318,8 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "confidential".into(),
             changed_by: "owner".into(),
             timestamp: 6,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18727,6 +20331,8 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "same-ms classified".into(),
             changed_by: "owner".into(),
             timestamp: 6,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18738,6 +20344,8 @@ async fn shared_space_history_omits_values_written_under_a_higher_marking() {
             new_value: "internal".into(),
             changed_by: "owner".into(),
             timestamp: 6,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let same_ms = svc
@@ -18798,6 +20406,8 @@ async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
             new_value: "internal".into(),
             changed_by: "owner".into(),
             timestamp: 1,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18809,6 +20419,8 @@ async fn shared_space_history_redacts_create_time_values_above_the_ceiling() {
             new_value: "public note".into(),
             changed_by: "owner".into(),
             timestamp: 2,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let mut req = with_named_principal(
@@ -18853,6 +20465,8 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             new_value: "public note".into(),
             changed_by: "owner".into(),
             timestamp: 3,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let marking = format!("properties.{}", markings::OBJECT_CLASSIFICATION_PROPERTY);
@@ -18865,6 +20479,8 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             new_value: "confidential".into(),
             changed_by: "owner".into(),
             timestamp: 4,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -18876,6 +20492,8 @@ async fn shared_space_history_redacts_old_values_when_retention_removes_exposure
             new_value: "internal".into(),
             changed_by: "owner".into(),
             timestamp: 5,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     let mut req = with_named_principal(
@@ -18916,6 +20534,8 @@ async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
         new_value: new.into(),
         changed_by: "owner".into(),
         timestamp,
+        operation_id: String::new(),
+        ..Default::default()
     };
     runtime
         .record_object_change(&marking("ms-downgrade", "confidential", "internal", 1))
@@ -18932,6 +20552,8 @@ async fn shared_space_history_uses_store_order_for_same_millisecond_markings() {
             new_value: "secret after raise".into(),
             changed_by: "owner".into(),
             timestamp: 2,
+            operation_id: String::new(),
+            ..Default::default()
         })
         .unwrap();
     runtime
@@ -19743,8 +21365,9 @@ async fn split_plane_run_records_usage_on_the_chisei_dest() {
     let dir = tempfile::tempdir().unwrap();
     let sekai =
         crate::db::store::SekaiStore::open_sqlite(dir.path().join("sekai.db").to_str().unwrap());
-    let chisei =
-        crate::db::store::ChiseiStore::open_sqlite(dir.path().join("chisei.db").to_str().unwrap());
+    let chisei = crate::chisei_store::ChiseiStore::open_sqlite(
+        dir.path().join("chisei.db").to_str().unwrap(),
+    );
     let svc = SekaiServiceImpl::new(sekai.clone()).with_cross_store_admission(Arc::new(
         CrossStoreAdmission::new(chisei.clone(), sekai.clone(), None),
     ));
@@ -21621,6 +23244,7 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
 
 struct IsolatedClaimExtension {
     deny: bool,
+    refuse: Option<crate::enterprise::IsolatedProcessRefusal>,
 }
 
 impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
@@ -21654,6 +23278,7 @@ impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
             issuer: "https://issuer.test".into(),
             resource: "https://sekai.test".into(),
             expires_at: i64::MAX,
+            device: None,
         })
     }
 
@@ -21696,15 +23321,23 @@ impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
             Ok(())
         }
     }
+
+    fn refuse_isolated_process_job(
+        &self,
+        _context: &crate::enterprise::AuthenticatedContext,
+        _job: &crate::enterprise::IsolatedProcessJob,
+    ) -> Option<crate::enterprise::IsolatedProcessRefusal> {
+        self.refuse.clone()
+    }
 }
 
 fn isolated_claim_service(deny: bool) -> SekaiServiceImpl {
+    isolated_claim_service_with(IsolatedClaimExtension { deny, refuse: None })
+}
+
+fn isolated_claim_service_with(extension: IsolatedClaimExtension) -> SekaiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-        SekaiDb::new_with_enterprise_extension(
-            ":memory:",
-            Some(Arc::new(IsolatedClaimExtension { deny })),
-        )
-        .unwrap(),
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(extension))).unwrap(),
     )));
     SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
 }
@@ -21815,6 +23448,121 @@ async fn isolated_process_claim_skips_work_the_extension_denies() {
         .work;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].transform_id, "t-iso-deny");
+}
+
+/// Claims once for tenant-a in `ops` and returns the refused run's proto.
+async fn claim_refused(svc: &SekaiServiceImpl) -> TransformRun {
+    let claim = || {
+        svc.claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+    };
+    // The refused run is never handed out, now or on the next claim.
+    for _ in 0..2 {
+        assert_eq!(claim().await.unwrap_err().code(), tonic::Code::NotFound);
+    }
+    let runs = svc
+        .list_governed_transform_runs(with_tenant_admin(
+            ListGovernedTransformRunsRequest {
+                namespace: "ops".into(),
+                limit: 10,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    let listed = svc
+        .list_claimable_transform_work(with_tenant_admin(
+            ListClaimableTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                limit: 10,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert!(listed.is_empty());
+    let run = runs.into_iter().next().unwrap();
+    let read = svc
+        .get_governed_transform_run(with_tenant_admin(
+            GetGovernedTransformRunRequest {
+                run_id: run.run_id.clone(),
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
+        .unwrap();
+    assert_eq!(read.refusal, run.refusal);
+    read
+}
+
+#[tokio::test]
+async fn isolated_process_claim_the_extension_refuses_ends_the_run_for_good() {
+    let svc = isolated_claim_service_with(IsolatedClaimExtension {
+        deny: false,
+        refuse: Some(crate::enterprise::IsolatedProcessRefusal {
+            code: "quota_exceeded".into(),
+            details: [
+                ("unit".into(), "compute_seconds".into()),
+                ("period".into(), "month".into()),
+                ("limit".into(), "3600".into()),
+                ("usage".into(), "3590".into()),
+                ("estimate".into(), "30".into()),
+            ]
+            .into(),
+        }),
+    });
+    enqueue_isolated_claim(&svc, "t-iso-refuse").await;
+    let run = claim_refused(&svc).await;
+    assert_eq!(run.dispatch_status, "refused");
+    let refusal = run.refusal.unwrap();
+    assert_eq!(refusal.code, "quota_exceeded");
+    assert_eq!(refusal.details["limit"], "3600");
+    assert_eq!(refusal.details.len(), 5);
+}
+
+#[tokio::test]
+async fn isolated_process_refusal_with_secret_like_text_is_withheld() {
+    let svc = isolated_claim_service_with(IsolatedClaimExtension {
+        deny: false,
+        refuse: Some(crate::enterprise::IsolatedProcessRefusal {
+            code: "approval_refused".into(),
+            details: [("approver".into(), "api_key=live-abcdef123456".into())].into(),
+        }),
+    });
+    enqueue_isolated_claim(&svc, "t-iso-withheld").await;
+    let run = claim_refused(&svc).await;
+    assert_eq!(run.dispatch_status, "refused");
+    let refusal = run.refusal.unwrap();
+    assert_eq!(refusal.code, "reason_withheld");
+    assert!(refusal.details.is_empty());
+    // A credential-like detail name is withheld whatever its value.
+    let svc = isolated_claim_service_with(IsolatedClaimExtension {
+        deny: false,
+        refuse: Some(crate::enterprise::IsolatedProcessRefusal {
+            code: "approval_refused".into(),
+            details: [("api_key".into(), "live-abcdef123456".into())].into(),
+        }),
+    });
+    enqueue_isolated_claim(&svc, "t-iso-withheld-key").await;
+    assert_eq!(
+        claim_refused(&svc).await.refusal.unwrap().code,
+        "reason_withheld"
+    );
 }
 
 #[tokio::test]
@@ -23094,6 +24842,100 @@ fn seed_inspect_action_type(svc: &SekaiServiceImpl, namespace: &str) {
         .unwrap();
 }
 
+fn seed_close_action_type(svc: &SekaiServiceImpl, namespace: &str) {
+    svc.db
+        .runtime()
+        .put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: namespace.into(),
+                type_id: "Ticket.close".into(),
+                version: "1".into(),
+                description: "close one ticket".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec![
+                    crate::sekai::governed_action_type::EFFECT_KIND_NOTIFY.into(),
+                ],
+                enabled: true,
+                ..Default::default()
+            },
+            "root",
+            1,
+        )
+        .unwrap();
+}
+
+struct ShadowInstructionHost {
+    remaining: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::sekai::agent_dry_run::AgentDryRunHost for ShadowInstructionHost {
+    fn admit_and_complete(
+        &self,
+        request: &crate::sekai::agent_dry_run::DryRunModelRequest,
+    ) -> Result<
+        crate::sekai::agent_dry_run::DryRunModelReply,
+        crate::sekai::agent_dry_run::DryRunFailure,
+    > {
+        if self.remaining.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(crate::sekai::agent_dry_run::DryRunFailure::Budget(
+                "budget exceeded".into(),
+            ));
+        }
+        self.remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let action_type = if request.instructions.contains("Close") {
+            "Ticket.close"
+        } else {
+            "Ticket.inspect"
+        };
+        Ok(crate::sekai::agent_dry_run::DryRunModelReply {
+            route: "native/scripted".into(),
+            output: "scripted".into(),
+            tool_calls: Vec::new(),
+            proposed_actions: vec![crate::sekai::agent_dry_run::ProposedAction {
+                action_type: action_type.into(),
+                parameters_json: r#"{"id":"1"}"#.into(),
+            }],
+        })
+    }
+}
+
+async fn seed_agent_close_edit(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    expected_head: &str,
+) -> String {
+    svc.apply_definition_branch_edit(with_named_principal(
+        ApplyDefinitionBranchEditRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            expected_head_digest: expected_head.into(),
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "agent".into(),
+                member_id: "triage".into(),
+                member_digest: String::new(),
+                definition_json: serde_json::json!({
+                    "contract_version": "sekai.agent-definition/v1",
+                    "name": "Triage",
+                    "task_class": "lookup",
+                    "instructions": "Close tickets.",
+                    "allowed_action_types": ["Ticket.inspect", "Ticket.close"]
+                })
+                .to_string(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: format!("edit-close-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .revision
+    .unwrap()
+    .revision_digest
+}
+
 async fn seed_agent_draft(svc: &SekaiServiceImpl, namespace: &str) -> String {
     let parent = seed_definition_parent(svc, namespace);
     grant_source_namespace(svc, namespace, "root", security::Role::Admin);
@@ -23514,6 +25356,399 @@ async fn agent_dry_run_refuses_allowed_actions_that_fail_the_type_schema() {
 }
 
 #[tokio::test]
+async fn agent_shadow_lists_diffs_without_submitting_and_cannot_certify() {
+    let mut svc = service();
+    let namespace = "agent-shadow-rpc";
+    let active = seed_agent_draft(&svc, namespace).await;
+    let candidate = seed_agent_close_edit(&svc, namespace, &active).await;
+    seed_inspect_action_type(&svc, namespace);
+    seed_close_action_type(&svc, namespace);
+    svc.dry_run_host = Some(std::sync::Arc::new(ShadowInstructionHost {
+        remaining: std::sync::atomic::AtomicUsize::new(8),
+    }));
+    let response = svc
+        .run_agent_shadow(with_named_principal(
+            RunAgentShadowRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate.clone(),
+                envelopes: vec![AgentTriggerEnvelope {
+                    id: "env-1".into(),
+                    input: "ticket 1 arrived".into(),
+                }],
+                require_for_promotion: false,
+                active_revision_digest: active.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let report = response.report.expect("shadow report");
+    assert_eq!(report.evaluated, 1);
+    assert_eq!(report.differed, 1);
+    assert_eq!(report.unchanged, 0);
+    assert_eq!(report.samples[0].active[0].action_type, "Ticket.inspect");
+    assert_eq!(report.samples[0].candidate[0].action_type, "Ticket.close");
+    assert!(report.passing);
+    let instances = svc
+        .list_action_instances(with_named_principal(
+            ListActionInstancesRequest {
+                namespace: namespace.into(),
+                ..Default::default()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(instances.instances.is_empty());
+    let loaded = svc
+        .get_agent_shadow_report(with_named_principal(
+            GetAgentShadowReportRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .expect("stored report");
+    assert_eq!(loaded.shadow_id, report.shadow_id);
+    assert_eq!(loaded.differed, 1);
+    grant_source_namespace(&svc, namespace, "reader", security::Role::Viewer);
+    let denied_get = svc
+        .get_agent_shadow_report(with_named_principal(
+            GetAgentShadowReportRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate.clone(),
+            },
+            "reader",
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        denied_get.code() == tonic::Code::PermissionDenied
+            || denied_get.code() == tonic::Code::NotFound,
+        "{}",
+        denied_get.code()
+    );
+    let denied_require = svc
+        .run_agent_shadow(with_named_principal(
+            RunAgentShadowRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate.clone(),
+                envelopes: vec![AgentTriggerEnvelope {
+                    id: "env-1".into(),
+                    input: "ticket 1 arrived".into(),
+                }],
+                require_for_promotion: false,
+                active_revision_digest: active,
+            },
+            "reader",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_require.code(), tonic::Code::PermissionDenied);
+    let expires = now_millis() + 86_400_000;
+    let refused = svc
+        .put_definition_certification(with_named_principal(
+            PutDefinitionCertificationRequest {
+                namespace: namespace.into(),
+                revision_digest: candidate,
+                suite_id: crate::sekai::agent_shadow::suite_id(namespace, "triage"),
+                certification_id: report.shadow_id,
+                baseline_status: "pass".into(),
+                latest_status: "pass".into(),
+                expires_at_ms: expires,
+                revoked_at_ms: 0,
+            },
+            "reviewer",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        crate::sekai::agent_shadow::REFUSAL_SHADOW_CERTIFY
+    );
+}
+
+#[tokio::test]
+async fn agent_shadow_exhausted_budget_refuses_without_submitting() {
+    let mut svc = service();
+    let namespace = "agent-shadow-budget";
+    let active = seed_agent_draft(&svc, namespace).await;
+    let candidate = seed_agent_close_edit(&svc, namespace, &active).await;
+    let host = std::sync::Arc::new(crate::sekai::agent_dry_run::ScriptedHost {
+        route: Ok("native/scripted".into()),
+        budget: Err("budget exceeded".into()),
+        reply: crate::sekai::agent_dry_run::DryRunModelReply {
+            route: String::new(),
+            output: String::new(),
+            tool_calls: Vec::new(),
+            proposed_actions: Vec::new(),
+        },
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    svc.dry_run_host = Some(host.clone());
+    let denied = svc
+        .run_agent_shadow(with_named_principal(
+            RunAgentShadowRequest {
+                namespace: namespace.into(),
+                member_id: "triage".into(),
+                candidate_revision_digest: candidate,
+                envelopes: vec![AgentTriggerEnvelope {
+                    id: "env-1".into(),
+                    input: "ticket 1 arrived".into(),
+                }],
+                require_for_promotion: false,
+                active_revision_digest: active,
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(denied.message(), "budget exceeded");
+    assert_eq!(host.attempts(), 1);
+    let instances = svc
+        .list_action_instances(with_named_principal(
+            ListActionInstancesRequest {
+                namespace: namespace.into(),
+                ..Default::default()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(instances.instances.is_empty());
+}
+
+#[tokio::test]
+async fn agent_shadow_blocks_merge_when_the_namespace_requires_a_report() {
+    let mut svc = service();
+    let namespace = "agent-shadow-merge";
+    let active = seed_agent_draft(&svc, namespace).await;
+    seed_inspect_action_type(&svc, namespace);
+    seed_close_action_type(&svc, namespace);
+    svc.dry_run_host = Some(std::sync::Arc::new(ShadowInstructionHost {
+        remaining: std::sync::atomic::AtomicUsize::new(16),
+    }));
+    svc.run_agent_shadow(with_named_principal(
+        RunAgentShadowRequest {
+            namespace: namespace.into(),
+            member_id: "triage".into(),
+            candidate_revision_digest: active.clone(),
+            envelopes: vec![AgentTriggerEnvelope {
+                id: "env-1".into(),
+                input: "ticket 1 arrived".into(),
+            }],
+            require_for_promotion: true,
+            active_revision_digest: active.clone(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = seed_agent_close_edit(&svc, namespace, &active).await;
+    seed_agent_eval_run(&svc, "shadow-merge-cert", "agent-suite", true);
+    let expires = now_millis() + 86_400_000;
+    svc.put_definition_certification(with_named_principal(
+        PutDefinitionCertificationRequest {
+            namespace: namespace.into(),
+            revision_digest: candidate.clone(),
+            suite_id: "agent-suite".into(),
+            certification_id: "shadow-merge-cert".into(),
+            baseline_status: "pass".into(),
+            latest_status: "pass".into(),
+            expires_at_ms: expires,
+            revoked_at_ms: 0,
+        },
+        "reviewer",
+    ))
+    .await
+    .unwrap();
+    let published = svc
+        .get_published_definition_revision(with_named_principal(
+            GetPublishedDefinitionRevisionRequest {
+                namespace: namespace.into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "shadow".into(),
+            base_digest: published.clone(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("propose-{namespace}"),
+            major_revision: false,
+            migration_plan_digest: String::new(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "shadow".into(),
+            idempotency_key: format!("approve-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let refused = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "shadow".into(),
+                expected_published_digest: published.clone(),
+                idempotency_key: format!("merge-{namespace}"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        crate::sekai::agent_shadow::REFUSAL_SHADOW
+    );
+    svc.run_agent_shadow(with_named_principal(
+        RunAgentShadowRequest {
+            namespace: namespace.into(),
+            member_id: "triage".into(),
+            candidate_revision_digest: candidate,
+            envelopes: vec![AgentTriggerEnvelope {
+                id: "env-1".into(),
+                input: "ticket 1 arrived".into(),
+            }],
+            require_for_promotion: true,
+            active_revision_digest: active,
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "shadow".into(),
+            expected_published_digest: published,
+            idempotency_key: format!("merge-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn agent_shadow_merge_without_eval_runs_table_is_not_required() {
+    let svc = service();
+    let namespace = "agent-shadow-no-eval-table";
+    let parent = seed_definition_parent(&svc, namespace);
+    svc.db
+        .runtime()
+        .conn()
+        .execute("DROP TABLE chisei_eval_runs", [])
+        .unwrap();
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: format!("create-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: format!("edit-{namespace}"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "shadow".into(),
+            base_digest: parent.revision_digest.clone(),
+            candidate_digest: candidate,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("propose-{namespace}"),
+            major_revision: false,
+            migration_plan_digest: String::new(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "shadow".into(),
+            idempotency_key: format!("approve-{namespace}"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "shadow".into(),
+                expected_published_digest: parent.revision_digest,
+                idempotency_key: format!("merge-{namespace}"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(merged.proposal.unwrap().status, "merged");
+}
+
+#[tokio::test]
 async fn write_freeze_refuses_in_scope_writes_and_records_receipts() {
     let svc = service();
     svc.set_write_freeze(with_named_principal(
@@ -23789,6 +26024,7 @@ async fn write_freeze_blocks_machine_action_submit() {
             review_threshold: 0,
             review_pool: vec![],
             review_agent_reviewers: vec![],
+            last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
         }),
         request_id: "put-freeze-dispatch".into(),
     }))
@@ -23819,6 +26055,7 @@ async fn write_freeze_blocks_machine_action_submit() {
         evidence_submission_ids: Vec::new(),
         request_id: "req-freeze-human".into(),
         ontology_digest: String::new(),
+        offline: None,
     }))
     .await
     .unwrap();
@@ -23833,6 +26070,7 @@ async fn write_freeze_blocks_machine_action_submit() {
             evidence_submission_ids: Vec::new(),
             request_id: "req-freeze-machine".into(),
             ontology_digest: String::new(),
+            offline: None,
         },
         "tester",
     );
@@ -24424,3 +26662,6290 @@ async fn synthetic_tenants_pass_the_real_read_checks() {
 
 #[path = "isolation_probes.rs"]
 mod isolation_probes;
+
+#[tokio::test]
+async fn dataset_branch_rpcs_isolate_then_merge_once_by_another_principal() {
+    let svc = service();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "branched".into(),
+            name: "branched".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "branched".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v1".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let branch = svc
+        .create_dataset_branch(with_principal(CreateDatasetBranchRequest {
+            dataset_id: "branched".into(),
+            name: "dev".into(),
+            from_version_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .branch
+        .unwrap();
+    assert!(!branch.written);
+    svc.db
+        .runtime()
+        .write_dataset_branch_rows(
+            "branched",
+            "dev",
+            &[[("kind".to_string(), "v2".to_string())].into()],
+            false,
+        )
+        .unwrap();
+    let diff = svc
+        .compare_dataset_branch(with_principal(CompareDatasetBranchRequest {
+            dataset_id: "branched".into(),
+            name: "dev".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((diff.parent_rows, diff.branch_rows), (1, 2));
+    let proposal = svc
+        .propose_dataset_branch_merge(with_principal(ProposeDatasetBranchMergeRequest {
+            dataset_id: "branched".into(),
+            name: "dev".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    let merge = |principal: &str| {
+        with_named_principal(
+            MergeDatasetBranchRequest {
+                dataset_id: "branched".into(),
+                proposal_id: proposal.id.clone(),
+                reason: String::new(),
+            },
+            principal,
+        )
+    };
+    let own = svc.merge_dataset_branch(merge("tester")).await.unwrap_err();
+    assert_eq!(own.code(), tonic::Code::PermissionDenied);
+    let merged = svc
+        .merge_dataset_branch(merge("reviewer"))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(merged.status, "merged");
+    assert!(merged.receipt_id.starts_with("sha256:"));
+    let versions = svc
+        .list_dataset_versions(with_principal(ListDatasetVersionsRequest {
+            dataset_id: "branched".into(),
+            as_of_ms: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(versions.len(), 2);
+    assert_eq!(
+        versions.last().unwrap().version_id,
+        merged.merged_version_id
+    );
+    let listed = svc
+        .list_dataset_branches(with_principal(ListDatasetBranchesRequest {
+            dataset_id: "branched".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(listed.branches.is_empty());
+    let missing = svc
+        .delete_dataset_branch(with_principal(DeleteDatasetBranchRequest {
+            dataset_id: "branched".into(),
+            name: "dev".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+fn gate_binding(namespace: &str, blocking: bool) -> domain::Object {
+    use crate::sekai::definition_consumer_impact::{
+        BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+    };
+    let mut binding = DefinitionConsumerBinding {
+        contract_version: BINDING_CONTRACT.into(),
+        owner: "billing-team".into(),
+        resource_identity: "app:invoices".into(),
+        namespace: namespace.into(),
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        property: "title".into(),
+        declaration_digest: String::new(),
+        source_locator: "invoices/src/ticket.rs".into(),
+        blocking,
+    };
+    binding.declaration_digest = binding_digest(&binding);
+    let mut properties = HashMap::from([
+        ("contract_version".into(), binding.contract_version),
+        ("owner".into(), binding.owner),
+        ("resource_identity".into(), binding.resource_identity),
+        ("member_kind".into(), binding.member_kind),
+        ("member_id".into(), binding.member_id),
+        ("property".into(), binding.property),
+        ("declaration_digest".into(), binding.declaration_digest),
+        ("source_locator".into(), binding.source_locator),
+    ]);
+    if blocking {
+        properties.insert("blocking".into(), "true".into());
+    }
+    domain::Object {
+        id: "binding-invoices".into(),
+        kind: BINDING_KIND.into(),
+        name: "binding-invoices".into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:binding-invoices"),
+        properties,
+        created: 1,
+        updated: 1,
+    }
+}
+
+/// Branch, edit, propose, approve and merge; the merge result is returned.
+async fn try_publish(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    parent: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    properties: &str,
+    major_revision: bool,
+) -> Result<String, Status> {
+    let _ = svc
+        .create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: namespace.into(),
+                branch_id: branch_id.into(),
+                parent_revision_digest: parent.into(),
+                idempotency_key: format!("{branch_id}-create"),
+            },
+            "root",
+        ))
+        .await;
+    let candidate = match svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: branch_id.into(),
+                expected_head_digest: parent.into(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: format!(r#"{{"name":"Ticket","properties":{properties}}}"#),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: format!("{branch_id}-edit"),
+            },
+            "root",
+        ))
+        .await
+    {
+        Ok(applied) => applied.into_inner().revision.unwrap().revision_digest,
+        Err(_) => {
+            svc.get_definition_branch(with_named_principal(
+                GetDefinitionBranchRequest {
+                    namespace: namespace.into(),
+                    branch_id: branch_id.into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .branch
+            .unwrap()
+            .head_revision_digest
+        }
+    };
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            proposal_id: proposal_id.into(),
+            base_digest: parent.into(),
+            candidate_digest: candidate,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("{proposal_id}-propose"),
+            major_revision,
+            migration_plan_digest: String::new(),
+        },
+        "root",
+    ))
+    .await?;
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: proposal_id.into(),
+            idempotency_key: format!("{proposal_id}-approve"),
+        },
+        "root",
+    ))
+    .await?;
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: proposal_id.into(),
+                expected_published_digest: parent.into(),
+                idempotency_key: format!("{proposal_id}-merge"),
+            },
+            "root",
+        ))
+        .await?
+        .into_inner();
+    Ok(merged.published_revision.unwrap().revision_digest)
+}
+
+#[tokio::test]
+async fn blocking_consumer_bindings_gate_breaking_publishes() {
+    let svc = service();
+    let namespace = "gate-team";
+    let parent = seed_definition_parent(&svc, namespace);
+    let with_title = try_publish(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "g-1",
+        "g-cs-1",
+        r#"["title"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&gate_binding(namespace, true))
+        .unwrap();
+
+    // Making `title` required is breaking too, though no property is removed.
+    let tightened = try_publish(
+        &svc,
+        namespace,
+        &with_title,
+        "g-req",
+        "g-cs-req",
+        r#"["title"],"required":["title"]"#,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        tightened.code(),
+        tonic::Code::FailedPrecondition,
+        "{tightened:?}"
+    );
+    assert!(
+        tightened.message().contains("app:invoices"),
+        "{tightened:?}"
+    );
+
+    // Dropping `title` breaks the blocking binding: refused, naming it.
+    let blocked = try_publish(
+        &svc,
+        namespace,
+        &with_title,
+        "g-2",
+        "g-cs-2",
+        r#"["body"]"#,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(blocked.code(), tonic::Code::FailedPrecondition);
+    assert!(blocked.message().contains("app:invoices"), "{blocked:?}");
+    assert!(blocked.message().contains("Ticket.title"), "{blocked:?}");
+
+    // The same change as an approved major revision publishes past the gate.
+    let major = try_publish(
+        &svc,
+        namespace,
+        &with_title,
+        "g-2",
+        "g-cs-2-major",
+        r#"["body"]"#,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_ne!(major, with_title);
+
+    // An advisory binding never blocks and is not disclosed.
+    let restored = try_publish(
+        &svc,
+        namespace,
+        &major,
+        "g-3",
+        "g-cs-3",
+        r#"["title"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .update_object(&gate_binding(namespace, false))
+        .unwrap();
+    try_publish(
+        &svc,
+        namespace,
+        &restored,
+        "g-4",
+        "g-cs-4",
+        r#"["body"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+}
+
+fn changelog_binding(namespace: &str) -> domain::Object {
+    use crate::sekai::definition_consumer_impact::{
+        BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+    };
+    let mut binding = DefinitionConsumerBinding {
+        contract_version: BINDING_CONTRACT.into(),
+        owner: "billing-team".into(),
+        resource_identity: "app:invoices".into(),
+        namespace: namespace.into(),
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        property: "title".into(),
+        declaration_digest: String::new(),
+        source_locator: "invoices/src/ticket.rs".into(),
+        blocking: false,
+    };
+    binding.declaration_digest = binding_digest(&binding);
+    domain::Object {
+        id: "binding-invoices".into(),
+        kind: BINDING_KIND.into(),
+        name: "binding-invoices".into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:binding-invoices"),
+        properties: HashMap::from([
+            ("contract_version".into(), binding.contract_version),
+            ("owner".into(), binding.owner),
+            ("resource_identity".into(), binding.resource_identity),
+            ("member_kind".into(), binding.member_kind),
+            ("member_id".into(), binding.member_id),
+            ("property".into(), binding.property),
+            ("declaration_digest".into(), binding.declaration_digest),
+            ("source_locator".into(), binding.source_locator),
+        ]),
+        created: 1,
+        updated: 1,
+    }
+}
+
+async fn changelog(
+    svc: &SekaiServiceImpl,
+    caller: &str,
+    reader: &str,
+) -> GetOntologyChangelogResponse {
+    svc.get_ontology_changelog(with_named_principal(
+        GetOntologyChangelogRequest {
+            namespaces: vec!["orders".into()],
+            since_ms: now_millis() - 7 * 24 * 60 * 60 * 1000,
+            until_ms: now_millis() + 1_000,
+            reader: reader.into(),
+        },
+        caller,
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+#[tokio::test]
+async fn ontology_changelog_lists_the_week_with_authors_approvers_and_consumers() {
+    let svc = service();
+    let namespace = "orders";
+    let parent = seed_definition_parent(&svc, namespace);
+    svc.db
+        .runtime()
+        .create_object(&changelog_binding(namespace))
+        .unwrap();
+    let ticket = |properties: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        definition_json: format!(r#"{{"name":"Ticket","properties":{properties}}}"#),
+        member_digest: String::new(),
+    };
+    let (added, _) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "log-1",
+        "log-cs-1",
+        vec![ticket(r#"["title"]"#)],
+    )
+    .await;
+    // Dropping `title` breaks the invoices app bound to it.
+    let (revision, receipt) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &added,
+        "log-2",
+        "log-cs-2",
+        vec![ticket(r#"["body"]"#)],
+    )
+    .await;
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(namespace, "orders-team", security::Role::Admin, "local")
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+
+    let digest = changelog(&svc, "root", "orders-team").await;
+    assert_eq!(digest.reader, "orders-team");
+    let entries: Vec<_> = digest
+        .entries
+        .iter()
+        .filter(|entry| entry.change_kind == "definition_revision")
+        .collect();
+    assert_eq!(entries.len(), 2, "{digest:?}");
+    assert_eq!(
+        entries[0].summary,
+        ["changed object type Ticket: added properties title"]
+    );
+    assert!(entries[0].affected_consumers.is_empty());
+    let entry = entries[1];
+    assert_eq!(entry.revision_digest, revision);
+    assert_eq!(entry.receipt_id, receipt);
+    assert_eq!(entry.author, "root");
+    assert_eq!(entry.approvers, ["root"]);
+    assert_eq!(entry.published_by, "root");
+    assert_eq!(
+        entry.summary,
+        ["changed object type Ticket: added properties body; removed properties title"]
+    );
+    assert!(
+        entry
+            .affected_consumers
+            .iter()
+            .any(|consumer| consumer.resource_identity == "app:invoices"),
+        "{entry:?}"
+    );
+
+    // With no namespaces named, the team's own namespaces are covered.
+    let by_role = svc
+        .get_ontology_changelog(with_named_principal(
+            GetOntologyChangelogRequest {
+                namespaces: Vec::new(),
+                since_ms: now_millis() - 7 * 24 * 60 * 60 * 1000,
+                until_ms: now_millis() + 1_000,
+                reader: "orders-team".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(by_role.entries, digest.entries);
+
+    // A team without access to the namespace gets nothing for it.
+    let outsider = changelog(&svc, "root", "outsider-team").await;
+    assert!(outsider.entries.is_empty(), "{outsider:?}");
+    // Building another reader's digest is for credential admins only.
+    let denied = svc
+        .get_ontology_changelog(with_named_principal(
+            GetOntologyChangelogRequest {
+                namespaces: vec![namespace.into()],
+                since_ms: 0,
+                until_ms: 1_000,
+                reader: "orders-team".into(),
+            },
+            "outsider-team",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn transform_replay_rpc_reproduces_and_needs_read_on_every_input() {
+    let svc = service();
+    seed_lineage_object(&svc, "replay-secret", "replays");
+    for (id, object_id) in [("replay-in", "replay-secret"), ("replay-out", "")] {
+        svc.create_dataset(with_named_principal(
+            CreateDatasetRequest {
+                dataset: Some(Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: ["id", "keep"]
+                        .map(|name| ColumnDef {
+                            name: name.into(),
+                            r#type: "string".into(),
+                            classification: "public".into(),
+                        })
+                        .to_vec(),
+                    object_id: object_id.into(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                }),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    // Only root may read the input.
+    svc.security.add_grant(&security::Grant {
+        id: "replay-grant".into(),
+        object_id: "replay-secret".into(),
+        principal: "root".into(),
+        role: security::Role::Viewer,
+        created: 1,
+        ..Default::default()
+    });
+    let runtime = svc.db.runtime();
+    runtime
+        .append_rows(
+            "replay-in",
+            &[
+                [
+                    ("id".to_string(), "1".to_string()),
+                    ("keep".into(), "yes".into()),
+                ]
+                .into(),
+                [
+                    ("id".to_string(), "2".to_string()),
+                    ("keep".into(), "no".into()),
+                ]
+                .into(),
+            ],
+        )
+        .unwrap();
+    let transform = crate::sekai::governed_transform::GovernedTransform {
+        contract_version: crate::sekai::governed_transform::CONTRACT_VERSION.into(),
+        namespace: "replays".into(),
+        transform_id: "keep".into(),
+        input_dataset_id: "replay-in".into(),
+        output_dataset_id: "replay-out".into(),
+        steps: vec![crate::sekai::governed_transform::TransformStep {
+            kind: "filter".into(),
+            column: "keep".into(),
+            op: "eq".into(),
+            value: "yes".into(),
+            columns: Vec::new(),
+        }],
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: None,
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .unwrap();
+    runtime.put_governed_transform(&transform, 10).unwrap();
+    let original = runtime
+        .run_governed_transform("replays", "keep", false, 20)
+        .unwrap();
+    let request = |principal: &str| {
+        with_named_principal(
+            ReplayGovernedTransformRequest {
+                namespace: "replays".into(),
+                transform_id: "keep".into(),
+                key_column: "id".into(),
+                ..Default::default()
+            },
+            principal,
+        )
+    };
+    let refused = svc
+        .replay_governed_transform(request("local"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (tonic::Code::PermissionDenied, "access denied")
+    );
+    let replay = svc
+        .replay_governed_transform(request("root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .replay
+        .unwrap();
+    assert!(replay.diff.as_ref().unwrap().reproduced);
+    assert_eq!(replay.output_digest, original.output_digest);
+    assert_eq!(replay.inputs[0].dataset_id, "replay-in");
+    let get = |principal: &str| {
+        with_named_principal(
+            GetTransformReplayRequest {
+                id: replay.id.clone(),
+            },
+            principal,
+        )
+    };
+    let fetched = svc
+        .get_transform_replay(get("root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .replay
+        .unwrap();
+    // The stored record keeps counts and digests, not row values.
+    assert_eq!(
+        fetched.diff.unwrap().replay_digest,
+        replay.diff.as_ref().unwrap().replay_digest
+    );
+    assert_eq!(fetched.id, replay.id);
+    // Someone who cannot read the input cannot read the record either.
+    let hidden = svc.get_transform_replay(get("local")).await.unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::PermissionDenied);
+    let missing = svc
+        .get_transform_replay(with_named_principal(
+            GetTransformReplayRequest { id: "nope".into() },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    // Once property grants are enforced, the whole-row replay is refused.
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "replays".into(),
+        kind: "widget".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+            property: "id".into(),
+            access: crate::sekai::object_security::PropertyGrantAccess::Read,
+        }]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = runtime
+        .put_object_security_policy(&policy, "root", "put-replay-grants", 30)
+        .unwrap();
+    runtime
+        .activate_object_security_policies(
+            "replays",
+            &BTreeMap::from([("widget".into(), revision.revision_digest)]),
+            "root",
+            "activate-replay-grants",
+            31,
+        )
+        .unwrap();
+    let restricted = svc
+        .replay_governed_transform(request("root"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (restricted.code(), restricted.message()),
+        (
+            tonic::Code::FailedPrecondition,
+            crate::sekai::transform_replay::REPLAY_PROPERTY_RESTRICTED
+        )
+    );
+}
+
+#[tokio::test]
+async fn transform_shadow_rpc_reports_changed_rows_and_needs_admin() {
+    let svc = service();
+    for id in ["shadow-in", "shadow-out"] {
+        svc.create_dataset(with_named_principal(
+            CreateDatasetRequest {
+                dataset: Some(Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: ["id", "keep"]
+                        .map(|name| ColumnDef {
+                            name: name.into(),
+                            r#type: "string".into(),
+                            classification: "public".into(),
+                        })
+                        .to_vec(),
+                    object_id: String::new(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                }),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    let runtime = svc.db.runtime();
+    let rows: Vec<HashMap<String, String>> = [("1", "yes"), ("2", "maybe")]
+        .map(|(id, keep)| {
+            [
+                ("id".to_string(), id.to_string()),
+                ("keep".into(), keep.into()),
+            ]
+            .into()
+        })
+        .to_vec();
+    runtime.append_rows("shadow-in", &rows).unwrap();
+    let transform = |op: &str, value: &str| {
+        crate::sekai::governed_transform::GovernedTransform {
+            contract_version: crate::sekai::governed_transform::CONTRACT_VERSION.into(),
+            namespace: "shadows".into(),
+            transform_id: "keep".into(),
+            input_dataset_id: "shadow-in".into(),
+            output_dataset_id: "shadow-out".into(),
+            steps: vec![crate::sekai::governed_transform::TransformStep {
+                kind: "filter".into(),
+                column: "keep".into(),
+                op: op.into(),
+                value: value.into(),
+                columns: Vec::new(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    };
+    runtime
+        .put_governed_transform(&transform("eq", "yes"), 10)
+        .unwrap();
+    let run = runtime
+        .run_governed_transform(
+            "shadows",
+            "keep",
+            false,
+            crate::sekai::dataset_version::now_ms(),
+        )
+        .unwrap();
+    let request = |principal: &str, definition_json: String| {
+        with_named_principal(
+            ShadowGovernedTransformRequest {
+                namespace: "shadows".into(),
+                transform_id: "keep".into(),
+                definition_json,
+                key_column: "id".into(),
+                ..Default::default()
+            },
+            principal,
+        )
+    };
+    let candidate = serde_json::to_string(&transform("neq", "no")).unwrap();
+    let refused = svc
+        .shadow_governed_transform(request("analyst", candidate.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (tonic::Code::PermissionDenied, "credential admin required")
+    );
+    let empty = svc
+        .shadow_governed_transform(request("root", String::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+    let report = svc
+        .shadow_governed_transform(request("root", candidate))
+        .await
+        .unwrap()
+        .into_inner()
+        .report
+        .unwrap();
+    assert_eq!(report.runs.len(), 1);
+    assert_eq!(report.runs[0].run_id, run.run_id);
+    assert_eq!(report.runs[0].changed_keys, ["2"]);
+    assert_eq!((report.rows_compared, report.rows_matched), (2, 1));
+    assert_eq!(report.samples[0].change.as_ref().unwrap().key, "2");
+}
+
+fn catalog_request(source_id: &str) -> RegisterCatalogEntryRequest {
+    RegisterCatalogEntryRequest {
+        namespace: "warehouse".into(),
+        entry_kind: "dataset".into(),
+        source_system: "mizuchi".into(),
+        source_id: source_id.into(),
+        display_name: "Orders".into(),
+        description: "daily orders".into(),
+        owners: vec!["alice".into()],
+        steward: "bob".into(),
+        tags: vec!["finance".into()],
+        access_marking: String::new(),
+        schema_summary: "id,total".into(),
+        freshness_ms: 1,
+        deprecated: false,
+        binding: None,
+    }
+}
+
+async fn visible_catalog_entries(svc: &SekaiServiceImpl, principal: &str) -> Vec<domain::Object> {
+    svc.list_objects(with_named_principal(
+        ListObjectsRequest {
+            filter: Some(ListFilter {
+                kind: crate::sekai::catalog::CATALOG_ENTRY_KIND.into(),
+                namespace: "warehouse".into(),
+                ..Default::default()
+            }),
+            page_token: String::new(),
+        },
+        principal,
+    ))
+    .await
+    .map(|response| {
+        response
+            .into_inner()
+            .objects
+            .iter()
+            .map(support_mapping::from_proto_obj)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn catalog_lineage_follows_bindings_and_redacts_undiscoverable_targets() {
+    let svc = service();
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(
+            "warehouse",
+            "warehouse-team",
+            security::Role::Admin,
+            "local",
+        )
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "orders-binding".into(),
+            kind: "dataset_binding".into(),
+            name: "orders".into(),
+            namespace: "warehouse".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "orders".into(),
+            name: "orders".into(),
+            columns: Vec::new(),
+            object_id: "orders-binding".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "global-hidden".into(),
+            name: "global-hidden".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    let mut hidden = catalog_request("tbl-hidden");
+    hidden.binding = Some(CatalogBinding {
+        kind: "dataset".into(),
+        target_id: "global-hidden".into(),
+        source_type_descriptor_id: String::new(),
+    });
+    let denied = svc
+        .register_catalog_entry(with_named_principal(hidden, "warehouse-team"))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::InvalidArgument);
+    let mut bound = catalog_request("tbl-bound");
+    bound.binding = Some(CatalogBinding {
+        kind: "dataset".into(),
+        target_id: "orders".into(),
+        source_type_descriptor_id: String::new(),
+    });
+    let registered = svc
+        .register_catalog_entry(with_named_principal(bound, "warehouse-team"))
+        .await
+        .unwrap()
+        .into_inner();
+    let entry_id = registered.entry.unwrap().id;
+    let unbound_id = svc
+        .register_catalog_entry(with_named_principal(
+            catalog_request("tbl-free"),
+            "warehouse-team",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .entry
+        .unwrap()
+        .id;
+    let none = svc
+        .get_catalog_entry_lineage(with_named_principal(
+            GetCatalogEntryLineageRequest {
+                namespace: "warehouse".into(),
+                entry_id: unbound_id.clone(),
+                depth: 0,
+                page_size: 0,
+                page_token: String::new(),
+            },
+            "warehouse-team",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!none.has_binding);
+    let lineage = svc
+        .get_catalog_entry_lineage(with_named_principal(
+            GetCatalogEntryLineageRequest {
+                namespace: "warehouse".into(),
+                entry_id,
+                depth: 0,
+                page_size: 0,
+                page_token: String::new(),
+            },
+            "warehouse-team",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(lineage.has_binding);
+    let deep = svc
+        .get_catalog_entry_lineage(with_named_principal(
+            GetCatalogEntryLineageRequest {
+                namespace: "warehouse".into(),
+                entry_id: unbound_id,
+                depth: 9,
+                page_size: 0,
+                page_token: String::new(),
+            },
+            "warehouse-team",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(deep.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn catalog_registration_is_idempotent_and_follows_namespace_access() {
+    let svc = service();
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(
+            "warehouse",
+            "warehouse-team",
+            security::Role::Admin,
+            "local",
+        )
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    let register = |principal: &str, source_id: &str| {
+        svc.register_catalog_entry(with_named_principal(catalog_request(source_id), principal))
+    };
+    let first = register("warehouse-team", "tbl-1")
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.changed);
+    let again = register("warehouse-team", "tbl-1")
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!again.changed);
+    assert_eq!(
+        again.entry.as_ref().unwrap().id,
+        first.entry.as_ref().unwrap().id
+    );
+
+    let outsider = register("outsider", "tbl-2").await.unwrap_err();
+    assert_eq!(outsider.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        visible_catalog_entries(&svc, "warehouse-team").await.len(),
+        1
+    );
+    assert!(visible_catalog_entries(&svc, "outsider").await.is_empty());
+
+    // Generic writes cannot forge or edit an entry.
+    let mut forged = first.entry.unwrap();
+    forged.id = "catalog:forged".into();
+    let refused = svc
+        .create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(forged),
+                lease_precondition: None,
+            },
+            "warehouse-team",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn publishing_an_object_type_registers_and_retires_its_catalog_entry() {
+    let svc = service();
+    let namespace = "catalog-team";
+    let parent = seed_definition_parent(&svc, namespace);
+    let ontology_entries = |svc: &SekaiServiceImpl| {
+        svc.db
+            .runtime()
+            .list_objects(&domain::ListFilter {
+                kind: Some(crate::sekai::catalog::CATALOG_ENTRY_KIND.into()),
+                namespace: Some(namespace.into()),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    let (with_ticket, _) = publish_definition_history_entry(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "cat-1",
+        "cat-cs-1",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Invoice".into(),
+            definition_json:
+                r#"{"name":"Invoice","properties":["total","due"],"access_marking":"confidential","lint_suppressions":[{"rule":"orphan_object_type","reason":"test fixture"}]}"#
+                    .into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    // The background reconciler keeps the catalog in line with publishes.
+    let reconcile = |svc: &SekaiServiceImpl| {
+        let failed =
+            crate::sekai::catalog::reconcile_ontology_entries(svc.db.runtime(), now_millis())
+                .unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+    };
+    reconcile(&svc);
+    let entries = ontology_entries(&svc);
+    let invoice: Vec<_> = entries
+        .iter()
+        .filter(|e| e.properties.get("source_id").map(String::as_str) == Some("Invoice"))
+        .collect();
+    assert_eq!(invoice.len(), 1, "{entries:?}");
+    assert_eq!(invoice[0].properties["entry_kind"], "object_type");
+    assert_eq!(invoice[0].properties["schema_summary"], "due,total");
+    assert_eq!(invoice[0].properties["status"], "active");
+    // The definition's marking is the entry's, so restricted metadata stays hidden.
+    assert_eq!(invoice[0].properties["access_marking"], "confidential");
+
+    // Removing the object type deprecates its entry; nothing is deleted.
+    let applied = svc
+        .create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: namespace.into(),
+                branch_id: "cat-2".into(),
+                parent_revision_digest: with_ticket.clone(),
+                idempotency_key: "cat-2-create".into(),
+            },
+            "root",
+        ))
+        .await;
+    assert!(applied.is_ok());
+    let edit = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "cat-2".into(),
+                expected_head_digest: with_ticket.clone(),
+                upserts: Vec::new(),
+                removals: vec![DefinitionMemberRef {
+                    member_kind: "object_type".into(),
+                    member_id: "Invoice".into(),
+                }],
+                idempotency_key: "cat-2-edit".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    {
+        let candidate = edit.into_inner().revision.unwrap().revision_digest;
+        for (step, result) in [
+            (
+                "propose",
+                svc.create_definition_proposal(with_named_principal(
+                    CreateDefinitionProposalRequest {
+                        namespace: namespace.into(),
+                        branch_id: "cat-2".into(),
+                        proposal_id: "cat-cs-2".into(),
+                        base_digest: with_ticket.clone(),
+                        candidate_digest: candidate,
+                        eval_plan_digests: Vec::new(),
+                        named_foreign_digests: Vec::new(),
+                        idempotency_key: "cat-2-propose".into(),
+                        major_revision: true,
+                        migration_plan_digest: String::new(),
+                    },
+                    "root",
+                ))
+                .await
+                .map(|_| ()),
+            ),
+            (
+                "approve",
+                svc.approve_definition_proposal(with_named_principal(
+                    ApproveDefinitionProposalRequest {
+                        namespace: namespace.into(),
+                        proposal_id: "cat-cs-2".into(),
+                        idempotency_key: "cat-2-approve".into(),
+                    },
+                    "root",
+                ))
+                .await
+                .map(|_| ()),
+            ),
+            (
+                "merge",
+                svc.merge_definition_proposal(with_named_principal(
+                    MergeDefinitionProposalRequest {
+                        namespace: namespace.into(),
+                        proposal_id: "cat-cs-2".into(),
+                        expected_published_digest: with_ticket.clone(),
+                        idempotency_key: "cat-2-merge".into(),
+                    },
+                    "root",
+                ))
+                .await
+                .map(|_| ()),
+            ),
+        ] {
+            result.unwrap_or_else(|error| panic!("{step}: {error:?}"));
+        }
+        reconcile(&svc);
+        let invoice = ontology_entries(&svc)
+            .into_iter()
+            .find(|e| e.properties.get("source_id").map(String::as_str) == Some("Invoice"))
+            .unwrap();
+        assert_eq!(invoice.properties["status"], "deprecated");
+    }
+}
+
+#[tokio::test]
+async fn media_upload_resumes_checks_its_checksum_and_reads_under_object_policy() {
+    use sha2::{Digest, Sha256};
+    let svc = service();
+    grant_source_namespace(&svc, "field", "alice", security::Role::Admin);
+    grant_source_namespace(&svc, "field", "carol", security::Role::Viewer);
+    let file: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
+    let sha = crate::sekai::media_upload::hex(&Sha256::digest(&file));
+    let begin = |key: &str, sha: &str| BeginMediaUploadRequest {
+        namespace: "field".into(),
+        idempotency_key: key.into(),
+        size_bytes: file.len() as u64,
+        sha256: sha.into(),
+        media_type: "image/jpeg".into(),
+        file_name: "site.jpg".into(),
+        access_marking: String::new(),
+    };
+    let chunk = |upload_id: &str, offset: usize, end: usize| UploadMediaChunkRequest {
+        upload_id: upload_id.into(),
+        offset: offset as u64,
+        data: file[offset..end].to_vec(),
+    };
+
+    // A viewer may not upload into the namespace.
+    let denied = svc
+        .begin_media_upload(with_named_principal(begin("p-1", &sha), "carol"))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+    let started = svc
+        .begin_media_upload(with_named_principal(begin("p-1", &sha), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    let id = started.upload_id.clone();
+    svc.upload_media_chunk(with_named_principal(chunk(&id, 0, 1000), "alice"))
+        .await
+        .unwrap();
+    // The connection drops; the client asks where to continue, and a resent
+    // first chunk is a harmless retry.
+    let status = svc
+        .get_media_upload(with_named_principal(
+            GetMediaUploadRequest {
+                upload_id: id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((status.received_bytes, status.complete), (1000, false));
+    let retried = svc
+        .upload_media_chunk(with_named_principal(chunk(&id, 0, 1000), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retried.received_bytes, 1000);
+    let gap = svc
+        .upload_media_chunk(with_named_principal(chunk(&id, 2000, 2500), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(gap.code(), tonic::Code::FailedPrecondition);
+    assert!(gap.message().contains("offset 1000"), "{gap:?}");
+    // Nobody else sees or continues the session.
+    let foreign = svc
+        .upload_media_chunk(with_named_principal(chunk(&id, 1000, 2000), "carol"))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::NotFound);
+    svc.upload_media_chunk(with_named_principal(chunk(&id, 1000, 2500), "alice"))
+        .await
+        .unwrap();
+    let done = svc
+        .complete_media_upload(with_named_principal(
+            CompleteMediaUploadRequest {
+                upload_id: id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(done.complete);
+    assert!(
+        done.media_reference.starts_with("sekai-media:media-"),
+        "{done:?}"
+    );
+
+    // The same key returns the same reference, and completing is idempotent.
+    let again = svc
+        .begin_media_upload(with_named_principal(begin("p-1", &sha), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.media_reference, done.media_reference);
+    let completed_again = svc
+        .complete_media_upload(with_named_principal(
+            CompleteMediaUploadRequest {
+                upload_id: id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(completed_again.media_reference, done.media_reference);
+    let changed = svc
+        .begin_media_upload(with_named_principal(begin("p-1", &"0".repeat(64)), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(changed.code(), tonic::Code::AlreadyExists);
+
+    // A namespace reader reads the file; a caller without access cannot.
+    let read = |principal: &str| {
+        svc.read_media(with_named_principal(
+            ReadMediaRequest {
+                media_reference: done.media_reference.clone(),
+                offset: 0,
+                limit: 0,
+            },
+            principal,
+        ))
+    };
+    let body = read("carol").await.unwrap().into_inner();
+    assert_eq!(body.data, file);
+    assert_eq!(
+        (body.sha256.as_str(), body.media_type.as_str()),
+        (sha.as_str(), "image/jpeg")
+    );
+    assert_eq!(
+        read("mallory").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    // Generic object reads never expose the media object.
+    let object_id = done.media_reference.trim_start_matches("sekai-media:");
+    let generic = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: object_id.into(),
+            },
+            "alice",
+        ))
+        .await;
+    assert!(generic.is_err(), "{generic:?}");
+
+    // A checksum mismatch is refused, and the upload can be sent again.
+    let wrong = svc
+        .begin_media_upload(with_named_principal(begin("p-2", &"a".repeat(64)), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    for (start, end) in [(0, 1000), (1000, 2000), (2000, 2500)] {
+        svc.upload_media_chunk(with_named_principal(
+            chunk(&wrong.upload_id, start, end),
+            "alice",
+        ))
+        .await
+        .unwrap();
+    }
+    let mismatch = svc
+        .complete_media_upload(with_named_principal(
+            CompleteMediaUploadRequest {
+                upload_id: wrong.upload_id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(mismatch.code(), tonic::Code::InvalidArgument);
+    assert!(
+        mismatch.message().contains("checksum mismatch"),
+        "{mismatch:?}"
+    );
+    let reset = svc
+        .get_media_upload(with_named_principal(
+            GetMediaUploadRequest {
+                upload_id: wrong.upload_id,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((reset.received_bytes, reset.complete), (0, false));
+}
+
+fn bundle_binding(namespace: &str, id: &str, owner: &str) -> domain::Object {
+    use crate::sekai::definition_consumer_impact::{
+        BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
+    };
+    let mut binding = DefinitionConsumerBinding {
+        contract_version: BINDING_CONTRACT.into(),
+        owner: owner.into(),
+        resource_identity: format!("app:{id}"),
+        namespace: namespace.into(),
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        property: "title".into(),
+        declaration_digest: String::new(),
+        source_locator: format!("{id}/src/ticket.rs"),
+        blocking: false,
+    };
+    binding.declaration_digest = binding_digest(&binding);
+    domain::Object {
+        id: format!("binding-{id}"),
+        kind: BINDING_KIND.into(),
+        name: format!("binding-{id}"),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:binding-{id}"),
+        properties: HashMap::from([
+            ("contract_version".into(), binding.contract_version),
+            ("owner".into(), binding.owner),
+            ("resource_identity".into(), binding.resource_identity),
+            ("member_kind".into(), binding.member_kind),
+            ("member_id".into(), binding.member_id),
+            ("property".into(), binding.property),
+            ("declaration_digest".into(), binding.declaration_digest),
+            ("source_locator".into(), binding.source_locator),
+        ]),
+        created: 1,
+        updated: 1,
+    }
+}
+
+#[tokio::test]
+async fn change_bundle_plans_declared_changes_and_reports_only_visible_consumers() {
+    let svc = service();
+    let namespace = "bundles";
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(namespace, "alice", security::Role::Admin, "local")
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    let parent = seed_definition_parent(&svc, namespace);
+    let from = try_publish(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "cb-1",
+        "cb-cs-1",
+        r#"["title","state"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    // `title` is renamed to `subject`, and `priority` is new and required.
+    let to = try_publish(
+        &svc,
+        namespace,
+        &from,
+        "cb-2",
+        "cb-cs-2",
+        r#"["subject","state","priority"],"required":["priority"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    // Unmarked objects need an explicit grant: alice sees one binding only.
+    let mut namespace_object = svc
+        .db
+        .runtime()
+        .find_by_external_id(&format!("namespace:{namespace}"))
+        .unwrap()
+        .unwrap();
+    namespace_object
+        .properties
+        .insert(markings::DENY_UNMARKED_PROPERTY.into(), "true".into());
+    svc.db.runtime().update_object(&namespace_object).unwrap();
+    for (id, owner) in [("visible", "billing-team"), ("hidden", "secret-team")] {
+        svc.db
+            .runtime()
+            .create_object(&bundle_binding(namespace, id, owner))
+            .unwrap();
+    }
+    grant_object_role(&svc, "binding-visible", "alice", security::Role::Viewer);
+
+    let generate = |hints: DefinitionChangeHints| {
+        svc.generate_definition_change_bundle(with_named_principal(
+            GenerateDefinitionChangeBundleRequest {
+                namespace: namespace.into(),
+                from_revision_digest: from.clone(),
+                to_revision_digest: to.clone(),
+                hints: Some(hints),
+            },
+            "alice",
+        ))
+    };
+    let declared = DefinitionChangeHints {
+        renames: vec![DefinitionPropertyRename {
+            object_type: "Ticket".into(),
+            from_property: "title".into(),
+            to_property: "subject".into(),
+        }],
+        defaults: vec![DefinitionPropertyDefault {
+            object_type: "Ticket".into(),
+            property: "priority".into(),
+            value: "normal".into(),
+        }],
+        type_changes: Vec::new(),
+    };
+    let bundle = generate(declared.clone()).await.unwrap().into_inner();
+    assert_eq!(bundle.contract_version, "sekai.definition-change-bundle/v1");
+    assert!(bundle.bundle_digest.starts_with("sha256:"));
+    assert!(bundle.steps.iter().all(|step| !step.manual), "{bundle:?}");
+    let backfill = bundle
+        .backfill
+        .iter()
+        .map(|a| (a.property.as_str(), a.mode.as_str(), a.source.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backfill,
+        [
+            ("priority", "default", "normal"),
+            ("subject", "copy", "title")
+        ]
+    );
+    let impact = bundle.impact.unwrap();
+    let consumers = impact
+        .impacts
+        .iter()
+        .map(|path| (path.resource_identity.as_str(), path.property.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(consumers, [("app:visible", "title")]);
+    let rendered = format!("{impact:?}");
+    assert!(!rendered.contains("hidden") && !rendered.contains("secret-team"));
+    // Generation is a read: the same inputs give the same bundle.
+    assert_eq!(
+        generate(declared.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .bundle_digest,
+        bundle.bundle_digest
+    );
+
+    let mut with_type_change = declared;
+    with_type_change.type_changes.push(DefinitionPropertyRef {
+        object_type: "Ticket".into(),
+        property: "state".into(),
+    });
+    let flagged = generate(with_type_change).await.unwrap().into_inner();
+    let manual = flagged
+        .steps
+        .iter()
+        .filter(|step| step.manual)
+        .map(|step| (step.property.as_str(), step.reason.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(manual, [("state", "type_change_not_convertible")]);
+
+    let mismatched = generate(DefinitionChangeHints {
+        renames: vec![DefinitionPropertyRename {
+            object_type: "Ticket".into(),
+            from_property: "state".into(),
+            to_property: "subject".into(),
+        }],
+        ..DefinitionChangeHints::default()
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(mismatched.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn sync_scope_snapshot_and_deltas_follow_read_policy_links_and_quota() {
+    use crate::sekai::sync_scope::SYNC_CONTRACT;
+    let svc = service();
+    grant_source_namespace(&svc, "field", "alice", security::Role::Admin);
+    let db = svc.db.runtime();
+    let object = |id: &str, kind: &str, props: &[(&str, &str)]| domain::Object {
+        id: id.into(),
+        kind: kind.into(),
+        name: id.into(),
+        namespace: "field".into(),
+        external_id: String::new(),
+        properties: props
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        created: 0,
+        updated: 0,
+    };
+    for created in [
+        object("wo-1", "WorkOrder", &[("site", "north")]),
+        object("wo-2", "WorkOrder", &[("site", "north")]),
+        object("wo-3", "WorkOrder", &[("site", "south")]),
+        object(
+            "wo-secret",
+            "WorkOrder",
+            &[
+                ("site", "north"),
+                (markings::OBJECT_CLASSIFICATION_PROPERTY, "confidential"),
+            ],
+        ),
+        object("site-a", "Site", &[]),
+    ] {
+        db.create_object_with_audit(&created, "alice").unwrap();
+    }
+    db.create_link(&domain::Link {
+        id: "l-1".into(),
+        from_id: "wo-1".into(),
+        to_id: "site-a".into(),
+        relation: "located_at".into(),
+        created: 0,
+    })
+    .unwrap();
+    let put = |max_objects: u32| PutSyncScopeRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        kind: "WorkOrder".into(),
+        property_filters: vec![PropertyFilter {
+            key: "site".into(),
+            op: "eq".into(),
+            value: "north".into(),
+        }],
+        link: Some(SyncScopeLink {
+            relation: "located_at".into(),
+            direction: "outgoing".into(),
+            max_hops: 1,
+        }),
+        max_objects,
+        max_offline_age_ms: 0,
+    };
+    let snapshot = |token: &str| ReadSyncSnapshotRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        page_token: token.into(),
+        limit: 2,
+    };
+    let deltas = |cursor: &str| ReadSyncDeltasRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        cursor: cursor.into(),
+        limit: 0,
+    };
+
+    // Unversioned requests are refused.
+    let unversioned = svc
+        .put_sync_scope(with_named_principal(
+            PutSyncScopeRequest {
+                contract_version: String::new(),
+                ..put(10)
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(unversioned.code(), tonic::Code::InvalidArgument);
+
+    // Over its quota, the scope is refused with the quota named.
+    svc.put_sync_scope(with_named_principal(put(2), "alice"))
+        .await
+        .unwrap();
+    let over = svc
+        .read_sync_snapshot(with_named_principal(snapshot(""), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(over.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        over.message().contains("quota of 2 objects (max_objects)"),
+        "{over:?}"
+    );
+
+    // The snapshot pages by id; a resumed page continues without overlap.
+    svc.put_sync_scope(with_named_principal(put(10), "alice"))
+        .await
+        .unwrap();
+    let first = svc
+        .read_sync_snapshot(with_named_principal(snapshot(""), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.total_objects, 3);
+    assert!(first.cursor.is_empty());
+    let ids = |objects: &[Object]| objects.iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&first.objects), ["site-a", "wo-1"]);
+    // The transfer drops; the client asks for the same page again.
+    let retried = svc
+        .read_sync_snapshot(with_named_principal(
+            snapshot(&first.next_page_token),
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let last = svc
+        .read_sync_snapshot(with_named_principal(
+            snapshot(&first.next_page_token),
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&retried.objects), ids(&last.objects));
+    assert_eq!(ids(&last.objects), ["wo-2"]);
+    assert!(last.next_page_token.is_empty() && !last.cursor.is_empty());
+    // The marked object never left the server.
+    let everything = [first.objects.clone(), last.objects.clone()].concat();
+    assert!(!everything.iter().any(|o| o.id == "wo-secret"));
+
+    // Nothing changed: an empty delta keeps the cursor.
+    let quiet = svc
+        .read_sync_deltas(with_named_principal(deltas(&last.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(quiet.upserts.is_empty() && quiet.removed_object_ids.is_empty());
+
+    // wo-2 changes, wo-1 leaves the filter (and takes site-a with it), and
+    // a marked change stays hidden.
+    let mut moved = object("wo-1", "WorkOrder", &[("site", "south")]);
+    db.update_object_with_audit(&moved, "alice").unwrap();
+    db.update_object_with_audit(
+        &object(
+            "wo-2",
+            "WorkOrder",
+            &[("site", "north"), ("status", "done")],
+        ),
+        "alice",
+    )
+    .unwrap();
+    db.update_object_with_audit(
+        &object(
+            "wo-secret",
+            "WorkOrder",
+            &[
+                ("site", "north"),
+                ("status", "done"),
+                (markings::OBJECT_CLASSIFICATION_PROPERTY, "confidential"),
+            ],
+        ),
+        "alice",
+    )
+    .unwrap();
+    let delta = svc
+        .read_sync_deltas(with_named_principal(deltas(&quiet.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&delta.upserts), ["wo-2"]);
+    assert_eq!(delta.upserts[0].properties["status"], "done");
+    assert_eq!(delta.removed_object_ids, ["site-a", "wo-1"]);
+    // Retrying the same cursor is safe and gives the same answer.
+    let again = svc
+        .read_sync_deltas(with_named_principal(deltas(&quiet.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.removed_object_ids, delta.removed_object_ids);
+    assert_eq!(ids(&again.upserts), ids(&delta.upserts));
+    assert_eq!(again.cursor, delta.cursor);
+
+    // Coming back into scope sends the object whole; a delete removes it.
+    moved.properties.insert("site".into(), "north".into());
+    db.update_object_with_audit(&moved, "alice").unwrap();
+    db.delete_object_with_audit("wo-2", "alice").unwrap();
+    let back = svc
+        .read_sync_deltas(with_named_principal(deltas(&delta.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ids(&back.upserts), ["site-a", "wo-1"]);
+    assert_eq!(back.removed_object_ids, ["wo-2"]);
+
+    // Another principal has no such scope and no cursor.
+    grant_source_namespace(&svc, "field", "bob", security::Role::Viewer);
+    let foreign = svc
+        .read_sync_deltas(with_named_principal(deltas(&back.cursor), "bob"))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::NotFound);
+    // An unknown cursor asks for a new snapshot.
+    let lost = svc
+        .read_sync_deltas(with_named_principal(deltas("pos-unknown"), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(lost.resnapshot_required);
+}
+
+#[tokio::test]
+async fn catalog_owners_curate_through_actions_and_markings_only_rise() {
+    let svc = service();
+    for principal in ["tester", "alice", "bob", "carol"] {
+        let (_, grants) = svc
+            .db
+            .runtime()
+            .ensure_team_namespace("warehouse", principal, security::Role::Admin, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        let grant = security::Grant {
+            id: format!("action-admin-{principal}"),
+            object_id: "action".into(),
+            principal: principal.into(),
+            role: security::Role::Admin,
+            created: 0,
+            ..Default::default()
+        };
+        svc.db.runtime().create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+    }
+    // Owner and steward are cleared to the marking they curate.
+    for principal in ["alice", "bob"] {
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: format!("principal-{principal}-curate"),
+                kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: principal.into(),
+                namespace: "warehouse".into(),
+                external_id: markings::principal_profile_external_id(principal),
+                properties: HashMap::from([
+                    (
+                        markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                        "confidential".into(),
+                    ),
+                    (
+                        markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                        "true".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        grant_object_role(
+            &svc,
+            &format!("principal-{principal}-curate"),
+            "root",
+            security::Role::Admin,
+        );
+    }
+    let mut registration = catalog_request("tbl-curate");
+    let entry_id = svc
+        .register_catalog_entry(with_named_principal(registration.clone(), "tester"))
+        .await
+        .unwrap()
+        .into_inner()
+        .entry
+        .unwrap()
+        .id;
+    svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            namespace: "warehouse".into(),
+            type_id: "catalog.curate".into(),
+            version: "1".into(),
+            description: "Curate a catalog entry".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"description":{"type":"string"},"tags":{"type":"string"},"owners":{"type":"string"},"access_marking":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            enabled: true,
+            object_kind: crate::sekai::catalog::CATALOG_ENTRY_KIND.into(),
+            object_mutation: "update".into(),
+            ..Default::default()
+        }),
+        request_id: "put-curate".into(),
+    }))
+    .await
+    .unwrap();
+    let submit = |principal: &str, key: &str, parameters: serde_json::Value| {
+        let mut parameters = parameters;
+        parameters["object_id"] = serde_json::json!(entry_id.clone());
+        svc.submit_action_instance(with_named_principal(
+            SubmitActionInstanceRequest {
+                namespace: "warehouse".into(),
+                type_id: "catalog.curate".into(),
+                version: "1".into(),
+                parameters_json: parameters.to_string(),
+                idempotency_key: key.into(),
+                evidence_submission_ids: Vec::new(),
+                request_id: format!("req-{key}"),
+                ontology_digest: String::new(),
+                offline: None,
+            },
+            principal,
+        ))
+    };
+    let entry = || svc.db.runtime().get_object(&entry_id).unwrap().unwrap();
+
+    // A non-owner, non-steward edit fails closed and changes nothing.
+    let refused = submit("carol", "carol-1", serde_json::json!({"tags": "spam"})).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(entry().properties["tags"], "finance");
+
+    // An owner edit is an admitted Action with a receipt.
+    let curated = submit(
+        "alice",
+        "alice-1",
+        serde_json::json!({"description": "curated orders", "tags": "finance,ledger"}),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .instance
+    .unwrap();
+    assert_eq!(
+        curated.status,
+        crate::sekai::action_instance::STATUS_ADMITTED
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_operation_receipt(&curated.operation_id)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(entry().properties["description"], "curated orders");
+    assert_eq!(entry().properties["tags"], "finance,ledger");
+
+    // The source registering again keeps the curated fields.
+    registration.description = "daily orders v2".into();
+    svc.register_catalog_entry(with_named_principal(registration, "tester"))
+        .await
+        .unwrap();
+    assert_eq!(entry().properties["description"], "curated orders");
+    assert_eq!(entry().properties["tags"], "finance,ledger");
+
+    // Search sees the edit once the index catches up.
+    let hits = svc
+        .search(with_named_principal(
+            SearchRequest {
+                namespace: "warehouse".into(),
+                text: "ledger".into(),
+                kinds: vec![crate::sekai::catalog::CATALOG_ENTRY_KIND.into()],
+                property_filters: Vec::new(),
+                facets: Vec::new(),
+                page_token: String::new(),
+                page_size: 10,
+                source: "object".into(),
+                ..Default::default()
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert!(hits.iter().any(|hit| hit.id == entry_id), "{hits:?}");
+    // The marking only rises, by an owner or the steward.
+    submit(
+        "alice",
+        "alice-2",
+        serde_json::json!({"access_marking": "internal"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(entry().properties["access_marking"], "internal");
+    let lowered = submit(
+        "bob",
+        "bob-1",
+        serde_json::json!({"access_marking": "public"}),
+    )
+    .await;
+    assert!(lowered.is_err(), "{lowered:?}");
+    assert_eq!(entry().properties["access_marking"], "internal");
+}
+
+#[tokio::test]
+async fn embedding_specs_need_a_credential_admin_and_a_hosted_route() {
+    let svc = service();
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace("embeds", "alice", security::Role::Admin, "local")
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    let spec = |model: &str| EmbeddingSpecDefinition {
+        namespace: "embeds".into(),
+        spec_id: "notes".into(),
+        object_kind: "note".into(),
+        properties: vec!["title".into()],
+        chunk_chars: 200,
+        dimension: 4,
+        batch_size: 8,
+        model: model.into(),
+        ..Default::default()
+    };
+    let put = |principal: &str, model: &str| {
+        svc.put_embedding_spec(with_named_principal(
+            PutEmbeddingSpecRequest {
+                spec: Some(spec(model)),
+            },
+            principal,
+        ))
+    };
+    // A namespace admin is not a credential admin.
+    let denied = put("alice", "hosted.local/embed-small").await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied, "{denied:?}");
+    let builtin = put("root", "openai/text-embedding-3-small")
+        .await
+        .unwrap_err();
+    assert_eq!(builtin.code(), tonic::Code::InvalidArgument);
+
+    let stored = put("root", "hosted.local/embed-small")
+        .await
+        .unwrap()
+        .into_inner()
+        .spec
+        .unwrap();
+    assert_eq!(stored.updated_by, "root");
+    let listed = svc
+        .list_embedding_specs(with_named_principal(
+            ListEmbeddingSpecsRequest {
+                namespace: "embeds".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .specs;
+    assert_eq!(listed, [stored]);
+    let delete = || {
+        svc.delete_embedding_spec(with_named_principal(
+            DeleteEmbeddingSpecRequest {
+                namespace: "embeds".into(),
+                spec_id: "notes".into(),
+            },
+            "root",
+        ))
+    };
+    assert!(delete().await.unwrap().into_inner().deleted);
+    assert!(!delete().await.unwrap().into_inner().deleted);
+}
+
+#[tokio::test]
+async fn an_offline_submit_needs_a_device_bound_credential() {
+    // #1580: an Action prepared offline is accepted only with the device's
+    // proof, so a request without a device-bound credential is refused
+    // before admission.
+    let svc = service();
+    let mut request = Request::new(crate::grpc::pb::sekai::SubmitActionInstanceRequest {
+        namespace: "acme".into(),
+        type_id: "customer.record.update".into(),
+        version: "1".into(),
+        parameters_json: r#"{"object_id":"rec-1","title":"final"}"#.into(),
+        idempotency_key: "offline-1".into(),
+        offline: Some(crate::grpc::pb::sekai::OfflineSubmission {
+            prepared_at_ms: 1,
+            base_updated_ms: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    request
+        .metadata_mut()
+        .insert("x-principal", MetadataValue::from_static("alice"));
+    let refused = svc.submit_action_instance(request).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated, "{refused:?}");
+    assert!(refused.message().contains("device"), "{refused:?}");
+}
+
+#[tokio::test]
+async fn sync_deltas_purge_what_the_caller_may_no_longer_read() {
+    // #1633: a change in what the caller may read keeps the cursor and
+    // arrives as purges: a hidden property alone, or a hidden object whole.
+    use crate::sekai::object_security::{
+        OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+        ObjectSecurityPredicate, ObjectSecurityRule, PropertyGrant, PropertyGrantAccess,
+    };
+    use crate::sekai::sync_scope::SYNC_CONTRACT;
+    let svc = service();
+    grant_source_namespace(&svc, "field", "alice", security::Role::Admin);
+    let db = svc.db.runtime();
+    let object = |id: &str, props: &[(&str, &str)]| domain::Object {
+        id: id.into(),
+        kind: "WorkOrder".into(),
+        name: id.into(),
+        namespace: "field".into(),
+        external_id: String::new(),
+        properties: props
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        created: 0,
+        updated: 0,
+    };
+    for created in [
+        object("wo-1", &[("site", "north"), ("notes", "gate code 1234")]),
+        object("wo-2", &[("site", "north"), ("notes", "dog on site")]),
+    ] {
+        db.create_object_with_audit(&created, "alice").unwrap();
+    }
+    let hour = 3_600_000;
+    let scope = svc
+        .put_sync_scope(with_named_principal(
+            PutSyncScopeRequest {
+                contract_version: SYNC_CONTRACT.into(),
+                namespace: "field".into(),
+                scope_id: "north".into(),
+                kind: "WorkOrder".into(),
+                property_filters: vec![PropertyFilter {
+                    key: "site".into(),
+                    op: "eq".into(),
+                    value: "north".into(),
+                }],
+                link: None,
+                max_objects: 10,
+                max_offline_age_ms: hour,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(scope.max_offline_age_ms, hour);
+    let before = now_millis();
+    let snapshot = svc
+        .read_sync_snapshot(with_named_principal(
+            ReadSyncSnapshotRequest {
+                contract_version: SYNC_CONTRACT.into(),
+                namespace: "field".into(),
+                scope_id: "north".into(),
+                page_token: String::new(),
+                limit: 0,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(snapshot.objects.len(), 2);
+    // The client must sync again within the scope's maximum offline age.
+    assert!(
+        (before + hour..=now_millis() + hour).contains(&snapshot.offline_until_ms),
+        "{}",
+        snapshot.offline_until_ms
+    );
+    let deltas = |cursor: &str| ReadSyncDeltasRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        cursor: cursor.into(),
+        limit: 0,
+    };
+
+    // A property grant now leaves out `notes`: both objects are sent again
+    // without it, and only that property is purged. The cursor continues.
+    let policy = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "field".into(),
+        kind: "WorkOrder".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![PropertyGrant {
+            property: "site".into(),
+            access: PropertyGrantAccess::Read,
+        }]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-field-grants", 1)
+        .unwrap();
+    // Activation covers every kind in the namespace; the others allow all.
+    let mut revisions = BTreeMap::from([("WorkOrder".to_string(), revision.revision_digest)]);
+    let kinds: std::collections::BTreeSet<String> = db
+        .list_objects(&domain::ListFilter {
+            namespace: Some("field".into()),
+            limit: 1000,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|object| object.kind)
+        .filter(|kind| kind != "WorkOrder")
+        .collect();
+    for kind in kinds {
+        let other = ObjectSecurityPolicy {
+            kind: kind.clone(),
+            property_grants: None,
+            ..policy.clone()
+        };
+        let digest = db
+            .put_object_security_policy(&other, "root", &format!("put-field-{kind}"), 1)
+            .unwrap()
+            .revision_digest;
+        revisions.insert(kind, digest);
+    }
+    db.activate_object_security_policies("field", &revisions, "root", "activate-field-grants", 2)
+        .unwrap();
+    let narrowed = svc
+        .read_sync_deltas(with_named_principal(deltas(&snapshot.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!narrowed.resnapshot_required);
+    assert!(narrowed.removed_object_ids.is_empty());
+    assert_eq!(narrowed.upserts.len(), 2);
+    assert!(
+        narrowed
+            .upserts
+            .iter()
+            .all(|object| !object.properties.contains_key("notes"))
+    );
+    let purged: Vec<(String, Vec<String>)> = narrowed
+        .purges
+        .iter()
+        .map(|purge| (purge.object_id.clone(), purge.properties.clone()))
+        .collect();
+    assert_eq!(
+        purged,
+        [
+            ("wo-1".to_string(), vec!["notes".to_string()]),
+            ("wo-2".to_string(), vec!["notes".to_string()]),
+        ]
+    );
+    assert!(narrowed.offline_until_ms > 0);
+
+    // Marking wo-2 confidential hides it: it is removed and purged whole.
+    db.update_object_with_audit(
+        &object(
+            "wo-2",
+            &[
+                ("site", "north"),
+                ("notes", "dog on site"),
+                (markings::OBJECT_CLASSIFICATION_PROPERTY, "confidential"),
+            ],
+        ),
+        "alice",
+    )
+    .unwrap();
+    let hidden = svc
+        .read_sync_deltas(with_named_principal(deltas(&narrowed.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(hidden.removed_object_ids, ["wo-2"]);
+    assert_eq!(hidden.purges.len(), 1);
+    assert_eq!(hidden.purges[0].object_id, "wo-2");
+    assert!(hidden.purges[0].properties.is_empty());
+    // Leaving the filter is an ordinary removal, not a purge.
+    db.update_object_with_audit(
+        &object("wo-1", &[("site", "south"), ("notes", "gate code 1234")]),
+        "alice",
+    )
+    .unwrap();
+    let left = svc
+        .read_sync_deltas(with_named_principal(deltas(&hidden.cursor), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(left.removed_object_ids, ["wo-1"]);
+    assert!(left.purges.is_empty());
+}
+
+#[tokio::test]
+async fn change_bundle_dry_run_backfills_a_branch_and_leaves_the_dataset() {
+    let svc = service();
+    let namespace = "dryrun";
+    let parent = seed_definition_parent(&svc, namespace);
+    let from = try_publish(
+        &svc,
+        namespace,
+        &parent.revision_digest,
+        "dr-1",
+        "dr-cs-1",
+        r#"["title","state"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    let to = try_publish(
+        &svc,
+        namespace,
+        &from,
+        "dr-2",
+        "dr-cs-2",
+        r#"["subject","state","priority"],"required":["priority"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    // Tickets live in a dataset bound to a confidential object.
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "tickets-source".into(),
+            kind: "source_table".into(),
+            name: "tickets".into(),
+            namespace: namespace.into(),
+            external_id: String::new(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.create_dataset(with_named_principal(
+        CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "tickets".into(),
+                name: "tickets".into(),
+                columns: ["id", "title", "state"]
+                    .map(|name| ColumnDef {
+                        name: name.into(),
+                        r#type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .to_vec(),
+                object_id: "tickets-source".into(),
+                created: 1,
+                partition_keys: Vec::new(),
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let rows = vec![
+        HashMap::from([
+            ("id".to_string(), "1".to_string()),
+            ("title".to_string(), "Broken".to_string()),
+            ("state".to_string(), "open".to_string()),
+        ]),
+        HashMap::from([
+            ("id".to_string(), "2".to_string()),
+            ("title".to_string(), "Slow".to_string()),
+            ("state".to_string(), "done".to_string()),
+        ]),
+    ];
+    svc.db.runtime().append_rows("tickets", &rows).unwrap();
+    svc.db
+        .runtime()
+        .register_object_type_datasource(
+            &crate::sekai::object_type_index::ObjectTypeDatasource {
+                contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: namespace.into(),
+                kind: "Ticket".into(),
+                definition_digest: "sha256:ticket".into(),
+                dataset_id: "tickets".into(),
+                key_column: "id".into(),
+                property_mapping: BTreeMap::new(),
+                hidden_column: String::new(),
+                edits_only: false,
+            },
+            1,
+        )
+        .unwrap();
+    let request = DryRunDefinitionChangeBundleRequest {
+        namespace: namespace.into(),
+        from_revision_digest: from,
+        to_revision_digest: to,
+        hints: Some(DefinitionChangeHints {
+            renames: vec![DefinitionPropertyRename {
+                object_type: "Ticket".into(),
+                from_property: "title".into(),
+                to_property: "subject".into(),
+            }],
+            defaults: vec![DefinitionPropertyDefault {
+                object_type: "Ticket".into(),
+                property: "priority".into(),
+                value: "normal".into(),
+            }],
+            type_changes: Vec::new(),
+        }),
+        bundle_digest: String::new(),
+    };
+    let run = svc
+        .dry_run_definition_change_bundle(with_named_principal(request.clone(), "root"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(run.unbacked_object_types.is_empty());
+    let ticket = &run.runs[0];
+    assert_eq!((ticket.rows, ticket.rows_changed), (2, 2));
+    assert!(!ticket.samples_withheld);
+    let sample = ticket.samples.iter().find(|s| s.key == "1").unwrap();
+    assert_eq!(sample.before["title"], "Broken");
+    assert_eq!(sample.after["subject"], "Broken");
+    assert_eq!(sample.after["priority"], "normal");
+    assert_eq!(sample.after["title"], "Broken");
+
+    // The branch holds the backfill; the dataset itself is unchanged.
+    let branch_rows = svc
+        .db
+        .runtime()
+        .dataset_branch_rows("tickets", &ticket.branch)
+        .unwrap();
+    assert!(branch_rows.iter().all(|row| row["priority"] == "normal"));
+    let live = svc
+        .db
+        .runtime()
+        .query_rows("tickets", &crate::sekai::dataset::RowQuery::default())
+        .unwrap();
+    assert!(
+        live.iter()
+            .all(|row| row.contains_key("title") && !row.contains_key("priority"))
+    );
+    assert_eq!(
+        svc.db
+            .runtime()
+            .list_dataset_versions("tickets")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Idempotent per bundle digest, and pinned to it.
+    let again = svc
+        .dry_run_definition_change_bundle(with_named_principal(
+            DryRunDefinitionChangeBundleRequest {
+                bundle_digest: run.bundle_digest.clone(),
+                ..request.clone()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.runs, run.runs);
+    let stale = svc
+        .dry_run_definition_change_bundle(with_named_principal(
+            DryRunDefinitionChangeBundleRequest {
+                bundle_digest: "sha256:other".into(),
+                ..request.clone()
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+
+    // A writer without clearance for the input's marking gets counts only.
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace(namespace, "alice", security::Role::Admin, "local")
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    let withheld = svc
+        .dry_run_definition_change_bundle(with_named_principal(request, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(withheld.runs[0].samples_withheld);
+    assert!(withheld.runs[0].samples.is_empty());
+    assert_eq!(withheld.runs[0].rows_changed, 2);
+    // Only the dry run creates bundle branches.
+    let reserved = svc
+        .create_dataset_branch(with_named_principal(
+            CreateDatasetBranchRequest {
+                dataset_id: "tickets".into(),
+                name: "bundle-forged".into(),
+                from_version_id: String::new(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(reserved.code(), tonic::Code::InvalidArgument);
+    // A dry run is a preview: its branch is never proposed for merge.
+    let merge = svc
+        .propose_dataset_branch_merge(with_named_principal(
+            ProposeDatasetBranchMergeRequest {
+                dataset_id: "tickets".into(),
+                name: ticket.branch.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(merge.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn changes_without_a_recorded_writer_read_as_unattributed() {
+    let svc = service();
+    // A row written before writer attribution, or by an internal writer
+    // that records none, is never given an inferred writer (#1690).
+    svc.db
+        .runtime()
+        .create_object_with_audit(
+            &domain::Object {
+                id: "legacy-change".into(),
+                kind: "ticket".into(),
+                name: "legacy".into(),
+                namespace: "ns".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+            "migration",
+        )
+        .unwrap();
+    let changes = svc
+        .list_object_changes(with_principal(ListObjectChangesRequest {
+            object_id: "legacy-change".into(),
+            limit: 10,
+            offset: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert!(!changes.is_empty());
+    assert!(
+        changes
+            .iter()
+            .all(|change| change.writer_kind == "unattributed"
+                && change.writer_ref.is_empty()
+                && change.receipt_id.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_scoped_device_syncs_its_tenant_namespace_only() {
+    // #1836: a device-bound assertion issued for one tenant defines a scope
+    // and syncs inside that tenant's namespace with its proof, and is refused
+    // in another tenant's namespace and without the proof.
+    use crate::sekai::sync_scope::SYNC_CONTRACT;
+    use base64::Engine as _;
+    use ed25519_dalek::Signer as _;
+    let svc = enterprise_service();
+    for (id, namespace) in [("wo-1", "allowed"), ("wo-x", "denied")] {
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: "WorkOrder".into(),
+                name: id.into(),
+                namespace: namespace.into(),
+                external_id: String::new(),
+                properties: HashMap::from([("site".to_string(), "north".to_string())]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+    let request = |message: &[u8], method: &str, nonce: &str, signed: bool| {
+        let digest = crate::identity_assertion::request_digest(
+            &format!("/sekai.SekaiService/{method}"),
+            message,
+        );
+        let mut context = test_tenant_context();
+        context.device = Some(crate::enterprise::AuthenticatedDevice {
+            id: "device-11".into(),
+            public_key: key.verifying_key().to_bytes(),
+            assertion_nonce: nonce.into(),
+            wipe: false,
+        });
+        let proof = signed.then(|| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                key.sign(&crate::identity_assertion::device_proof_input(
+                    nonce, &digest,
+                ))
+                .to_bytes(),
+            )
+        });
+        (context, proof)
+    };
+    fn wrap<T>(
+        message: T,
+        (context, proof): (crate::enterprise::AuthenticatedContext, Option<String>),
+    ) -> Request<T> {
+        let mut req = with_named_principal(message, "subject-a");
+        if let Some(proof) = proof {
+            req.metadata_mut()
+                .insert("x-sekai-device-proof", proof.parse().unwrap());
+        }
+        req.extensions_mut().insert(context);
+        req
+    }
+    let put = |namespace: &str| PutSyncScopeRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: namespace.into(),
+        scope_id: "north".into(),
+        kind: "WorkOrder".into(),
+        property_filters: vec![],
+        link: None,
+        max_objects: 10,
+        max_offline_age_ms: 0,
+    };
+    let snapshot = |namespace: &str| ReadSyncSnapshotRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: namespace.into(),
+        scope_id: "north".into(),
+        page_token: String::new(),
+        limit: 0,
+    };
+
+    let own = put("allowed");
+    svc.put_sync_scope(wrap(
+        own.clone(),
+        request(&own.encode_to_vec(), "PutSyncScope", "n-1", true),
+    ))
+    .await
+    .unwrap();
+    let read = snapshot("allowed");
+    let page = svc
+        .read_sync_snapshot(wrap(
+            read.clone(),
+            request(&read.encode_to_vec(), "ReadSyncSnapshot", "n-2", true),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        page.objects
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect::<Vec<_>>(),
+        ["wo-1"]
+    );
+    let deltas = ReadSyncDeltasRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "allowed".into(),
+        scope_id: "north".into(),
+        cursor: page.cursor.clone(),
+        limit: 0,
+    };
+    svc.read_sync_deltas(wrap(
+        deltas.clone(),
+        request(&deltas.encode_to_vec(), "ReadSyncDeltas", "n-3", true),
+    ))
+    .await
+    .unwrap();
+
+    // Another tenant's namespace is refused, with the proof.
+    let other = put("denied");
+    let refused = svc
+        .put_sync_scope(wrap(
+            other.clone(),
+            request(&other.encode_to_vec(), "PutSyncScope", "n-4", true),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused.code(),
+            tonic::Code::PermissionDenied | tonic::Code::NotFound
+        ),
+        "{refused:?}"
+    );
+    // Without the proof, the device-bound context is refused.
+    let unsigned = svc
+        .read_sync_snapshot(wrap(
+            read.clone(),
+            request(&read.encode_to_vec(), "ReadSyncSnapshot", "n-5", false),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unsigned.code(),
+        tonic::Code::Unauthenticated,
+        "{unsigned:?}"
+    );
+}
+
+#[tokio::test]
+async fn sync_needs_the_device_proof_and_a_revoked_device_gets_only_wipe() {
+    // #1634: a device-bound credential syncs only with its device's proof
+    // over each request, and a revoked device's wipe assertion gets a wipe
+    // instruction and no data.
+    use crate::sekai::sync_scope::SYNC_CONTRACT;
+    use base64::Engine as _;
+    use ed25519_dalek::Signer as _;
+    let svc = service();
+    grant_source_namespace(&svc, "field", "alice", security::Role::Admin);
+    svc.db
+        .runtime()
+        .create_object_with_audit(
+            &domain::Object {
+                id: "wo-1".into(),
+                kind: "WorkOrder".into(),
+                name: "wo-1".into(),
+                namespace: "field".into(),
+                external_id: String::new(),
+                properties: HashMap::from([("site".to_string(), "north".to_string())]),
+                created: 0,
+                updated: 0,
+            },
+            "alice",
+        )
+        .unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let context = |nonce: &str, wipe: bool| {
+        let mut context = crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "alice".into(),
+                credential_id: "device:7".into(),
+            },
+        );
+        context.device = Some(crate::enterprise::AuthenticatedDevice {
+            id: "device-7".into(),
+            public_key: key.verifying_key().to_bytes(),
+            assertion_nonce: nonce.into(),
+            wipe,
+        });
+        context
+    };
+    // A request from the device, with its proof when `signer` is given.
+    fn from_device<T: prost::Message>(
+        message: T,
+        method: &str,
+        context: crate::enterprise::AuthenticatedContext,
+        signer: Option<&ed25519_dalek::SigningKey>,
+    ) -> Request<T> {
+        let digest = crate::identity_assertion::request_digest(
+            &format!("/sekai.SekaiService/{method}"),
+            &message.encode_to_vec(),
+        );
+        let nonce = context.device.as_ref().unwrap().assertion_nonce.clone();
+        let mut request = with_named_principal(message, "alice");
+        if let Some(signer) = signer {
+            let proof = signer.sign(&crate::identity_assertion::device_proof_input(
+                &nonce, &digest,
+            ));
+            request.metadata_mut().insert(
+                "x-sekai-device-proof",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(proof.to_bytes())
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        request.extensions_mut().insert(context);
+        request
+    }
+    let put = PutSyncScopeRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        kind: "WorkOrder".into(),
+        property_filters: vec![],
+        link: None,
+        max_objects: 10,
+        max_offline_age_ms: 0,
+    };
+    svc.put_sync_scope(from_device(
+        put.clone(),
+        "PutSyncScope",
+        context("n-0", false),
+        Some(&key),
+    ))
+    .await
+    .unwrap();
+    let snapshot = ReadSyncSnapshotRequest {
+        contract_version: SYNC_CONTRACT.into(),
+        namespace: "field".into(),
+        scope_id: "north".into(),
+        page_token: String::new(),
+        limit: 0,
+    };
+
+    // A copied token without the device key is refused.
+    let copied = svc
+        .read_sync_snapshot(from_device(
+            snapshot.clone(),
+            "ReadSyncSnapshot",
+            context("n-1", false),
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(copied.code(), tonic::Code::Unauthenticated, "{copied:?}");
+    let stolen = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+    let forged = svc
+        .read_sync_snapshot(from_device(
+            snapshot.clone(),
+            "ReadSyncSnapshot",
+            context("n-2", false),
+            Some(&stolen),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(forged.code(), tonic::Code::Unauthenticated);
+    // The device itself syncs.
+    let synced = svc
+        .read_sync_snapshot(from_device(
+            snapshot.clone(),
+            "ReadSyncSnapshot",
+            context("n-3", false),
+            Some(&key),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(synced.objects.len(), 1);
+    assert!(!synced.wipe_required);
+
+    // Revoked: the wipe assertion gets the instruction and no data, on the
+    // snapshot and on deltas, and cannot change its scope.
+    let wiped = svc
+        .read_sync_snapshot(from_device(
+            snapshot,
+            "ReadSyncSnapshot",
+            context("n-4", true),
+            Some(&key),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(wiped.wipe_required);
+    assert!(wiped.objects.is_empty() && wiped.cursor.is_empty());
+    let wiped_deltas = svc
+        .read_sync_deltas(from_device(
+            ReadSyncDeltasRequest {
+                contract_version: SYNC_CONTRACT.into(),
+                namespace: "field".into(),
+                scope_id: "north".into(),
+                cursor: synced.cursor.clone(),
+                limit: 0,
+            },
+            "ReadSyncDeltas",
+            context("n-5", true),
+            Some(&key),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(wiped_deltas.wipe_required);
+    assert!(wiped_deltas.upserts.is_empty() && wiped_deltas.cursor.is_empty());
+    let refused = svc
+        .put_sync_scope(from_device(
+            put,
+            "PutSyncScope",
+            context("n-6", true),
+            Some(&key),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+}
+
+/// Opens (and approves, when asked) a proposal renaming `Ticket.title` to
+/// `subject` and requiring `priority` on top of `parent`, carrying its
+/// change bundle under `hints`, without merging it. Returns the candidate.
+async fn open_approved_ticket_proposal(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    parent: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    approve: bool,
+    hints: &DefinitionChangeHints,
+) -> String {
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            parent_revision_digest: parent.into(),
+            idempotency_key: format!("{branch_id}-create"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: branch_id.into(),
+                expected_head_digest: parent.into(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket","properties":["subject","state","priority"],"required":["priority"]}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: format!("{branch_id}-edit"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    // The proposal carries its change bundle, so approval binds it.
+    let bundle_digest = svc
+        .generate_definition_change_bundle(with_named_principal(
+            GenerateDefinitionChangeBundleRequest {
+                namespace: namespace.into(),
+                from_revision_digest: parent.into(),
+                to_revision_digest: candidate.clone(),
+                hints: Some(hints.clone()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bundle_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: branch_id.into(),
+            proposal_id: proposal_id.into(),
+            base_digest: parent.into(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: format!("{proposal_id}-propose"),
+            major_revision: false,
+            migration_plan_digest: bundle_digest,
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    if approve {
+        svc.approve_definition_proposal(with_named_principal(
+            ApproveDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: proposal_id.into(),
+                idempotency_key: format!("{proposal_id}-approve"),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    candidate
+}
+
+/// A published `Ticket` (title, state) backed by a `tickets` dataset with two
+/// rows, and an open proposal renaming title to subject and requiring
+/// priority (default "normal"). Returns the apply request.
+async fn bundle_apply_fixture(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    dataset_columns: &[&str],
+    approve: bool,
+) -> ApplyDefinitionChangeBundleRequest {
+    let parent = seed_definition_parent(svc, namespace);
+    let from = try_publish(
+        svc,
+        namespace,
+        &parent.revision_digest,
+        "ap-1",
+        "ap-cs-1",
+        r#"["title","state"]"#,
+        false,
+    )
+    .await
+    .unwrap();
+    let hints = DefinitionChangeHints {
+        renames: vec![DefinitionPropertyRename {
+            object_type: "Ticket".into(),
+            from_property: "title".into(),
+            to_property: "subject".into(),
+        }],
+        defaults: vec![DefinitionPropertyDefault {
+            object_type: "Ticket".into(),
+            property: "priority".into(),
+            value: "normal".into(),
+        }],
+        type_changes: Vec::new(),
+    };
+    let to =
+        open_approved_ticket_proposal(svc, namespace, &from, "ap-2", "ap-cs-2", approve, &hints)
+            .await;
+    svc.create_dataset(with_named_principal(
+        CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "tickets".into(),
+                name: "tickets".into(),
+                columns: dataset_columns
+                    .iter()
+                    .map(|name| ColumnDef {
+                        name: (*name).into(),
+                        r#type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .collect(),
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let rows = ["Broken", "Slow"]
+        .iter()
+        .enumerate()
+        .map(|(index, title)| {
+            HashMap::from([
+                ("id".to_string(), index.to_string()),
+                ("title".to_string(), title.to_string()),
+                ("state".to_string(), "open".to_string()),
+            ])
+        })
+        .collect::<Vec<_>>();
+    svc.db.runtime().append_rows("tickets", &rows).unwrap();
+    svc.db
+        .runtime()
+        .register_object_type_datasource(
+            &crate::sekai::object_type_index::ObjectTypeDatasource {
+                contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: namespace.into(),
+                kind: "Ticket".into(),
+                definition_digest: "sha256:ticket".into(),
+                dataset_id: "tickets".into(),
+                key_column: "id".into(),
+                property_mapping: BTreeMap::new(),
+                hidden_column: String::new(),
+                edits_only: false,
+            },
+            1,
+        )
+        .unwrap();
+    let bundle_digest = svc
+        .generate_definition_change_bundle(with_named_principal(
+            GenerateDefinitionChangeBundleRequest {
+                namespace: namespace.into(),
+                from_revision_digest: from.clone(),
+                to_revision_digest: to,
+                hints: Some(hints.clone()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bundle_digest;
+    ApplyDefinitionChangeBundleRequest {
+        namespace: namespace.into(),
+        proposal_id: "ap-cs-2".into(),
+        hints: Some(hints),
+        bundle_digest,
+        expected_published_digest: from,
+    }
+}
+
+async fn published_digest(svc: &SekaiServiceImpl, namespace: &str) -> String {
+    svc.db
+        .runtime()
+        .get_published_definition_revision(namespace)
+        .unwrap()
+        .unwrap()
+        .revision_digest
+}
+
+fn ticket_rows(svc: &SekaiServiceImpl) -> Vec<HashMap<String, String>> {
+    let mut rows = svc
+        .db
+        .runtime()
+        .query_rows("tickets", &Default::default())
+        .unwrap();
+    rows.sort_by(|a, b| a["id"].cmp(&b["id"]));
+    rows
+}
+
+#[tokio::test]
+async fn approved_bundle_applies_the_backfill_then_publishes_last() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let apply = svc
+        .apply_definition_change_bundle(with_named_principal(request.clone(), "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(apply.status, "completed", "{apply:?}");
+    assert_eq!(
+        apply
+            .steps
+            .iter()
+            .map(|step| step.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "backfill:tickets",
+            "verify:tickets",
+            "merge:tickets",
+            "publish"
+        ]
+    );
+    let published = published_digest(&svc, "apply").await;
+    assert_ne!(published, from);
+    assert_eq!(apply.steps[3].detail, published);
+    let rows = ticket_rows(&svc);
+    assert_eq!(rows[0]["subject"], "Broken");
+    assert_eq!(rows[1]["priority"], "normal");
+    // A rerun returns the completed record and writes nothing more.
+    let versions = svc
+        .db
+        .runtime()
+        .list_dataset_versions("tickets")
+        .unwrap()
+        .len();
+    let again = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(again, apply);
+    assert_eq!(
+        svc.db
+            .runtime()
+            .list_dataset_versions("tickets")
+            .unwrap()
+            .len(),
+        versions
+    );
+}
+
+#[tokio::test]
+async fn a_failing_backfill_leaves_the_published_revision_unchanged() {
+    let svc = service();
+    // `subject` already holds data, so the copy would overwrite it.
+    let request = bundle_apply_fixture(
+        &svc,
+        "apply-fail",
+        &["id", "title", "state", "subject"],
+        true,
+    )
+    .await;
+    let from = request.expected_published_digest.clone();
+    let apply = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(apply.status, "failed");
+    assert_eq!(apply.failed_step, "backfill:tickets");
+    assert!(
+        apply
+            .error
+            .contains("definition_change_bundle_overwrites_column"),
+        "{}",
+        apply.error
+    );
+    assert_eq!(published_digest(&svc, "apply-fail").await, from);
+    let stored = svc
+        .get_definition_bundle_apply(with_named_principal(
+            GetDefinitionBundleApplyRequest {
+                namespace: "apply-fail".into(),
+                proposal_id: "ap-cs-2".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(stored, apply);
+}
+
+#[tokio::test]
+async fn an_interrupted_apply_resumes_with_each_step_applied_once() {
+    use crate::sekai::definition_bundle_apply::BundleApplyStore;
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-resume", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let versions_before = svc
+        .db
+        .runtime()
+        .list_dataset_versions("tickets")
+        .unwrap()
+        .len();
+    // The publish's compare-and-swap fails: everything before it is done.
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    let failed = svc
+        .apply_definition_change_bundle(with_named_principal(stale, "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(failed.failed_step, "publish");
+    assert_eq!(published_digest(&svc, "apply-resume").await, from);
+    // Crash after the dataset merge but before the record noted it done.
+    let (mut record, revision) = svc
+        .db
+        .runtime()
+        .get_definition_bundle_apply("apply-resume", "ap-cs-2")
+        .unwrap()
+        .unwrap();
+    record.steps[2].status = "pending".into();
+    svc.db
+        .runtime()
+        .put_definition_bundle_apply(&record, revision)
+        .unwrap();
+    let resumed = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap();
+    assert_eq!(resumed.status, "completed", "{resumed:?}");
+    assert_ne!(published_digest(&svc, "apply-resume").await, from);
+    // One merge: exactly one new dataset version.
+    assert_eq!(
+        svc.db
+            .runtime()
+            .list_dataset_versions("tickets")
+            .unwrap()
+            .len(),
+        versions_before + 1
+    );
+}
+
+#[tokio::test]
+async fn an_unapproved_bundle_cannot_be_applied() {
+    use crate::sekai::definition_bundle_apply::BundleApplyStore;
+    let svc = service();
+    let request =
+        bundle_apply_fixture(&svc, "apply-unapproved", &["id", "title", "state"], false).await;
+    let from = request.expected_published_digest.clone();
+    let status = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert_eq!(published_digest(&svc, "apply-unapproved").await, from);
+    assert!(
+        svc.db
+            .runtime()
+            .get_definition_bundle_apply("apply-unapproved", "ap-cs-2")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Dry-runs the bundle an apply request names, as a reviewer would first.
+async fn dry_run_apply_bundle(
+    svc: &SekaiServiceImpl,
+    request: &ApplyDefinitionChangeBundleRequest,
+) {
+    let candidate = svc
+        .db
+        .runtime()
+        .get_definition_proposal(&request.namespace, &request.proposal_id)
+        .unwrap()
+        .unwrap()
+        .candidate_digest;
+    svc.dry_run_definition_change_bundle(with_named_principal(
+        DryRunDefinitionChangeBundleRequest {
+            namespace: request.namespace.clone(),
+            from_revision_digest: request.expected_published_digest.clone(),
+            to_revision_digest: candidate,
+            hints: request.hints.clone(),
+            bundle_digest: request.bundle_digest.clone(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+}
+
+async fn apply_bundle(
+    svc: &SekaiServiceImpl,
+    request: &ApplyDefinitionChangeBundleRequest,
+) -> DefinitionBundleApply {
+    svc.apply_definition_change_bundle(with_named_principal(request.clone(), "root"))
+        .await
+        .unwrap()
+        .into_inner()
+        .apply
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_apply_after_a_dry_run_refills_the_branch_from_the_current_version() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-stale", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    dry_run_apply_bundle(&svc, &request).await;
+    // A row lands after the dry run filled the branch.
+    svc.db
+        .runtime()
+        .append_rows(
+            "tickets",
+            &[HashMap::from([
+                ("id".to_string(), "2".to_string()),
+                ("title".to_string(), "Late".to_string()),
+                ("state".to_string(), "open".to_string()),
+            ])],
+        )
+        .unwrap();
+    // Apply refills the bundle branch itself, from the version it finds.
+    let done = apply_bundle(&svc, &request).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    assert_ne!(published_digest(&svc, "apply-stale").await, from);
+    let rows = ticket_rows(&svc);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2]["subject"], "Late");
+}
+
+#[tokio::test]
+async fn a_source_reclassified_after_the_dry_run_never_merges_its_copy() {
+    let svc = service();
+    let request =
+        bundle_apply_fixture(&svc, "apply-reclassified", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    dry_run_apply_bundle(&svc, &request).await;
+    let mut dataset = svc.db.runtime().get_dataset("tickets").unwrap().unwrap();
+    for column in &mut dataset.columns {
+        if column.name == "title" {
+            column.classification = "sensitive".into();
+        }
+    }
+    svc.db.runtime().update_dataset(&dataset).unwrap();
+    let apply = apply_bundle(&svc, &request).await;
+    assert_eq!(apply.failed_step, "backfill:tickets", "{apply:?}");
+    assert!(
+        apply
+            .error
+            .contains("definition_change_bundle_classified_copy"),
+        "{}",
+        apply.error
+    );
+    assert_eq!(published_digest(&svc, "apply-reclassified").await, from);
+    assert!(
+        ticket_rows(&svc)
+            .iter()
+            .all(|row| !row.contains_key("subject"))
+    );
+}
+
+#[tokio::test]
+async fn an_apply_finishes_when_its_proposal_was_merged_meanwhile() {
+    let svc = service();
+    let request =
+        bundle_apply_fixture(&svc, "apply-takeover", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // Someone merges the proposal before the apply runs again.
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: "apply-takeover".into(),
+            proposal_id: "ap-cs-2".into(),
+            expected_published_digest: from.clone(),
+            idempotency_key: "manual-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let done = apply_bundle(&svc, &stale).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    assert_eq!(
+        done.steps[3].detail,
+        published_digest(&svc, "apply-takeover").await
+    );
+}
+
+#[tokio::test]
+async fn apply_refuses_hints_other_than_the_proposal_carries() {
+    let svc = service();
+    let mut request =
+        bundle_apply_fixture(&svc, "apply-hints", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let candidate = svc
+        .db
+        .runtime()
+        .get_definition_proposal("apply-hints", "ap-cs-2")
+        .unwrap()
+        .unwrap()
+        .candidate_digest;
+    // Another default than the approved one, with its own matching digest.
+    let mut hints = request.hints.clone().unwrap();
+    hints.defaults[0].value = "high".into();
+    request.bundle_digest = svc
+        .generate_definition_change_bundle(with_named_principal(
+            GenerateDefinitionChangeBundleRequest {
+                namespace: "apply-hints".into(),
+                from_revision_digest: from.clone(),
+                to_revision_digest: candidate,
+                hints: Some(hints.clone()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bundle_digest;
+    request.hints = Some(hints);
+    let status = svc
+        .apply_definition_change_bundle(with_named_principal(request, "root"))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains("definition_bundle_apply_unapproved_bundle")
+    );
+    assert_eq!(published_digest(&svc, "apply-hints").await, from);
+}
+
+#[tokio::test]
+async fn an_ordinary_merge_refuses_a_bundle_branch_proposal() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-direct", &["id", "title", "state"], true).await;
+    dry_run_apply_bundle(&svc, &request).await;
+    let branch = svc
+        .db
+        .runtime()
+        .list_dataset_branches("tickets")
+        .unwrap()
+        .into_iter()
+        .find(|branch| {
+            branch
+                .name
+                .starts_with(crate::sekai::dataset_branch::BUNDLE_BRANCH_PREFIX)
+        })
+        .unwrap();
+    let proposal = svc
+        .db
+        .runtime()
+        .propose_dataset_branch(&crate::sekai::dataset_branch::ProposeDatasetBranch {
+            expected_incarnation: None,
+            dataset_id: "tickets".into(),
+            branch: branch.name.clone(),
+            actor: "someone-else".into(),
+            tenant: branch.tenant.clone(),
+        })
+        .unwrap();
+    let status = svc
+        .merge_dataset_branch(with_named_principal(
+            MergeDatasetBranchRequest {
+                dataset_id: "tickets".into(),
+                proposal_id: proposal.id,
+                reason: String::new(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert!(
+        ticket_rows(&svc)
+            .iter()
+            .all(|row| !row.contains_key("subject"))
+    );
+}
+
+#[tokio::test]
+async fn rows_written_between_merge_and_publish_are_backfilled_before_publishing() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-moved", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // A row in the old shape lands after the merge.
+    svc.db
+        .runtime()
+        .append_rows(
+            "tickets",
+            &[HashMap::from([
+                ("id".to_string(), "2".to_string()),
+                ("title".to_string(), "Late".to_string()),
+                ("state".to_string(), "open".to_string()),
+            ])],
+        )
+        .unwrap();
+    let moved = apply_bundle(&svc, &request).await;
+    assert_eq!(moved.failed_step, "publish", "{moved:?}");
+    assert!(
+        moved.error.contains("definition_bundle_apply_data_moved"),
+        "{}",
+        moved.error
+    );
+    assert_eq!(published_digest(&svc, "apply-moved").await, from);
+    let done = apply_bundle(&svc, &request).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    let rows = ticket_rows(&svc);
+    assert_eq!(
+        (rows[2]["subject"].as_str(), rows[2]["priority"].as_str()),
+        ("Late", "normal")
+    );
+}
+
+#[tokio::test]
+async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-fence", &["id", "title", "state"], true).await;
+    let refused = svc
+        .db
+        .runtime()
+        .merge_definition_proposal(
+            &definition_proposal_domain::MergeDefinitionProposal {
+                namespace: "apply-fence".into(),
+                proposal_id: "ap-cs-2".into(),
+                expected_published_digest: request.expected_published_digest.clone(),
+                idempotency_key: "fenced-merge".into(),
+                expected_dataset_versions: vec![("tickets".into(), "not-the-latest".into())],
+                expected_datasources: Vec::new(),
+            },
+            "root",
+            1,
+        )
+        .unwrap_err();
+    assert!(
+        refused.starts_with(crate::sekai::definition_proposal::MERGE_DATASET_MOVED),
+        "{refused}"
+    );
+    let latest = svc
+        .db
+        .runtime()
+        .latest_dataset_version_id("tickets")
+        .unwrap();
+    let reconfigured = svc
+        .db
+        .runtime()
+        .merge_definition_proposal(
+            &definition_proposal_domain::MergeDefinitionProposal {
+                namespace: "apply-fence".into(),
+                proposal_id: "ap-cs-2".into(),
+                expected_published_digest: request.expected_published_digest.clone(),
+                idempotency_key: "fenced-merge-2".into(),
+                expected_dataset_versions: vec![("tickets".into(), latest)],
+                expected_datasources: vec![("Ticket".into(), "not-this-mapping".into())],
+            },
+            "root",
+            1,
+        )
+        .unwrap_err();
+    assert!(
+        reconfigured.starts_with(crate::sekai::definition_proposal::MERGE_DATASOURCE_CHANGED),
+        "{reconfigured}"
+    );
+    assert_eq!(
+        published_digest(&svc, "apply-fence").await,
+        request.expected_published_digest
+    );
+}
+
+#[tokio::test]
+async fn a_datasource_remapped_between_attempts_is_migrated_again() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-remap", &["id", "title", "state"], true).await;
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // The object type now reads `subject` from another column.
+    svc.db
+        .runtime()
+        .register_object_type_datasource(
+            &crate::sekai::object_type_index::ObjectTypeDatasource {
+                contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: "apply-remap".into(),
+                kind: "Ticket".into(),
+                definition_digest: "sha256:ticket".into(),
+                dataset_id: "tickets".into(),
+                key_column: "id".into(),
+                property_mapping: BTreeMap::from([("subject".into(), "subject_col".into())]),
+                hidden_column: String::new(),
+                edits_only: false,
+            },
+            2,
+        )
+        .unwrap();
+    let done = apply_bundle(&svc, &request).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    let rows = ticket_rows(&svc);
+    assert_eq!(rows[0]["subject_col"], "Broken");
+    // The mapped column is defined, so the datasource stays valid.
+    let columns = svc
+        .db
+        .runtime()
+        .get_dataset("tickets")
+        .unwrap()
+        .unwrap()
+        .columns;
+    let subject = columns
+        .iter()
+        .find(|column| column.name == "subject_col")
+        .unwrap();
+    assert_eq!(subject.classification, "public");
+}
+
+#[tokio::test]
+async fn an_unmergeable_recorded_proposal_starts_the_dataset_over() {
+    use crate::sekai::definition_bundle_apply::BundleApplyStore;
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-lost", &["id", "title", "state"], true).await;
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // The recorded dataset proposal is gone (as after its branch was deleted).
+    let (mut record, revision) = svc
+        .db
+        .runtime()
+        .get_definition_bundle_apply("apply-lost", "ap-cs-2")
+        .unwrap()
+        .unwrap();
+    record.steps[2].status = "pending".into();
+    record.steps[2].effect = "no-such-proposal".into();
+    svc.db
+        .runtime()
+        .put_definition_bundle_apply(&record, revision)
+        .unwrap();
+    let restarted = apply_bundle(&svc, &request).await;
+    assert_eq!(restarted.failed_step, "merge:tickets", "{restarted:?}");
+    let done = apply_bundle(&svc, &request).await;
+    assert_eq!(done.status, "completed", "{done:?}");
+    assert_eq!(ticket_rows(&svc)[0]["subject"], "Broken");
+}
+
+#[tokio::test]
+async fn a_refill_never_overwrites_a_bundle_column_reclassified_since() {
+    let svc = service();
+    let request = bundle_apply_fixture(&svc, "apply-redact", &["id", "title", "state"], true).await;
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // The bundle's `subject` column is reclassified, and a row lands, so the
+    // next apply must refill the dataset.
+    let mut dataset = svc.db.runtime().get_dataset("tickets").unwrap().unwrap();
+    for column in &mut dataset.columns {
+        if column.name == "subject" {
+            column.classification = "sensitive".into();
+        }
+    }
+    svc.db.runtime().update_dataset(&dataset).unwrap();
+    svc.db
+        .runtime()
+        .append_rows(
+            "tickets",
+            &[HashMap::from([
+                ("id".to_string(), "2".to_string()),
+                ("title".to_string(), "Late".to_string()),
+                ("state".to_string(), "open".to_string()),
+            ])],
+        )
+        .unwrap();
+    assert_eq!(apply_bundle(&svc, &request).await.failed_step, "publish");
+    let refused = apply_bundle(&svc, &request).await;
+    assert_eq!(refused.failed_step, "backfill:tickets", "{refused:?}");
+    assert!(
+        refused
+            .error
+            .contains("definition_change_bundle_overwrites_column"),
+        "{}",
+        refused.error
+    );
+}
+#[tokio::test]
+async fn plans_are_stored_simulated_through_preview_and_read_back() {
+    let svc = service();
+    grant_action_admin(&svc);
+    let db = svc.db.runtime();
+    db.upsert_object_type(&crate::sekai::schema::ObjectType {
+        kind: "customer_record".into(),
+        description: "fixture".into(),
+        properties: vec![],
+        is_builtin: false,
+        implements: vec![],
+    })
+    .unwrap();
+    db.create_object(&crate::domain::Object {
+        id: "cust-plan".into(),
+        kind: "customer_record".into(),
+        name: "Northwind".into(),
+        namespace: "acme".into(),
+        external_id: String::new(),
+        properties: HashMap::from([("title".into(), "account".into())]),
+        created: 10,
+        updated: 20,
+    })
+    .unwrap();
+    db.put_governed_action_type(
+        crate::sekai::governed_action_type::GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "customer.retitle".into(),
+            version: "1".into(),
+            description: "Retitle one customer".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"title":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            object_kind: "customer_record".into(),
+            object_mutation: "update".into(),
+            enabled: true,
+            ..Default::default()
+        },
+        "operator",
+        1,
+    )
+    .unwrap();
+
+    let intent_request = || CreatePlanIntentRequest {
+        namespace: "acme".into(),
+        intent_id: "intent-1".into(),
+        goal: "Retitle Northwind".into(),
+        constraints: vec![],
+    };
+    let intent = svc
+        .create_plan_intent(with_principal(intent_request()))
+        .await
+        .unwrap()
+        .into_inner()
+        .intent
+        .unwrap();
+    let retried = svc
+        .create_plan_intent(with_principal(intent_request()))
+        .await
+        .unwrap()
+        .into_inner()
+        .intent
+        .unwrap();
+    assert_eq!(retried, intent);
+    let conflict = svc
+        .create_plan_intent(with_principal(CreatePlanIntentRequest {
+            goal: "something else".into(),
+            ..intent_request()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+    svc.propose_plan(with_principal(ProposePlanRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-1".into(),
+        intent_id: "intent-1".into(),
+        steps: vec![PlanStep {
+            type_id: "customer.retitle".into(),
+            version: "1".into(),
+            object_id: "cust-plan".into(),
+            parameters_json: r#"{"object_id":"cust-plan","title":"vip"}"#.into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let simulation = svc
+        .simulate_plan(with_principal(SimulatePlanRequest {
+            namespace: "acme".into(),
+            plan_id: "plan-1".into(),
+            simulation_id: "sim-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .simulation
+        .unwrap();
+    assert!(simulation.digest.starts_with("sha256:"));
+    assert_eq!(simulation.steps[0].outcome, "valid");
+    assert_eq!(
+        simulation.steps[0]
+            .effect
+            .as_ref()
+            .unwrap()
+            .changed_properties,
+        ["title"]
+    );
+    // Nothing applied: no instance, the object keeps its title.
+    assert!(
+        db.list_action_instances("acme", None, None, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.get_object("cust-plan").unwrap().unwrap().properties["title"],
+        "account"
+    );
+
+    let read = svc
+        .get_plan(with_principal(GetPlanRequest {
+            namespace: "acme".into(),
+            plan_id: "plan-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.intent.unwrap(), intent);
+    assert_eq!(read.plan.unwrap().steps[0].object_id, "cust-plan");
+    assert_eq!(read.simulations, [simulation]);
+    let missing = svc
+        .get_plan(with_principal(GetPlanRequest {
+            namespace: "acme".into(),
+            plan_id: "nope".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+mod spawn_db_tests {
+    use super::*;
+    use crate::db::store::SekaiStore;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_db_does_not_block_the_tokio_worker() {
+        let service = SekaiServiceImpl::new(SekaiStore::memory());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = service.spawn_db(move || {
+            let _ = started_tx.send(());
+            release_rx
+                .recv()
+                .map_err(|_| Status::internal("release signal closed"))?;
+            Ok(())
+        });
+        let probe = async {
+            started_rx.await.expect("blocking work started");
+            tokio::task::yield_now().await;
+            let _ = release_tx.send(());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(blocking, probe);
+            result
+        })
+        .await
+        .expect("spawn_db blocked the Tokio worker")
+        .unwrap();
+    }
+}
+
+/// Stores three one-step Action types on `cust-plan` in `acme`: `plan.a`
+/// and `plan.b` decided by alice or bob, and `plan.c` by alice alone on the
+/// `risk` queue. Returns the plan request steps, one per type.
+fn plan_review_fixture(svc: &SekaiServiceImpl) -> Vec<PlanStep> {
+    grant_action_admin(svc);
+    let db = svc.db.runtime();
+    db.upsert_object_type(&crate::sekai::schema::ObjectType {
+        kind: "customer_record".into(),
+        description: "fixture".into(),
+        properties: vec![],
+        is_builtin: false,
+        implements: vec![],
+    })
+    .unwrap();
+    db.create_object(&crate::domain::Object {
+        id: "cust-plan".into(),
+        kind: "customer_record".into(),
+        name: "Northwind".into(),
+        namespace: "acme".into(),
+        external_id: String::new(),
+        properties: HashMap::from([("title".into(), "account".into())]),
+        created: 10,
+        updated: 20,
+    })
+    .unwrap();
+    let mut steps = Vec::new();
+    for (type_id, approvers, queue) in [
+        ("plan.a", vec!["alice", "bob"], ""),
+        ("plan.b", vec!["alice", "bob"], ""),
+        ("plan.c", vec!["alice"], "risk"),
+    ] {
+        db.put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: "acme".into(),
+                type_id: type_id.into(),
+                version: "1".into(),
+                description: "Retitle one customer".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"title":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                object_kind: "customer_record".into(),
+                object_mutation: "update".into(),
+                enabled: true,
+                approvers: approvers.into_iter().map(String::from).collect(),
+                review_queue: crate::sekai::review_queue::ReviewQueueSpec {
+                    queue_id: queue.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            "operator",
+            1,
+        )
+        .unwrap();
+        steps.push(PlanStep {
+            type_id: type_id.into(),
+            version: "1".into(),
+            object_id: "cust-plan".into(),
+            parameters_json: r#"{"object_id":"cust-plan","title":"vip"}"#.into(),
+        });
+    }
+    steps
+}
+
+/// Proposes and simulates `plan_id` as `tester`; returns the simulation digest.
+async fn simulated_plan(
+    svc: &SekaiServiceImpl,
+    plan_id: &str,
+    simulation_id: &str,
+    steps: Vec<PlanStep>,
+) -> String {
+    svc.create_plan_intent(with_principal(CreatePlanIntentRequest {
+        namespace: "acme".into(),
+        intent_id: "intent-review".into(),
+        goal: "Retitle Northwind".into(),
+        constraints: vec![],
+    }))
+    .await
+    .unwrap();
+    svc.propose_plan(with_principal(ProposePlanRequest {
+        namespace: "acme".into(),
+        plan_id: plan_id.into(),
+        intent_id: "intent-review".into(),
+        steps,
+    }))
+    .await
+    .unwrap();
+    svc.simulate_plan(with_principal(SimulatePlanRequest {
+        namespace: "acme".into(),
+        plan_id: plan_id.into(),
+        simulation_id: simulation_id.into(),
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .simulation
+    .unwrap()
+    .digest
+}
+
+fn as_decider<T>(payload: T, principal: &str) -> Request<T> {
+    let mut request = with_named_principal(payload, principal);
+    request
+        .metadata_mut()
+        .insert("x-sekai-auth-source", MetadataValue::from_static("token"));
+    request
+}
+
+async fn decide_plan(
+    svc: &SekaiServiceImpl,
+    plan_id: &str,
+    digest: &str,
+    decision: &str,
+    decider: &str,
+) -> Result<DecidePlanReviewResponse, Status> {
+    svc.decide_plan_review(as_decider(
+        DecidePlanReviewRequest {
+            namespace: "acme".into(),
+            plan_id: plan_id.into(),
+            simulation_digest: digest.into(),
+            decision: decision.into(),
+            reason: "reviewed".into(),
+        },
+        decider,
+    ))
+    .await
+    .map(Response::into_inner)
+}
+
+#[tokio::test]
+async fn a_plan_is_granted_once_by_an_approver_of_every_step() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    let digest = simulated_plan(&svc, "plan-r", "sim-1", steps).await;
+    // Not submitted yet: nothing to decide.
+    let early = decide_plan(&svc, "plan-r", &digest, "grant", "alice")
+        .await
+        .unwrap_err();
+    assert_eq!(early.code(), tonic::Code::PermissionDenied);
+
+    let submit = || SubmitPlanReviewRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-r".into(),
+        simulation_id: "sim-1".into(),
+    };
+    let review = svc
+        .submit_plan_review(with_principal(submit()))
+        .await
+        .unwrap()
+        .into_inner()
+        .review
+        .unwrap();
+    assert_eq!(review.simulation_digest, digest);
+    assert_eq!(review.queue_ids, ["risk"]);
+    assert!(review.decision.is_empty());
+    let retried = svc
+        .submit_plan_review(with_principal(submit()))
+        .await
+        .unwrap()
+        .into_inner()
+        .review
+        .unwrap();
+    assert_eq!(retried, review);
+    // A decision binds one simulation: another one cannot replace it.
+    svc.simulate_plan(with_principal(SimulatePlanRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-r".into(),
+        simulation_id: "sim-2".into(),
+    }))
+    .await
+    .unwrap();
+    let rebound = svc
+        .submit_plan_review(with_principal(SubmitPlanReviewRequest {
+            simulation_id: "sim-2".into(),
+            ..submit()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(rebound.code(), tonic::Code::AlreadyExists);
+
+    // Only the planner submits a plan for review.
+    let foreign = svc
+        .submit_plan_review(with_named_principal(submit(), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    // The planner never decides their own plan.
+    let own = decide_plan(&svc, "plan-r", &digest, "grant", "tester")
+        .await
+        .unwrap_err();
+    assert_eq!(own.code(), tonic::Code::PermissionDenied);
+    // bob may decide the first two steps but not the third.
+    let partial = decide_plan(&svc, "plan-r", &digest, "grant", "bob")
+        .await
+        .unwrap_err();
+    assert_eq!(partial.code(), tonic::Code::PermissionDenied);
+    assert!(
+        partial.message().contains("step 2 (plan.c)"),
+        "{}",
+        partial.message()
+    );
+    let stale = decide_plan(&svc, "plan-r", "sha256:other", "grant", "alice")
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    let read = || async {
+        svc.get_plan(with_principal(GetPlanRequest {
+            namespace: "acme".into(),
+            plan_id: "plan-r".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .review
+        .unwrap()
+    };
+    assert!(read().await.decision.is_empty());
+
+    let granted = decide_plan(&svc, "plan-r", &digest, "grant", "alice")
+        .await
+        .unwrap();
+    assert!(!granted.replay);
+    let decided = granted.review.unwrap();
+    assert_eq!(
+        (
+            decided.plan_id.as_str(),
+            decided.simulation_digest.as_str(),
+            decided.decision.as_str(),
+            decided.decided_by.as_str()
+        ),
+        ("plan-r", digest.as_str(), "grant", "alice")
+    );
+    assert_eq!(read().await, decided);
+    let again = decide_plan(&svc, "plan-r", &digest, "grant", "alice")
+        .await
+        .unwrap();
+    assert!(again.replay);
+    assert_eq!(again.review.unwrap(), decided);
+    let reversed = decide_plan(&svc, "plan-r", &digest, "deny", "alice")
+        .await
+        .unwrap_err();
+    assert_eq!(reversed.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn a_denied_plan_records_the_decision_and_runs_nothing() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    let digest = simulated_plan(&svc, "plan-d", "sim-1", steps).await;
+    svc.submit_plan_review(with_principal(SubmitPlanReviewRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-d".into(),
+        simulation_id: "sim-1".into(),
+    }))
+    .await
+    .unwrap();
+    let denied = decide_plan(&svc, "plan-d", &digest, "deny", "alice")
+        .await
+        .unwrap();
+    assert_eq!(denied.review.unwrap().decision, "deny");
+    assert!(
+        decide_plan(&svc, "plan-d", &digest, "deny", "alice")
+            .await
+            .unwrap()
+            .replay
+    );
+    let db = svc.db.runtime();
+    assert!(
+        db.list_action_instances("acme", None, None, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.get_object("cust-plan").unwrap().unwrap().properties["title"],
+        "account"
+    );
+}
+
+#[tokio::test]
+async fn conversation_draft_traces_each_member_to_its_turn_and_lints_unpublished() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "interview");
+    // A team namespace: principals outside the team may not draft in it.
+    grant_source_namespace(&svc, "interview", "root", security::Role::Admin);
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: "interview".into(),
+            branch_id: "draft".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: "create".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    // One edit per answered turn of a scripted interview.
+    let turns = [
+        (
+            "object_type",
+            "Customer",
+            r#"{"name":"Customer","owner":"sales","source_turn":"interview-1#turn-1"}"#,
+        ),
+        (
+            "object_type",
+            "Order",
+            r#"{"name":"Order","owner":"sales","properties":["total"],"access_marking":"finance","source_turn":"interview-1#turn-2"}"#,
+        ),
+        (
+            "link_type",
+            "PlacedBy",
+            r#"{"name":"PlacedBy","source_turn":"interview-1#turn-3"}"#,
+        ),
+    ];
+    let mut head = parent.revision_digest.clone();
+    for (turn, (kind, id, json)) in turns.iter().enumerate() {
+        head = svc
+            .apply_definition_branch_edit(with_named_principal(
+                ApplyDefinitionBranchEditRequest {
+                    namespace: "interview".into(),
+                    branch_id: "draft".into(),
+                    expected_head_digest: head,
+                    upserts: vec![DefinitionMemberInput {
+                        member_kind: (*kind).into(),
+                        member_id: (*id).into(),
+                        definition_json: (*json).into(),
+                        member_digest: String::new(),
+                    }],
+                    removals: Vec::new(),
+                    idempotency_key: format!("turn-{turn}"),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .branch
+            .unwrap()
+            .head_revision_digest;
+    }
+    let db = svc.db.runtime();
+    let mut traced: Vec<(String, String)> = db
+        .get_definition_members("interview", &head)
+        .unwrap()
+        .into_iter()
+        .filter_map(|member| {
+            let value: serde_json::Value = serde_json::from_str(&member.definition_json).unwrap();
+            Some((member.member_id, value["source_turn"].as_str()?.to_string()))
+        })
+        .collect();
+    traced.sort();
+    assert_eq!(
+        traced,
+        [
+            ("Customer".to_string(), "interview-1#turn-1".to_string()),
+            ("Order".into(), "interview-1#turn-2".into()),
+            ("PlacedBy".into(), "interview-1#turn-3".into()),
+        ]
+    );
+    // Drafting never publishes.
+    assert_eq!(
+        db.get_published_definition_revision("interview")
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        parent.revision_digest
+    );
+
+    let lint = |branch_id: &str, principal: &'static str| {
+        svc.get_ontology_lint_report(with_named_principal(
+            GetOntologyLintReportRequest {
+                namespace: "interview".into(),
+                branch_id: branch_id.into(),
+            },
+            principal,
+        ))
+    };
+    let draft = lint("draft", "root").await.unwrap().into_inner();
+    assert_eq!(draft.revision_digest, head);
+    let subjects: Vec<String> = draft
+        .findings
+        .iter()
+        .map(|finding| format!("{}:{}", finding.rule, finding.subject_id))
+        .collect();
+    assert!(
+        subjects.contains(&"unowned_link_type:PlacedBy".into()),
+        "{subjects:?}"
+    );
+    assert!(!subjects.contains(&"unowned_object_type:Customer".into()));
+    let published = lint("", "root").await.unwrap().into_inner();
+    assert_eq!(published.revision_digest, parent.revision_digest);
+    assert_eq!(
+        lint("missing", "root").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+
+    // A malformed turn reference is refused.
+    let malformed = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: "interview".into(),
+                branch_id: "draft".into(),
+                expected_head_digest: head.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Invoice".into(),
+                    definition_json: r#"{"name":"Invoice","source_turn":7}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "malformed".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+
+    // An agent without draft permission for the namespace is refused, and
+    // cannot read the draft through lint.
+    let refused = svc
+        .create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: "interview".into(),
+                branch_id: "agent-draft".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "agent-create".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let refused = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: "interview".into(),
+                branch_id: "draft".into(),
+                expected_head_digest: head,
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Invoice".into(),
+                    definition_json: r#"{"name":"Invoice","source_turn":"interview-1#turn-4"}"#
+                        .into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "agent-edit".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        lint("draft", "tester").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn ontology_health_drops_with_a_stale_dataset_and_a_broken_contract_and_recovers() {
+    let svc = service();
+    seed_definition_parent(&svc, "health");
+    grant_source_namespace(&svc, "health", "root", security::Role::Admin);
+    let db = svc.db.runtime();
+    db.create_object(&domain::Object {
+        id: "orders-object".into(),
+        kind: "Ticket".into(),
+        name: "orders".into(),
+        namespace: "health".into(),
+        external_id: String::new(),
+        properties: HashMap::new(),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    db.create_dataset(&dataset::Dataset {
+        id: "orders".into(),
+        name: "orders".into(),
+        columns: vec![dataset::ColumnDef {
+            name: "total".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: "orders-object".into(),
+        created: 1,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    // Scheduled checks judge the latest version.
+    db.append_rows(
+        "orders",
+        &[HashMap::from([("total".to_string(), "9".to_string())])],
+    )
+    .unwrap();
+    db.put_dataset_health_check(&crate::sekai::dataset_health::DatasetHealthCheck {
+        dataset_id: "orders".into(),
+        check_id: "fresh".into(),
+        kind: "freshness".into(),
+        max_age_ms: i64::MAX / 2,
+        min_rows: 0,
+        max_rows: 0,
+        columns: Vec::new(),
+        predicate: Vec::new(),
+        blocking: false,
+        every_ms: 1_000,
+        tenant: String::new(),
+        space: String::new(),
+        last_run_ms: 0,
+    })
+    .unwrap();
+    // The binding's `Ticket.title` is not in the published Ticket.
+    let binding = gate_binding("health", true);
+    db.create_object(&binding).unwrap();
+    let health = |principal: &'static str, namespace: &'static str| {
+        svc.get_ontology_health(with_named_principal(
+            GetOntologyHealthRequest {
+                namespace: namespace.into(),
+            },
+            principal,
+        ))
+    };
+    let part = |response: &GetOntologyHealthResponse, name: &str| {
+        response.namespaces[0]
+            .parts
+            .iter()
+            .find(|part| part.part == name)
+            .cloned()
+            .unwrap()
+    };
+
+    // Missing two scheduled runs fires a late alert: the dataset is stale.
+    for now_ms in [5_000, 7_000] {
+        db.run_dataset_health_checks("orders", now_ms).unwrap();
+    }
+    let sick = health("root", "health").await.unwrap().into_inner();
+    assert_eq!(part(&sick, "freshness").score, 0);
+    assert_eq!(part(&sick, "freshness").problems[0].subject_id, "orders");
+    assert_eq!(part(&sick, "quality").score, 100);
+    let contract = part(&sick, "contract");
+    assert_eq!(contract.score, 0);
+    assert_eq!(contract.problems[0].code, "property_removed");
+    assert!(!part(&sick, "trust").available);
+    assert_eq!(part(&sick, "access").score, 100);
+    assert_eq!(sick.namespaces[0].score, Some(0));
+    assert_eq!(sick.score, Some(0));
+
+    // Back on schedule and the binding withdrawn: both parts recover.
+    for now_ms in [7_500, 8_000] {
+        db.run_dataset_health_checks("orders", now_ms).unwrap();
+    }
+    db.delete_object(&binding.id).unwrap();
+    let well = health("root", "health").await.unwrap().into_inner();
+    assert_eq!(part(&well, "freshness").score, 100);
+    assert_eq!(part(&well, "contract").score, 100);
+    // Lint still flags the ownerless Ticket, so it is now the lowest part.
+    assert_eq!(well.namespaces[0].score, Some(part(&well, "lint").score));
+    assert!(part(&well, "lint").score < 100);
+
+    // A caller without access to the namespace gets nothing about it.
+    assert_eq!(
+        health("tester", "health").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let tenant = health("tester", "").await.unwrap().into_inner();
+    assert!(tenant.namespaces.is_empty());
+    assert_eq!(tenant.score, None);
+    let everything = health("root", "").await.unwrap().into_inner();
+    assert_eq!(everything.namespaces.len(), 1);
+}
+
+#[tokio::test]
+async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_sees() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "lint-a");
+    let member = |kind: &str, id: &str, json: &str| DefinitionMemberInput {
+        member_kind: kind.into(),
+        member_id: id.into(),
+        definition_json: json.into(),
+        member_digest: String::new(),
+    };
+    publish_definition_history_entry(
+        &svc,
+        "lint-a",
+        &parent.revision_digest,
+        "lint-a-1",
+        "lint-a-cs-1",
+        vec![
+            member(
+                "object_type",
+                "Ticket",
+                r#"{"name":"Ticket","owner":"support"}"#,
+            ),
+            member(
+                "object_type",
+                "User",
+                // Linked by data only after publishing, so the gate needs
+                // the suppression at merge time.
+                r#"{"name":"User","owner":"identity","lint_suppressions":[{"rule":"orphan_object_type","reason":"linked once tickets are assigned"}]}"#,
+            ),
+            member(
+                "object_type",
+                "Note",
+                r#"{"name":"Note","lint_suppressions":[{"rule":"orphan_object_type","reason":"kept for the lint fixture"}]}"#,
+            ),
+            member(
+                "link_type",
+                "AssignedTo",
+                r#"{"name":"AssignedTo","owner":"support"}"#,
+            ),
+        ],
+    )
+    .await;
+    let db = svc.db.runtime();
+    let object = |id: &str, kind: &str, marking: &str| crate::domain::Object {
+        id: id.into(),
+        kind: kind.into(),
+        name: id.into(),
+        namespace: "lint-a".into(),
+        external_id: String::new(),
+        properties: if marking.is_empty() {
+            HashMap::new()
+        } else {
+            HashMap::from([("access_marking".into(), marking.into())])
+        },
+        created: 1,
+        updated: 1,
+    };
+    for (id, kind, marking) in [
+        ("t-1", "Ticket", ""),
+        ("u-1", "User", ""),
+        ("t-2", "Ticket", ""),
+        ("t-secret", "Ticket", "restricted"),
+        // Linked only to an object of a type the definition does not publish.
+        ("t-3", "Ticket", ""),
+        ("w-1", "Widget", ""),
+    ] {
+        db.create_object(&object(id, kind, marking)).unwrap();
+    }
+    db.create_link(&crate::domain::Link {
+        id: "l-2".into(),
+        from_id: "w-1".into(),
+        to_id: "t-3".into(),
+        relation: "Uses".into(),
+        created: 1,
+    })
+    .unwrap();
+    db.put_governed_action_type(
+        crate::sekai::governed_action_type::GovernedActionType {
+            namespace: "lint-a".into(),
+            type_id: "ticket.close".into(),
+            version: "1".into(),
+            description: "Close a ticket".into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            parameter_schema_json:
+                r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}"#.into(),
+            enabled: true,
+            ..Default::default()
+        },
+        "operator",
+        1,
+    )
+    .unwrap();
+    db.create_link(&crate::domain::Link {
+        id: "l-1".into(),
+        from_id: "t-1".into(),
+        to_id: "u-1".into(),
+        relation: "AssignedTo".into(),
+        created: 1,
+    })
+    .unwrap();
+
+    let lint = |principal: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.get_ontology_lint_report(with_named_principal(
+                GetOntologyLintReportRequest {
+                    namespace: "lint-a".into(),
+                    branch_id: String::new(),
+                },
+                principal,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+        }
+    };
+    let subjects = |report: &GetOntologyLintReportResponse| {
+        report
+            .findings
+            .iter()
+            .map(|finding| format!("{}:{}", finding.rule, finding.subject_id))
+            .collect::<Vec<_>>()
+    };
+    let full = lint("root").await;
+    assert!(full.complete);
+    assert_eq!(
+        subjects(&full),
+        [
+            "action_type_never_run:ticket.close",
+            "orphan_object:t-2",
+            "orphan_object:t-secret",
+            "orphan_object_type:Note",
+            "unowned_object_type:Note",
+        ]
+    );
+    // A caller not cleared for the restricted object never sees it named,
+    // and one who does not administer Actions sees nothing of them.
+    let limited = subjects(&lint("tester").await);
+    assert!(limited.contains(&"orphan_object:t-2".to_string()));
+    assert!(!limited.contains(&"orphan_object:t-secret".to_string()));
+    assert!(
+        !limited
+            .iter()
+            .any(|subject| subject.starts_with("action_type"))
+    );
+
+    let missing = svc
+        .get_ontology_lint_report(with_principal(GetOntologyLintReportRequest {
+            namespace: "lint-none".into(),
+            branch_id: String::new(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn unreferenced_properties_follow_visible_consumers_and_suppressions() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "lint-b");
+    publish_definition_history_entry(
+        &svc,
+        "lint-b",
+        &parent.revision_digest,
+        "lint-b-1",
+        "lint-b-cs-1",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","owner":"support","properties":["title","legacy"],"lint_suppressions":[{"rule":"unreferenced_property","property":"legacy","reason":"read by the nightly export"},{"rule":"orphan_object_type","reason":"seed type"}]}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await;
+    // A consumer the tester may not read references `title`.
+    let mut binding = crate::domain::Object {
+        id: "binding-secret".into(),
+        kind: crate::sekai::definition_consumer_impact::BINDING_KIND.into(),
+        name: "binding-secret".into(),
+        namespace: "lint-b".into(),
+        external_id: String::new(),
+        properties: HashMap::from(
+            [
+                (
+                    "contract_version",
+                    crate::sekai::definition_consumer_impact::BINDING_CONTRACT,
+                ),
+                ("owner", "secret-team"),
+                ("resource_identity", "secret-dashboard"),
+                ("member_kind", "object_type"),
+                ("member_id", "Ticket"),
+                ("property", "title"),
+                ("declaration_digest", "sha256:declared"),
+                ("source_locator", "dashboards/secret"),
+                ("access_marking", "restricted"),
+            ]
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+        ),
+        created: 1,
+        updated: 1,
+    };
+    let declared = crate::sekai::definition_consumer_impact::binding_digest(
+        &crate::sekai::definition_consumer_impact::binding_from_object(&binding).unwrap(),
+    );
+    binding
+        .properties
+        .insert("declaration_digest".into(), declared);
+    svc.db.runtime().create_object(&binding).unwrap();
+    let lint = |principal: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.get_ontology_lint_report(with_named_principal(
+                GetOntologyLintReportRequest {
+                    namespace: "lint-b".into(),
+                    branch_id: String::new(),
+                },
+                principal,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .findings
+        }
+    };
+    let summary = |findings: &[OntologyLintFinding]| {
+        findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{}:{}{}:{}",
+                    finding.rule,
+                    finding.subject_id,
+                    if finding.property.is_empty() {
+                        String::new()
+                    } else {
+                        format!(".{}", finding.property)
+                    },
+                    finding.suppression_reason
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        summary(&lint("root").await),
+        ["unreferenced_property:Ticket.legacy:read by the nightly export"]
+    );
+    // Without the consumer, the type reads as orphaned and `title` as
+    // unreferenced, and nothing names the consumer.
+    let limited = lint("tester").await;
+    assert_eq!(
+        summary(&limited),
+        [
+            "orphan_object_type:Ticket:seed type",
+            "unreferenced_property:Ticket.legacy:read by the nightly export",
+            "unreferenced_property:Ticket.title:",
+        ]
+    );
+    assert!(limited.iter().all(|finding| {
+        !finding.detail.contains("secret") && !finding.subject_id.contains("secret")
+    }));
+    assert!(limited[0].suppressed && !limited[2].suppressed);
+}
+
+#[tokio::test]
+async fn a_proposal_introducing_an_orphan_type_merges_only_with_a_suppression() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "gate-a").revision_digest;
+    let orphan = |json: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: "Orphan".into(),
+        definition_json: json.into(),
+        member_digest: String::new(),
+    };
+    let refused = propose_and_merge_definition(
+        &svc,
+        "gate-a",
+        &parent,
+        "gate-a-1",
+        "gate-a-cs-1",
+        vec![orphan(r#"{"name":"Orphan"}"#)],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("definition_lint_gate: orphan_object_type Orphan"),
+        "{}",
+        refused.message()
+    );
+    // The reviewer sees the blocking finding on the proposal.
+    let proposal = |id: &'static str| {
+        let svc = &svc;
+        async move {
+            let response = svc
+                .get_definition_proposal(with_named_principal(
+                    GetDefinitionProposalRequest {
+                        namespace: "gate-a".into(),
+                        proposal_id: id.into(),
+                    },
+                    "root",
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.lint_complete);
+            response.lint_findings
+        }
+    };
+    let blocking = proposal("gate-a-cs-1").await;
+    assert_eq!(
+        blocking
+            .iter()
+            .map(|finding| (
+                finding.rule.as_str(),
+                finding.severity.as_str(),
+                finding.suppressed
+            ))
+            .collect::<Vec<_>>(),
+        // The warning shows and does not block.
+        [
+            ("orphan_object_type", "error", false),
+            ("unowned_object_type", "warning", false)
+        ]
+    );
+    // The seed's own orphan `Ticket` predates the proposal and never blocks.
+    assert!(
+        blocking
+            .iter()
+            .all(|finding| finding.subject_id == "Orphan")
+    );
+
+    let merged = propose_and_merge_definition(
+        &svc,
+        "gate-a",
+        &parent,
+        "gate-a-2",
+        "gate-a-cs-2",
+        vec![orphan(
+            r#"{"name":"Orphan","lint_suppressions":[{"rule":"orphan_object_type","reason":"wired to a consumer next release"}]}"#,
+        )],
+    )
+    .await
+    .unwrap();
+    let published = merged.published_revision.unwrap().revision_digest;
+    assert_eq!(
+        proposal("gate-a-cs-2").await[0].suppression_reason,
+        "wired to a consumer next release"
+    );
+
+    // A proposal introducing nothing the gate blocks merges as before.
+    propose_and_merge_definition(
+        &svc,
+        "gate-a",
+        &published,
+        "gate-a-3",
+        "gate-a-cs-3",
+        vec![DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","owner":"support"}"#.into(),
+            member_digest: String::new(),
+        }],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_planner_executes_a_granted_plan_and_get_plan_reads_it() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    let digest = simulated_plan(&svc, "plan-x", "sim-1", steps).await;
+    svc.submit_plan_review(with_principal(SubmitPlanReviewRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-x".into(),
+        simulation_id: "sim-1".into(),
+    }))
+    .await
+    .unwrap();
+    decide_plan(&svc, "plan-x", &digest, "grant", "alice")
+        .await
+        .unwrap();
+    let execute = |principal: &str| {
+        with_named_principal(
+            ExecuteActionPlanRequest {
+                namespace: "acme".into(),
+                plan_id: "plan-x".into(),
+            },
+            principal,
+        )
+    };
+    // Only the planner runs the plan; to anyone else it does not exist.
+    for other in ["alice", "bob"] {
+        let refused = svc.execute_action_plan(execute(other)).await.unwrap_err();
+        assert!(
+            matches!(
+                refused.code(),
+                tonic::Code::NotFound | tonic::Code::PermissionDenied
+            ),
+            "{other}: {refused:?}"
+        );
+    }
+    let execution = svc
+        .execute_action_plan(execute("tester"))
+        .await
+        .unwrap()
+        .into_inner()
+        .execution
+        .unwrap();
+    assert_eq!(execution.status, "completed", "{execution:?}");
+    assert_eq!(execution.steps.len(), 3);
+    assert!(execution.steps.iter().all(|step| step.status == "admitted"));
+    let read = svc
+        .get_plan(with_principal(GetPlanRequest {
+            namespace: "acme".into(),
+            plan_id: "plan-x".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.execution.unwrap(), execution);
+}
+
+#[tokio::test]
+async fn a_plan_whose_approver_holds_no_active_credential_stops_before_any_step() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    let digest = simulated_plan(&svc, "plan-x", "sim-1", steps).await;
+    svc.submit_plan_review(with_principal(SubmitPlanReviewRequest {
+        namespace: "acme".into(),
+        plan_id: "plan-x".into(),
+        simulation_id: "sim-1".into(),
+    }))
+    .await
+    .unwrap();
+    decide_plan(&svc, "plan-x", &digest, "grant", "alice")
+        .await
+        .unwrap();
+    // Credentials are in use, and the approver holds none.
+    svc.db
+        .runtime()
+        .create_principal_credential(
+            "tester",
+            &sekai_domain::gateway_keys::hash_gateway_key("planner-token"),
+            1,
+        )
+        .unwrap();
+    let execution = svc
+        .execute_action_plan(with_named_principal(
+            ExecuteActionPlanRequest {
+                namespace: "acme".into(),
+                plan_id: "plan-x".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .execution
+        .unwrap();
+    assert_eq!(execution.status, "stopped", "{execution:?}");
+    assert_eq!(execution.stop_reason, "approver_authority_revoked");
+    assert!(execution.steps.is_empty());
+}
+
+/// `exp` publishes `Ticket`, whose `secret` property a read policy withholds
+/// from everyone, and holds `rows` visible tickets plus one restricted one.
+async fn export_fixture(svc: &SekaiServiceImpl, rows: usize, title: &str) -> String {
+    seed_definition_parent(svc, "exp");
+    let db = svc.db.runtime();
+    let ticket = |id: String, properties: Vec<(&str, String)>| crate::domain::Object {
+        name: id.clone(),
+        id,
+        kind: "Ticket".into(),
+        namespace: "exp".into(),
+        external_id: String::new(),
+        properties: properties
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+        created: 1,
+        updated: 1,
+    };
+    for n in 0..rows {
+        db.create_object(&ticket(
+            format!("t-{n:05}"),
+            vec![("title", title.into()), ("secret", format!("s{n}"))],
+        ))
+        .unwrap();
+    }
+    db.create_object(&ticket(
+        "t-hidden".into(),
+        vec![
+            ("title", "hidden".into()),
+            ("access_marking", "restricted".into()),
+        ],
+    ))
+    .unwrap();
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "exp".into(),
+        kind: "Ticket".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+            property: "title".into(),
+            access: crate::sekai::object_security::PropertyGrantAccess::Read,
+        }]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-export", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        "exp",
+        &BTreeMap::from([("Ticket".into(), revision.revision_digest)]),
+        "root",
+        "activate-export",
+        2,
+    )
+    .unwrap();
+    published_digest(svc, "exp").await
+}
+
+fn export_request(digest: &str) -> ExportObjectSetRequest {
+    ExportObjectSetRequest {
+        descriptor: Some(ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "exp".into(),
+            kind: "Ticket".into(),
+            definition_digest: digest.into(),
+            ..Default::default()
+        }),
+        properties: vec!["title".into(), "secret".into()],
+        format: "csv".into(),
+    }
+}
+
+fn receipt_outcome(svc: &SekaiServiceImpl, receipt_id: &str) -> Option<String> {
+    crate::sekai::data_export::export_receipt(svc.db.runtime(), receipt_id)
+        .unwrap()
+        .and_then(|receipt| {
+            receipt
+                .events
+                .iter()
+                .find(|event| event.attributes.contains_key("outcome"))
+                .map(|event| event.attributes["outcome"].clone())
+        })
+}
+
+#[tokio::test]
+async fn an_export_needs_its_grant_and_streams_only_what_a_read_shows() {
+    use futures_util::StreamExt;
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "a, \"quoted\"").await;
+    let refused = svc
+        .export_object_set(with_principal(export_request(&digest)))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "quarterly audit".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .export_object_set(with_principal(export_request(&digest)))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let receipt_id = chunks[0].receipt_id.clone();
+    let data: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.data.clone()).collect();
+    assert_eq!(
+        String::from_utf8(data.clone()).unwrap(),
+        "id,title,secret\nt-00000,\"a, \"\"quoted\"\"\",\nt-00001,\"a, \"\"quoted\"\"\",\n"
+    );
+    let done = chunks.last().unwrap();
+    assert!(done.done);
+    assert_eq!(done.row_count, 2);
+    let expected = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+    assert_eq!(done.content_digest, expected);
+    let read = |principal: &'static str| {
+        let svc = &svc;
+        let receipt_id = receipt_id.clone();
+        async move {
+            svc.get_export_receipt(with_named_principal(
+                GetExportReceiptRequest {
+                    operation_id: receipt_id,
+                },
+                principal,
+            ))
+            .await
+        }
+    };
+    let receipt = read("tester").await.unwrap().into_inner();
+    assert_eq!(
+        (
+            receipt.outcome.as_str(),
+            receipt.row_count,
+            receipt.content_digest.as_str()
+        ),
+        ("completed", 2, expected.as_str())
+    );
+    // Another reader learns nothing of it.
+    assert_eq!(read("bob").await.unwrap_err().code(), tonic::Code::NotFound);
+
+    // A traversal (here as v2 hops) is not exported as its start set.
+    let mut hops = export_request(&digest);
+    hops.descriptor.as_mut().unwrap().hops = vec![ObjectSetTraversal {
+        relation: "rel".into(),
+        far_kind: "Ticket".into(),
+        ..Default::default()
+    }];
+    let refused_hops = svc
+        .export_object_set(with_principal(hops))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            refused_hops.code(),
+            tonic::Code::Unimplemented | tonic::Code::InvalidArgument
+        ),
+        "{refused_hops:?}"
+    );
+
+    svc.revoke_namespace_export(with_named_principal(
+        RevokeNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "audit closed".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let revoked = svc
+        .export_object_set(with_principal(export_request(&digest)))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
+}
+
+async fn collect_export(
+    svc: &SekaiServiceImpl,
+    request: ExportObjectSetRequest,
+    principal: &str,
+) -> (String, String) {
+    use futures_util::StreamExt;
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .export_object_set(with_named_principal(request, principal))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let receipt_id = chunks[0].receipt_id.clone();
+    let data =
+        String::from_utf8(chunks.iter().flat_map(|chunk| chunk.data.clone()).collect()).unwrap();
+    (receipt_id, data)
+}
+
+fn tenth_sample(csv: &str) -> Vec<u8> {
+    let mut lines = csv.lines();
+    let header = lines.next().expect("csv header");
+    let rows: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+    let take = (rows.len() / 10).max(8);
+    let mut sample = String::from(header);
+    sample.push('\n');
+    for line in rows.into_iter().take(take) {
+        sample.push_str(line);
+        sample.push('\n');
+    }
+    sample.into_bytes()
+}
+
+#[tokio::test]
+async fn watermarked_exports_fingerprint_marked_decimals_and_trace_from_a_sample() {
+    use crate::sekai::audit;
+    use crate::sekai::markings;
+    use std::collections::BTreeMap;
+    let svc = service();
+    let ns = format!(
+        "wm-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    seed_definition_parent(&svc, &ns);
+    let db = svc.db.runtime();
+    for actor in ["alice", "bob"] {
+        let profile_id = format!("principal-{actor}-{ns}");
+        db.create_object(&crate::domain::Object {
+            id: profile_id.clone(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: actor.into(),
+            namespace: ns.clone(),
+            external_id: markings::principal_profile_external_id(actor),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    "internal".into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        grant_object_role(&svc, &profile_id, "root", security::Role::Admin);
+    }
+    for n in 0..80 {
+        db.create_object(&crate::domain::Object {
+            id: format!("w-{n:05}"),
+            kind: "Ticket".into(),
+            name: format!("w-{n:05}"),
+            namespace: ns.clone(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("title".into(), format!("row-{n}")),
+                ("temperature".into(), format!("{}.50", 10 + n)),
+                ("secret".into(), format!("s{n}")),
+                (
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "internal".into(),
+                ),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    }
+    let ticket_policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: ns.clone(),
+        kind: "Ticket".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![
+            crate::sekai::object_security::PropertyGrant {
+                property: "title".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            },
+            crate::sekai::object_security::PropertyGrant {
+                property: "temperature".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            },
+        ]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let profile_policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: ns.clone(),
+        kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: None,
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let ticket_revision = db
+        .put_object_security_policy(&ticket_policy, "root", "put-wm", 1)
+        .unwrap();
+    let profile_revision = db
+        .put_object_security_policy(&profile_policy, "root", "put-wm-profile", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        &ns,
+        &BTreeMap::from([
+            ("Ticket".into(), ticket_revision.revision_digest),
+            (
+                markings::PRINCIPAL_PROFILE_KIND.into(),
+                profile_revision.revision_digest,
+            ),
+        ]),
+        "root",
+        "activate-wm",
+        2,
+    )
+    .unwrap();
+    let digest = published_digest(&svc, &ns).await;
+    let request = ExportObjectSetRequest {
+        descriptor: Some(ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: ns.clone(),
+            kind: "Ticket".into(),
+            definition_digest: digest,
+            ..Default::default()
+        }),
+        properties: vec!["title".into(), "temperature".into()],
+        format: "csv".into(),
+    };
+    for principal in ["alice", "bob"] {
+        svc.grant_namespace_export(with_named_principal(
+            GrantNamespaceExportRequest {
+                namespace: ns.clone(),
+                principal: principal.into(),
+                reason: "watermark audit".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+    }
+    let (_, alice_plain) = collect_export(&svc, request.clone(), "alice").await;
+    let (_, bob_plain) = collect_export(&svc, request.clone(), "bob").await;
+    assert_eq!(alice_plain, bob_plain);
+    assert!(alice_plain.contains("row-0"));
+    assert!(alice_plain.contains("10.50"));
+
+    svc.put_export_fingerprint_policy(with_named_principal(
+        PutExportFingerprintPolicyRequest {
+            policy: Some(ExportFingerprintPolicy {
+                namespace: ns.clone(),
+                marking: "internal".into(),
+                fingerprint_properties: vec!["temperature".into()],
+                ..Default::default()
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let loaded = svc
+        .get_export_fingerprint_policy(with_named_principal(
+            GetExportFingerprintPolicyRequest {
+                namespace: ns.clone(),
+                marking: "internal".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .policy
+        .unwrap();
+    assert_eq!(loaded.fingerprint_properties, ["temperature"]);
+
+    let (alice_id, alice_marked) = collect_export(&svc, request.clone(), "alice").await;
+    let (bob_id, bob_marked) = collect_export(&svc, request, "bob").await;
+    assert_ne!(alice_marked, bob_marked);
+    for line in alice_marked.lines().skip(1).filter(|line| !line.is_empty()) {
+        let mut fields = line.split(',');
+        let _id = fields.next().unwrap();
+        let title = fields.next().unwrap();
+        assert!(title.starts_with("row-"), "{line}");
+        let temperature = fields.next().unwrap();
+        assert!(
+            temperature.contains('.'),
+            "temperature stays a decimal: {line}"
+        );
+    }
+
+    let alice_trace = svc
+        .trace_export(with_named_principal(
+            TraceExportRequest {
+                namespace: ns.clone(),
+                sample: tenth_sample(&alice_marked),
+                format: "csv".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(alice_trace.matches.len(), 1, "{alice_trace:?}");
+    assert_eq!(alice_trace.matches[0].receipt_id, alice_id);
+    assert_eq!(alice_trace.matches[0].score, 1.0);
+
+    let bob_trace = svc
+        .trace_export(with_named_principal(
+            TraceExportRequest {
+                namespace: ns.clone(),
+                sample: tenth_sample(&bob_marked),
+                format: "csv".into(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(bob_trace.matches[0].receipt_id, bob_id);
+
+    let denied = svc
+        .trace_export(with_named_principal(
+            TraceExportRequest {
+                namespace: ns.clone(),
+                sample: tenth_sample(&alice_marked),
+                format: "csv".into(),
+            },
+            "carol",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+    let decisions = db
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("trace_export".into()),
+            target_id: Some(ns.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.actor == "alice" && decision.outcome == "completed")
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.actor == "carol" && decision.outcome == "denied")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_export_leaves_an_aborted_receipt() {
+    use futures_util::StreamExt;
+    let svc = service();
+    // Far more than the stream buffers, so the export is still writing.
+    let digest = export_fixture(&svc, 3_000, &"x".repeat(400)).await;
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "migration".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let mut stream = svc
+        .export_object_set(with_principal(export_request(&digest)))
+        .await
+        .unwrap()
+        .into_inner();
+    let receipt_id = stream.next().await.unwrap().unwrap().receipt_id;
+    assert_eq!(receipt_outcome(&svc, &receipt_id), None);
+    drop(stream);
+    let aborted = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Some(outcome) = receipt_outcome(&svc, &receipt_id) {
+                return outcome;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(aborted, "aborted");
+}
+
+#[tokio::test]
+async fn ontology_health_snapshots_are_recorded_once_per_window_and_read_by_what_the_reader_sees() {
+    let svc = service();
+    seed_definition_parent(&svc, "health");
+    grant_source_namespace(&svc, "health", "root", security::Role::Admin);
+    grant_source_namespace(&svc, "health", "viewer", security::Role::Viewer);
+    // A dataset bound to an object the viewer may not read.
+    let db = svc.db.runtime();
+    db.create_object(&domain::Object {
+        id: "secret-object".into(),
+        kind: "Ticket".into(),
+        name: "secret".into(),
+        namespace: "health".into(),
+        external_id: String::new(),
+        properties: HashMap::from([("access_marking".into(), "restricted".into())]),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    db.create_dataset(&dataset::Dataset {
+        id: "secret".into(),
+        name: "secret".into(),
+        columns: Vec::new(),
+        object_id: "secret-object".into(),
+        created: 1,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    const DAY: i64 = 86_400_000;
+    let record = |principal: &'static str| {
+        svc.record_ontology_health_snapshot(with_named_principal(
+            RecordOntologyHealthSnapshotRequest {
+                namespace: "health".into(),
+                window_ms: DAY,
+                retention_ms: 7 * DAY,
+                // The ownerless Ticket keeps lint below 100: the first
+                // snapshot is below the threshold.
+                threshold: 100,
+            },
+            principal,
+        ))
+    };
+    let trend = |principal: &'static str| {
+        svc.list_ontology_health_trend(with_named_principal(
+            ListOntologyHealthTrendRequest {
+                namespace: "health".into(),
+            },
+            principal,
+        ))
+    };
+
+    let first = record("root").await.unwrap().into_inner();
+    assert!(!first.replay);
+    let event = first.event.unwrap();
+    assert_eq!(event.kind, "below_threshold");
+    let snapshot = first.snapshot.unwrap();
+    assert!(snapshot.parts.iter().any(|part| part.part == "access"));
+    // The same window again stores nothing and writes no second event.
+    let again = record("root").await.unwrap().into_inner();
+    assert!(again.replay && again.event.is_none());
+    assert_eq!(
+        again.snapshot.unwrap().window_start_ms,
+        snapshot.window_start_ms
+    );
+    // Only the namespace's administrator records.
+    for other in ["viewer", "tester"] {
+        assert_eq!(
+            record(other).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied,
+            "{other}"
+        );
+    }
+
+    let full = trend("root").await.unwrap().into_inner();
+    assert_eq!(full.snapshots, std::slice::from_ref(&snapshot));
+    assert_eq!(full.events, [event]);
+    // A reader sees no part they may not see now: not the access part, nor
+    // the dataset parts scored from the dataset they may not read, nor lint
+    // (scored from what the recorder could see); nor an event whose score
+    // those parts fed.
+    let partial = trend("viewer").await.unwrap().into_inner();
+    assert_eq!(partial.snapshots.len(), 1);
+    let shown: Vec<&str> = partial.snapshots[0]
+        .parts
+        .iter()
+        .map(|part| part.part.as_str())
+        .collect();
+    for hidden in ["access", "freshness", "quality", "lint"] {
+        assert!(!shown.contains(&hidden), "{hidden} in {shown:?}");
+    }
+    assert!(shown.contains(&"contract"), "{shown:?}");
+    assert!(partial.events.is_empty());
+    // A caller without access to the namespace gets nothing about it.
+    assert_eq!(
+        trend("tester").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn a_dataset_version_exports_under_its_grant_without_withheld_columns() {
+    use futures_util::StreamExt;
+    let svc = service();
+    let db = svc.db.runtime();
+    db.create_object(&crate::domain::Object {
+        id: "orders-binding".into(),
+        kind: "OrderBook".into(),
+        name: "orders".into(),
+        namespace: "dexp".into(),
+        external_id: String::new(),
+        properties: HashMap::new(),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    db.create_dataset(&crate::sekai::dataset::Dataset {
+        id: "orders".into(),
+        name: "orders".into(),
+        // `amount` is restricted: redacted for a reader who may not
+        // administer the bound object.
+        columns: [
+            ("id", "public"),
+            ("amount", "sensitive"),
+            ("secret", "public"),
+        ]
+        .map(|(name, classification)| crate::sekai::dataset::ColumnDef {
+            name: name.into(),
+            col_type: "string".into(),
+            classification: classification.into(),
+        })
+        .to_vec(),
+        object_id: "orders-binding".into(),
+        created: 0,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    db.append_rows(
+        "orders",
+        &[("1", "10"), ("2", "20")].map(|(id, amount)| {
+            HashMap::from([
+                ("id".to_string(), id.to_string()),
+                ("amount".to_string(), amount.to_string()),
+                ("secret".to_string(), format!("s{id}")),
+            ])
+        }),
+    )
+    .unwrap();
+    let version_id = db.latest_dataset_version_id("orders").unwrap();
+    // The bound object's read policy withholds `secret`.
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "dexp".into(),
+        kind: "OrderBook".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(
+            ["id", "amount"]
+                .map(|property| crate::sekai::object_security::PropertyGrant {
+                    property: property.into(),
+                    access: crate::sekai::object_security::PropertyGrantAccess::Read,
+                })
+                .to_vec(),
+        ),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-dexp", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        "dexp",
+        &BTreeMap::from([("OrderBook".into(), revision.revision_digest)]),
+        "root",
+        "activate-dexp",
+        2,
+    )
+    .unwrap();
+    let request = || ExportDatasetVersionRequest {
+        dataset_id: "orders".into(),
+        version_id: version_id.clone(),
+        columns: Vec::new(),
+        format: "csv".into(),
+    };
+
+    let refused = svc
+        .export_dataset_version(with_principal(request()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let refusals = db
+        .list_decisions(&sekai_types::decision_ledger::DecisionFilter {
+            action: Some("governed_export".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].outcome, "refused");
+
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "dexp".into(),
+            principal: "tester".into(),
+            reason: "finance close".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .export_dataset_version(with_principal(request()))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let data: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.data.clone()).collect();
+    assert_eq!(
+        String::from_utf8(data.clone()).unwrap(),
+        "id,amount,secret\n1,[redacted],\n2,[redacted],\n"
+    );
+    let done = chunks.last().unwrap();
+    assert_eq!(done.row_count, 2);
+    assert_eq!(
+        done.content_digest,
+        format!("sha256:{:x}", sha2::Sha256::digest(&data))
+    );
+    let receipt = svc
+        .get_export_receipt(with_principal(GetExportReceiptRequest {
+            operation_id: chunks[0].receipt_id.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (receipt.outcome.as_str(), receipt.content_digest.as_str()),
+        ("completed", done.content_digest.as_str())
+    );
+
+    // Cell grants cannot be mapped onto dataset rows: refused, not exported.
+    let cells = crate::sekai::object_security::ObjectSecurityPolicy {
+        value_instance_grants: Some(Vec::new()),
+        ..policy
+    };
+    let revision = db
+        .put_object_security_policy(&cells, "root", "put-dexp-cells", 3)
+        .unwrap();
+    db.activate_object_security_policies(
+        "dexp",
+        &BTreeMap::from([("OrderBook".into(), revision.revision_digest)]),
+        "root",
+        "activate-dexp-cells",
+        4,
+    )
+    .unwrap();
+    let refused_cells = svc
+        .export_dataset_version(with_principal(request()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused_cells.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn a_saved_export_runs_for_its_owner_into_an_artifact_and_fails_closed_once_revoked() {
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "row").await;
+    let definition = |format: &str| ExportDefinition {
+        namespace: "exp".into(),
+        definition_id: "nightly".into(),
+        object_set: Some(ExportObjectSetRequest {
+            format: format.into(),
+            ..export_request(&digest)
+        }),
+        ..Default::default()
+    };
+    let put = |principal: &'static str, definition: ExportDefinition| {
+        let svc = &svc;
+        async move {
+            svc.put_export_definition(with_named_principal(
+                PutExportDefinitionRequest {
+                    definition: Some(definition),
+                },
+                principal,
+            ))
+            .await
+        }
+    };
+    // Saving checks what a run would: no grant, no definition.
+    assert_eq!(
+        put("tester", definition("csv")).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let grant = |revoke: bool| {
+        let svc = &svc;
+        async move {
+            if revoke {
+                svc.revoke_namespace_export(with_named_principal(
+                    RevokeNamespaceExportRequest {
+                        namespace: "exp".into(),
+                        principal: "tester".into(),
+                        reason: "rotation".into(),
+                    },
+                    "root",
+                ))
+                .await
+                .unwrap();
+            } else {
+                svc.grant_namespace_export(with_named_principal(
+                    GrantNamespaceExportRequest {
+                        namespace: "exp".into(),
+                        principal: "tester".into(),
+                        reason: "nightly extract".into(),
+                    },
+                    "root",
+                ))
+                .await
+                .unwrap();
+            }
+        }
+    };
+    grant(false).await;
+    let saved = put("tester", definition("csv"))
+        .await
+        .unwrap()
+        .into_inner()
+        .definition
+        .unwrap();
+    assert_eq!(saved.owner, "tester");
+    assert_eq!(
+        put("tester", definition("csv"))
+            .await
+            .unwrap()
+            .into_inner()
+            .definition
+            .unwrap(),
+        saved
+    );
+    assert_eq!(
+        put("tester", definition("jsonl")).await.unwrap_err().code(),
+        tonic::Code::AlreadyExists
+    );
+    let get = |principal: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.get_export_definition(with_named_principal(
+                GetExportDefinitionRequest {
+                    namespace: "exp".into(),
+                    definition_id: "nightly".into(),
+                },
+                principal,
+            ))
+            .await
+        }
+    };
+    assert_eq!(get("bob").await.unwrap_err().code(), tonic::Code::NotFound);
+    let run = |principal: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.run_export_definition(with_named_principal(
+                RunExportDefinitionRequest {
+                    namespace: "exp".into(),
+                    definition_id: "nightly".into(),
+                },
+                principal,
+            ))
+            .await
+        }
+    };
+    assert_eq!(run("bob").await.unwrap_err().code(), tonic::Code::NotFound);
+    let ran = run("tester").await.unwrap().into_inner();
+    assert_eq!(ran.row_count, 2);
+    let artifact = svc
+        .db
+        .runtime()
+        .get_export_artifact(&ran.receipt_id, now_millis())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        format!("sha256:{:x}", sha2::Sha256::digest(&artifact.bytes)),
+        ran.content_digest
+    );
+    assert_eq!(
+        String::from_utf8(artifact.bytes).unwrap(),
+        "id,title,secret\nt-00000,row,\nt-00001,row,\n"
+    );
+    assert_eq!(
+        receipt_outcome(&svc, &ran.receipt_id).as_deref(),
+        Some("completed")
+    );
+
+    // Revoked: the next run fails closed and leaves a refused receipt.
+    grant(true).await;
+    let refused = run("tester").await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let refused_id = refused
+        .message()
+        .rsplit("receipt ")
+        .next()
+        .unwrap()
+        .trim_end_matches(')')
+        .to_string();
+    assert_eq!(
+        receipt_outcome(&svc, &refused_id).as_deref(),
+        Some("refused")
+    );
+
+    assert!(
+        svc.delete_export_definition(with_named_principal(
+            DeleteExportDefinitionRequest {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .deleted
+    );
+    assert_eq!(
+        get("tester").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+}
+
+#[tokio::test]
+async fn a_pre_schedule_export_definition_can_still_be_deleted() {
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "row").await;
+    let definition = ExportDefinition {
+        namespace: "exp".into(),
+        definition_id: "nightly".into(),
+        owner: "tester".into(),
+        object_set: Some(ExportObjectSetRequest {
+            format: "csv".into(),
+            ..export_request(&digest)
+        }),
+        ..Default::default()
+    };
+    let mut stored = serde_json::to_value(&definition).unwrap();
+    stored.as_object_mut().unwrap().remove("everyMs");
+    svc.db
+        .runtime()
+        .put_export_definition("exp", "nightly", "tester", &stored.to_string())
+        .unwrap();
+    assert!(
+        svc.delete_export_definition(with_named_principal(
+            DeleteExportDefinitionRequest {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .deleted
+    );
+}
+
+#[tokio::test]
+async fn a_scheduled_export_runs_once_per_bucket_and_an_adapter_fetches_then_acks() {
+    use futures_util::StreamExt;
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "row").await;
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "nightly extract".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.put_export_definition(with_named_principal(
+        PutExportDefinitionRequest {
+            definition: Some(ExportDefinition {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+                every_ms: 1_000,
+                object_set: Some(ExportObjectSetRequest {
+                    format: "csv".into(),
+                    ..export_request(&digest)
+                }),
+                ..Default::default()
+            }),
+        },
+        "tester",
+    ))
+    .await
+    .unwrap();
+    let tick = |now_ms: i64| {
+        let svc = &svc;
+        async move {
+            svc.tick_governed_transforms(with_named_principal(
+                TickGovernedTransformsRequest { now_ms },
+                "local",
+            ))
+            .await
+        }
+    };
+    tick(1_500).await.unwrap();
+    tick(1_500).await.unwrap();
+    let listed = svc
+        .list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts;
+    assert_eq!(listed.len(), 1);
+    assert!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .is_empty()
+    );
+    let receipt_id = listed[0].receipt_id.clone();
+    let digest = listed[0].content_digest.clone();
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .fetch_export_artifact(with_named_principal(
+            FetchExportArtifactRequest {
+                receipt_id: receipt_id.clone(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let bytes: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.data.clone()).collect();
+    assert_eq!(format!("sha256:{:x}", sha2::Sha256::digest(&bytes)), digest);
+    assert!(chunks.last().unwrap().done);
+    assert_eq!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: "sha256:deadbeef".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: digest.clone(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .acknowledged
+    );
+    assert!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: digest,
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .acknowledged
+    );
+    assert_eq!(
+        svc.fetch_export_artifact(with_named_principal(
+            FetchExportArtifactRequest {
+                receipt_id: receipt_id.clone(),
+            },
+            "tester",
+        ))
+        .await
+        .err()
+        .unwrap()
+        .code(),
+        tonic::Code::NotFound
+    );
+    assert!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .is_empty()
+    );
+    tick(2_000).await.unwrap();
+    assert_eq!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .len(),
+        1
+    );
+    svc.revoke_namespace_export(with_named_principal(
+        RevokeNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "rotation".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    tick(3_000).await.unwrap();
+    let listed = svc
+        .list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts;
+    assert_eq!(listed.len(), 1);
+}
+
+#[tokio::test]
+async fn a_reused_export_definition_id_does_not_deliver_another_owners_artifact() {
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "row").await;
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "nightly extract".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.put_export_definition(with_named_principal(
+        PutExportDefinitionRequest {
+            definition: Some(ExportDefinition {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+                object_set: Some(ExportObjectSetRequest {
+                    format: "csv".into(),
+                    ..export_request(&digest)
+                }),
+                ..Default::default()
+            }),
+        },
+        "tester",
+    ))
+    .await
+    .unwrap();
+    let ran = svc
+        .run_export_definition(with_named_principal(
+            RunExportDefinitionRequest {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        svc.delete_export_definition(with_named_principal(
+            DeleteExportDefinitionRequest {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .deleted
+    );
+    svc.db
+        .runtime()
+        .put_export_definition(
+            "exp",
+            "nightly",
+            "bob",
+            &serde_json::to_string(&ExportDefinition {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+                owner: "bob".into(),
+                object_set: Some(ExportObjectSetRequest {
+                    format: "csv".into(),
+                    ..export_request(&digest)
+                }),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .is_empty()
+    );
+    let listed = svc
+        .list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].receipt_id, ran.receipt_id);
+    assert_eq!(
+        svc.fetch_export_artifact(with_named_principal(
+            FetchExportArtifactRequest {
+                receipt_id: ran.receipt_id,
+            },
+            "bob",
+        ))
+        .await
+        .err()
+        .unwrap()
+        .code(),
+        tonic::Code::NotFound
+    );
+}
+
+/// #1777: every RPC newly admitted for tenant assertions refuses a namespace
+/// of another tenant before reading or writing it.
+#[tokio::test]
+async fn admitted_tenant_rpcs_refuse_another_tenants_namespace() {
+    tenant_rpcs_refuse_another_tenants_namespace(&enterprise_service()).await;
+}
+
+/// #1613: a PostgreSQL runtime holds the identity extension as SQLite does,
+/// so the same tenant isolation holds at the gRPC boundary.
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+fn postgres_admitted_tenant_rpcs_refuse_another_tenants_namespace() {
+    let scratch = crate::db::ScratchDatabase::create();
+    let postgres = scratch
+        .connect()
+        .with_enterprise_extension(Some(Arc::new(TestEnterpriseExtension)));
+    let db = Arc::new(RuntimeDb::Postgres(Arc::new(postgres)));
+    assert_extension_derives_context(&db);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+                db.clone(),
+            ));
+            tenant_rpcs_refuse_another_tenants_namespace(&svc).await;
+        });
+    drop(db);
+}
+
+async fn tenant_rpcs_refuse_another_tenants_namespace(svc: &SekaiServiceImpl) {
+    let ns = || "denied".to_string();
+    let mut codes = Vec::new();
+    macro_rules! probe {
+        ($name:literal, $call:expr) => {
+            codes.push(($name, $call.await.err().map(|status| status.code())));
+        };
+    }
+    probe!(
+        "PreviewObjectAction",
+        svc.preview_object_action(with_tenant_context(PreviewObjectActionRequest {
+            namespace: ns(),
+            object_id: "obj".into(),
+            type_id: "t".into(),
+            version: "1".into(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "ListGovernedActionTypes",
+        svc.list_governed_action_types(with_tenant_context(ListGovernedActionTypesRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "ExplainDerivation",
+        svc.explain_derivation(with_tenant_context(ExplainDerivationRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "EvaluateObjectSet",
+        svc.evaluate_object_set(with_tenant_context(EvaluateObjectSetRequest {
+            descriptor: Some(ObjectSetDescriptor {
+                contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+                namespace: ns(),
+                kind: "widget".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "GetSourceSyncState",
+        svc.get_source_sync_state(with_tenant_context(GetSourceSyncStateRequest {
+            namespace: ns(),
+            source_instance: "acme/ops".into(),
+            type_digest: crate::sekai::object_sync::GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+        }))
+    );
+    probe!(
+        "ReadObjectChangeSubscription",
+        svc.read_object_change_subscription(with_tenant_context(
+            ReadObjectChangeSubscriptionRequest {
+                scope: Some(ObjectChangeSubscriptionScope {
+                    namespace: ns(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        ))
+    );
+    probe!(
+        "CompareDefinitionRevisions",
+        svc.compare_definition_revisions(with_tenant_context(CompareDefinitionRevisionsRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "QueryObjectPolicyAudit",
+        svc.query_object_policy_audit(with_tenant_context(QueryObjectPolicyAuditRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    for (name, code) in codes {
+        assert_eq!(code, Some(tonic::Code::PermissionDenied), "{name}");
+    }
+    // The same subject, an Action administrator, lists its own tenant's
+    // types: the refusal above is the tenant's.
+    let grant = security::Grant {
+        id: "subject-a-action-admin".into(),
+        object_id: "action".into(),
+        principal: "subject-a".into(),
+        role: security::Role::Admin,
+        created: 0,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&grant).unwrap();
+    svc.security.add_grant(&grant);
+    let own = |namespace: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.list_governed_action_types(with_tenant_context(ListGovernedActionTypesRequest {
+                namespace: namespace.into(),
+                ..Default::default()
+            }))
+            .await
+        }
+    };
+    own("allowed").await.unwrap();
+    assert_eq!(
+        own("denied").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+}

@@ -2,7 +2,12 @@
 set -euo pipefail
 
 container_name="sekai-postgres-reusable-test-$$"
-postgres_port="${SEKAI_TEST_POSTGRES_PORT:-55433}"
+# An ephemeral host port, so two lanes on one machine never share one (#1554).
+free_port() {
+  command -v python3 >/dev/null || { echo "python3 is required to pick an ephemeral PostgreSQL port" >&2; exit 1; }
+  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+postgres_port="${SEKAI_TEST_POSTGRES_PORT:-$(free_port)}"
 postgres_image="${SEKAI_TEST_POSTGRES_IMAGE:-docker.io/library/postgres:17-alpine}"
 certificate_dir="$(mktemp -d "${TMPDIR:-/tmp}/sekai-postgres-reusable.XXXXXX")"
 postgres_password="sekai-test-$$"
@@ -40,6 +45,7 @@ openssl x509 -req -days 1 \
   -out "$certificate_dir/server.crt" >/dev/null 2>&1
 chmod 600 "$certificate_dir/server.key"
 
+start_container() {
 container run --detach --remove \
   --name "$container_name" \
   --publish "127.0.0.1:${postgres_port}:5432" \
@@ -57,6 +63,23 @@ container run --detach --remove \
         -c ssl=on \
         -c ssl_cert_file=/tmp/server.crt \
         -c ssl_key_file=/tmp/server.key' >/dev/null
+}
+# The picked port can be taken before the container binds it; try a fresh
+# one, under a fresh name, unless the port was set explicitly.
+base_name="$container_name"
+for attempt in 1 2 3 4 5; do
+  container_name="$base_name-$attempt"
+  if start_container; then
+    break
+  fi
+  # A failed start can leave the named container behind; drop it.
+  container delete --force "$container_name" >/dev/null 2>&1 || true
+  if [[ -n "${SEKAI_TEST_POSTGRES_PORT:-}" || "$attempt" == 5 ]]; then
+    echo "could not start PostgreSQL on 127.0.0.1:$postgres_port" >&2
+    exit 1
+  fi
+  postgres_port="$(free_port)"
+done
 
 for _ in {1..30}; do
   if container exec "$container_name" pg_isready -U sekai -d sekai_test >/dev/null 2>&1; then
@@ -82,4 +105,8 @@ SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
   cargo test --locked db::postgres::tests::reusable_credentials_exclude_tenant_rows \
+    -- --ignored --nocapture
+SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
+SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
+  cargo test --locked db::postgres::tests::legacy_tenant_tables_are_dropped_and_populated_ones_refuse_startup \
     -- --ignored --nocapture

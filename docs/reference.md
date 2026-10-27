@@ -58,6 +58,8 @@ lives in the separate [research index](research/README.md).
   `chisei-plane` processes, wrong-plane rejection, and the authenticated hop.
 - [Docker](docker.md) — container dest-pair Combined boot, image
   `SEKAI_DATA_DIR`, and transport choices.
+- [Kubernetes on minikube](kubernetes-minikube.md) — StatefulSet manifests,
+  TLS secret, and Tenkai `kubernetes-inprocess` apply.
 - [Operator console](operator-console.md) — authenticated browser shell and
   namespace context.
 - [Evaluation-plan operator CLI](evaluation-operator-cli.md) — safe plan
@@ -73,6 +75,8 @@ lives in the separate [research index](research/README.md).
   fail, missing, and invalid results for versioned quality rules.
 - [Governed geospatial queries](geospatial-queries.md) — authorized spatial
   comparison of named property claims after property grants.
+- [Fenced Ezu geo feed](ezu-geo-feed.md) — incremental object geo changes
+  and GeoArrow backfill into Ezu under a run lease and durable cursor.
 - [Governed transforms](governed-transforms.md) — in-process dataset JobSpec,
   run receipt, Console, and `sekaictl admin transform`.
 - [Team operations](team-operations.md) — namespace bootstrap and operator
@@ -84,8 +88,8 @@ lives in the separate [research index](research/README.md).
 - [Replica conformance adapter](replica-conformance.md) — bounded callable
   shared-state checks for composed local test harnesses.
 - [PostgreSQL parity: Sekai](postgres-sekai-parity.md) and
-  [Chisei](postgres-chisei-parity.md) — supported dual-backend surfaces and
-  SQLite-only exceptions.
+  [Chisei](postgres-chisei-parity.md) — dual-backend surfaces and the remaining
+  shrink-only SQLite-only list.
 
 ## Graph, ontology, and retrieval
 
@@ -121,6 +125,14 @@ lives in the separate [research index](research/README.md).
   operation identity on the inbound span, receipt, and object-change event.
 - [Authorized consumer impact](definition-consumer-impact.md) — registered
   definition-consumer bindings joined to revision comparison.
+- [Ontology lint](ontology-lint.md): structural findings over a namespace
+  under the caller's read policy.
+- [Governed export](governed-export.md): object sets out of the plane
+  under an export grant, with a receipt per export.
+- [RPCs for tenant assertions](tenant-assertion-rpcs.md): which RPCs a
+  tenant-scoped identity assertion may call, and which it may not.
+- [Ontology health](ontology-health.md): a 0-100 score per namespace from
+  freshness, checks, contracts, lint and grants.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
   `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
   hops/aggregates, evaluated through authorized list and traverse.
@@ -128,6 +140,21 @@ lives in the separate [research index](research/README.md).
   objects and dataset metadata under the live read policy.
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   `ExpandNeighborhood` and `FindPaths` under the live read policy at every hop.
+- [Explaining a property value](explain-value.md) — experimental
+  `ExplainValue`: the writes behind one value, each joined to its writer and
+  receipt, with hidden steps reported.
+- [Data catalog](catalog.md) — experimental `RegisterCatalogEntry`.
+- [Ontology changelog](ontology-changelog.md) — experimental
+  `GetOntologyChangelog` for a reader and a window of at most 31 days.
+- [Media uploads](media-uploads.md) — experimental `BeginMediaUpload`,
+  `UploadMediaChunk`, `CompleteMediaUpload`, `GetMediaUpload` and `ReadMedia`.
+- [Offline sync](offline-sync.md) — experimental `PutSyncScope`,
+  `ReadSyncSnapshot` and `ReadSyncDeltas`, contract `sekai.sync/v1`.
+- [Object comments](object-comments.md) — experimental
+  `CreateObjectComment`, `UpdateObjectComment`, `ListObjectComments` and
+  `ListCommentMentions` under the target's read policy.
+- [Trust scores](trust-scores.md) — experimental `PutTrustScoringRule`,
+  `GetTrustScoringRule` and `ScoreObjectTrust`.
 - [Evidence producer contract](action-evidence-producer-contract.md) —
   evidence submission with optional ActionInstance creation.
 - [Inbound object sync](object-sync.md) — authenticated source batches,

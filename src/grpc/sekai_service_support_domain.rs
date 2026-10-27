@@ -406,6 +406,8 @@ pub(super) fn from_proto_governed_action_type(
             pool: proto.review_pool,
             agent_reviewers: proto.review_agent_reviewers,
         },
+        offline_conflict: proto.offline_conflict,
+        last_writer_wins_properties: proto.last_writer_wins_properties,
         enabled: proto.enabled,
         created_by: proto.created_by,
         created_at_ms: proto.created_at_ms,
@@ -449,6 +451,8 @@ pub(super) fn to_proto_governed_action_type(
         review_threshold: domain.review_queue.threshold,
         review_pool: domain.review_queue.pool.clone(),
         review_agent_reviewers: domain.review_queue.agent_reviewers.clone(),
+        offline_conflict: domain.offline_conflict.clone(),
+        last_writer_wins_properties: domain.last_writer_wins_properties.clone(),
         enabled: domain.enabled,
         created_by: domain.created_by.clone(),
         created_at_ms: domain.created_at_ms,
@@ -504,7 +508,62 @@ pub(super) fn to_proto_action_instance(
         review_sla_deadline_ms: domain.review.sla_deadline_ms,
         review_escalated: domain.review.escalated,
         agent_decision: domain.review.agent_decision,
+        marking: domain.marking.clone(),
+        offline: domain.offline.as_ref().map(to_proto_offline_submission),
+        conflict: domain
+            .conflict
+            .as_ref()
+            .map(|conflict| crate::grpc::pb::sekai::ActionConflict {
+                object_id: conflict.object_id.clone(),
+                base_updated_ms: conflict.base_updated_ms,
+                current_updated_ms: conflict.current_updated_ms,
+                properties: conflict.properties.clone(),
+            }),
     }
+}
+fn to_proto_offline_submission(
+    domain: &crate::sekai::offline_action::OfflineSubmission,
+) -> crate::grpc::pb::sekai::OfflineSubmission {
+    crate::grpc::pb::sekai::OfflineSubmission {
+        prepared_at_ms: domain.prepared_at_ms,
+        base_updated_ms: domain.base_updated_ms,
+        base_properties: domain
+            .base_properties
+            .iter()
+            .map(|(name, value)| crate::grpc::pb::sekai::BaseProperty {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        lease_id: domain.lease_id.clone(),
+        device_id: domain.device_id.clone(),
+    }
+}
+/// The offline submission a request carries; the device id comes from the
+/// device-bound assertion, never from the request.
+pub(super) fn from_proto_offline_submission(
+    proto: crate::grpc::pb::sekai::OfflineSubmission,
+    device_id: String,
+) -> Result<crate::sekai::offline_action::OfflineSubmission, Status> {
+    let mut base_properties = std::collections::BTreeMap::new();
+    for property in proto.base_properties {
+        if base_properties
+            .insert(property.name.clone(), property.value)
+            .is_some()
+        {
+            return Err(Status::invalid_argument(format!(
+                "offline base_properties names {} twice",
+                property.name
+            )));
+        }
+    }
+    Ok(crate::sekai::offline_action::OfflineSubmission {
+        prepared_at_ms: proto.prepared_at_ms,
+        base_updated_ms: proto.base_updated_ms,
+        base_properties,
+        lease_id: proto.lease_id,
+        device_id,
+    })
 }
 pub(super) fn to_proto_action_effect(
     domain: &crate::sekai::action_effect::ActionEffect,
@@ -946,6 +1005,12 @@ pub(super) fn to_proto_definition_revision(
     }
 }
 pub(super) fn map_definition_write_error(error: String) -> Status {
+    // Names only blocking bindings, which consumers disclosed by opting in.
+    if error.starts_with("definition_publish_blocked")
+        || error.starts_with(crate::sekai::transform_shadow::REFUSAL_TRANSFORM_SHADOW)
+    {
+        return Status::failed_precondition(error);
+    }
     if error.starts_with("definition_revision_not_found")
         || error.starts_with("definition_branch_not_found")
         || error.starts_with("definition_member_not_found")
@@ -975,7 +1040,12 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("definition_rollback_requires_migration_plan")
     {
         Status::failed_precondition("definition write is not current")
-    } else if error.starts_with("agent_promotion_") {
+    } else if error.starts_with("agent_promotion_")
+        || error.starts_with(crate::sekai::definition_package::REFUSAL_INCOMPATIBLE)
+    {
+        Status::failed_precondition(error)
+    } else if error.starts_with(crate::sekai::ontology_lint::LINT_GATE) {
+        // Names only definition members the merger may already read.
         Status::failed_precondition(error)
     } else if let Some(gate) = error.strip_prefix("compatibility_gate:") {
         Status::failed_precondition(format!("compatibility_gate:{gate}"))
@@ -1024,6 +1094,8 @@ pub(super) fn to_proto_definition_proposal(
         close_reason_code: proposal.close_reason_code.clone(),
         restored_from_digest: proposal.restored_from_digest.clone(),
         migration_plan_digest: proposal.migration_plan_digest.clone(),
+        major_revision: proposal.major_revision,
+        source_package_digest: proposal.source_package_digest.clone(),
     }
 }
 pub(super) fn authorize_proposal_member_writes(
@@ -1575,6 +1647,14 @@ pub(super) fn visible_action_object(
     action: crate::enterprise::NamespaceAction,
 ) -> Result<crate::domain::Object, Status> {
     let unavailable = || Status::permission_denied("object action unavailable");
+    // A refusal reads as unavailable; a dependency that failed stays an
+    // internal error, so a caller can tell it apart and retry.
+    let refused_or_internal = |status: Status| match status.code() {
+        tonic::Code::Internal | tonic::Code::Unavailable => {
+            Status::internal("object visibility unavailable")
+        }
+        _ => unavailable(),
+    };
     let namespace = namespace.trim();
     let object_id = object_id.trim();
     if namespace.is_empty() || object_id.is_empty() {
@@ -1597,7 +1677,7 @@ pub(super) fn visible_action_object(
         &object.namespace,
         action,
     )
-    .map_err(|_| unavailable())?;
+    .map_err(refused_or_internal)?;
     require_visible_object_contents(
         service.db.runtime(),
         &service.security,
@@ -1608,7 +1688,7 @@ pub(super) fn visible_action_object(
         None,
     )
     .map(|(object, _)| object)
-    .map_err(|_| unavailable())
+    .map_err(refused_or_internal)
 }
 pub(super) fn map_object_action_projection_error(
     error: crate::sekai::action_describe_preview::ObjectActionProjectionError,
@@ -1620,6 +1700,9 @@ pub(super) fn map_object_action_projection_error(
         crate::sekai::action_describe_preview::ObjectActionProjectionError::InvalidArgument(
             message,
         ) => Status::invalid_argument(message),
+        crate::sekai::action_describe_preview::ObjectActionProjectionError::Store(_) => {
+            Status::internal("object action store unavailable")
+        }
     }
 }
 pub(super) fn object_action_description_to_proto(
@@ -1670,12 +1753,12 @@ pub(super) fn object_action_preview_to_proto(
 
 fn parse_system_one_json(
     raw: &str,
-) -> Result<Option<sekai_provider::system_one::SystemOneBind>, Status> {
+) -> Result<Option<chisei_provider::system_one::SystemOneBind>, Status> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(None);
     }
-    let bind: sekai_provider::system_one::SystemOneBind =
+    let bind: chisei_provider::system_one::SystemOneBind =
         serde_json::from_str(raw).map_err(|error| {
             Status::invalid_argument(format!("system_one_json must be JSON: {error}"))
         })?;

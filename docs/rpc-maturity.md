@@ -80,6 +80,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.TakeoverExpiredLease` | `sekai.leases` | yes | none | `experimental` |
 | `SekaiService.ApplySourceBatch` | `sekai.object-sync` | yes | example | `stable` |
 | `SekaiService.GetSourceSyncState` | `sekai.object-sync` | yes | example | `stable` |
+| `SekaiService.ListSourceBatchTransactions` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RegisterSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.InspectSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RetireSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
@@ -95,11 +96,23 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.PutDefinitionCertification` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionCertificationGate` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.DryRunAgent` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.RunAgentShadow` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.GetAgentShadowReport` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetPublishedDefinitionRevision` | `sekai.definition-branch` | yes | none | `stable` |
 | `SekaiService.ListPublishedDefinitionRevisions` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ProposeDefinitionRollback` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.ExportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.ImportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.CompareDefinitionRevisions` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ReportDefinitionConsumerImpact` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetOntologyLintReport` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetOntologyHealth` | `sekai.definition-branch, sekai.graph, sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.RecordOntologyHealthSnapshot` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.ListOntologyHealthTrend` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.GenerateDefinitionChangeBundle` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
+| `SekaiService.DryRunDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ApplyDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetDefinitionBundleApply` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ClassifyDefinitionRevisionCompatibility` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ExecuteDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |
@@ -109,11 +122,29 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.DeleteObject` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.ListObjects` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.EvaluateObjectSet` | `sekai.graph` | yes | none | `stable` |
+| `SekaiService.GrantNamespaceExport` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.RevokeNamespaceExport` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ExportObjectSet` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ExportDatasetVersion` | `sekai.dataset, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetExportReceipt` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.PutExportFingerprintPolicy` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetExportFingerprintPolicy` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.TraceExport` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.PutExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.DeleteExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.RunExportDefinition` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListDeliverableExportArtifacts` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.FetchExportArtifact` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.AcknowledgeExportDelivery` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RegisterObjectTypeDatasource` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.Search` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetSearchIndexStatus` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.PutEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ListEmbeddingSpecs` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.DeleteEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
@@ -142,10 +173,11 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.ActivateObjectSecurityPolicies` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityActivation` | `sekai.object-security` | yes | none | `stable` |
-| `SekaiService.PutPurposeAuthorization` | `sekai.object-security` | sqlite only | none | `experimental` |
-| `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | sqlite only | none | `experimental` |
-| `SekaiService.PutClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
-| `SekaiService.GetClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
+| `SekaiService.PutPurposeAuthorization` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.PutClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.GetClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.QueryCounterfactualView` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.FindByExternalId` | `sekai.graph` | yes | none | `stable` |
@@ -155,6 +187,25 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetLinks` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.GetLinkedObjects` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.Traverse` | `sekai.graph` | yes | none | `stable` |
+| `SekaiService.PutTrustScoringRule` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetTrustScoringRule` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ScoreObjectTrust` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.CreateObjectComment` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.UpdateObjectComment` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ListObjectComments` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ListCommentMentions` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetOntologyChangelog` | `sekai.definitions` | yes | none | `experimental` |
+| `SekaiService.RegisterCatalogEntry` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetCatalogEntryLineage` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ListCatalogCriticalityOutbox` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.BeginMediaUpload` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.UploadMediaChunk` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.CompleteMediaUpload` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.GetMediaUpload` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ReadMedia` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.PutSyncScope` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ReadSyncSnapshot` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ReadSyncDeltas` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.FindPaths` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
@@ -179,16 +230,28 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.CreateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.UpdateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.ListDatasets` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.AppendRows` | `sekai.datasets` | sqlite only | host | `stable` |
-| `SekaiService.QueryRows` | `sekai.datasets` | sqlite only | host | `stable` |
+| `SekaiService.AppendRows` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.QueryRows` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.ListDatasetVersions` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetDatasetVersion` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RollbackDataset` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.CreateDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListDatasetBranches` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.DeleteDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.CompareDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ProposeDatasetBranchMerge` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.MergeDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.RunGovernedTransformOnBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ReplayGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetTransformReplay` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ShadowGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutDatasetHealthCheck` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListDatasetHealthChecks` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListDatasetHealthResults` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RunDatasetHealthChecks` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListDatasetAlerts` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListConsumerViolationNotifications` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.AcknowledgeConsumerViolationNotification` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.CreateVirtualTable` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListVirtualTables` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.CreateGrant` | `sekai.authorization` | yes | host | `stable` |
@@ -200,7 +263,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.EnsureTeamNamespace` | `sekai.team-namespaces, sekai.authorization, sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RecordDecision` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListDecisions` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.ListObjectChanges` | `sekai.audit, sekai.graph` | sqlite only | none | `experimental` |
+| `SekaiService.ListObjectChanges` | `sekai.audit, sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ExplainValue` | `sekai.audit, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetAttestation` | `sekai.attestations, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListAttestations` | `sekai.attestations, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.VerifyAttestation` | `sekai.attestations, sekai.audit` | yes | none | `experimental` |
@@ -210,10 +274,22 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.DecideActionInstance` | `sekai.audit` | yes | host, example | `stable` |
-| `SekaiService.PutActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
-| `SekaiService.RunActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
+| `SekaiService.PutActionBinding` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.RunActionBinding` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.PutFenceBinding` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.RunFenceBinding` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.PutEzuGeoFeed` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.RunEzuGeoFeed` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.BackfillEzuGeoFeed` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
+| `SekaiService.CreatePlanIntent` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ProposePlan` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.SimulatePlan` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetPlan` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.SubmitPlanReview` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.DecidePlanReview` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ExecuteActionPlan` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionInstances` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.GetActionEffect` | `sekai.audit` | yes | example | `stable` |
@@ -253,7 +329,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetProvenanceReport` | `sekai.audit, sekai.evidence, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RegisterEvidenceSchema` | `sekai.evidence` | yes | example | `stable` |
 | `SekaiService.ListEvidenceAdapters` | `sekai.evidence` | yes | none | `experimental` |
-| `SekaiService.SubmitEvidence` | `sekai.evidence` | sqlite only | example | `stable` |
+| `SekaiService.SubmitEvidence` | `sekai.evidence` | yes | example | `stable` |
 | `SekaiService.GetEvidenceSubmission` | `sekai.evidence` | yes | none | `experimental` |
 | `SekaiService.ListEvidenceSubmissions` | `sekai.evidence` | yes | none | `experimental` |
 | `SekaiService.CreateHandoff` | `sekai.handoffs` | yes | none | `experimental` |
@@ -261,16 +337,22 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `ChiseiService.EvaluateGovernedSubject` | `chisei.execution` | yes | none | `experimental` |
 | `ChiseiService.ExportGovernedSubjectProvenance` | `chisei.execution` | yes | none | `experimental` |
 | `ChiseiService.ExecuteEvaluationManifest` | `chisei.evaluation` | yes | cli | `stable` |
+| `ChiseiService.RunEvalDataset` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.CompareEvalDatasetRuns` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.ListEvalDatasetRunTrend` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.CancelEvaluationExecution` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.AuthorizeExternalAction` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.TransitionExternalAction` | `chisei.approvals` | yes | example | `stable` |
-| `ChiseiService.RedeemExternalActionPermit` | `chisei.approvals` | sqlite only | example | `stable` |
+| `ChiseiService.RedeemExternalActionPermit` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.SetExternalActionPolicy` | `chisei.approvals` | yes | none | `experimental` |
 | `ChiseiService.RecordUsage` | `chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetBudgetLimit` | `chisei.budget` | yes | none | `stable` |
 | `ChiseiService.DecideGatewayExecution` | `chisei.policy, chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
 | `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.StartPolicyShadow` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.GetPolicyShadowReport` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.StopPolicyShadow` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.ListRoutingProfiles` | `chisei.provider_registry` | yes | none | `experimental` |
 | `ChiseiService.PutRoutingProfile` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.RevokeRoutingProfile` | `chisei.policy` | yes | none | `experimental` |

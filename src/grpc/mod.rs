@@ -21,12 +21,12 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::PrincipalCredential;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
 use crate::plane::ProcessPlane;
 use crate::rpc_maturity::RpcMaturityLayer;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
+use sekai_domain::gateway_keys::hash_gateway_key;
 use std::convert::Infallible;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -44,6 +44,15 @@ const TENANT_CONTEXT_HEADER: &str = "x-sekai-tenant-id";
 /// Caller metadata that the community authentication boundary accepts as
 /// authority-bearing. Tenant hints are stripped and therefore absent here.
 pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization", "x-principal"];
+
+pub(crate) fn write_freeze_status(err: crate::sekai::write_freeze::WriteFreezeError) -> Status {
+    match err {
+        crate::sekai::write_freeze::WriteFreezeError::Frozen(reason) => {
+            Status::failed_precondition(reason)
+        }
+        crate::sekai::write_freeze::WriteFreezeError::Internal(error) => Status::internal(error),
+    }
+}
 
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
@@ -171,7 +180,75 @@ fn assertion_reject_status(reject: crate::identity_assertion::AssertionReject) -
         crate::identity_assertion::AssertionReject::ScopeEscalation => {
             Status::permission_denied("assertion scope escalation")
         }
+        crate::identity_assertion::AssertionReject::Device => {
+            Status::unauthenticated("invalid assertion device claim")
+        }
     }
+}
+
+/// Request metadata carrying a device proof (ADR 0126).
+pub(crate) const DEVICE_PROOF_HEADER: &str = "x-sekai-device-proof";
+
+/// RPCs (`Service/Method`) that check device proofs with
+/// [`require_device_proof`]. Every other RPC refuses a device-bound
+/// assertion outright, so a copied one never authenticates where no proof
+/// is checked. Each entry calls the hook over its own request.
+const DEVICE_PROOF_RPCS: &[&str] = &[
+    // Offline governed Actions (#1580).
+    "sekai.SekaiService/SubmitActionInstance",
+    // Offline sync (#1634).
+    "sekai.SekaiService/PutSyncScope",
+    "sekai.SekaiService/ReadSyncSnapshot",
+    "sekai.SekaiService/ReadSyncDeltas",
+];
+
+/// RPCs a device the issuer revoked may still call: the sync reads, which
+/// answer it only with a wipe instruction (#1634).
+const DEVICE_WIPE_RPCS: &[&str] = &[
+    "sekai.SekaiService/ReadSyncSnapshot",
+    "sekai.SekaiService/ReadSyncDeltas",
+];
+
+/// Whether `rpc` (`Service/Method`) checks device proofs.
+fn checks_device_proof(rpc: &str) -> bool {
+    DEVICE_PROOF_RPCS.contains(&rpc)
+}
+
+/// The device-proof hook for a protected RPC: a request authenticated by a
+/// device-bound assertion must carry the device's proof over this request
+/// (`method` and the encoded message) in [`DEVICE_PROOF_HEADER`]. With
+/// `device_required`, an unbound context is refused too.
+pub(crate) fn require_device_proof<T: prost::Message>(
+    request: &tonic::Request<T>,
+    method: &str,
+    device_required: bool,
+) -> Result<(), Status> {
+    // No authenticated context is an unbound one: it passes unless the RPC
+    // requires a device.
+    let Some(context) = request
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+    else {
+        return if device_required {
+            reject_unauthorized();
+            Err(Status::unauthenticated(
+                "device proof refused: device_unbound",
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    let digest =
+        crate::identity_assertion::request_digest(method, &request.get_ref().encode_to_vec());
+    let proof = request
+        .metadata()
+        .get(DEVICE_PROOF_HEADER)
+        .map(|value| value.to_str().unwrap_or_default());
+    crate::identity_assertion::verify_device_proof(context, &digest, proof, device_required)
+        .map_err(|reject| {
+            reject_unauthorized();
+            Status::unauthenticated(format!("device proof refused: {}", reject.as_str()))
+        })
 }
 
 /// Catalog metadata RPCs a discover-only space role may call.
@@ -186,6 +263,8 @@ fn is_discover_rpc(method: &str) -> bool {
             | "DescribeObjectAction"
             | "DiscoverCapabilities"
             | "Search"
+            | "GetCatalogEntryLineage"
+            | "ListCatalogCriticalityOutbox"
     )
 }
 
@@ -201,6 +280,14 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
                 | "ResolveInvariantSet"
                 | "RetrieveContext"
                 | "DiscoverCapabilities"
+                | "ExplainDerivation"
+                | "CompareDefinitionRevisions"
+                | "QueryObjectPolicyAudit"
+                // Offline sync (#1836) needs namespace read: a scope is the
+                // caller's own definition, not namespace data.
+                | "PutSyncScope"
+                | "ReadSyncSnapshot"
+                | "ReadSyncDeltas"
         )
     {
         crate::enterprise::NamespaceAction::Write
@@ -366,7 +453,8 @@ fn finish_authenticated(
         return Err(Status::permission_denied("enterprise authorization denied"));
     }
     if let Some((_, method)) = rpc_identity::request_rpc_method(&req) {
-        if method == "DecideActionInstance" {
+        // Deciding a parked Action or a whole plan is approval, not write.
+        if matches!(method, "DecideActionInstance" | "DecidePlanReview") {
             authenticated_context
                 .authorize_space_approval()
                 .map_err(|_| Status::permission_denied("space approval denied"))?;
@@ -566,6 +654,28 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                             reject_unauthorized();
                             assertion_reject_status(reject)
                         })?;
+                    if authenticated_context.device.is_some() {
+                        let rpc = rpc_identity::request_rpc_method(&req)
+                            .map(|(service, method)| format!("{service}/{method}"))
+                            .unwrap_or_default();
+                        if !checks_device_proof(&rpc) {
+                            reject_unauthorized();
+                            return Err(Status::unauthenticated(
+                                "device-bound assertions are accepted only by RPCs that check device proofs",
+                            ));
+                        }
+                        if authenticated_context
+                            .device
+                            .as_ref()
+                            .is_some_and(|device| device.wipe)
+                            && !DEVICE_WIPE_RPCS.contains(&rpc.as_str())
+                        {
+                            reject_unauthorized();
+                            return Err(Status::permission_denied(
+                                "the device was revoked and must wipe",
+                            ));
+                        }
+                    }
                     let enterprise_scoped = self.db.runtime().enterprise_extension().is_some()
                         || authenticated_context.tenant.is_some();
                     return finish_authenticated_audited(
@@ -698,12 +808,38 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExpandNeighborhood"
             | "FindPaths"
             | "ListObjectChanges"
+            | "ExplainValue"
             | "GetPublishedDefinitionRevision"
             | "ListPublishedDefinitionRevisions"
             | "GetDefinitionMember"
+            | "GetOntologyLintReport"
+            // Governed export (#1627): the handlers check the export grant and
+            // namespace administration per namespace.
+            | "GrantNamespaceExport"
+            | "RevokeNamespaceExport"
+            | "ExportObjectSet"
+            | "ExportDatasetVersion"
+            | "GetExportReceipt"
+            | "PutExportFingerprintPolicy"
+            | "GetExportFingerprintPolicy"
+            | "TraceExport"
+            | "PutExportDefinition"
+            | "GetExportDefinition"
+            | "DeleteExportDefinition"
+            | "RunExportDefinition"
+            | "ListDeliverableExportArtifacts"
+            | "FetchExportArtifact"
+            | "AcknowledgeExportDelivery"
+            | "GetOntologyHealth"
+            | "RecordOntologyHealthSnapshot"
+            | "ListOntologyHealthTrend"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
             | "DryRunAgent"
+            | "RunAgentShadow"
+            | "GetAgentShadowReport"
+            | "GetCatalogEntryLineage"
+            | "ListCatalogCriticalityOutbox"
             | "GetDefinitionBranch"
             | "CreateDefinitionBranch"
             | "ApplyDefinitionBranchEdit"
@@ -711,10 +847,30 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "CreateDefinitionProposal"
             | "ApproveDefinitionProposal"
             | "MergeDefinitionProposal"
+            // Rollback and package import open proposals under the same
+            // namespace and member grants; export reads like a member read.
+            | "ProposeDefinitionRollback"
+            | "ExportDefinitionPackage"
+            | "ImportDefinitionPackage"
             | "GetGovernedFactVersion"
             | "ResolveInvariantSet"
             | "SubmitActionInstance"
             | "DecideActionInstance"
+            // Offline sync (#1836): each call enforces the caller's tenant on
+            // the scope's namespace, and a device-bound context still needs
+            // its device's proof (ADR 0126).
+            | "PutSyncScope"
+            | "ReadSyncSnapshot"
+            | "ReadSyncDeltas"
+            // Plans (#1675) and their review (#1678): handlers enforce the
+            // tenant context per namespace.
+            | "CreatePlanIntent"
+            | "ProposePlan"
+            | "SimulatePlan"
+            | "GetPlan"
+            | "SubmitPlanReview"
+            | "DecidePlanReview"
+            | "ExecuteActionPlan"
             | "GetActionInstance"
             | "ListActionInstances"
             | "GetActionEffect"
@@ -742,12 +898,30 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListDatasetVersions"
             | "GetDatasetVersion"
             | "RollbackDataset"
+            | "CreateDatasetBranch"
+            | "ListDatasetBranches"
+            | "DeleteDatasetBranch"
+            | "CompareDatasetBranch"
+            | "ProposeDatasetBranchMerge"
+            | "MergeDatasetBranch"
             | "PutDatasetHealthCheck"
             | "ListDatasetHealthChecks"
             | "ListDatasetHealthResults"
             | "RunDatasetHealthChecks"
             | "ListDatasetAlerts"
+            | "ListConsumerViolationNotifications"
+            | "AcknowledgeConsumerViolationNotification"
             | "DescribeObjectAction"
+            // Admitted for tenant assertions (#1777); each handler authorizes
+            // the request's namespace against the assertion's tenant.
+            | "PreviewObjectAction"
+            | "ListGovernedActionTypes"
+            | "ExplainDerivation"
+            | "EvaluateObjectSet"
+            | "GetSourceSyncState"
+            | "ReadObjectChangeSubscription"
+            | "CompareDefinitionRevisions"
+            | "QueryObjectPolicyAudit"
             | "DiscoverCapabilities"
             | "Search"
             | "GetSearchIndexStatus"
@@ -1450,7 +1624,25 @@ pub fn build_services_for_plane(
         ProcessPlane::Sekai => {}
     }
 
-    Ok((Arc::new(sekai_svc), Arc::new(chisei_svc)))
+    let chisei_svc = Arc::new(chisei_svc);
+    if plane == ProcessPlane::Combined {
+        sekai_svc = sekai_svc.with_embedding_route(hosted_embedding_route(chisei_svc.clone()));
+    }
+    Ok((Arc::new(sekai_svc), chisei_svc))
+}
+
+/// The hosted catalog route of a stored embedding spec, admitted as hosted
+/// execution admits it. Combined mode only: it needs the Chisei catalog.
+fn hosted_embedding_route(
+    chisei: Arc<chisei_service::ChiseiServiceImpl>,
+) -> crate::composition::embedding_catch_up::EmbeddingRoute {
+    use crate::sekai::embedding_index::EmbeddingError;
+    Arc::new(move |stored| {
+        let admitted = chisei
+            .hosted_embedder(&stored.spec.namespace, &stored.model)
+            .map_err(|status| EmbeddingError::Refused(status.message().to_string()));
+        Box::pin(async move { admitted })
+    })
 }
 
 fn spawn_service_background_tasks(
@@ -1475,13 +1667,61 @@ fn spawn_service_background_tasks(
         );
     }
     if plane.serves_sekai() {
-        spawn_execution_evidence_reconciler(db);
+        spawn_catalog_reconciler(db.clone());
+        spawn_export_sweeper(db.clone());
+        spawn_execution_evidence_reconciler(db.clone());
     }
     if plane == ProcessPlane::Combined
         && let Some(clerk) = &sekai_svc.cross_store
     {
         spawn_admission_reconciler(clerk.clone());
     }
+    if plane == ProcessPlane::Combined {
+        spawn_embedding_catch_up(db.clone(), chisei_svc.clone());
+    }
+}
+
+/// Embed every stored spec on a schedule (#1609). Combined mode only: it
+/// needs the Sekai change feed and the Chisei route catalog. Safe on every
+/// instance at once; catch-up writes are fenced per spec.
+fn spawn_embedding_catch_up(db: Arc<RuntimeDb>, chisei: Arc<chisei_service::ChiseiServiceImpl>) {
+    use crate::composition::embedding_catch_up::catch_up_stored_specs;
+    use crate::sekai::embedding_index::EmbeddingError;
+    let hosted = hosted_embedding_route(chisei);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let route = |stored| hosted(stored);
+            let now = || chrono::Utc::now().timestamp_millis();
+            // Another pass while any spec has more pending, up to a bound.
+            for _ in 0..8 {
+                let outcomes = match catch_up_stored_specs(&db, &route, &now).await {
+                    Ok(outcomes) => outcomes,
+                    Err(error) => {
+                        tracing::error!(%error, "embedding specs unavailable");
+                        break;
+                    }
+                };
+                let mut more = false;
+                for (stored, outcome) in outcomes {
+                    match outcome {
+                        Ok(report) => more |= report.more,
+                        Err(EmbeddingError::Conflict(_)) => {}
+                        Err(error) => tracing::warn!(
+                            namespace = %stored.spec.namespace,
+                            spec = %stored.spec.id,
+                            %error,
+                            "embedding catch-up failed; retrying next pass"
+                        ),
+                    }
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn spawn_admission_reconciler(
@@ -1504,6 +1744,57 @@ fn spawn_admission_reconciler(
                 Err(error) => {
                     tracing::error!(%error, "admission reservation reconciliation task failed")
                 }
+            }
+        }
+    });
+}
+
+/// Remove expired export artifacts and close exports whose exporter was
+/// lost (#1628, ADR 0130), whether or not anything exports. Safe on every
+/// instance at once: each removal and each close is conditional.
+fn spawn_export_sweeper(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let now = chrono::Utc::now().timestamp_millis();
+                crate::sekai::data_export::recover_abandoned_exports(&db, now)?;
+                crate::sekai::data_export::sweep_expired_artifacts(&db, now)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::error!(%error, "export sweep failed"),
+                Err(error) => tracing::error!(%error, "export sweep task failed"),
+            }
+        }
+    });
+}
+
+/// Keep object-type catalog entries in line with each published ontology
+/// (ADR 0122). Safe on every instance at once.
+fn spawn_catalog_reconciler(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::sekai::catalog::reconcile_ontology_entries(
+                    &db,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(failed)) if failed.is_empty() => {}
+                Ok(Ok(failed)) => {
+                    tracing::warn!(?failed, "catalog reconciliation failed for namespaces")
+                }
+                Ok(Err(error)) => tracing::error!(%error, "catalog reconciliation failed"),
+                Err(error) => tracing::error!(%error, "catalog reconciliation task failed"),
             }
         }
     });
@@ -1790,6 +2081,7 @@ mod tests {
             scopes: vec!["sekai.read".into(), "sekai.write".into()],
             expires_at,
             nonce: nonce.into(),
+            device: None,
         }
     }
 
@@ -1824,6 +2116,14 @@ mod tests {
             NamespaceAction::Discover
         );
         assert_eq!(
+            rpc_namespace_action("GetCatalogEntryLineage"),
+            NamespaceAction::Discover
+        );
+        assert_eq!(
+            rpc_namespace_action("ListCatalogCriticalityOutbox"),
+            NamespaceAction::Discover
+        );
+        assert_eq!(
             rpc_namespace_action("ListDatasetVersions"),
             NamespaceAction::Discover
         );
@@ -1835,6 +2135,18 @@ mod tests {
             rpc_namespace_action("RollbackDataset"),
             NamespaceAction::Write
         );
+        for method in ["ListDatasetBranches", "CompareDatasetBranch"] {
+            assert_eq!(rpc_namespace_action(method), NamespaceAction::Read);
+        }
+        for method in [
+            "CreateDatasetBranch",
+            "DeleteDatasetBranch",
+            "ProposeDatasetBranchMerge",
+            "MergeDatasetBranch",
+        ] {
+            assert_eq!(rpc_namespace_action(method), NamespaceAction::Write);
+            assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
+        }
         assert_eq!(
             rpc_namespace_action("DescribeObjectAction"),
             NamespaceAction::Discover
@@ -1858,6 +2170,8 @@ mod tests {
         for (role, method, allowed) in [
             (SpaceRole::Discoverer, "ListSchemaTypes", true),
             (SpaceRole::Discoverer, "ListDatasets", true),
+            (SpaceRole::Discoverer, "GetCatalogEntryLineage", true),
+            (SpaceRole::Discoverer, "ListCatalogCriticalityOutbox", true),
             (SpaceRole::Discoverer, "ListDatasetVersions", true),
             (SpaceRole::Discoverer, "GetDatasetVersion", false),
             (SpaceRole::Discoverer, "RollbackDataset", false),
@@ -1872,9 +2186,29 @@ mod tests {
             (SpaceRole::Discoverer, "CreateObject", false),
             (SpaceRole::Viewer, "CreateObject", false),
             (SpaceRole::Viewer, "GetObject", true),
+            (SpaceRole::Viewer, "CompareDefinitionRevisions", true),
+            (SpaceRole::Viewer, "PreviewObjectAction", false),
+            (SpaceRole::Editor, "PreviewObjectAction", true),
+            (SpaceRole::Viewer, "GetOntologyLintReport", true),
+            // Data leaving the plane takes space write, not view.
+            (SpaceRole::Viewer, "ExportObjectSet", false),
+            (SpaceRole::Editor, "ExportObjectSet", true),
+            (SpaceRole::Discoverer, "GetOntologyLintReport", false),
+            (SpaceRole::Viewer, "GetOntologyHealth", true),
+            (SpaceRole::Discoverer, "GetOntologyHealth", false),
+            (SpaceRole::Viewer, "ListOntologyHealthTrend", true),
+            (SpaceRole::Viewer, "RecordOntologyHealthSnapshot", false),
+            (SpaceRole::Editor, "RecordOntologyHealthSnapshot", true),
             (SpaceRole::Editor, "CreateObject", true),
             (SpaceRole::Editor, "DecideActionInstance", false),
             (SpaceRole::Approver, "DecideActionInstance", true),
+            (SpaceRole::Editor, "DecidePlanReview", false),
+            (SpaceRole::Approver, "DecidePlanReview", true),
+            (SpaceRole::Viewer, "GetPlan", true),
+            (SpaceRole::Viewer, "SubmitPlanReview", false),
+            (SpaceRole::Editor, "SubmitPlanReview", true),
+            (SpaceRole::Viewer, "ExecuteActionPlan", false),
+            (SpaceRole::Editor, "ExecuteActionPlan", true),
             (SpaceRole::Approver, "CreateObject", false),
             (SpaceRole::Administrator, "CreateObject", true),
         ] {
@@ -2159,6 +2493,7 @@ mod tests {
                     issuer: "https://issuer.test".into(),
                     resource: "https://sekai.test".into(),
                     expires_at: self.expires_at,
+                    device: None,
                 })
             }
 
@@ -2255,6 +2590,44 @@ mod tests {
         assert!(!valid_single_principal(""));
     }
 
+    /// Tenant-callable RPCs (#1777, docs/tenant-assertion-rpcs.md): the
+    /// namespace-scoped ones are admitted, and the global schema and ontology
+    /// calls, which have no namespace to bind a tenant to, are not.
+    #[test]
+    fn tenant_assertions_reach_namespace_scoped_rpcs_only() {
+        for method in [
+            "PreviewObjectAction",
+            "ListGovernedActionTypes",
+            "ExplainDerivation",
+            "EvaluateObjectSet",
+            "GetSourceSyncState",
+            "ReadObjectChangeSubscription",
+            "CompareDefinitionRevisions",
+            "QueryObjectPolicyAudit",
+        ] {
+            assert!(enterprise_namespace_method(method), "{method}");
+        }
+        for method in [
+            // ADR 0111: closing a proposal stays with unscoped credentials.
+            "CloseDefinitionProposal",
+            "CreateSchemaType",
+            "CreateOntologyClass",
+            "CreateOntologyRelation",
+            "ListOntologyClasses",
+            "ListOntologyRelations",
+        ] {
+            assert!(!enterprise_namespace_method(method), "{method}");
+        }
+        assert_eq!(
+            rpc_namespace_action("CompareDefinitionRevisions"),
+            crate::enterprise::NamespaceAction::Read
+        );
+        assert_eq!(
+            rpc_namespace_action("PreviewObjectAction"),
+            crate::enterprise::NamespaceAction::Write
+        );
+    }
+
     #[test]
     fn enterprise_allowlist_includes_governed_facts_and_native_execution() {
         for method in [
@@ -2277,6 +2650,9 @@ mod tests {
             "GetDefinitionBranch",
             "CreateDefinitionBranch",
             "ApplyDefinitionBranchEdit",
+            "ProposeDefinitionRollback",
+            "ExportDefinitionPackage",
+            "ImportDefinitionPackage",
         ] {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
@@ -2299,6 +2675,20 @@ mod tests {
     }
 
     #[test]
+    fn scoped_contexts_reach_offline_sync_with_read_scope() {
+        // Admitted for scoped contexts, and classified as reads, so a
+        // `sekai.read` device assertion passes the credential-scope check.
+        for method in ["PutSyncScope", "ReadSyncSnapshot", "ReadSyncDeltas"] {
+            assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
+            assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
+            assert_eq!(
+                rpc_namespace_action(method),
+                crate::enterprise::NamespaceAction::Read
+            );
+        }
+    }
+
+    #[test]
     fn scoped_transform_reads_preview_and_put_exclude_run() {
         // Reads and preview check namespace read (ADR 0110). Put checks
         // namespace write and dataset read (#1557). Run stays unadmitted.
@@ -2312,10 +2702,14 @@ mod tests {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
         }
-        assert!(!enterprise_namespace_rpc(
-            "sekai.SekaiService",
-            "RunGovernedTransform"
-        ));
+        for method in [
+            "RunGovernedTransform",
+            "RunGovernedTransformOnBranch",
+            "ReplayGovernedTransform",
+            "ShadowGovernedTransform",
+        ] {
+            assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
+        }
     }
 
     #[test]
@@ -2646,5 +3040,73 @@ mod tests {
             "SubmitActionInstance",
         ));
         assert!(interceptor.call(after).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod device_proof_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::Signer as _;
+    use prost::Message as _;
+
+    const METHOD: &str = "/sekai.v1.Sekai/GetObject";
+
+    fn request(
+        device: Option<&ed25519_dalek::SigningKey>,
+        proof: Option<String>,
+    ) -> tonic::Request<sekai_proto::sekai::GetObjectRequest> {
+        let mut context = crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: "device-user".into(),
+                credential_id: "credential".into(),
+            },
+        );
+        context.device = device.map(|key| crate::enterprise::AuthenticatedDevice {
+            id: "device-7".into(),
+            public_key: key.verifying_key().to_bytes(),
+            assertion_nonce: "nonce-1".into(),
+            wipe: false,
+        });
+        let mut request = tonic::Request::new(sekai_proto::sekai::GetObjectRequest {
+            id: "object-1".into(),
+        });
+        request.extensions_mut().insert(context);
+        if let Some(proof) = proof {
+            request
+                .metadata_mut()
+                .insert(DEVICE_PROOF_HEADER, proof.parse().unwrap());
+        }
+        request
+    }
+
+    fn proof(
+        key: &ed25519_dalek::SigningKey,
+        message: &sekai_proto::sekai::GetObjectRequest,
+    ) -> String {
+        let digest = crate::identity_assertion::request_digest(METHOD, &message.encode_to_vec());
+        let input = crate::identity_assertion::device_proof_input("nonce-1", &digest);
+        URL_SAFE_NO_PAD.encode(key.sign(&input).to_bytes())
+    }
+
+    #[test]
+    fn the_hook_checks_the_proof_over_the_request_it_guards() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let message = request(None, None).into_inner();
+        let valid = request(Some(&key), Some(proof(&key, &message)));
+        assert!(require_device_proof(&valid, METHOD, true).is_ok());
+        let other = sekai_proto::sekai::GetObjectRequest {
+            id: "object-2".into(),
+        };
+        let mismatched = request(Some(&key), Some(proof(&key, &other)));
+        assert_eq!(
+            require_device_proof(&mismatched, METHOD, false)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert!(require_device_proof(&request(Some(&key), None), METHOD, false).is_err());
+        assert!(require_device_proof(&request(None, None), METHOD, false).is_ok());
+        assert!(require_device_proof(&request(None, None), METHOD, true).is_err());
     }
 }

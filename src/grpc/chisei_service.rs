@@ -1,4 +1,4 @@
-use crate::db::store::ChiseiEvolveStore;
+use crate::chisei_store::ChiseiEvolveStore;
 use base64::Engine as _;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -38,13 +38,13 @@ use crate::chisei::receipt::{
     GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
     ReceiptEventKind, ReceiptSurface, UncoveredSurface,
 };
+use crate::chisei_store::ChiseiDecisionStore;
 use crate::composition::lookup_first;
 use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::db::store::ChiseiDecisionStore;
 use crate::domain::{ListFilter, Object};
 #[cfg(test)]
 use crate::sekai::action_policy::ActionDecision;
@@ -54,6 +54,7 @@ use crate::sekai::markings;
 mod budget_identity;
 mod content_execution;
 mod context_expansion;
+pub(crate) mod embedding_route;
 mod evaluation_execution_lifecycle;
 mod evaluation_manifest_resolution;
 mod execution_planning;
@@ -83,6 +84,8 @@ mod rpc_execution;
 mod rpc_model_release_evidence;
 #[path = "chisei_service_rpc_model_review.rs"]
 mod rpc_model_review;
+#[path = "chisei_service_rpc_policy_shadow.rs"]
+mod rpc_policy_shadow;
 
 #[cfg(test)]
 use crate::chisei::policy::ContextAdmissionAction;
@@ -118,7 +121,7 @@ pub struct ChiseiServiceImpl {
     pub(super) active_promotions: Arc<ActivePromotions>,
     pub(super) evaluation_execution_lifecycle:
         evaluation_execution_lifecycle::EvaluationExecutionLifecycle,
-    pub(super) db: crate::db::store::ChiseiStore,
+    pub(super) db: crate::chisei_store::ChiseiStore,
     pub(super) config: Config,
     pub(super) provider_registry_state_path: Option<PathBuf>,
     pub(super) sekai_commit_lookup: Option<Arc<dyn crate::chisei::sekai_commit::SekaiCommitLookup>>,
@@ -272,7 +275,7 @@ impl ChiseiServiceImpl {
         }
     }
 
-    pub fn new(db: impl Into<crate::db::store::ChiseiStore>, config: Config) -> Self {
+    pub fn new(db: impl Into<crate::chisei_store::ChiseiStore>, config: Config) -> Self {
         Self::new_with_evaluator_registries(
             db,
             config.clone(),
@@ -290,7 +293,7 @@ impl ChiseiServiceImpl {
     }
 
     pub fn new_with_evaluator_registry(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         config: Config,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
     ) -> Self {
@@ -303,7 +306,7 @@ impl ChiseiServiceImpl {
     }
 
     pub fn new_with_evaluator_registries(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         config: Config,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
         stochastic_evaluator_registry: Arc<
@@ -387,7 +390,7 @@ impl ChiseiServiceImpl {
     }
 
     pub fn with_budget(
-        db: impl Into<crate::db::store::ChiseiStore>,
+        db: impl Into<crate::chisei_store::ChiseiStore>,
         config: Config,
         budget: Arc<BudgetTracker>,
     ) -> Self {
@@ -732,6 +735,27 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_execution::revoke_routing_profile(self, req).await
     }
 
+    async fn start_policy_shadow(
+        &self,
+        req: Request<StartPolicyShadowRequest>,
+    ) -> Result<Response<StartPolicyShadowResponse>, Status> {
+        rpc_policy_shadow::start_policy_shadow(self, req).await
+    }
+
+    async fn get_policy_shadow_report(
+        &self,
+        req: Request<GetPolicyShadowReportRequest>,
+    ) -> Result<Response<GetPolicyShadowReportResponse>, Status> {
+        rpc_policy_shadow::get_policy_shadow_report(self, req).await
+    }
+
+    async fn stop_policy_shadow(
+        &self,
+        req: Request<StopPolicyShadowRequest>,
+    ) -> Result<Response<StopPolicyShadowResponse>, Status> {
+        rpc_policy_shadow::stop_policy_shadow(self, req).await
+    }
+
     async fn set_model_review(
         &self,
         req: Request<SetModelReviewRequest>,
@@ -940,6 +964,27 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ExecuteEvaluationManifestRequest>,
     ) -> Result<Response<ExecuteEvaluationManifestResponse>, Status> {
         rpc_execution::execute_evaluation_manifest(self, req).await
+    }
+
+    async fn run_eval_dataset(
+        &self,
+        req: Request<RunEvalDatasetRequest>,
+    ) -> Result<Response<RunEvalDatasetResponse>, Status> {
+        rpc_execution::run_eval_dataset(self, req).await
+    }
+
+    async fn compare_eval_dataset_runs(
+        &self,
+        req: Request<CompareEvalDatasetRunsRequest>,
+    ) -> Result<Response<CompareEvalDatasetRunsResponse>, Status> {
+        rpc_execution::compare_eval_dataset_runs(self, req).await
+    }
+
+    async fn list_eval_dataset_run_trend(
+        &self,
+        req: Request<ListEvalDatasetRunTrendRequest>,
+    ) -> Result<Response<ListEvalDatasetRunTrendResponse>, Status> {
+        rpc_execution::list_eval_dataset_run_trend(self, req).await
     }
 
     async fn cancel_evaluation_execution(

@@ -183,11 +183,10 @@ Definitions without an ACL entry follow the existing world-readable ACL
 default. Once grants exist for a definition, list operations omit it for
 unauthorized principals. Mutations require ontology, schema, or definition
 administration and append a decision to the tamper-evident audit ledger in the
-same transaction as the definition change. On the community SQLite runtime that
-transaction is local SQLite; on community PostgreSQL the public audited
-mutation RPCs fail closed until dual-backend audit parity lands (see
-[architecture.md](architecture.md#persistence) and
-[postgres-sekai-parity.md](postgres-sekai-parity.md)).
+same transaction as the definition change. Community SQLite and PostgreSQL
+share that audited create and apply path. Experimental
+`DeleteOntologyClass` and `DeleteOntologyRelation` stay on the shrink-only
+SQLite-only list (see [postgres-sekai-parity.md](postgres-sekai-parity.md)).
 
 ## Semantic reads
 
@@ -201,10 +200,9 @@ call rechecks namespace, object ACL, object security, and ontology visibility,
 so hidden classes, relations, and properties do not appear. Computed
 properties stay query-time overlays and are never persisted.
 
-These RPCs are `stable`. Query-time entailment is SQLite-only. Community
-PostgreSQL serves `reasoning_mode=asserted_only` and fails `entailment`
-closed with `FAILED_PRECONDITION`, and `DiscoverCapabilities` on that runtime
-reports `supports_entailment=0` for all three capabilities. See
+These RPCs are `stable`. Query-time entailment runs on SQLite and community
+PostgreSQL (#1320) from the same authorization-filtered ontology snapshot, and
+`DiscoverCapabilities` reports `supports_entailment=1` on both. See
 [integration-contract.md](integration-contract.md).
 
 ## Validation and deletion

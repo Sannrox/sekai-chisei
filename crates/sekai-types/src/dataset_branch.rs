@@ -10,8 +10,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// Rows of a branch or version, in order.
+pub type BranchRows = Vec<std::collections::HashMap<String, String>>;
+/// Computes branch rows from the dataset's column definitions and base rows,
+/// read in the same transaction; an error writes nothing.
+pub type BranchCompute<'a> = dyn Fn(
+        &[crate::dataset::ColumnDef],
+        &[std::collections::HashMap<String, String>],
+    ) -> Result<BranchRows, String>
+    + 'a;
+
+/// Branches named `bundle-*` hold definition change bundle dry runs
+/// (#1692): only the dry run creates them, they are never proposed for
+/// merge, and any redaction or erasure of their dataset deletes them.
+pub const BUNDLE_BRANCH_PREFIX: &str = "bundle-";
+
 pub const BRANCH_NOT_FOUND: &str = "dataset branch not found";
 pub const BRANCH_EXISTS: &str = "dataset branch already exists";
+/// The branch was deleted or recreated since the caller read it.
+pub const BRANCH_CHANGED: &str = "dataset branch changed since it was read";
 pub const BRANCH_NAME_INVALID: &str =
     "dataset branch name must be 1-64 characters of [A-Za-z0-9._-]";
 pub const PROPOSAL_NOT_FOUND: &str = "dataset branch proposal not found";
@@ -82,6 +99,10 @@ pub struct ProposeDatasetBranch {
     pub branch: String,
     pub actor: String,
     pub tenant: String,
+    /// When set, the branch must still be this incarnation, checked in the
+    /// transaction that captures its rows, so a branch recreated under the
+    /// same name is never proposed in its place.
+    pub expected_incarnation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -103,6 +124,9 @@ pub struct DatasetBranchRun {
     /// Input datasets read from the branch; the others read the parent.
     pub branch_inputs: Vec<String>,
     pub markings_out: String,
+    /// What each input read, for a replay's determinism record.
+    #[serde(default)]
+    pub inputs: Vec<crate::transform_replay::ReplayInput>,
 }
 
 /// Branch head against the parent's live rows.

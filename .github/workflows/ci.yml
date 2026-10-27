@@ -7,41 +7,100 @@ on:
   schedule:
     - cron: "27 3 * * 1"
 
+# A new push to a pull request cancels its previous run; main runs every push.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Pull request paths that need the optional lanes; a change elsewhere is
+  # still checked by the run on main.
+  IMAGE_PATHS: '^(build/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
+  TEMPLATE_PATHS: '^(crates/(sekai-connector-template|sekai-source-sdk|sekai-types|sekai-proto)/|src/connector_template\.rs$|scripts/check-connector-template\.sh$|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
 
 jobs:
+  # Whether a pull request needs the image lane. Pushes to main and scheduled
+  # runs take every lane, so anything a path filter misses is caught there.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.scope.outputs.images }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "images=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BASE"...HEAD | grep -Eq "$IMAGE_PATHS"; then
+            echo "images=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "images=false" >> "$GITHUB_OUTPUT"
+          fi
+
   rustfmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: cargo fmt-check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy-all
 
+  # Required check: it computes its own scope rather than needing `changes`,
+  # because a required job skipped after a failed dependency reads as passed.
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test-all
       - run: cargo run -p sekai-source-sdk --example out_of_tree_adapter --locked
       - run: bash scripts/check-source-sdk-api.sh
-      - run: bash scripts/check-connector-template.sh
+      # Reuses this job's target directory, so it stays here.
+      - id: template
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BASE"...HEAD | grep -Eq "$TEMPLATE_PATHS"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.template.outputs.run == 'true'
+        run: bash scripts/check-connector-template.sh
       - run: ./scripts/validate-ontology-deps.sh
+
+  # Not a required check: it runs beside Build & Test, not after it.
+  images:
+    name: Release images
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
       - run: ./build/release-images.sh
       - run: docker run --rm "$(cat _output/image-tag)" sekaictl --help

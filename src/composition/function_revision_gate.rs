@@ -617,7 +617,7 @@ mod tests {
             minimum_mean_score_micros: 800_000,
             expected_label: "systems",
             host: host(),
-            budget: FunctionBudget::default(),
+            budget: FunctionBudget::for_tests(),
         })
         .unwrap()
     }
@@ -764,7 +764,7 @@ mod tests {
             minimum_mean_score_micros: 800_000,
             expected_label: "systems",
             host: host(),
-            budget: FunctionBudget::default(),
+            budget: FunctionBudget::for_tests(),
         })
         .unwrap_err();
         assert!(error.contains("is not in the store"));

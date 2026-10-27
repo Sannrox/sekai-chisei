@@ -1,48 +1,8 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 20,
+  "limit": 9,
   "surfaces": [
-    {
-      "id": "SekaiService.PutPurposeAuthorization",
-      "kind": "rpc",
-      "methods": ["put_purpose_authorization"]
-    },
-    {
-      "id": "SekaiService.RevokePurposeAuthorization",
-      "kind": "rpc",
-      "methods": ["revoke_purpose_authorization"]
-    },
-    {
-      "id": "SekaiService.PutClassificationLattice",
-      "kind": "rpc",
-      "methods": ["put_classification_lattice"]
-    },
-    {
-      "id": "SekaiService.GetClassificationLattice",
-      "kind": "rpc",
-      "methods": ["get_classification_lattice"]
-    },
-    {
-      "id": "SekaiService.PutActionBinding",
-      "kind": "rpc",
-      "methods": ["put_action_binding"]
-    },
-    {
-      "id": "SekaiService.RunActionBinding",
-      "kind": "rpc",
-      "methods": ["get_action_binding", "advance_action_binding_cursor"]
-    },
-    {
-      "id": "SekaiService.AppendRows",
-      "kind": "rpc",
-      "methods": ["append_rows"]
-    },
-    {
-      "id": "SekaiService.QueryRows",
-      "kind": "rpc",
-      "methods": ["query_rows"]
-    },
     {
       "id": "SekaiService.DeleteOntologyClass",
       "kind": "rpc",
@@ -52,25 +12,6 @@
       "id": "SekaiService.DeleteOntologyRelation",
       "kind": "rpc",
       "methods": ["delete_ontology_relation_with_audit"]
-    },
-    {
-      "id": "SekaiService.ListObjectChanges",
-      "kind": "rpc",
-      "methods": ["list_visible_object_changes"]
-    },
-    {
-      "id": "SekaiService.SubmitEvidence",
-      "kind": "rpc",
-      "methods": [
-        "validate_execution_evidence_envelope",
-        "reject_evidence_submission",
-        "record_execution_evidence"
-      ]
-    },
-    {
-      "id": "ChiseiService.RedeemExternalActionPermit",
-      "kind": "rpc",
-      "methods": ["redeem_permit"]
     },
     {
       "id": "admin.warehouse-projection",

@@ -30,6 +30,46 @@ An ungranted property filter or facet fails closed. Dataset metadata
 `ListDatasets` is. Object hits require read. Column classifications the
 caller cannot cover are not matched or returned.
 
+## Hybrid search
+
+`mode: "hybrid"` adds vector candidates to the text candidates and fuses the
+two lists under the one named profile `late_fusion.rrf/v1`: reciprocal rank
+fusion with k = 60, each list weighted by `text_weight` and
+`vector_weight` (both 0 means 1 each; a list weighted 0 adds nothing). Ties
+break by source and id, so a fixed index returns a fixed order. The
+response names the profile in `fusion_profile`. Hybrid search needs text.
+
+Vector candidates come from the embedding index
+([embedding-index.md](embedding-index.md)): every stored spec of the
+requested kinds, or of all kinds when none are named. The query text is
+embedded once per spec through its admitted route, so hybrid search runs in
+combined mode only; elsewhere it fails with `FAILED_PRECONDITION`. A spec
+whose kind's active policy withholds any of its source properties is not
+searched.
+
+The search is exact over the chunk table, on SQLite and PostgreSQL alike (#1682). Chunks whose marking the caller's
+clearance denies are dropped before scoring, and objects rank by their best
+chunk across all searched specs. Before a candidate counts toward the cap
+it must pass the same per-object read policy as text candidates (ACL,
+purpose, compiled object policy) and the live recheck. A vector hit is also
+dropped when the live projection hides one of its source properties, or
+when the object's kind or source text changed since it was embedded: a stale
+vector may carry a value the caller can no longer read. Hidden objects
+therefore never use up the cap, recall is 1.0 over what the caller may
+read, and a filled cap marks the count as a lower bound. A vector hit that
+does not match the text has no highlights. `vector_lag_ms` is the age of the
+oldest object change the searched vectors have not consumed.
+
+Agents reach hybrid search through the MCP tool `sekai.search.query`
+([capability-catalog.md](capability-catalog.md#hybrid-search-tool)), which
+returns object references, never vectors. Each hybrid hit carries its fused
+`score`; text-mode hits carry 0.
+
+Agents reach hybrid search through the MCP tool `sekai.search.query`
+([capability-catalog.md](capability-catalog.md#hybrid-search-tool)), which
+returns object references, never vectors. Each hybrid hit carries its fused
+`score`; text-mode hits carry 0.
+
 ## Status
 
 `GetSearchIndexStatus` is a namespace read. It returns analyzer version,

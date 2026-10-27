@@ -34,7 +34,7 @@
   "provenance": [
     {
       "subject": "ActionInstanceAdmissionModule",
-      "source": "src/sekai/action_instance_admission.rs",
+      "source": "crates/sekai-core/src/sekai/action_instance_admission.rs",
       "locator": "ActionInstanceAdmission/admit/record_admission",
       "confidence": 1.0
     },
@@ -46,7 +46,7 @@
     },
     {
       "subject": "GovernedActionInstance",
-      "source": "src/sekai/action_instance.rs",
+      "source": "crates/sekai-core/src/sekai/action_instance.rs",
       "locator": "ActionInstance",
       "confidence": 1.0
     },
@@ -58,7 +58,7 @@
     },
     {
       "subject": "admits_governed_action_instance",
-      "source": "src/sekai/action_instance_admission.rs",
+      "source": "crates/sekai-core/src/sekai/action_instance_admission.rs",
       "locator": "admit/record_admission",
       "confidence": 1.0
     }

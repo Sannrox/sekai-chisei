@@ -24,7 +24,7 @@ use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
     CreateLinkRequest, DescribeObjectActionRequest, DiscoverCapabilitiesRequest,
     EvaluateObjectSetRequest, GetLinksRequest, GetObjectRequest, Link, PreviewObjectActionRequest,
-    SubmitActionInstanceRequest, SubmitActionInstanceResponse,
+    SearchRequest, SearchResponse, SubmitActionInstanceRequest, SubmitActionInstanceResponse,
 };
 use crate::grpc::sekai_service::SekaiServiceImpl;
 use crate::sekai::capability::CONTRACT_VERSION;
@@ -48,6 +48,31 @@ pub enum NativeRpc {
     CompareDefinitionRevisions,
     ReportDefinitionConsumerImpact,
     CreateDefinitionProposal,
+    Search,
+}
+
+impl NativeRpc {
+    /// The public RPC this tool calls, as the maturity table names it.
+    pub fn rpc_name(self) -> &'static str {
+        match self {
+            Self::GetObject => "GetObject",
+            Self::EvaluateObjectSet => "EvaluateObjectSet",
+            Self::DescribeObjectAction => "DescribeObjectAction",
+            Self::PreviewObjectAction => "PreviewObjectAction",
+            Self::SubmitActionInstance => "SubmitActionInstance",
+            Self::GetOperationReceipt => "GetOperationReceipt",
+            Self::GetLinks => "GetLinks",
+            Self::CreateLink => "CreateLink",
+            Self::ResolveEvaluationPlan => "ResolveEvaluationPlan",
+            Self::ExecuteEvaluationManifest => "ExecuteEvaluationManifest",
+            Self::CreateDefinitionBranch => "CreateDefinitionBranch",
+            Self::ApplyDefinitionBranchEdit => "ApplyDefinitionBranchEdit",
+            Self::CompareDefinitionRevisions => "CompareDefinitionRevisions",
+            Self::ReportDefinitionConsumerImpact => "ReportDefinitionConsumerImpact",
+            Self::CreateDefinitionProposal => "CreateDefinitionProposal",
+            Self::Search => "Search",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +119,12 @@ pub async fn dispatch_native(
     chisei: &ChiseiServiceImpl,
     rpc: NativeRpc,
     invocation: SdkInvocation,
+    experimental_rpcs: bool,
 ) -> Result<Value, AdapterError> {
+    // In-process dispatch skips the gRPC maturity layer, so it applies the
+    // same gate: an experimental RPC stays off unless `experimental_rpcs`.
+    crate::rpc_maturity::require_invokable(rpc.rpc_name(), experimental_rpcs)
+        .map_err(status_error)?;
     match rpc {
         NativeRpc::GetObject => {
             let request = invocation
@@ -290,7 +320,45 @@ pub async fn dispatch_native(
                 .create_definition_proposal(bind_json(&invocation)?)
                 .await,
         ),
+        NativeRpc::Search => Ok(search_references(
+            sekai
+                .search(bind_json::<SearchRequest>(&invocation)?)
+                .await
+                .map_err(status_error)?
+                .into_inner(),
+        )),
     }
+}
+
+/// The search tool's result: one reference per object hit (kind, id, fused
+/// score, and the highlighted fields of the caller's live projection), in
+/// the RPC's order. The Search RPC returns no vectors, so none can leak here.
+pub fn search_references(response: SearchResponse) -> Value {
+    let references = response
+        .hits
+        .into_iter()
+        .filter(|hit| hit.source == "object")
+        .map(|hit| {
+            json!({
+                "type": hit.kind,
+                "id": hit.id,
+                "score": hit.score,
+                "fields": hit
+                    .highlights
+                    .into_iter()
+                    .map(|highlight| (highlight.field, Value::String(highlight.text)))
+                    .collect::<serde_json::Map<_, _>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "references": references,
+        "count": response.count,
+        "count_is_lower_bound": response.count_is_lower_bound,
+        "next_page_token": response.next_page_token,
+        "fusion_profile": response.fusion_profile,
+        "authority": false,
+    })
 }
 
 fn bind_json<T: serde::de::DeserializeOwned + prost::Message + Default>(
@@ -553,6 +621,25 @@ impl NativeSurface for FixtureSurface {
                     "status": "open"
                 }
             })),
+            NativeRpc::Search => {
+                let text = required_string(&invocation.input, "text")?;
+                let hits = self
+                    .objects
+                    .values()
+                    .filter(|object| object.name.contains(&text))
+                    .map(|object| crate::grpc::pb::sekai::SearchHit {
+                        source: "object".into(),
+                        id: object.id.clone(),
+                        kind: object.kind.clone(),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                Ok(search_references(SearchResponse {
+                    count: hits.len() as i64,
+                    hits,
+                    ..Default::default()
+                }))
+            }
         }
     }
 }
@@ -859,6 +946,16 @@ impl NativeSurface for SdkSurface {
                 serde_json::to_value(response)
                     .map_err(|error| AdapterError::Protocol(error.to_string()))
             }
+            NativeRpc::Search => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.search(bind_json::<SearchRequest>(&invocation)?),
+                )
+                .await?;
+                Ok(search_references(response))
+            }
         }
     }
 }
@@ -926,6 +1023,7 @@ fn submit_request(invocation: &SdkInvocation) -> Result<SubmitActionInstanceRequ
         request_id: invocation.operation_id.clone(),
         ontology_digest: json_string(&invocation.input, "ontology_digest", "ontologyDigest")
             .unwrap_or_default(),
+        offline: None,
     })
 }
 

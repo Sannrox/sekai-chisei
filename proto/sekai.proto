@@ -307,6 +307,14 @@ message ObjectChange {
   // Plane-stamped operation identity when the change was produced by a
   // governed action. Empty for mutations that have no bound operation.
   string operation_id = 8;
+  // Who wrote the change (#1690): source_transaction, transform_run,
+  // action_instance, direct, or unattributed when the row records none.
+  string writer_kind = 9;
+  // The source transaction, `run@checkpoint`, or Action instance.
+  string writer_ref = 10;
+  // The writer's durable receipt: source transaction, transform run, or the
+  // Action's operation receipt.
+  string receipt_id = 11;
 }
 
 // A versioned description of an existing native query or retrieval surface.
@@ -546,6 +554,189 @@ message EvaluateObjectSetRequest {
   string page_token = 2;
   int64 required_freshness_ms = 3;
 }
+// Governed export (#1627, ADR 0130). An export grant is a namespace grant
+// on top of read: reading an object set does not entitle a principal to
+// take it out of the plane.
+message NamespaceExportGrant {
+  string namespace = 1;
+  string principal = 2;
+  string granted_by = 3;
+  int64 granted_at_ms = 4;
+  string reason = 5;
+  // Empty while the grant is active.
+  string revoked_by = 6;
+  int64 revoked_at_ms = 7;
+  string revocation_reason = 8;
+}
+message GrantNamespaceExportRequest {
+  string namespace = 1;
+  string principal = 2;
+  string reason = 3;
+}
+message GrantNamespaceExportResponse {
+  NamespaceExportGrant grant = 1;
+}
+message RevokeNamespaceExportRequest {
+  string namespace = 1;
+  string principal = 2;
+  string reason = 3;
+}
+message RevokeNamespaceExportResponse {
+  NamespaceExportGrant grant = 1;
+}
+// Streams an object set as CSV or JSON Lines under the caller's read policy.
+message ExportObjectSetRequest {
+  ObjectSetDescriptor descriptor = 1;
+  // Properties to export, in column order; the object id always comes first.
+  repeated string properties = 2;
+  // csv | jsonl
+  string format = 3;
+}
+// The first message carries the receipt id, later ones the file bytes, and
+// the last one (`done`) the row count and the digest the receipt records.
+// Streams one dataset version as CSV or JSON Lines (#1695), under the same
+// export grant and receipt as ExportObjectSet; the response messages are
+// the same.
+message ExportDatasetVersionRequest {
+  string dataset_id = 1;
+  string version_id = 2;
+  // Columns to export, in order; empty means every column of the dataset.
+  repeated string columns = 3;
+  // csv | jsonl
+  string format = 4;
+}
+// A saved export (#1628): one source, run later for its owner alone. Set
+// exactly one of object_set and dataset_version; their namespace is the
+// definition's.
+message ExportDefinition {
+  string namespace = 1;
+  string definition_id = 2;
+  // Set by the plane: the principal that saved it.
+  string owner = 3;
+  ExportObjectSetRequest object_set = 4;
+  ExportDatasetVersionRequest dataset_version = 5;
+  int64 created_at_ms = 6;
+  // Interval for the transform schedule graph (ADR 0103). Zero is unscheduled.
+  int64 every_ms = 7;
+}
+message PutExportDefinitionRequest {
+  ExportDefinition definition = 1;
+}
+message PutExportDefinitionResponse {
+  ExportDefinition definition = 1;
+}
+message GetExportDefinitionRequest {
+  string namespace = 1;
+  string definition_id = 2;
+}
+message GetExportDefinitionResponse {
+  ExportDefinition definition = 1;
+}
+message DeleteExportDefinitionRequest {
+  string namespace = 1;
+  string definition_id = 2;
+}
+message DeleteExportDefinitionResponse {
+  bool deleted = 1;
+}
+// Runs a saved export now, for its owner alone, into a stored artifact.
+message RunExportDefinitionRequest {
+  string namespace = 1;
+  string definition_id = 2;
+}
+message RunExportDefinitionResponse {
+  // The run's receipt, which keys its artifact.
+  string receipt_id = 1;
+  int64 row_count = 2;
+  string content_digest = 3;
+}
+// Adapter delivery (#1628): completed, unexpired, unacknowledged artifacts.
+message ListDeliverableExportArtifactsRequest {
+  string namespace = 1;
+}
+message DeliverableExportArtifact {
+  string receipt_id = 1;
+  string namespace = 2;
+  string definition_id = 3;
+  string content_digest = 4;
+  int64 created_at_ms = 5;
+  int64 expires_at_ms = 6;
+}
+message ListDeliverableExportArtifactsResponse {
+  repeated DeliverableExportArtifact artifacts = 1;
+}
+message FetchExportArtifactRequest {
+  string receipt_id = 1;
+}
+message AcknowledgeExportDeliveryRequest {
+  // The digest the adapter verified over the fetched bytes.
+  string receipt_id = 1;
+  string content_digest = 2;
+}
+message AcknowledgeExportDeliveryResponse {
+  bool acknowledged = 1;
+}
+// An export's receipt, to its initiating caller or a namespace admin.
+message GetExportReceiptRequest {
+  string operation_id = 1;
+}
+message GetExportReceiptResponse {
+  string operation_id = 1;
+  string namespace = 2;
+  string initiating_actor = 3;
+  // Empty while open, else completed or aborted.
+  string outcome = 4;
+  int64 row_count = 5;
+  string content_digest = 6;
+  int64 started_at_ms = 7;
+  int64 completed_at_ms = 8;
+  // The full receipt (`sekai.governed-export/v1`), JSON.
+  string receipt_json = 9;
+}
+// Fingerprinting for one marking in one namespace (#1466). An empty
+// fingerprint_properties list is off.
+message ExportFingerprintPolicy {
+  string namespace = 1;
+  string marking = 2;
+  repeated string fingerprint_properties = 3;
+  string updated_by = 4;
+  int64 updated_at_ms = 5;
+}
+message PutExportFingerprintPolicyRequest {
+  ExportFingerprintPolicy policy = 1;
+}
+message PutExportFingerprintPolicyResponse {
+  ExportFingerprintPolicy policy = 1;
+}
+message GetExportFingerprintPolicyRequest {
+  string namespace = 1;
+  string marking = 2;
+}
+message GetExportFingerprintPolicyResponse {
+  ExportFingerprintPolicy policy = 1;
+}
+// Scores a leaked fragment against fingerprinted exports in a namespace.
+message TraceExportRequest {
+  string namespace = 1;
+  bytes sample = 2;
+  // csv | jsonl
+  string format = 3;
+}
+message TraceExportMatch {
+  string receipt_id = 1;
+  double score = 2;
+}
+message TraceExportResponse {
+  repeated TraceExportMatch matches = 1;
+}
+message ExportObjectSetChunk {
+  string receipt_id = 1;
+  bytes data = 2;
+  bool done = 3;
+  int64 row_count = 4;
+  // sha256:<hex> of every data byte, in order.
+  string content_digest = 5;
+}
 message ObjectTypeDatasource {
   string contract_version = 1;
   string namespace = 2;
@@ -605,6 +796,12 @@ message SearchRequest {
   string page_token = 6;
   int32 page_size = 7;
   string source = 8;
+  // "" or "text": text candidates only. "hybrid": text and exact vector
+  // candidates, fused by late_fusion.rrf/v1 (reciprocal rank fusion, k=60).
+  string mode = 9;
+  // Hybrid weights per candidate list; both 0 means 1 each.
+  double text_weight = 10;
+  double vector_weight = 11;
 }
 message SearchHighlight {
   string field = 1;
@@ -616,6 +813,8 @@ message SearchHit {
   string kind = 3;
   repeated SearchHighlight highlights = 4;
   bool authority = 5;
+  // Hybrid mode: the late_fusion.rrf/v1 score the hit ranked by. 0 in text mode.
+  double score = 6;
 }
 message SearchFacetValue {
   string value = 1;
@@ -633,6 +832,10 @@ message SearchResponse {
   string next_page_token = 5;
   bool authority = 6;
   int64 lag_ms = 7;
+  // Set in hybrid mode.
+  string fusion_profile = 8;
+  // Age of the oldest object change the searched vectors have not consumed.
+  int64 vector_lag_ms = 9;
 }
 message GetSearchIndexStatusRequest {
   string namespace = 1;
@@ -741,6 +944,26 @@ message TransformRun {
   string trigger_ref = 22;
   repeated TransformPartition input_partitions = 23;
   repeated TransformPartition output_partitions = 24;
+  // Set when dispatch_status is refused: why an extension refused the run
+  // for good (#1701).
+  TransformRunRefusal refusal = 25;
+  // When the run finished; absent while it has not (#1651).
+  optional int64 finished_at_ms = 26;
+  // Measured compute time of a finished run: in-process from the start of
+  // compute until its own output is written (downstream runs it triggers
+  // count on their own), isolated from the latest claim to write-back.
+  // Absent for a run that never computed (failed, refused, cancelled).
+  optional double compute_seconds = 27;
+  // The dataset version each input was read at, by dataset id (#1794). Empty
+  // on runs from before pins and on runs that read nothing.
+  map<string, string> input_versions = 28;
+}
+message TransformRunRefusal {
+  // A short rule name, such as quota_exceeded; reason_withheld when the
+  // extension's reason was malformed or looked secret.
+  string code = 1;
+  // Bounded named values, such as unit, period, limit, usage and estimate.
+  map<string, string> details = 2;
 }
 message TickGovernedTransformsRequest {
   int64 now_ms = 1;
@@ -1155,6 +1378,29 @@ message PutClassificationLatticeRequest { ClassificationLattice lattice = 1; }
 message PutClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 message GetClassificationLatticeRequest { string namespace = 1; }
 message GetClassificationLatticeResponse { ClassificationLattice lattice = 1; }
+// What embedding catch-up embeds in a namespace, and the hosted catalog
+// model route (`hosted.<name>/<model>`) that embeds it (#1609).
+message EmbeddingSpecDefinition {
+  string namespace = 1;
+  string spec_id = 2;
+  string object_kind = 3;
+  repeated string properties = 4;
+  uint32 chunk_chars = 5;
+  uint32 dimension = 6;
+  uint32 batch_size = 7;
+  string model = 8;
+  string updated_by = 9;
+  int64 updated_at_ms = 10;
+}
+message PutEmbeddingSpecRequest { EmbeddingSpecDefinition spec = 1; }
+message PutEmbeddingSpecResponse { EmbeddingSpecDefinition spec = 1; }
+message ListEmbeddingSpecsRequest { string namespace = 1; }
+message ListEmbeddingSpecsResponse { repeated EmbeddingSpecDefinition specs = 1; }
+message DeleteEmbeddingSpecRequest {
+  string namespace = 1;
+  string spec_id = 2;
+}
+message DeleteEmbeddingSpecResponse { bool deleted = 1; }
 message PolicySimulationDifference {
   string principal = 1;
   string object_id = 2;
@@ -1175,6 +1421,268 @@ message SimulateObjectPolicyChangeResponse {
   string current_activation_digest = 2;
   string candidate_digest = 3;
   repeated PolicySimulationDifference differences = 4;
+}
+// Candidate marking rule for a counterfactual view: objects of `kind` whose
+// properties equal every `property_equals` entry carry `marking` instead.
+message CounterfactualMarkingRule {
+  string kind = 1;
+  map<string, string> property_equals = 2;
+  string marking = 3;
+}
+// Read-only: rebuild a namespace's objects as of `as_of_ms` from the recorded
+// change log and compare what each principal could read then with what it
+// could have read under the candidate policies or marking rule. Credential
+// admin only; every call is recorded as a decision.
+message QueryCounterfactualViewRequest {
+  string namespace = 1;
+  int64 as_of_ms = 2;
+  // Narrow the object set. Empty means every kind or every object.
+  string kind = 3;
+  repeated string object_ids = 4;
+  // Replace the policy in effect for each named kind.
+  repeated ObjectSecurityPolicyBinding candidate_policies = 5;
+  CounterfactualMarkingRule candidate_marking_rule = 6;
+  // Empty means the caller.
+  repeated string principals = 7;
+}
+message CounterfactualPrincipalView {
+  string principal = 1;
+  repeated string actual_visible_object_ids = 2;
+  repeated string counterfactual_visible_object_ids = 3;
+  // Visible then, hidden under the candidate.
+  repeated string hidden_object_ids = 4;
+  // Hidden then, visible under the candidate.
+  repeated string revealed_object_ids = 5;
+}
+message QueryCounterfactualViewResponse {
+  string namespace = 1;
+  int64 as_of_ms = 2;
+  string actual_digest = 3;
+  string candidate_digest = 4;
+  repeated CounterfactualPrincipalView views = 5;
+  repeated PolicySimulationDifference differences = 6;
+  // Existed at `as_of_ms` but the log cannot rebuild their values (deleted
+  // since). Left out of both views.
+  repeated string unreconstructable_object_ids = 7;
+  // Digest of the evaluated object set, principals, ACL denials and time.
+  string input_digest = 10;
+  // Digest of the whole report; equal inputs and history give an equal digest.
+  string report_digest = 8;
+  string decision_id = 9;
+}
+// A namespace's trust scoring rule revision (`sekai.trust-scoring-rule/v1`).
+message TrustScoringRuleRevision {
+  string namespace = 1;
+  string rule_json = 2;
+  string revision_digest = 3;
+  uint64 version = 4;
+  string updated_by = 5;
+  int64 updated_at_ms = 6;
+}
+// Credential admin only. Stores a new revision when `expected_revision_digest`
+// names the current one (empty for the first rule); the same revision again
+// is a no-op. Audited in the rule object's change log.
+message PutTrustScoringRuleRequest {
+  string rule_json = 1;
+  string expected_revision_digest = 2;
+}
+message PutTrustScoringRuleResponse { TrustScoringRuleRevision rule = 1; }
+message GetTrustScoringRuleRequest { string namespace = 1; }
+message GetTrustScoringRuleResponse { TrustScoringRuleRevision rule = 1; }
+message TrustReason {
+  string factor = 1;
+  int32 delta = 2;
+  string detail = 3;
+}
+message ObjectTrustScore {
+  string object_id = 1;
+  uint32 score = 2;
+  repeated TrustReason reasons = 3;
+}
+// Score one page of an object set under the namespace's trust scoring rule.
+// Members are read with the caller's authority; signals come from what the
+// caller can see.
+message ScoreObjectTrustRequest {
+  ObjectSetDescriptor descriptor = 1;
+  string page_token = 2;
+  // Omit members scoring below this (0..=100).
+  uint32 min_score = 3;
+  // Highest score first, then object id; otherwise object-set order.
+  bool order_by_score = 4;
+}
+message ScoreObjectTrustResponse {
+  string rule_revision_digest = 1;
+  repeated ObjectTrustScore scores = 2;
+  string next_page_token = 3;
+}
+// A comment on an object, or on one of its properties. Shown only to
+// callers who can read the target object and the property; a body that
+// quoted a property hidden from the caller is redacted, except for its author.
+message ObjectComment {
+  string comment_id = 1;
+  string object_id = 2;
+  // Empty when the comment is on the whole object.
+  string property = 3;
+  string body = 4;
+  string author = 5;
+  repeated string mentions = 6;
+  bool resolved = 7;
+  string resolved_by = 8;
+  int64 created_at_ms = 9;
+  int64 updated_at_ms = 10;
+  // Id of the latest object change-log entry for this comment.
+  string receipt_id = 11;
+}
+// Every mentioned principal must be able to read the object and property.
+message CreateObjectCommentRequest {
+  string object_id = 1;
+  string property = 2;
+  string body = 3;
+  repeated string mentions = 4;
+}
+message CreateObjectCommentResponse { ObjectComment comment = 1; }
+// Edit the body and mentions (author only) and/or resolve or reopen (any
+// reader of the target). `expected_updated_at_ms` must match the stored
+// comment, so a stale writer fails with FAILED_PRECONDITION.
+message UpdateObjectCommentRequest {
+  string comment_id = 1;
+  optional string body = 2;
+  repeated string mentions = 3;
+  optional bool resolved = 4;
+  int64 expected_updated_at_ms = 5;
+}
+message UpdateObjectCommentResponse { ObjectComment comment = 1; }
+message ListObjectCommentsRequest {
+  string object_id = 1;
+  bool include_resolved = 2;
+}
+message ListObjectCommentsResponse {
+  repeated ObjectComment comments = 1;
+  // Comments the caller can see, resolved ones included.
+  int32 total = 2;
+}
+// Comments in `namespace` that mention the caller, on objects the caller can
+// still read.
+message ListCommentMentionsRequest { string namespace = 1; }
+message ListCommentMentionsResponse { repeated ObjectComment comments = 1; }
+// One change in an ontology changelog.
+message OntologyChangelogEntry {
+  string namespace = 1;
+  // definition_revision | policy_activation
+  string change_kind = 2;
+  string revision_digest = 3;
+  string previous_revision_digest = 4;
+  // One plain-language line per change; members the reader cannot read are
+  // left out.
+  repeated string summary = 5;
+  // compatible | conditional | breaking | unknown (definition revisions).
+  string compatibility = 6;
+  string author = 7;
+  repeated string approvers = 8;
+  string published_by = 9;
+  int64 changed_at_ms = 10;
+  string receipt_id = 11;
+  // Registered consumers the reader can see that the change affects.
+  repeated DefinitionConsumerImpactPath affected_consumers = 12;
+  string impact_completeness = 13;
+}
+// Changes in [since_ms, until_ms) (at most 31 days) across `namespaces`, or
+// every namespace the reader holds a role in when empty, oldest first. The
+// reader is the caller, or a team or principal a credential admin names to
+// build its digest; everything is authorized as the reader, so a namespace
+// the reader cannot read contributes nothing.
+message GetOntologyChangelogRequest {
+  repeated string namespaces = 1;
+  int64 since_ms = 2;
+  int64 until_ms = 3;
+  string reader = 4;
+}
+message GetOntologyChangelogResponse {
+  string reader = 1;
+  int64 since_ms = 2;
+  int64 until_ms = 3;
+  repeated OntologyChangelogEntry entries = 4;
+}
+// Register or update the catalog entry a source system owns, keyed by its
+// stable id: one entry per (namespace, entry_kind, source_system, source_id).
+// Needs namespace write. Identical content is a no-op; a marking is only
+// raised; `deprecated` deregisters without deleting. Entries are objects of
+// kind `catalog_entry`, read and searched under the ordinary read policy.
+message RegisterCatalogEntryRequest {
+  string namespace = 1;
+  // dataset | object_type | pipeline | source | service | release | environment
+  string entry_kind = 2;
+  string source_system = 3;
+  string source_id = 4;
+  string display_name = 5;
+  string description = 6;
+  repeated string owners = 7;
+  string steward = 8;
+  repeated string tags = 9;
+  string access_marking = 10;
+  string schema_summary = 11;
+  int64 freshness_ms = 12;
+  bool deprecated = 13;
+  // Optional. Exactly one typed core binding; omitted entries have no lineage.
+  CatalogBinding binding = 14;
+}
+message RegisterCatalogEntryResponse {
+  // Empty when the caller may write the entry but not read it.
+  Object entry = 1;
+  // False when the stored entry already said exactly this.
+  bool changed = 2;
+}
+// Core artifact an entry binds to. kind is dataset | object_type | transform | source.
+message CatalogBinding {
+  string kind = 1;
+  string target_id = 2;
+  // Required when kind is source.
+  string source_type_descriptor_id = 3;
+}
+message CatalogLineageNode {
+  // Empty when redacted: kind only, no id, name or marking.
+  Object entry = 1;
+  bool redacted = 2;
+  string entry_kind = 3;
+}
+message GetCatalogEntryLineageRequest {
+  string namespace = 1;
+  string entry_id = 2;
+  int32 depth = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+message GetCatalogEntryLineageResponse {
+  bool has_binding = 1;
+  repeated CatalogLineageNode upstream = 2;
+  repeated CatalogLineageNode downstream = 3;
+  string next_page_token = 4;
+}
+// Derived and declared criticality exported for the delivery plane (#1688).
+// Discover on the namespace. Events for entries the caller cannot read
+// are omitted. The payload carries criticality, not markings.
+message ListCatalogCriticalityOutboxRequest {
+  string namespace = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+message CatalogCriticalityEvent {
+  string event_id = 1;
+  string namespace = 2;
+  string entry_id = 3;
+  string entry_kind = 4;
+  string source_system = 5;
+  string source_id = 6;
+  string declared = 7;
+  string derived = 8;
+  string effective = 9;
+  string evidence_digest = 10;
+  int64 created_at_ms = 11;
+  int64 seq = 12;
+}
+message ListCatalogCriticalityOutboxResponse {
+  repeated CatalogCriticalityEvent events = 1;
+  string next_page_token = 2;
 }
 message ObjectPolicyAuditEvent {
   string event_id = 1;
@@ -1479,6 +1987,228 @@ message RollbackDatasetResponse {
   repeated Row rows = 2;
 }
 
+// Dataset branches (ADR 0119). The tenant always comes from the caller's
+// authenticated context.
+message DatasetBranch {
+  string dataset_id = 1;
+  string name = 2;
+  string base_version_id = 3;
+  bool written = 4;
+  string created_by = 5;
+  int64 created_at_ms = 6;
+}
+message CreateDatasetBranchRequest {
+  string dataset_id = 1;
+  string name = 2;
+  // Empty forks the dataset's latest version.
+  string from_version_id = 3;
+}
+message CreateDatasetBranchResponse { DatasetBranch branch = 1; }
+message ListDatasetBranchesRequest { string dataset_id = 1; }
+message ListDatasetBranchesResponse { repeated DatasetBranch branches = 1; }
+message DeleteDatasetBranchRequest {
+  string dataset_id = 1;
+  string name = 2;
+}
+message DeleteDatasetBranchResponse {}
+message CompareDatasetBranchRequest {
+  string dataset_id = 1;
+  string name = 2;
+}
+message CompareDatasetBranchResponse {
+  repeated string columns_added = 1;
+  repeated string columns_removed = 2;
+  int64 parent_rows = 3;
+  int64 branch_rows = 4;
+  string parent_digest = 5;
+  string branch_digest = 6;
+}
+message DatasetBranchProposal {
+  string id = 1;
+  string dataset_id = 2;
+  string branch = 3;
+  string parent_version_id = 4;
+  string branch_digest = 5;
+  string proposer = 6;
+  string status = 7;
+  string merged_by = 8;
+  string merged_version_id = 9;
+  string receipt_id = 10;
+  int64 created_at_ms = 11;
+  int64 merged_at_ms = 12;
+}
+message ProposeDatasetBranchMergeRequest {
+  string dataset_id = 1;
+  string name = 2;
+}
+message ProposeDatasetBranchMergeResponse { DatasetBranchProposal proposal = 1; }
+message MergeDatasetBranchRequest {
+  string dataset_id = 1;
+  string proposal_id = 2;
+  string reason = 3;
+}
+message MergeDatasetBranchResponse { DatasetBranchProposal proposal = 1; }
+message RunGovernedTransformOnBranchRequest {
+  string namespace = 1;
+  string transform_id = 2;
+  string branch = 3;
+}
+message RunGovernedTransformOnBranchResponse {
+  string output_dataset_id = 1;
+  int64 rows_written = 2;
+  repeated string branch_inputs = 3;
+  string markings_out = 4;
+}
+// Replay a governed transform over pinned input versions on a fresh branch
+// of its output (#1585). Experimental.
+message ReplayGovernedTransformRequest {
+  string namespace = 1;
+  string transform_id = 2;
+  // Input dataset id to version id; unpinned inputs read the version at
+  // as_of_ms, or their latest when it is 0.
+  map<string, string> input_versions = 3;
+  int64 as_of_ms = 4;
+  // A candidate definition (JSON) to run instead of the stored one.
+  string definition_json = 5;
+  // The output version to diff against; default as for unpinned inputs.
+  string baseline_version_id = 6;
+  // The row key; default the key of an object type backed by the output.
+  string key_column = 7;
+}
+message ReplayInput {
+  string alias = 1;
+  string dataset_id = 2;
+  string version_id = 3;
+  int64 rows = 4;
+  string digest = 5;
+  // Declared columns used; versions do not keep their schema, so these are
+  // the dataset's columns at replay time.
+  repeated string columns = 6;
+}
+message ReplayRowChange {
+  string key = 1;
+  map<string, string> before = 2;
+  map<string, string> after = 3;
+}
+message ReplayDiff {
+  string key_column = 1;
+  repeated string columns_added = 2;
+  repeated string columns_removed = 3;
+  int64 baseline_rows = 4;
+  int64 replay_rows = 5;
+  string baseline_digest = 6;
+  string replay_digest = 7;
+  int64 rows_added = 8;
+  int64 rows_removed = 9;
+  int64 rows_changed = 10;
+  repeated string changed_keys = 11;
+  repeated ReplayRowChange samples = 12;
+  bool reproduced = 13;
+}
+message ReplayDownstream {
+  string dataset_id = 1;
+  string via_transform = 2;
+  repeated string object_types = 3;
+}
+message TransformReplay {
+  string id = 1;
+  string namespace = 2;
+  string transform_id = 3;
+  string output_dataset_id = 4;
+  // Promote by proposing and merging this branch; discard by deleting it.
+  string branch = 5;
+  repeated ReplayInput inputs = 6;
+  string definition_digest = 7;
+  bool candidate = 8;
+  string engine_version = 9;
+  int64 as_of_ms = 10;
+  string baseline_version_id = 11;
+  repeated string non_deterministic = 12;
+  string markings_out = 13;
+  string output_digest = 14;
+  ReplayDiff diff = 15;
+  repeated ReplayDownstream downstream = 16;
+  string actor = 17;
+  int64 created_at_ms = 18;
+}
+message ReplayGovernedTransformResponse { TransformReplay replay = 1; }
+// The stored record: counts and digests, without changed keys or samples.
+message GetTransformReplayRequest { string id = 1; }
+message GetTransformReplayResponse { TransformReplay replay = 1; }
+// Shadow a candidate transform revision against the active one (#1795):
+// one candidate replay per run of the active revision, on the input
+// versions that run pinned, diffed against the output version it wrote.
+// Writes only replay branches. Experimental.
+message ShadowGovernedTransformRequest {
+  string namespace = 1;
+  string transform_id = 2;
+  // The candidate definition (JSON); it keeps the namespace, id and output.
+  string definition_json = 3;
+  // Runs of the active revision to shadow; default its newest runs.
+  repeated string run_ids = 4;
+  // How many newest runs when run_ids is empty: 0 is 10, at most 25.
+  uint32 limit = 5;
+  // The row key; default as for a replay.
+  string key_column = 6;
+  // Also make the namespace require a passing report before a definition
+  // proposal may promote a changed transform (#1796). Once set, it stays.
+  bool require_for_promotion = 7;
+}
+message ShadowRunComparison {
+  string run_id = 1;
+  // Empty when the run was not replayed.
+  string replay_id = 2;
+  string branch = 3;
+  // The output version the active run wrote.
+  string baseline_version_id = 4;
+  // Why the run is not in the totals; empty when it is.
+  string skipped = 5;
+  int64 rows_compared = 6;
+  int64 rows_matched = 7;
+  int64 rows_added = 8;
+  int64 rows_removed = 9;
+  int64 rows_changed = 10;
+  repeated string changed_keys = 11;
+  optional int64 active_compute_ms = 12;
+  optional int64 active_latency_ms = 13;
+  // The candidate replay, start to commit; in-process, so also its compute.
+  int64 shadow_ms = 14;
+}
+message ShadowRowSample {
+  string run_id = 1;
+  ReplayRowChange change = 2;
+}
+message TransformShadowReport {
+  string namespace = 1;
+  string transform_id = 2;
+  string active_definition_digest = 3;
+  string candidate_definition_digest = 4;
+  repeated ShadowRunComparison runs = 5;
+  // Totals over the runs that were not skipped.
+  int64 runs_compared = 6;
+  int64 rows_compared = 7;
+  int64 rows_matched = 8;
+  int64 rows_added = 9;
+  int64 rows_removed = 10;
+  int64 rows_changed = 11;
+  // rows_matched / rows_compared; 1 when nothing was compared.
+  double match_rate = 12;
+  repeated ShadowRowSample samples = 13;
+  int64 active_compute_ms = 14;
+  int64 shadow_compute_ms = 15;
+  // Mean per compared run.
+  int64 active_latency_ms = 16;
+  int64 shadow_latency_ms = 17;
+  // The stored report: counts and digests, without changed keys or samples.
+  string id = 18;
+  // The candidate as a definition member carries it, without schedule or
+  // trigger; promotion checks reports by this digest.
+  string candidate_member_digest = 19;
+  // At least one run was compared.
+  bool passing = 20;
+}
+message ShadowGovernedTransformResponse { TransformShadowReport report = 1; }
+
 message DatasetHealthCheck {
   string dataset_id = 1;
   string check_id = 2;
@@ -1532,6 +2262,33 @@ message DatasetAlert {
 }
 message ListDatasetAlertsRequest { string dataset_id = 1; }
 message ListDatasetAlertsResponse { repeated DatasetAlert alerts = 1; }
+// Caller-scoped deliveries for freshness (#1411) and quality (#681) violations
+// written at commit for bound consumers (#1636). Evidence is stored in full
+// and stripped at read when the caller cannot read the dataset.
+message ConsumerViolationNotification {
+  string event_id = 1;
+  string kind = 2;
+  string namespace = 3;
+  string member_kind = 4;
+  string member_id = 5;
+  string rule_id = 6;
+  string evidence = 7;
+  int64 created_at_ms = 8;
+  int64 acknowledged_at_ms = 9;
+}
+message ListConsumerViolationNotificationsRequest {
+  string page_token = 1;
+  int32 page_size = 2;
+  bool include_acknowledged = 3;
+}
+message ListConsumerViolationNotificationsResponse {
+  repeated ConsumerViolationNotification notifications = 1;
+  string next_page_token = 2;
+}
+message AcknowledgeConsumerViolationNotificationRequest { string event_id = 1; }
+message AcknowledgeConsumerViolationNotificationResponse {
+  ConsumerViolationNotification notification = 1;
+}
 
 message CreateVirtualTableRequest { VirtualTable table = 1; }
 message CreateVirtualTableResponse { VirtualTable table = 1; }
@@ -1566,6 +2323,49 @@ message ListDecisionsRequest { string actor = 1; string action = 2; int64 after 
 message ListDecisionsResponse { repeated Decision decisions = 1; }
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
 message ListObjectChangesResponse { repeated ObjectChange changes = 1; }
+
+// Why one property value is what it is (#1452).
+message ExplainValueRequest {
+  string object_id = 1;
+  // An object property, or `name`.
+  string property = 2;
+  // Explain the value at this time (milliseconds); 0 explains the current value.
+  int64 as_of_ms = 3;
+}
+// One write in the chain.
+message ValueExplanationStep {
+  string change_id = 1;
+  int64 timestamp = 2;
+  string field = 3;
+  // The value this write set, redacted as ListObjectChanges redacts it.
+  string value = 4;
+  // source_transaction, transform_run, action_instance, direct, or unattributed.
+  string writer_kind = 5;
+  // The caller may not read the writer's record. A hidden step carries only
+  // its time, field, value and writer kind.
+  bool hidden = 6;
+  // Source transaction, `run@checkpoint`, or Action instance.
+  string writer_ref = 7;
+  string receipt_id = 8;
+  string changed_by = 9;
+  // The writer's record: source batch and record result, transform run, or
+  // Action instance with its decisions.
+  map<string, string> details = 10;
+}
+message ExplainValueResponse {
+  string object_id = 1;
+  string property = 2;
+  string value = 3;
+  // The object's access marking at the same time.
+  string marking = 4;
+  // Oldest first. The first step of a value set at creation is the creation.
+  repeated ValueExplanationStep steps = 5;
+  repeated ValueExplanationStep marking_steps = 6;
+  // No step is hidden or unattributed, and both values were recorded. The
+  // value an earlier incarnation was created with is not recorded when no
+  // edit followed; it then reads empty and incomplete.
+  bool complete = 7;
+}
 
 message PolicyAttestation {
   string id = 1;
@@ -1643,6 +2443,39 @@ message GovernedActionType {
   int64 review_threshold = 25;
   repeated string review_pool = 26;
   repeated string review_agent_reviewers = 27;
+  // How an Action prepared offline (#1580) meets a bound object that changed
+  // since the device read it: reject_any (empty means this), reject_touched,
+  // or last_writer_wins for last_writer_wins_properties.
+  string offline_conflict = 28;
+  repeated string last_writer_wins_properties = 29;
+}
+// What a device saw when it prepared an Action offline (#1580, ADR 0127).
+message OfflineSubmission {
+  int64 prepared_at_ms = 1;
+  // The bound object's updated time when the device read it.
+  int64 base_updated_ms = 2;
+  // What the device saw for each field the Action writes: its properties,
+  // and `name` when the Action renames. A list, not a map, so the request
+  // re-encodes to the bytes the device proof signed.
+  repeated BaseProperty base_properties = 3;
+  // The offline lease the device prepared under, if any.
+  string lease_id = 4;
+  // Set by the plane from the device-bound assertion; ignored on submit.
+  string device_id = 5;
+}
+// One field as the device saw it. An unset value means it was absent.
+message BaseProperty {
+  string name = 1;
+  optional string value = 2;
+}
+// Why an offline Action was not applied: its object changed past the base.
+message ActionConflict {
+  string object_id = 1;
+  int64 base_updated_ms = 2;
+  int64 current_updated_ms = 3;
+  // Written properties whose current values differ from the base. Empty
+  // under reject_any, which compares versions only.
+  repeated string properties = 4;
 }
 message PutGovernedActionTypeRequest { GovernedActionType type = 1; string request_id = 2; }
 message PutGovernedActionTypeResponse { GovernedActionType type = 1; }
@@ -1695,6 +2528,14 @@ message ActionInstance {
   int64 review_sla_deadline_ms = 22;
   bool review_escalated = 23;
   bool agent_decision = 24;
+  // Derived at admission from the bound object and the binding; reading the
+  // instance needs clearance for it. Empty when unmarked.
+  string marking = 25;
+  // Set when the Action was prepared offline (#1580).
+  OfflineSubmission offline = 26;
+  // Set when an offline Action met a changed object; the instance is denied
+  // with deny_reason offline_conflict.
+  ActionConflict conflict = 27;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;
@@ -1707,6 +2548,9 @@ message SubmitActionInstanceRequest {
   string request_id = 7;
   // Optional ontology binding copied onto operation.receipt/v1. Not parameter data.
   string ontology_digest = 8;
+  // An Action prepared offline (#1580). Needs a device-bound assertion and
+  // the device's proof over this request.
+  OfflineSubmission offline = 9;
 }
 message SubmitActionInstanceResponse {
   ActionInstance instance = 1;
@@ -1764,6 +2608,91 @@ message RunActionBindingResponse {
   // Always false: the subscription and the binding grant nothing.
   bool authority = 6;
 }
+// Ezu geofence-event automation binding (#1564, ADR 0121). binding_json is
+// the sekai.fence-binding/v1 document: namespace, fences, event kinds,
+// collection and object kind, pinned type and version, run_as service
+// principal, and a closed parameter mapping.
+message PutFenceBindingRequest {
+  string binding_json = 1;
+}
+message PutFenceBindingResponse {
+  string binding_json = 1;
+  uint64 revision = 2;
+}
+message RunFenceBindingRequest {
+  string namespace = 1;
+  string binding_id = 2;
+}
+// What one Ezu event became, by its id (lsn, index).
+message FenceBindingSubmission {
+  uint64 lsn = 1;
+  uint32 index = 2;
+  string fence = 3;
+  string entity = 4;
+  string kind = 5;
+  // Empty when the event was skipped.
+  string instance_id = 6;
+  string status = 7;
+  bool replay = 8;
+  string skipped_reason = 9;
+}
+message RunFenceBindingResponse {
+  uint64 binding_revision = 1;
+  repeated FenceBindingSubmission submissions = 2;
+  // The Ezu id the binding has now read through; absent before any event.
+  optional uint64 through_lsn = 3;
+  uint32 through_index = 4;
+  // Age of the oldest event this run read, 0 when there was nothing new.
+  int64 lag_ms = 5;
+  // The run read a full page; more events may be waiting.
+  bool more = 6;
+}
+// Fenced incremental feed of object geo changes into Ezu (#1797).
+// feed_json is the sekai.ezu-geo-feed/v1 document: namespace, object kind,
+// geo property, collection, optional filter fields, and run_as.
+message PutEzuGeoFeedRequest {
+  string feed_json = 1;
+}
+message PutEzuGeoFeedResponse {
+  string feed_json = 1;
+  uint64 revision = 2;
+}
+message RunEzuGeoFeedRequest {
+  string namespace = 1;
+  string feed_id = 2;
+}
+message RunEzuGeoFeedResponse {
+  uint64 feed_revision = 1;
+  uint64 through_seq = 2;
+  uint32 writes = 3;
+  uint32 deletes = 4;
+  uint32 rejected_geometries = 5;
+  uint32 errors = 6;
+  // Age of the oldest change this run read, 0 when there was nothing new.
+  int64 lag_ms = 7;
+  // The run read a full page; more changes may be waiting.
+  bool more = 8;
+}
+// On-demand GeoArrow backfill for an Ezu geo feed (#1798). Captures a
+// namespace change watermark, bulk-upserts live objects of the bound kind
+// through Arrow Flight, then hands the incremental cursor to that watermark
+// so a change between backfill start and complete is not lost.
+message BackfillEzuGeoFeedRequest {
+  string namespace = 1;
+  string feed_id = 2;
+}
+message BackfillEzuGeoFeedResponse {
+  uint64 feed_revision = 1;
+  // Incremental cursor after this page: the captured watermark when the
+  // backfill finished, otherwise the previous cursor.
+  uint64 through_seq = 2;
+  uint32 writes = 3;
+  uint32 rejected_geometries = 4;
+  uint32 errors = 5;
+  // This page was full; more live objects may be waiting.
+  bool more = 6;
+  uint64 backfill_watermark = 7;
+}
 
 // Observational object-bound Action describe/preview (#836).
 // Preview is not a permit. Submit remains SubmitActionInstance.
@@ -1818,6 +2747,191 @@ message PreviewObjectActionResponse {
   // Bind + parameter-body provenance on a valid preview of a bound type.
   string system_one_fill_json = 14;
 }
+
+// --- Intents, proposed plans and simulations (#1675) ---
+
+// A goal with constraints. Created once per caller-supplied intent_id; a
+// retry returns the stored intent, another body under the id is refused.
+message PlanIntent {
+  string namespace = 1;
+  string intent_id = 2;
+  string goal = 3;
+  repeated string constraints = 4;
+  string planner = 5;
+  int64 created_at_ms = 6;
+}
+// One step: an Action type and version applied to one existing object; the
+// preview path is object-bound, so steps are updates. A step a reader may
+// not see keeps its type and loses object_id and parameters_json.
+message PlanStep {
+  string type_id = 1;
+  string version = 2;
+  string object_id = 3;
+  string parameters_json = 4;
+}
+// Ordered steps for an intent; not a DAG.
+message ProposedPlan {
+  string namespace = 1;
+  string plan_id = 2;
+  string intent_id = 3;
+  string planner = 4;
+  repeated PlanStep steps = 5;
+  int64 created_at_ms = 6;
+}
+// The object write a step's Action would make.
+message PlanStepEffect {
+  string object_id = 1;
+  string object_kind = 2;
+  // update: steps act on existing objects.
+  string mutation = 3;
+  // Properties the write sets or changes, sorted; _name for the name.
+  repeated string changed_properties = 4;
+}
+// What PreviewObjectAction predicted for one step. outcome is a preview
+// outcome, or redacted for a step the reader may not see.
+message PlanStepSimulation {
+  uint32 index = 1;
+  string object_id = 2;
+  string object_revision = 3;
+  string outcome = 4;
+  string reason_code = 5;
+  string policy_decision = 6;
+  // The approval the step needs before it may run: none or required.
+  string approval_state = 7;
+  string budget_decision = 8;
+  string failing_criterion = 9;
+  PlanStepEffect effect = 10;
+}
+// One simulation of a plan. digest covers the canonical plan and every
+// step's prediction and object revision, not ids or times.
+message PlanSimulation {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+  string digest = 4;
+  string simulated_by = 5;
+  int64 simulated_at_ms = 6;
+  repeated PlanStepSimulation steps = 7;
+}
+message CreatePlanIntentRequest {
+  string namespace = 1;
+  string intent_id = 2;
+  string goal = 3;
+  repeated string constraints = 4;
+}
+message CreatePlanIntentResponse {
+  PlanIntent intent = 1;
+}
+message ProposePlanRequest {
+  string namespace = 1;
+  string plan_id = 2;
+  string intent_id = 3;
+  repeated PlanStep steps = 4;
+}
+message ProposePlanResponse {
+  ProposedPlan plan = 1;
+}
+// Runs every step through PreviewObjectAction; applies nothing and writes
+// no Action receipt. A retry with a stored simulation_id returns it.
+message SimulatePlanRequest {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+}
+message SimulatePlanResponse {
+  PlanSimulation simulation = 1;
+}
+message GetPlanRequest {
+  string namespace = 1;
+  string plan_id = 2;
+}
+// The plan with its intent and up to 100 simulations, newest first, under
+// the caller's read policy.
+message GetPlanResponse {
+  PlanIntent intent = 1;
+  ProposedPlan plan = 2;
+  repeated PlanSimulation simulations = 3;
+  // Absent until the plan is submitted for review (#1678).
+  PlanReview review = 4;
+  // Absent until execution starts (#1679).
+  PlanExecution execution = 5;
+}
+// One review-queue bundle over a simulated plan (#1678), bound to one stored
+// simulation. decision is empty while pending, else grant or deny.
+message PlanReview {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+  string simulation_digest = 4;
+  // Queues the steps route to, as their Action types would place them.
+  repeated string queue_ids = 5;
+  string submitted_by = 6;
+  int64 submitted_at_ms = 7;
+  string decision = 8;
+  string decided_by = 9;
+  string reason = 10;
+  int64 decided_at_ms = 11;
+}
+message SubmitPlanReviewRequest {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+}
+message SubmitPlanReviewResponse {
+  PlanReview review = 1;
+}
+// One decision for the whole plan. The decider must be able to decide every
+// step as a single parked Action; otherwise the first step beyond their
+// authority is named and nothing is recorded.
+message DecidePlanReviewRequest {
+  string namespace = 1;
+  string plan_id = 2;
+  // The digest of the simulation the review is bound to.
+  string simulation_digest = 3;
+  // grant | deny
+  string decision = 4;
+  string reason = 5;
+}
+message DecidePlanReviewResponse {
+  PlanReview review = 1;
+  bool replay = 2;
+}
+// One executed step of an approved plan (#1679): the Action instance its
+// submit admitted, under idempotency key plan:{plan_id}:step:{index}. A
+// step a reader may not see keeps only its index.
+message PlanStepExecution {
+  uint32 index = 1;
+  string instance_id = 2;
+  string operation_id = 3;
+  string status = 4;
+}
+// Execution of an approved plan. status is running, completed or stopped;
+// a stopped plan names why (plan_not_approved, approver_authority_revoked,
+// simulation_changed, step_refused) and the step it stopped before.
+message PlanExecution {
+  string namespace = 1;
+  string plan_id = 2;
+  string simulation_id = 3;
+  string simulation_digest = 4;
+  string status = 5;
+  uint32 next_step = 6;
+  repeated PlanStepExecution steps = 7;
+  string stop_reason = 8;
+  optional uint32 stopped_at_step = 9;
+  string started_by = 10;
+  int64 updated_at_ms = 11;
+}
+// Runs a granted plan's steps in order as the planner, each parked step
+// decided by the approver, who calls this. Before each step the approver's
+// authority is rechecked and the step is simulated again. A retry, also
+// after a crash, resumes and never applies a step twice.
+message ExecuteActionPlanRequest {
+  string namespace = 1;
+  string plan_id = 2;
+}
+message ExecuteActionPlanResponse {
+  PlanExecution execution = 1;
+}
 message GetActionInstanceRequest {
   string instance_id = 1;
   // Optional alternate lookup when instance_id empty.
@@ -1846,6 +2960,10 @@ message ListActionInstancesRequest {
   string type_id = 2;
   string status = 3;
   uint32 limit = 4;
+  // Only the parked instances the caller may decide, under the checks
+  // DecideActionInstance applies (#1771); `status` is ignored. Those checks
+  // replace the namespace read check: a named approver decides without one.
+  bool decidable_by_caller = 5;
 }
 message ListActionInstancesResponse { repeated ActionInstance instances = 1; }
 
@@ -2576,6 +3694,22 @@ message GetSourceSyncStateResponse {
   bool found = 1;
   SourceSyncState state = 2;
 }
+// A binding's batch transactions, newest first by (opened_at_ms,
+// transaction_id) (#1699). Metadata only, never the batch payload. The page
+// token is an opaque keyset cursor, so batches applied between pages neither
+// repeat nor are skipped.
+message ListSourceBatchTransactionsRequest {
+  string namespace = 1;
+  string source_instance = 2;
+  string type_digest = 3;
+  uint32 page_size = 4; // 0, or anything above 100, returns at most 100
+  string page_token = 5;
+}
+message ListSourceBatchTransactionsResponse {
+  bool found = 1;
+  repeated SourceBatchTransaction transactions = 2;
+  string next_page_token = 3; // empty on the last page
+}
 
 // Additive registered source-type descriptors (ADR 0060 / #818). Inspection
 // returns bounded identity fields only. GitHub Issue/PullRequest stays the
@@ -2740,6 +3874,52 @@ message DryRunAgentResponse {
   repeated DryRunAgentToolCall tool_calls = 3;
   repeated DryRunAgentAction actions = 4;
 }
+
+// #1631 Agent shadows: replay recorded trigger envelopes through DryRunAgent.
+// No live trigger path. Proposed Actions are compared and never submitted.
+message AgentTriggerEnvelope {
+  string id = 1;
+  string input = 2;
+}
+message AgentShadowSample {
+  string envelope_id = 1;
+  string input = 2;
+  repeated DryRunAgentAction active = 3;
+  repeated DryRunAgentAction candidate = 4;
+}
+message AgentShadowReport {
+  string contract_version = 1;
+  string namespace = 2;
+  string member_id = 3;
+  string active_revision_digest = 4;
+  string candidate_revision_digest = 5;
+  string shadow_id = 6;
+  uint32 evaluated = 7;
+  uint32 unchanged = 8;
+  uint32 differed = 9;
+  uint32 cost_tokens = 10;
+  int64 latency_ms = 11;
+  bool passing = 12;
+  string verdict_reason = 13;
+  bool require_for_promotion = 14;
+  repeated AgentShadowSample samples = 15;
+}
+message RunAgentShadowRequest {
+  string namespace = 1;
+  string member_id = 2;
+  string candidate_revision_digest = 3;
+  repeated AgentTriggerEnvelope envelopes = 4;
+  bool require_for_promotion = 5;
+  // Empty means the published revision.
+  string active_revision_digest = 6;
+}
+message RunAgentShadowResponse { AgentShadowReport report = 1; }
+message GetAgentShadowReportRequest {
+  string namespace = 1;
+  string member_id = 2;
+  string candidate_revision_digest = 3;
+}
+message GetAgentShadowReportResponse { AgentShadowReport report = 1; }
 message DefinitionCertificationGate {
   string namespace = 1;
   string revision_digest = 2;
@@ -2819,6 +3999,10 @@ message DefinitionProposal {
   string close_reason_code = 16; // set only after close
   string restored_from_digest = 17; // prior published revision restored by this proposal
   string migration_plan_digest = 18; // pin required when rollback would drop live properties
+  // Approved as a new major revision: may break blocking consumer bindings.
+  bool major_revision = 19;
+  // Package digest of the definition package this proposal imports (#1700).
+  string source_package_digest = 20;
 }
 
 message CreateDefinitionProposalRequest {
@@ -2830,6 +4014,12 @@ message CreateDefinitionProposalRequest {
   repeated string eval_plan_digests = 6;
   repeated string named_foreign_digests = 7;
   string idempotency_key = 8;
+  // Propose a new major revision. Once approved it may break blocking
+  // consumer bindings; the flag is part of the approved proposal digest.
+  bool major_revision = 9;
+  // The change bundle digest this proposal migrates by (#1693). Part of the
+  // approved proposal digest: ApplyDefinitionChangeBundle runs only it.
+  string migration_plan_digest = 10;
 }
 
 message CreateDefinitionProposalResponse {
@@ -2843,6 +4033,14 @@ message GetDefinitionProposalRequest {
 
 message GetDefinitionProposalResponse {
   DefinitionProposal proposal = 1;
+  // Lint findings the candidate introduces over the base (#1687), judged on
+  // the consumer bindings the caller may see. Unsuppressed error findings
+  // block the merge, which judges them on every binding.
+  repeated OntologyLintFinding lint_findings = 2;
+  // False when the caller's consumer bindings were too many to scan; the
+  // findings then judge as if none existed, while the merge gate still
+  // reads them all.
+  bool lint_complete = 3;
 }
 
 message ApproveDefinitionProposalRequest {
@@ -2910,6 +4108,34 @@ message ListPublishedDefinitionRevisionsResponse {
   string next_page_token = 2;
 }
 
+message ExportDefinitionPackageRequest {
+  string namespace = 1;
+  // A published revision; empty exports the published head.
+  string revision_digest = 2;
+}
+
+message ExportDefinitionPackageResponse {
+  // sekai.definition-package/v1 envelope: package, provenance, signature.
+  string envelope_json = 1;
+  string package_digest = 2;
+}
+
+message ImportDefinitionPackageRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string envelope_json = 4;
+  string idempotency_key = 5;
+}
+
+message ImportDefinitionPackageResponse {
+  DefinitionProposal proposal = 1;
+  DefinitionRevisionDiff preview = 2;
+  string source_namespace = 3;
+  string source_revision_digest = 4;
+  string signer_identity = 5;
+}
+
 message ProposeDefinitionRollbackRequest {
   string namespace = 1;
   string branch_id = 2;
@@ -2960,6 +4186,8 @@ message DefinitionConsumerImpactPath {
   string member_id = 4;
   string property = 5;
   string source_locator = 6;
+  // The binding blocks breaking publishes and is disclosed to producers.
+  bool blocking = 7;
 }
 message ReportDefinitionConsumerImpactRequest {
   string namespace = 1;
@@ -2971,6 +4199,278 @@ message ReportDefinitionConsumerImpactResponse {
   string from_revision_digest = 2;
   string to_revision_digest = 3;
   repeated DefinitionConsumerImpactPath impacts = 4;
+}
+
+// Author-declared intent a definition diff cannot show (ADR 0125).
+message DefinitionPropertyRename {
+  string object_type = 1;
+  string from_property = 2;
+  string to_property = 3;
+}
+message DefinitionPropertyDefault {
+  string object_type = 1;
+  string property = 2;
+  // Value existing objects get for a new required property.
+  string value = 3;
+}
+// Ontology lint (#1454): structural findings over one namespace's published
+// definition and what the caller may see of its data. Experimental.
+message GetOntologyLintReportRequest {
+  string namespace = 1;
+  // Empty lints the published definition. Set, it lints the head of that
+  // draft branch (#1461). A server without branch lint ignores this field and
+  // lints the published revision; compare revision_digest with the branch head.
+  string branch_id = 2;
+}
+message OntologyLintFinding {
+  // orphan_object_type | orphan_object | unowned_object_type |
+  // unowned_link_type | broad_marking_applied | broad_marking_granted |
+  // action_type_never_run | unreferenced_property
+  string rule = 1;
+  // object_type | link_type | object | marking | action_type | property
+  // (subject_id is then the object type, and property the property)
+  string subject_kind = 2;
+  string subject_id = 3;
+  // error | warning | info
+  string severity = 4;
+  string detail = 5;
+  // A suppression in the subject's definition covers the finding (#1684).
+  bool suppressed = 6;
+  string suppression_reason = 7;
+  string property = 8;
+}
+message GetOntologyLintReportResponse {
+  string revision_digest = 1;
+  // Sorted by rule, then subject.
+  repeated OntologyLintFinding findings = 2;
+  // False when the object scan was cut short (the object rules were skipped)
+  // or findings past the cap were dropped.
+  bool complete = 3;
+}
+message GetOntologyHealthRequest {
+  // Empty scores every namespace with a published definition that the
+  // caller may read (its tenant's, under an enterprise context).
+  string namespace = 1;
+}
+message OntologyHealthProblem {
+  // dataset | binding | grant | object_type | link_type | object | marking |
+  // action_type
+  string subject_kind = 1;
+  string subject_id = 2;
+  // What is wrong: stale, check_failed, member_removed, property_removed,
+  // unverifiable, expired, unreviewed, or a lint rule.
+  string code = 3;
+}
+message OntologyHealthPart {
+  // freshness | quality | contract | lint | trust | access
+  string part = 1;
+  // False when the server cannot compute the part or the caller may not see
+  // it; unavailable_reason says which, and the part leaves the total.
+  bool available = 2;
+  // 0-100, higher is healthier.
+  uint32 score = 3;
+  string unavailable_reason = 4;
+  // The top contributing problems, at most ten.
+  repeated OntologyHealthProblem problems = 5;
+  // False when the inputs were capped, so the score may be too high.
+  bool complete = 6;
+}
+message NamespaceHealth {
+  string namespace = 1;
+  // The lowest available part; absent when no part is available.
+  optional uint32 score = 2;
+  repeated OntologyHealthPart parts = 3;
+}
+message GetOntologyHealthResponse {
+  // The lowest namespace score; absent when no namespace has one.
+  optional uint32 score = 1;
+  repeated NamespaceHealth namespaces = 2;
+  // False when more namespaces matched than one request scores.
+  bool complete = 3;
+}
+// Records one health snapshot of a namespace for the current window
+// (#1694). An external periodic caller drives it; the plane runs no
+// scheduler. The caller's schedule carries the window, retention and
+// threshold.
+message RecordOntologyHealthSnapshotRequest {
+  string namespace = 1;
+  // Window length; the snapshot belongs to the window holding the current
+  // time. At least one minute.
+  int64 window_ms = 2;
+  // Snapshots of windows that started longer ago are pruned. At least one
+  // window.
+  int64 retention_ms = 3;
+  // 0-100: a total that falls below it writes one threshold event.
+  uint32 threshold = 4;
+}
+message OntologyHealthPartScore {
+  // freshness | quality | contract | lint | trust | access
+  string part = 1;
+  // Absent when the part was unavailable when recorded.
+  optional uint32 score = 2;
+  // False when the inputs were capped, so the score may be too high.
+  bool complete = 3;
+}
+message OntologyHealthSnapshot {
+  string namespace = 1;
+  int64 window_start_ms = 2;
+  int64 window_ms = 3;
+  int64 recorded_at_ms = 4;
+  uint32 threshold = 5;
+  // Only the parts the reader may see now.
+  repeated OntologyHealthPartScore parts = 6;
+  // The lowest score of `parts`; absent when none has one.
+  optional uint32 score = 7;
+}
+message OntologyHealthEvent {
+  string namespace = 1;
+  int64 window_start_ms = 2;
+  // below_threshold
+  string kind = 3;
+  uint32 score = 4;
+  uint32 threshold = 5;
+  int64 emitted_at_ms = 6;
+}
+message RecordOntologyHealthSnapshotResponse {
+  OntologyHealthSnapshot snapshot = 1;
+  // True when this window was already recorded; nothing was written.
+  bool replay = 2;
+  // The threshold event this record wrote, if any.
+  optional OntologyHealthEvent event = 3;
+}
+message ListOntologyHealthTrendRequest {
+  string namespace = 1;
+}
+message ListOntologyHealthTrendResponse {
+  // Oldest first, within the retention of the latest record.
+  repeated OntologyHealthSnapshot snapshots = 1;
+  // Only events whose snapshot the reader may see in full.
+  repeated OntologyHealthEvent events = 2;
+}
+message DefinitionPropertyRef {
+  string object_type = 1;
+  string property = 2;
+}
+message DefinitionChangeHints {
+  repeated DefinitionPropertyRename renames = 1;
+  repeated DefinitionPropertyDefault defaults = 2;
+  repeated DefinitionPropertyRef type_changes = 3;
+}
+// kind: rename_property, default_required_property, drop_property,
+// type_change, or remove_object_type. Manual steps carry a reason code.
+message DefinitionMigrationStep {
+  string kind = 1;
+  string object_type = 2;
+  string property = 3;
+  string from_property = 4;
+  string default_value = 5;
+  bool manual = 6;
+  string reason = 7;
+}
+// mode: copy from the source property, or default to the source literal.
+message DefinitionBackfillAssignment {
+  string object_type = 1;
+  string property = 2;
+  string mode = 3;
+  string source = 4;
+}
+message GenerateDefinitionChangeBundleRequest {
+  string namespace = 1;
+  string from_revision_digest = 2;
+  string to_revision_digest = 3;
+  DefinitionChangeHints hints = 4;
+}
+// Read-only: generation publishes, writes, and runs nothing.
+message GenerateDefinitionChangeBundleResponse {
+  string contract_version = 1;
+  string bundle_digest = 2;
+  DefinitionRevisionDiff diff = 3;
+  repeated DefinitionMigrationStep steps = 4;
+  string backfill_contract = 5;
+  repeated DefinitionBackfillAssignment backfill = 6;
+  // Caller-scoped; outside bundle_digest.
+  ReportDefinitionConsumerImpactResponse impact = 7;
+}
+
+// Run a change bundle's backfill on a dataset branch per backed object type
+// (#1692). Writes only branches named for the bundle digest, never the
+// datasets themselves; a rerun converges on the same branch rows.
+message DryRunDefinitionChangeBundleRequest {
+  string namespace = 1;
+  string from_revision_digest = 2;
+  string to_revision_digest = 3;
+  DefinitionChangeHints hints = 4;
+  // When set, the regenerated bundle must still have this digest.
+  string bundle_digest = 5;
+}
+message DefinitionBackfillSample {
+  string key = 1;
+  map<string, string> before = 2;
+  map<string, string> after = 3;
+}
+message DefinitionBackfillDryRun {
+  string object_type = 1;
+  string dataset_id = 2;
+  string branch = 3;
+  int64 rows = 4;
+  int64 rows_changed = 5;
+  repeated DefinitionBackfillSample samples = 6;
+  // True when the caller may not read the dataset's marking: counts only.
+  bool samples_withheld = 7;
+}
+message DryRunDefinitionChangeBundleResponse {
+  string bundle_digest = 1;
+  repeated DefinitionBackfillDryRun runs = 2;
+  // Object types with a backfill but no backing dataset to run it on.
+  repeated string unbacked_object_types = 3;
+}
+
+// Applies an approved proposal's change bundle (#1693): for each dataset
+// backing a backfilled object type, backfill its bundle branch, verify it,
+// and merge it; then publish the proposal's revision, last. A rerun resumes
+// the same apply.
+message ApplyDefinitionChangeBundleRequest {
+  string namespace = 1;
+  // The proposal pins the base and candidate revisions the bundle spans.
+  string proposal_id = 2;
+  DefinitionChangeHints hints = 3;
+  // The bundle the reviewers approved; the regenerated bundle must match.
+  string bundle_digest = 4;
+  // The published head the final publish compare-and-swaps against.
+  string expected_published_digest = 5;
+}
+message DefinitionBundleApplyStep {
+  // backfill:<dataset>, verify:<dataset>, merge:<dataset>, or publish.
+  string name = 1;
+  // pending, done, or failed.
+  string status = 2;
+  // What the step left: the branch, the dataset merge proposal (which names
+  // the merged version), the published digest; or the error.
+  string detail = 3;
+}
+message DefinitionBundleApply {
+  string contract_version = 1;
+  string namespace = 2;
+  string proposal_id = 3;
+  string bundle_digest = 4;
+  // running, failed, or completed.
+  string status = 5;
+  repeated DefinitionBundleApplyStep steps = 6;
+  string failed_step = 7;
+  string error = 8;
+  string applied_by = 9;
+  int64 created_at_ms = 10;
+  int64 updated_at_ms = 11;
+}
+message ApplyDefinitionChangeBundleResponse {
+  DefinitionBundleApply apply = 1;
+}
+message GetDefinitionBundleApplyRequest {
+  string namespace = 1;
+  string proposal_id = 2;
+}
+message GetDefinitionBundleApplyResponse {
+  DefinitionBundleApply apply = 1;
 }
 
 message DefinitionCompatibilityReason {
@@ -3132,6 +4632,7 @@ service SekaiService {
   rpc TakeoverExpiredLease(TakeoverExpiredLeaseRequest) returns (TakeoverExpiredLeaseResponse);
   rpc ApplySourceBatch(ApplySourceBatchRequest) returns (ApplySourceBatchResponse);
   rpc GetSourceSyncState(GetSourceSyncStateRequest) returns (GetSourceSyncStateResponse);
+  rpc ListSourceBatchTransactions(ListSourceBatchTransactionsRequest) returns (ListSourceBatchTransactionsResponse);
   rpc RegisterSourceTypeDescriptor(RegisterSourceTypeDescriptorRequest) returns (RegisterSourceTypeDescriptorResponse);
   rpc InspectSourceTypeDescriptor(InspectSourceTypeDescriptorRequest) returns (InspectSourceTypeDescriptorResponse);
   rpc RetireSourceTypeDescriptor(RetireSourceTypeDescriptorRequest) returns (RetireSourceTypeDescriptorResponse);
@@ -3146,12 +4647,31 @@ service SekaiService {
   rpc PutDefinitionCertification(PutDefinitionCertificationRequest) returns (PutDefinitionCertificationResponse);
   rpc GetDefinitionCertificationGate(GetDefinitionCertificationGateRequest) returns (GetDefinitionCertificationGateResponse);
   rpc DryRunAgent(DryRunAgentRequest) returns (DryRunAgentResponse);
+  rpc RunAgentShadow(RunAgentShadowRequest) returns (RunAgentShadowResponse);
+  rpc GetAgentShadowReport(GetAgentShadowReportRequest) returns (GetAgentShadowReportResponse);
   rpc CloseDefinitionProposal(CloseDefinitionProposalRequest) returns (CloseDefinitionProposalResponse);
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc ListPublishedDefinitionRevisions(ListPublishedDefinitionRevisionsRequest) returns (ListPublishedDefinitionRevisionsResponse);
   rpc ProposeDefinitionRollback(ProposeDefinitionRollbackRequest) returns (ProposeDefinitionRollbackResponse);
+  // Signed, namespace-independent definition packages (#1700). Export signs
+  // a published revision with this plane's package key; import verifies the
+  // envelope against this plane's trusted package keys and opens a proposal.
+  rpc ExportDefinitionPackage(ExportDefinitionPackageRequest) returns (ExportDefinitionPackageResponse);
+  rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
+  rpc GetOntologyLintReport(GetOntologyLintReportRequest) returns (GetOntologyLintReportResponse);
+  rpc GetOntologyHealth(GetOntologyHealthRequest) returns (GetOntologyHealthResponse);
+  rpc RecordOntologyHealthSnapshot(RecordOntologyHealthSnapshotRequest)
+      returns (RecordOntologyHealthSnapshotResponse);
+  rpc ListOntologyHealthTrend(ListOntologyHealthTrendRequest)
+      returns (ListOntologyHealthTrendResponse);
+  rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
+  rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
+  // Experimental: apply an approved proposal's change bundle, resumably (#1693).
+  rpc ApplyDefinitionChangeBundle(ApplyDefinitionChangeBundleRequest) returns (ApplyDefinitionChangeBundleResponse);
+  rpc GetDefinitionBundleApply(GetDefinitionBundleApplyRequest) returns (GetDefinitionBundleApplyResponse);
+  rpc GetOntologyChangelog(GetOntologyChangelogRequest) returns (GetOntologyChangelogResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);
   rpc ExecuteDefinitionFactMigration(ExecuteDefinitionFactMigrationRequest) returns (ExecuteDefinitionFactMigrationResponse);
   rpc GetDefinitionFactMigration(GetDefinitionFactMigrationRequest) returns (GetDefinitionFactMigrationResponse);
@@ -3161,6 +4681,21 @@ service SekaiService {
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc EvaluateObjectSet(EvaluateObjectSetRequest) returns (EvaluateObjectSetResponse);
+  rpc GrantNamespaceExport(GrantNamespaceExportRequest) returns (GrantNamespaceExportResponse);
+  rpc RevokeNamespaceExport(RevokeNamespaceExportRequest) returns (RevokeNamespaceExportResponse);
+  rpc ExportObjectSet(ExportObjectSetRequest) returns (stream ExportObjectSetChunk);
+  rpc GetExportReceipt(GetExportReceiptRequest) returns (GetExportReceiptResponse);
+  rpc PutExportFingerprintPolicy(PutExportFingerprintPolicyRequest) returns (PutExportFingerprintPolicyResponse);
+  rpc GetExportFingerprintPolicy(GetExportFingerprintPolicyRequest) returns (GetExportFingerprintPolicyResponse);
+  rpc TraceExport(TraceExportRequest) returns (TraceExportResponse);
+  rpc PutExportDefinition(PutExportDefinitionRequest) returns (PutExportDefinitionResponse);
+  rpc GetExportDefinition(GetExportDefinitionRequest) returns (GetExportDefinitionResponse);
+  rpc DeleteExportDefinition(DeleteExportDefinitionRequest) returns (DeleteExportDefinitionResponse);
+  rpc RunExportDefinition(RunExportDefinitionRequest) returns (RunExportDefinitionResponse);
+  rpc ListDeliverableExportArtifacts(ListDeliverableExportArtifactsRequest) returns (ListDeliverableExportArtifactsResponse);
+  rpc FetchExportArtifact(FetchExportArtifactRequest) returns (stream ExportObjectSetChunk);
+  rpc AcknowledgeExportDelivery(AcknowledgeExportDeliveryRequest) returns (AcknowledgeExportDeliveryResponse);
+  rpc ExportDatasetVersion(ExportDatasetVersionRequest) returns (stream ExportObjectSetChunk);
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
   rpc GetObjectTypeIndexStatus(GetObjectTypeIndexStatusRequest) returns (GetObjectTypeIndexStatusResponse);
@@ -3198,8 +4733,22 @@ service SekaiService {
   rpc RevokePurposeAuthorization(RevokePurposeAuthorizationRequest) returns (RevokePurposeAuthorizationResponse);
   rpc PutClassificationLattice(PutClassificationLatticeRequest) returns (PutClassificationLatticeResponse);
   rpc GetClassificationLattice(GetClassificationLatticeRequest) returns (GetClassificationLatticeResponse);
+  rpc PutEmbeddingSpec(PutEmbeddingSpecRequest) returns (PutEmbeddingSpecResponse);
+  rpc ListEmbeddingSpecs(ListEmbeddingSpecsRequest) returns (ListEmbeddingSpecsResponse);
+  rpc DeleteEmbeddingSpec(DeleteEmbeddingSpecRequest) returns (DeleteEmbeddingSpecResponse);
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
+  rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
+  rpc RegisterCatalogEntry(RegisterCatalogEntryRequest) returns (RegisterCatalogEntryResponse);
+  rpc GetCatalogEntryLineage(GetCatalogEntryLineageRequest) returns (GetCatalogEntryLineageResponse);
+  rpc ListCatalogCriticalityOutbox(ListCatalogCriticalityOutboxRequest) returns (ListCatalogCriticalityOutboxResponse);
+  rpc CreateObjectComment(CreateObjectCommentRequest) returns (CreateObjectCommentResponse);
+  rpc UpdateObjectComment(UpdateObjectCommentRequest) returns (UpdateObjectCommentResponse);
+  rpc ListObjectComments(ListObjectCommentsRequest) returns (ListObjectCommentsResponse);
+  rpc ListCommentMentions(ListCommentMentionsRequest) returns (ListCommentMentionsResponse);
+  rpc PutTrustScoringRule(PutTrustScoringRuleRequest) returns (PutTrustScoringRuleResponse);
+  rpc GetTrustScoringRule(GetTrustScoringRuleRequest) returns (GetTrustScoringRuleResponse);
+  rpc ScoreObjectTrust(ScoreObjectTrustRequest) returns (ScoreObjectTrustResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);
 
@@ -3209,6 +4758,24 @@ service SekaiService {
   rpc GetLinkedObjects(GetLinkedObjectsRequest) returns (GetLinkedObjectsResponse);
 
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
+  // Governed media uploads (#1623, ADR 0123). Experimental. A client
+  // begins an upload with the file's size and SHA-256, sends it in chunks
+  // (resuming from `received_bytes` after an interruption), and completes
+  // it. Completing checks the SHA-256 and returns a `sekai-media:`
+  // reference to a governed `media_attachment` object; reading the file is
+  // a read of that object. The same idempotency key returns the same upload.
+  rpc BeginMediaUpload(BeginMediaUploadRequest) returns (MediaUploadStatus);
+  rpc UploadMediaChunk(UploadMediaChunkRequest) returns (MediaUploadStatus);
+  rpc CompleteMediaUpload(CompleteMediaUploadRequest) returns (MediaUploadStatus);
+  rpc GetMediaUpload(GetMediaUploadRequest) returns (MediaUploadStatus);
+  rpc ReadMedia(ReadMediaRequest) returns (ReadMediaResponse);
+  // Offline sync scopes (#1632, ADR 0124), contract `sekai.sync/v1`.
+  // Experimental. A principal defines a scope, takes a snapshot of it, then
+  // reads deltas from the cursor the snapshot ends with. Every object passes
+  // the online read checks and is projected per property.
+  rpc PutSyncScope(PutSyncScopeRequest) returns (SyncScopeResponse);
+  rpc ReadSyncSnapshot(ReadSyncSnapshotRequest) returns (ReadSyncSnapshotResponse);
+  rpc ReadSyncDeltas(ReadSyncDeltasRequest) returns (ReadSyncDeltasResponse);
   rpc ExpandNeighborhood(ExpandNeighborhoodRequest) returns (ExpandNeighborhoodResponse);
   rpc FindPaths(FindPathsRequest) returns (FindPathsResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
@@ -3241,11 +4808,23 @@ service SekaiService {
   rpc ListDatasetVersions(ListDatasetVersionsRequest) returns (ListDatasetVersionsResponse);
   rpc GetDatasetVersion(GetDatasetVersionRequest) returns (GetDatasetVersionResponse);
   rpc RollbackDataset(RollbackDatasetRequest) returns (RollbackDatasetResponse);
+  rpc CreateDatasetBranch(CreateDatasetBranchRequest) returns (CreateDatasetBranchResponse);
+  rpc ListDatasetBranches(ListDatasetBranchesRequest) returns (ListDatasetBranchesResponse);
+  rpc DeleteDatasetBranch(DeleteDatasetBranchRequest) returns (DeleteDatasetBranchResponse);
+  rpc CompareDatasetBranch(CompareDatasetBranchRequest) returns (CompareDatasetBranchResponse);
+  rpc ProposeDatasetBranchMerge(ProposeDatasetBranchMergeRequest) returns (ProposeDatasetBranchMergeResponse);
+  rpc MergeDatasetBranch(MergeDatasetBranchRequest) returns (MergeDatasetBranchResponse);
+  rpc RunGovernedTransformOnBranch(RunGovernedTransformOnBranchRequest) returns (RunGovernedTransformOnBranchResponse);
+  rpc ReplayGovernedTransform(ReplayGovernedTransformRequest) returns (ReplayGovernedTransformResponse);
+  rpc GetTransformReplay(GetTransformReplayRequest) returns (GetTransformReplayResponse);
+  rpc ShadowGovernedTransform(ShadowGovernedTransformRequest) returns (ShadowGovernedTransformResponse);
   rpc PutDatasetHealthCheck(PutDatasetHealthCheckRequest) returns (PutDatasetHealthCheckResponse);
   rpc ListDatasetHealthChecks(ListDatasetHealthChecksRequest) returns (ListDatasetHealthChecksResponse);
   rpc ListDatasetHealthResults(ListDatasetHealthResultsRequest) returns (ListDatasetHealthResultsResponse);
   rpc RunDatasetHealthChecks(RunDatasetHealthChecksRequest) returns (RunDatasetHealthChecksResponse);
   rpc ListDatasetAlerts(ListDatasetAlertsRequest) returns (ListDatasetAlertsResponse);
+  rpc ListConsumerViolationNotifications(ListConsumerViolationNotificationsRequest) returns (ListConsumerViolationNotificationsResponse);
+  rpc AcknowledgeConsumerViolationNotification(AcknowledgeConsumerViolationNotificationRequest) returns (AcknowledgeConsumerViolationNotificationResponse);
   rpc CreateVirtualTable(CreateVirtualTableRequest) returns (CreateVirtualTableResponse);
   rpc ListVirtualTables(ListVirtualTablesRequest) returns (ListVirtualTablesResponse);
 
@@ -3260,6 +4839,8 @@ service SekaiService {
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
+  // Experimental: the chain of writes behind one property value (#1452).
+  rpc ExplainValue(ExplainValueRequest) returns (ExplainValueResponse);
   rpc GetAttestation(GetAttestationRequest) returns (GetAttestationResponse);
   rpc ListAttestations(ListAttestationsRequest) returns (ListAttestationsResponse);
   rpc VerifyAttestation(VerifyAttestationRequest) returns (VerifyAttestationResponse);
@@ -3274,8 +4855,20 @@ service SekaiService {
   rpc DecideActionInstance(DecideActionInstanceRequest) returns (DecideActionInstanceResponse);
   rpc PutActionBinding(PutActionBindingRequest) returns (PutActionBindingResponse);
   rpc RunActionBinding(RunActionBindingRequest) returns (RunActionBindingResponse);
+  rpc PutFenceBinding(PutFenceBindingRequest) returns (PutFenceBindingResponse);
+  rpc RunFenceBinding(RunFenceBindingRequest) returns (RunFenceBindingResponse);
+  rpc PutEzuGeoFeed(PutEzuGeoFeedRequest) returns (PutEzuGeoFeedResponse);
+  rpc RunEzuGeoFeed(RunEzuGeoFeedRequest) returns (RunEzuGeoFeedResponse);
+  rpc BackfillEzuGeoFeed(BackfillEzuGeoFeedRequest) returns (BackfillEzuGeoFeedResponse);
   rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
   rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
+  rpc CreatePlanIntent(CreatePlanIntentRequest) returns (CreatePlanIntentResponse);
+  rpc ProposePlan(ProposePlanRequest) returns (ProposePlanResponse);
+  rpc SimulatePlan(SimulatePlanRequest) returns (SimulatePlanResponse);
+  rpc GetPlan(GetPlanRequest) returns (GetPlanResponse);
+  rpc SubmitPlanReview(SubmitPlanReviewRequest) returns (SubmitPlanReviewResponse);
+  rpc DecidePlanReview(DecidePlanReviewRequest) returns (DecidePlanReviewResponse);
+  rpc ExecuteActionPlan(ExecuteActionPlanRequest) returns (ExecuteActionPlanResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
   // Typed effects on admitted ActionInstances (#398).
@@ -3325,4 +4918,166 @@ service SekaiService {
   rpc ListEvidenceSubmissions(ListEvidenceSubmissionsRequest) returns (ListEvidenceSubmissionsResponse);
   rpc CreateHandoff(CreateHandoffRequest) returns (CreateHandoffResponse);
   rpc RevokeHandoff(RevokeHandoffRequest) returns (RevokeHandoffResponse);
+}
+
+message BeginMediaUploadRequest {
+  string namespace = 1;
+  // Scoped to the namespace and the uploader. Repeating a begin with the
+  // same key and declaration returns the same upload.
+  string idempotency_key = 2;
+  // At most 64 MiB.
+  uint64 size_bytes = 3;
+  // Lowercase hex SHA-256 of the whole file.
+  string sha256 = 4;
+  // type/subtype, for example image/jpeg.
+  string media_type = 5;
+  string file_name = 6;
+  // Classification marking of the file; empty for unmarked.
+  string access_marking = 7;
+}
+
+message MediaUploadStatus {
+  string upload_id = 1;
+  uint64 size_bytes = 2;
+  // Send the next chunk from here.
+  uint64 received_bytes = 3;
+  bool complete = 4;
+  // `sekai-media:<object id>` once complete.
+  string media_reference = 5;
+}
+
+message UploadMediaChunkRequest {
+  string upload_id = 1;
+  // Must equal the upload's received_bytes. A chunk the upload already holds
+  // is accepted as a retry and changes nothing.
+  uint64 offset = 2;
+  // At most 1 MiB.
+  bytes data = 3;
+}
+
+message CompleteMediaUploadRequest {
+  string upload_id = 1;
+}
+
+message GetMediaUploadRequest {
+  string upload_id = 1;
+}
+
+message ReadMediaRequest {
+  string media_reference = 1;
+  uint64 offset = 2;
+  // Default and maximum 1 MiB.
+  uint32 limit = 3;
+}
+
+message ReadMediaResponse {
+  bytes data = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+  string media_type = 4;
+  string file_name = 5;
+  string access_marking = 6;
+}
+
+message SyncScopeLink {
+  string relation = 1;
+  // `outgoing` (default) or `incoming`.
+  string direction = 2;
+  // 1 or 2.
+  uint32 max_hops = 3;
+}
+
+message PutSyncScopeRequest {
+  // `sekai.sync/v1`.
+  string contract_version = 1;
+  string namespace = 2;
+  string scope_id = 3;
+  string kind = 4;
+  // At most 4; eq, gt, gte, lt or lte.
+  repeated PropertyFilter property_filters = 5;
+  // Also sync the objects linked to the matches by one relation.
+  SyncScopeLink link = 6;
+  // The scope's quota of visible objects, at most 5000.
+  uint32 max_objects = 7;
+  // How long a client may show synced data without syncing again (#1633):
+  // 0 for no limit, otherwise one minute to 366 days.
+  int64 max_offline_age_ms = 8;
+}
+
+message SyncScopeResponse {
+  string contract_version = 1;
+  string namespace = 2;
+  string scope_id = 3;
+  uint32 max_objects = 4;
+  int64 max_offline_age_ms = 5;
+}
+
+message ReadSyncSnapshotRequest {
+  string contract_version = 1;
+  string namespace = 2;
+  string scope_id = 3;
+  // Empty to start a snapshot; otherwise the previous next_page_token.
+  string page_token = 4;
+  // Default 50, at most 100.
+  uint32 limit = 5;
+}
+
+message ReadSyncSnapshotResponse {
+  string contract_version = 1;
+  repeated Object objects = 2;
+  // Empty on the last page.
+  string next_page_token = 3;
+  // Set on the last page: read deltas from here.
+  string cursor = 4;
+  // Members in the snapshot, including any no longer readable when sent.
+  uint32 total_objects = 5;
+  // Set on the last page when the scope has a maximum offline age: the
+  // client must sync again before showing the data after this time.
+  int64 offline_until_ms = 6;
+  // The device was revoked (#1634): delete every synced object and the
+  // cursor. No data comes with it.
+  bool wipe_required = 7;
+}
+
+message ReadSyncDeltasRequest {
+  string contract_version = 1;
+  string namespace = 2;
+  string scope_id = 3;
+  string cursor = 4;
+  // Most object changes (upserts and removals) in this read: default 50,
+  // at most 100.
+  uint32 limit = 5;
+}
+
+message ReadSyncDeltasResponse {
+  string contract_version = 1;
+  // Objects to store or replace, as an online read shows them.
+  repeated Object upserts = 2;
+  // Objects to drop: deleted, hidden, or out of the scope.
+  repeated string removed_object_ids = 3;
+  // Read the next deltas from here. The previous cursor stays valid until
+  // this one is used.
+  string cursor = 4;
+  // More changes are waiting.
+  bool more = 5;
+  // The cursor cannot continue (expired, scope changed, or a filter the
+  // caller may no longer query): discard the replica and take a new
+  // snapshot. A change in what the caller may read does not end a cursor;
+  // it arrives as purges.
+  bool resnapshot_required = 6;
+  // Data the caller may no longer read (#1633): delete it. An entry without
+  // properties is a whole object (also in removed_object_ids); one with
+  // properties names those the object, upserted here, no longer shows.
+  repeated SyncPurge purges = 7;
+  // As in the snapshot: sync again before showing data after this time.
+  // Set only when this read leaves nothing pending (`more` false); until
+  // then the previous deadline holds.
+  int64 offline_until_ms = 8;
+  // As in the snapshot: the device was revoked; wipe, with no data.
+  bool wipe_required = 9;
+}
+
+message SyncPurge {
+  string object_id = 1;
+  repeated string properties = 2;
 }

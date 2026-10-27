@@ -1,4 +1,5 @@
 use super::*;
+use crate::ext::*;
 
 pub(super) async fn create_definition_branch(
     service: &SekaiServiceImpl,
@@ -140,6 +141,11 @@ fn stored_suite_result(
     if crate::sekai::agent_dry_run::run_is_dry_run(&run.config_ref, &run.suite_id) {
         return Err(Status::failed_precondition(
             crate::sekai::agent_dry_run::REFUSAL_DRY_RUN,
+        ));
+    }
+    if crate::sekai::agent_shadow::run_is_shadow(&run.config_ref, &run.suite_id) {
+        return Err(Status::failed_precondition(
+            crate::sekai::agent_shadow::REFUSAL_SHADOW_CERTIFY,
         ));
     }
     if run.suite_id != suite_id {
@@ -614,6 +620,8 @@ pub(super) async fn create_definition_proposal(
         eval_plan_digests: input.eval_plan_digests,
         named_foreign_digests: input.named_foreign_digests,
         idempotency_key: input.idempotency_key,
+        major_revision: input.major_revision,
+        migration_plan_digest: input.migration_plan_digest,
     };
     request.prepare().map_err(Status::invalid_argument)?;
     authorize_definition_revision(
@@ -659,6 +667,8 @@ pub(super) async fn get_definition_proposal(
 ) -> Result<Response<GetDefinitionProposalResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let policy_context = principal_policy_context(&req);
+    let purpose = request_purpose_presentation(&req, &principals);
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
@@ -688,8 +698,39 @@ pub(super) async fn get_definition_proposal(
         &proposal.candidate_digest,
         false,
     )?;
+    // The lint findings the candidate introduces over the base (#1687),
+    // judged on the consumers this caller may see; the merge gate judges
+    // the same on every consumer.
+    let db = service.db.runtime();
+    let members = |digest: &str| {
+        db.get_definition_members(&proposal.namespace, digest)
+            .map_err(|_| Status::internal("definition revision unavailable"))
+    };
+    let (bindings, lint_complete) = visible_lint_objects(
+        service,
+        &principals,
+        &policy_context,
+        purpose.as_ref(),
+        tenant_context.as_ref(),
+        crate::sekai::definition_consumer_impact::BINDING_KIND,
+        Some(&proposal.namespace),
+        MAX_LINT_OBJECTS,
+    )?;
+    let (consumed, consumed_properties) =
+        crate::sekai::ontology_lint::consumer_references(&bindings);
+    let lint_findings = crate::sekai::ontology_lint::introduced_findings(
+        &members(&proposal.base_digest)?,
+        &members(&proposal.candidate_digest)?,
+        &consumed,
+        &consumed_properties,
+    );
     Ok(Response::new(GetDefinitionProposalResponse {
         proposal: Some(to_proto_definition_proposal(&proposal)),
+        lint_findings: lint_findings
+            .into_iter()
+            .map(lint_finding_to_proto)
+            .collect(),
+        lint_complete,
     }))
 }
 fn refuse_proposal_creator(
@@ -775,42 +816,24 @@ pub(super) async fn approve_definition_proposal(
         proposal: Some(to_proto_definition_proposal(&proposal)),
     }))
 }
-pub(super) async fn merge_definition_proposal(
+/// The checks before a proposal's revision is published (merge, or the last
+/// step of a change bundle apply): the actor did not create it, may read both
+/// revisions and write the changed members, an approval is still current, and
+/// agent tool approvals hold. Returns the acting principal.
+pub(super) fn authorize_definition_proposal_merge(
     service: &SekaiServiceImpl,
-    req: Request<MergeDefinitionProposalRequest>,
-) -> Result<Response<MergeDefinitionProposalResponse>, Status> {
-    let principals = caller_principals(&req);
-    require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
-    let input = req.into_inner();
-    authorize_source_sync_namespace(
-        service,
-        &principals,
-        tenant_context.as_ref(),
-        &input.namespace,
-        true,
-    )?;
-    let request = definition_proposal_domain::MergeDefinitionProposal {
-        namespace: input.namespace,
-        proposal_id: input.proposal_id,
-        expected_published_digest: input.expected_published_digest,
-        idempotency_key: input.idempotency_key,
-    };
-    request.request_digest().map_err(Status::invalid_argument)?;
-    let proposal = service
-        .db
-        .runtime()
-        .get_definition_proposal(&request.namespace, &request.proposal_id)
-        .map_err(|_| Status::internal("definition proposal unavailable"))?
-        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    proposal: &crate::sekai::definition_proposal::DefinitionProposal,
+) -> Result<String, Status> {
     let actor = principals
         .first()
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
-    refuse_proposal_creator(&proposal, actor, "merge")?;
-    authorize_proposal_revision_reads(service, &principals, &proposal)?;
+    refuse_proposal_creator(proposal, actor, "merge")?;
+    authorize_proposal_revision_reads(service, principals, proposal)?;
     authorize_proposal_member_writes(
         service,
-        &principals,
+        principals,
         &proposal.namespace,
         &proposal.base_digest,
         &proposal.candidate_digest,
@@ -820,7 +843,7 @@ pub(super) async fn merge_definition_proposal(
         authorize_source_sync_namespace(
             service,
             principals,
-            tenant_context.as_ref(),
+            tenant_context,
             &proposal.namespace,
             true,
         )
@@ -842,6 +865,47 @@ pub(super) async fn merge_definition_proposal(
     }
     agent_tool_approvals(service, &proposal.namespace, &proposal.candidate_digest)?
         .map_err(Status::failed_precondition)?;
+    require_agent_shadow_for_merge(service, proposal)?;
+    Ok(actor.clone())
+}
+
+pub(super) async fn merge_definition_proposal(
+    service: &SekaiServiceImpl,
+    req: Request<MergeDefinitionProposalRequest>,
+) -> Result<Response<MergeDefinitionProposalResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    let request = definition_proposal_domain::MergeDefinitionProposal {
+        namespace: input.namespace,
+        proposal_id: input.proposal_id,
+        expected_published_digest: input.expected_published_digest,
+        idempotency_key: input.idempotency_key,
+        expected_dataset_versions: Vec::new(),
+        expected_datasources: Vec::new(),
+    };
+    request.request_digest().map_err(Status::invalid_argument)?;
+    let proposal = service
+        .db
+        .runtime()
+        .get_definition_proposal(&request.namespace, &request.proposal_id)
+        .map_err(|_| Status::internal("definition proposal unavailable"))?
+        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    let actor = authorize_definition_proposal_merge(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &proposal,
+    )?;
+    let actor = actor.as_str();
     let result = service
         .db
         .runtime()
@@ -1397,7 +1461,10 @@ pub(super) fn definition_genesis(
 /// Seeds the genesis revision as the published head when the namespace has
 /// none. A namespace that already published anything
 /// else must branch from that head instead.
-fn seed_definition_genesis(service: &SekaiServiceImpl, namespace: &str) -> Result<(), Status> {
+pub(super) fn seed_definition_genesis(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+) -> Result<(), Status> {
     let genesis = definition_genesis(namespace).map_err(Status::invalid_argument)?;
     service
         .db
@@ -1535,6 +1602,440 @@ pub(super) async fn dry_run_agent(
     }))
 }
 
+pub(super) async fn run_agent_shadow(
+    service: &SekaiServiceImpl,
+    req: Request<RunAgentShadowRequest>,
+) -> Result<Response<RunAgentShadowResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    definition_branch_domain::validate_digest(
+        "candidate_revision_digest",
+        &input.candidate_revision_digest,
+    )
+    .map_err(Status::invalid_argument)?;
+    definition_branch_domain::DefinitionMemberRef {
+        member_kind: crate::sekai::agent_promotion::MEMBER_KIND_AGENT.into(),
+        member_id: input.member_id.clone(),
+    }
+    .validate()
+    .map_err(Status::invalid_argument)?;
+    let envelopes: Vec<crate::sekai::agent_shadow::TriggerEnvelope> = input
+        .envelopes
+        .into_iter()
+        .map(|envelope| crate::sekai::agent_shadow::TriggerEnvelope {
+            id: envelope.id,
+            input: envelope.input,
+        })
+        .collect();
+    let candidate = load_agent_definition(
+        service,
+        &principals,
+        &input.namespace,
+        &input.candidate_revision_digest,
+        &input.member_id,
+    )?;
+    let active_digest = if input.active_revision_digest.is_empty() {
+        service
+            .db
+            .runtime()
+            .get_published_definition_revision(&input.namespace)
+            .map_err(|_| Status::internal("definition member unavailable"))?
+            .ok_or_else(|| Status::not_found("definition member unavailable"))?
+            .revision_digest
+    } else {
+        definition_branch_domain::validate_digest(
+            "active_revision_digest",
+            &input.active_revision_digest,
+        )
+        .map_err(Status::invalid_argument)?;
+        input.active_revision_digest.clone()
+    };
+    let active = load_agent_definition(
+        service,
+        &principals,
+        &input.namespace,
+        &active_digest,
+        &input.member_id,
+    )?;
+    let runtime = service.db.runtime();
+    let namespace = input.namespace.clone();
+    let host = ShadowDryRunHost {
+        injected: service.dry_run_host.as_deref(),
+        runtime,
+    };
+    let shadow_id = format!("agent-shadow-{}", uuid::Uuid::new_v4().simple());
+    let report = crate::sekai::agent_shadow::run_shadow(
+        &crate::sekai::agent_shadow::ShadowRun {
+            namespace: &input.namespace,
+            member_id: &input.member_id,
+            active_digest: &active_digest,
+            candidate_digest: &input.candidate_revision_digest,
+            active: &active,
+            candidate: &candidate,
+            envelopes: &envelopes,
+            require_for_promotion: input.require_for_promotion,
+            shadow_id: &shadow_id,
+        },
+        &host,
+        |action_type, parameters_json| {
+            crate::sekai::agent_dry_run::validate_dry_run_proposed_action(
+                runtime,
+                &namespace,
+                action_type,
+                parameters_json,
+            )
+        },
+    )
+    .map_err(map_shadow_failure)?;
+    persist_shadow_report(service, &report, now_millis())?;
+    if input.require_for_promotion {
+        persist_shadow_requirement(service, &input.namespace, now_millis())?;
+    }
+    Ok(Response::new(RunAgentShadowResponse {
+        report: Some(to_proto_shadow_report(&report)),
+    }))
+}
+
+pub(super) async fn get_agent_shadow_report(
+    service: &SekaiServiceImpl,
+    req: Request<GetAgentShadowReportRequest>,
+) -> Result<Response<GetAgentShadowReportResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    let report = load_shadow_report(
+        service,
+        &input.namespace,
+        &input.member_id,
+        &input.candidate_revision_digest,
+        false,
+        None,
+    )?
+    .ok_or_else(|| Status::not_found("agent shadow report unavailable"))?;
+    for digest in [
+        report.active_revision_digest.as_str(),
+        report.candidate_revision_digest.as_str(),
+    ] {
+        authorize_definition_revision(service, &principals, &report.namespace, digest, false)
+            .map_err(|status| match status.code() {
+                tonic::Code::NotFound => Status::not_found("agent shadow report unavailable"),
+                tonic::Code::Internal => Status::internal("agent shadow report unavailable"),
+                _ => status,
+            })?;
+    }
+    Ok(Response::new(GetAgentShadowReportResponse {
+        report: Some(to_proto_shadow_report(&report)),
+    }))
+}
+
+struct ShadowDryRunHost<'a> {
+    injected: Option<&'a dyn crate::sekai::agent_dry_run::AgentDryRunHost>,
+    runtime: &'a crate::db::runtime_db::RuntimeDb,
+}
+
+impl crate::sekai::agent_dry_run::AgentDryRunHost for ShadowDryRunHost<'_> {
+    fn admit_and_complete(
+        &self,
+        request: &crate::sekai::agent_dry_run::DryRunModelRequest,
+    ) -> Result<
+        crate::sekai::agent_dry_run::DryRunModelReply,
+        crate::sekai::agent_dry_run::DryRunFailure,
+    > {
+        match self.injected {
+            Some(host) => host.admit_and_complete(request),
+            None => default_dry_run(self.runtime, request),
+        }
+    }
+}
+
+fn map_shadow_failure(error: crate::sekai::agent_shadow::ShadowFailure) -> Status {
+    match error {
+        crate::sekai::agent_shadow::ShadowFailure::RouteAdmission(reason)
+        | crate::sekai::agent_shadow::ShadowFailure::Budget(reason)
+        | crate::sekai::agent_shadow::ShadowFailure::Model(reason) => {
+            Status::failed_precondition(reason)
+        }
+    }
+}
+
+fn load_agent_definition(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    revision_digest: &str,
+    member_id: &str,
+) -> Result<crate::sekai::agent_definition::AgentDefinition, Status> {
+    authorize_definition_revision(service, principals, namespace, revision_digest, false).map_err(
+        |status| match status.code() {
+            tonic::Code::NotFound => Status::not_found("definition member unavailable"),
+            tonic::Code::Internal => Status::internal("definition member unavailable"),
+            _ => status,
+        },
+    )?;
+    let member = service
+        .db
+        .runtime()
+        .get_definition_member(
+            namespace,
+            revision_digest,
+            crate::sekai::agent_promotion::MEMBER_KIND_AGENT,
+            member_id,
+        )
+        .map_err(|_| Status::internal("definition member unavailable"))?
+        .ok_or_else(|| Status::not_found("definition member unavailable"))?;
+    let definition: crate::sekai::agent_definition::AgentDefinition =
+        serde_json::from_str(&member.definition_json)
+            .map_err(|_| Status::not_found("definition member unavailable"))?;
+    definition
+        .validate()
+        .map_err(|_| Status::not_found("definition member unavailable"))?;
+    Ok(definition)
+}
+
+fn persist_shadow_report(
+    service: &SekaiServiceImpl,
+    report: &crate::sekai::agent_shadow::ShadowReport,
+    timestamp: i64,
+) -> Result<(), Status> {
+    use crate::chisei::eval::{CaseResult, Run};
+    let run = Run {
+        id: report.shadow_id.clone(),
+        suite_id: crate::sekai::agent_shadow::suite_id(&report.namespace, &report.member_id),
+        config_ref: crate::sekai::agent_shadow::SHADOW_CONFIG_REF.into(),
+        results: vec![CaseResult {
+            case_id: report.candidate_revision_digest.clone(),
+            passed: report.passing,
+            status: "agent_shadow".into(),
+            result: serde_json::to_string(report).unwrap_or_else(|_| "{}".into()),
+            score: i32::from(report.passing),
+            reason: report.verdict_reason.clone(),
+            elapsed: report.latency_ms,
+        }],
+        timestamp,
+    };
+    service
+        .db
+        .runtime()
+        .put_eval_run(&run)
+        .map_err(Status::internal)?;
+    Ok(())
+}
+
+fn persist_shadow_requirement(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    timestamp: i64,
+) -> Result<(), Status> {
+    use crate::chisei::eval::{CaseResult, Run};
+    let run = Run {
+        id: format!("agent-shadow-required-{}", uuid::Uuid::new_v4().simple()),
+        suite_id: crate::sekai::agent_shadow::required_suite_id(namespace),
+        config_ref: crate::sekai::agent_shadow::REQUIRED_CONFIG_REF.into(),
+        results: vec![CaseResult {
+            case_id: namespace.into(),
+            passed: true,
+            status: "required".into(),
+            result: "required".into(),
+            score: 1,
+            reason: String::new(),
+            elapsed: 0,
+        }],
+        timestamp,
+    };
+    service
+        .db
+        .runtime()
+        .put_eval_run(&run)
+        .map_err(Status::internal)?;
+    Ok(())
+}
+
+fn eval_runs_relation_missing(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("chisei_eval_runs")
+        && (error.contains("no such table") || error.contains("does not exist"))
+}
+
+fn list_shadow_eval_runs(
+    service: &SekaiServiceImpl,
+    suite_id: &str,
+) -> Result<Vec<crate::chisei::eval::Run>, Status> {
+    match service.db.runtime().list_eval_run_records(suite_id) {
+        Ok(runs) => Ok(runs),
+        Err(error) if eval_runs_relation_missing(&error) => Ok(Vec::new()),
+        Err(error) => Err(Status::internal(error)),
+    }
+}
+
+fn load_shadow_report(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    member_id: &str,
+    candidate_digest: &str,
+    passing_only: bool,
+    expected_active: Option<&str>,
+) -> Result<Option<crate::sekai::agent_shadow::ShadowReport>, Status> {
+    let mut runs = list_shadow_eval_runs(
+        service,
+        &crate::sekai::agent_shadow::suite_id(namespace, member_id),
+    )?;
+    runs.sort_by_key(|run| std::cmp::Reverse(run.timestamp));
+    for run in runs {
+        if !crate::sekai::agent_shadow::run_is_shadow(&run.config_ref, &run.suite_id) {
+            continue;
+        }
+        let Some(result) = run.results.first() else {
+            continue;
+        };
+        if !candidate_digest.is_empty() && result.case_id != candidate_digest {
+            continue;
+        }
+        if let Ok(report) =
+            serde_json::from_str::<crate::sekai::agent_shadow::ShadowReport>(&result.result)
+        {
+            if report.namespace == namespace
+                && report.member_id == member_id
+                && (!passing_only || report.passing)
+                && expected_active
+                    .map(|active| report.active_revision_digest == active)
+                    .unwrap_or(true)
+            {
+                return Ok(Some(report));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn namespace_requires_agent_shadow(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+) -> Result<bool, Status> {
+    let runs = list_shadow_eval_runs(
+        service,
+        &crate::sekai::agent_shadow::required_suite_id(namespace),
+    )?;
+    Ok(runs
+        .iter()
+        .any(|run| crate::sekai::agent_shadow::run_is_shadow(&run.config_ref, &run.suite_id)))
+}
+
+fn require_agent_shadow_for_merge(
+    service: &SekaiServiceImpl,
+    proposal: &crate::sekai::definition_proposal::DefinitionProposal,
+) -> Result<(), Status> {
+    if !namespace_requires_agent_shadow(service, &proposal.namespace)? {
+        return Ok(());
+    }
+    let candidate = service
+        .db
+        .runtime()
+        .get_definition_revision(&proposal.namespace, &proposal.candidate_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?
+        .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+    let base = service
+        .db
+        .runtime()
+        .get_definition_revision(&proposal.namespace, &proposal.base_digest)
+        .map_err(|_| Status::internal("definition resource unavailable"))?;
+    for member in candidate
+        .members
+        .iter()
+        .filter(|member| member.member_kind == crate::sekai::agent_promotion::MEMBER_KIND_AGENT)
+    {
+        let expected_active = base.as_ref().and_then(|revision| {
+            revision
+                .members
+                .iter()
+                .any(|base_member| {
+                    base_member.member_kind == crate::sekai::agent_promotion::MEMBER_KIND_AGENT
+                        && base_member.member_id == member.member_id
+                })
+                .then_some(proposal.base_digest.as_str())
+        });
+        let report = load_shadow_report(
+            service,
+            &proposal.namespace,
+            &member.member_id,
+            &proposal.candidate_digest,
+            true,
+            expected_active,
+        )?;
+        crate::sekai::agent_shadow::require_shadow_report(
+            true,
+            report.as_ref(),
+            &proposal.candidate_digest,
+            expected_active,
+        )
+        .map_err(Status::failed_precondition)?;
+    }
+    Ok(())
+}
+
+fn to_proto_shadow_report(report: &crate::sekai::agent_shadow::ShadowReport) -> AgentShadowReport {
+    AgentShadowReport {
+        contract_version: report.contract_version.clone(),
+        namespace: report.namespace.clone(),
+        member_id: report.member_id.clone(),
+        active_revision_digest: report.active_revision_digest.clone(),
+        candidate_revision_digest: report.candidate_revision_digest.clone(),
+        shadow_id: report.shadow_id.clone(),
+        evaluated: report.evaluated,
+        unchanged: report.unchanged,
+        differed: report.differed,
+        cost_tokens: report.cost_tokens,
+        latency_ms: report.latency_ms,
+        passing: report.passing,
+        verdict_reason: report.verdict_reason.clone(),
+        require_for_promotion: report.require_for_promotion,
+        samples: report
+            .samples
+            .iter()
+            .map(|sample| AgentShadowSample {
+                envelope_id: sample.envelope_id.clone(),
+                input: sample.input.clone(),
+                active: sample
+                    .active
+                    .iter()
+                    .map(|action| DryRunAgentAction {
+                        action_type: action.action_type.clone(),
+                        parameters_json: action.parameters_json.clone(),
+                        disposition: action.disposition.clone(),
+                        reason: action.reason.clone(),
+                    })
+                    .collect(),
+                candidate: sample
+                    .candidate
+                    .iter()
+                    .map(|action| DryRunAgentAction {
+                        action_type: action.action_type.clone(),
+                        parameters_json: action.parameters_json.clone(),
+                        disposition: action.disposition.clone(),
+                        reason: action.reason.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 fn map_dry_run_failure(error: crate::sekai::agent_dry_run::DryRunFailure) -> Status {
     match error {
         crate::sekai::agent_dry_run::DryRunFailure::RouteAdmission(reason)
@@ -1658,4 +2159,341 @@ fn admit_dry_run_route(
         }
     }
     Err(DryRunFailure::RouteAdmission(REFUSAL_NOT_ENABLED.into()))
+}
+
+/// Objects the lint scans in a namespace; past this the object rules are
+/// skipped and the report is partial.
+const MAX_LINT_OBJECTS: usize = 2_000;
+/// Links read per object and direction, and neighbors authorized in all.
+const MAX_LINT_LINKS: usize = 64;
+const MAX_LINT_NEIGHBORS: usize = 2_000;
+/// Recent instances checked for one the caller may see, per Action type.
+const MAX_LINT_INSTANCES: usize = 50;
+
+/// Lints a namespace's published definition (#1454). The caller needs read
+/// on the namespace and on every published member; data the lint reads is
+/// limited to what the caller may see, so no finding names a hidden object,
+/// consumer or principal.
+pub(super) async fn get_ontology_lint_report(
+    service: &SekaiServiceImpl,
+    req: Request<GetOntologyLintReportRequest>,
+) -> Result<Response<GetOntologyLintReportResponse>, Status> {
+    use crate::sekai::ontology_lint::{LintInput, lint, profile_clearance};
+
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let policy_context = principal_policy_context(&req);
+    let purpose = request_purpose_presentation(&req, &principals);
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let GetOntologyLintReportRequest {
+        namespace,
+        branch_id,
+    } = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &namespace,
+        false,
+    )?;
+    let db = service.db.runtime();
+    // A draft branch lints its head; otherwise the published revision.
+    let revision_digest = if branch_id.is_empty() {
+        db.get_published_definition_revision(&namespace)
+            .map_err(|_| Status::internal("definition revision unavailable"))?
+            .ok_or_else(|| Status::not_found("no published definition"))?
+            .revision_digest
+    } else {
+        db.get_definition_branch(&namespace, &branch_id)
+            .map_err(|_| Status::internal("definition branch unavailable"))?
+            .ok_or_else(|| Status::not_found("definition branch unavailable"))?
+            .head_revision_digest
+    };
+    authorize_definition_revision(
+        service,
+        &principals,
+        &namespace,
+        &revision_digest,
+        branch_id.is_empty(),
+    )?;
+    let members = db
+        .get_definition_members(&namespace, &revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    let visible = |kind: &str, namespace: Option<&str>, cap: usize| {
+        visible_lint_objects(
+            service,
+            &principals,
+            &policy_context,
+            purpose.as_ref(),
+            tenant_context.as_ref(),
+            kind,
+            namespace,
+            cap,
+        )
+    };
+
+    // The object rules cover instances of the linted revision's object types only.
+    let mut objects = Vec::new();
+    let mut objects_complete = true;
+    for object_type in members.iter().filter(|m| m.member_kind == "object_type") {
+        let (found, complete) = visible(
+            &object_type.member_id,
+            Some(&namespace),
+            MAX_LINT_OBJECTS.saturating_sub(objects.len()),
+        )?;
+        objects.extend(found);
+        objects_complete &= complete;
+    }
+    let ids: std::collections::BTreeSet<&str> =
+        objects.iter().map(|object| object.id.as_str()).collect();
+    // A link counts only when the caller can see its other end, an object of
+    // the namespace of any kind, read with this request's purpose. Reads are
+    // bounded per object and across neighbors; an object the bounds leave
+    // undecided makes the object rules skip, so no finding is a guess.
+    let mut neighbor_reads = 0usize;
+    let mut neighbors = std::collections::BTreeMap::<String, bool>::new();
+    let mut visible_neighbor = |id: &str| -> Result<Option<bool>, Status> {
+        if ids.contains(id) {
+            return Ok(Some(true));
+        }
+        if let Some(known) = neighbors.get(id) {
+            return Ok(Some(*known));
+        }
+        if neighbor_reads == MAX_LINT_NEIGHBORS {
+            return Ok(None);
+        }
+        neighbor_reads += 1;
+        let visible = match db
+            .get_object_with_policy_context(id, &policy_context)
+            .map_err(Status::internal)?
+        {
+            Some(neighbor) if neighbor.namespace == namespace => require_visible_object_contents(
+                db,
+                &service.security,
+                neighbor,
+                &principals,
+                tenant_context.as_ref(),
+                &format!("ontology_lint:{id}"),
+                purpose.as_ref(),
+            )
+            .is_ok(),
+            _ => false,
+        };
+        neighbors.insert(id.to_string(), visible);
+        Ok(Some(visible))
+    };
+    let mut linked = std::collections::BTreeSet::new();
+    if objects_complete {
+        'objects: for object in &objects {
+            let mut decided = true;
+            for direction in [domain::Direction::Outgoing, domain::Direction::Incoming] {
+                let links = db
+                    .get_links_limited(&object.id, "", &direction, MAX_LINT_LINKS + 1)
+                    .map_err(Status::internal)?;
+                decided &= links.len() <= MAX_LINT_LINKS;
+                for link in links.iter().take(MAX_LINT_LINKS) {
+                    let other = if link.from_id == object.id {
+                        &link.to_id
+                    } else {
+                        &link.from_id
+                    };
+                    if other == &object.id {
+                        continue;
+                    }
+                    match visible_neighbor(other)? {
+                        Some(true) => {
+                            linked.insert(object.id.clone());
+                            continue 'objects;
+                        }
+                        Some(false) => {}
+                        None => decided = false,
+                    }
+                }
+            }
+            if !decided {
+                objects_complete = false;
+                break;
+            }
+        }
+    }
+    let (bindings, bindings_complete) = visible(
+        crate::sekai::definition_consumer_impact::BINDING_KIND,
+        Some(&namespace),
+        MAX_LINT_OBJECTS,
+    )?;
+    let (consumed, consumed_properties) =
+        crate::sekai::ontology_lint::consumer_references(&bindings);
+    let (entries, entries_complete) = visible(
+        crate::sekai::catalog::CATALOG_ENTRY_KIND,
+        Some(&namespace),
+        MAX_LINT_OBJECTS,
+    )?;
+    let property = |object: &domain::Object, key: &str| {
+        object
+            .properties
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let catalog_owned = entries
+        .iter()
+        .filter(|entry| {
+            property(entry, "source_system") == crate::sekai::catalog::ONTOLOGY_SOURCE
+                && property(entry, "entry_kind") == "object_type"
+                && !property(entry, "owners").is_empty()
+        })
+        .map(|entry| property(entry, "source_id"))
+        .collect();
+    // Action types the caller administers, each with whether it has an
+    // instance the caller may see, so neither the registry nor a hidden run
+    // shows through.
+    let mut action_types = std::collections::BTreeMap::new();
+    for action_type in db
+        .list_governed_action_types(&namespace, None, true)
+        .map_err(Status::internal)?
+    {
+        if action_types.contains_key(&action_type.type_id)
+            || check_action_admin(&service.security, &action_type.type_id, &principals).is_err()
+        {
+            continue;
+        }
+        let ran = db
+            .list_action_instances(
+                &namespace,
+                Some(&action_type.type_id),
+                None,
+                MAX_LINT_INSTANCES,
+            )
+            .map_err(Status::internal)?
+            .iter()
+            .any(|instance| {
+                super::rpc_actions::authorize_action_instance_visibility(
+                    service,
+                    &principals,
+                    tenant_context.as_ref(),
+                    &policy_context,
+                    instance,
+                )
+                .is_ok()
+            });
+        action_types.insert(action_type.type_id, ran);
+    }
+    let (profiles, profiles_complete) = visible(
+        crate::sekai::markings::PRINCIPAL_PROFILE_KIND,
+        None,
+        MAX_LINT_OBJECTS,
+    )?;
+    let report = lint(&LintInput {
+        members,
+        objects,
+        objects_complete,
+        linked,
+        consumed,
+        consumed_properties,
+        catalog_owned,
+        action_types,
+        clearances: profiles.iter().map(profile_clearance).collect(),
+    });
+    Ok(Response::new(GetOntologyLintReportResponse {
+        revision_digest,
+        findings: report
+            .findings
+            .into_iter()
+            .map(lint_finding_to_proto)
+            .collect(),
+        // A capped side scan can only add findings, never hide one, but
+        // the report says it is partial.
+        complete: report.complete && bindings_complete && entries_complete && profiles_complete,
+    }))
+}
+
+/// Up to `cap` objects of `kind` the caller may read, as a read would show
+/// them, and whether that is all of them. Visibility filtering scans the
+/// whole matching population, so a population past the cap is not scanned
+/// at all.
+#[allow(clippy::too_many_arguments)]
+fn visible_lint_objects(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    kind: &str,
+    namespace: Option<&str>,
+    cap: usize,
+) -> Result<(Vec<domain::Object>, bool), Status> {
+    let db = service.db.runtime();
+    let over_cap = !db
+        .list_objects(&domain::ListFilter {
+            kind: Some(kind.into()),
+            name: None,
+            namespace: namespace.map(String::from),
+            property_filters: Vec::new(),
+            interface_filter: Vec::new(),
+            limit: 1,
+            offset: i32::try_from(cap).unwrap_or(i32::MAX),
+            order_by: "name".into(),
+            descending: false,
+        })
+        .map_err(Status::internal)?
+        .is_empty();
+    if over_cap {
+        return Ok((Vec::new(), false));
+    }
+    let mut objects = Vec::new();
+    loop {
+        let filter = domain::ListFilter {
+            kind: Some(kind.into()),
+            name: None,
+            namespace: namespace.map(String::from),
+            property_filters: Vec::new(),
+            interface_filter: Vec::new(),
+            limit: MAX_LIST_LIMIT,
+            offset: objects.len() as i32,
+            order_by: "name".into(),
+            descending: false,
+        };
+        let (page, _) = list_objects_with_marking(
+            db,
+            &filter,
+            principals,
+            policy_context,
+            purpose,
+            tenant_context,
+            // Findings read properties only as a read would show them.
+            |objects, principals, tenant_context| {
+                service.resolve_computed_for_responses_with_policy(
+                    objects,
+                    principals,
+                    Some(policy_context),
+                    tenant_context,
+                    purpose,
+                )
+            },
+        )?;
+        let last = page.len() < MAX_LIST_LIMIT as usize;
+        objects.extend(page);
+        if objects.len() > cap {
+            objects.truncate(cap);
+            return Ok((objects, false));
+        }
+        if last {
+            return Ok((objects, true));
+        }
+    }
+}
+
+fn lint_finding_to_proto(finding: crate::sekai::ontology_lint::LintFinding) -> OntologyLintFinding {
+    OntologyLintFinding {
+        rule: finding.rule.into(),
+        subject_kind: finding.subject_kind.into(),
+        subject_id: finding.subject_id,
+        property: finding.property,
+        severity: finding.severity.into(),
+        detail: finding.detail,
+        suppressed: finding.suppressed.is_some(),
+        suppression_reason: finding.suppressed.unwrap_or_default(),
+    }
 }

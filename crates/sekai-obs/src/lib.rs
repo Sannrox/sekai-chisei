@@ -4,6 +4,7 @@
 //! the vocabulary and exporters the gateway previously copied.
 
 pub mod build_info;
+pub mod correlation;
 pub mod labels;
 pub mod logging;
 pub mod metrics;

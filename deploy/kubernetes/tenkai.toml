@@ -1,0 +1,26 @@
+# Kubernetes packaging of sekai-chisei (#1313).
+#
+# Requires TENKAI_SOFTWARE_EXECUTOR=kubernetes-inprocess and an
+# environment-scoped kubeconfig path (`tenkaictl env cluster-config set`).
+# Manifests live under manifests/; Tenkai applies them with field manager
+# `tenkai` and admits health from StatefulSet conditions.
+#
+# Create Secret `sekai-chisei-tls` in the environment namespace before apply.
+# Walkthrough: docs/kubernetes-minikube.md
+
+[product]
+name = "sekai-chisei"
+version = "1.3.0"
+description = "sekai-chisei control plane (Kubernetes StatefulSet)"
+kind = "software"
+
+[deploy]
+workdir = "."
+# In-process apply uses manifests/; install is unused when the executor is set.
+# Fail closed if the operator forgets TENKAI_SOFTWARE_EXECUTOR.
+install = "echo 'set TENKAI_SOFTWARE_EXECUTOR=kubernetes-inprocess for this product' >&2; exit 1"
+uninstall = "true"
+# In-process health is workload conditions. This command is the shell-path
+# reminder if the executor env is forgotten.
+health = "echo 'set TENKAI_SOFTWARE_EXECUTOR=kubernetes-inprocess for this product' >&2; exit 1"
+inputs = ["manifests"]

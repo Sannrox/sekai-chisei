@@ -101,7 +101,9 @@ The standard gRPC health service is available without the application auth
 interceptor so native gRPC probes can call `grpc.health.v1.Health/Check`.
 
 For Kubernetes HTTP probes, set `OPS_BIND=0.0.0.0` only when the kubelet must
-reach the pod IP:
+reach the pod IP. The Tenkai packaging in `deploy/kubernetes/` does this and
+mounts TLS from Secret `sekai-chisei-tls`; see
+[kubernetes-minikube.md](kubernetes-minikube.md).
 
 ```yaml
 livenessProbe:

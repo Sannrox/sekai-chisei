@@ -14,7 +14,10 @@ use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use sekai_chisei::db::runtime_db::RuntimeDb;
 
 use sekai_chisei::grpc::client::connect_sekai;
 use sekai_chisei::grpc::pb::chisei::GetOperationReceiptRequest;
@@ -276,7 +279,9 @@ async fn exercise_product_loop(server: &LoopServer) {
             upserts: vec![DefinitionMemberInput {
                 member_kind: "object_type".into(),
                 member_id: "incident".into(),
-                definition_json: r#"{"name":"incident"}"#.into(),
+                // A reasoned suppression lets the lint gate publish a type no
+                // consumer references yet.
+                definition_json: r#"{"name":"incident","lint_suppressions":[{"rule":"orphan_object_type","reason":"first type of the product loop"}]}"#.into(),
                 member_digest: String::new(),
             }],
             removals: Vec::new(),
@@ -296,6 +301,8 @@ async fn exercise_product_loop(server: &LoopServer) {
             eval_plan_digests: Vec::new(),
             named_foreign_digests: Vec::new(),
             idempotency_key: "loop-propose".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
         })
         .await
         .unwrap_or_else(|error| panic!("propose: {error}\n{}", logs()));
@@ -517,6 +524,10 @@ async fn exercise_product_loop(server: &LoopServer) {
 async fn sqlite_runs_the_product_loop() {
     let server = LoopServer::spawn(&Backend::Sqlite);
     exercise_product_loop(&server).await;
+    crate::evidence_backend_conformance::exercise_execution_recording(
+        &RuntimeDb::memory(),
+        "loop-sqlite",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -530,4 +541,15 @@ async fn postgres_runs_the_product_loop() {
         ca_cert: sekai.ca_cert.clone(),
     });
     exercise_product_loop(&server).await;
+    // The postgres client builds its own runtime and panics on Drop while this
+    // tokio worker is still driving tasks. Own the pool on a thread that has none.
+    let exec = ScratchDatabase::create();
+    std::thread::spawn(move || {
+        crate::evidence_backend_conformance::exercise_execution_recording(
+            &RuntimeDb::Postgres(Arc::new(exec.connect(8))),
+            "loop-postgres",
+        );
+    })
+    .join()
+    .expect("execution recording");
 }

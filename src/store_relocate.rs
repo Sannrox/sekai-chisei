@@ -1596,6 +1596,8 @@ pub fn is_mutating_rpc(method: &str) -> bool {
         || name.starts_with("Watch")
         || name == "ExpandNeighborhood"
         || name == "FindPaths"
+        || name == "ExplainValue"
+        || name == "CompareDatasetBranch"
         || name == "Check"
         || name == "CheckAccess"
         || name == "CheckReady"
@@ -2020,8 +2022,9 @@ pub fn open_layout_or_fence(default_sqlite_path: &str) -> Result<CombinedStoreLa
 mod tests {
     use super::*;
     use crate::chisei::budget::{BudgetTracker, PeriodType};
+    use crate::chisei::external_action::ExternalActionSekaiDbExt;
+    use crate::chisei_store::ChiseiStore;
     use crate::db::sekai::SekaiDb;
-    use crate::db::store::ChiseiStore;
     use crate::sekai::action_instance::{ActionInstance, STATUS_ADMITTED};
     use std::sync::Arc;
 
@@ -2515,6 +2518,9 @@ mod tests {
                 created_at_ms: 1,
                 decided_at_ms: 1,
                 system_one_fill_json: String::new(),
+                marking: String::new(),
+                conflict: None,
+                offline: None,
             })
             .unwrap();
     }

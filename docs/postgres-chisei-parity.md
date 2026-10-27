@@ -1,7 +1,9 @@
 # Chisei PostgreSQL parity
 
 This note closes the Chisei governed-decision and execution PostgreSQL parity
-track (#237). Community PostgreSQL runtime selection is activated by #238.
+track (#237) and the equal-PostgreSQL epic (#1328). Community PostgreSQL
+runtime selection is activated by #238. PostgreSQL is a first-class community
+backend.
 
 ## Outcome
 
@@ -21,7 +23,7 @@ projections are the shrink-only list
 | `chisei.evaluation` / samples | Proven | `tests/chisei_eval_backend_conformance.rs` |
 | `chisei.portfolio` | Proven | `tests/chisei_portfolio_backend_conformance.rs` |
 | `chisei.policy` | Proven (graph objects) | `tests/chisei_policy_backend_conformance.rs` |
-| `chisei.approvals` | Proven for issue/revoke/policy; online redeem SQLite-only | `tests/chisei_external_action_backend_conformance.rs`, `tests/chisei_external_permit_backend_conformance.rs`; list entry `ChiseiService.RedeemExternalActionPermit` |
+| `chisei.approvals` | Proven for issue/revoke/policy, online redeem, offline reconcile, and delegation-chain validation | `tests/chisei_external_action_backend_conformance.rs`, `tests/chisei_external_permit_backend_conformance.rs` |
 | `chisei.learning` | Proven for Kioku lifecycle and Gunshi allocation | `tests/chisei_kioku_backend_conformance.rs`, `tests/chisei_gunshi_backend_conformance.rs` |
 | `chisei.data-quality-rule` | SQLite-only | list entry `admin.data-quality`; see [data-quality-rules.md](data-quality-rules.md) |
 | `chisei.observations` | Proven | eval sample harness |
@@ -33,7 +35,7 @@ projections are the shrink-only list
 | --- | --- |
 | `tests/fixtures/chisei_rpc_inventory/v1.json` | Fail-closed map of every Chisei/LLM RPC |
 | `tests/fixtures/runtime_backend/postgres-chisei-complete-v1.json` | Complete Chisei capability advertisement |
-| `src/db/chisei_rpc_inventory.rs` | Inventory validation and capability helper |
+| `crates/sekai-core/src/db/chisei_rpc_inventory.rs` | Inventory validation and capability helper |
 | `tests/chisei_*_backend_conformance.rs` | Shared SQLite/PostgreSQL harnesses |
 
 `complete_chisei_surfaces` lists surfaces with dual-backend *storage* evidence
@@ -49,19 +51,33 @@ named in
 | Eval / portfolio / policy / gateway audit harnesses | Dual harnesses for existing methods |
 | External-action authorization and permits | PostgreSQL methods + harnesses |
 | Kioku learning lifecycle | PostgreSQL methods + harnesses |
-| Inventory complete capability | This closeout |
+| Inventory complete capability | Parent closeout |
+| Permit redeem, reconcile, and delegation (#1323) | Dual-backend approvals path |
+| Equal-PostgreSQL epic (#1328) | First-class community backend closeout |
+
+Tenant state, OIDC and OAuth are not Sekai-owned on any backend (ADR 0099,
+#1613); tenant authority comes from the identity extension on either one.
 
 ## Still outside this track
 
-- Tenant state, OIDC, and OAuth
 - Host-local permit verification crypto (`verify_for_executor`) — never a
   control-plane dual-backend claim
-- Control-plane online redeem (see the shrink-only list)
+- `PlanExecution` and `PlanContentExecution` fail closed on PostgreSQL:
+  both persist the plan through `put_operation_receipt_with_kioku_holdouts`,
+  which the community PostgreSQL store rejects even with an empty holdout
+  list. This is a public planning limitation, not a shrink-only helper.
+- Dest-pair `reconcile_missing_execution_evidence` cannot join the Sekai and
+  Chisei stores on one connection and stays fail-closed on PostgreSQL
 
 ## Operator posture
 
-SQLite remains the default community backend. Combined PostgreSQL opens
-`SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
-A single `DATABASE_URL` is retired and refuses boot. Use that dest-pair for dual-backend budget
-reserve/usage, limit projection, policy, execution, Kioku, and gateway governance. Prefer SQLite
-when hosts must redeem online permits (see [configuration.md](configuration.md) and #238).
+SQLite remains the default community backend. PostgreSQL is a first-class
+community choice. Combined PostgreSQL opens `SEKAI_DATABASE_URL` +
+`CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`. A single
+`DATABASE_URL` is retired and refuses boot. Use that dest-pair for
+dual-backend budget reserve/usage, limit projection, policy, execution
+storage, Kioku, permit redeem/reconcile, and gateway governance (see
+[configuration.md](configuration.md) and #238). `PlanExecution` and
+`PlanContentExecution` fail closed on PostgreSQL until receipt persist with
+Kioku holdouts lands. Remaining shrink-only admin projections
+(`admin.data-quality`, `admin.learning-change`) also fail closed.

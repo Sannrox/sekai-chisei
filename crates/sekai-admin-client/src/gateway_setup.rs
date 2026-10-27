@@ -8,6 +8,8 @@ use chrono::Utc;
 use tonic::Request as GrpcRequest;
 
 use crate::client::connect_sekai;
+use chisei_provider::gateway_keys::default_virtual_key;
+use sekai_domain::gateway_keys::hash_gateway_key;
 use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_proto::chisei::{SetBudgetLimitRequest, SetNamespacePolicyRequest};
 use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
@@ -16,7 +18,6 @@ use sekai_proto::sekai::{
     FindByExternalIdRequest, Link, ListFilter, ListObjectsRequest, Object, UpdateDatasetRequest,
     UpdateObjectRequest,
 };
-use sekai_provider::gateway_keys::{default_virtual_key, hash_gateway_key};
 
 const DEFAULT_CONTEXT_ADMISSION_POLICY_JSON: &str = r#"{"contract_version":"chisei.context-admission/v1","default_action":"include","unknown_action":"hold_out","rules":[]}"#;
 
@@ -883,7 +884,7 @@ async fn upsert_object(
 async fn ensure_llm_calls_dataset(
     sekai: &mut SekaiServiceClient<GatewayClient>,
 ) -> Result<(), tonic::Status> {
-    let columns = sekai_provider::gateway_contract::LLM_CALLS_COLUMNS
+    let columns = chisei_provider::gateway_contract::LLM_CALLS_COLUMNS
         .iter()
         .copied()
         .map(|name| ColumnDef {
@@ -1112,7 +1113,7 @@ mod tests {
 
         let sekai_store = sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone());
         let sekai_svc = SekaiServiceImpl::new(sekai_store.clone());
-        let chisei_store = sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db.clone());
+        let chisei_store = sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(db.clone());
         let _ =
             sekai_chisei::chisei::model_review::enable_registry_provider_families(&chisei_store);
         let chisei_svc = ChiseiServiceImpl::new(chisei_store, test_config())

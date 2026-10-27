@@ -2,9 +2,9 @@
 
 use crate::chisei::data_quality::{self, PublishDataQualityRule};
 use crate::chisei::sekai_facts::SekaiFacts;
+use crate::chisei_store::ChiseiStore;
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
-use crate::db::store::ChiseiStore;
 use chrono::Utc;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;

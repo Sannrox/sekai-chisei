@@ -9,9 +9,9 @@ use std::fs;
 use std::path::Path;
 
 fn postgres_sources() -> Vec<(String, String)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/sekai-core/src/db");
     let mut sources = fs::read_dir(&dir)
-        .expect("src/db")
+        .expect("crates/sekai-core/src/db")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {

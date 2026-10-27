@@ -10,12 +10,12 @@
 use sekai_chisei::chisei::eval::{EvalStore, Suite};
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
-use sekai_chisei::gateway_keys::hash_gateway_key;
 use sekai_chisei::sekai::coordination::{
     ADMISSION_POLICY_FIFO, ContentionScope, ReconcileFilter, WORK_UNIT_STATUS_PENDING,
     WORK_UNIT_STATUS_STALE, WorkUnit,
 };
 use sekai_chisei::sekai::credentials::PrincipalCredentialStore;
+use sekai_domain::gateway_keys::hash_gateway_key;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -147,12 +147,12 @@ fn credential_reload_and_eval_share_across_replicas() {
     assert!(store.maybe_reload(&pair.b));
     assert!(store.resolve(secret).is_none());
 
-    let writer = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
-        Arc::clone(&pair.a),
-    ));
-    let reader = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
-        Arc::clone(&pair.b),
-    ));
+    let writer = EvalStore::with_db(
+        sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(Arc::clone(&pair.a)),
+    );
+    let reader = EvalStore::with_db(
+        sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(Arc::clone(&pair.b)),
+    );
     writer
         .put_suite(Suite {
             id: "closeout-suite".into(),

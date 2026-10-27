@@ -1,0 +1,105 @@
+# Data catalog
+
+Catalog entries describe datasets, object types, pipelines, sources, services,
+releases and environments: owners, steward, tags, marking, schema summary,
+freshness and status. They are
+experimental; `RegisterCatalogEntry`, `GetCatalogEntryLineage` and
+`ListCatalogCriticalityOutbox` need
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature (see
+[rpc-maturity.md](rpc-maturity.md)).
+The design is [ADR 0122](decisions/0122-governed-catalog-entries.md).
+
+## Reading
+
+An entry is an object of kind `catalog_entry` in the namespace it describes,
+with properties `entry_kind` (`dataset`, `object_type`, `pipeline`, `source`,
+`service`, `release` or `environment`),
+`source_system`, `source_id`, `description`, `owners`, `steward`, `tags`,
+`access_marking`, `schema_summary`, `freshness_ms` and `status` (`active` or
+`deprecated`). Read and find entries with the ordinary object RPCs and
+search (kind `catalog_entry`), under the same read policy as any object: a
+caller without access to a namespace or marking sees no entry, count or
+facet value for it.
+
+## Registering
+
+`RegisterCatalogEntry` records what a source system reports, keyed by its
+stable id: one entry per namespace, entry kind, source system and source id.
+
+- Needs namespace write; the stored entry is checked like any object update
+  (ACL, markings, object security policy, property grants, schema-restricted
+  properties), and a write freeze stops it.
+- Registering identical content writes nothing; a changed registration is an
+  audited object update.
+- A marking only rises: the entry keeps the least marking that dominates the
+  stored and requested ones, under the namespace's lattice.
+- `deprecated: true` deregisters; nothing is deleted.
+- The response omits the entry when the caller may write but not read it.
+
+Generic object writes refuse the kind, and `source_system: sekai.ontology`
+is reserved. Object security activation does not require a `catalog_entry`
+policy; in an activated namespace without one, entries are unreadable.
+
+## Curation
+
+Owners and the steward curate an entry's `description`, `tags`, `owners` and
+`declared_criticality` through a governed Action (#1686, #1688): an Action
+type with `object_kind: catalog_entry` and `object_mutation: update`, whose
+parameters are the entry's `object_id` and the fields to set (`tags` and
+`owners` as comma-separated lists; `declared_criticality` as `low`,
+`medium`, `high` or `critical`). The Action is admitted, receipted and
+audited like any other; the write is an object update carrying the Action's
+operation id.
+
+- Only a principal listed in `owners`, or the `steward`, may curate; anyone
+  else is refused. The submitter must still pass the Action type's submit
+  policy.
+- Only those fields and `access_marking` change; names, source identity and
+  status stay with registration. An entry always keeps an owner.
+- The marking only rises. A curation that would lower it is refused;
+  lowering is the audited declassify path.
+- A curated field stays curated: the entry lists it in `curated`, and later
+  registrations keep the curated value instead of the source's.
+- Search follows the edit once the index catches up, under the same read
+  policy.
+
+## Object types
+
+Object types register themselves: every 60 seconds on each Sekai instance,
+the plane keeps one active entry per published
+object type, with its `access_marking` and property names, and deprecates
+entries for object types no longer published. Namespaces under a write
+freeze catch up after it lifts.
+
+## Lineage
+
+`GetCatalogEntryLineage` walks typed core bindings (#1685). At registration an
+entry may carry exactly one binding for its kind: a dataset id, an object type
+id, a transform id, or a source identifier plus its live source type
+descriptor. Registration checks the target exists and is discoverable; a later
+registration cannot retarget it. Ontology-published object types bind
+themselves. Unbound entries have no lineage and say so.
+
+Traversal uses those bindings, the transform graph (input and output
+datasets), recorded source dataset identity, and registered object-type
+datasources. There is no second lineage store and no name inference. Depth
+defaults to 8 and page size to 32. A node whose bound target the caller cannot
+discover is a redacted placeholder: kind only, no id, name or marking. Search
+counts and facets still omit hidden entries. Registration of a new binding
+needs the same discover access `ListDatasets` uses for that target.
+
+## Services, releases and environments
+
+Service, release and environment entries register like any other kind, keyed
+by the source's stable id. They may bind to the dataset, object type,
+transform or source they reach. Derived criticality is the highest of
+`low < medium < high < critical` implied by markings on reachable data
+(`public` → `low`, `internal` → `medium`, `confidential` → `high`,
+`restricted` → `critical`). Declared criticality is curated. Effective is
+the higher of the two; a lower declared value does not lower it. Lowering
+effective follows the audited declassify path on the reachable data.
+
+Each change to declared, derived or effective appends one outbox event
+(`sekai.catalog-criticality/v1`) with a content digest and no markings.
+`ListCatalogCriticalityOutbox` is Discover on the namespace and omits events
+for entries the caller cannot read.

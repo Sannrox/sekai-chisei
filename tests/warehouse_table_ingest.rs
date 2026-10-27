@@ -183,6 +183,8 @@ async fn publish_object_type(
                 eval_plan_digests: Vec::new(),
                 named_foreign_digests: Vec::new(),
                 idempotency_key: "orders-propose".into(),
+                major_revision: false,
+                migration_plan_digest: String::new(),
             },
             SCHEMA_ADMIN,
         ))
@@ -308,7 +310,13 @@ async fn warehouse_snapshots_hydrate_typed_objects_with_checkpoints_and_quaranti
     assert_eq!(kind, first.record_kind);
     let definition = warehouse_table_ingest::object_type_definition(&first);
     assert!(!definition.contains("customer_email"), "{definition}");
-    let published = publish_object_type(&service, &kind, definition).await;
+    // No consumer references the new type yet, so the lint gate needs a
+    // reasoned suppression to publish it.
+    let mut definition: serde_json::Value = serde_json::from_str(&definition).unwrap();
+    definition["lint_suppressions"] = serde_json::json!([
+        {"rule": "orphan_object_type", "reason": "queried by the product loop"}
+    ]);
+    let published = publish_object_type(&service, &kind, definition.to_string()).await;
     let open_in_eu = service
         .evaluate_object_set(with_principal(
             EvaluateObjectSetRequest {

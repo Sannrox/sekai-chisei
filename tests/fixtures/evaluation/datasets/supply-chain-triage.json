@@ -1,0 +1,31 @@
+{
+  "contract_version": "chisei.eval-dataset-definition/v1",
+  "name": "supply-chain-triage",
+  "generator": "supply_chain",
+  "namespace": "eval-supply-chain",
+  "seed": 1673,
+  "preset": "load_test",
+  "templates": [
+    {
+      "id": "shipment-status",
+      "kind": "synthetic_shipment",
+      "input_properties": ["tracking", "quantity"],
+      "expected_property": "status",
+      "tags": ["shipment", "status"]
+    },
+    {
+      "id": "incident-state",
+      "kind": "synthetic_incident",
+      "input_properties": ["shipment", "severity"],
+      "expected_property": "state",
+      "tags": ["incident", "triage"]
+    },
+    {
+      "id": "part-criticality",
+      "kind": "synthetic_part",
+      "input_properties": ["sku"],
+      "expected_property": "critical",
+      "tags": ["part"]
+    }
+  ]
+}

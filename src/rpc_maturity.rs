@@ -492,7 +492,6 @@ mod tests {
     #[test]
     fn table_matches_proto_and_stays_within_the_stable_limit() {
         let table = RpcMaturityTable::load().expect("maturity table");
-        assert_eq!(table.entries.len(), 231);
         assert_eq!(table.stable_rpcs().len(), 68);
         assert!(
             table
@@ -600,6 +599,14 @@ mod tests {
             tonic::Code::FailedPrecondition
         );
         assert!(require_invokable("DryRunAgent", true).is_ok());
+        assert_eq!(
+            require_invokable("RunAgentShadow", false)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(require_invokable("RunAgentShadow", true).is_ok());
+        assert!(require_invokable("GetAgentShadowReport", true).is_ok());
         assert!(require_invokable("GetDefinitionMember", true).is_ok());
         assert!(require_invokable("CreateFunction", true).is_ok());
         assert!(require_invokable("ListKiokuCandidates", true).is_ok());

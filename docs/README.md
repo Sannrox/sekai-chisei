@@ -39,7 +39,8 @@ If you want to deploy or operate the control plane:
 4. Use the [Docker guide](docker.md) if you want the supported container
    topology. Compose sets Combined dest-pair
    (`SEKAI_DB_PATH`/`CHISEI_DB_PATH`); the image sets `SEKAI_DATA_DIR=/data`,
-   which derives the same pair.
+   which derives the same pair. Use [Kubernetes on minikube](kubernetes-minikube.md)
+   for the Tenkai `kubernetes-inprocess` StatefulSet packaging.
 5. For live operations, see the [operator console](operator-console.md),
    [leases](leases.md), [object security](object-security.md), and
    [PostgreSQL parity](postgres-sekai-parity.md) /
@@ -91,6 +92,8 @@ If you want to deploy or operate the control plane:
   evaluated against pinned dataset revisions.
 - [Governed geospatial queries](geospatial-queries.md) — authorized point,
   distance, contains, and intersects over named property claims.
+- [Fenced Ezu geo feed](ezu-geo-feed.md) — incremental object geo changes
+  and GeoArrow backfill into Ezu under a run lease and durable cursor.
 - [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
   authenticated execution for operator-deployed domain evaluators.
 - [Inbound object sync](object-sync.md) — bounded source batches, durable
@@ -118,16 +121,41 @@ If you want to deploy or operate the control plane:
 - [Authorized consumer impact](definition-consumer-impact.md) —
   registered definition-consumer bindings joined to revision comparison.
   Zero visible dependents is not proof of zero impact.
+- [Ontology lint](ontology-lint.md): structural findings over a namespace
+  under the caller's read policy.
+- [Governed export](governed-export.md): object sets out of the plane
+  under an export grant, with a receipt per export.
+- [RPCs for tenant assertions](tenant-assertion-rpcs.md): which RPCs a
+  tenant-scoped identity assertion may call, and which it may not.
+- [Ontology health](ontology-health.md): a 0-100 score per namespace from
+  freshness, checks, contracts, lint and grants.
+- [Definition change bundles](definition-change-bundles.md) — revision
+  diff, migration plan, backfill, and consumer impact in one read-only
+  bundle.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
   `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
   hops/aggregates, evaluated through authorized list and traverse. A page
   is not authority.
+- [Embedding index](embedding-index.md) — stored specs embedded through a
+  hosted catalog route on a schedule, with governance tags on every vector.
 - [Permission-aware search](search.md) — experimental text search over
   objects and dataset metadata. Hits, counts, facets, and highlights come
   from the live authorized projection. A page is not authority.
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   bounded expansion and shortest paths over links, with read policy at
   every hop. Hidden objects are omitted, not placeholders.
+- [Data catalog](catalog.md) — experimental catalog entries for datasets,
+  object types and pipelines, registered by stable source id.
+- [Ontology changelog](ontology-changelog.md) — experimental changelog and
+  team digest of definition revisions and policy activations, as the reader.
+- [Media uploads](media-uploads.md) — experimental resumable, checksummed
+  uploads that return a governed media reference.
+- [Offline sync](offline-sync.md) — experimental sync scopes: a
+  policy-filtered snapshot, then resumable deltas.
+- [Object comments](object-comments.md) — experimental comment threads and
+  mentions on objects, visible only to readers of the object.
+- [Trust scores](trust-scores.md) — experimental per-object confidence
+  from a versioned namespace rule, with the reasons for each score.
 - [Object-change subscriptions](object-change-subscriptions.md) —
   plane-owned create/update/delete pages over event-subscription cursors.
   Snapshot, then stream; a page is not authority.

@@ -31,10 +31,10 @@ engine's own unit tests continue to exercise detailed internal accounting.
 The conformance suite is intentionally small and composes existing focused
 tests rather than recreating every source fixture:
 
-- `src/chisei/epistemic_descriptor.rs` covers asserted, derived, hypothesis,
+- `crates/chisei-core/src/chisei/epistemic_descriptor.rs` covers asserted, derived, hypothesis,
   Kioku supported/contested/insufficient, stale/retracted/superseded lifecycle,
   external evidence, aggregate byte bounds, and source-digest omission.
-- `src/chisei/pipeline.rs` covers local versus external egress, classification
+- `crates/chisei-core/src/chisei/pipeline.rs` covers local versus external egress, classification
   ceilings, object-property redaction, Kioku applicability, and bounded
   egress records.
 - `src/grpc/sekai_service.rs` covers evidence submission lifecycle and
@@ -43,9 +43,8 @@ tests rather than recreating every source fixture:
   gateway sampling through the canonical decision preflight, receipt descriptor
   aggregates, and egress-audit projections.
 
-Asserted graph retrieval is reusable on SQLite and PostgreSQL. Query-time
-ontology entailment remains SQLite-only; PostgreSQL returns an explicit
-`FAILED_PRECONDITION` instead of a partial inference projection. The suite is
+Asserted graph retrieval and query-time ontology entailment are reusable on
+SQLite and PostgreSQL (#1320). The suite is
 credential- and service-free; backend-specific PostgreSQL conformance remains
 covered by the existing ignored inventory tests when
 `SEKAI_TEST_POSTGRES_URL` is supplied.

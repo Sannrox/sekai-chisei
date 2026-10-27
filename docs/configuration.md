@@ -46,6 +46,8 @@ template.
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set `1` to explicitly allow authenticated public TCP without TLS |
 | `SEKAI_SITE_ID` | `local` | Site/region pin stamped on coordination leases and online permit redemption; multi-region sites use a distinct non-empty id (see [region-pins.md](region-pins.md)) |
+| `SEKAI_EZU_URL` | unset | Ezu HTTP and Arrow Flight address for fence-binding event reads and geo-feed writes ([ezu-geo-feed.md](ezu-geo-feed.md)) |
+| `EZU_TOKEN` | unset | Community bearer for Ezu; enterprise resolves provider `ezu` per `run_as` tenant. The token decides the Ezu namespace |
 | `SEKAI_OBJECT_INDEX_ENGINE` | `hop-projection` | Object-set hop engine (`hop-projection` default, or `nested-loop` as an explicit debug scan). Unset or empty parses as hop-projection. After the default switch, operators must `ReindexObjectType` for hop kinds. Pinning nested-loop does not bypass an unready generation. Both engines fail closed while hop-projection ready is false after a binding-generation bump. Switching engines requires `ReindexObjectType` |
 | `SEKAI_OBJECT_INDEX_DUAL_READ` | unset | Canary/CI only. Set `1` to compare both engines and fail closed on mismatch; evaluate also requires `max_rows_scanned` because both plans share the cost meter |
 | `SEKAI_OBJECT_LOG_DUAL_READ` | unset | Canary/CI only. Set `1` to sample-compare SQL EvaluateObjectSet to a tagged mikura log and fail closed on mismatch, missing log, or missing `max_rows_scanned`. Plans the log cannot witness without a silent rule mismatch (`group_by`, multi-key sort, distinct, path multiplicity, non-i64 measure, incoming hop direction) keep the SQL answer and skip the canary instead of refusing evaluate. After #980 every production multi-hop has `group_by`, so those requests skip. Whole-set min/max/avg without `group_by` compare when reconstructed i64 measures match. Property grants project into the tagged multi-deny view: declared properties a kind neither grants nor reads are denied. The canary still skips when the evaluate reads an ungranted property or a narrowed kind has no schema ([ADR 0081](decisions/0081-evaluate-reads-mikura-library.md)) |
@@ -117,12 +119,12 @@ PostgreSQL implements the reusable community surface set—Sekai, Chisei, gatewa
 governance, and operations health—with shared SQLite/PostgreSQL conformance for
 the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts Combined PostgreSQL on
 `SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL`, and only when migrations and
-capabilities validate. Some public paths remain SQLite-only and fail
-closed on community Postgres (query-time ontology
-entailment, dataset row append/query through `RuntimeDb`, and online permit
-redeem/reconcile). See
-[postgres-sekai-parity.md](postgres-sekai-parity.md) and
-[postgres-chisei-parity.md](postgres-chisei-parity.md). Backend selection does
+capabilities validate. Remaining SQLite-only experimental RPCs and admin
+projections fail closed on community PostgreSQL; they live on the shrink-only
+list in [postgres-sekai-parity.md](postgres-sekai-parity.md) and
+[postgres-chisei-parity.md](postgres-chisei-parity.md). Chisei `PlanExecution`
+and `PlanContentExecution` also fail closed on PostgreSQL (receipt persist
+with Kioku holdouts). Backend selection does
 not enable tenant, OIDC, OAuth, or identity endpoints.
 
 For multi-replica control planes, use a shared backend so budgets, leases, and

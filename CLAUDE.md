@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the combined server, `src/bin/sekai.rs` and `src/bin/chisei.rs` start the `sekai-plane` and `chisei-plane` processes, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite and PostgreSQL community backends (`SEKAI_DB_BACKEND`), `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, and `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic. Workspace crates include `chisei-gateway`, `sekai-proto`, `sekai-provider` (re-exported as `sekai_chisei::llm`), `sekai-admin-client`, `sekai-client`, and `sekai-ontology`. Canonical protocol files are in `proto/`; keep `crates/sekai-proto/proto/` in byte-for-byte sync. Integration tests live in `tests/`. Combined-mode SQLite uses dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` when both are set, otherwise with no store variable `sekai.db`/`chisei.db` under `SEKAI_DATA_DIR` (default `./data`); `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE` are retired and refuse boot with guidance toward `sekaictl admin store relocate`. Do not commit local databases or generated runtime state. `CLAUDE.md` is a compatibility copy of this file for Claude Code; keep them identical. Domain lifecycle maps live in `CONTEXT.md`.
+`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the combined server, `src/bin/sekai.rs` and `src/bin/chisei.rs` start the `sekai-plane` and `chisei-plane` processes, `src/bin/sekaictl.rs` starts the operator CLI, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, and `src/composition/` holds code that needs both planes. Policy, budget, routing, evaluation, pipeline, and Chisei persistence live in `crates/chisei-core` and are re-exported as `sekai_chisei::{chisei, chisei_store}`. Durable graph, audit, lineage, security, coordination, and Sekai persistence live in `crates/sekai-core` and are re-exported as `sekai_chisei::{sekai, db}`. Workspace crates include `chisei-gateway`, `chisei-core`, `chisei-provider` (re-exported as `sekai_chisei::llm`), `sekai-admin-client`, `sekai-client`, `sekai-connector-template`, `sekai-core`, `sekai-domain`, `sekai-keys`, `sekai-obs`, `sekai-ontology`, `sekai-proto`, `sekai-source-sdk`, and `sekai-types`. Canonical protocol files are in `proto/`; keep `crates/sekai-proto/proto/` in byte-for-byte sync. Integration tests live in `tests/`. Combined-mode SQLite uses dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` when both are set, otherwise with no store variable `sekai.db`/`chisei.db` under `SEKAI_DATA_DIR` (default `./data`); `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE` are retired and refuse boot with guidance toward `sekaictl admin store relocate`. Do not commit local databases or generated runtime state. `CLAUDE.md` is a compatibility copy of this file for Claude Code; keep them identical. Domain lifecycle maps live in `CONTEXT.md`.
 
 ## Build, Test, and Development Commands
 
@@ -34,7 +34,11 @@ implementing. Agents never switch, reset, or stash the primary checkout;
 inspect `git status -sb` and `git worktree list` before Git or GitHub work and
 preserve other lanes. The "Parallel delivery lanes" section of
 `docs/project-operating-system.md` defines claims, the lane limit, collision
-surfaces, and serialized Git mutations.
+surfaces, and serialized Git mutations. Each lane builds into its own worktree's
+`target/` (the default; never point two lanes at one `CARGO_TARGET_DIR`), binds
+test ports at `:0`, and gives PostgreSQL conformance its own database through
+`scripts/postgres-conformance.sh`. `--test-threads=1` serializes tests inside one
+process; it does not isolate two agents.
 
 ## Ontology Policy
 
@@ -53,7 +57,7 @@ Ontology classes and relations describe meaning. Directory commands record local
 
 ## Coding Style & Naming Conventions
 
-Follow standard Rust formatting with `cargo fmt` and keep modules aligned with the existing domain boundaries. Use `snake_case` for files, modules, functions, and variables; use `PascalCase` for types and traits; use `SCREAMING_SNAKE_CASE` for constants. Keep provider-specific behavior behind `crates/sekai-provider/` abstractions (re-exported as `sekai_chisei::llm`). Prefer explicit policy, audit, and authorization behavior over hidden side effects.
+Follow standard Rust formatting with `cargo fmt` and keep modules aligned with the existing domain boundaries. Use `snake_case` for files, modules, functions, and variables; use `PascalCase` for types and traits; use `SCREAMING_SNAKE_CASE` for constants. Keep provider-specific behavior behind `crates/chisei-provider/` abstractions (re-exported as `sekai_chisei::llm`). Prefer explicit policy, audit, and authorization behavior over hidden side effects.
 
 ## Testing Guidelines
 

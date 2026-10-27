@@ -28,6 +28,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".", "#[serde(rename_all = \"camelCase\")]")
+        // Fields added after a message shipped default when JSON callers
+        // (the MCP adapter) omit them.
+        .field_attribute(
+            "sekai.CreateDefinitionProposalRequest.major_revision",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.DefinitionProposal.major_revision",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.CreateDefinitionProposalRequest.migration_plan_digest",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.DefinitionConsumerImpactPath.blocking",
+            "#[serde(default)]",
+        )
+        .field_attribute("sekai.ExportDefinition.every_ms", "#[serde(default)]")
         .compile_protos(
             &[
                 format!("{proto_root}/sekai.proto"),

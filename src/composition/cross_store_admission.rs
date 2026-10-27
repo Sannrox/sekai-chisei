@@ -13,10 +13,11 @@ use crate::chisei::receipt::{
 };
 use crate::chisei::sekai_commit::{SekaiCommitLookup, SekaiCommitRef};
 use crate::chisei::system_one_action::SystemOneProposal;
+use crate::chisei_store::{ChiseiReceiptStore, ChiseiStore};
 use crate::db::chisei_operation_reservation::{
     OperationReservation, RESERVATION_FINALIZED, RESERVATION_PENDING, RESERVATION_RELEASED,
 };
-use crate::db::store::{ChiseiReceiptStore, ChiseiStore, SekaiStore};
+use crate::db::store::SekaiStore;
 use crate::sekai::action_instance::{
     compute_request_digest_with_envelope, submit_budget_subject, validate_parameters_json,
 };
@@ -27,19 +28,6 @@ use crate::sekai::action_instance_admission::{
 use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 
 pub const DEFAULT_RESERVATION_TTL_MS: i64 = 15 * 60 * 1_000;
-
-impl SekaiCommitLookup for SekaiStore {
-    fn lookup_commit(&self, operation_id: &str) -> Result<Option<SekaiCommitRef>, String> {
-        Ok(self
-            .runtime()
-            .get_action_instance_by_operation_id(operation_id)?
-            .map(|instance| SekaiCommitRef {
-                namespace: instance.namespace,
-                instance_id: instance.instance_id,
-                status: instance.status,
-            }))
-    }
-}
 
 #[derive(Clone)]
 pub struct CrossStoreAdmission {
@@ -172,7 +160,7 @@ impl CrossStoreAdmission {
             .put_operation_reservation(&reservation)
             .map_err(ActionInstanceAdmissionError::Internal)?;
         if self.distinct_stores {
-            self.write_decision_receipt(&stored, now_ms)?;
+            self.write_decision_receipt(&stored, None, now_ms)?;
         }
         Ok(stored)
     }
@@ -214,7 +202,11 @@ impl CrossStoreAdmission {
             .put_operation_reservation(&next)
             .map_err(ActionInstanceAdmissionError::Internal)?;
         if self.distinct_stores {
-            self.write_decision_receipt(&stored, now_ms)?;
+            self.write_decision_receipt(
+                &stored,
+                commit.map(|commit| commit.marking.as_str()),
+                now_ms,
+            )?;
         }
         Ok(stored)
     }
@@ -309,7 +301,11 @@ impl CrossStoreAdmission {
         let outcome = match self.submit_sekai(request, actor, now_ms, tenant, machine_credential) {
             Ok(outcome) => outcome,
             Err(error) => {
-                if is_write_freeze_refusal(&error) {
+                // A refusal that admitted nothing gives the charge back: a
+                // freeze, or a submitter not cleared for the marking (#1706).
+                if is_write_freeze_refusal(&error)
+                    || matches!(error, ActionInstanceAdmissionError::PermissionDenied(_))
+                {
                     let _ = self.release(&reserved, now_ms);
                 } else {
                     let _ = self.finalize(&reserved, None, now_ms);
@@ -321,14 +317,18 @@ impl CrossStoreAdmission {
             namespace: outcome.instance.namespace.clone(),
             instance_id: outcome.instance.instance_id.clone(),
             status: outcome.instance.status.clone(),
+            marking: outcome.instance.marking.clone(),
         };
         self.finalize(&reserved, Some(&commit), now_ms)?;
         Ok(outcome)
     }
 
+    /// `marking` is the committed instance's (#1706); the receipt then needs
+    /// clearance for it, as the instance does.
     fn write_decision_receipt(
         &self,
         reservation: &OperationReservation,
+        marking: Option<&str>,
         now_ms: i64,
     ) -> Result<(), ActionInstanceAdmissionError> {
         let mut attributes = BTreeMap::from([
@@ -344,6 +344,12 @@ impl CrossStoreAdmission {
             attributes.insert(
                 "sekai_commit_status".into(),
                 reservation.sekai_status.clone(),
+            );
+        }
+        if let Some(marking) = marking.filter(|marking| !marking.is_empty()) {
+            attributes.insert(
+                crate::chisei::sekai_commit::RECEIPT_MARKING_ATTRIBUTE.into(),
+                marking.to_string(),
             );
         }
         let completed_at_ms = (reservation.status != RESERVATION_PENDING).then_some(now_ms);
@@ -505,6 +511,11 @@ mod tests {
             delegating_actor: None,
             budget_already_reserved: false,
             resource_tenant: String::new(),
+            binding_markings: Vec::new(),
+            source_object_id: String::new(),
+            marking_gate: Default::default(),
+            expected_object_revision: String::new(),
+            offline: None,
         }
     }
 

@@ -37,8 +37,8 @@ and is interpreted in the object’s namespace lattice. Operators who need
 isolated compartments must not reuse the same custom token name across
 lattices.
 Trusted service principals remain an explicit exception. SQLite is the
-reference store. PostgreSQL get returns no lattice so the ordinal ceiling
-stays in force; put is unavailable.
+reference store. Amended (#1321): PostgreSQL stores lattices too, with the
+same read, search and transform enforcement.
 
 Credential admins publish and inspect the lattice through
 `PutClassificationLattice` and `GetClassificationLattice`.
@@ -63,4 +63,4 @@ the lattice.
 
 Pure tests cover dominance, incomparable join, unknown tokens, and the
 unactivated ordinal fallback. SQLite persists lattices in normal CI.
-PostgreSQL get remains empty so default-ceiling reads stay available.
+PostgreSQL persists them too (#1321), under the same shared conformance.

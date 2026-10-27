@@ -1,0 +1,7 @@
+{
+  "schema": "sekai.probe-spec/v1",
+  "id": "get-links-cross-tenant",
+  "as": "tenant",
+  "call": {"rpc": "GetLinks", "direction": "outgoing"},
+  "expect": {"codes": ["PermissionDenied", "NotFound"]}
+}

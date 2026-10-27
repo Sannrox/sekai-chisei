@@ -28,7 +28,8 @@ absent rows. Applicable allows record value-free `purpose.read` evidence.
 
 Unactivated namespaces and policies that omit `required_purpose` stay as today.
 Trusted service principals remain an explicit exception. SQLite is the reference
-store; PostgreSQL fails closed as unavailable for purpose authorizations.
+store. Amended (#1321): PostgreSQL stores purpose authorizations too, with the
+same lookup.
 
 ## Alternatives considered
 

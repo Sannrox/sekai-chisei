@@ -48,10 +48,12 @@ use sekai_chisei::chisei::receipt::{
     ReceiptEventKind,
 };
 use sekai_chisei::chisei::sekai_facts::SekaiFacts;
+use sekai_chisei::chisei_store::ChiseiStore;
 use sekai_chisei::config::Config;
 use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::db::store::{ChiseiStore, SekaiStore};
+use sekai_chisei::db::store::SekaiStore;
 use sekai_chisei::domain::Object;
+use sekai_chisei::ext::*;
 use sekai_chisei::grpc::chisei_service::ChiseiServiceImpl;
 use sekai_chisei::grpc::pb::chisei::{
     self, chisei_service_server::ChiseiService as ChiseiGrpcService,
