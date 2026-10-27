@@ -170,6 +170,12 @@ A pull request should include:
 - configuration, migration, compatibility, and security implications; and
 - a linked issue or context when one exists.
 
+Pull requests do not edit `CHANGELOG.md`. The title (Conventional Commit) and
+body carry the change note. Put a breaking change or upgrade step under a
+`### Breaking` or `### Upgrade` heading in the body and add the
+`risk:breaking` or `risk:migration` label; release prep drafts the changelog
+section from them.
+
 Do not put hostnames, home directories, absolute worktree paths, or other
 private environment details in public pull request or issue text. Delivery
 briefs on GitHub may list only claim branch, repo-relative worktree (for

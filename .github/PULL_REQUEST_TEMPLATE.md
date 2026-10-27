@@ -46,7 +46,9 @@ do not claim immutable hosted or merge proof. -->
 ## Impact
 
 <!-- Describe API, migration, configuration, compatibility, security, or
-operator impact. Write "None" where applicable. -->
+operator impact. Write "None" where applicable. Do not edit CHANGELOG.md:
+add a "### Breaking" or "### Upgrade" section to this body for a breaking
+change or upgrade step, and the risk:breaking or risk:migration label. -->
 
 - API/compatibility:
 - Persistence/migrations:

@@ -372,10 +372,12 @@ these surfaces run in sequence, not in parallel.
 
 Shared files that every lane used to touch are kept out of the way:
 
-- `CHANGELOG.md` is release-owned. Pull Requests do not edit it; the
-  release-note context goes in the Pull Request body, which becomes the
-  squash commit. At release, `scripts/changelog-draft.sh` lists the merged
-  changes since the last tag for the release owner to write up;
+- `CHANGELOG.md` is release-owned. Pull Requests do not edit it. The
+  Conventional Commit title and the body carry the change note and become
+  the squash commit; a breaking change or upgrade step goes under a
+  `### Breaking` or `### Upgrade` heading in the body, and the Pull Request
+  carries `risk:breaking` or `risk:migration`. Release prep drafts the
+  section (see "Releases and versioning");
 - RPC fixture tests check the fixtures against the proto, not a hardcoded
   total, so adding an RPC touches only its fixture rows;
 - `compatibility.json` is release-owned: the release workflow generates it
@@ -557,6 +559,13 @@ or data-integrity corrections. Tag signed or otherwise protected release
 commits as `vMAJOR.MINOR.PATCH`. GitHub Releases contain generated change notes
 edited into user-facing `Added`, `Changed`, `Fixed`, `Security`, and
 `Migration` sections where applicable.
+
+Release prep runs `bash scripts/changelog-draft.sh <version>`, which prints a
+Keep a Changelog section for the Pull Requests merged since the last `v*` tag:
+`feat` under Added, `fix` under Fixed, `refactor` and `perf` under Changed,
+and Breaking and Upgrade entries from `risk:breaking` and `risk:migration`
+labels or the matching body headings. The release owner edits that section
+into `CHANGELOG.md` and commits it with the version bump.
 
 The release owner verifies Cargo/package version, migration and configuration
 notes, CI, container build, smoke behavior, and rollback/backup implications.
