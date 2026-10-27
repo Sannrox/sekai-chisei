@@ -313,8 +313,44 @@ written under a shortened name with a SHA-256 suffix, and `layout.json` maps tha
 path to the full id under `long_ids`. Two ids that differ only in case are
 refused, because their files would collide on a case-insensitive file system.
 The tree is written beside the target and renamed into place, so a failed export
-leaves nothing behind. Importing a
-tree is not part of the command; apply it through the governed definition flow.
+leaves nothing behind.
+
+## Import a file tree as a proposal
+
+```sh
+sekaictl ontology import --namespace <ns> --dir <dir> --source-commit <sha> [--target <url-or-socket>]
+```
+
+Applies an exported tree to a namespace as one governed proposal (#1618),
+through the experimental `ImportDefinitionTree` RPC. Promoting between
+environments is the same import run against each one.
+
+- **Exactly the change.** The tree is compared with the namespace's published
+  definitions as export renders them. Added and changed files become upserts,
+  and published members the tree lacks become removals. An unchanged tree
+  opens no branch and no proposal.
+- **Credentials stay put.** A file that renders the same as the published
+  member is sent with the stored body, so the redaction placeholder never
+  overwrites a credential reference. A changed file that still holds
+  `[credential reference omitted]` is refused.
+- **Provenance.** The branch and proposal are `import-<sha>`, and the
+  proposal records `source_commit`. Importing the same commit and tree again
+  replays the same proposal; the same commit with other contents conflicts.
+- **No silent reverts.** The import names the published revision it compared
+  the tree with. If another proposal merged since, it is refused as a failed
+  precondition and nothing is written; import again. A retry of the same
+  request, for example after a lost response, still replays its proposal.
+- **Compatibility before merge.** The command prints each added, changed and
+  removed definition and the compatibility class of the published head
+  against the candidate (`compatible`, `conditional`, `breaking`, `unknown`)
+  with its reasons. The merge gate still decides what may merge.
+- **Fails closed.** Every grant (namespace write, and schema, ontology or
+  Action admin for each member the import changes or removes) is checked
+  before the first write, so a refused import creates no branch.
+- **Never merges.** The proposal goes through the normal review, lint and
+  merge gates.
+- The marking lattice in `markings/lattice.json` is not imported: it is not
+  governed by proposals.
 
 ## Evidence-driven definition proposals
 

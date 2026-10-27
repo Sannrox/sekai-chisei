@@ -38,8 +38,9 @@ pub const DOMAIN_DOC_VERSION: &str = "sekai.ontology-product/v1";
 pub const SEED_DOC_VERSION: &str = "sekai.seed/v1";
 
 pub fn usage() -> &'static str {
-    "sekaictl ontology <inspect|apply|export|seed|run|first-run|context|expand|explain|lint> ...\n  \
+    "sekaictl ontology <inspect|apply|export|import|seed|run|first-run|context|expand|explain|lint> ...\n  \
      sekaictl ontology export --namespace <ns> --out <dir> [--target <url-or-socket>]\n  \
+     sekaictl ontology import --namespace <ns> --dir <dir> --source-commit <sha> [--target <url-or-socket>]\n  \
      sekaictl ontology apply --file <domain.json> [--target <url-or-socket>]\n  \
      sekaictl ontology seed --file <seed.json> [--target <url-or-socket>]\n  \
      sekaictl ontology run --namespace <ns> --task-type <capability> --spec <json-or-@file> [--target ...]\n  \
@@ -948,6 +949,46 @@ async fn lint_namespace(target: &str, args: &[String]) -> Result<(), BoxErr> {
 
 // --- CLI entry ----------------------------------------------------------------
 
+/// One line per changed definition, then the compatibility verdict, so an
+/// incompatible change is visible before anyone reviews the proposal.
+fn print_import_outcome(namespace: &str, outcome: &crate::ontology_import::ImportOutcome) {
+    use crate::ontology_import::ImportOutcome;
+    let ImportOutcome::Proposed(proposal) = outcome else {
+        println!("{namespace}: tree matches the published definitions; no proposal opened");
+        return;
+    };
+    let crate::ontology_import::ImportProposal {
+        proposal_id,
+        preview,
+        compatibility,
+    } = proposal.as_ref();
+    println!("{namespace}: opened proposal {proposal_id}");
+    for (change, members) in [
+        ("added", &preview.added),
+        ("changed", &preview.changed),
+        ("removed", &preview.removed),
+    ] {
+        for member in members {
+            println!("  {change} {}/{}", member.member_kind, member.member_id);
+        }
+    }
+    println!("compatibility: {}", compatibility.class);
+    for reason in &compatibility.reasons {
+        println!(
+            "  {} {}/{}: {}{}",
+            reason.class,
+            reason.member_kind,
+            reason.member_id,
+            reason.code,
+            if reason.property.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reason.property)
+            }
+        );
+    }
+}
+
 pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxErr> {
     let Some(sub) = args.first().map(String::as_str) else {
         return Err(std::io::Error::other(usage()).into());
@@ -964,6 +1005,21 @@ pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxEr
             )
             .await?;
             println!("exported {namespace}: {files} files to {out}");
+            Ok(())
+        }
+        "import" => {
+            let rest = &args[1..];
+            let namespace = require_flag(rest, "--namespace").map_err(std::io::Error::other)?;
+            let dir = require_flag(rest, "--dir").map_err(std::io::Error::other)?;
+            let commit = require_flag(rest, "--source-commit").map_err(std::io::Error::other)?;
+            let outcome = crate::ontology_import::import(
+                &target_from_args(rest),
+                &namespace,
+                Path::new(&dir),
+                &commit,
+            )
+            .await?;
+            print_import_outcome(&namespace, &outcome);
             Ok(())
         }
         "apply" => {

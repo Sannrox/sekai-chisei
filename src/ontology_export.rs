@@ -16,7 +16,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 use tonic::{Code, Request};
 
-use crate::grpc::client::connect_sekai;
+use crate::grpc::client::{GatewayClient, connect_sekai};
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
     ClassificationLattice, GetClassificationLatticeRequest, GetDefinitionMemberRequest,
@@ -51,7 +51,7 @@ pub fn build_tree(
     for member in members {
         let value: Value = serde_json::from_str(&member.definition_json)
             .map_err(|error| format!("{}/{}: {error}", member.kind, member.id))?;
-        let path = format!("{}/{}.json", encode(&member.kind), file_stem(&member.id));
+        let path = member_path(&member.kind, &member.id);
         if path.contains(HASHED_MARK) {
             long_ids.insert(path.clone(), Value::String(member.id.clone()));
         }
@@ -218,7 +218,7 @@ fn file_stem(id: &str) -> String {
 
 /// Percent-encodes everything but ASCII letters, digits, `-` and `_`, so any id is
 /// one safe path segment (no `.`, `..` or separators).
-fn encode(segment: &str) -> String {
+pub(crate) fn encode(segment: &str) -> String {
     let mut encoded = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
@@ -228,6 +228,81 @@ fn encode(segment: &str) -> String {
         }
     }
     encoded
+}
+
+/// Where a member's file sits in the tree.
+pub(crate) fn member_path(kind: &str, id: &str) -> String {
+    format!("{}/{}.json", encode(kind), file_stem(id))
+}
+
+/// Whether a file stem is a bounded long-id name, which only `layout.json`
+/// maps back to its id.
+pub(crate) fn is_hashed_stem(stem: &str) -> bool {
+    stem.contains(HASHED_MARK)
+}
+
+/// Inverts [`encode`]; `None` for a segment `encode` would not produce, so a
+/// hand-made file name cannot alias another id.
+pub(crate) fn decode(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = segment.get(index + 1..index + 3)?;
+            if hex.bytes().any(|byte| byte.is_ascii_lowercase()) {
+                return None;
+            }
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    (encode(&decoded) == segment).then_some(decoded)
+}
+
+/// The published revision's digest and its members with their stored bodies;
+/// `None` when the namespace has published nothing.
+pub(crate) async fn published_members(
+    client: &mut SekaiServiceClient<GatewayClient>,
+    namespace: &str,
+) -> Result<Option<(String, Vec<ExportMember>)>, BoxErr> {
+    let revision = match client
+        .get_published_definition_revision(Request::new(GetPublishedDefinitionRevisionRequest {
+            namespace: namespace.into(),
+        }))
+        .await
+    {
+        Ok(response) => response.into_inner().revision,
+        Err(status) if status.code() == Code::NotFound => None,
+        Err(status) => return Err(status.into()),
+    };
+    let Some(revision) = revision else {
+        return Ok(None);
+    };
+    let mut members = Vec::with_capacity(revision.members.len());
+    for member in &revision.members {
+        let body = client
+            .get_definition_member(Request::new(GetDefinitionMemberRequest {
+                namespace: namespace.into(),
+                revision_digest: revision.revision_digest.clone(),
+                member_kind: member.member_kind.clone(),
+                member_id: member.member_id.clone(),
+            }))
+            .await?
+            .into_inner()
+            .member
+            .ok_or_else(|| std::io::Error::other("definition member missing from revision"))?;
+        members.push(ExportMember {
+            kind: body.member_kind,
+            id: body.member_id,
+            definition_json: body.definition_json,
+        });
+    }
+    Ok(Some((revision.revision_digest, members)))
 }
 
 /// Creates a new directory beside `out` that this process owns: `create_dir`
@@ -287,33 +362,9 @@ pub async fn export(target: &str, namespace: &str, out: &Path) -> Result<usize, 
         .into());
     }
     let mut client = SekaiServiceClient::new(connect_sekai(target).await?);
-    let revision = client
-        .get_published_definition_revision(Request::new(GetPublishedDefinitionRevisionRequest {
-            namespace: namespace.into(),
-        }))
+    let (_, members) = published_members(&mut client, namespace)
         .await?
-        .into_inner()
-        .revision
         .ok_or_else(|| std::io::Error::other("namespace has no published definition revision"))?;
-    let mut members = Vec::with_capacity(revision.members.len());
-    for member in &revision.members {
-        let body = client
-            .get_definition_member(Request::new(GetDefinitionMemberRequest {
-                namespace: namespace.into(),
-                revision_digest: revision.revision_digest.clone(),
-                member_kind: member.member_kind.clone(),
-                member_id: member.member_id.clone(),
-            }))
-            .await?
-            .into_inner()
-            .member
-            .ok_or_else(|| std::io::Error::other("definition member missing from revision"))?;
-        members.push(ExportMember {
-            kind: body.member_kind,
-            id: body.member_id,
-            definition_json: body.definition_json,
-        });
-    }
     let lattice = match client
         .get_classification_lattice(Request::new(GetClassificationLatticeRequest {
             namespace: namespace.into(),

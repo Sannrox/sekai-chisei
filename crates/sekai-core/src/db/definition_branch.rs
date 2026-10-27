@@ -876,6 +876,7 @@ impl SekaiDb {
                 restored_from_digest: &request.restore_from_digest,
                 migration_plan_digest: &request.migration_plan_digest,
                 source_package_digest: "",
+                source_commit: "",
             },
             &published,
             &published_revision,
@@ -961,6 +962,7 @@ impl SekaiDb {
                 restored_from_digest: "",
                 migration_plan_digest: "",
                 source_package_digest: &request.source_package_digest,
+                source_commit: &request.source_commit,
             },
             &published,
             &published_revision,
@@ -1059,6 +1061,7 @@ impl SekaiDb {
             migration_plan_digest: request.migration_plan_digest.clone(),
             major_revision: request.major_revision,
             source_package_digest: String::new(),
+            source_commit: String::new(),
         };
         insert_proposal_sqlite(&transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
@@ -1944,6 +1947,7 @@ fn open_replacement_proposal_sqlite(
         migration_plan_digest: replacement.migration_plan_digest,
         major_revision: false,
         source_package_digest: replacement.source_package_digest,
+        source_commit: replacement.source_commit,
     })?;
     let proposal = DefinitionProposal {
         contract_version: PROPOSAL_CONTRACT_VERSION.into(),
@@ -1966,6 +1970,7 @@ fn open_replacement_proposal_sqlite(
         migration_plan_digest: replacement.migration_plan_digest.into(),
         major_revision: false,
         source_package_digest: replacement.source_package_digest.into(),
+        source_commit: replacement.source_commit.into(),
     };
     insert_proposal_sqlite(transaction, &proposal)?;
     Ok(proposal)

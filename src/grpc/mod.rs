@@ -852,6 +852,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ProposeDefinitionRollback"
             | "ExportDefinitionPackage"
             | "ImportDefinitionPackage"
+            | "ImportDefinitionTree"
             | "GetGovernedFactVersion"
             | "ResolveInvariantSet"
             | "SubmitActionInstance"
@@ -2653,6 +2654,7 @@ mod tests {
             "ProposeDefinitionRollback",
             "ExportDefinitionPackage",
             "ImportDefinitionPackage",
+            "ImportDefinitionTree",
         ] {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));

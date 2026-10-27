@@ -66,6 +66,10 @@ pub struct DefinitionProposal {
     /// imports (#1700). Empty for proposals not created by import.
     #[serde(default)]
     pub source_package_digest: String,
+    /// Commit of the definition file tree this proposal imports (#1618).
+    /// Empty for proposals not created by a tree import.
+    #[serde(default)]
+    pub source_commit: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +389,7 @@ impl CreateDefinitionProposal {
             migration_plan_digest: &self.migration_plan_digest,
             major_revision: self.major_revision,
             source_package_digest: "",
+            source_commit: "",
         })?;
         let request_digest = canonical_digest(
             "create_definition_proposal",
@@ -400,6 +405,7 @@ impl CreateDefinitionProposal {
                 migration_plan_digest: &self.migration_plan_digest,
                 major_revision: self.major_revision,
                 source_package_digest: "",
+                source_commit: "",
             },
         )?;
         Ok((
@@ -460,7 +466,13 @@ pub struct ProposeDefinitionImport {
     pub namespace: String,
     pub branch_id: String,
     pub proposal_id: String,
+    /// A signed package import names its package; a file tree import names
+    /// its commit instead. Exactly one is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_package_digest: String,
+    /// Omitted when empty, so request digests of package imports are unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_commit: String,
     #[serde(default, skip_serializing)]
     pub members: Vec<DefinitionMember>,
     // Captured for compare-and-swap only, like rollback.
@@ -474,7 +486,18 @@ impl ProposeDefinitionImport {
         validate_namespace(&self.namespace)?;
         validate_identifier("branch_id", &self.branch_id, MAX_DEFINITION_ID_BYTES)?;
         validate_identifier("proposal_id", &self.proposal_id, MAX_DEFINITION_ID_BYTES)?;
-        validate_digest("source_package_digest", &self.source_package_digest)?;
+        match (
+            self.source_package_digest.is_empty(),
+            self.source_commit.is_empty(),
+        ) {
+            (false, true) => validate_digest("source_package_digest", &self.source_package_digest)?,
+            (true, false) => validate_source_commit(&self.source_commit)?,
+            _ => {
+                return Err(
+                    "an import names exactly one of source_package_digest and source_commit".into(),
+                );
+            }
+        }
         validate_digest("expected_published_digest", &self.expected_published_digest).map_err(
             |_| {
                 "stale_published_definition_head: expected published digest is required".to_string()
@@ -498,7 +521,26 @@ impl ProposeDefinitionImport {
             &self.idempotency_key,
             MAX_DEFINITION_ID_BYTES,
         )?;
-        canonical_digest("propose_definition_import", self)
+        if self.source_commit.is_empty() {
+            // A package's digest already binds its members.
+            return canonical_digest("propose_definition_import", self);
+        }
+        // A commit is only a caller's label, so a tree import binds its
+        // members here: the same key with other contents is a conflict, not a
+        // replay of the first proposal.
+        let mut members: Vec<(&str, &str, &str)> = self
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.member_kind.as_str(),
+                    member.member_id.as_str(),
+                    member.member_digest.as_str(),
+                )
+            })
+            .collect();
+        members.sort_unstable();
+        canonical_digest("propose_definition_tree_import", &(self, members))
     }
 }
 
@@ -559,6 +601,9 @@ impl DefinitionProposal {
         if !self.source_package_digest.is_empty() {
             validate_digest("source_package_digest", &self.source_package_digest)?;
         }
+        if !self.source_commit.is_empty() {
+            validate_source_commit(&self.source_commit)?;
+        }
         let expected = proposal_content_digest(&PreparedProposalDigestInput {
             namespace: &self.namespace,
             branch_id: &self.branch_id,
@@ -571,6 +616,7 @@ impl DefinitionProposal {
             migration_plan_digest: &self.migration_plan_digest,
             major_revision: self.major_revision,
             source_package_digest: &self.source_package_digest,
+            source_commit: &self.source_commit,
         })?;
         if expected != self.proposal_digest {
             return Err("definition proposal content binding is invalid".into());
@@ -708,6 +754,7 @@ pub struct ReplacementProposal<'a> {
     pub restored_from_digest: &'a str,
     pub migration_plan_digest: &'a str,
     pub source_package_digest: &'a str,
+    pub source_commit: &'a str,
 }
 
 /// Upserts every member of a prior published revision and removes members that
@@ -922,6 +969,22 @@ pub struct PreparedProposalDigestInput<'a> {
     /// Omitted when empty, so digests of earlier proposals are unchanged.
     #[serde(skip_serializing_if = "str::is_empty")]
     pub source_package_digest: &'a str,
+    /// Omitted when empty, so digests of earlier proposals are unchanged.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub source_commit: &'a str,
+}
+
+/// A Git object id: 7 to 64 lowercase hex digits (abbreviated, SHA-1 or SHA-256).
+pub fn validate_source_commit(commit: &str) -> Result<(), String> {
+    if (7..=64).contains(&commit.len())
+        && commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err("source_commit must be 7 to 64 lowercase hex digits".into())
+    }
 }
 
 fn canonical_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
@@ -1038,6 +1101,7 @@ mod tests {
             migration_plan_digest: String::new(),
             major_revision: false,
             source_package_digest: String::new(),
+            source_commit: String::new(),
         };
         proposal.proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
             namespace: &proposal.namespace,
@@ -1051,6 +1115,7 @@ mod tests {
             migration_plan_digest: "",
             major_revision: false,
             source_package_digest: "",
+            source_commit: "",
         })
         .unwrap();
         proposal.verify().unwrap();

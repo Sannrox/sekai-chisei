@@ -17,7 +17,11 @@ const OBJECT_DATA: &str = "object-data-must-not-be-exported";
 
 /// Publishes `members` as the namespace's first definition revision through the
 /// reviewed proposal flow.
-async fn publish(server: &LoopServer, namespace: &str, members: Vec<(String, String, String)>) {
+pub(crate) async fn publish(
+    server: &LoopServer,
+    namespace: &str,
+    members: Vec<(String, String, String)>,
+) {
     let mut sekai = server.sekai().await;
     let branch = sekai
         .create_definition_branch(CreateDefinitionBranchRequest {
@@ -105,7 +109,11 @@ async fn put_lattice(server: &LoopServer, namespace: &str, lattice: Classificati
         .unwrap_or_else(|error| panic!("lattice: {error}\n{}", server.logs()));
 }
 
-fn export(server: &LoopServer, namespace: &str, out: &Path) -> BTreeMap<String, Vec<u8>> {
+pub(crate) fn export(
+    server: &LoopServer,
+    namespace: &str,
+    out: &Path,
+) -> BTreeMap<String, Vec<u8>> {
     server.sekaictl_ok(&[
         "ontology",
         "export",

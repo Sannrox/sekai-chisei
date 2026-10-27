@@ -4003,6 +4003,8 @@ message DefinitionProposal {
   bool major_revision = 19;
   // Package digest of the definition package this proposal imports (#1700).
   string source_package_digest = 20;
+  // Commit of the definition file tree this proposal imports (#1618).
+  string source_commit = 21;
 }
 
 message CreateDefinitionProposalRequest {
@@ -4134,6 +4136,31 @@ message ImportDefinitionPackageResponse {
   string source_namespace = 3;
   string source_revision_digest = 4;
   string signer_identity = 5;
+}
+
+// The whole tree a `sekaictl ontology import` reads: every member the
+// namespace should hold. Members of the published head the tree lacks become
+// removals. Every check precedes the first write, so a refused import creates
+// no branch.
+message ImportDefinitionTreeRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  repeated DefinitionMemberInput members = 4;
+  // The commit the tree was read from, recorded on the proposal.
+  string source_commit = 5;
+  string idempotency_key = 6;
+  // The published revision the tree was compared with; empty when the
+  // namespace had published nothing. A different head is refused, so a
+  // definition merged in between is never reverted.
+  string expected_published_digest = 7;
+}
+
+message ImportDefinitionTreeResponse {
+  DefinitionProposal proposal = 1;
+  DefinitionRevisionDiff preview = 2;
+  // Published head against the candidate, reported before merge.
+  DefinitionRevisionCompatibility compatibility = 3;
 }
 
 message ProposeDefinitionRollbackRequest {
@@ -4658,6 +4685,8 @@ service SekaiService {
   // envelope against this plane's trusted package keys and opens a proposal.
   rpc ExportDefinitionPackage(ExportDefinitionPackageRequest) returns (ExportDefinitionPackageResponse);
   rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
+  // Opens a proposal with exactly the definitions a file tree changes (#1618).
+  rpc ImportDefinitionTree(ImportDefinitionTreeRequest) returns (ImportDefinitionTreeResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc GetOntologyLintReport(GetOntologyLintReportRequest) returns (GetOntologyLintReportResponse);

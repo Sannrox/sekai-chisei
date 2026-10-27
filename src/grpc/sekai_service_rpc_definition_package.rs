@@ -258,29 +258,84 @@ pub(super) fn import_definition_package_with(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let opened = open_import_proposal(
+        service,
+        &principals,
+        &input.namespace,
+        members,
+        ImportSource {
+            branch_id: input.branch_id,
+            proposal_id: input.proposal_id,
+            package_digest: envelope.package.package_digest.clone(),
+            commit: String::new(),
+            idempotency_key: input.idempotency_key,
+            expected_published_digest: None,
+        },
+    )?;
+    Ok(Response::new(ImportDefinitionPackageResponse {
+        proposal: Some(to_proto_definition_proposal(&opened.proposal)),
+        preview: Some(to_proto_definition_revision_diff(&opened.preview)),
+        source_namespace: envelope.provenance.source_namespace,
+        source_revision_digest: envelope.provenance.source_revision_digest,
+        signer_identity: envelope.signature.identity,
+    }))
+}
+
+/// Where an import comes from and the identifiers of the proposal it opens.
+struct ImportSource {
+    branch_id: String,
+    proposal_id: String,
+    /// A signed package's digest, or empty for a file tree.
+    package_digest: String,
+    /// A file tree's commit, or empty for a signed package.
+    commit: String,
+    idempotency_key: String,
+    /// The published head the caller planned against, when it planned:
+    /// `Some("")` for a namespace that had published nothing. A package
+    /// import (`None`) applies to whatever head is current.
+    expected_published_digest: Option<String>,
+}
+
+/// The proposal an import opened, with the revisions it compares.
+struct OpenedImport {
+    proposal: definition_proposal_domain::DefinitionProposal,
+    preview: definition_diff_domain::DefinitionRevisionDiff,
+    compatibility: definition_diff_domain::DefinitionRevisionCompatibility,
+}
+
+/// Open a branch and proposal whose candidate holds exactly `members` on top
+/// of the published head. Every authorization and importability check runs
+/// before the first write, so a refused import creates no branch.
+fn open_import_proposal(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    members: Vec<definition_branch_domain::DefinitionMember>,
+    source: ImportSource,
+) -> Result<OpenedImport, Status> {
     let existing = service
         .db
         .runtime()
-        .get_published_definition_revision(&input.namespace)
+        .get_published_definition_revision(namespace)
         .map_err(|_| Status::internal("definition revision unavailable"))?;
     let needs_genesis = existing.is_none();
     let published = match existing {
         Some(published) => {
             authorize_definition_revision(
                 service,
-                &principals,
-                &input.namespace,
+                principals,
+                namespace,
                 &published.revision_digest,
                 true,
             )?;
             published
         }
         // Seeded only after every check below passes.
-        None => super::rpc_definitions::definition_genesis(&input.namespace)
+        None => super::rpc_definitions::definition_genesis(namespace)
             .map_err(Status::invalid_argument)?,
     };
     // Write access is needed only where the import changes something:
-    // added or changed members and members the package lacks.
+    // added or changed members and members the import lacks.
     let published_digests = published
         .members
         .iter()
@@ -307,21 +362,35 @@ pub(super) fn import_definition_package_with(
         .filter(|key| !package_keys.contains(*key))
         .cloned();
     for (member_kind, member_id) in changed.chain(removed).collect::<Vec<_>>() {
-        authorize_definition_member_write(service, &principals, &member_kind, &member_id)?;
+        authorize_definition_member_write(service, principals, &member_kind, &member_id)?;
     }
     // The response shows the candidate, so the caller must be able to read
     // every incoming member before anything is written.
     for (member_kind, member_id) in &package_keys {
-        authorize_definition_member_read(service, &principals, member_kind, member_id)?;
+        authorize_definition_member_read(service, principals, member_kind, member_id)?;
     }
+    // The backend replays an identical request first and only then compares
+    // the published head, so a retry after a lost response still succeeds.
+    // A tree import compares against the head the caller planned with; a
+    // namespace that had published nothing starts from its genesis.
+    let expected_published_digest = match source.expected_published_digest {
+        None => published.revision_digest.clone(),
+        Some(expected) if expected.is_empty() => {
+            super::rpc_definitions::definition_genesis(namespace)
+                .map_err(Status::invalid_argument)?
+                .revision_digest
+        }
+        Some(expected) => expected,
+    };
     let request = definition_proposal_domain::ProposeDefinitionImport {
-        namespace: input.namespace,
-        branch_id: input.branch_id,
-        proposal_id: input.proposal_id,
-        source_package_digest: envelope.package.package_digest.clone(),
+        namespace: namespace.to_string(),
+        branch_id: source.branch_id,
+        proposal_id: source.proposal_id,
+        source_package_digest: source.package_digest,
+        source_commit: source.commit,
         members,
-        expected_published_digest: published.revision_digest.clone(),
-        idempotency_key: input.idempotency_key,
+        expected_published_digest,
+        idempotency_key: source.idempotency_key,
     };
     request.prepare().map_err(|error| {
         if error.starts_with(REFUSAL_INCOMPATIBLE) {
@@ -362,21 +431,21 @@ pub(super) fn import_definition_package_with(
     // returned revisions are authorized again, as rollback does.
     authorize_definition_revision(
         service,
-        &principals,
+        principals,
         &proposal.namespace,
         &proposal.base_digest,
         true,
     )?;
     authorize_definition_revision(
         service,
-        &principals,
+        principals,
         &proposal.namespace,
         &proposal.candidate_digest,
         false,
     )?;
     authorize_proposal_member_writes(
         service,
-        &principals,
+        principals,
         &proposal.namespace,
         &proposal.base_digest,
         &proposal.candidate_digest,
@@ -401,11 +470,71 @@ pub(super) fn import_definition_package_with(
         &candidate_members,
     )
     .map_err(map_definition_write_error)?;
-    Ok(Response::new(ImportDefinitionPackageResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
-        preview: Some(to_proto_definition_revision_diff(&preview)),
-        source_namespace: envelope.provenance.source_namespace,
-        source_revision_digest: envelope.provenance.source_revision_digest,
-        signer_identity: envelope.signature.identity,
+    let compatibility = definition_diff_domain::classify_definition_revision_compatibility(
+        &base,
+        &base_members,
+        &candidate,
+        &candidate_members,
+    )
+    .map_err(map_definition_write_error)?;
+    Ok(OpenedImport {
+        proposal,
+        preview,
+        compatibility,
+    })
+}
+
+/// Import a definition file tree (#1618): exactly the members the tree
+/// changes, adds or lacks become one proposal recording `source_commit`. The
+/// proposal goes through the normal review and merge gates.
+pub(super) async fn import_definition_tree(
+    service: &SekaiServiceImpl,
+    req: Request<ImportDefinitionTreeRequest>,
+) -> Result<Response<ImportDefinitionTreeResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    let members = input
+        .members
+        .into_iter()
+        .map(|member| {
+            definition_branch_domain::DefinitionMemberInput {
+                member_kind: member.member_kind,
+                member_id: member.member_id,
+                definition_json: member.definition_json,
+                member_digest: String::new(),
+            }
+            .prepare(&input.namespace)
+            .map_err(Status::invalid_argument)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let opened = open_import_proposal(
+        service,
+        &principals,
+        &input.namespace,
+        members,
+        ImportSource {
+            branch_id: input.branch_id,
+            proposal_id: input.proposal_id,
+            package_digest: String::new(),
+            commit: input.source_commit,
+            idempotency_key: input.idempotency_key,
+            expected_published_digest: Some(input.expected_published_digest),
+        },
+    )?;
+    Ok(Response::new(ImportDefinitionTreeResponse {
+        proposal: Some(to_proto_definition_proposal(&opened.proposal)),
+        preview: Some(to_proto_definition_revision_diff(&opened.preview)),
+        compatibility: Some(to_proto_definition_revision_compatibility(
+            &opened.compatibility,
+        )),
     }))
 }

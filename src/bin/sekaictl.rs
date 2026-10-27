@@ -477,7 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
             Some(
-                "apply" | "export" | "seed" | "run" | "first-run" | "context" | "expand"
+                "apply" | "export" | "import" | "seed" | "run" | "first-run" | "context" | "expand"
                 | "explain" | "lint",
             ) => {
                 sekai_chisei::launch::load_local_env();
