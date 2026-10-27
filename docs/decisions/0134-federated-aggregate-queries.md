@@ -1,6 +1,6 @@
 # ADR 0134: Federated queries return only suppressed aggregates
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-26
 - Owners: @Sannrox
 - Issue: #1464
