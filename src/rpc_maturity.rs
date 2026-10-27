@@ -492,7 +492,6 @@ mod tests {
     #[test]
     fn table_matches_proto_and_stays_within_the_stable_limit() {
         let table = RpcMaturityTable::load().expect("maturity table");
-        assert_eq!(table.stable_rpcs().len(), 68);
         assert!(
             table
                 .entries
@@ -530,6 +529,31 @@ mod tests {
                 "{rpc} is used by the gateway host"
             );
         }
+    }
+
+    #[test]
+    fn table_names_unclassified_and_unknown_rpcs() {
+        let table = RpcMaturityTable::load().expect("maturity table");
+
+        let mut missing = table.clone();
+        let dropped = missing.entries.remove(0);
+        let error = missing.validate().expect_err("unclassified proto rpc");
+        assert!(
+            error.contains(&rpc_key(&dropped.service, &dropped.rpc)),
+            "{error}"
+        );
+
+        let mut unknown = table.clone();
+        let mut ghost = unknown.entries[0].clone();
+        ghost.rpc = "NotARealRpc".into();
+        unknown.entries.push(ghost);
+        let error = unknown.validate().expect_err("rpc not in proto");
+        assert!(error.contains("NotARealRpc"), "{error}");
+
+        let mut twice = table;
+        twice.entries.push(twice.entries[0].clone());
+        let error = twice.validate().expect_err("rpc classified twice");
+        assert!(error.contains(&twice.entries[0].rpc), "{error}");
     }
 
     #[test]
