@@ -277,6 +277,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ImportDefinitionTree",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "CompareDefinitionRevisions",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",

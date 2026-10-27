@@ -1096,6 +1096,7 @@ pub(super) fn to_proto_definition_proposal(
         migration_plan_digest: proposal.migration_plan_digest.clone(),
         major_revision: proposal.major_revision,
         source_package_digest: proposal.source_package_digest.clone(),
+        source_commit: proposal.source_commit.clone(),
     }
 }
 pub(super) fn authorize_proposal_member_writes(

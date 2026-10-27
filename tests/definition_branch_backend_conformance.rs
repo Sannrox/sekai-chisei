@@ -1551,6 +1551,7 @@ fn exercise_definition_import(db: &dyn DefinitionBranchBackend, namespace: &str)
         branch_id: "pkg-import".into(),
         proposal_id: "pkg-cs-import".into(),
         source_package_digest: digest('e'),
+        source_commit: String::new(),
         members: vec![incoming.clone()],
         expected_published_digest: published.clone(),
         idempotency_key: "pkg-import-1".into(),

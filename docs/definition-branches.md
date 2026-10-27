@@ -111,6 +111,16 @@ or datasets still carry, merge without a pinned `migration_plan_digest` fails
 executed fact migration; `ExecuteDefinitionFactMigration` still requires the
 TO revision to already be the published head.
 
+### Definition file trees (#1618)
+
+`ImportDefinitionTree` (experimental) opens a branch and proposal whose
+candidate holds exactly the given members on top of the published head, like
+a package import without a signature. It is what
+`sekaictl ontology import` calls. The proposal records `source_commit` (7 to
+64 lowercase hex digits), and the response carries the diff preview and the
+compatibility classification of the published head against the candidate.
+Every grant is checked before the first write.
+
 ### Signed definition packages (#1700)
 
 `ExportDefinitionPackage` and `ImportDefinitionPackage` (experimental, behind

@@ -539,6 +539,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_definition_package::import_definition_package(self, req).await
     }
 
+    async fn import_definition_tree(
+        &self,
+        req: Request<ImportDefinitionTreeRequest>,
+    ) -> Result<Response<ImportDefinitionTreeResponse>, Status> {
+        rpc_definition_package::import_definition_tree(self, req).await
+    }
+
     async fn compare_definition_revisions(
         &self,
         req: Request<CompareDefinitionRevisionsRequest>,
