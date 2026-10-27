@@ -132,9 +132,9 @@ before changing a core boundary.
 
 For a public gRPC change:
 
-- update the relevant file under `proto/` and keep
-  `crates/sekai-proto/proto/` in byte-for-byte sync (the crate build fails if
-  they differ);
+- update the relevant file under `proto/`, the only committed copy
+  (`crates/sekai-proto` compiles it from there and is workspace-only while
+  publishing is off);
 - update the service implementation and client/example call sites;
 - add compatibility or migration notes when behavior changes; and
 - test authorization, validation, and error semantics, not only the happy path.

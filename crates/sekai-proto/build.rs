@@ -1,28 +1,19 @@
+/// Compiles the workspace contract in `../../proto`, the only committed copy.
+/// Path and git dependencies build inside a full checkout and find it there.
+/// A standalone build (for example a future registry package) must stage the
+/// files into this crate's gitignored `proto/` first; while publishing is off
+/// the crate is workspace-only.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let proto_root = ["../../proto", "proto"]
+        .into_iter()
+        .find(|root| std::path::Path::new(root).join("sekai.proto").exists())
+        .ok_or("sekai.proto not found in ../../proto or a staged proto/")?;
     for name in ["sekai.proto", "chisei.proto"] {
-        let workspace_contract = std::path::Path::new("../../proto").join(name);
-        let packaged_contract = std::path::Path::new("proto").join(name);
-        println!("cargo:rerun-if-changed={}", packaged_contract.display());
-        if workspace_contract.exists() {
-            println!("cargo:rerun-if-changed={}", workspace_contract.display());
-            if std::fs::read(&workspace_contract)? != std::fs::read(&packaged_contract)? {
-                return Err(format!(
-                    "{} must match the workspace contract {}",
-                    packaged_contract.display(),
-                    workspace_contract.display()
-                )
-                .into());
-            }
-        }
+        println!("cargo:rerun-if-changed={proto_root}/{name}");
     }
     unsafe {
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
     }
-    let proto_root = if std::path::Path::new("../../proto/sekai.proto").exists() {
-        "../../proto".to_string()
-    } else {
-        "proto".to_string()
-    };
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
@@ -52,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_root}/sekai.proto"),
                 format!("{proto_root}/chisei.proto"),
             ],
-            &[proto_root],
+            &[proto_root.to_string()],
         )?;
     Ok(())
 }

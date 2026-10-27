@@ -512,14 +512,7 @@ pub fn protocol_revision(root: impl AsRef<Path>) -> Result<String, String> {
 fn protocol_body(root: &Path) -> Result<String, String> {
     let mut body = String::new();
     for name in PROTO_FILES {
-        let canonical = read_text(&root.join("proto").join(name))?;
-        let crate_copy = read_text(&root.join("crates/sekai-proto/proto").join(name))?;
-        if canonical != crate_copy {
-            return Err(format!(
-                "{name} in proto/ and crates/sekai-proto/proto/ diverge"
-            ));
-        }
-        body.push_str(&canonical);
+        body.push_str(&read_text(&root.join("proto").join(name))?);
         body.push('\n');
     }
     Ok(body)
