@@ -1,5 +1,7 @@
 # 0007: Provisional classification markings and purpose gates
 
+- Status: accepted
+
 ## Status
 
 Accepted for v1 (#301). Vocabulary remains the default ceiling for unmarked

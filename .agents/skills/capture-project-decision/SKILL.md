@@ -24,7 +24,8 @@ Promote the durable result, not the conversation that produced it.
    exhaustive details. Put rationale in the ADR and usage in docs. Complete when
    the same rule is not maintained in multiple prose locations.
 4. For an ADR, copy `docs/decisions/0000-template.md`, allocate the next number,
-   include the source links, and update `docs/decisions/README.md`. Supersede by
+   include the source links, and regenerate the index with
+   `sh scripts/adr-index.sh` (never edit it by hand). Supersede by
    adding a new ADR and cross-linking both; retain historical text. Complete
    when status and relationships are explicit.
 5. Check links, examples, Skill metadata, and affected indexes. Complete when a
