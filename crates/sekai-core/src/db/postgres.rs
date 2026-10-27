@@ -1208,7 +1208,7 @@ impl PostgresDb {
         }
         // The columns of the credential table this connection resolves, not
         // of one in another schema.
-        let credentials_scoped: bool = connection
+        let tenant_column_present: bool = connection
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_attribute
                  WHERE attrelid = to_regclass('sekai_principal_credentials')
@@ -1217,7 +1217,7 @@ impl PostgresDb {
             )
             .map_err(|error| error.to_string())?
             .get(0);
-        if credentials_scoped {
+        if tenant_column_present {
             let populated: bool = connection
                 .query_one(
                     "SELECT EXISTS (SELECT 1 FROM sekai_principal_credentials WHERE tenant_id <> '')",
