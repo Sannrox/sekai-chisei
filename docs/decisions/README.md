@@ -21,13 +21,17 @@ Routine implementation detail stays in its Issue and pull request.
 4. Set the status to `accepted` when merged.
 5. Never rewrite the history of a superseded decision. Add a new ADR and link
    both records.
+6. Run `scripts/adr-index.sh` in the same change. The index below is generated
+   from each record's heading and `- Status:` line; never edit it by hand. CI
+   runs `scripts/adr-index.sh --check`.
 
 ## Index
 
+<!-- adr-index:start -->
 - [ADR 0001: Evaluate bounded ontology entailment at query time](0001-query-time-ontology-entailment.md)
-- [ADR 0002: Identify prompt variants by immutable versioned names](0002-versioned-prompt-variant-identity.md)
-- [ADR 0003: Inspect ontology through authenticated static artifacts](0003-authenticated-static-ontology-inspection.md)
-- [ADR 0004: Add selective bitemporal history to the current graph (retired for 1.0)](0004-selective-bitemporal-history.md)
+- [ADR 0002: Identify prompt variants by immutable versioned names](0002-versioned-prompt-variant-identity.md) (proposed)
+- [ADR 0003: Inspect ontology through authenticated static artifacts](0003-authenticated-static-ontology-inspection.md) (proposed)
+- [ADR 0004: Add selective bitemporal history to the current graph](0004-selective-bitemporal-history.md) (retired for 1.0)
 - [ADR 0005: Object-bound coordination leases](0005-object-bound-coordination-leases.md)
 - [ADR 0007: Provisional classification markings and purpose gates](0007-provisional-classification-markings.md)
 - [ADR 0008: Keep the gateway a fail-closed protocol translator](0008-gateway-is-a-fail-closed-translator.md)
@@ -40,16 +44,16 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0016: Publish a dedicated versioned Rust core-loop client](0016-versioned-rust-core-loop-client.md)
 - [ADR 0017: Return the repository to Apache 2.0](0017-return-to-apache-2.0.md)
 - [ADR 0018: Keep ontology relation cardinality advisory in 1.x](0018-ontology-relation-cardinality.md)
-- [ADR 0019: Keep native discovery and the HTTP provider matrix as separate catalogs](0019-dual-capability-catalogs.md)
+- [ADR 0019: Keep native discovery and the HTTP provider matrix as separate catalogs](0019-dual-capability-catalogs.md) (proposed)
 - [ADR 0020: Keep shared type revisions, inbound object sync, and permit-backed external mutation separate](0020-shared-type-revisions-and-object-sync.md)
 - [ADR 0021: Defer a second object-sync source until GitHub Issue/PR admission is live](0021-defer-second-object-sync-source.md)
-- [ADR 0022: Admit inbound records as plane-committed source batches](0022-source-batch-transactions.md)
-- [ADR 0023: Fence ordered source change feeds by synchronization generation](0023-generation-fenced-source-change-feeds.md)
-- [ADR 0024: Evolve governed definitions through branches with immutable revision history](0024-governed-definition-branches.md)
-- [ADR 0025: Enforce activated object security in storage queries](0025-storage-enforced-object-security.md)
+- [ADR 0022: Admit inbound records as plane-committed source batches](0022-source-batch-transactions.md) (proposed)
+- [ADR 0023: Fence ordered source change feeds by synchronization generation](0023-generation-fenced-source-change-feeds.md) (proposed)
+- [ADR 0024: Evolve governed definitions through branches with immutable revision history](0024-governed-definition-branches.md) (proposed)
+- [ADR 0025: Enforce activated object security in storage queries](0025-storage-enforced-object-security.md) (proposed)
 - [ADR 0026: Publish change sets as governed branch proposals](0026-governed-branch-proposals.md)
-- [ADR 0027: Deny property access without an explicit grant](0027-explicit-property-grants.md)
-- [ADR 0028: Execute approved checkpointed fact migration](0028-checkpointed-fact-migration.md)
+- [ADR 0027: Deny property access without an explicit grant](0027-explicit-property-grants.md) (proposed)
+- [ADR 0028: Execute approved checkpointed fact migration](0028-checkpointed-fact-migration.md) (proposed)
 - [ADR 0029: Share namespaces through grant-scoped signed snapshots](0029-signed-namespace-snapshots.md)
 - [ADR 0030: Apply one compiled row predicate to every public query path](0030-row-scoped-query-access.md)
 - [ADR 0031: Require a scoped purpose authorization for governed reads](0031-purpose-bound-reads.md)
@@ -112,12 +116,12 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0088: One object-log host owns identity; clerk processes are its clients](0088-one-object-log-host-many-clerk-clients.md)
 - [ADR 0089: Park approval-gated Action instances and decide them explicitly](0089-park-and-decide-action-instances.md)
 - [ADR 0090: Bind object changes to governed Actions through a plane-owned binding](0090-object-change-action-bindings.md)
-- [ADR 0091: Object-log owns EvaluateObjectSet identity; SQL object_type_index is a rebuildable projection](0091-object-log-owns-evaluate-identity.md)
-- [ADR 0092: Chisei builds without Sekai; Sekai may build on Chisei (superseded by ADR 0096)](0092-chisei-builds-without-sekai.md)
+- [ADR 0091: Object-log owns identity; SQL object_type_index is a rebuildable projection](0091-object-log-owns-evaluate-identity.md)
+- [ADR 0092: Chisei builds without Sekai; Sekai may build on Chisei](0092-chisei-builds-without-sekai.md) (superseded by ADR 0096)
 - [ADR 0093: Agent drafts use immutable definition members](0093-agent-drafts-use-definition-members.md)
 - [ADR 0094: Scoped contexts author immutable definition drafts](0094-scoped-definition-draft-authoring.md)
 - [ADR 0095: Ship evidence and findings as a types-only domain package](0095-feedback-evidence-finding-package.md)
-- [ADR 0096: Sekai runs without Chisei; Chisei requires Sekai](0096-sekai-runs-without-chisei.md)
+- [ADR 0096: Sekai runs without Chisei; Chisei requires Sekai](0096-sekai-runs-without-chisei.md) (proposed)
 - [ADR 0097: Sekai hosts in-process governed transform compute](0097-in-process-transform-host.md)
 - [ADR 0098: Keep a separate `chisei-plane` process](0098-keep-chisei-plane-process.md)
 - [ADR 0099: Shared identity and tenancy contract](0099-shared-identity-and-tenancy.md)
@@ -156,3 +160,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0132: Fenced incremental feed of object geo changes into Ezu](0132-ezu-geo-feed.md)
 - [ADR 0133: GeoArrow backfill for the Ezu geo feed](0133-ezu-geo-feed-backfill.md)
 - [ADR 0134: Federated queries return only suppressed aggregates](0134-federated-aggregate-queries.md)
+<!-- adr-index:end -->

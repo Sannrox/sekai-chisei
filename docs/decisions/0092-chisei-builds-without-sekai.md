@@ -1,6 +1,6 @@
 # ADR 0092: Chisei builds without Sekai; Sekai may build on Chisei
 
-- Status: superseded
+- Status: superseded by ADR 0096
 - Date: 2026-10-03
 - Owners: @Sannrox
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/1236 (#1236)
