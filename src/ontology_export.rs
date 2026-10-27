@@ -60,7 +60,7 @@ pub fn build_tree(
                 "{path} and {other} differ only in case and cannot share a tree"
             ));
         }
-        tree.insert(path, render(&omit_credentials(value))?);
+        tree.insert(path, render(&omit_credentials(without_envelope(value)))?);
     }
     if let Some(lattice) = lattice.filter(|lattice| !lattice.tokens.is_empty()) {
         tree.insert(
@@ -144,6 +144,22 @@ fn credential_key(key: &str) -> bool {
 /// Redacts credential values: everything beneath a credential-shaped key. Governed
 /// definitions name their properties in a `properties` array of strings, so a
 /// property called `password` is a string in an array and keeps its name.
+/// Top-level keys of governed documents that name where a body was stored
+/// rather than what it defines; they would tie the tree to one namespace.
+const ENVELOPE_KEYS: &[&str] = &["namespace", "definition_digest"];
+
+fn without_envelope(value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => {
+            for key in ENVELOPE_KEYS {
+                map.remove(*key);
+            }
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
 fn omit_credentials(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
@@ -426,6 +442,24 @@ mod tests {
         }
         assert!(body.contains("\"max_tokens\": 5"), "{body}");
         assert!(!body.contains("k2") && !body.contains("k3"), "{body}");
+    }
+
+    #[test]
+    fn namespace_and_digest_envelopes_are_left_out() {
+        let tree = build_tree(
+            &[member(
+                "transform",
+                "daily",
+                r#"{"name":"daily","namespace":"ns-a","definition_digest":"sha256:ab","inputs":[{"namespace":"kept"}]}"#,
+            )],
+            None,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_str(&tree["transform/daily.json"]).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"name": "daily", "inputs": [{"namespace": "kept"}]})
+        );
     }
 
     #[test]
