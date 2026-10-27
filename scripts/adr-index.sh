@@ -5,8 +5,8 @@
 # accepted are shown after the link. Only the lines between the adr-index
 # markers are generated; prose outside them is kept.
 #
-#   scripts/adr-index.sh          rewrite the index
-#   scripts/adr-index.sh --check  exit 1 with a diff when the index is stale
+#   sh scripts/adr-index.sh          rewrite the index
+#   sh scripts/adr-index.sh --check  exit 1 with a diff when the index is stale
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -59,7 +59,7 @@ awk -v start="$START" -v end="$END" -v index_file="$index" '
 
 if [ "$mode" = check ]; then
   diff -u "$README" "$generated" || {
-    echo "$README is stale; run scripts/adr-index.sh" >&2
+    echo "$README is stale; run sh scripts/adr-index.sh" >&2
     exit 1
   }
 else

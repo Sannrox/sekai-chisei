@@ -21,9 +21,9 @@ Routine implementation detail stays in its Issue and pull request.
 4. Set the status to `accepted` when merged.
 5. Never rewrite the history of a superseded decision. Add a new ADR and link
    both records.
-6. Run `scripts/adr-index.sh` in the same change. The index below is generated
-   from each record's heading and `- Status:` line; never edit it by hand. CI
-   runs `scripts/adr-index.sh --check`.
+6. Run `sh scripts/adr-index.sh` in the same change. The index below is
+   generated from each record's heading and `- Status:` line; never edit it by
+   hand. CI runs `sh scripts/adr-index.sh --check`.
 
 ## Index
 
