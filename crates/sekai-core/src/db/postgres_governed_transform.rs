@@ -179,6 +179,8 @@ impl PostgresDb {
                 continue;
             }
             let object_id = format!("{dataset_id}-object");
+            // The order runs use: dataset rows, then the bound object.
+            lock_dataset_rows(&mut tx, &dataset_id)?;
             lock_object_lifecycle(&mut tx, &object_id)?;
             for statement in crate::sekai::adhoc_transform::SWEEP_STATEMENTS {
                 let parameter = if statement.contains("{object}") {
