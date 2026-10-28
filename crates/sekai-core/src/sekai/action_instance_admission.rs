@@ -2939,9 +2939,15 @@ mod tests {
 
     fn setup() -> RuntimeDb {
         let db = RuntimeDb::memory();
-        db.put_governed_action_type(
-            GovernedActionType {
-                namespace: "acme".into(),
+        db.put_governed_action_type(dispatch_type("acme"), "operator", 1)
+            .unwrap();
+        db
+    }
+
+    /// The runtime-dispatch type the plain admission tests submit.
+    fn dispatch_type(namespace: &str) -> GovernedActionType {
+        GovernedActionType {
+                namespace: namespace.into(),
                 type_id: "dispatch".into(),
                 version: "1".into(),
                 description: "dispatch work".into(),
@@ -2957,12 +2963,7 @@ mod tests {
                 updated_at_ms: 0,
                 disabled_at_ms: 0,
                 ..Default::default()
-            },
-            "operator",
-            1,
-        )
-        .unwrap();
-        db
+            }
     }
 
     fn postgres_runtime() -> RuntimeDb {
@@ -6294,9 +6295,15 @@ mod tests {
             keys: Default::default(),
         };
         let admission = ActionInstanceAdmission::new(db, Some(&budget));
-        let key = format!("after-receipt-{}", uuid::Uuid::new_v4().simple());
+        // A namespace of its own: the PostgreSQL test database is shared.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let namespace = format!("after-receipt-{suffix}");
+        db.put_governed_action_type(dispatch_type(&namespace), "operator", 1)
+            .unwrap();
+        let key = format!("after-receipt-{suffix}");
         let submit = || {
             let mut submit = request(r#"{"runtime":"shikigami"}"#);
+            submit.namespace = namespace.clone();
             submit.idempotency_key = key.clone();
             submit
         };
@@ -6313,7 +6320,7 @@ mod tests {
         crash_next_admission(CrashPoint::AfterReceipt);
         assert!(admission.admit(submit(), "alice", 10).is_err());
         let stored = db
-            .get_action_instance_by_idempotency("acme", &key)
+            .get_action_instance_by_idempotency(&namespace, &key)
             .unwrap()
             .expect("instance");
         assert!(
