@@ -53,6 +53,10 @@ update that changes `definition_revision_digest` or `agent_member`.
 A frozen instance admits no new wakes and no new Actions on its behalf.
 Freezing and unfreezing are audited governed Actions. Work admitted before the
 freeze completes under its existing receipts; freezing is not cancellation.
+An Action's commit is ordered against the freeze (#1970): its object write, or
+its receipt when it writes none, re-checks the instance in the committing
+transaction, and a parked Action granted after the freeze ends denied with a
+receipt naming it.
 
 SQLite is the reference store, as on dark sites. PostgreSQL stays
 unavailable for instances until a slice adds parity and shared conformance,

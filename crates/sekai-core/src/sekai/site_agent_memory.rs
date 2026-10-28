@@ -190,6 +190,15 @@ pub fn is_action_only_kind(kind: &str) -> bool {
     kind == KIND || kind == crate::sekai::site_agent_instance::KIND
 }
 
+/// Whether `message` is this module's refusal because the memory's instance
+/// is frozen, gone, or acts as another principal: the writer may not write
+/// now, as when the commit itself refuses (#1970).
+pub fn is_owner_refusal(message: &str) -> bool {
+    (message.starts_with("site agent instance ")
+        && (message.ends_with(" is frozen") || message.ends_with(" not found in this namespace")))
+        || message.starts_with("only the principal of site agent instance ")
+}
+
 /// Whether `object` is a working memory item that was forgotten.
 pub fn is_forgotten(object: &Object) -> bool {
     object.kind == KIND
@@ -513,5 +522,148 @@ mod tests {
         assert!(is_action_only_kind(KIND));
         assert!(is_action_only_kind(crate::sekai::site_agent_instance::KIND));
         assert!(!is_action_only_kind("component"));
+    }
+
+    /// A freeze committing between planning and the write denies the
+    /// Action with a receipt naming the freeze, and writes nothing (#1970).
+    #[test]
+    fn a_freeze_committing_before_the_write_denies_it() {
+        let db = setup();
+        remember(&db, "create", AGENT).unwrap();
+        crate::sekai::action_instance_admission::freeze_before_next_commit("line-7");
+        let refused = admit(
+            &db,
+            ACTION_UPDATE,
+            json!({"object_id": "note-1", "content": "after the freeze"}),
+            "late",
+            AGENT,
+        )
+        .unwrap();
+        assert_eq!(refused.instance.status, STATUS_DENIED);
+        assert_eq!(
+            refused.instance.deny_reason,
+            "site agent instance line-7 is frozen"
+        );
+        let stored = db
+            .get_action_instance(&refused.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, STATUS_DENIED);
+        assert_eq!(
+            db.get_object("note-1").unwrap().unwrap().properties[CONTENT_PROPERTY],
+            "valve 3 sticks"
+        );
+        let receipt = db
+            .get_operation_receipt(&refused.instance.operation_id)
+            .unwrap()
+            .expect("receipt");
+        assert!(receipt.events.iter().any(|event| {
+            event.attributes.get("deny_reason").map(String::as_str)
+                == Some("site agent instance line-7 is frozen")
+        }));
+    }
+
+    /// The same holds for an Action that writes no object: it commits at
+    /// its receipt, and a freeze committed since admission denies it.
+    #[test]
+    fn a_freeze_committing_before_an_effects_only_action_denies_it() {
+        let db = setup();
+        db.put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: NAMESPACE.into(),
+                type_id: "site.ping".into(),
+                version: ACTION_VERSION.into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"note":{"type":"string"}},"required":["note"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec![
+                    crate::sekai::governed_action_type::EFFECT_KIND_NOTIFY.into(),
+                ],
+                enabled: true,
+                ..Default::default()
+            },
+            "operator",
+            1,
+        )
+        .unwrap();
+        crate::sekai::action_instance_admission::freeze_before_next_commit("line-7");
+        let refused = admit(&db, "site.ping", json!({"note": "check"}), "ping", AGENT).unwrap();
+        assert_eq!(refused.instance.status, STATUS_DENIED);
+        assert_eq!(
+            refused.instance.deny_reason,
+            "site agent instance line-7 is frozen"
+        );
+        assert!(
+            db.list_action_effects_for_instance(&refused.instance.instance_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_memory_write_is_refused_for_a_moved_or_missing_instance() {
+        use crate::sekai::action_instance::memory_refusal;
+        assert_eq!(
+            memory_refusal("line-7", AGENT, None).as_deref(),
+            Some("site agent instance line-7 not found in this namespace")
+        );
+        assert_eq!(
+            memory_refusal("line-7", AGENT, Some((Some("svc-other".into()), None))).as_deref(),
+            Some("only the principal of site agent instance line-7 writes its memory")
+        );
+        assert_eq!(
+            memory_refusal("line-7", AGENT, Some((Some(AGENT.into()), None))),
+            None
+        );
+    }
+
+    /// A memory write parked before its instance froze ends denied with a
+    /// receipt when an approver grants it (#1970).
+    #[test]
+    fn a_parked_memory_write_granted_after_a_freeze_ends_denied() {
+        let db = setup();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all(NAMESPACE);
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let parked = admit(
+            &db,
+            ACTION_CREATE,
+            json!({"object_id": "note-1", "instance_id": "line-7", "content": "x"}),
+            "parked",
+            AGENT,
+        )
+        .unwrap()
+        .instance;
+        assert_eq!(parked.status, crate::sekai::action_instance::STATUS_PARKED);
+        let mut instance = db.get_object("line-7").unwrap().unwrap();
+        instance.properties.insert(
+            crate::sekai::site_agent_instance::FROZEN_PROPERTY.into(),
+            "true".into(),
+        );
+        db.update_object(&instance).unwrap();
+        let decided = ActionInstanceAdmission::new(&db, None)
+            .decide(
+                crate::sekai::action_instance_admission::ActionInstanceDecisionRequest {
+                    instance_id: parked.instance_id.clone(),
+                    decision: "grant".into(),
+                    reason: "ok".into(),
+                    decider_principals: vec!["operator".into()],
+                    decider_is_namespace_admin: true,
+                    delegating_actor: None,
+                    execution_claim: None,
+                },
+                "operator",
+                20,
+            )
+            .unwrap();
+        assert_eq!(decided.instance.status, STATUS_DENIED);
+        assert_eq!(
+            decided.instance.deny_reason,
+            "site agent instance line-7 is frozen"
+        );
+        assert!(db.get_object("note-1").unwrap().is_none());
+        assert!(
+            db.get_operation_receipt(&parked.operation_id)
+                .unwrap()
+                .is_some()
+        );
     }
 }

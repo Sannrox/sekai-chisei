@@ -70,9 +70,10 @@ note the person it acts for cannot read.
 ## Consequences
 
 `install` registers the kind and its Actions, as for instances, and is not yet
-wired into boot. The freeze and ownership checks run when a write is planned;
-a freeze or principal change committing between planning and the write is
-fenced by #1970, as for every Action a frozen instance's principal submits. The direct-write guards cover both kinds through one helper.
+wired into boot. The freeze and ownership checks run when a write is planned
+and again inside the transaction that commits it (#1970), so a freeze or
+principal change committing in between denies the write with a receipt. The
+direct-write guards cover both kinds through one helper.
 Until #1968 lands, agents have no dedicated read path.
 
 ## Validation

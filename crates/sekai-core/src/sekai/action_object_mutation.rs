@@ -17,6 +17,10 @@ use crate::sekai::markings::PRINCIPAL_PROFILE_KIND;
 use crate::sekai::schema::SchemaRegistry;
 use std::collections::HashMap;
 
+/// Prefix of the refusal when a site agent's instance refused an admission's
+/// write as it committed (#1970); the reservation is then already denied.
+pub const SITE_AGENT_REFUSED: &str = "site agent refused the write: ";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionObjectMutationError {
     InvalidArgument(String),
@@ -479,6 +483,12 @@ pub fn apply(
                 ADMISSION_FENCE_LOST.into(),
             ));
         }
+        // The reservation is already denied; the caller records why.
+        FencedAdmissionWrite::Refused(reason) => {
+            return Err(ActionObjectMutationError::FailedPrecondition(format!(
+                "{SITE_AGENT_REFUSED}{reason}"
+            )));
+        }
     };
     let object = match write {
         ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
@@ -501,6 +511,8 @@ pub enum ParkedGrant {
     NotParked,
     Stale,
     ClaimLost,
+    /// The submitting site agent's instance refuses the write (#1970).
+    Refused(String),
 }
 
 /// Applies the planned write and moves the parked instance to `granted` in
@@ -558,6 +570,7 @@ pub fn grant_parked(
         ParkedGrantOutcome::NotParked => ParkedGrant::NotParked,
         ParkedGrantOutcome::Stale => ParkedGrant::Stale,
         ParkedGrantOutcome::ClaimLost => ParkedGrant::ClaimLost,
+        ParkedGrantOutcome::Refused(reason) => ParkedGrant::Refused(reason),
         ParkedGrantOutcome::Granted { previous } => {
             ParkedGrant::Granted(prepared.map(|(mutation, created, object)| {
                 Box::new(AppliedObjectMutation {

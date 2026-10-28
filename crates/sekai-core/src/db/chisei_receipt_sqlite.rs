@@ -34,6 +34,27 @@ impl SekaiDb {
         lease: &crate::sekai::action_instance::AdmissionLease,
         receipt: &OperationReceipt,
     ) -> Result<bool, String> {
+        self.put_admission_receipt_checked(instance_id, lease, receipt, false)
+            .map(|written| {
+                matches!(
+                    written,
+                    crate::sekai::action_instance::FencedAdmissionWrite::Applied(())
+                )
+            })
+    }
+
+    /// [`Self::put_admission_receipt`] that, with `check_site_agent`, first
+    /// refuses an Action whose principal's site agent instance froze since
+    /// admission (#1970): in this transaction it marks the reservation
+    /// denied, records no receipt, and answers why.
+    pub fn put_admission_receipt_checked(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+        check_site_agent: bool,
+    ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
+        use crate::sekai::action_instance::FencedAdmissionWrite;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -44,7 +65,15 @@ impl SekaiDb {
             lease,
             true,
         )? {
-            return Ok(false);
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        if check_site_agent
+            && let Some(reason) =
+                crate::sekai::action_instance::sqlite_reservation_refusal(&tx, instance_id, None)?
+        {
+            crate::sekai::action_instance::sqlite_deny_reservation(&tx, instance_id, &reason)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(FencedAdmissionWrite::Refused(reason));
         }
         upsert_operation_receipt(&tx, receipt)?;
         self.append_operation_receipt_chain(&tx, receipt)?;
@@ -57,7 +86,7 @@ impl SekaiDb {
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(true)
+        Ok(FencedAdmissionWrite::Applied(()))
     }
 
     pub fn get_operation_receipt(
