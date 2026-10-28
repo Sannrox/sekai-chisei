@@ -1639,6 +1639,59 @@ mod tests {
         RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()))
     }
 
+    /// #1722: decisions recorded from many threads on a file-backed store
+    /// each take the next `seq`, with no gap and a chain that verifies.
+    #[test]
+    fn concurrent_decision_writers_get_distinct_sequences_and_an_intact_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.db");
+        let db = std::sync::Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let workers = 8;
+        let per_worker = 25;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|worker| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for index in 0..per_worker {
+                        db.record_decision(&Decision {
+                            id: format!("decision-{worker}-{index}"),
+                            timestamp: 1_000 + index as i64,
+                            actor: format!("worker-{worker}"),
+                            action: "test.decide".into(),
+                            reason: "concurrent writer".into(),
+                            evidence: Default::default(),
+                            target_id: format!("target-{worker}"),
+                            outcome: "allow".into(),
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let total = (workers * per_worker) as i64;
+        let sequences: Vec<i64> = {
+            let conn = db.conn();
+            let mut statement = conn
+                .prepare("SELECT seq FROM sekai_decisions WHERE seq IS NOT NULL ORDER BY seq")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(sequences, (1..=total).collect::<Vec<_>>());
+        let verification = db.verify_ledger().unwrap();
+        assert!(verification.ok, "{verification:?}");
+        assert_eq!(verification.entries_checked, total);
+    }
+
     #[test]
     fn concurrent_team_namespace_bootstraps_wait_for_the_write_lock() {
         // #1148: bootstrap reads the boundary under the write lock, so
