@@ -717,6 +717,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "RunAdHocGovernedTransform",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "PreviewGovernedTransform",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

@@ -3825,7 +3825,12 @@ async fn source_sync_rejects_anonymous_ambiguous_and_unauthorized_principals() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 
     let read_denied = svc
         .get_source_sync_state(with_named_principal(
@@ -4680,7 +4685,12 @@ async fn owner_admin_cannot_declassify_without_grant_and_granted_principal_is_au
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
     let still = svc
         .db
         .runtime()
@@ -4811,7 +4821,12 @@ async fn delegated_actor_without_declassify_grant_cannot_strip_marking() {
     delegated.act = Some("human-a".into());
     request.extensions_mut().insert(delegated);
     let denied = svc.guarded_update_object(request).await.unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
     let still = svc
         .db
         .runtime()
@@ -4876,7 +4891,12 @@ async fn trusted_principal_declassify_uses_profile_grant() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
     svc.db
         .runtime()
         .create_object(&domain::Object {
@@ -5420,7 +5440,12 @@ async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
     assert_eq!(denied.message(), "access denied");
 
     let allowed = svc
@@ -8597,7 +8622,12 @@ async fn object_bound_lease_requires_target_object_authorization() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 
     let lease = svc
         .acquire_lease(with_named_principal(
@@ -9117,7 +9147,12 @@ async fn governed_action_type_registry_put_get_list_disable() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 }
 
 #[tokio::test]
@@ -11801,7 +11836,12 @@ async fn team_namespace_bootstrap_is_atomic_and_admin_only() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
     assert!(
         svc.db
             .runtime()
@@ -12681,7 +12721,12 @@ async fn reconcile_requires_scope_ownership_for_target_scope() {
         }))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 
     let still_running = svc
         .get_work_unit(with_named_principal(
@@ -13158,7 +13203,12 @@ async fn scoring_writer_records_private_typed_learning_and_retries_idempotently(
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 
     // The same namespace/request pair produces the same id and the action's exact-retry path
     // does not duplicate the object, link, or grant.
@@ -15002,7 +15052,12 @@ async fn evidence_control_plane_authenticates_and_filters_inspection() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 
     let listed = svc
         .list_evidence_submissions(with_named_principal(
@@ -18457,7 +18512,12 @@ async fn action_instance_reads_require_entitlement_and_target_visibility() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 }
 
 #[tokio::test]
@@ -24416,7 +24476,12 @@ async fn preview_governed_transform_denies_unreadable_input() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
     let query = svc
         .query_rows(with_named_principal(
             QueryRowsRequest {
@@ -24886,7 +24951,12 @@ async fn preview_retrieve_denies_unreadable_input() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 }
 
 fn seed_inspect_action_type(svc: &SekaiServiceImpl, namespace: &str) {
@@ -27262,7 +27332,12 @@ async fn ontology_changelog_lists_the_week_with_authors_approvers_and_consumers(
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 }
 
 #[tokio::test]
@@ -27962,7 +28037,12 @@ async fn media_upload_resumes_checks_its_checksum_and_reads_under_object_policy(
         .begin_media_upload(with_named_principal(begin("p-1", &sha), "carol"))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 
     let started = svc
         .begin_media_upload(with_named_principal(begin("p-1", &sha), "alice"))
@@ -32055,7 +32135,12 @@ async fn watermarked_exports_fingerprint_marked_decimals_and_trace_from_a_sample
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
 
     let decisions = db
         .list_decisions(&audit::DecisionFilter {
@@ -33528,5 +33613,208 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
     assert_eq!(
         wake(svc.db.runtime(), "line-7", "change:60000").unwrap(),
         Some(at)
+    );
+}
+
+/// #1964: a non-admin caller runs an inline definition into a scratch
+/// output, a retry replays it, an unreadable input is refused before any
+/// run, and nothing is stored in the catalog.
+#[tokio::test]
+async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
+    use crate::sekai::adhoc_transform::AdHocRequest;
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+
+    let store = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+        store.clone(),
+    ));
+    // A second plane on the same store, its grant cache loaded before the run.
+    let other_plane =
+        SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(store));
+    let runtime = svc.db.runtime();
+    let column = || ColumnDef {
+        name: "id".into(),
+        col_type: "string".into(),
+        classification: "public".into(),
+    };
+    runtime
+        .create_object(&domain::Object {
+            id: "private-in".into(),
+            kind: "artifact".into(),
+            name: "private".into(),
+            namespace: "ops".into(),
+            external_id: "artifact:private-in".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    for (id, object_id) in [("open-in", ""), ("private-in", "private-in")] {
+        runtime
+            .create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: vec![column()],
+                object_id: object_id.into(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        runtime
+            .append_rows(
+                id,
+                &[
+                    HashMap::from([("id".to_string(), "1".to_string())]),
+                    HashMap::from([("id".to_string(), "2".to_string())]),
+                ],
+            )
+            .unwrap();
+    }
+    let owner = security::Grant {
+        id: "owner-private".into(),
+        object_id: "private-in".into(),
+        principal: "bob".into(),
+        role: security::Role::Admin,
+        created: 0,
+        ..Default::default()
+    };
+    runtime.create_grant(&owner).unwrap();
+    svc.security.add_grant(&owner);
+    let run = |input: &'static str, key: &'static str| {
+        svc.run_ad_hoc_governed_transform(with_named_principal(
+            RunAdHocGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    input_dataset_id: input.into(),
+                    profile: crate::sekai::governed_transform::ANALYTICAL_CLASS.into(),
+                    sql: "SELECT id FROM input".into(),
+                    ..GovernedTransform::default()
+                }),
+                session_label: "explore".into(),
+                idempotency_key: key.into(),
+            },
+            "alice",
+        ))
+    };
+
+    let first = run("open-in", "k1").await.unwrap().into_inner();
+    assert!(!first.replayed);
+    let receipt = first.run.clone().unwrap();
+    assert_eq!(
+        (receipt.trigger_cause.as_str(), receipt.trigger_ref.as_str()),
+        ("adhoc", "explore")
+    );
+    assert_eq!(
+        runtime
+            .query_rows(&first.scratch_dataset_id, &Default::default())
+            .unwrap()
+            .len(),
+        2
+    );
+    let foreign = svc
+        .query_rows(with_named_principal(
+            QueryRowsRequest {
+                dataset_id: first.scratch_dataset_id.clone(),
+                query: None,
+            },
+            "bob",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        foreign.code(),
+        tonic::Code::PermissionDenied,
+        "another principal cannot read the scratch output"
+    );
+    let read_on_other_plane = |principal: &'static str| {
+        other_plane.query_rows(with_named_principal(
+            QueryRowsRequest {
+                dataset_id: first.scratch_dataset_id.clone(),
+                query: None,
+            },
+            principal,
+        ))
+    };
+    assert_eq!(
+        read_on_other_plane("bob").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied,
+        "another plane enforces the stored scratch grant"
+    );
+    read_on_other_plane("alice").await.unwrap();
+    let object = other_plane
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: format!("{}-object", first.scratch_dataset_id),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            object.code(),
+            tonic::Code::PermissionDenied | tonic::Code::NotFound
+        ),
+        "the scratch object stays the caller's on another plane: {object:?}"
+    );
+    let again = run("open-in", "k1").await.unwrap().into_inner();
+    assert!(again.replayed);
+    assert_eq!(again.run.unwrap().run_id, receipt.run_id);
+
+    let unbounded = svc
+        .run_ad_hoc_governed_transform(with_named_principal(
+            RunAdHocGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    input_dataset_id: "open-in".into(),
+                    steps: vec![TransformStep {
+                        kind: "project".into(),
+                        column: String::new(),
+                        op: String::new(),
+                        value: String::new(),
+                        columns: vec!["id".into()],
+                    }],
+                    ..GovernedTransform::default()
+                }),
+                session_label: "explore".into(),
+                idempotency_key: "k9".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unbounded.code(),
+        tonic::Code::InvalidArgument,
+        "a definition without execution budgets is refused"
+    );
+    let denied = run("private-in", "k2").await.unwrap_err();
+    assert_eq!(
+        denied.code(),
+        tonic::Code::PermissionDenied,
+        "{}",
+        denied.message()
+    );
+    let refused = AdHocRequest {
+        namespace: "ops".into(),
+        caller: "alice".into(),
+        session_label: "explore".into(),
+        idempotency_key: "k2".into(),
+    };
+    assert!(
+        runtime
+            .get_dataset(&refused.scratch_dataset_id())
+            .unwrap()
+            .is_none(),
+        "a refused run leaves no scratch output"
+    );
+    assert!(
+        runtime.list_governed_transforms("ops").unwrap().is_empty(),
+        "ad-hoc definitions are never stored"
     );
 }

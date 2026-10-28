@@ -63,6 +63,7 @@ impl SekaiServiceImpl {
         entries.push(isolated_transform_capability(experimental));
         entries.push(scheduler_transform_capability(experimental));
         entries.push(preview_transform_capability(experimental));
+        entries.push(adhoc_transform_capability(experimental));
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -445,6 +446,24 @@ fn scheduler_transform_capability(enabled: bool) -> CapabilityEntry {
     );
     entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry
+}
+
+fn adhoc_transform_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        crate::sekai::governed_transform::ADHOC_COMPUTE_CAPABILITY.into(),
+        "Run an inline governed transform once with the caller's read authority into an expiring scratch output, with a receipt.".into(),
+        "transform",
+        "sekai.RunAdHocGovernedTransformRequest",
+        "sekai.RunAdHocGovernedTransformResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "dataset:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "marking".into(),
+        "property_grant".into(),
+    ];
     entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
     entry
 }

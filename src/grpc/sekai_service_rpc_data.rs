@@ -2025,47 +2025,9 @@ pub(super) async fn put_governed_transform(
         .into_inner()
         .transform
         .ok_or_else(|| Status::invalid_argument("transform required"))?;
-    let analytical = from_proto_analytical(&proto);
-    let isolated_process = from_proto_isolated(&proto)?;
-    let transform = crate::sekai::governed_transform::GovernedTransform {
-        contract_version: proto.contract_version,
-        namespace: proto.namespace,
-        transform_id: proto.transform_id,
-        input_dataset_id: proto.input_dataset_id,
-        output_dataset_id: proto.output_dataset_id,
-        steps: proto
-            .steps
-            .into_iter()
-            .map(|step| crate::sekai::governed_transform::TransformStep {
-                kind: step.kind,
-                column: step.column,
-                op: step.op,
-                value: step.value,
-                columns: step.columns,
-            })
-            .collect(),
-        quality_rule: proto.quality_rule,
-        definition_digest: proto.definition_digest,
-        analytical,
-        isolated_process,
-        schedule: if proto.schedule_every_ms > 0 {
-            Some(crate::sekai::governed_transform::TransformSchedule {
-                every_ms: proto.schedule_every_ms,
-            })
-        } else {
-            None
-        },
-        trigger: if proto.trigger_on_input_commit {
-            Some(crate::sekai::governed_transform::TransformTrigger {
-                on_input_commit: true,
-                debounce_ms: proto.trigger_debounce_ms,
-            })
-        } else {
-            None
-        },
-    }
-    .prepare()
-    .map_err(|error| Status::invalid_argument(error.message()))?;
+    let transform = governed_transform_from_proto(proto)?
+        .prepare()
+        .map_err(|error| Status::invalid_argument(error.message()))?;
     if let Some(context) = tenant_context.as_ref() {
         enforce_namespace_tenant_context(
             service.db.runtime(),
@@ -2106,6 +2068,216 @@ pub(super) async fn put_governed_transform(
     Ok(Response::new(PutGovernedTransformResponse {
         transform: Some(to_proto_transform(&transform)),
     }))
+}
+
+/// The definition a request carries, not yet prepared.
+fn governed_transform_from_proto(
+    proto: GovernedTransform,
+) -> Result<crate::sekai::governed_transform::GovernedTransform, Status> {
+    let analytical = from_proto_analytical(&proto);
+    let isolated_process = from_proto_isolated(&proto)?;
+    Ok(crate::sekai::governed_transform::GovernedTransform {
+        contract_version: proto.contract_version,
+        namespace: proto.namespace,
+        transform_id: proto.transform_id,
+        input_dataset_id: proto.input_dataset_id,
+        output_dataset_id: proto.output_dataset_id,
+        steps: proto
+            .steps
+            .into_iter()
+            .map(|step| crate::sekai::governed_transform::TransformStep {
+                kind: step.kind,
+                column: step.column,
+                op: step.op,
+                value: step.value,
+                columns: step.columns,
+            })
+            .collect(),
+        quality_rule: proto.quality_rule,
+        definition_digest: proto.definition_digest,
+        analytical,
+        isolated_process,
+        schedule: (proto.schedule_every_ms > 0).then_some(
+            crate::sekai::governed_transform::TransformSchedule {
+                every_ms: proto.schedule_every_ms,
+            },
+        ),
+        trigger: proto.trigger_on_input_commit.then_some(
+            crate::sekai::governed_transform::TransformTrigger {
+                on_input_commit: true,
+                debounce_ms: proto.trigger_debounce_ms,
+            },
+        ),
+    })
+}
+
+/// Runs an inline definition once with the caller's read authority into a
+/// scratch output only the caller may read (ADR 0138, #1964). Inputs pass
+/// the preview read checks; a row carrying a column the caller may not read
+/// refuses the run, since a full run would expose it.
+pub(super) async fn run_adhoc_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<RunAdHocGovernedTransformRequest>,
+) -> Result<Response<RunAdHocGovernedTransformResponse>, Status> {
+    use crate::sekai::adhoc_transform::{
+        ADHOC_COLUMN_DENIED, ADHOC_IDENTITY_CONFLICT, ADHOC_OUTPUT_BUDGET, AdHocRequest,
+        DEFAULT_SCRATCH_RETENTION_MS, OutputBudget, scratch_grant,
+    };
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    let proto = input
+        .transform
+        .ok_or_else(|| Status::invalid_argument("transform required"))?;
+    let request = AdHocRequest {
+        namespace: proto.namespace.clone(),
+        caller: principals.first().cloned().unwrap_or_default(),
+        session_label: input.session_label,
+        idempotency_key: input.idempotency_key,
+    };
+    request.validate().map_err(Status::invalid_argument)?;
+    let transform = request
+        .bind(governed_transform_from_proto(proto)?)
+        .prepare()
+        .map_err(|error| Status::invalid_argument(error.message()))?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &transform.namespace,
+            false,
+        )?;
+    }
+    check_team_namespace(
+        service.db.runtime(),
+        &principals,
+        &transform.namespace,
+        false,
+    )?;
+    if transform.is_isolated_process() {
+        return Err(Status::unimplemented(
+            "isolated-process ad-hoc runs are not available yet",
+        ));
+    }
+    // The analytical profile carries the input memory and time budgets that
+    // bound a reader-callable run before its output is checked.
+    if transform.analytical.is_none() {
+        return Err(Status::invalid_argument(
+            "ad-hoc runs need the analytical profile",
+        ));
+    }
+    // Read limits per input; the run refuses a row with any other key.
+    let column_allowlists =
+        authorize_preview_inputs(service, &principals, tenant_context.as_ref(), &transform)?;
+    // A committed identity replays without spending execution quota.
+    if let Some(outcome) =
+        crate::sekai::adhoc_transform::committed(service.db.runtime(), &request, &transform)
+            .map_err(|error| {
+                if error == ADHOC_IDENTITY_CONFLICT {
+                    Status::already_exists(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?
+    {
+        return Ok(Response::new(adhoc_response(
+            service,
+            &principals,
+            outcome,
+        )?));
+    }
+    let quota = service.quota_runtime();
+    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let held = admit_tenant_transform(
+        quota.as_ref(),
+        &gate,
+        tenant_context.as_ref(),
+        &format!("transform-adhoc:{}", request.identity()),
+        false,
+    )?;
+    let owner_tenant = tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.as_str())
+        .unwrap_or("");
+    let now = now_millis();
+    let outcome = match crate::sekai::adhoc_transform::run(
+        service.db.runtime(),
+        &crate::sekai::adhoc_transform::AdHocSubmission {
+            request: &request,
+            transform: &transform,
+            budget: &OutputBudget::default(),
+            column_allowlists: &column_allowlists,
+            expires_at_ms: now.saturating_add(DEFAULT_SCRATCH_RETENTION_MS),
+            tenant_id: owner_tenant,
+        },
+        now,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            return Err(if error == ADHOC_COLUMN_DENIED {
+                Status::permission_denied("access denied")
+            } else if error == ADHOC_OUTPUT_BUDGET {
+                Status::resource_exhausted(error)
+            } else if error == ADHOC_IDENTITY_CONFLICT {
+                Status::already_exists(error)
+            } else {
+                transform_work_status(error)
+            });
+        }
+    };
+    if outcome.replayed {
+        abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+    } else {
+        // The store holds the scratch grant; this plane's cache learns it now.
+        service.security.add_grant(&scratch_grant(&request, now));
+        let recorded = record_tenant_transform_usage(
+            quota.as_ref(),
+            tenant_context
+                .as_ref()
+                .and_then(|context| context.tenant.as_ref())
+                .map(|tenant| tenant.tenant_id.as_str()),
+            &outcome.run,
+            &request.caller,
+            now_millis(),
+        );
+        release_tenant_transform(
+            service.db.runtime(),
+            &gate,
+            &outcome.run.run_id,
+            held.as_ref(),
+        )?;
+        if recorded? {
+            ack_transform_usage_pending(service.db.runtime(), &outcome.run.run_id)?;
+        }
+    }
+    Ok(Response::new(adhoc_response(
+        service,
+        &principals,
+        outcome,
+    )?))
+}
+
+fn adhoc_response(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    outcome: crate::sekai::adhoc_transform::AdHocRun,
+) -> Result<RunAdHocGovernedTransformResponse, Status> {
+    Ok(RunAdHocGovernedTransformResponse {
+        run: Some(with_run_outcome(
+            service,
+            &outcome.run,
+            to_proto_transform_run(
+                &outcome.run,
+                caller_can_read_run_datasets(service, principals, &outcome.run),
+            ),
+        )?),
+        scratch_dataset_id: outcome.scratch_dataset_id,
+        expires_at_ms: outcome.expires_at_ms,
+        replayed: outcome.replayed,
+    })
 }
 
 fn preview_response(
@@ -2317,31 +2489,10 @@ pub(super) async fn preview_governed_transform(
     let proto = input
         .transform
         .ok_or_else(|| Status::invalid_argument("transform required"))?;
-    let analytical = from_proto_analytical(&proto);
-    let isolated_process = from_proto_isolated(&proto)?;
     let transform = crate::sekai::governed_transform::GovernedTransform {
-        contract_version: proto.contract_version,
-        namespace: proto.namespace,
-        transform_id: proto.transform_id,
-        input_dataset_id: proto.input_dataset_id,
-        output_dataset_id: proto.output_dataset_id,
-        steps: proto
-            .steps
-            .into_iter()
-            .map(|step| crate::sekai::governed_transform::TransformStep {
-                kind: step.kind,
-                column: step.column,
-                op: step.op,
-                value: step.value,
-                columns: step.columns,
-            })
-            .collect(),
-        quality_rule: proto.quality_rule,
-        definition_digest: proto.definition_digest,
-        analytical,
-        isolated_process,
         schedule: None,
         trigger: None,
+        ..governed_transform_from_proto(proto)?
     }
     .prepare()
     .map_err(|error| Status::invalid_argument(error.message()))?;
@@ -4110,33 +4261,21 @@ pub(super) fn caller_can_read_run_datasets(
     principals: &[String],
     run: &crate::sekai::governed_transform::TransformRun,
 ) -> bool {
-    let transform = if run.profile == crate::sekai::governed_transform::ISOLATED_CLASS {
-        service
-            .db
-            .runtime()
-            .admitted_isolated_transform(&run.run_id)
-            .ok()
-            .flatten()
-    } else {
-        service
-            .db
-            .runtime()
-            .get_governed_transform(&run.namespace, &run.transform_id)
-            .ok()
-            .flatten()
-    };
-    let Some(transform) = transform else {
-        return false;
-    };
-    if transform.definition_digest != run.definition_digest {
-        return false;
-    }
-    let mut dataset_ids: Vec<String> = transform
-        .input_bindings()
-        .into_iter()
-        .map(|(_, dataset_id)| dataset_id)
-        .collect();
-    dataset_ids.push(transform.output_dataset_id);
+    // An ad-hoc run (ADR 0138) has no catalog definition; its inputs are
+    // the datasets it pinned and its output is its scratch dataset.
+    let dataset_ids: Vec<String> =
+        if run.trigger_cause == crate::sekai::adhoc_transform::TRANSFORM_TRIGGER_ADHOC {
+            run.input_versions
+                .keys()
+                .cloned()
+                .chain([run.transform_id.clone()])
+                .collect()
+        } else {
+            match catalog_run_datasets(service, run) {
+                Some(dataset_ids) => dataset_ids,
+                None => return false,
+            }
+        };
     for dataset_id in dataset_ids {
         let Ok(Some(dataset)) = service.db.runtime().get_dataset(&dataset_id) else {
             return false;
@@ -4154,6 +4293,39 @@ pub(super) fn caller_can_read_run_datasets(
         }
     }
     true
+}
+
+/// The input and output datasets of a run's catalog definition, when the
+/// definition the run used is still the stored one.
+fn catalog_run_datasets(
+    service: &SekaiServiceImpl,
+    run: &crate::sekai::governed_transform::TransformRun,
+) -> Option<Vec<String>> {
+    let transform = if run.profile == crate::sekai::governed_transform::ISOLATED_CLASS {
+        service
+            .db
+            .runtime()
+            .admitted_isolated_transform(&run.run_id)
+            .ok()
+            .flatten()
+    } else {
+        service
+            .db
+            .runtime()
+            .get_governed_transform(&run.namespace, &run.transform_id)
+            .ok()
+            .flatten()
+    }?;
+    if transform.definition_digest != run.definition_digest {
+        return None;
+    }
+    let mut dataset_ids: Vec<String> = transform
+        .input_bindings()
+        .into_iter()
+        .map(|(_, dataset_id)| dataset_id)
+        .collect();
+    dataset_ids.push(transform.output_dataset_id);
+    Some(dataset_ids)
 }
 
 fn to_proto_partition(

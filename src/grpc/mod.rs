@@ -910,6 +910,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListGovernedTransformRuns"
             | "GetGovernedTransformRun"
             | "PreviewGovernedTransform"
+            | "RunAdHocGovernedTransform"
             | "PutGovernedTransform"
             | "ListDatasets"
             | "ListDatasetVersions"
@@ -2940,6 +2941,7 @@ mod tests {
             "ListGovernedTransformRuns",
             "GetGovernedTransformRun",
             "PreviewGovernedTransform",
+            "RunAdHocGovernedTransform",
             "PutGovernedTransform",
         ] {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));

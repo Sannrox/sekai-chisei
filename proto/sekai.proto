@@ -961,6 +961,21 @@ message PreviewGovernedTransformRequest {
   uint32 row_cap = 2;
   string preview_id = 3;
 }
+// An inline definition run once with the caller's read authority (ADR 0138).
+message RunAdHocGovernedTransformRequest {
+  GovernedTransform transform = 1;
+  // Groups related runs; named on the receipt as its trigger reference.
+  string session_label = 2;
+  // One run per caller, session and key.
+  string idempotency_key = 3;
+}
+message RunAdHocGovernedTransformResponse {
+  TransformRun run = 1;
+  string scratch_dataset_id = 2;
+  int64 expires_at_ms = 3;
+  // True when an earlier submission with this identity made the run.
+  bool replayed = 4;
+}
 message PreviewGovernedTransformInputStat {
   string alias = 1;
   string dataset_id = 2;
@@ -4921,6 +4936,7 @@ service SekaiService {
   rpc PutGovernedTransform(PutGovernedTransformRequest) returns (PutGovernedTransformResponse);
   rpc RunGovernedTransform(RunGovernedTransformRequest) returns (RunGovernedTransformResponse);
   rpc PreviewGovernedTransform(PreviewGovernedTransformRequest) returns (PreviewGovernedTransformResponse);
+  rpc RunAdHocGovernedTransform(RunAdHocGovernedTransformRequest) returns (RunAdHocGovernedTransformResponse);
   rpc GetGovernedTransformRun(GetGovernedTransformRunRequest) returns (GetGovernedTransformRunResponse);
   rpc ListGovernedTransforms(ListGovernedTransformsRequest) returns (ListGovernedTransformsResponse);
   rpc ListGovernedTransformRuns(ListGovernedTransformRunsRequest) returns (ListGovernedTransformRunsResponse);

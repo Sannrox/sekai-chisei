@@ -351,16 +351,26 @@ pub(super) fn check_object_acl_with_audit(
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
 ) -> Result<(), Status> {
-    let result = if matches!(
+    let read = matches!(
         operation,
         crate::sekai::object_security::ObjectSecurityOperation::Read
             | crate::sekai::object_security::ObjectSecurityOperation::Traverse
             | crate::sekai::object_security::ObjectSecurityOperation::Query
             | crate::sekai::object_security::ObjectSecurityOperation::Export
-    ) {
-        check_read(security, object_id, principals)
+    );
+    // A scratch output is checked against its stored grants; only its id
+    // shape costs a store read.
+    let scratch = if crate::sekai::adhoc_transform::is_scratch_object_id(object_id) {
+        db.get_object(object_id)
+            .map_err(Status::internal)?
+            .filter(|object| object.kind == crate::sekai::adhoc_transform::SCRATCH_OBJECT_KIND)
     } else {
-        check_write(security, object_id, principals)
+        None
+    };
+    let result = match &scratch {
+        Some(object) => check_object_acl(db, security, object, principals, !read),
+        None if read => check_read(security, object_id, principals),
+        None => check_write(security, object_id, principals),
     };
     if result.is_err() {
         record_delegated_policy_decision(
@@ -661,7 +671,7 @@ pub(super) fn object_is_visible_for_purpose(
             crate::enterprise::NamespaceAction::Read,
         )
         .unwrap_or(false)
-        && check_read(security, &object.id, principals).is_ok()
+        && check_object_acl(db, security, object, principals, false).is_ok()
         && object_passes_marking(db, object, principals).unwrap_or(false)
         && object_passes_security_policy(db, object, principals, tenant_context, operation, purpose)
             .unwrap_or(false)
@@ -1682,6 +1692,32 @@ pub(super) fn check_dataset_access(
         }
     };
     check_team_namespace(db, principals, &object.namespace, write)?;
+    check_object_acl(db, security, &object, principals, write)
+}
+
+/// The object ACL check. A scratch output (ADR 0138) is checked against its
+/// stored grants, not this plane's cache: another plane may have created it
+/// after this cache loaded, and a missing ACL reads as open. It fails
+/// closed when no grant is stored.
+pub(super) fn check_object_acl(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: &domain::Object,
+    principals: &[String],
+    write: bool,
+) -> Result<(), Status> {
+    let stored;
+    let security = if object.kind == crate::sekai::adhoc_transform::SCRATCH_OBJECT_KIND {
+        let grants = db.list_grants(&object.id).map_err(Status::internal)?;
+        if grants.is_empty() {
+            return Err(Status::permission_denied("access denied"));
+        }
+        stored = SecurityChecker::new();
+        stored.load(&grants);
+        &stored
+    } else {
+        security
+    };
     if write {
         check_write(security, &object.id, principals)
     } else {
