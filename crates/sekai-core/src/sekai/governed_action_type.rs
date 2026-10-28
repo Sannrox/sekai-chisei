@@ -7,6 +7,7 @@
 use crate::db::sekai::SekaiDb;
 use crate::sekai::action_type_criteria::{ActionSubmissionCriterion, validate_submission_criteria};
 use rusqlite::{OptionalExtension, params};
+use sekai_types::impact_class::ImpactClass;
 use serde::{Deserialize, Serialize};
 
 /// Known effect kinds allowed on governed action types at registry time.
@@ -65,6 +66,9 @@ pub struct GovernedActionType {
     /// The properties `last_writer_wins` may overwrite.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_writer_wins_properties: Vec<String>,
+    /// `routine` or `high_impact` (#1910). Empty means unclassified.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub impact_class: String,
     pub enabled: bool,
     pub created_by: String,
     pub created_at_ms: i64,
@@ -78,6 +82,12 @@ impl GovernedActionType {
             &self.offline_conflict,
             &self.last_writer_wins_properties,
         )?;
+        if !self.impact_class.is_empty() && self.impact().is_none() {
+            return Err(format!(
+                "impact_class must be empty or one of: {}",
+                ImpactClass::ALL.map(ImpactClass::as_str).join(", ")
+            ));
+        }
         if self.namespace.trim().is_empty() {
             return Err("namespace required".into());
         }
@@ -159,6 +169,12 @@ impl GovernedActionType {
         Ok(())
     }
 
+    /// The declared impact class. Empty, or a value this build does not
+    /// know, is unclassified.
+    pub fn impact(&self) -> Option<ImpactClass> {
+        ImpactClass::parse(&self.impact_class)
+    }
+
     pub fn effect_kinds_to_materialize(&self) -> &[String] {
         if self.declared_effect_kinds.is_empty() {
             &self.allowed_effect_kinds
@@ -236,8 +252,9 @@ pub fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
         "system_one": t.system_one,
         "review_queue": t.review_queue,
     });
-    // Added after types were stored: only a set rule enters the
-    // fingerprint, so every stored type keeps its fingerprint.
+    // Added after types were stored: only a set offline rule or impact
+    // class enters the fingerprint, so every stored type keeps its
+    // fingerprint.
     let mut body = body;
     if !t.offline_conflict.is_empty() || !t.last_writer_wins_properties.is_empty() {
         let object = body.as_object_mut().expect("fingerprint body is an object");
@@ -246,6 +263,10 @@ pub fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
             "last_writer_wins_properties".into(),
             t.last_writer_wins_properties.clone().into(),
         );
+    }
+    if !t.impact_class.is_empty() {
+        let object = body.as_object_mut().expect("fingerprint body is an object");
+        object.insert("impact_class".into(), t.impact_class.clone().into());
     }
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }
@@ -546,6 +567,69 @@ mod tests {
             .list_governed_action_types("acme", Some("review.intake"), false)
             .unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    /// #1910: an unclassified type keeps the fingerprint it had before
+    /// `impact_class` existed, so stored versions stay idempotent on re-put.
+    #[test]
+    fn unclassified_fingerprint_is_unchanged_and_a_class_is_part_of_the_version() {
+        assert_eq!(
+            body_fingerprint(&sample(true)).unwrap(),
+            concat!(
+                r#"{"allowed_effect_kinds":["runtime_dispatch","notify"],"budget_scope":"","#,
+                r#""declared_effect_kinds":[],"description":"Admit a review decision","#,
+                r#""object_kind":"","object_mutation":"","parameter_schema_json":"#,
+                r#""{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"}},"#,
+                r#"\"required\":[\"summary\"],\"additionalProperties\":false}","policy_scope":"","#,
+                r#""review_queue":{"agent_reviewers":[],"escalate":"","escalate_to":"","pool":[],"#,
+                r#""queue_id":"","sla_ms":0,"threshold":0,"threshold_param":""},"#,
+                r#""submission_criteria":[],"system_one":null}"#,
+            )
+        );
+        let db = SekaiDb::new(":memory:").unwrap();
+        // A row written before the field existed has no `impact_class` key.
+        let legacy = serde_json::to_string(&sample(true)).unwrap();
+        assert!(!legacy.contains("impact_class"));
+        db.migrate_governed_action_types().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_governed_action_types
+                 (namespace, type_id, version, body_json, enabled, created_by,
+                  created_at_ms, updated_at_ms, disabled_at_ms)
+                 VALUES ('acme', 'review.intake', '1.0.0', ?1, 1, 'operator', 1, 1, 0)",
+                params![legacy],
+            )
+            .unwrap();
+        db.put_governed_action_type(sample(true), "operator", 2)
+            .unwrap();
+
+        let mut classified = sample(true);
+        classified.impact_class = "high_impact".into();
+        let err = db
+            .put_governed_action_type(classified.clone(), "operator", 3)
+            .unwrap_err();
+        assert!(err.contains("immutable"), "{err}");
+        classified.version = "2.0.0".into();
+        db.put_governed_action_type(classified, "operator", 4)
+            .unwrap();
+        let stored = db
+            .get_governed_action_type("acme", "review.intake", "2.0.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.impact(), Some(ImpactClass::HighImpact));
+    }
+
+    #[test]
+    fn impact_class_is_a_closed_set() {
+        for class in ImpactClass::ALL {
+            let mut type_def = sample(true);
+            type_def.impact_class = class.as_str().into();
+            type_def.validate().unwrap();
+        }
+        let mut type_def = sample(true);
+        type_def.impact_class = "critical".into();
+        let err = type_def.validate().unwrap_err();
+        assert!(err.contains("impact_class"), "{err}");
     }
 
     #[test]

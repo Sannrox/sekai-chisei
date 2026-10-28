@@ -15,6 +15,7 @@ use crate::sekai::audit;
 use crate::sekai::delegating_principal::{
     DelegatorApplyError, current_delegating_principal_state, revalidate_delegator_at_apply,
 };
+use crate::sekai::governed_action_type::GovernedActionType;
 use crate::sekai::parked_work::{ActionWorkContinuation, ActionWorkPark};
 use sekai_domain::receipt::{
     OperationReceipt, OperationReceiptEvent, ReceiptArtifact, ReceiptEventKind,
@@ -74,6 +75,27 @@ pub struct ReportActionClaimEvent<'a> {
     pub request_id: &'a str,
 }
 
+/// An Action Work claim cited by a model call (#1910).
+#[derive(Debug, Clone, Copy)]
+pub struct CitedActionClaim<'a> {
+    pub effect_id: &'a str,
+    pub claim_generation: u64,
+    pub fencing_token: &'a str,
+}
+
+/// What a cited claim resolves to. Only `Live` carries an Action type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CitedClaimResolution {
+    /// Live, held by the caller, in the call's namespace.
+    Live(Box<GovernedActionType>),
+    /// No such effect in the call's namespace, or its instance or type is gone.
+    NotFound,
+    /// Not claimed, lease expired, or a stale generation or token.
+    NotLive,
+    /// Live, but taken by another principal.
+    Foreign,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaimedActionWork {
     pub effect: ActionEffect,
@@ -127,6 +149,7 @@ impl<'a> ActionWorkLifecycle<'a> {
                 command.effect_id,
                 command.runtime_id,
                 command.request_id,
+                actor,
                 command.ttl_ms,
                 now_ms,
             )
@@ -381,6 +404,49 @@ impl<'a> ActionWorkLifecycle<'a> {
         })
     }
 
+    /// Resolve a claim cited by a model call to the claimed Action type.
+    /// Read-only. The claim must pass the same live fence as heartbeat and
+    /// ack (against the stored owner), have been taken by `caller`, and
+    /// belong to `namespace`; an effect in another namespace reads as not
+    /// found so its existence is not disclosed.
+    pub fn resolve_cited_claim(
+        &self,
+        claim: CitedActionClaim<'_>,
+        caller: &str,
+        namespace: &str,
+        now_ms: i64,
+    ) -> Result<CitedClaimResolution, String> {
+        let Some(effect) = self.db.get_action_effect(claim.effect_id)? else {
+            return Ok(CitedClaimResolution::NotFound);
+        };
+        if effect.namespace != namespace {
+            return Ok(CitedClaimResolution::NotFound);
+        }
+        if effect
+            .require_live_fence(
+                &effect.claim_owner,
+                claim.claim_generation,
+                claim.fencing_token,
+                now_ms,
+            )
+            .is_err()
+        {
+            return Ok(CitedClaimResolution::NotLive);
+        }
+        if effect.claim_principal.is_empty() || effect.claim_principal != caller {
+            return Ok(CitedClaimResolution::Foreign);
+        }
+        let Some(instance) = self.db.get_action_instance(&effect.instance_id)? else {
+            return Ok(CitedClaimResolution::NotFound);
+        };
+        Ok(self
+            .db
+            .get_governed_action_type(&instance.namespace, &instance.type_id, &instance.version)?
+            .map_or(CitedClaimResolution::NotFound, |action_type| {
+                CitedClaimResolution::Live(Box::new(action_type))
+            }))
+    }
+
     pub fn report_event(
         &self,
         command: ReportActionClaimEvent<'_>,
@@ -418,6 +484,7 @@ impl<'a> ActionWorkLifecycle<'a> {
                 command.effect_id,
                 command.runtime_id,
                 command.request_id,
+                actor,
                 command.ttl_ms,
                 now_ms,
             )

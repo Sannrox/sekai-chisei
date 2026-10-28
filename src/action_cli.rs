@@ -103,6 +103,9 @@ struct TypeFile {
     offline_conflict: String,
     #[serde(default)]
     last_writer_wins_properties: Vec<String>,
+    /// `routine` or `high_impact` (#1910). Empty means unclassified.
+    #[serde(default)]
+    impact_class: String,
     #[serde(default)]
     review_queue_id: String,
     #[serde(default)]
@@ -236,6 +239,7 @@ fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxE
             disabled_at_ms: 0,
             last_writer_wins_properties: parsed.last_writer_wins_properties,
             offline_conflict: parsed.offline_conflict,
+            impact_class: parsed.impact_class,
         },
         request_id,
     ))

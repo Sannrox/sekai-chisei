@@ -2265,6 +2265,265 @@ async fn planned_execution_charges_the_work_unit_budget_chain() {
     }
 }
 
+/// Register a `high_impact` Action type in `namespace`, admit one instance,
+/// and claim its runtime work as `holder` (#1910).
+fn seed_claimed_action(
+    db: &RuntimeDb,
+    namespace: &str,
+    holder: &str,
+) -> crate::sekai::action_effect::ActionEffect {
+    use crate::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType};
+    db.put_governed_action_type(
+        GovernedActionType {
+            namespace: namespace.into(),
+            type_id: "invade".into(),
+            version: "1".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            impact_class: "high_impact".into(),
+            enabled: true,
+            ..Default::default()
+        },
+        "operator",
+        1,
+    )
+    .unwrap();
+    let effect = crate::sekai::action_effect::plan_effects_for_admit(
+        "invade-instance",
+        namespace,
+        "invade-operation",
+        &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+        r#"{"runtime":"shikigami"}"#,
+        1,
+        false,
+    )
+    .unwrap()
+    .remove(0);
+    db.put_action_effects(std::slice::from_ref(&effect))
+        .unwrap();
+    db.put_action_instance(&crate::sekai::action_instance::ActionInstance {
+        instance_id: "invade-instance".into(),
+        namespace: namespace.into(),
+        type_id: "invade".into(),
+        version: "1".into(),
+        principal: "agent:submitter".into(),
+        delegating_actor: None,
+        parameters_json: r#"{"runtime":"shikigami"}"#.into(),
+        request_digest: "invade-digest".into(),
+        idempotency_key: "invade-idem".into(),
+        operation_id: "invade-operation".into(),
+        status: crate::sekai::action_instance::STATUS_ADMITTED.into(),
+        deny_reason: String::new(),
+        evidence_submission_ids: Vec::new(),
+        policy_decision: "allow".into(),
+        budget_decision: "allow".into(),
+        created_at_ms: 1,
+        decided_at_ms: 1,
+        system_one_fill_json: String::new(),
+        parked_object_digest: String::new(),
+        decided_by: String::new(),
+        approval_decision: String::new(),
+        autonomous_envelope_id: String::new(),
+        review: Default::default(),
+        agent_action: false,
+        admission_tenant: String::new(),
+        resource_tenant: String::new(),
+        marking: String::new(),
+        conflict: None,
+        approval: None,
+        offline: None,
+    })
+    .unwrap();
+    crate::sekai::action_work_lifecycle::ActionWorkLifecycle::new(db)
+        .claim(
+            crate::sekai::action_work_lifecycle::ClaimActionWork {
+                effect_id: &effect.effect_id,
+                runtime_id: "shikigami",
+                request_id: "claim-1",
+                ttl_ms: 600_000,
+            },
+            holder,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .effect
+}
+
+fn cite_claim(
+    effect: &crate::sekai::action_effect::ActionEffect,
+    claim_generation: u64,
+) -> Option<ActionClaimRef> {
+    Some(ActionClaimRef {
+        effect_id: effect.effect_id.clone(),
+        claim_generation,
+        fencing_token: effect.claim_fencing_token.clone(),
+    })
+}
+
+/// #1910: a planned call citing a live claim of a `high_impact` Action type
+/// carries that class on the plan, the policy decision and the model call.
+/// A stale fence or no claim stays unclassified; the fencing token is never
+/// recorded.
+#[tokio::test]
+async fn planned_execution_resolves_impact_class_from_a_cited_claim() {
+    let provider_url = spawn_synthetic_ollama_provider().await;
+    let mut service = managed_ollama_execution_service(provider_url);
+    service.sekai_facts =
+        crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&service.db));
+    let context = managed_execution_context(
+        vec!["chisei.execute".into()],
+        "sekai:control-plane",
+        i64::MAX,
+    );
+    let claimed = seed_claimed_action(
+        service.db.runtime(),
+        "managed-conformance",
+        &context.principal.subject,
+    );
+    let plan_for = |request_id: &str, claim: Option<ActionClaimRef>| {
+        let mut request = managed_plan_request(request_id);
+        request.input.as_mut().unwrap().action_claim = claim;
+        let mut request = Request::new(request);
+        attach_managed_context(&mut request, context.clone());
+        service.plan_execution(request)
+    };
+
+    let plan = plan_for(
+        "impact-live",
+        cite_claim(&claimed, claimed.claim_generation),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .plan
+    .unwrap();
+    assert_eq!(plan.action_impact_class, "high_impact");
+    assert_eq!(plan.action_claim_resolution, "live");
+    // Planned while the claim is live, executed after it is acknowledged.
+    let outlived = plan_for(
+        "impact-outlived",
+        cite_claim(&claimed, claimed.claim_generation),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .plan
+    .unwrap();
+    assert_eq!(outlived.action_claim_resolution, "live");
+    let run = |plan: ExecutionPlan| {
+        let mut execute = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        attach_managed_context(&mut execute, context.clone());
+        let service = &service;
+        async move {
+            let plan_id = execute.get_ref().plan.as_ref().unwrap().plan_id.clone();
+            let mut stream = service
+                .execute_plan_stream(execute)
+                .await
+                .unwrap()
+                .into_inner();
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+            service
+                .db
+                .get_operation_receipt(&plan_id)
+                .unwrap()
+                .expect("receipt")
+        }
+    };
+    let receipt = run(plan).await;
+    for kind in [
+        ReceiptEventKind::PolicyDecided,
+        ReceiptEventKind::ModelCalled,
+    ] {
+        let event = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == kind)
+            .expect("event");
+        assert_eq!(event.attributes["impact_class"], "high_impact");
+        assert_eq!(event.attributes["action_claim_resolution"], "live");
+        assert_eq!(
+            event.attributes["action_claim_effect_id"],
+            claimed.effect_id
+        );
+        assert_eq!(
+            event.attributes["action_claim_generation"],
+            claimed.claim_generation.to_string()
+        );
+        assert!(
+            event
+                .attributes
+                .values()
+                .all(|value| !value.contains(&claimed.claim_fencing_token))
+        );
+    }
+
+    service
+        .db
+        .runtime()
+        .ack_action_work(
+            &claimed.effect_id,
+            "shikigami",
+            claimed.claim_generation,
+            &claimed.claim_fencing_token,
+            crate::sekai::action_effect::ACK_OUTCOME_FAILED,
+            "done",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap();
+    let outlived_receipt = run(outlived).await;
+    let attributes = |kind: ReceiptEventKind| {
+        outlived_receipt
+            .events
+            .iter()
+            .find(|event| event.kind == kind)
+            .unwrap()
+            .attributes
+            .clone()
+    };
+    let model_call = attributes(ReceiptEventKind::ModelCalled);
+    assert_eq!(model_call["impact_class"], "");
+    assert_eq!(model_call["action_claim_resolution"], "not_live");
+    // The policy event keeps the planning-time record.
+    assert_eq!(
+        attributes(ReceiptEventKind::PolicyDecided)["action_claim_resolution"],
+        "live"
+    );
+
+    let stale = plan_for(
+        "impact-stale",
+        cite_claim(&claimed, claimed.claim_generation + 1),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .plan
+    .unwrap();
+    assert_eq!(stale.action_impact_class, "");
+    assert_eq!(stale.action_claim_resolution, "not_live");
+    let policy = service
+        .db
+        .get_operation_receipt(&stale.plan_id)
+        .unwrap()
+        .unwrap()
+        .events
+        .into_iter()
+        .find(|event| event.kind == ReceiptEventKind::PolicyDecided)
+        .unwrap();
+    assert_eq!(policy.attributes["impact_class"], "");
+    assert_eq!(policy.attributes["action_claim_resolution"], "not_live");
+
+    let unclaimed = plan_for("impact-none", None)
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert_eq!(unclaimed.action_impact_class, "");
+    assert_eq!(unclaimed.action_claim_resolution, "no_claim");
+}
+
 #[tokio::test]
 async fn managed_stream_read_failure_records_failed_receipt_without_route_switch() {
     let (provider_url, requests) = spawn_synthetic_invalid_stream_ollama_provider().await;
@@ -5257,6 +5516,7 @@ fn run_test_gateway_pipeline(
         model: "native-default",
         runtime: "native",
         task_class,
+        action_impact: &Default::default(),
     })
     .unwrap()
 }
@@ -7659,6 +7919,7 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
             model: "native-default",
             runtime: "native",
             task_class: "",
+            action_impact: &Default::default(),
         })
         .unwrap();
     assert!(
@@ -10288,6 +10549,7 @@ async fn decide_gateway_execution_admits_and_denies_closed() {
         capability_requirements_json: Vec::new(),
         expected_calls: 1,
         pipeline_spec: "summarize team-a".into(),
+        action_claim: None,
     });
     admit
         .metadata_mut()
@@ -10355,6 +10617,7 @@ async fn decide_gateway_execution_admits_and_denies_closed() {
         capability_requirements_json: Vec::new(),
         expected_calls: 1,
         pipeline_spec: String::new(),
+        action_claim: None,
     });
     context_denied
         .metadata_mut()
@@ -10410,6 +10673,7 @@ async fn decide_gateway_execution_admits_and_denies_closed() {
         capability_requirements_json: Vec::new(),
         expected_calls: 2,
         pipeline_spec: String::new(),
+        action_claim: None,
     });
     request_budget_denied
         .metadata_mut()
@@ -10445,6 +10709,7 @@ async fn decide_gateway_execution_admits_and_denies_closed() {
         capability_requirements_json: Vec::new(),
         expected_calls: 1,
         pipeline_spec: String::new(),
+        action_claim: None,
     });
     denied
         .metadata_mut()
@@ -10507,11 +10772,55 @@ fn decide_request(
         capability_requirements_json: Vec::new(),
         expected_calls: 1,
         pipeline_spec: pipeline_spec.into(),
+        action_claim: None,
     });
     request
         .metadata_mut()
         .insert("x-principal", "local".parse().unwrap());
     request
+}
+
+/// #1910: the gateway decision record carries the class resolved from a
+/// cited claim; another principal's claim resolves unclassified.
+#[tokio::test]
+async fn decide_gateway_execution_records_the_cited_claim_impact() {
+    let mut svc = openai_team_a_service();
+    svc.sekai_facts =
+        crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&svc.db));
+    svc.policy
+        .set_context_admission_policy(
+            "team-a",
+            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+        )
+        .unwrap();
+    let claimed = seed_claimed_action(svc.db.runtime(), "team-a", "local");
+    let decide = |correlation: &str, caller: &str| {
+        let mut request = decide_request(correlation, "");
+        request.get_mut().action_claim = cite_claim(&claimed, claimed.claim_generation);
+        request
+            .metadata_mut()
+            .insert("x-principal", caller.parse().unwrap());
+        svc.decide_gateway_execution(request)
+    };
+
+    decide("op-impact-holder", "local").await.unwrap();
+    let record = svc
+        .db
+        .get_decision("gateway-decide:team-a:op-impact-holder:1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.evidence["impact_class"], "high_impact");
+    assert_eq!(record.evidence["action_claim_resolution"], "live");
+    assert_eq!(record.evidence["action_claim_effect_id"], claimed.effect_id);
+
+    decide("op-impact-foreign", "root").await.unwrap();
+    let record = svc
+        .db
+        .get_decision("gateway-decide:team-a:op-impact-foreign:1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.evidence["impact_class"], "");
+    assert_eq!(record.evidence["action_claim_resolution"], "foreign");
 }
 
 #[tokio::test]
@@ -10664,6 +10973,7 @@ async fn decide_rejects_mixed_capability_catalogs_as_unsupported() {
             capability_requirements_json,
             expected_calls: 1,
             pipeline_spec: String::new(),
+            action_claim: None,
         });
         request
             .metadata_mut()
@@ -10756,6 +11066,7 @@ async fn decide_gateway_execution_requires_authenticated_principal() {
         capability_requirements_json: Vec::new(),
         expected_calls: 1,
         pipeline_spec: String::new(),
+        action_claim: None,
     });
     let err = svc.decide_gateway_execution(request).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -12363,6 +12674,7 @@ async fn unreviewed_model_is_refused_at_gateway_decide() {
         capability_requirements_json: Vec::new(),
         expected_calls: 1,
         pipeline_spec: String::new(),
+        action_claim: None,
     });
     request
         .metadata_mut()
@@ -12426,6 +12738,7 @@ async fn unreviewed_fallback_is_omitted_from_gateway_decide() {
         capability_requirements_json: Vec::new(),
         expected_calls: 1,
         pipeline_spec: String::new(),
+        action_claim: None,
     });
     request
         .metadata_mut()

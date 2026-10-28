@@ -400,6 +400,8 @@ pub(super) async fn gateway_decision_preflight(
         capability_requirements_json,
         expected_calls: 1,
         pipeline_spec: pipeline_spec.to_string(),
+        // The HTTP edge has no claim header; its calls stay unclassified.
+        action_claim: None,
     };
     match connect_governance(runtime, target).await {
         Ok(channel) => {

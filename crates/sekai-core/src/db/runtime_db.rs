@@ -4750,20 +4750,23 @@ impl RuntimeDb {
         }
     }
 
+    /// Claim runtime work for `runtime_id`, recording the authenticated
+    /// `principal` that holds the claim.
     pub fn claim_action_work(
         &self,
         effect_id: &str,
         runtime_id: &str,
         request_id: &str,
+        principal: &str,
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<crate::sekai::action_effect::ActionEffect, String> {
         match self {
             Self::Sqlite(db) => {
-                db.claim_action_work(effect_id, runtime_id, request_id, ttl_ms, now_ms)
+                db.claim_action_work(effect_id, runtime_id, request_id, principal, ttl_ms, now_ms)
             }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.claim_action_work(effect_id, runtime_id, request_id, ttl_ms, now_ms)
+                db.claim_action_work(effect_id, runtime_id, request_id, principal, ttl_ms, now_ms)
             }),
         }
     }

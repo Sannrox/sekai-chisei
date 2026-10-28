@@ -8,6 +8,7 @@
 mod action_approval_adr;
 mod action_binding_adr;
 mod action_binding_backend_conformance;
+mod action_claim_impact_backend_conformance;
 mod action_governance_backend_conformance;
 mod agent_instruction_sync;
 mod autonomous_envelope_adr;
@@ -187,6 +188,7 @@ const GROUPED_MODULES: &[&str] = &[
     "action_approval_adr",
     "action_binding_adr",
     "action_binding_backend_conformance",
+    "action_claim_impact_backend_conformance",
     "action_governance_backend_conformance",
     "agent_instruction_sync",
     "autonomous_envelope_adr",
@@ -435,6 +437,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 149);
+    assert_eq!(GROUPED_MODULES.len(), 150);
     assert_eq!(SEPARATE_TARGETS.len(), 22);
 }
