@@ -60,7 +60,10 @@ written through governed Actions, and no domain-specific core RPC.
    successor, so a repeated or restarted pass reopens it once. Changes are
    found in the committed object-change feed, never by polling a source. The
    certification moves to `cert:security.finding-exposure/v1.2`. A server
-   driver for these passes is #1954.
+   driver (#1954) runs these passes on every instance as an
+   operator-configured principal (`SEKAI_SECURITY_REOPEN_RUN_AS`), checked
+   for namespace write and write freezes like an Action binding's run, and
+   keeps each namespace's feed position in a compare-and-set cursor.
 
 ## Alternatives considered
 

@@ -36,6 +36,15 @@ supersedes it with a `needs-review` disposition that names the fact, and its
 receipt's idempotency key names it too. The package functions
 `reopen_changed_basis` and `reopen_expired` find those dispositions from the
 committed object-change feed and the stored expiry, and reopen each once.
+With `SEKAI_SECURITY_REOPEN_RUN_AS` set, every Sekai-serving instance runs
+them each minute (#1954) in every namespace holding the package, as that
+principal and through the same namespace-write and write-freeze checks as an
+Action binding's run. A namespace that refuses the principal is skipped and
+logged. The feed position is stored per namespace and advanced by
+compare-and-set, so instances running at once never move it backwards. Each
+pass also sweeps every disposition heading its chain for an expiry or a basis
+its exposure no longer has, so a change committed behind the feed position is
+still caught.
 Neither package
 ships live instances, and neither is a runtime grant.
 

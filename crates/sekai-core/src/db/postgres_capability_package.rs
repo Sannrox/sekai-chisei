@@ -7,6 +7,71 @@ use crate::db::postgres::PostgresDb;
 use crate::sekai::capability_package::{CapabilityPackageCertification, PACKAGE_UNAVAILABLE};
 
 impl PostgresDb {
+    /// Namespaces holding a live certification of `package_id`.
+    pub fn list_live_package_namespaces(&self, package_id: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT DISTINCT namespace FROM sekai_capability_packages
+                 WHERE (record_json::jsonb) ->> 'package_id' = $1
+                   AND (record_json::jsonb) ->> 'superseded_by' = ''
+                   AND (record_json::jsonb) ->> 'revocation' = ''
+                 ORDER BY namespace",
+                &[&package_id],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    /// See the SQLite store.
+    pub fn get_package_feed_cursor(
+        &self,
+        namespace: &str,
+        consumer: &str,
+    ) -> Result<Option<u64>, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT next_seq FROM sekai_package_feed_cursors
+                 WHERE namespace = $1 AND consumer = $2",
+                &[&namespace, &consumer],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, i64>(0).max(0) as u64))
+    }
+
+    /// See the SQLite store.
+    pub fn advance_package_feed_cursor(
+        &self,
+        namespace: &str,
+        consumer: &str,
+        expected: Option<u64>,
+        next: u64,
+    ) -> Result<bool, String> {
+        let overflow = |_| "feed position overflows".to_string();
+        let next = i64::try_from(next).map_err(overflow)?;
+        let mut connection = self.connection()?;
+        let changed = match expected {
+            None => connection.execute(
+                "INSERT INTO sekai_package_feed_cursors (namespace, consumer, next_seq)
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                &[&namespace, &consumer, &next],
+            ),
+            Some(expected) => {
+                let expected = i64::try_from(expected).map_err(overflow)?;
+                connection.execute(
+                    "UPDATE sekai_package_feed_cursors SET next_seq = $3
+                     WHERE namespace = $1 AND consumer = $2 AND next_seq = $4",
+                    &[&namespace, &consumer, &next, &expected],
+                )
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
     pub fn get_capability_package(
         &self,
         namespace: &str,

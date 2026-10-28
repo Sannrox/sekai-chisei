@@ -7833,6 +7833,43 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_live_package_namespaces(&self, package_id: &str) -> Result<Vec<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_live_package_namespaces(package_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_live_package_namespaces(package_id))
+            }
+        }
+    }
+
+    pub fn get_package_feed_cursor(
+        &self,
+        namespace: &str,
+        consumer: &str,
+    ) -> Result<Option<u64>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_package_feed_cursor(namespace, consumer),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_package_feed_cursor(namespace, consumer))
+            }
+        }
+    }
+
+    pub fn advance_package_feed_cursor(
+        &self,
+        namespace: &str,
+        consumer: &str,
+        expected: Option<u64>,
+        next: u64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.advance_package_feed_cursor(namespace, consumer, expected, next),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.advance_package_feed_cursor(namespace, consumer, expected, next)
+            }),
+        }
+    }
+
     pub fn list_capability_packages(
         &self,
         namespace: &str,
