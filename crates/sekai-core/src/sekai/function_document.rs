@@ -1326,6 +1326,7 @@ mod tests {
                     resource_tenant: String::new(),
                     marking: String::new(),
                     conflict: None,
+                    approval: None,
                     offline: None,
                 })
                 .unwrap();

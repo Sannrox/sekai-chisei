@@ -135,6 +135,7 @@ fn seed_effect(db: &RuntimeDb, suffix: &str) {
         resource_tenant: String::new(),
         marking: String::new(),
         conflict: None,
+        approval: None,
         offline: None,
     })
     .unwrap();

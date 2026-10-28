@@ -923,6 +923,9 @@ pub(super) fn record_completed_operation_on_with_path(
     answer_path: Option<&str>,
     lookup_refusal: Option<&str>,
 ) -> Result<(), String> {
+    // Priced from the provider-reported usage and the table in force now, and
+    // never recomputed. Boot refuses a table that does not parse; an unpriced
+    // model leaves `cost_usd_micros` off the model call event.
     let cost_usd_micros = crate::cost_estimate::pricing_from_env()
         .ok()
         .and_then(|pricing| native_execution_cost(plan, response, &pricing));

@@ -771,6 +771,33 @@ pub(super) fn require_execution_namespace_access_with_context(
     }
     require_execution_namespace_access(facts, config, actor, namespace)
 }
+/// Authorize an enterprise context to read `namespace` on the Sekai store
+/// through the tenant path the Sekai namespace RPCs use: space role and
+/// credential scope, a service principal's live registration scope, guest
+/// and shared-space grants, and the extension's decision, with their audit.
+/// Without an in-process Sekai store the read is refused; without an
+/// extension the principal's namespace grant is required too.
+pub(super) fn require_enterprise_namespace_read(
+    facts: &dyn SekaiFactReader,
+    context: &crate::enterprise::AuthenticatedContext,
+    namespace: &str,
+) -> Result<(), Status> {
+    let namespace = canonical_namespace(namespace)?;
+    let store = facts
+        .in_process_store()
+        .map_err(|error| sekai_fact_status(error, "namespace access denied"))?;
+    let db = store.runtime();
+    crate::grpc::sekai_service::enforce_namespace_tenant_context_for(
+        db,
+        Some(context),
+        namespace,
+        crate::enterprise::NamespaceAction::Read,
+    )?;
+    if db.enterprise_extension().is_none() {
+        require_namespace_access(facts, &context.principal.subject, namespace)?;
+    }
+    Ok(())
+}
 pub(super) fn enterprise_execution_status(error: crate::enterprise::ExtensionError) -> Status {
     match error {
         crate::enterprise::ExtensionError::CredentialNotFound
@@ -813,6 +840,39 @@ pub(super) fn execution_budget_scope(
         .to_string();
     }
     format!("project:{}/agent:{}", namespace.trim(), actor.trim())
+}
+
+/// The budget chain a planned execution is checked and charged against
+/// (#1866): [`execution_budget_scope`], extended with the caller's work unit
+/// when one is named. A local caller with a work unit is placed at
+/// `project:<namespace>/agent:<user or local>`, so the work unit nests under
+/// a real chain as it does for every other caller.
+pub(super) fn planned_execution_budget_scope(
+    namespace: &str,
+    actor: &str,
+    requested_user_id: &str,
+    work_unit: &str,
+) -> Result<String, Status> {
+    let work_unit = work_unit.trim();
+    if work_unit.is_empty() {
+        return Ok(execution_budget_scope(namespace, actor, requested_user_id));
+    }
+    if work_unit.contains('/') || work_unit.len() > 256 {
+        return Err(Status::invalid_argument(
+            "budget_work_unit must be at most 256 bytes without '/'",
+        ));
+    }
+    let base = if matches!(actor, "root" | "local") {
+        let agent = if requested_user_id.trim().is_empty() {
+            actor
+        } else {
+            requested_user_id.trim()
+        };
+        format!("project:{}/agent:{agent}", namespace.trim())
+    } else {
+        execution_budget_scope(namespace, actor, requested_user_id)
+    };
+    Ok(format!("{base}/work_unit:{work_unit}"))
 }
 pub(super) fn strongest_pressure(
     left: crate::chisei::budget::PressureLevel,

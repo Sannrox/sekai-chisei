@@ -727,6 +727,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "RegisterTransformRuntime",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ListClaimableTransformWork",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
@@ -2479,6 +2488,15 @@
       "consumer": "none",
       "classification": "stable",
       "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetBudgetUsage",
+      "storage_path": "chisei.budget",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
     },
     {
       "service": "ChiseiService",

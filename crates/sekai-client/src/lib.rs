@@ -346,6 +346,9 @@ pub struct ClientConfig {
     pub retry: RetryPolicy,
     pub allow_insecure_remote: bool,
     pub tls_ca_certificate: Option<Vec<u8>>,
+    /// Trust the built-in roots (WebPKI or native, by feature) in addition
+    /// to `tls_ca_certificate`. Off with [`ClientConfig::without_builtin_roots`].
+    pub trust_builtin_roots: bool,
     pub max_stream_events: usize,
     pub max_stream_bytes: usize,
 }
@@ -362,6 +365,7 @@ impl ClientConfig {
             retry: RetryPolicy::default(),
             allow_insecure_remote: false,
             tls_ca_certificate: None,
+            trust_builtin_roots: true,
             max_stream_events: DEFAULT_MAX_STREAM_EVENTS,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
         }
@@ -408,6 +412,14 @@ impl ClientConfig {
         self
     }
 
+    /// Trust only the configured CA certificate over HTTPS, not the
+    /// built-in roots, for callers bound to their own PKI. Construction
+    /// fails when no CA certificate is configured.
+    pub fn without_builtin_roots(mut self) -> Self {
+        self.trust_builtin_roots = false;
+        self
+    }
+
     pub fn with_stream_limits(mut self, max_events: usize, max_bytes: usize) -> Self {
         self.max_stream_events = max_events;
         self.max_stream_bytes = max_bytes;
@@ -419,6 +431,10 @@ impl ClientConfig {
         validate_optional_text("namespace", self.namespace.as_deref(), 200)?;
         validate_optional_text("catalog_version", self.catalog_version.as_deref(), 200)?;
         if self.target.trim().is_empty() {
+            return Err(SdkError::invalid_argument());
+        }
+        // With no roots at all no server could be trusted.
+        if !self.trust_builtin_roots && self.tls_ca_certificate.is_none() {
             return Err(SdkError::invalid_argument());
         }
         if self.default_timeout.is_zero() || self.default_timeout > MAX_TIMEOUT {
@@ -451,6 +467,7 @@ impl fmt::Debug for ClientConfig {
                 "tls_ca_certificate",
                 &self.tls_ca_certificate.as_ref().map(|_| "configured"),
             )
+            .field("trust_builtin_roots", &self.trust_builtin_roots)
             .field("max_stream_events", &self.max_stream_events)
             .field("max_stream_bytes", &self.max_stream_bytes)
             .finish()
@@ -709,7 +726,11 @@ impl GrpcTransport {
             .map_err(|_| SdkError::invalid_argument())?
             .connect_timeout(config.default_timeout);
         if scheme == "https" {
-            let mut tls = tls_config_with_enabled_roots();
+            let mut tls = if config.trust_builtin_roots {
+                tls_config_with_enabled_roots()
+            } else {
+                ClientTlsConfig::new()
+            };
             if let Some(certificate) = config.tls_ca_certificate.as_ref() {
                 tls = tls.ca_certificate(Certificate::from_pem(certificate.clone()));
             }

@@ -316,7 +316,11 @@ fn policy_checked_read_overhead_stays_within_published_budget() {
     );
 }
 
+// A wall-clock p99 ratio that shared runners cannot hold in a debug build
+// alongside the rest of the suite (#1884). The scheduled object-path job
+// runs it in release.
 #[test]
+#[ignore = "wall-clock p99 ratio; run by the scheduled object-path job"]
 fn mixed_get_object_p99_stays_within_2x_idle_during_source_batch() {
     // One RPC page is capped at 500 records; the helper applies two pages.
     let harness = ObjectPathHarness::open(

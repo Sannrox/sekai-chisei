@@ -12,10 +12,12 @@
 //!   cap, policy and Action budget left out.
 //!
 //! Model replies are recorded in `fixtures/game_players/responses-v1.json`,
-//! keyed by the prompt's digest. A loopback replay endpoint serves them as
-//! the `native` runtime, so no run calls a live model; a prompt without a
-//! recording fails the run. To record afresh against an OpenAI-compatible
-//! endpoint:
+//! keyed by the prompt's digest, with the token usage the provider reported.
+//! A loopback replay endpoint serves them as the `native` runtime, so no run
+//! calls a live model; a prompt without a recording fails the run. The
+//! server prices each call from `fixtures/game_players/prices-v2.json`,
+//! passed as its model price table. To record afresh against an
+//! OpenAI-compatible endpoint:
 //!
 //! ```sh
 //! GAME_PLAYERS_RECORD_URL=<base url> GAME_PLAYERS_RECORD_MODEL=<model> \
@@ -33,8 +35,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use sekai_chisei::grpc::pb::chisei::{
-    ExecutePlanRequest, ExecutionInput, PlanExecutionRequest, SetModelFamilyEnablementRequest,
-    SetNamespacePolicyRequest,
+    ExecutePlanRequest, ExecutionInput, GetOperationReceiptRequest, PlanExecutionRequest,
+    SetModelFamilyEnablementRequest, SetNamespacePolicyRequest,
 };
 use sekai_chisei::grpc::pb::sekai::{EnsureTeamNamespaceRequest, SubmitActionInstanceRequest};
 use sekai_chisei::sekai::synthetic::Rng;
@@ -50,24 +52,88 @@ const ROUTING: &str = include_str!("../examples/game-ontology/routing-v1.json");
 const RESPONSES_PATH: &str = "tests/fixtures/game_players/responses-v1.json";
 const RESPONSES: &str = include_str!("fixtures/game_players/responses-v1.json");
 const RESPONSES_VERSION: &str = "game-players.responses/v1";
+pub(crate) const PRICES: &str = include_str!("fixtures/game_players/prices-v2.json");
+const PRICES_VERSION: &str = "game-players.prices/v2";
+/// What the replay endpoint reports for a recording made before recordings
+/// kept usage.
+const UNRECORDED_USAGE: Usage = Usage {
+    prompt_tokens: 64,
+    completion_tokens: 16,
+};
 pub(crate) const SEED: u64 = 1855;
 /// The ungoverned player's namespace, for both its model calls and Actions.
 const FREE: &str = "game-free";
 /// Both players act as the pack's acting agent.
-const PLAYER: &str = "commander";
+pub(crate) const PLAYER: &str = "commander";
 
-/// One recorded model reply.
+/// One recorded model reply. `usage` is what the provider reported; older
+/// recordings without it replay [`UNRECORDED_USAGE`].
 #[derive(Clone, Serialize, Deserialize)]
 struct Recording {
     prompt_digest: String,
     prompt: String,
     reply: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
+}
+
+/// Token usage in the OpenAI-compatible `usage` shape.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct Usage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Recordings {
     version: String,
     responses: Vec<Recording>,
+}
+
+/// One route's illustrative price, in USD per million tokens.
+#[derive(Deserialize, Serialize, Clone)]
+pub(crate) struct RoutePrice {
+    pub(crate) route: String,
+    pub(crate) runtime: String,
+    pub(crate) model: String,
+    pub(crate) input_usd_per_1m: i64,
+    pub(crate) output_usd_per_1m: i64,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Prices {
+    pub(crate) version: String,
+    pub(crate) unit: String,
+    pub(crate) routes: Vec<RoutePrice>,
+}
+
+impl Prices {
+    pub(crate) fn load() -> Self {
+        let prices: Self = serde_json::from_str(PRICES).expect("prices json");
+        assert_eq!(prices.version, PRICES_VERSION);
+        prices
+    }
+
+    /// The table in the server's `CHISEI_GATEWAY_PRICING` format.
+    pub(crate) fn spec(&self) -> String {
+        self.routes
+            .iter()
+            .map(|price| {
+                format!(
+                    "{}={}:{}",
+                    price.model, price.input_usd_per_1m, price.output_usd_per_1m
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    pub(crate) fn by(&self, field: impl Fn(&RoutePrice) -> &str, value: &str) -> &RoutePrice {
+        self.routes
+            .iter()
+            .find(|price| field(price) == value)
+            .unwrap_or_else(|| panic!("no price for {value}"))
+    }
 }
 
 fn digest(text: &str) -> String {
@@ -168,20 +234,21 @@ async fn replay_completion(State(state): State<ReplayState>, Json(body): Json<Va
         .lock()
         .unwrap()
         .get(&key)
-        .map(|recording| recording.reply.clone());
-    let reply = match (recorded, &state.upstream) {
-        (Some(reply), _) => reply,
+        .map(|recording| (recording.reply.clone(), recording.usage));
+    let (reply, usage) = match (recorded, &state.upstream) {
+        (Some(recorded), _) => recorded,
         (None, Some((url, model))) => {
-            let reply = record(url, model, &prompt).await;
+            let (reply, usage) = record(url, model, &prompt).await;
             state.replies.lock().unwrap().insert(
                 key.clone(),
                 Recording {
                     prompt_digest: key,
                     prompt,
                     reply: reply.clone(),
+                    usage,
                 },
             );
-            reply
+            (reply, usage)
         }
         (None, None) => {
             return (
@@ -191,7 +258,7 @@ async fn replay_completion(State(state): State<ReplayState>, Json(body): Json<Va
                 .into_response();
         }
     };
-    let usage = json!({"prompt_tokens": 64, "completion_tokens": 16});
+    let usage = usage.unwrap_or(UNRECORDED_USAGE);
     if body["stream"].as_bool().unwrap_or(false) {
         let delta = json!({
             "id": "chatcmpl_replay",
@@ -221,8 +288,9 @@ async fn replay_completion(State(state): State<ReplayState>, Json(body): Json<Va
     }
 }
 
-/// Asks the live endpoint once, for the recording test only.
-async fn record(url: &str, model: &str, prompt: &str) -> String {
+/// Asks the live endpoint once, for the recording test only, and keeps the
+/// usage it reports.
+async fn record(url: &str, model: &str, prompt: &str) -> (String, Option<Usage>) {
     let mut request = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", url.trim_end_matches('/')))
         .json(&json!({
@@ -241,11 +309,12 @@ async fn record(url: &str, model: &str, prompt: &str) -> String {
         .json()
         .await
         .expect("record body");
-    body["choices"][0]["message"]["content"]
+    let reply = body["choices"][0]["message"]["content"]
         .as_str()
         .expect("recorded reply")
         .trim()
-        .to_string()
+        .to_string();
+    (reply, serde_json::from_value(body["usage"].clone()).ok())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -312,9 +381,13 @@ pub(crate) enum Verdict {
     Denied {
         rule: String,
     },
-    /// The Action policy parked it for an approver.
+    /// The Action policy parked it for an approver: the policy decision, the
+    /// scope and clause that required approval, and who may decide.
     Parked {
         policy: String,
+        scope: String,
+        rule: String,
+        approvers: Vec<String>,
     },
     /// Admission refused the submission.
     Refused {
@@ -420,9 +493,14 @@ fn ungoverned_types() -> Vec<Value> {
 }
 
 /// A server with the policy pack, the routine route, and the ungoverned
-/// namespace, with model calls served by `replay`.
+/// namespace, with model calls served by `replay` and priced from the
+/// fixture price table.
 pub(crate) async fn start(replay: &Replay) -> GovernedGame {
-    let game = GovernedGame::start_with_env(&[("NATIVE_LLM_URL", &replay.url)]).await;
+    let game = GovernedGame::start_with_env(&[
+        ("NATIVE_LLM_URL", &replay.url),
+        ("CHISEI_GATEWAY_PRICING", &Prices::load().spec()),
+    ])
+    .await;
     let logs = || game.server.logs();
     let files = tempfile::tempdir().unwrap();
 
@@ -621,9 +699,17 @@ async fn act(
         "denied" => Verdict::Denied {
             rule: instance.deny_reason,
         },
-        "parked" => Verdict::Parked {
-            policy: instance.policy_decision,
-        },
+        "parked" => {
+            let approval = instance
+                .approval
+                .unwrap_or_else(|| panic!("{key}: parked without approval detail"));
+            Verdict::Parked {
+                policy: instance.policy_decision,
+                scope: approval.policy_scope,
+                rule: approval.rule,
+                approvers: approval.approvers,
+            }
+        }
         other => panic!("{key}: unexpected status {other}: {instance:?}"),
     };
     (verdict, Some(submission))
@@ -730,7 +816,22 @@ async fn unapproved_invasion_waits_for_the_admiral_only_when_governed() {
     assert_eq!(outcome.governed[0].decision, outcome.ungoverned[0].decision);
     assert_eq!(outcome.governed[0].decision["action"], "invade");
     match &outcome.governed[0].verdict {
-        Verdict::Parked { policy } => assert!(policy.contains("require_approval"), "{policy}"),
+        Verdict::Parked {
+            policy,
+            scope,
+            rule,
+            approvers,
+        } => {
+            assert!(policy.contains("require_approval"), "{policy}");
+            assert_eq!(
+                (scope.as_str(), rule.as_str(), approvers.as_slice()),
+                (
+                    "project:game-invasions",
+                    "default_decision",
+                    ["admiral".to_string()].as_slice()
+                )
+            );
+        }
         other => panic!("governed invasion: {other:?}"),
     }
     assert_eq!(outcome.ungoverned[0].verdict, Verdict::Applied);
@@ -756,6 +857,50 @@ async fn the_same_seed_and_recordings_replay_identically() {
         digests.push(outcome_digest(&outcomes));
     }
     assert_eq!(digests[0], digests[1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_move_reports_its_recorded_usage_and_table_cost() {
+    let replay = Replay::spawn(None).await;
+    let game = start(&replay).await;
+    let outcome = play(&game, SEED, Scenario::AllianceBetrayal).await;
+    let prompt = &Scenario::AllianceBetrayal.prompts(SEED)[0];
+    let usage = replay.state.replies.lock().unwrap()[&digest(prompt)]
+        .usage
+        .expect("recorded usage");
+    let receipt = game
+        .server
+        .chisei()
+        .await
+        .get_operation_receipt(GetOperationReceiptRequest {
+            request_id: outcome.governed[0].request_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("receipt")
+        .into_inner();
+    let receipt: Value = serde_json::from_str(&receipt.receipt_json).unwrap();
+    let call = receipt["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "model_called")
+        .expect("model call event");
+    let attribute = |name: &str| call["attributes"][name].as_str().unwrap_or_default();
+    assert_eq!(attribute("input_tokens"), usage.prompt_tokens.to_string());
+    assert_eq!(
+        attribute("output_tokens"),
+        usage.completion_tokens.to_string()
+    );
+    // Whole USD per million tokens is that many micro-USD per token.
+    let prices = Prices::load();
+    let price = prices.by(|price| &price.model, attribute("model"));
+    assert_eq!(
+        attribute("cost_usd_micros"),
+        (usage.prompt_tokens * price.input_usd_per_1m
+            + usage.completion_tokens * price.output_usd_per_1m)
+            .to_string()
+    );
 }
 
 /// Records a reply for every scripted prompt from a live endpoint and

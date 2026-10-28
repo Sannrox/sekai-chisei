@@ -363,6 +363,34 @@ pub fn compute_preview_tables(
     Ok((rows, String::new()))
 }
 
+/// Prometheus text of the transform work queue gauges, read from the store
+/// at scrape time (#1732). Only isolated-process runs are queued; other
+/// profiles run in the request. The output depends on store state only, so
+/// every plane instance on one store reports the same series.
+pub fn transform_work_depth_metrics(
+    db: &crate::db::runtime_db::RuntimeDb,
+    now_ms: i64,
+) -> Result<String, String> {
+    let pools = db
+        .transform_pool_depths(now_ms)?
+        .into_iter()
+        .map(|depth| crate::obs::signals::TransformPoolGauge {
+            pool: depth.pool,
+            queued: depth.queued,
+            claimable: depth.claimable,
+            oldest_claimable_age_seconds: depth
+                .oldest_claimable_created_at_ms
+                .map_or(0.0, |oldest| {
+                    now_ms.saturating_sub(oldest).max(0) as f64 / 1000.0
+                }),
+        })
+        .collect();
+    Ok(crate::obs::signals::render_transform_work_depth(
+        ISOLATED_CLASS,
+        pools,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +506,89 @@ mod tests {
     }
 
     #[test]
+    fn empty_placement_requires_keeps_the_earlier_digest_and_json() {
+        let transform = isolated_transform("python", "runner:1");
+        // Pinned from before placement existed: admitted runs stay valid.
+        assert_eq!(
+            transform.definition_digest,
+            "sha256:02fd70652a1a391954e7f1647096371d947342c9112089d6c2e97ffb112fbac1"
+        );
+        let json = serde_json::to_string(&transform).unwrap();
+        assert!(!json.contains("requires"));
+        let stored: GovernedTransform = serde_json::from_str(&json).unwrap();
+        assert!(stored.isolated_process.unwrap().requires.is_empty());
+        assert_eq!(
+            sekai_types::governed_transform::admitted_placement_requires(&json),
+            Some(BTreeMap::new())
+        );
+    }
+
+    #[test]
+    fn isolated_process_code_participates_in_digest() {
+        let base = isolated_transform("python", "runner:1");
+        let with = |code: &str| {
+            let mut transform = base.clone();
+            transform.isolated_process.as_mut().unwrap().code = code.into();
+            transform.definition_digest.clear();
+            transform.prepare().unwrap().definition_digest
+        };
+        assert_ne!(with("print(1)"), base.definition_digest);
+        assert_ne!(with("print(1)"), with("print(2)"));
+    }
+
+    #[test]
+    fn placement_requires_participates_in_digest() {
+        let base = isolated_transform("python", "runner:1");
+        let with = |pairs: &[(&str, &str)]| {
+            let mut transform = base.clone();
+            transform.isolated_process.as_mut().unwrap().requires = pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            transform.definition_digest.clear();
+            transform.prepare().unwrap().definition_digest
+        };
+        let gpu = with(&[("accelerator", "gpu")]);
+        assert_ne!(gpu, base.definition_digest);
+        assert_ne!(gpu, with(&[("accelerator", "cpu")]));
+        assert_ne!(with(&[("a", "bc")]), with(&[("ab", "c")]));
+    }
+
+    #[test]
+    fn placement_requires_every_pair_exactly() {
+        use sekai_types::governed_transform::placement_satisfied;
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        let requires = labels(&[("accelerator", "gpu"), ("zone", "a")]);
+        assert!(placement_satisfied(
+            &requires,
+            &labels(&[("accelerator", "gpu"), ("zone", "a"), ("pool", "x")])
+        ));
+        assert!(!placement_satisfied(
+            &requires,
+            &labels(&[("accelerator", "gpu")])
+        ));
+        assert!(!placement_satisfied(
+            &requires,
+            &labels(&[("accelerator", "GPU"), ("zone", "a")])
+        ));
+        assert!(placement_satisfied(&BTreeMap::new(), &BTreeMap::new()));
+    }
+
+    #[test]
+    fn transform_pool_is_default_or_a_ledger_digest_prefix() {
+        assert_eq!(transform_pool(&BTreeMap::new()), DEFAULT_TRANSFORM_POOL);
+        let gpu = BTreeMap::from([("accelerator".to_string(), "gpu".to_string())]);
+        let pool = transform_pool(&gpu);
+        assert_eq!(pool.len(), 16);
+        assert!(placement_labels_digest(&gpu).starts_with(&format!("sha256:{pool}")));
+    }
+
+    #[test]
     fn isolated_process_prepare_trims_input_aliases() {
         let mut transform = isolated_transform("python", "runner:1");
         transform.isolated_process.as_mut().unwrap().inputs = vec![TransformInput {
@@ -579,6 +690,8 @@ mod tests {
                 engine: engine.into(),
                 runtime_image: runtime_image.into(),
                 inputs: Vec::new(),
+                requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,

@@ -217,6 +217,12 @@ message ExecutionInput {
   // A missing, cross-namespace, inactive, rolled-back, changed, or otherwise
   // unusable pin fails closed with one non-disclosing error.
   LearningPin learning_pin = 19;
+  // Optional work unit (#1866). The execution is checked and charged
+  // against the budget chain `project:<namespace>/agent:<caller>`, extended
+  // with `/work_unit:<this>` when set, so per-work-unit budgets govern
+  // planned model use as they govern gateway decisions. Must not contain
+  // `/`.
+  string budget_work_unit = 20;
 }
 
 // Exact identity of a `chisei.learning-change/v1` learning: its ID and the
@@ -943,6 +949,43 @@ message SetBudgetLimitRequest {
   string metric = 9;
 }
 message SetBudgetLimitResponse {}
+
+// Reads budget usage for a scope. The scope fields resolve exactly as in
+// SetBudgetLimitRequest; an Action budget subject goes in `subject`.
+message GetBudgetUsageRequest {
+  string user_id = 1;
+  string subject = 2;
+  string project = 3;
+  string agent = 4;
+  string key_id = 5;
+  string work_unit = 6;
+}
+// One level of the scope chain for one metric, in the current period of
+// that level's limit.
+message BudgetScopeUsage {
+  string scope_id = 1;
+  // "tokens" or "requests".
+  string metric = 2;
+  // The limit's period; "daily" for an unlimited level, the period its
+  // usage is charged to.
+  string period_type = 3;
+  // Start of the current period, Unix milliseconds UTC.
+  int64 period_start = 4;
+  int64 used = 5;
+  // True when the level has no limit for this metric. `limit` and
+  // `remaining` are then zero. A set limit of zero is a hard stop.
+  bool unlimited = 6;
+  int64 limit = 7;
+  // `limit - used`, floored at zero.
+  int64 remaining = 8;
+}
+message GetBudgetUsageResponse {
+  // The resolved scope id.
+  string scope_id = 1;
+  // Every level admission checks and charges, root to leaf, tokens then
+  // requests per level, read in one snapshot.
+  repeated BudgetScopeUsage levels = 2;
+}
 
 message SetNamespacePolicyRequest {
   string namespace = 1;
@@ -1887,6 +1930,9 @@ service ChiseiService {
   // Budget
   rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);
   rpc SetBudgetLimit(SetBudgetLimitRequest) returns (SetBudgetLimitResponse);
+  // Read-only usage, limit and remainder per scope level; same authorization
+  // as SetBudgetLimit.
+  rpc GetBudgetUsage(GetBudgetUsageRequest) returns (GetBudgetUsageResponse);
   // Single fat decide for gateway PEP thinning (Issue #163).
   rpc DecideGatewayExecution(DecideGatewayExecutionRequest) returns (DecideGatewayExecutionResponse);
 

@@ -118,6 +118,7 @@ chisei_store_trait! {
         fn budget_assert_home_writable(&self, scope_id: &str, metric: &str, local_site_id: &str) -> Result<(), String>;
         fn budget_record_idempotent(&self, scope_id: &str, metric: &str, amount: i64, idempotency_key: &str, now_ms: i64) -> Result<bool, String>;
         fn budget_usage(&self, scope_id: &str, metric: &str, now_ms: i64) -> Result<(i64, i64, String), String>;
+        fn budget_usage_chain(&self, scope_id: &str, now_ms: i64) -> Result<Vec<sekai_core::db::chisei_budget::BudgetScopeUsage>, String>;
         fn budget_namespace_pressure(&self, namespace: &str, metric: &str, now_ms: i64) -> Result<i32, String>;
         fn budget_get_transfer(&self, transfer_id: &str) -> Result<Option<sekai_core::db::chisei_budget::BudgetTransferRecord>, String>;
         fn budget_transfer_capacity(&self, transfer_id: &str, metric: &str, from_scope_id: &str, to_scope_id: &str, amount: i64, actor: &str, now_ms: i64) -> Result<sekai_core::db::chisei_budget::BudgetTransferRecord, String>;
@@ -135,6 +136,7 @@ chisei_store_trait! {
         fn get_operation_receipt(&self, operation_id: &str) -> Result<Option<OperationReceipt>, String>;
         fn find_operation_receipt_by_request_id(&self, request_id: &str) -> Result<Option<OperationReceipt>, String>;
         fn put_operation_reservation(&self, reservation: &OperationReservation) -> Result<OperationReservation, String>;
+        fn settle_pending_reservation(&self, next: &OperationReservation, refund_metric: Option<&str>) -> Result<Option<OperationReservation>, String>;
         fn get_operation_reservation(&self, namespace: &str, operation_id: &str) -> Result<Option<OperationReservation>, String>;
         fn list_pending_operation_reservations(&self, limit: usize) -> Result<Vec<OperationReservation>, String>;
         fn append_operation_receipt_event(&self, operation_id: &str, event: OperationReceiptEvent) -> Result<(OperationReceipt, bool), String>;

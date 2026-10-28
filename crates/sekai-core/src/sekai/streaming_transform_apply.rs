@@ -699,6 +699,8 @@ mod tests {
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
+                requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,

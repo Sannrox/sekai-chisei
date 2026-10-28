@@ -7,19 +7,19 @@ Regenerate with `GAME_REPORT_UPDATE=1 cargo test --test it game_demo_report`.
 | --- | --- |
 | Seed | 1855 |
 | policy_pack | `game-ontology.policy-pack/v1` |
-| price_unit | `millicredit` |
-| prices | `game-players.prices/v1` |
-| prices_sha256 | `9bb0c5077f2017a69222059101911565dc90c835bcd4ed3876c30bce92b69152` |
+| price_unit | `usd_micros` |
+| prices | `game-players.prices/v2` |
+| prices_sha256 | `92c60c50c20e769bae43cdcc988e9af68689dd33d6cc0499f3bb263225763a23` |
 | responses | `game-players.responses/v1` |
-| responses_sha256 | `78a2596bf5fdfa80b3217e4f2be456d76fe5a63e5c05787c5e4f4ac12e0608c6` |
+| responses_sha256 | `b785ebb27b8992352bba326cf8af42774d9d271b84913d9ae62f2470e9fa393c` |
 | routing | `game-ontology.routing/v1` |
 
-Costs are in millicredits at these illustrative route prices (credits per 1000 tokens):
+Costs are in micro-USD, read from each model call's receipt. The server priced the calls with these illustrative route prices (USD per million tokens):
 
-| Route | Runtime | Input | Output |
-| --- | --- | --- | --- |
-| routine | native | 1 | 2 |
-| high_impact | openai | 30 | 120 |
+| Route | Runtime | Model | Input | Output |
+| --- | --- | --- | --- | --- |
+| routine | native | `native/native-default` | 1 | 2 |
+| high_impact | openai | `gpt-5.5` | 30 | 120 |
 
 ## AllianceBetrayal
 
@@ -59,13 +59,13 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 | --- | --- | --- |
 | Moves | 1 | 1 |
 | Model calls | 1 | 1 |
-| Tokens (in / out) | 64 / 16 | 64 / 16 |
-| Tokens per move | 80 | 80 |
-| Cost | 96 | 96 |
+| Tokens (in / out) | 85 / 13 | 85 / 13 |
+| Tokens per move | 98 | 98 |
+| Cost | 111 | 111 |
 | Wins | 0 | 1 |
-| Cost per win | n/a | 96 |
-| Cost at high_impact | 3840 | 3840 |
-| Savings from routing | 3744 | 3744 |
+| Cost per win | n/a | 111 |
+| Cost at high_impact | 4110 | 4110 |
+| Savings from routing | 3999 | 3999 |
 
 ## TreasuryDrain
 
@@ -93,7 +93,7 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 | --- | --- | --- | --- | --- | --- | --- |
 | governed | 0 | local `native/native-default` in `game`, policy allow, budget allowed true | `game.treasury.spend` `operation-TreasuryDrain-governed-0` | admitted: policy allow, budget allow | submit_action_instance by commander: action_instance_admitted | `admission-reservation/v1`: budget_decided (budget_subject=action:governed/project:game-treasury/agent:commander, reservation_status=finalized, sekai_commit_instance_id=instance:TreasuryDrain-governed-0, sekai_commit_status=admitted) |
 | governed | 1 | local `native/native-default` in `game`, policy allow, budget allowed true | `game.treasury.spend` `operation-TreasuryDrain-governed-1` | admitted: policy allow, budget allow | submit_action_instance by commander: action_instance_admitted | `admission-reservation/v1`: budget_decided (budget_subject=action:governed/project:game-treasury/agent:commander, reservation_status=finalized, sekai_commit_instance_id=instance:TreasuryDrain-governed-1, sekai_commit_status=admitted) |
-| governed | 2 | local `native/native-default` in `game`, policy allow, budget allowed true | `game.treasury.spend` `operation-TreasuryDrain-governed-2` | none | none | none |
+| governed | 2 | local `native/native-default` in `game`, policy allow, budget allowed true | `game.treasury.spend` `operation-TreasuryDrain-governed-2` | denied: policy allow, budget budget_exceeded | submit_action_instance by commander: action_instance_budget_denied | `typed-hop/v1`: budget_decided (sekai_commit_instance_id=instance:TreasuryDrain-governed-2, sekai_commit_status=denied) |
 | ungoverned | 0 | local `native/native-default` in `game-free`, policy allow, budget allowed true | `game.treasury.spend` `operation-TreasuryDrain-ungoverned-0` | admitted: policy allow, budget allow | submit_action_instance by commander: action_instance_admitted | `admission-reservation/v1`: budget_decided (budget_subject=action:governed/project:game-free/agent:commander, reservation_status=finalized, sekai_commit_instance_id=instance:TreasuryDrain-ungoverned-0, sekai_commit_status=admitted) |
 | ungoverned | 1 | local `native/native-default` in `game-free`, policy allow, budget allowed true | `game.treasury.spend` `operation-TreasuryDrain-ungoverned-1` | admitted: policy allow, budget allow | submit_action_instance by commander: action_instance_admitted | `admission-reservation/v1`: budget_decided (budget_subject=action:governed/project:game-free/agent:commander, reservation_status=finalized, sekai_commit_instance_id=instance:TreasuryDrain-ungoverned-1, sekai_commit_status=admitted) |
 | ungoverned | 2 | local `native/native-default` in `game-free`, policy allow, budget allowed true | `game.treasury.spend` `operation-TreasuryDrain-ungoverned-2` | admitted: policy allow, budget allow | submit_action_instance by commander: action_instance_admitted | `admission-reservation/v1`: budget_decided (budget_subject=action:governed/project:game-free/agent:commander, reservation_status=finalized, sekai_commit_instance_id=instance:TreasuryDrain-ungoverned-2, sekai_commit_status=admitted) |
@@ -111,13 +111,13 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 | --- | --- | --- |
 | Moves | 3 | 3 |
 | Model calls | 3 | 3 |
-| Tokens (in / out) | 192 / 48 | 192 / 48 |
-| Tokens per move | 80 | 80 |
-| Cost | 288 | 288 |
+| Tokens (in / out) | 222 / 36 | 222 / 36 |
+| Tokens per move | 86 | 86 |
+| Cost | 294 | 294 |
 | Wins | 2 | 3 |
-| Cost per win | 144 | 96 |
-| Cost at high_impact | 11520 | 11520 |
-| Savings from routing | 11232 | 11232 |
+| Cost per win | 147 | 98 |
+| Cost at high_impact | 10980 | 10980 |
+| Savings from routing | 10686 | 10686 |
 
 ## UnapprovedInvasion
 
@@ -125,7 +125,7 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 
 | Turn | Decision | Governed | Ungoverned |
 | --- | --- | --- | --- |
-| 0 | `{"action":"invade","planet":"p-rival"}` | parked: `require_approval` | applied |
+| 0 | `{"action":"invade","planet":"p-rival"}` | parked: `require_approval` by `project:game-invasions` `default_decision`, approvers `admiral` | applied |
 
 `p-rival.occupied_by` afterwards: `(unset)`
 
@@ -157,13 +157,13 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 | --- | --- | --- |
 | Moves | 1 | 1 |
 | Model calls | 1 | 1 |
-| Tokens (in / out) | 64 / 16 | 64 / 16 |
-| Tokens per move | 80 | 80 |
-| Cost | 96 | 96 |
+| Tokens (in / out) | 78 / 13 | 78 / 13 |
+| Tokens per move | 91 | 91 |
+| Cost | 104 | 104 |
 | Wins | 0 | 1 |
-| Cost per win | n/a | 96 |
-| Cost at high_impact | 3840 | 3840 |
-| Savings from routing | 3744 | 3744 |
+| Cost per win | n/a | 104 |
+| Cost at high_impact | 3900 | 3900 |
+| Savings from routing | 3796 | 3796 |
 
 ## Totals
 
@@ -171,21 +171,31 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 | --- | --- | --- |
 | Moves | 5 | 5 |
 | Model calls | 5 | 5 |
-| Tokens (in / out) | 320 / 80 | 320 / 80 |
-| Tokens per move | 80 | 80 |
-| Cost | 480 | 480 |
+| Tokens (in / out) | 385 / 62 | 385 / 62 |
+| Tokens per move | 89.4 | 89.4 |
+| Cost | 509 | 509 |
 | Wins | 2 | 5 |
-| Cost per win | 240 | 96 |
-| Cost at high_impact | 19200 | 19200 |
-| Savings from routing | 18720 | 18720 |
+| Cost per win | 254.5 | 101.8 |
+| Cost at high_impact | 18990 | 18990 |
+| Savings from routing | 18481 | 18481 |
+
+## Budgets
+
+| Scope | Metric | Period | Used | Limit | Remaining |
+| --- | --- | --- | --- | --- | --- |
+| `commander` | tokens | daily | 894 | unlimited | unlimited |
+| `commander` | requests | daily | 0 | unlimited | unlimited |
+| `action:governed/project:game-treasury` | tokens | daily | 2 | 2 | 0 |
+| `action:governed/project:game-treasury` | requests | daily | 0 | unlimited | unlimited |
 
 ## Methods
 
-- `cost`: Each move's tokens priced at the route whose runtime the receipt's route_selected event names, using the fixture price table, in millicredits.
+- `budgets`: GetBudgetUsage after all scenarios, for the player's user scope, which plan execution charges, and each pack Action budget subject. Each row is the scope's own level in its current period; one server plays every scenario, so usage accumulates.
+- `cost`: The cost_usd_micros of each move's model_called event. The server priced the call when it completed, from the reported usage and its CHISEI_GATEWAY_PRICING table, set to the fixture's illustrative prices.
 - `cost_per_win`: Cost divided by wins, rounded to 3 decimals; null without a win.
-- `routing_savings`: Counterfactual: the same tokens priced at the high_impact route, minus the cost. It is not charged spend; no public RPC reads model spend per route.
-- `rule`: The pack rule a block's trigger belongs to. A parked Action does not name its policy scope, so its trigger is the scope the pack gives the Action type.
-- `tokens`: Input and output tokens of each move's model_called event in its GetOperationReceipt. The replay endpoint reports the same usage for every reply, because the recordings store none.
+- `routing_savings`: Counterfactual: the receipt's tokens priced at the high_impact route's table entry with the server's pricing function, minus the cost. It is not charged spend; no public RPC reads model spend per route.
+- `rule`: The pack rule a block's trigger belongs to. A parked Action's trigger is the policy scope its instance names.
+- `tokens`: Input and output tokens of each move's model_called event in its GetOperationReceipt, as the provider reported them. The replay endpoint reports the usage stored with each recording; the fixture's recordings are hand-written, so that usage is illustrative, not measured.
 - `win`: A move whose Action applied. The harness scores no game result.
 
 ## Normalization
@@ -198,7 +208,3 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 ## Gaps
 
 - #1866: Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices.
-- #1867: A parked Action names neither the policy scope nor the approvers; the invasion block's trigger comes from the pack.
-- #1870: No public RPC reads budget usage or remaining limit for a scope; tokens come from operation receipts.
-- #1871: An Action submission refused by its Action budget leaves no instance, decision record or operation receipt; its audit row is empty.
-- #1872: Chisei has no model price table; cost uses the fixture's illustrative prices. Recorded replies carry no token usage, so tokens per move reflect the replay endpoint.

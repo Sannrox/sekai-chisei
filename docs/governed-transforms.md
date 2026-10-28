@@ -54,7 +54,7 @@ caller can read the datasets bound by the run's definition. Arrow/Parquet remain
 
 The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `GetGovernedTransformRun`, `ListGovernedTransforms`,
-`ListGovernedTransformRuns`, `ListClaimableTransformWork`,
+`ListGovernedTransformRuns`, `RegisterTransformRuntime`, `ListClaimableTransformWork`,
 `ClaimTransformWork`, `HeartbeatTransformClaim`, `ReadTransformRunInputs`,
 `WriteTransformRunResult`, `ApplyStreamingTransformBatch`, `TickGovernedTransforms`,
 `GetTransformOutputState`, `CancelGovernedTransformRun`,
@@ -75,6 +75,54 @@ or `ApplySourceBatch` coalesces into one downstream run inside the debounce
 window. Cycles are refused at Put. Failed upstream runs mark downstream
 outputs `blocked`; a later success unblocks them. Cancelling a run skips
 not-yet-started downstream work and records that on the receipts.
+
+An isolated-process definition may declare `requires`, placement labels as
+key and value pairs, part of its definition digest when non-empty (#1733,
+ADR 0129). A worker registers its labels for its runtime id in a namespace
+with `RegisterTransformRuntime`, which replaces the earlier set. Listing and
+claiming offer a run only to a runtime whose labels include every required
+pair exactly; there is no scoring. The claim reads the labels in its own
+transaction, so a stale listing or a claim naming the run cannot bypass the
+check, and a relabelled runtime is matched at its next claim. A runtime that
+never registered has no labels and gets only runs without requirements, as
+before. A run no runtime may claim stays pending. Keys and values are 1 to 63
+letters, digits, `-`, `_` or `.` (keys may also use `/`), at most 32 per set,
+and a repeated key is refused. Only planes from this release honor
+`requires`: an older plane drops it at Put and does not check it at claim, so
+declare requirements once every plane serving the store is upgraded.
+Definitions without `requires` keep their digest.
+
+The plane's `/metrics` exports the isolated-process queue as three gauges per
+`profile` (`isolated_process`; other profiles run in the request) and worker
+`pool` (#1732, ADR 0129):
+
+| Gauge | Value |
+| --- | --- |
+| `sekai_transform_work_queued` | Waiting runs: pending, or claimed with a lapsed lease that may still be reclaimed. Includes runs no registered runtime may claim. |
+| `sekai_transform_work_claimable` | Waiting runs without requirements, or whose requirements a runtime registered in the run's namespace meets. |
+| `sekai_transform_work_oldest_claimable_age_seconds` | Age of the oldest claimable run since admission; 0 when none. |
+
+A pool is the run's `requires` set: `default` when empty, else the first 16
+hex characters of the `sha256:` digest the decision ledger records as
+`labels_digest` for a runtime registering an equal set. The digest keeps
+tenant-authored label values out of metrics; there are no namespace or tenant
+labels. A scrape reports `default`, every pool with waiting runs, and the pool
+of every registered label set, which reads 0 when nothing waits, so a pool
+scaled to zero stays visible. A pool neither waiting nor registered is absent.
+Besides `default`, the first 32 pools in label order are named and the rest
+are summed into `other`, which appears only then. Each scrape reads the store
+with one aggregate over waiting work and one read of registered label sets,
+and the series depend on that state alone, so every plane on one store
+reports the same series. Registrations do not expire, so a pool whose workers
+were scaled to zero still reads claimable.
+
+A scaler reads them as follows:
+
+- `claimable` above 0 or a growing oldest age: add workers to that pool.
+- `queued` above `claimable`: runs need a pool nothing has registered, so
+  deploy one.
+- Several plane instances report the same values, so aggregate with `max`, not
+  `sum`.
 
 The analytical profile runs SQL in a private in-memory SQLite connection
 (bundled rusqlite). Default bounds: 64 MiB and 5 seconds. Over-budget runs

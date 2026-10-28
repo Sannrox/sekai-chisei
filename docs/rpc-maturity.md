@@ -69,6 +69,11 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 `require_approval` policy parks an Action on both community backends;
 `DecideActionInstance` grants or denies it on both.
 
+The rows are generated from
+[`tests/fixtures/rpc_maturity/v1.json`](../tests/fixtures/rpc_maturity/v1.json).
+Edit the fixture, then regenerate with
+`RPC_MATURITY_DOCS_UPDATE=1 cargo test -p sekai-chisei --lib rpc_maturity::tests::docs_table`.
+
 <!-- rpc-maturity-rows -->
 
 | RPC | Storage path | Real backend | Known consumer | Classification |
@@ -153,8 +158,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.ListGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListGovernedTransformRuns` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.RegisterTransformRuntime` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListClaimableTransformWork` | `sekai.datasets` | yes | example | `experimental` |
-| `SekaiService.ClaimTransformWork` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.HeartbeatTransformClaim` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.WriteTransformRunResult` | `sekai.datasets` | yes | example | `experimental` |
@@ -162,6 +167,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.TickGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.GetTransformOutputState` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.CancelGovernedTransformRun` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.ClaimTransformWork` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
 | `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `experimental` |
 | `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
@@ -226,8 +232,8 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.CreateOntologyRelation` | `sekai.ontology-definitions` | yes | cli | `stable` |
 | `SekaiService.DeleteOntologyRelation` | `sekai.ontology-definitions` | sqlite only | none | `experimental` |
 | `SekaiService.CreateFunction` | `sekai.function-definitions` | yes | none | `experimental` |
-| `SekaiService.InvokeFunction` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.ListFunctions` | `sekai.function-definitions` | yes | none | `experimental` |
+| `SekaiService.InvokeFunction` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.CreateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.UpdateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.ListDatasets` | `sekai.datasets` | yes | none | `experimental` |
@@ -348,6 +354,7 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `ChiseiService.SetExternalActionPolicy` | `chisei.approvals` | yes | none | `experimental` |
 | `ChiseiService.RecordUsage` | `chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetBudgetLimit` | `chisei.budget` | yes | none | `stable` |
+| `ChiseiService.GetBudgetUsage` | `chisei.budget` | yes | cli | `experimental` |
 | `ChiseiService.DecideGatewayExecution` | `chisei.policy, chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
 | `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |

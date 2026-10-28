@@ -3087,6 +3087,7 @@ dependencies = [
  "http",
  "hyper-util",
  "prost",
+ "rustls",
  "sekai-proto",
  "serde_json",
  "sha2 0.10.9",

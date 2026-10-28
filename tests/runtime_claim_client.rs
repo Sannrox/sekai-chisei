@@ -140,6 +140,7 @@ fn seed_action_with_act(db: &RuntimeDb, prefix: &str, delegating_actor: Option<&
         resource_tenant: String::new(),
         marking: String::new(),
         conflict: None,
+        approval: None,
         offline: None,
     })
     .unwrap();
@@ -169,7 +170,10 @@ fn seed_dataset_rows(db: &RuntimeDb, dataset_id: &str, rows: &[HashMap<String, S
     }
 }
 
-fn seed_transform(db: &RuntimeDb, prefix: &str) {
+/// The code the seeded isolated-process transform runs (#1605).
+const TRANSFORM_CODE: &str = "print('transform')";
+
+fn seed_transform(db: &RuntimeDb, prefix: &str, requires: &[(&str, &str)]) {
     db.ensure_team_namespace(NAMESPACE, PRINCIPAL, Role::Admin, PRINCIPAL)
         .unwrap();
     let dataset = |id: &str| Dataset {
@@ -205,6 +209,11 @@ fn seed_transform(db: &RuntimeDb, prefix: &str) {
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
+            requires: requires
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            code: TRANSFORM_CODE.into(),
         }),
         schedule: None,
         trigger: None,
@@ -322,7 +331,7 @@ async fn exercise_delegator_claim_refusal(db: RuntimeDb, prefix: &str) {
 }
 
 async fn exercise_transform(db: RuntimeDb, prefix: &str) {
-    seed_transform(&db, prefix);
+    seed_transform(&db, prefix, &[]);
     let plane = ServingPlane::start(db.clone()).await;
     let client = plane.client().await;
     let claim = client.runtime_claim();
@@ -337,6 +346,10 @@ async fn exercise_transform(db: RuntimeDb, prefix: &str) {
         ClaimAttempt::Claimed(claimed) => claimed,
         other => panic!("expected claimed transform, got {other:?}"),
     };
+    // The claimed transform carries the code the runner executes (#1605).
+    let transform = claimed.transform.as_ref().expect("claimed transform");
+    assert_eq!(transform.code, TRANSFORM_CODE);
+    assert_eq!(transform.engine, "python");
     let work = claimed.work.expect("claimed work");
     let fence = TransformFence::from_work(&work, "runner-a");
 
@@ -385,6 +398,78 @@ async fn exercise_transform(db: RuntimeDb, prefix: &str) {
         .expect("completed run");
     assert_eq!(written.dispatch_status, "completed");
     plane.shutdown().await;
+}
+
+/// A run requiring `accelerator=gpu` is offered to and claimed by a runtime
+/// only once it registers that label (#1733).
+async fn exercise_transform_placement(db: RuntimeDb, prefix: &str) {
+    seed_transform(&db, prefix, &[("accelerator", "gpu")]);
+    let plane = ServingPlane::start(db.clone()).await;
+    let client = plane.client().await;
+    let claim = client.runtime_claim();
+
+    claim
+        .register_transform_runtime("runner-a", [("accelerator", "cpu")])
+        .await
+        .unwrap();
+    assert!(
+        claim
+            .list_transform_work("runner-a", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let run_id = db.list_governed_transform_runs(NAMESPACE, 10).unwrap()[0]
+        .run_id
+        .clone();
+    assert!(matches!(
+        claim
+            .claim_transform_work("runner-a", &run_id, Duration::from_secs(30))
+            .await
+            .unwrap(),
+        ClaimAttempt::Contended
+    ));
+
+    claim
+        .register_transform_runtime("runner-a", [("accelerator", "gpu")])
+        .await
+        .unwrap();
+    assert_eq!(
+        claim
+            .list_transform_work("runner-a", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    match claim
+        .claim_transform_work("runner-a", "", Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        ClaimAttempt::Claimed(claimed) => assert_eq!(claimed.work.unwrap().run_id, run_id),
+        other => panic!("expected claimed transform, got {other:?}"),
+    }
+    plane.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_runtime_claim_transform_placement_conformance() {
+    exercise_transform_placement(RuntimeDb::memory(), "sqlite-placement").await;
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_runtime_claim_transform_placement_conformance() {
+    let scratch = ScratchDatabase::create();
+    let db = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
+    let prefix = format!("pg-p-{}", uuid::Uuid::new_v4().simple());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(exercise_transform_placement(db.clone(), &prefix));
+    drop(db);
 }
 
 #[tokio::test(flavor = "multi_thread")]

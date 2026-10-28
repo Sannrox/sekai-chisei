@@ -57,6 +57,8 @@ mod scored_knowledge_admission;
 mod search_rpc;
 #[path = "sync_scope_rpc.rs"]
 mod sync_scope_rpc;
+#[path = "transform_placement_rpc.rs"]
+mod transform_placement_rpc;
 #[cfg(test)]
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
@@ -82,6 +84,8 @@ use support_domain::*;
 #[path = "sekai_service_support_credentials.rs"]
 mod support_credentials;
 use support_credentials::*;
+// Chisei reads authorize a tenant context the same way (#1770).
+pub(in crate::grpc) use support_credentials::enforce_namespace_tenant_context_for;
 #[path = "sekai_service_rpc_actions.rs"]
 mod rpc_actions;
 #[path = "sekai_service_rpc_coordination.rs"]
@@ -1548,6 +1552,12 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListGovernedTransformRunsRequest>,
     ) -> Result<Response<ListGovernedTransformRunsResponse>, Status> {
         rpc_data::list_governed_transform_runs(self, req).await
+    }
+    async fn register_transform_runtime(
+        &self,
+        req: Request<RegisterTransformRuntimeRequest>,
+    ) -> Result<Response<RegisterTransformRuntimeResponse>, Status> {
+        transform_placement_rpc::register_transform_runtime(self, req).await
     }
     async fn list_claimable_transform_work(
         &self,

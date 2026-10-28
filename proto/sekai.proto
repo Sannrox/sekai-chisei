@@ -887,6 +887,20 @@ message GovernedTransform {
   int64 schedule_every_ms = 16;
   bool trigger_on_input_commit = 17;
   int64 trigger_debounce_ms = 18;
+  // Placement labels a claiming runtime must carry, every pair exactly
+  // (#1733). Isolated-process profile only; keys must not repeat. Part of
+  // definition_digest when non-empty. Planes before this field drop it.
+  repeated TransformLabel requires = 19;
+  // The code the isolated-process engine runs: SQL or Python source
+  // (#1605). Isolated-process profile only, and required there. Stored
+  // with the definition, part of definition_digest, and returned with a
+  // claimed transform so the claiming runner has what to execute.
+  string code = 20;
+}
+// One placement label: an exact key and value.
+message TransformLabel {
+  string key = 1;
+  string value = 2;
 }
 message PutGovernedTransformRequest {
   GovernedTransform transform = 1;
@@ -1030,8 +1044,27 @@ message TransformWork {
   int64 created_at_ms = 13;
   string tenant_id = 14;
 }
+// Labels a worker registers for its runtime id in one namespace (#1733).
+// Listing and claiming read them at claim time; an unregistered runtime has
+// none and sees only runs without requirements.
+message TransformRuntime {
+  string namespace = 1;
+  string runtime_id = 2;
+  repeated TransformLabel labels = 3;
+  int64 updated_at_ms = 4;
+}
+// Replaces the runtime's labels. Keys must not repeat.
+message RegisterTransformRuntimeRequest {
+  string namespace = 1;
+  string runtime_id = 2;
+  repeated TransformLabel labels = 3;
+}
+message RegisterTransformRuntimeResponse {
+  TransformRuntime runtime = 1;
+}
 message ListClaimableTransformWorkRequest {
   string namespace = 1;
+  // Lists only runs whose requirements this runtime's registered labels meet.
   string runtime_id = 2;
   int32 limit = 3;
 }
@@ -2536,6 +2569,23 @@ message ActionInstance {
   // Set when an offline Action met a changed object; the instance is denied
   // with deny_reason offline_conflict.
   ActionConflict conflict = 27;
+  // Why the instance parked and who may decide it (#1867). Set when it
+  // parked, kept after the decision; unset for an instance that never parked.
+  ActionApprovalRequirement approval = 28;
+}
+// What required approval for a parked ActionInstance, as admission saw it.
+message ActionApprovalRequirement {
+  // Action policy scope whose rule required approval, e.g. project:<scope>.
+  // Empty when agent autonomy parked a submit the policy allowed.
+  string policy_scope = 1;
+  // action_override:<action> | risk_override:<class> | default_decision |
+  // agent_autonomy:propose_only
+  string rule = 2;
+  // Principals the Action type names as approvers. The submitter never
+  // decides their own instance, even when listed.
+  repeated string approvers = 3;
+  // namespace_admin when the type names no approvers, else empty.
+  string approver_role = 4;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;
@@ -4741,6 +4791,7 @@ service SekaiService {
   rpc GetGovernedTransformRun(GetGovernedTransformRunRequest) returns (GetGovernedTransformRunResponse);
   rpc ListGovernedTransforms(ListGovernedTransformsRequest) returns (ListGovernedTransformsResponse);
   rpc ListGovernedTransformRuns(ListGovernedTransformRunsRequest) returns (ListGovernedTransformRunsResponse);
+  rpc RegisterTransformRuntime(RegisterTransformRuntimeRequest) returns (RegisterTransformRuntimeResponse);
   rpc ListClaimableTransformWork(ListClaimableTransformWorkRequest) returns (ListClaimableTransformWorkResponse);
   rpc ClaimTransformWork(ClaimTransformWorkRequest) returns (ClaimTransformWorkResponse);
   rpc HeartbeatTransformClaim(HeartbeatTransformClaimRequest) returns (HeartbeatTransformClaimResponse);

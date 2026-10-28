@@ -4,7 +4,7 @@ use crate::chisei::decision_ledger::Decision;
 use crate::chisei_store::{ChiseiBudgetStore, ChiseiDecisionStore, ChiseiStore};
 use sekai_core::db::chisei_budget::{METRIC_TOKENS, scope_chain};
 
-pub use sekai_core::db::chisei_budget::BudgetTransferRecord;
+pub use sekai_core::db::chisei_budget::{BudgetScopeUsage, BudgetTransferRecord};
 
 /// Operator-visible multi-region budget topology (#294).
 ///
@@ -347,11 +347,23 @@ impl BudgetTracker {
         estimated: i32,
         idempotency_key: &str,
     ) -> Result<(), String> {
+        self.check_and_reserve_idempotent_at(scope_id, estimated, idempotency_key, now_ms())
+    }
+
+    /// [`Self::check_and_reserve_idempotent`] in the budget period of `now_ms`,
+    /// for a caller that records the charge's time to refund it later.
+    pub fn check_and_reserve_idempotent_at(
+        &self,
+        scope_id: &str,
+        estimated: i32,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
         self.db.budget_check_and_reserve_chain_for_site(
             scope_id,
             METRIC_TOKENS,
             i64::from(estimated),
-            now_ms(),
+            now_ms,
             Some(idempotency_key),
             self.require_home_pin(),
             self.local_site_id(),
@@ -533,6 +545,13 @@ impl BudgetTracker {
         }
     }
 
+    /// Usage, limit and remaining headroom of every level admission checks
+    /// for `scope_id`, tokens and requests, in each limit's current period.
+    /// Read-only: one snapshot, no reservation and no audit row.
+    pub fn usage_chain(&self, scope_id: &str) -> Result<Vec<BudgetScopeUsage>, String> {
+        self.db.budget_usage_chain(scope_id, now_ms())
+    }
+
     /// Returns the bounded scope with the least remaining headroom in the
     /// hierarchy. When the whole chain is unlimited, preserves the requested
     /// scope's ordinary zero-limit usage representation.
@@ -617,6 +636,7 @@ impl BudgetTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sekai_core::db::chisei_budget::METRIC_REQUESTS;
     use std::sync::Arc;
 
     fn tracker() -> BudgetTracker {
@@ -1013,6 +1033,78 @@ mod tests {
         assert_eq!(t.get_usage("project:p").tokens_used, 40);
         assert_eq!(t.get_usage("project:p/agent:a").tokens_used, 40);
         assert_eq!(t.get_usage("project:p/agent:a/work_unit:w").tokens_used, 40);
+    }
+
+    #[test]
+    fn usage_chain_reports_used_and_remaining_at_every_level() {
+        let t = tracker();
+        t.set_limit("project:p", 100, PeriodType::Monthly).unwrap();
+        t.set_limit("agent:a", 50, PeriodType::Daily).unwrap();
+        t.set_limit_with_metric("project:p/agent:a", METRIC_REQUESTS, 1, PeriodType::Weekly)
+            .unwrap();
+        t.check_and_reserve("project:p/agent:a/work_unit:w", 40)
+            .unwrap();
+        // Refused at the flat agent level: nothing is charged anywhere.
+        assert!(
+            t.check_and_reserve("project:p/agent:a/work_unit:w", 11)
+                .is_err()
+        );
+
+        let before = chrono::Utc::now().timestamp_millis();
+        let levels = t.usage_chain("project:p/agent:a/work_unit:w").unwrap();
+        let after = chrono::Utc::now().timestamp_millis();
+        let level = |scope: &str, metric: &str| {
+            levels
+                .iter()
+                .find(|level| level.scope_id == scope && level.metric == metric)
+                .unwrap_or_else(|| panic!("{scope} {metric} missing: {levels:?}"))
+        };
+        let scopes: Vec<_> = levels
+            .iter()
+            .filter(|level| level.metric == METRIC_TOKENS)
+            .map(|level| level.scope_id.as_str())
+            .collect();
+        assert_eq!(scope_chain("project:p/agent:a/work_unit:w"), scopes);
+
+        let project = level("project:p", METRIC_TOKENS);
+        assert_eq!(
+            (project.used, project.limit, project.remaining()),
+            (40, Some(100), Some(60))
+        );
+        assert_eq!(project.period_type, "monthly");
+        let agent = level("agent:a", METRIC_TOKENS);
+        assert_eq!((agent.used, agent.remaining()), (40, Some(10)));
+        let calls = level("project:p/agent:a", METRIC_REQUESTS);
+        assert_eq!(
+            (calls.used, calls.limit, calls.remaining()),
+            (0, Some(1), Some(1))
+        );
+        assert_eq!(calls.period_type, "weekly");
+        // Unlimited levels still report what they were charged.
+        let work_unit = level("project:p/agent:a/work_unit:w", METRIC_TOKENS);
+        assert_eq!(
+            (work_unit.used, work_unit.limit, work_unit.remaining()),
+            (40, None, None)
+        );
+        // Period windows are the ones enforcement charges.
+        let window = |now| sekai_core::db::chisei_budget::period_start_ms("monthly", now);
+        assert!([window(before), window(after)].contains(&project.period_start));
+    }
+
+    #[test]
+    fn usage_chain_floors_remaining_and_keeps_a_zero_limit_bounded() {
+        let t = tracker();
+        t.set_limit("s", 0, PeriodType::Daily).unwrap();
+        t.record("s", 7);
+        let levels = t.usage_chain("s").unwrap();
+        let tokens = levels
+            .iter()
+            .find(|level| level.scope_id == "s" && level.metric == METRIC_TOKENS)
+            .unwrap();
+        assert_eq!(
+            (tokens.used, tokens.limit, tokens.remaining()),
+            (7, Some(0), Some(0))
+        );
     }
 
     #[test]

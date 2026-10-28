@@ -90,6 +90,51 @@ pub struct ActionInstance {
     /// instance is then denied with `offline_conflict`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict: Option<crate::sekai::offline_action::ActionConflict>,
+    /// Why the instance parked and who may decide it (#1867). Set when it
+    /// parks and kept after the decision; `None` for an instance that never
+    /// parked or was stored before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalRequirement>,
+}
+
+/// What required approval for a parked instance, and who is entitled to
+/// decide it, as admission saw it at park time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequirement {
+    /// Action policy scope whose rule required approval. Empty when agent
+    /// autonomy parked a submit the policy allowed.
+    pub policy_scope: String,
+    /// The deciding clause: `action_override:<action>`,
+    /// `risk_override:<class>`, `default_decision`, or
+    /// `agent_autonomy:propose_only`.
+    pub rule: String,
+    /// Principals the Action type names as approvers. The submitter never
+    /// decides their own instance, even when listed.
+    pub approvers: Vec<String>,
+    /// `namespace_admin` when the type names no approvers, else empty.
+    pub approver_role: String,
+}
+
+/// `approver_role` when an Action type names no approvers.
+pub const APPROVER_ROLE_NAMESPACE_ADMIN: &str = "namespace_admin";
+/// `rule` when agent autonomy, not the policy, parked the submit.
+pub const RULE_AGENT_PROPOSE_ONLY: &str = "agent_autonomy:propose_only";
+
+impl ApprovalRequirement {
+    /// The requirement for a park decided by `rule` in `policy_scope`, with
+    /// the type's declared `approvers`.
+    pub fn new(policy_scope: &str, rule: String, approvers: &[String]) -> Self {
+        Self {
+            policy_scope: policy_scope.to_string(),
+            rule,
+            approvers: approvers.to_vec(),
+            approver_role: if approvers.is_empty() {
+                APPROVER_ROLE_NAMESPACE_ADMIN.into()
+            } else {
+                String::new()
+            },
+        }
+    }
 }
 
 impl ActionInstance {
@@ -747,6 +792,7 @@ mod tests {
             system_one_fill_json: String::new(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         }
     }

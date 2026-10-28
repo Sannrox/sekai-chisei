@@ -87,6 +87,22 @@ export SEKAI_BUDGET_PARTITION_SIMULATED=1
 
 Transfers refuse fail-closed. Local homes continue to enforce only their allocated limits. Clear the flag (or restart without it) to re-enable transfers after connectivity is restored.
 
+### Reading usage and remaining limits
+
+`ChiseiService.GetBudgetUsage` (experimental; `SEKAI_EXPERIMENTAL_RPCS=1` or the
+`experimental-rpcs` feature) reads, for a scope, every level admission checks
+and charges, root to leaf: used, limit and remaining for `tokens` and
+`requests`, in each level's current period. The scope fields are those of
+`SetBudgetLimit`, and so is the authorization: control-plane administration
+only. A level without a limit reports `unlimited` with the usage charged to
+its daily period; a limit of zero is a hard stop, not unlimited. The read is
+one snapshot and changes nothing.
+
+```sh
+sekaictl admin governance budget usage --project p --agent a --work-unit w --json
+sekaictl admin governance budget usage --subject action:governed/project:p
+```
+
 ### Pressure views
 
 Regional vs global (pool) pressure is meaningful only when topology exposes both: local scope usage/limits under regional modes, plus pool membership when `pool_id` is set. Single-region deployments keep today's chain pressure only.

@@ -511,6 +511,13 @@ pub async fn apply_domain(target: &str, doc: &DomainDocument) -> Result<ApplyRep
                 let msg = status.message().to_string();
                 if msg.contains("already") || msg.contains("exists") || msg.contains("duplicate") {
                     eprintln!("warning: class {:?} already present: {msg}", class.name);
+                } else if status.code() == tonic::Code::Unavailable {
+                    // Lock contention, not a mapped_kind problem: no schema hint.
+                    return Err(format!(
+                        "create ontology class {:?}: store busy, retry: {msg}",
+                        class.name
+                    )
+                    .into());
                 } else {
                     return Err(format!(
                         "create ontology class {:?}: {msg}. Hint: mapped_kind must exist as a schema type (apply ensures non-builtin kinds; builtins need no ensure).",
@@ -659,6 +666,7 @@ pub async fn plan_and_execute(
         attempt_id: String::new(),
         route_override: String::new(),
         learning_pin: None,
+        budget_work_unit: String::new(),
     };
 
     let plan = client

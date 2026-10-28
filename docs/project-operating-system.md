@@ -387,6 +387,11 @@ Shared files that every lane used to touch are kept out of the way:
   prints, and is renumbered with it when another lane lands one first. Two
   lanes adding one both append to the migration list, so the second shows a
   conflict instead of merging a duplicate number.
+- tests for one RPC live in a `#[cfg(test)]` module of that RPC's file, as
+  in `src/grpc/search_rpc.rs` and `src/grpc/explain_value_rpc.rs`. The
+  shared `src/grpc/sekai_service_tests.rs` holds only tests that span
+  several features, so lanes stop appending to the end of one large file.
+  Existing tests stay where they are.
 
 `main` does not require a branch to be up to date before it merges: the
 required checks must pass on the Pull Request head, and a lane refreshes only

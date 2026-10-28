@@ -80,8 +80,9 @@ async fn ops_routes_report_health_readiness_and_metrics() {
         std::env::temp_dir().join(format!("sekai-ops-registry-{}", uuid::Uuid::new_v4()));
     let registry_path = directory.join("provider-registry.json");
     let app = sekai_chisei::obs::ops::router(
-        db,
+        db.clone(),
         None,
+        Some(db),
         registry_path.clone(),
         std::sync::Arc::new(sekai_chisei::sekai::credentials::PrincipalCredentialStore::new()),
         None,
@@ -139,6 +140,12 @@ async fn ops_routes_report_health_readiness_and_metrics() {
         .expect("metrics body");
     let body = String::from_utf8(body.to_vec()).expect("utf8 metrics");
     assert!(body.contains("sekai_build_info"));
+    // The scrape read the transform work queue from the Sekai store.
+    assert!(
+        body.contains(
+            r#"sekai_transform_work_queued{profile="isolated_process",pool="default"} 0"#
+        )
+    );
     std::fs::remove_dir_all(directory).expect("remove registry fixture");
 }
 

@@ -560,6 +560,10 @@ fn span_operation_id(logs: &str, expected: &str) -> String {
     }
 }
 
+// The capture lock must span the awaited work. Each test runs on its own
+// current-thread runtime, so another holder is always a different thread
+// and the wait cannot deadlock this one.
+#[allow(clippy::await_holding_lock)]
 async fn capture_submit_logs<F, Fut>(work: F) -> String
 where
     F: FnOnce() -> Fut,
@@ -579,6 +583,7 @@ where
         }
     }
 
+    let _serialized = crate::obs::tracing_capture_lock();
     let buf = Buf(Arc::new(Mutex::new(Vec::new())));
     let writer = buf.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -18365,6 +18370,7 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         resource_tenant: String::new(),
         marking: String::new(),
         conflict: None,
+        approval: None,
         offline: None,
     }
 }
@@ -20927,6 +20933,8 @@ async fn isolated_process_claim_and_write_back_are_namespace_authorized() {
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
+            requires: Default::default(),
+            code: String::new(),
         }),
         schedule: None,
         trigger: None,
@@ -21117,6 +21125,8 @@ async fn isolated_process_input_stream_requires_dataset_read() {
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
+            requires: Default::default(),
+            code: String::new(),
         }),
         schedule: None,
         trigger: None,
@@ -21717,6 +21727,7 @@ async fn isolated_run_without_tenant_stamps_the_put_owner() {
                 input_dataset_id: "in".into(),
                 output_dataset_id: "out".into(),
                 profile: ISOLATED_CLASS.into(),
+                code: "SELECT * FROM input".into(),
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 ..Default::default()
@@ -21824,6 +21835,7 @@ async fn isolated_write_retry_after_complete_records_usage_once() {
                 input_dataset_id: "in".into(),
                 output_dataset_id: "out".into(),
                 profile: ISOLATED_CLASS.into(),
+                code: "SELECT * FROM input".into(),
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 ..Default::default()
@@ -21975,6 +21987,8 @@ async fn isolated_claim_admits_quota_and_write_records_usage() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -22140,6 +22154,8 @@ async fn isolated_write_records_usage_for_the_claiming_tenant() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -22274,6 +22290,8 @@ async fn isolated_claim_without_tenant_context_meters_the_owner() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -22425,6 +22443,8 @@ async fn isolated_write_records_owner_usage_without_quota_limits() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -22546,6 +22566,7 @@ async fn scheduled_isolated_tick_meters_the_put_owner() {
                 input_dataset_id: "in".into(),
                 output_dataset_id: "out".into(),
                 profile: ISOLATED_CLASS.into(),
+                code: "SELECT * FROM input".into(),
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 schedule_every_ms: 1_000,
@@ -22960,6 +22981,8 @@ async fn isolated_claim_without_limits_binds_the_claiming_tenant() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -23073,6 +23096,8 @@ async fn isolated_quota_exhaustion_leaves_work_claimable() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -23179,6 +23204,8 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
+                requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,
@@ -23380,6 +23407,8 @@ async fn enqueue_isolated_claim(svc: &SekaiServiceImpl, transform_id: &str) {
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
+            requires: Default::default(),
+            code: String::new(),
         }),
         schedule: None,
         trigger: None,
@@ -23609,6 +23638,8 @@ async fn scheduled_isolated_tick_claims_against_the_put_owner() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: Some(TransformSchedule { every_ms: 1_000 }),
                 trigger: None,
@@ -23739,6 +23770,8 @@ async fn triggered_isolated_claim_uses_the_put_owner() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: Some(TransformTrigger {
@@ -23843,6 +23876,8 @@ async fn isolated_expired_claim_releases_concurrency_for_reclaim() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -23949,6 +23984,8 @@ async fn isolated_terminal_lease_failure_releases_concurrency() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -24080,6 +24117,8 @@ async fn isolated_cancel_releases_concurrency_for_next_claim() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -24542,6 +24581,7 @@ async fn preview_isolated_process_is_claimed_without_commit() {
                     input_dataset_id: "in".into(),
                     output_dataset_id: "out".into(),
                     profile: ISOLATED_CLASS.into(),
+                    code: "SELECT * FROM input".into(),
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     ..GovernedTransform::default()
@@ -24757,6 +24797,7 @@ async fn preview_retrieve_denies_unreadable_input() {
                     input_dataset_id: "in".into(),
                     output_dataset_id: "out".into(),
                     profile: ISOLATED_CLASS.into(),
+                    code: "SELECT * FROM input".into(),
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     ..GovernedTransform::default()
@@ -26280,6 +26321,8 @@ async fn apply_streaming_transform_batch_is_fenced_and_idempotent() {
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -26481,6 +26524,8 @@ async fn apply_streaming_transform_batch_stamps_markings_and_refuses_declassify(
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: String::new(),
                 }),
                 schedule: None,
                 trigger: None,

@@ -42,6 +42,7 @@ const MEDIA_PDF: &str = "application/pdf";
 const MEDIA_JSON: &str = "application/json";
 const MEDIA_PNG: &str = "image/png";
 const MEDIA_JPEG: &str = "image/jpeg";
+const MEDIA_DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,21 +175,20 @@ pub fn admit_document(
         return Err("admit timestamp must be non-negative".into());
     }
     let validated = validate_document(document, actor, now_ms)?;
-    if let Some(existing) =
-        db.get_governed_document(&validated.namespace, &validated.document_id)?
-    {
-        if existing.deleted_at_ms != 0 || existing.owner != actor || is_expired(&existing, now_ms) {
-            return Err(DOCUMENT_UNAVAILABLE.into());
-        }
-        if existing.content_digest == validated.content_digest
-            && definition_digest(&existing)? == definition_digest(&validated)?
-        {
-            return Ok(existing);
-        }
+    // Insert-or-read in one step: under concurrency the first definition wins
+    // and every other admission is compared against it (#1776).
+    let Some(existing) = db.insert_governed_document(&validated)? else {
+        return Ok(validated);
+    };
+    if existing.deleted_at_ms != 0 || existing.owner != actor || is_expired(&existing, now_ms) {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
-    db.put_governed_document(&validated)?;
-    Ok(validated)
+    if existing.content_digest == validated.content_digest
+        && definition_digest(&existing)? == definition_digest(&validated)?
+    {
+        return Ok(existing);
+    }
+    Err(DOCUMENT_UNAVAILABLE.into())
 }
 
 pub fn attach_rendition(
@@ -646,7 +646,7 @@ fn supported_media_type(media_type: &str, class: Option<&str>) -> bool {
         Some(RENDITION_THUMBNAIL) => matches!(media_type, MEDIA_PNG | MEDIA_JPEG),
         None => matches!(
             media_type,
-            MEDIA_TEXT_PLAIN | MEDIA_PDF | MEDIA_JSON | MEDIA_PNG | MEDIA_JPEG
+            MEDIA_TEXT_PLAIN | MEDIA_PDF | MEDIA_JSON | MEDIA_PNG | MEDIA_JPEG | MEDIA_DOCX
         ),
         Some(_) => false,
     }
@@ -1054,6 +1054,29 @@ mod tests {
     }
 
     #[test]
+    fn a_docx_document_is_admitted_with_its_extracted_text() {
+        let runtime = db();
+        pin_ceiling(&runtime, "analyst", "internal");
+        let mut docx = document();
+        docx.content_ref = content_ref(MEDIA_DOCX);
+        docx.content_digest = content_digest_for(&docx.content_ref).unwrap();
+        admit_document(&runtime, "analyst", &docx, 1_000).unwrap();
+        let mut text = rendition();
+        text.parent_content_digest = docx.content_digest.clone();
+        attach_rendition(&runtime, "analyst", &text, 1_500).unwrap();
+        // Renditions keep their own rules: DOCX is a source format only.
+        let mut docx_preview = rendition();
+        docx_preview.rendition_id = "rend:preview".into();
+        docx_preview.class = RENDITION_PREVIEW.into();
+        docx_preview.parent_content_digest = docx.content_digest.clone();
+        docx_preview.content_ref.media_type = MEDIA_DOCX.into();
+        assert_eq!(
+            attach_rendition(&runtime, "analyst", &docx_preview, 1_600).unwrap_err(),
+            FORMAT_UNSUPPORTED
+        );
+    }
+
+    #[test]
     fn unknown_format_corrupt_digest_and_unsupported_revision_fail_before_disclosure() {
         let runtime = db();
         pin_ceiling(&runtime, "analyst", "internal");
@@ -1173,6 +1196,71 @@ mod tests {
             .unwrap_err(),
             DOCUMENT_UNAVAILABLE
         );
+    }
+
+    /// Concurrent admissions of one id with different titles: exactly one
+    /// succeeds and the stored definition is the one it returned (#1776).
+    fn concurrent_conflicting_admissions_keep_one(
+        runtime: &RuntimeDb,
+        principal: &str,
+        document: &GovernedDocument,
+    ) {
+        const ADMISSIONS: usize = 8;
+        let barrier = std::sync::Barrier::new(ADMISSIONS);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..ADMISSIONS)
+                .map(|n| {
+                    let barrier = &barrier;
+                    let mut variant = document.clone();
+                    variant.title = format!("Brief {n}");
+                    scope.spawn(move || {
+                        barrier.wait();
+                        admit_document(runtime, principal, &variant, 1_000)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        let admitted: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .collect();
+        assert_eq!(admitted.len(), 1, "{results:?}");
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| error == DOCUMENT_UNAVAILABLE),
+            "{results:?}"
+        );
+        let stored = runtime
+            .get_governed_document(&document.namespace, &document.document_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&stored, admitted[0]);
+    }
+
+    #[test]
+    fn concurrent_conflicting_admissions_keep_the_first_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new(dir.path().join("docs.db").to_str().unwrap()).unwrap(),
+        ));
+        pin_ceiling(&runtime, "analyst", "internal");
+        concurrent_conflicting_admissions_keep_one(&runtime, "analyst", &document());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_concurrent_conflicting_admissions_keep_the_first_definition() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let runtime = postgres_runtime();
+        let (principal, document, _) = unique_case(&suffix);
+        pin_ceiling(&runtime, &principal, "internal");
+        concurrent_conflicting_admissions_keep_one(&runtime, &principal, &document);
     }
 
     fn postgres_runtime() -> RuntimeDb {

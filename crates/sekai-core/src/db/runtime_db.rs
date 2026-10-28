@@ -660,16 +660,50 @@ impl RuntimeDb {
         }
     }
 
+    pub fn register_transform_runtime(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        labels: &std::collections::BTreeMap<String, String>,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::governed_transform::TransformRuntime, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.register_transform_runtime(namespace, runtime_id, labels, actor, now_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.register_transform_runtime(namespace, runtime_id, labels, actor, now_ms)
+            }),
+        }
+    }
+
+    /// Transform work queue depth per worker pool (#1732).
+    pub fn transform_pool_depths(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformPoolDepth>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_pool_depths(now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_pool_depths(now_ms))
+            }
+        }
+    }
+
     pub fn list_claimable_transform_work(
         &self,
         namespace: &str,
+        runtime_id: &str,
         now_ms: i64,
         limit: i64,
     ) -> Result<Vec<crate::sekai::governed_transform::TransformWork>, String> {
         match self {
-            Self::Sqlite(db) => db.list_claimable_transform_work(namespace, now_ms, limit),
+            Self::Sqlite(db) => {
+                db.list_claimable_transform_work(namespace, runtime_id, now_ms, limit)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.list_claimable_transform_work(namespace, now_ms, limit)
+                db.list_claimable_transform_work(namespace, runtime_id, now_ms, limit)
             }),
         }
     }
@@ -2376,6 +2410,19 @@ impl RuntimeDb {
         }
     }
 
+    pub fn settle_pending_reservation(
+        &self,
+        next: &OperationReservation,
+        refund_metric: Option<&str>,
+    ) -> Result<Option<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.settle_pending_reservation(next, refund_metric),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.settle_pending_reservation(next, refund_metric)
+            }),
+        }
+    }
+
     pub fn list_pending_operation_reservations(
         &self,
         limit: usize,
@@ -2863,6 +2910,19 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.budget_usage(scope_id, metric, now_ms),
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.budget_usage(scope_id, metric, now_ms))
+            }
+        }
+    }
+
+    pub fn budget_usage_chain(
+        &self,
+        scope_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<crate::db::chisei_budget::BudgetScopeUsage>, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_usage_chain(scope_id, now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.budget_usage_chain(scope_id, now_ms))
             }
         }
     }
@@ -7452,14 +7512,15 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_governed_document(
+    /// Atomic first-writer-wins insert; see `SekaiDb::insert_governed_document`.
+    pub fn insert_governed_document(
         &self,
         document: &crate::sekai::document::GovernedDocument,
-    ) -> Result<(), String> {
+    ) -> Result<Option<crate::sekai::document::GovernedDocument>, String> {
         match self {
-            Self::Sqlite(db) => db.put_governed_document(document),
+            Self::Sqlite(db) => db.insert_governed_document(document),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.put_governed_document(document))
+                crate::db::postgres::off_runtime(|| db.insert_governed_document(document))
             }
         }
     }

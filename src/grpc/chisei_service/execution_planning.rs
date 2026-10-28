@@ -23,8 +23,12 @@ impl ChiseiServiceImpl {
         self.require_in_process_namespace_policy()?;
         let plan_id = uuid::Uuid::new_v4().to_string();
         let mut context_projection_latency_ms = 0_u64;
-        let normalized_user_id =
-            execution_budget_scope(&input.namespace, authenticated_actor, &input.user_id);
+        let normalized_user_id = planned_execution_budget_scope(
+            &input.namespace,
+            authenticated_actor,
+            &input.user_id,
+            &input.budget_work_unit,
+        )?;
         let scoped_pressure = self.budget.scope_pressure(&normalized_user_id);
         let namespace_pressure = self
             .budget

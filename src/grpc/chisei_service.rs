@@ -693,6 +693,13 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_control::set_budget_limit(self, req).await
     }
 
+    async fn get_budget_usage(
+        &self,
+        req: Request<GetBudgetUsageRequest>,
+    ) -> Result<Response<GetBudgetUsageResponse>, Status> {
+        rpc_control::get_budget_usage(self, req).await
+    }
+
     async fn set_namespace_policy(
         &self,
         req: Request<SetNamespacePolicyRequest>,

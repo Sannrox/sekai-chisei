@@ -64,6 +64,10 @@ pub enum CombinedStoreLayout {
         sekai_identity: StoreIdentity,
         chisei_identity: StoreIdentity,
         matched_generation: Arc<AtomicI64>,
+        /// Serializes the pairing-epoch check and advance in this process
+        /// (#1845): the two stores are read separately, so concurrent
+        /// advances between the reads would look like drift.
+        pairing_epoch: Arc<std::sync::Mutex<()>>,
     },
 }
 
@@ -417,6 +421,19 @@ impl CombinedStoreLayout {
         }
     }
 
+    /// Hold while checking and advancing the split pairing epoch; `None` for
+    /// an owned layout, which has no epoch.
+    pub(crate) fn lock_pairing_epoch(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self {
+            Self::Split { pairing_epoch, .. } => Some(
+                pairing_epoch
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            Self::Owned { .. } => None,
+        }
+    }
+
     pub(crate) fn cached_matched_generation(&self) -> Option<i64> {
         match self {
             Self::Split {
@@ -537,6 +554,7 @@ fn open_split_sqlite(
         sekai_identity,
         chisei_identity,
         matched_generation: new_matched_generation_cache(),
+        pairing_epoch: Arc::default(),
     })
 }
 
@@ -583,6 +601,7 @@ fn open_split_postgres(
         sekai_identity,
         chisei_identity,
         matched_generation: new_matched_generation_cache(),
+        pairing_epoch: Arc::default(),
     })
 }
 
