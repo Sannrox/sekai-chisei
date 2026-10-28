@@ -202,6 +202,8 @@ const DROP_LEGACY_TENANT_STATE_SCHEMA: &str =
     include_str!("postgres/0121_drop_legacy_tenant_state.sql");
 const TRANSFORM_RUN_OUTPUT_VERSION_SCHEMA: &str =
     include_str!("postgres/0119_transform_run_output_version.sql");
+const TRANSFORM_RUNTIME_LABELS_SCHEMA: &str =
+    include_str!("postgres/0122_transform_runtime_labels.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -953,6 +955,12 @@ const MIGRATIONS: &[Migration] = &[
         120,
         "drop_legacy_tenant_state",
         DROP_LEGACY_TENANT_STATE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        121,
+        "transform_runtime_labels",
+        TRANSFORM_RUNTIME_LABELS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

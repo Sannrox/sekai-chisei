@@ -57,6 +57,8 @@ mod scored_knowledge_admission;
 mod search_rpc;
 #[path = "sync_scope_rpc.rs"]
 mod sync_scope_rpc;
+#[path = "transform_placement_rpc.rs"]
+mod transform_placement_rpc;
 #[cfg(test)]
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
@@ -1550,6 +1552,12 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListGovernedTransformRunsRequest>,
     ) -> Result<Response<ListGovernedTransformRunsResponse>, Status> {
         rpc_data::list_governed_transform_runs(self, req).await
+    }
+    async fn register_transform_runtime(
+        &self,
+        req: Request<RegisterTransformRuntimeRequest>,
+    ) -> Result<Response<RegisterTransformRuntimeResponse>, Status> {
+        transform_placement_rpc::register_transform_runtime(self, req).await
     }
     async fn list_claimable_transform_work(
         &self,

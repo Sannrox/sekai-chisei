@@ -478,6 +478,67 @@ mod tests {
     }
 
     #[test]
+    fn empty_placement_requires_keeps_the_earlier_digest_and_json() {
+        let transform = isolated_transform("python", "runner:1");
+        // Pinned from before placement existed: admitted runs stay valid.
+        assert_eq!(
+            transform.definition_digest,
+            "sha256:02fd70652a1a391954e7f1647096371d947342c9112089d6c2e97ffb112fbac1"
+        );
+        let json = serde_json::to_string(&transform).unwrap();
+        assert!(!json.contains("requires"));
+        let stored: GovernedTransform = serde_json::from_str(&json).unwrap();
+        assert!(stored.isolated_process.unwrap().requires.is_empty());
+        assert_eq!(
+            sekai_types::governed_transform::admitted_placement_requires(&json),
+            Some(BTreeMap::new())
+        );
+    }
+
+    #[test]
+    fn placement_requires_participates_in_digest() {
+        let base = isolated_transform("python", "runner:1");
+        let with = |pairs: &[(&str, &str)]| {
+            let mut transform = base.clone();
+            transform.isolated_process.as_mut().unwrap().requires = pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            transform.definition_digest.clear();
+            transform.prepare().unwrap().definition_digest
+        };
+        let gpu = with(&[("accelerator", "gpu")]);
+        assert_ne!(gpu, base.definition_digest);
+        assert_ne!(gpu, with(&[("accelerator", "cpu")]));
+        assert_ne!(with(&[("a", "bc")]), with(&[("ab", "c")]));
+    }
+
+    #[test]
+    fn placement_requires_every_pair_exactly() {
+        use sekai_types::governed_transform::placement_satisfied;
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        let requires = labels(&[("accelerator", "gpu"), ("zone", "a")]);
+        assert!(placement_satisfied(
+            &requires,
+            &labels(&[("accelerator", "gpu"), ("zone", "a"), ("pool", "x")])
+        ));
+        assert!(!placement_satisfied(
+            &requires,
+            &labels(&[("accelerator", "gpu")])
+        ));
+        assert!(!placement_satisfied(
+            &requires,
+            &labels(&[("accelerator", "GPU"), ("zone", "a")])
+        ));
+        assert!(placement_satisfied(&BTreeMap::new(), &BTreeMap::new()));
+    }
+
+    #[test]
     fn isolated_process_prepare_trims_input_aliases() {
         let mut transform = isolated_transform("python", "runner:1");
         transform.isolated_process.as_mut().unwrap().inputs = vec![TransformInput {
@@ -579,6 +640,7 @@ mod tests {
                 engine: engine.into(),
                 runtime_image: runtime_image.into(),
                 inputs: Vec::new(),
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: None,

@@ -54,7 +54,7 @@ caller can read the datasets bound by the run's definition. Arrow/Parquet remain
 
 The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `GetGovernedTransformRun`, `ListGovernedTransforms`,
-`ListGovernedTransformRuns`, `ListClaimableTransformWork`,
+`ListGovernedTransformRuns`, `RegisterTransformRuntime`, `ListClaimableTransformWork`,
 `ClaimTransformWork`, `HeartbeatTransformClaim`, `ReadTransformRunInputs`,
 `WriteTransformRunResult`, `ApplyStreamingTransformBatch`, `TickGovernedTransforms`,
 `GetTransformOutputState`, `CancelGovernedTransformRun`,
@@ -75,6 +75,22 @@ or `ApplySourceBatch` coalesces into one downstream run inside the debounce
 window. Cycles are refused at Put. Failed upstream runs mark downstream
 outputs `blocked`; a later success unblocks them. Cancelling a run skips
 not-yet-started downstream work and records that on the receipts.
+
+An isolated-process definition may declare `requires`, placement labels as
+key and value pairs, part of its definition digest when non-empty (#1733,
+ADR 0129). A worker registers its labels for its runtime id in a namespace
+with `RegisterTransformRuntime`, which replaces the earlier set. Listing and
+claiming offer a run only to a runtime whose labels include every required
+pair exactly; there is no scoring. The claim reads the labels in its own
+transaction, so a stale listing or a claim naming the run cannot bypass the
+check, and a relabelled runtime is matched at its next claim. A runtime that
+never registered has no labels and gets only runs without requirements, as
+before. A run no runtime may claim stays pending. Keys and values are 1 to 63
+letters, digits, `-`, `_` or `.` (keys may also use `/`), at most 32 per set,
+and a repeated key is refused. Only planes from this release honor
+`requires`: an older plane drops it at Put and does not check it at claim, so
+declare requirements once every plane serving the store is upgraded.
+Definitions without `requires` keep their digest.
 
 The analytical profile runs SQL in a private in-memory SQLite connection
 (bundled rusqlite). Default bounds: 64 MiB and 5 seconds. Over-budget runs

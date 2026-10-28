@@ -1152,6 +1152,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "RegisterTransformRuntime",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/governed_transform.rs",
+        "crates/sekai-core/src/db/postgres_governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ListClaimableTransformWork",
       "kind": "persistent",
       "surfaces": [

@@ -660,16 +660,37 @@ impl RuntimeDb {
         }
     }
 
+    pub fn register_transform_runtime(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        labels: &std::collections::BTreeMap<String, String>,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::governed_transform::TransformRuntime, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.register_transform_runtime(namespace, runtime_id, labels, actor, now_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.register_transform_runtime(namespace, runtime_id, labels, actor, now_ms)
+            }),
+        }
+    }
+
     pub fn list_claimable_transform_work(
         &self,
         namespace: &str,
+        runtime_id: &str,
         now_ms: i64,
         limit: i64,
     ) -> Result<Vec<crate::sekai::governed_transform::TransformWork>, String> {
         match self {
-            Self::Sqlite(db) => db.list_claimable_transform_work(namespace, now_ms, limit),
+            Self::Sqlite(db) => {
+                db.list_claimable_transform_work(namespace, runtime_id, now_ms, limit)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.list_claimable_transform_work(namespace, now_ms, limit)
+                db.list_claimable_transform_work(namespace, runtime_id, now_ms, limit)
             }),
         }
     }
