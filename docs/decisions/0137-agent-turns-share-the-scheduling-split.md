@@ -46,7 +46,26 @@ decide what runs.
    `schedule`, `object_change` or `manual`, with the schedule id or the change
    window it came from.
 
-SQLite is the reference store for turns, as for instances (ADR 0136).
+Both stores keep turns (#1950); instances are written only on SQLite
+(ADR 0136), so a PostgreSQL plane has no instance to wake until their parity
+slice.
+
+### Schedule wakes (#1951)
+
+An instance's `wake_policies` holds self-describing tokens rather than
+references to a separate policy record: `schedule:<every_ms>` wakes the
+instance every `every_ms`, at least one minute. Instance writes refuse an
+unknown or malformed token. The instance's governed update Action is the only
+way to change a schedule, so every change leaves a receipt, and no second
+governed kind or dangling reference exists. A shared, named schedule can be
+added later as a token form that resolves an id, without breaking inline
+tokens.
+
+`TickGovernedTransforms` admits schedule wakes alongside transform and export
+schedules. Each tick admits the latest due time of each token, with cause
+reference `<token>@<due_ms>`; missed fires are not backfilled. Due times are
+offset per instance by a phase derived from its id, so instances on one
+interval do not fall due together, and every plane derives the same times.
 
 ## Alternatives considered
 

@@ -13,7 +13,8 @@
 //! SQLite is the reference store; PostgreSQL refuses instance writes until a
 //! parity slice (ADR 0136). Freezing (#1934) is its own pair of Actions: a
 //! frozen instance admits no new wake and no new Action submitted by its
-//! principal. Wakes and memory are later slices.
+//! principal. Schedule wakes (#1951) read `wake_policies`; memory is a later
+//! slice.
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
@@ -34,6 +35,8 @@ pub const ACTION_UNFREEZE: &str = "site_agent.instance.unfreeze";
 /// `"true"` while the instance is frozen; set only by the freeze and
 /// unfreeze Actions (#1934).
 pub const FROZEN_PROPERTY: &str = "frozen";
+/// Comma-separated wake tokens, such as `schedule:3600000` (#1951).
+pub const WAKE_POLICIES_PROPERTY: &str = "wake_policies";
 pub const ACTION_VERSION: &str = "1";
 
 /// `(name, required, description)` of each instance property.
@@ -58,7 +61,11 @@ const PROPERTIES: &[(&str, bool, &str)] = &[
         true,
         "The object ids or the ObjectSet the instance owns.",
     ),
-    ("wake_policies", false, "Comma-separated wake policy ids."),
+    (
+        WAKE_POLICIES_PROPERTY,
+        false,
+        "Comma-separated wake tokens; schedule:<every_ms> wakes the instance on an interval.",
+    ),
     (
         "autonomy_envelope_id",
         false,
@@ -229,6 +236,9 @@ pub fn validate_object_write(db: &RuntimeDb, object: &Object, now_ms: i64) -> Re
         if *required && property(object, name).is_none() {
             return Err(format!("{name} is required"));
         }
+    }
+    if let Some(wake) = property(object, WAKE_POLICIES_PROPERTY) {
+        crate::sekai::agent_wake::parse(wake)?;
     }
     let digest = property(object, "definition_revision_digest").unwrap_or_default();
     let member = property(object, "agent_member").unwrap_or_default();
@@ -470,6 +480,21 @@ mod tests {
             "rebind",
         ));
         assert!(message.contains("no current certification"), "{message}");
+        // Wake tokens are checked on every write (#1951).
+        let message = refusal(admit(
+            &runtime,
+            ACTION_UPDATE,
+            json!({"object_id": "line-7", WAKE_POLICIES_PROPERTY: "nightly"}),
+            "bad-wake",
+        ));
+        assert!(message.contains("unknown wake policy"), "{message}");
+        admit(
+            &runtime,
+            ACTION_UPDATE,
+            json!({"object_id": "line-7", WAKE_POLICIES_PROPERTY: "schedule:3600000"}),
+            "wake",
+        )
+        .unwrap();
     }
 
     /// A frozen instance's principal is refused new Actions with a named,
