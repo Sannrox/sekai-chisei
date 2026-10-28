@@ -4277,11 +4277,13 @@ pub(super) async fn tick_governed_transforms(
         .await
         .map_err(|_| Status::internal("export schedule tick failed"))?
         .map_err(Status::internal)?;
-    // Schedule wakes of site agent instances share this tick (ADR 0137).
+    // Schedule and change wakes of site agent instances share this tick
+    // (ADR 0137).
     let wake_service = service.clone();
     let wake_actor = actor.clone();
     tokio::task::spawn_blocking(move || {
-        crate::sekai::agent_wake::tick(wake_service.db.runtime(), now_ms, &wake_actor)
+        crate::sekai::agent_wake::tick(wake_service.db.runtime(), now_ms, &wake_actor)?;
+        wake_service.tick_change_wakes(now_ms, &wake_actor)
     })
     .await
     .map_err(|_| Status::internal("agent wake tick failed"))?

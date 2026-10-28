@@ -67,6 +67,23 @@ reference `<token>@<due_ms>`; missed fires are not backfilled. Due times are
 offset per instance by a phase derived from its id, so instances on one
 interval do not fall due together, and every plane derives the same times.
 
+### Change wakes (#1952)
+
+`change:<debounce_ms>` (at least one second) wakes the instance when an
+object named in its `responsibility` changes. The same tick reads committed
+object mutations after a durable cursor per instance and token; a new token
+starts at the present. Each object is read as the instance's principal, as a
+read request would be, and the object-change subscription projection decides
+the events. An update wakes only when the principal may read the changed
+property: a property grant must allow it, and a restricted property needs
+object admin. Creates of visible objects wake; deletes do not, since the
+principal can no longer be shown to read the object. Changes in one window
+of `debounce_ms` share one turn, due when the window closes, with cause
+reference `<token>@<window_start_ms>`. The cursor advances after admission
+with a compare-and-set, so a crash or a second plane replays the page and
+admission dedupes it. The responsibility is a list of object ids; an
+ObjectSet responsibility is a later slice.
+
 ## Alternatives considered
 
 - Waking agents from the worker (a runner polls and decides). Rejected:

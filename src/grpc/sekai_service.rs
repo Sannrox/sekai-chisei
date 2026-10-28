@@ -1,6 +1,8 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 #[path = "action_binding.rs"]
 mod action_binding;
+#[path = "agent_change_wake.rs"]
+mod agent_change_wake;
 #[path = "agent_turn_rpc.rs"]
 mod agent_turn_rpc;
 #[path = "authorized_link_mutation.rs"]

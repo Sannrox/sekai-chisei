@@ -578,7 +578,9 @@ fn ensure_object_change_checkpoint(
     db.advance_event_stream_checkpoint(&next, &current, &stream.definition_digest, None)
 }
 
-fn project_events(
+/// Projects committed mutations onto `scope` as seen through `visible`: the
+/// subscription rules that agent change wakes (#1952) share.
+pub fn project_events(
     scope: &ObjectChangeScope,
     visible: &[Object],
     mutations: &[CommittedObjectMutation],
