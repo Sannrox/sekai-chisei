@@ -47,6 +47,21 @@ written through governed Actions, and no domain-specific core RPC.
    the same primary-key analog as the feedback observation index. The
    plan-time checks only give a precise error.
 
+7. **A disposition reopens when its basis no longer holds** (#1925). The
+   exposure records the current facts of its target (dependency closure,
+   release and configuration digests, reachable markings, advisory revision)
+   through `security.exposure.basis`, which a connector or a transform
+   write-back drives. A disposition whose basis differs from those facts, or
+   whose expiry passed, is superseded by a `needs-review` disposition through
+   `security.disposition.reopen`. Dispositions stay immutable. The reopen
+   carries the basis unchanged and names the fact and its new value, and the
+   validator refuses a reopen the facts do not warrant. Its object id derives
+   from the disposition it reopens, and the successor index allows one
+   successor, so a repeated or restarted pass reopens it once. Changes are
+   found in the committed object-change feed, never by polling a source. The
+   certification moves to `cert:security.finding-exposure/v1.2`. A server
+   driver for these passes is #1954.
+
 ## Alternatives considered
 
 - A findings store and domain RPC. Rejected for the same reason as ADR 0095: a
@@ -73,5 +88,7 @@ Crate tests install the fixtures into an in-memory runtime and cover:
 - a replayed occurrence refused while the same request stays a no-op
 - an exposure refusing a hypothesis, or an occurrence of another finding, as evidence
 - a fixed exposure target
+- a false positive reopened when its closure changes, with the fact in its
+  receipt, and an expired disposition reopened once across a restart
 - store-level uniqueness without the plan-time check
 - concurrent duplicate findings keeping exactly one

@@ -132,6 +132,36 @@
           "type": "string",
           "required": false,
           "description": "Measured occurrence the verdict relies on; required unless the verdict is unknown."
+        },
+        {
+          "name": "dependency_closure_digest",
+          "type": "string",
+          "required": false,
+          "description": "Current digest of the deployed dependency closure."
+        },
+        {
+          "name": "release_digest",
+          "type": "string",
+          "required": false,
+          "description": "Current digest of the deployed release."
+        },
+        {
+          "name": "configuration_digest",
+          "type": "string",
+          "required": false,
+          "description": "Current digest of the configuration."
+        },
+        {
+          "name": "reachable_markings",
+          "type": "string",
+          "required": false,
+          "description": "Current comma-separated markings of data reachable from the target, or none."
+        },
+        {
+          "name": "advisory_revision",
+          "type": "string",
+          "required": false,
+          "description": "Current revision of the advisory."
         }
       ]
     },
@@ -150,7 +180,7 @@
           "name": "disposition",
           "type": "string",
           "required": true,
-          "description": "accept-risk, false-positive, mitigated, or fixed."
+          "description": "accept-risk, false-positive, mitigated, fixed, or needs-review when its basis changed or it expired."
         },
         {
           "name": "dependency_closure_digest",
@@ -205,6 +235,18 @@
           "type": "string",
           "required": false,
           "description": "Why the decision was taken."
+        },
+        {
+          "name": "reopened_fact",
+          "type": "string",
+          "required": false,
+          "description": "On a needs-review disposition: the basis fact that changed, or expires_at_ms when it expired."
+        },
+        {
+          "name": "reopened_value",
+          "type": "string",
+          "required": false,
+          "description": "On a needs-review disposition: the fact's value that reopened it."
         }
       ]
     }
@@ -270,6 +312,12 @@
       "subject": "Disposition",
       "source": "https://github.com/Sannrox/sekai-chisei/issues/1924",
       "locator": "A disposition records the validity basis it relied on; superseding keeps history",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Disposition",
+      "source": "https://github.com/Sannrox/sekai-chisei/issues/1925",
+      "locator": "A disposition returns to needs-review when its validity basis changes or it expires",
       "confidence": 1.0
     }
   ]
