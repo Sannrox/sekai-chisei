@@ -2026,7 +2026,7 @@ pub(super) async fn put_governed_transform(
         .transform
         .ok_or_else(|| Status::invalid_argument("transform required"))?;
     let analytical = from_proto_analytical(&proto);
-    let isolated_process = from_proto_isolated(&proto);
+    let isolated_process = from_proto_isolated(&proto)?;
     let transform = crate::sekai::governed_transform::GovernedTransform {
         contract_version: proto.contract_version,
         namespace: proto.namespace,
@@ -2318,7 +2318,7 @@ pub(super) async fn preview_governed_transform(
         .transform
         .ok_or_else(|| Status::invalid_argument("transform required"))?;
     let analytical = from_proto_analytical(&proto);
-    let isolated_process = from_proto_isolated(&proto);
+    let isolated_process = from_proto_isolated(&proto)?;
     let transform = crate::sekai::governed_transform::GovernedTransform {
         contract_version: proto.contract_version,
         namespace: proto.namespace,
@@ -2600,7 +2600,7 @@ pub(super) async fn list_claimable_transform_work(
     let work = service
         .db
         .runtime()
-        .list_claimable_transform_work(&input.namespace, now_millis(), limit)
+        .list_claimable_transform_work(&input.namespace, &input.runtime_id, now_millis(), limit)
         .map_err(Status::internal)?
         .iter()
         .map(to_proto_transform_work)
@@ -4009,6 +4009,11 @@ fn to_proto_transform(
             .as_ref()
             .map(|trigger| trigger.debounce_ms)
             .unwrap_or(0),
+        requires: transform
+            .isolated_process
+            .as_ref()
+            .map(|spec| super::transform_placement_rpc::labels_to_proto(&spec.requires))
+            .unwrap_or_default(),
     }
 }
 
@@ -4045,31 +4050,42 @@ fn from_proto_analytical(
     })
 }
 
+/// Placement `requires` belongs to the isolated-process profile only: on any
+/// other profile it is refused rather than dropped.
 fn from_proto_isolated(
     proto: &GovernedTransform,
-) -> Option<crate::sekai::governed_transform::IsolatedProcessSpec> {
+) -> Result<Option<crate::sekai::governed_transform::IsolatedProcessSpec>, Status> {
     let profile = proto.profile.trim().to_ascii_lowercase();
-    if profile == crate::sekai::governed_transform::ANALYTICAL_CLASS {
-        return None;
-    }
-    let has_spec = profile == crate::sekai::governed_transform::ISOLATED_CLASS
-        || !proto.engine.trim().is_empty()
-        || !proto.runtime_image.trim().is_empty();
+    let has_spec = profile != crate::sekai::governed_transform::ANALYTICAL_CLASS
+        && (profile == crate::sekai::governed_transform::ISOLATED_CLASS
+            || !proto.engine.trim().is_empty()
+            || !proto.runtime_image.trim().is_empty());
     if !has_spec {
-        return None;
+        if !proto.requires.is_empty() {
+            return Err(Status::invalid_argument(
+                "requires applies only to the isolated_process profile",
+            ));
+        }
+        return Ok(None);
     }
-    Some(crate::sekai::governed_transform::IsolatedProcessSpec {
-        engine: proto.engine.clone(),
-        runtime_image: proto.runtime_image.clone(),
-        inputs: proto
-            .inputs
-            .iter()
-            .map(|input| crate::sekai::governed_transform::TransformInput {
-                alias: input.alias.clone(),
-                dataset_id: input.dataset_id.clone(),
-            })
-            .collect(),
-    })
+    Ok(Some(
+        crate::sekai::governed_transform::IsolatedProcessSpec {
+            engine: proto.engine.clone(),
+            runtime_image: proto.runtime_image.clone(),
+            inputs: proto
+                .inputs
+                .iter()
+                .map(|input| crate::sekai::governed_transform::TransformInput {
+                    alias: input.alias.clone(),
+                    dataset_id: input.dataset_id.clone(),
+                })
+                .collect(),
+            requires: super::transform_placement_rpc::labels_from_proto(
+                "requires",
+                &proto.requires,
+            )?,
+        },
+    ))
 }
 
 pub(super) fn caller_can_read_run_datasets(

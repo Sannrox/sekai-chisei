@@ -28,9 +28,11 @@ use crate::protocol::sekai::{
     HeartbeatActionClaimResponse, HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse,
     ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
     ListClaimableTransformWorkRequest, ListClaimableTransformWorkResponse,
-    ReadTransformRunInputsRequest, ReadTransformRunInputsResponse, ReportActionClaimEventRequest,
+    ReadTransformRunInputsRequest, ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
+    RegisterTransformRuntimeResponse, ReportActionClaimEventRequest,
     ReportActionClaimEventResponse, StreamingTransformInputPosition, StreamingTransformObjectEdit,
-    TransformRunInputRow, WriteTransformRunResultRequest, WriteTransformRunResultResponse,
+    TransformLabel, TransformRunInputRow, WriteTransformRunResultRequest,
+    WriteTransformRunResultResponse,
 };
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -52,6 +54,7 @@ const CLAIM_ACTION: &str = "/sekai.SekaiService/ClaimActionWork";
 const HEARTBEAT_ACTION: &str = "/sekai.SekaiService/HeartbeatActionClaim";
 const ACK_ACTION: &str = "/sekai.SekaiService/AckActionWork";
 const REPORT_ACTION: &str = "/sekai.SekaiService/ReportActionClaimEvent";
+const REGISTER_TRANSFORM_RUNTIME: &str = "/sekai.SekaiService/RegisterTransformRuntime";
 const LIST_TRANSFORM: &str = "/sekai.SekaiService/ListClaimableTransformWork";
 const CLAIM_TRANSFORM: &str = "/sekai.SekaiService/ClaimTransformWork";
 const HEARTBEAT_TRANSFORM: &str = "/sekai.SekaiService/HeartbeatTransformClaim";
@@ -515,6 +518,39 @@ impl<'a> RuntimeClaimClient<'a> {
             },
             false,
             true,
+        )
+        .await
+    }
+
+    /// Replaces the placement labels of `runtime_id` (#1733). Listing and
+    /// claiming then offer only runs whose requirements the labels meet; a
+    /// runtime that never registers gets only runs without requirements.
+    /// Safe to repeat, so a worker registers on every start.
+    pub async fn register_transform_runtime<K, V>(
+        &self,
+        runtime_id: impl Into<String>,
+        labels: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<RegisterTransformRuntimeResponse, RuntimeClaimError>
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let namespace = self.namespace()?.to_string();
+        self.unary(
+            REGISTER_TRANSFORM_RUNTIME,
+            RegisterTransformRuntimeRequest {
+                namespace,
+                runtime_id: runtime_id.into(),
+                labels: labels
+                    .into_iter()
+                    .map(|(key, value)| TransformLabel {
+                        key: key.into(),
+                        value: value.into(),
+                    })
+                    .collect(),
+            },
+            true,
+            false,
         )
         .await
     }

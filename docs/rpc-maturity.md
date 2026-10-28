@@ -158,6 +158,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.ListGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListGovernedTransformRuns` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.RegisterTransformRuntime` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListClaimableTransformWork` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.HeartbeatTransformClaim` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |

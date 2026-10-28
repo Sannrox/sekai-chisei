@@ -10,19 +10,19 @@ use crate::sekai::governed_transform::{
     TRANSFORM_TRIGGER_CANCELLED, TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE,
     TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED, TRANSFORM_WORK_CLAIMED,
     TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows,
-    TransformOutputState, TransformRun, TransformRunInputRow, TransformWork,
+    TransformOutputState, TransformRun, TransformRunInputRow, TransformRuntime, TransformWork,
     WriteTransformRunCommand, admit_isolated_run, apply_preview_column_allowlist, bind_checkpoint,
     bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
     checkpoint_after_id, compute_preview_tables, compute_run_tables_until, dataset_digest,
     derive_transform_markings, evaluate_quality, fold_live_output_marking, fold_output_digest,
     input_partition_receipts, is_preview_id, new_preview_id, normalize_transform_claim_ttl_ms,
-    partition_records, partition_value, prepare_partition_commit, preview_output_schema_json,
-    preview_result_from_writeback, preview_schema_from_rows, preview_writeback_run,
-    receipts_for_touched_partitions, redact_run_partition_receipts, refuse_dependency_cycle,
-    require_bound_output_for_markings, rows_digest, schedule_due_bucket,
-    transform_claim_fence_matches, transform_claim_is_current, transform_completed_write_matches,
-    transform_quota_hold_status_allows, transform_work_is_claimable, trigger_is_due,
-    trim_page_to_bytes,
+    partition_records, partition_value, placement_admits, prepare_partition_commit,
+    preview_output_schema_json, preview_result_from_writeback, preview_schema_from_rows,
+    preview_writeback_run, receipts_for_touched_partitions, redact_run_partition_receipts,
+    refuse_dependency_cycle, registered_transform_runtime, require_bound_output_for_markings,
+    rows_digest, schedule_due_bucket, transform_claim_fence_matches, transform_claim_is_current,
+    transform_completed_write_matches, transform_quota_hold_status_allows,
+    transform_runtime_decision, transform_work_is_claimable, trigger_is_due, trim_page_to_bytes,
 };
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -259,10 +259,52 @@ impl SekaiDb {
                     created_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (run_id, checkpoint)
                 );
+                CREATE TABLE IF NOT EXISTS sekai_transform_runtime (
+                    namespace TEXT NOT NULL,
+                    runtime_id TEXT NOT NULL,
+                    labels_json TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, runtime_id)
+                );
                 ",
             )
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// Replaces the placement labels of `runtime_id` in `namespace` and, in
+    /// the same transaction, records the change on the decision ledger as
+    /// `actor`. The next list or claim by that runtime reads the new labels.
+    pub fn register_transform_runtime(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        labels: &BTreeMap<String, String>,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<TransformRuntime, String> {
+        let runtime = registered_transform_runtime(namespace, runtime_id, labels, now_ms)?;
+        let labels_json =
+            serde_json::to_string(&runtime.labels).map_err(|error| error.to_string())?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let previous = load_registered_runtime_labels(&tx, namespace, runtime_id)?;
+        let decision = transform_runtime_decision(&runtime, previous.as_ref(), actor);
+        crate::sekai::audit::validate_decision(&decision)?;
+        tx.execute(
+            "INSERT INTO sekai_transform_runtime (namespace, runtime_id, labels_json, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(namespace, runtime_id) DO UPDATE SET
+                labels_json = excluded.labels_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![runtime.namespace, runtime.runtime_id, labels_json, now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        crate::sekai::ledger::insert_chained_decision(&tx, &decision)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(runtime)
     }
 
     pub fn put_governed_transform(
@@ -581,31 +623,40 @@ impl SekaiDb {
             .collect()
     }
 
+    /// Claimable runs whose placement requirements the registered labels of
+    /// `runtime_id` meet. An unregistered runtime sees only unconstrained runs.
     pub fn list_claimable_transform_work(
         &self,
         namespace: &str,
+        runtime_id: &str,
         now_ms: i64,
         limit: i64,
     ) -> Result<Vec<TransformWork>, String> {
-        let conn = self.conn();
-        let mut stmt = conn
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let labels = load_transform_runtime_labels(&tx, namespace, runtime_id)?;
+        let mut stmt = tx
             .prepare(
                 "SELECT run_id, namespace, transform_id, definition_digest, engine, runtime_image,
                         status, claim_owner, claim_generation, fencing_token, claim_expires_at_ms,
-                        lease_expiries, created_at_ms, tenant_id
+                        lease_expiries, created_at_ms, tenant_id, definition_json
                  FROM sekai_transform_work
                  WHERE namespace = ?1
                  ORDER BY created_at_ms, run_id",
             )
             .map_err(|error| error.to_string())?;
         let rows = stmt
-            .query_map(params![namespace], map_transform_work)
+            .query_map(params![namespace], |row| {
+                Ok((map_transform_work(row)?, row.get::<_, String>(14)?))
+            })
             .map_err(|error| error.to_string())?;
         let cap = if limit <= 0 { 50 } else { limit.min(500) };
         let mut out = Vec::new();
         for row in rows {
-            let work = row.map_err(|error| error.to_string())?;
-            if transform_work_is_claimable(&work, now_ms) {
+            let (work, definition_json) = row.map_err(|error| error.to_string())?;
+            if transform_work_is_claimable(&work, now_ms)
+                && placement_admits(&definition_json, &labels)
+            {
                 out.push(work);
                 if out.len() as i64 >= cap {
                     break;
@@ -1778,6 +1829,9 @@ fn claim_transform_work_tx(
         rows.map(|row| row.map_err(|error| error.to_string()))
             .collect::<Result<Vec<_>, _>>()?
     };
+    // Read in the claim transaction, so the claim checks the labels it
+    // commits against and a stale listing cannot widen them.
+    let labels = load_transform_runtime_labels(tx, namespace, runtime_id)?;
     let wanted = run_id.trim();
     let mut chosen: Option<(TransformWork, GovernedTransform, bool)> = None;
     let mut failed_run_ids = Vec::new();
@@ -1786,6 +1840,13 @@ fn claim_transform_work_tx(
             continue;
         }
         if skip_run_ids.iter().any(|skipped| skipped == &work.run_id) {
+            continue;
+        }
+        // Before lease-expiry accounting: a runtime that may not claim the run
+        // leaves it untouched for one that may.
+        if transform_work_is_claimable(&work, now_ms)
+            && !placement_admits(&load_work_definition_json(tx, &work.run_id)?, &labels)
+        {
             continue;
         }
         let counted_lease_expiry =
@@ -2606,6 +2667,42 @@ fn persist_run_input_snapshot(
         }
     }
     Ok(())
+}
+
+/// Registered labels; an unregistered runtime has none.
+fn load_transform_runtime_labels(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    runtime_id: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    Ok(load_registered_runtime_labels(tx, namespace, runtime_id)?.unwrap_or_default())
+}
+
+fn load_registered_runtime_labels(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    runtime_id: &str,
+) -> Result<Option<BTreeMap<String, String>>, String> {
+    let json: Option<String> = tx
+        .query_row(
+            "SELECT labels_json FROM sekai_transform_runtime
+             WHERE namespace = ?1 AND runtime_id = ?2",
+            params![namespace, runtime_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    json.map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn load_work_definition_json(tx: &Transaction<'_>, run_id: &str) -> Result<String, String> {
+    tx.query_row(
+        "SELECT definition_json FROM sekai_transform_work WHERE run_id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn load_admitted_transform(
@@ -6331,6 +6428,7 @@ mod tests {
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -7536,6 +7634,147 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_first_registrations_record_one_replacement() {
+        // The immediate write transaction is taken before the previous set is read.
+        let db = std::sync::Arc::new(db());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["gpu", "cpu"]
+            .into_iter()
+            .map(|value| {
+                let (db, barrier) = (db.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let labels = BTreeMap::from([("accelerator".to_string(), value.to_string())]);
+                    barrier.wait();
+                    db.register_transform_runtime("ops", "racer", &labels, "local", 10)
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                target_id: Some("transform_runtime:ops:racer".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let registered: Vec<_> = decisions
+            .iter()
+            .filter(|decision| decision.outcome == "registered")
+            .collect();
+        let replaced: Vec<_> = decisions
+            .iter()
+            .filter(|decision| decision.outcome == "replaced")
+            .collect();
+        assert_eq!((registered.len(), replaced.len()), (1, 1));
+        assert_eq!(
+            replaced[0].evidence["previous_labels_digest"],
+            registered[0].evidence["labels_digest"]
+        );
+    }
+
+    #[test]
+    fn placement_requires_matching_runtime_labels_at_claim() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+            .unwrap();
+        let mut transform = isolated_transform();
+        transform.isolated_process.as_mut().unwrap().requires =
+            BTreeMap::from([("accelerator".into(), "gpu".into())]);
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let run_id = db
+            .run_governed_transform("ops", "iso1", false, 20)
+            .unwrap()
+            .run_id;
+        let gpu = BTreeMap::from([("accelerator".to_string(), "gpu".to_string())]);
+        db.register_transform_runtime("ops", "cpu", &BTreeMap::new(), "local", 30)
+            .unwrap();
+        db.register_transform_runtime("ops", "gpu", &gpu, "local", 30)
+            .unwrap();
+
+        // Unregistered and unlabeled runtimes neither see nor claim the run.
+        for runtime_id in ["cpu", "unregistered"] {
+            assert!(
+                db.list_claimable_transform_work("ops", runtime_id, 40, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                db.claim_transform_work("ops", runtime_id, &run_id, 1_000, 40)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let listed = db
+            .list_claimable_transform_work("ops", "gpu", 40, 10)
+            .unwrap();
+        assert_eq!(listed[0].run_id, run_id);
+        let (claimed, _) = db
+            .claim_transform_work("ops", "gpu", "", 1_000, 40)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.claim_generation, 1);
+
+        // After the lease lapses, a runtime that may not claim the run leaves
+        // its lease-expiry count alone; a relabelled one claims it next.
+        assert!(
+            db.claim_transform_work("ops", "cpu", "", 1_000, 5_000)
+                .unwrap()
+                .is_none()
+        );
+        db.register_transform_runtime("ops", "cpu", &gpu, "local", 5_000)
+            .unwrap();
+        let (reclaimed, _) = db
+            .claim_transform_work("ops", "cpu", "", 1_000, 5_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (reclaimed.claim_generation, reclaimed.lease_expiries),
+            (2, 1)
+        );
+
+        // Each registration is one ledger record; the relabel names the set it replaced.
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some(crate::sekai::governed_transform::TRANSFORM_RUNTIME_REGISTERED.into()),
+                target_id: Some("transform_runtime:ops:cpu".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut decisions: Vec<_> = decisions
+            .iter()
+            .map(|decision| (decision.timestamp, decision))
+            .collect();
+        decisions.sort_by_key(|(timestamp, _)| *timestamp);
+        let [(_, first), (_, replaced)] = decisions.as_slice() else {
+            panic!("two registrations recorded, got {}", decisions.len());
+        };
+        assert_eq!(
+            (first.actor.as_str(), first.outcome.as_str()),
+            ("local", "registered")
+        );
+        assert_eq!(first.evidence["labels"], "{}");
+        assert!(!first.evidence.contains_key("previous_labels_digest"));
+        assert_eq!(replaced.outcome, "replaced");
+        assert_eq!(replaced.evidence["labels"], r#"{"accelerator":"gpu"}"#);
+        assert_eq!(
+            replaced.evidence["labels_digest"],
+            crate::sekai::governed_transform::placement_labels_digest(&gpu)
+        );
+        assert_eq!(
+            replaced.evidence["previous_labels_digest"],
+            first.evidence["labels_digest"]
+        );
+    }
+
+    #[test]
     fn scheduled_isolated_tick_copies_put_owner_onto_work() {
         let db = db();
         db.create_dataset(&dataset("in")).unwrap();
@@ -7556,7 +7795,9 @@ mod tests {
             .unwrap();
         let admitted = db.tick_governed_transforms(1_500).unwrap();
         assert_eq!(admitted.len(), 1);
-        let claimable = db.list_claimable_transform_work("ops", 1_500, 10).unwrap();
+        let claimable = db
+            .list_claimable_transform_work("ops", "runner-a", 1_500, 10)
+            .unwrap();
         assert_eq!(claimable.len(), 1);
         assert_eq!(claimable[0].transform_id, "iso1");
         assert_eq!(claimable[0].tenant_id, "tenant-a");
@@ -7592,6 +7833,7 @@ mod tests {
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: Some(TransformTrigger {
@@ -7605,7 +7847,9 @@ mod tests {
             .unwrap();
         db.run_governed_transform_owned("ops", "t-up", false, 20, "tenant-a", "")
             .unwrap();
-        let claimable = db.list_claimable_transform_work("ops", 30, 10).unwrap();
+        let claimable = db
+            .list_claimable_transform_work("ops", "runner-a", 30, 10)
+            .unwrap();
         assert_eq!(claimable.len(), 1);
         assert_eq!(claimable[0].transform_id, "t-iso-down");
         assert_eq!(claimable[0].tenant_id, "tenant-a");
@@ -7722,6 +7966,7 @@ mod tests {
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -7893,6 +8138,7 @@ mod tests {
                         dataset_id: "right".into(),
                     },
                 ],
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -7968,6 +8214,7 @@ mod tests {
                         dataset_id: "right".into(),
                     },
                 ],
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -8325,7 +8572,9 @@ mod tests {
         db.put_governed_transform(&second, 11).unwrap();
         let admitted = db.tick_governed_transforms(1_500).unwrap();
         assert_eq!(admitted.len(), 1);
-        let leftover = db.list_claimable_transform_work("ops", 1_500, 10).unwrap();
+        let leftover = db
+            .list_claimable_transform_work("ops", "runner-a", 1_500, 10)
+            .unwrap();
         assert_eq!(leftover.len(), 1);
     }
 
@@ -8522,7 +8771,9 @@ mod tests {
         let admitted = db.tick_governed_transforms(1_500).unwrap();
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].transform_id, "iso2");
-        let claimable = db.list_claimable_transform_work("ops", 1_500, 10).unwrap();
+        let claimable = db
+            .list_claimable_transform_work("ops", "runner-a", 1_500, 10)
+            .unwrap();
         assert_eq!(claimable.len(), 2);
     }
 
@@ -8971,6 +9222,7 @@ mod tests {
                         dataset_id: "in".into(),
                     },
                 ],
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -9302,6 +9554,7 @@ mod tests {
                     alias: "input".into(),
                     dataset_id: "other".into(),
                 }],
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -9623,6 +9876,7 @@ mod tests {
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
+                requires: Default::default(),
             }),
             schedule: None,
             trigger: None,

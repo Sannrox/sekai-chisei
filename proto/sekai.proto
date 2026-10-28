@@ -887,6 +887,15 @@ message GovernedTransform {
   int64 schedule_every_ms = 16;
   bool trigger_on_input_commit = 17;
   int64 trigger_debounce_ms = 18;
+  // Placement labels a claiming runtime must carry, every pair exactly
+  // (#1733). Isolated-process profile only; keys must not repeat. Part of
+  // definition_digest when non-empty. Planes before this field drop it.
+  repeated TransformLabel requires = 19;
+}
+// One placement label: an exact key and value.
+message TransformLabel {
+  string key = 1;
+  string value = 2;
 }
 message PutGovernedTransformRequest {
   GovernedTransform transform = 1;
@@ -1030,8 +1039,27 @@ message TransformWork {
   int64 created_at_ms = 13;
   string tenant_id = 14;
 }
+// Labels a worker registers for its runtime id in one namespace (#1733).
+// Listing and claiming read them at claim time; an unregistered runtime has
+// none and sees only runs without requirements.
+message TransformRuntime {
+  string namespace = 1;
+  string runtime_id = 2;
+  repeated TransformLabel labels = 3;
+  int64 updated_at_ms = 4;
+}
+// Replaces the runtime's labels. Keys must not repeat.
+message RegisterTransformRuntimeRequest {
+  string namespace = 1;
+  string runtime_id = 2;
+  repeated TransformLabel labels = 3;
+}
+message RegisterTransformRuntimeResponse {
+  TransformRuntime runtime = 1;
+}
 message ListClaimableTransformWorkRequest {
   string namespace = 1;
+  // Lists only runs whose requirements this runtime's registered labels meet.
   string runtime_id = 2;
   int32 limit = 3;
 }
@@ -4758,6 +4786,7 @@ service SekaiService {
   rpc GetGovernedTransformRun(GetGovernedTransformRunRequest) returns (GetGovernedTransformRunResponse);
   rpc ListGovernedTransforms(ListGovernedTransformsRequest) returns (ListGovernedTransformsResponse);
   rpc ListGovernedTransformRuns(ListGovernedTransformRunsRequest) returns (ListGovernedTransformRunsResponse);
+  rpc RegisterTransformRuntime(RegisterTransformRuntimeRequest) returns (RegisterTransformRuntimeResponse);
   rpc ListClaimableTransformWork(ListClaimableTransformWorkRequest) returns (ListClaimableTransformWorkResponse);
   rpc ClaimTransformWork(ClaimTransformWorkRequest) returns (ClaimTransformWorkResponse);
   rpc HeartbeatTransformClaim(HeartbeatTransformClaimRequest) returns (HeartbeatTransformClaimResponse);

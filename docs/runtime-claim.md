@@ -27,7 +27,10 @@ isolated-process transform runners share one crate with `sekai-proto` and the
 compatibility matrix. `CoreLoopClient::runtime_claim()` lists and claims by
 dispatch kind, heartbeats, acks, reports claim events, streams admitted
 transform input snapshots, writes fenced transform results, and applies
-fenced streaming object batches.
+fenced streaming object batches. `register_transform_runtime` registers the
+runtime's placement labels; a run whose `requires` those labels do not meet
+is neither listed nor claimable for it, and a targeted claim of one is
+contention (see [governed-transforms.md](governed-transforms.md)).
 
 Typed errors keep fence loss, idle, contention, denial, and unavailability
 distinct. `SdkError` does not retain server status text, so the client maps

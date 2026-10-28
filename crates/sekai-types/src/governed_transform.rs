@@ -150,6 +150,11 @@ pub struct IsolatedProcessSpec {
     pub runtime_image: String,
     #[serde(default)]
     pub inputs: Vec<TransformInput>,
+    /// Placement labels a claiming runtime must carry, all of them, exactly
+    /// (#1733). Empty means any runtime may claim, and keeps the digest of
+    /// definitions written before placement existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub requires: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +305,15 @@ pub struct TransformWork {
     pub tenant_id: String,
 }
 
+/// Placement labels a worker registered for its runtime id (#1733).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransformRuntime {
+    pub namespace: String,
+    pub runtime_id: String,
+    pub labels: BTreeMap<String, String>,
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Default)]
 pub struct ClaimTransformWorkOutcome {
     pub claimed: Option<(TransformWork, GovernedTransform)>,
@@ -384,6 +398,7 @@ impl GovernedTransform {
         }
         if let Some(spec) = self.isolated_process.as_mut() {
             prepare_isolated(&mut self.input_dataset_id, spec, &self.steps)?;
+            validate_placement_labels("requires", &spec.requires)?;
         } else if let Some(spec) = self.analytical.as_mut() {
             prepare_analytical(&mut self.input_dataset_id, spec, &self.steps)?;
         } else {
@@ -543,6 +558,16 @@ pub fn definition_digest(transform: &GovernedTransform) -> String {
         if let Ok(inputs) = serde_json::to_vec(&spec.inputs) {
             hasher.update((inputs.len() as u64).to_le_bytes());
             hasher.update(inputs);
+        }
+        // Hashed only when present, so unconstrained definitions keep their
+        // earlier digest and admitted runs stay valid.
+        if !spec.requires.is_empty() {
+            hash_field(&mut hasher, "requires");
+            hasher.update((spec.requires.len() as u64).to_le_bytes());
+            for (key, value) in &spec.requires {
+                hash_field(&mut hasher, key);
+                hash_field(&mut hasher, value);
+            }
         }
     }
     if let Some(schedule) = &transform.schedule {
@@ -742,6 +767,186 @@ fn prepare_isolated(
         }
     }
     Ok(())
+}
+
+/// Most placement labels one definition may require or one runtime may carry.
+pub const MAX_PLACEMENT_LABELS: usize = 32;
+/// Longest placement label key or value, in bytes.
+pub const MAX_PLACEMENT_LABEL_LEN: usize = 63;
+
+/// Builds a placement label set from key and value pairs as they arrive on
+/// the wire. A repeated key is refused rather than collapsed, so a caller
+/// never gets a set other than the one it sent.
+pub fn placement_labels<I>(
+    field: &str,
+    pairs: I,
+) -> Result<BTreeMap<String, String>, TransformError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut labels = BTreeMap::new();
+    for (key, value) in pairs {
+        if labels.insert(key, value).is_some() {
+            return Err(TransformError::InvalidArgument(format!(
+                "{field} repeats a label key"
+            )));
+        }
+    }
+    validate_placement_labels(field, &labels)?;
+    Ok(labels)
+}
+
+/// Keys are 1 to 63 bytes of ASCII letters, digits, `-`, `_`, `.` and `/`,
+/// starting with a letter or digit. Values are the same without `/`.
+pub fn validate_placement_labels(
+    field: &str,
+    labels: &BTreeMap<String, String>,
+) -> Result<(), TransformError> {
+    if labels.len() > MAX_PLACEMENT_LABELS {
+        return Err(TransformError::InvalidArgument(format!(
+            "{field} allows at most {MAX_PLACEMENT_LABELS} labels"
+        )));
+    }
+    let valid = |text: &str, slash: bool| {
+        (1..=MAX_PLACEMENT_LABEL_LEN).contains(&text.len())
+            && text.starts_with(|first: char| first.is_ascii_alphanumeric())
+            && text.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '-' | '_' | '.')
+                    || (slash && character == '/')
+            })
+    };
+    for (key, value) in labels {
+        if !valid(key, true) || !valid(value, false) {
+            return Err(TransformError::InvalidArgument(format!(
+                "{field} label must be 1-{MAX_PLACEMENT_LABEL_LEN} characters of letters, digits, '-', '_' or '.'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// True when `labels` carries every required pair with the same value.
+pub fn placement_satisfied(
+    requires: &BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
+) -> bool {
+    requires
+        .iter()
+        .all(|(key, value)| labels.get(key) == Some(value))
+}
+
+/// Placement requirements of an admitted definition, read from the JSON the
+/// work row keeps. `None` when the JSON does not parse; the claim path then
+/// fails the run as a changed definition, as it always has.
+pub fn admitted_placement_requires(definition_json: &str) -> Option<BTreeMap<String, String>> {
+    #[derive(Deserialize)]
+    struct Admitted {
+        #[serde(default)]
+        isolated_process: Option<Placement>,
+    }
+    #[derive(Deserialize)]
+    struct Placement {
+        #[serde(default)]
+        requires: BTreeMap<String, String>,
+    }
+    let admitted: Admitted = serde_json::from_str(definition_json).ok()?;
+    Some(
+        admitted
+            .isolated_process
+            .map(|placement| placement.requires)
+            .unwrap_or_default(),
+    )
+}
+
+/// True when a runtime carrying `labels` may claim the run admitted as
+/// `definition_json`. A definition that does not parse is let through: the
+/// claim then fails the run as changed, as before placement existed.
+pub fn placement_admits(definition_json: &str, labels: &BTreeMap<String, String>) -> bool {
+    admitted_placement_requires(definition_json)
+        .is_none_or(|requires| placement_satisfied(&requires, labels))
+}
+
+/// Decision ledger action for a runtime label registration.
+pub const TRANSFORM_RUNTIME_REGISTERED: &str = "transform_runtime_register";
+
+/// `sha256:` digest of a label set, stable across key order.
+pub fn placement_labels_digest(labels: &BTreeMap<String, String>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((labels.len() as u64).to_le_bytes());
+    for (key, value) in labels {
+        hash_field(&mut hasher, key);
+        hash_field(&mut hasher, value);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Ledger record of one registration, written in the upsert's transaction.
+/// `previous` is the set it replaced, `None` for a first registration.
+pub fn transform_runtime_decision(
+    runtime: &TransformRuntime,
+    previous: Option<&BTreeMap<String, String>>,
+    actor: &str,
+) -> crate::decision_ledger::Decision {
+    let mut evidence = HashMap::from([
+        ("namespace".to_string(), runtime.namespace.clone()),
+        ("runtime_id".to_string(), runtime.runtime_id.clone()),
+        (
+            "labels".to_string(),
+            serde_json::to_string(&runtime.labels).unwrap_or_default(),
+        ),
+        (
+            "labels_digest".to_string(),
+            placement_labels_digest(&runtime.labels),
+        ),
+    ]);
+    if let Some(previous) = previous {
+        evidence.insert(
+            "previous_labels_digest".into(),
+            placement_labels_digest(previous),
+        );
+    }
+    crate::decision_ledger::Decision {
+        id: format!(
+            "{TRANSFORM_RUNTIME_REGISTERED}:{}:{}:{}",
+            runtime.namespace,
+            runtime.runtime_id,
+            uuid::Uuid::new_v4().simple()
+        ),
+        timestamp: runtime.updated_at_ms,
+        actor: actor.to_string(),
+        action: TRANSFORM_RUNTIME_REGISTERED.into(),
+        reason: String::new(),
+        evidence,
+        target_id: format!(
+            "transform_runtime:{}:{}",
+            runtime.namespace, runtime.runtime_id
+        ),
+        outcome: if previous.is_some() {
+            "replaced"
+        } else {
+            "registered"
+        }
+        .into(),
+    }
+}
+
+/// Validated registration of `runtime_id` with `labels`, for either store.
+pub fn registered_transform_runtime(
+    namespace: &str,
+    runtime_id: &str,
+    labels: &BTreeMap<String, String>,
+    now_ms: i64,
+) -> Result<TransformRuntime, String> {
+    require_token("namespace", namespace).map_err(|error| error.message())?;
+    require_token("runtime_id", runtime_id).map_err(|error| error.message())?;
+    validate_placement_labels("labels", labels).map_err(|error| error.message())?;
+    Ok(TransformRuntime {
+        namespace: namespace.to_string(),
+        runtime_id: runtime_id.to_string(),
+        labels: labels.clone(),
+        updated_at_ms: now_ms,
+    })
 }
 
 pub fn hash_field(hasher: &mut Sha256, value: &str) {
