@@ -106,6 +106,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build benchmarks
         run: cargo build --release --benches --bin perf-gate
+      # Kept out of the default suite, where its wall-clock ratio flakes
+      # (#1884); a release build on this job holds it.
+      - name: Mixed GetObject p99 during a source batch
+        run: cargo test --release --locked --test it object_path_benchmark::mixed_get_object_p99_stays_within_2x_idle_during_source_batch -- --ignored --exact
       - name: Run object-path matrix
         run: |
           set -euo pipefail

@@ -17,13 +17,18 @@ struct OpsState {
     db: Arc<RuntimeDb>,
     chisei_db: Option<Arc<RuntimeDb>>,
     provider_registry_state_path: PathBuf,
+    /// Sekai store whose transform work queue `/metrics` reads; `None`
+    /// on a process that does not serve Sekai.
+    transform_queue: Option<Arc<RuntimeDb>>,
 }
 
 /// Build the ops HTTP router: unauthenticated health/metrics plus the
-/// authenticated operator console under `/console`.
+/// authenticated operator console under `/console`. With `transform_queue`,
+/// each scrape also reads the transform work queue gauges from it.
 pub fn router(
     db: Arc<RuntimeDb>,
     chisei_db: Option<Arc<RuntimeDb>>,
+    transform_queue: Option<Arc<RuntimeDb>>,
     provider_registry_state_path: PathBuf,
     credential_store: Arc<PrincipalCredentialStore>,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
@@ -36,6 +41,7 @@ pub fn router(
             db: db.clone(),
             chisei_db,
             provider_registry_state_path,
+            transform_queue,
         });
 
     let console = console::router(ConsoleState {
@@ -52,11 +58,13 @@ pub fn router(
     ops.merge(console)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn bind_and_spawn(
     bind: &str,
     port: u16,
     db: Arc<RuntimeDb>,
     chisei_db: Option<Arc<RuntimeDb>>,
+    transform_queue: Option<Arc<RuntimeDb>>,
     provider_registry_state_path: PathBuf,
     credential_store: Arc<PrincipalCredentialStore>,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
@@ -69,6 +77,7 @@ pub async fn bind_and_spawn(
     let app = router(
         db,
         chisei_db,
+        transform_queue,
         provider_registry_state_path,
         credential_store,
         assertion_authority,
@@ -87,11 +96,25 @@ pub async fn bind_and_spawn(
     Ok(())
 }
 
-async fn metrics() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        crate::obs::metrics::handle().render(),
-    )
+async fn metrics(State(state): State<OpsState>) -> impl IntoResponse {
+    let mut body = crate::obs::metrics::handle().render();
+    if let Some(db) = state.transform_queue {
+        let queue = tokio::task::spawn_blocking(move || {
+            crate::sekai::governed_transform::transform_work_depth_metrics(
+                &db,
+                crate::sekai::dataset_version::now_ms(),
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        // Without a store read the gauges are absent; the scrape still succeeds.
+        match queue {
+            Ok(queue) => body.push_str(&queue),
+            Err(error) => warn!(error = %error, "transform work queue gauges not read"),
+        }
+    }
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 async fn healthz() -> impl IntoResponse {

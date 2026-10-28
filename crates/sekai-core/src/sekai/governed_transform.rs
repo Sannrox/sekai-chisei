@@ -363,6 +363,34 @@ pub fn compute_preview_tables(
     Ok((rows, String::new()))
 }
 
+/// Prometheus text of the transform work queue gauges, read from the store
+/// at scrape time (#1732). Only isolated-process runs are queued; other
+/// profiles run in the request. The output depends on store state only, so
+/// every plane instance on one store reports the same series.
+pub fn transform_work_depth_metrics(
+    db: &crate::db::runtime_db::RuntimeDb,
+    now_ms: i64,
+) -> Result<String, String> {
+    let pools = db
+        .transform_pool_depths(now_ms)?
+        .into_iter()
+        .map(|depth| crate::obs::signals::TransformPoolGauge {
+            pool: depth.pool,
+            queued: depth.queued,
+            claimable: depth.claimable,
+            oldest_claimable_age_seconds: depth
+                .oldest_claimable_created_at_ms
+                .map_or(0.0, |oldest| {
+                    now_ms.saturating_sub(oldest).max(0) as f64 / 1000.0
+                }),
+        })
+        .collect();
+    Ok(crate::obs::signals::render_transform_work_depth(
+        ISOLATED_CLASS,
+        pools,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +524,19 @@ mod tests {
     }
 
     #[test]
+    fn isolated_process_code_participates_in_digest() {
+        let base = isolated_transform("python", "runner:1");
+        let with = |code: &str| {
+            let mut transform = base.clone();
+            transform.isolated_process.as_mut().unwrap().code = code.into();
+            transform.definition_digest.clear();
+            transform.prepare().unwrap().definition_digest
+        };
+        assert_ne!(with("print(1)"), base.definition_digest);
+        assert_ne!(with("print(1)"), with("print(2)"));
+    }
+
+    #[test]
     fn placement_requires_participates_in_digest() {
         let base = isolated_transform("python", "runner:1");
         let with = |pairs: &[(&str, &str)]| {
@@ -536,6 +577,15 @@ mod tests {
             &labels(&[("accelerator", "GPU"), ("zone", "a")])
         ));
         assert!(placement_satisfied(&BTreeMap::new(), &BTreeMap::new()));
+    }
+
+    #[test]
+    fn transform_pool_is_default_or_a_ledger_digest_prefix() {
+        assert_eq!(transform_pool(&BTreeMap::new()), DEFAULT_TRANSFORM_POOL);
+        let gpu = BTreeMap::from([("accelerator".to_string(), "gpu".to_string())]);
+        let pool = transform_pool(&gpu);
+        assert_eq!(pool.len(), 16);
+        assert!(placement_labels_digest(&gpu).starts_with(&format!("sha256:{pool}")));
     }
 
     #[test]
@@ -641,6 +691,7 @@ mod tests {
                 runtime_image: runtime_image.into(),
                 inputs: Vec::new(),
                 requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,

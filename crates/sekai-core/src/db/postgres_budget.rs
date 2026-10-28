@@ -411,55 +411,11 @@ impl PostgresDb {
         delta: i64,
         now_ms: i64,
     ) -> Result<(), String> {
-        let chain = scope_chain(scope_id);
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        for scope in &chain {
-            let key = budget_lock_key(metric, scope);
-            transaction
-                .query_one(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                    &[&key],
-                )
-                .map_err(|error| format!("lock budget scope {scope}: {error}"))?;
-        }
-        for scope in &chain {
-            let period_type = transaction
-                .query_opt(
-                    "SELECT period_type FROM chisei_budget_limits
-                     WHERE scope_id = $1 AND metric = $2",
-                    &[&scope, &metric],
-                )
-                .map_err(|error| error.to_string())?
-                .map(|row| row.get::<_, String>(0))
-                .unwrap_or_else(|| "daily".to_string());
-            let period_start = period_start_ms(&period_type, now_ms);
-            transaction
-                .execute(
-                    "INSERT INTO chisei_budget_usage
-                        (scope_id, metric, period_start, amount_used)
-                     VALUES ($1, $2, $3, GREATEST($4::bigint, 0))
-                     ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
-                        amount_used = GREATEST(chisei_budget_usage.amount_used + $4, 0)",
-                    &[&scope, &metric, &period_start, &delta],
-                )
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute(
-                    "INSERT INTO chisei_budget_attributions
-                        (source_scope_id, applied_scope_id, metric, period_start, amount_used)
-                     VALUES ($1, $2, $3, $4, GREATEST($5::bigint, 0))
-                     ON CONFLICT (source_scope_id, applied_scope_id, metric, period_start)
-                     DO UPDATE SET
-                        amount_used = GREATEST(
-                            chisei_budget_attributions.amount_used + $5, 0
-                        )",
-                    &[&scope_id, &scope, &metric, &period_start, &delta],
-                )
-                .map_err(|error| error.to_string())?;
-        }
+        adjust_chain_tx(&mut transaction, scope_id, metric, delta, now_ms)?;
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -1006,6 +962,64 @@ fn pg_insert_transfer(
         ],
     )
     .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Add `delta` to `scope_id` and every ancestor's usage and attribution under
+/// their advisory locks, in the caller's transaction, so a caller can pair it
+/// atomically with another write, such as releasing a reservation (#1902).
+pub(crate) fn adjust_chain_tx(
+    transaction: &mut postgres::Transaction<'_>,
+    scope_id: &str,
+    metric: &str,
+    delta: i64,
+    now_ms: i64,
+) -> Result<(), String> {
+    let chain = scope_chain(scope_id);
+    for scope in &chain {
+        let key = budget_lock_key(metric, scope);
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&key],
+            )
+            .map_err(|error| format!("lock budget scope {scope}: {error}"))?;
+    }
+    for scope in &chain {
+        let period_type = transaction
+            .query_opt(
+                "SELECT period_type FROM chisei_budget_limits
+                 WHERE scope_id = $1 AND metric = $2",
+                &[&scope, &metric],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, String>(0))
+            .unwrap_or_else(|| "daily".to_string());
+        let period_start = period_start_ms(&period_type, now_ms);
+        transaction
+            .execute(
+                "INSERT INTO chisei_budget_usage
+                    (scope_id, metric, period_start, amount_used)
+                 VALUES ($1, $2, $3, GREATEST($4::bigint, 0))
+                 ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
+                    amount_used = GREATEST(chisei_budget_usage.amount_used + $4, 0)",
+                &[&scope, &metric, &period_start, &delta],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO chisei_budget_attributions
+                    (source_scope_id, applied_scope_id, metric, period_start, amount_used)
+                 VALUES ($1, $2, $3, $4, GREATEST($5::bigint, 0))
+                 ON CONFLICT (source_scope_id, applied_scope_id, metric, period_start)
+                 DO UPDATE SET
+                    amount_used = GREATEST(
+                        chisei_budget_attributions.amount_used + $5, 0
+                    )",
+                &[&scope_id, &scope, &metric, &period_start, &delta],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 

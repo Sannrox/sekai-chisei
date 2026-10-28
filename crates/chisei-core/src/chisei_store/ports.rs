@@ -136,6 +136,7 @@ chisei_store_trait! {
         fn get_operation_receipt(&self, operation_id: &str) -> Result<Option<OperationReceipt>, String>;
         fn find_operation_receipt_by_request_id(&self, request_id: &str) -> Result<Option<OperationReceipt>, String>;
         fn put_operation_reservation(&self, reservation: &OperationReservation) -> Result<OperationReservation, String>;
+        fn settle_pending_reservation(&self, next: &OperationReservation, refund_metric: Option<&str>) -> Result<Option<OperationReservation>, String>;
         fn get_operation_reservation(&self, namespace: &str, operation_id: &str) -> Result<Option<OperationReservation>, String>;
         fn list_pending_operation_reservations(&self, limit: usize) -> Result<Vec<OperationReservation>, String>;
         fn append_operation_receipt_event(&self, operation_id: &str, event: OperationReceiptEvent) -> Result<(OperationReceipt, bool), String>;

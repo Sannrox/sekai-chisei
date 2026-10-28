@@ -891,6 +891,11 @@ message GovernedTransform {
   // (#1733). Isolated-process profile only; keys must not repeat. Part of
   // definition_digest when non-empty. Planes before this field drop it.
   repeated TransformLabel requires = 19;
+  // The code the isolated-process engine runs: SQL or Python source
+  // (#1605). Isolated-process profile only, and required there. Stored
+  // with the definition, part of definition_digest, and returned with a
+  // claimed transform so the claiming runner has what to execute.
+  string code = 20;
 }
 // One placement label: an exact key and value.
 message TransformLabel {

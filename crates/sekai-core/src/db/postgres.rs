@@ -204,6 +204,8 @@ const TRANSFORM_RUN_OUTPUT_VERSION_SCHEMA: &str =
     include_str!("postgres/0119_transform_run_output_version.sql");
 const TRANSFORM_RUNTIME_LABELS_SCHEMA: &str =
     include_str!("postgres/0122_transform_runtime_labels.sql");
+const CHISEI_RESERVATION_CHARGE_KEY_SCHEMA: &str =
+    include_str!("postgres/0123_chisei_reservation_charge_key.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -962,6 +964,12 @@ const MIGRATIONS: &[Migration] = &[
         "transform_runtime_labels",
         TRANSFORM_RUNTIME_LABELS_SCHEMA,
         MigrationOwner::Sekai,
+    ),
+    mig(
+        122,
+        "chisei_reservation_charge_key",
+        CHISEI_RESERVATION_CHARGE_KEY_SCHEMA,
+        MigrationOwner::Chisei,
     ),
 ];
 

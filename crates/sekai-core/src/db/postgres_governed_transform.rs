@@ -19,8 +19,9 @@ use crate::sekai::governed_transform::{
     TRANSFORM_TRIGGER_CANCELLED, TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE,
     TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED, TRANSFORM_WORK_CLAIMED,
     TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows,
-    TransformOutputState, TransformRun, TransformRunInputRow, TransformRuntime, TransformWork,
-    WriteTransformRunCommand, admit_isolated_run, apply_preview_column_allowlist, bind_checkpoint,
+    TransformOutputState, TransformPoolDepth, TransformQueueGroup, TransformRun,
+    TransformRunInputRow, TransformRuntime, TransformWork, WriteTransformRunCommand,
+    admit_isolated_run, apply_preview_column_allowlist, bind_checkpoint,
     bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
     checkpoint_after_id, compute_preview_tables, compute_run_tables_until, dataset_digest,
     derive_transform_markings, evaluate_quality, fold_live_output_marking, fold_output_digest,
@@ -30,7 +31,7 @@ use crate::sekai::governed_transform::{
     preview_writeback_run, receipts_for_touched_partitions, redact_run_partition_receipts,
     refuse_dependency_cycle, registered_transform_runtime, require_bound_output_for_markings,
     rows_digest, schedule_due_bucket, transform_claim_fence_matches, transform_claim_is_current,
-    transform_completed_write_matches, transform_quota_hold_status_allows,
+    transform_completed_write_matches, transform_pool_depths, transform_quota_hold_status_allows,
     transform_runtime_decision, transform_work_is_claimable, trigger_is_due, trim_page_to_bytes,
 };
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
@@ -595,6 +596,62 @@ impl PostgresDb {
         crate::db::postgres_decision::insert_chained_decision(&mut tx, &decision)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(runtime)
+    }
+
+    /// Queue depth per worker pool across every namespace (#1732): one
+    /// aggregate over waiting work, grouped by namespace and admitted
+    /// definition, and every registered label set, read in one transaction. Takes no locks, so claims never wait on it.
+    pub fn transform_pool_depths(&self, now_ms: i64) -> Result<Vec<TransformPoolDepth>, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .build_transaction()
+            .read_only(true)
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .start()
+            .map_err(|error| error.to_string())?;
+        // An expired claim counts only if reclaiming it, which first counts
+        // the lapse, leaves it under the limit the claim enforces.
+        let waiting = "(w.status = $1 OR (w.status = $2 AND w.claim_expires_at_ms <= $3
+                        AND w.lease_expiries + 1 < $4))";
+        let args: [&(dyn postgres::types::ToSql + Sync); 4] = [
+            &TRANSFORM_WORK_PENDING,
+            &TRANSFORM_WORK_CLAIMED,
+            &now_ms,
+            &MAX_TRANSFORM_LEASE_EXPIRIES,
+        ];
+        let groups = tx
+            .query(
+                &format!(
+                    "SELECT w.namespace, w.definition_json, COUNT(*), MIN(w.created_at_ms)
+                     FROM sekai_transform_work w WHERE {waiting}
+                     GROUP BY w.namespace, w.definition_json"
+                ),
+                &args,
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| TransformQueueGroup {
+                namespace: row.get(0),
+                definition_json: row.get(1),
+                runs: row.get::<_, i64>(2).max(0) as u64,
+                oldest_created_at_ms: row.get(3),
+            })
+            .collect::<Vec<_>>();
+        let registered = tx
+            .query(
+                "SELECT DISTINCT namespace, labels_json FROM sekai_transform_runtime",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                serde_json::from_str(row.get(1))
+                    .map(|labels| (row.get::<_, String>(0), labels))
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(transform_pool_depths(&groups, &registered))
     }
 
     /// Claimable runs whose placement requirements the registered labels of
@@ -4524,10 +4581,10 @@ mod tests {
     use crate::db::postgres::ScratchDatabase;
     use crate::sekai::dataset::{ColumnDef, Dataset, RowQuery};
     use crate::sekai::governed_transform::{
-        AnalyticalSpec, CONTRACT_VERSION, ISOLATED_CLASS, IsolatedProcessSpec,
-        PARTITIONED_DIGEST_PREFIX, TRANSFORM_DEPENDENCY_CYCLE, TRANSFORM_TRIGGER_MANUAL,
-        TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_UPSTREAM, TransformInput, TransformSchedule,
-        TransformStep, TransformTrigger,
+        AnalyticalSpec, CONTRACT_VERSION, DEFAULT_TRANSFORM_POOL, ISOLATED_CLASS,
+        IsolatedProcessSpec, PARTITIONED_DIGEST_PREFIX, TRANSFORM_DEPENDENCY_CYCLE,
+        TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE, TRANSFORM_TRIGGER_UPSTREAM,
+        TransformInput, TransformSchedule, TransformStep, TransformTrigger, transform_pool,
     };
 
     fn dataset(id: &str) -> Dataset {
@@ -5123,6 +5180,7 @@ mod tests {
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
                 requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,
@@ -5793,6 +5851,7 @@ mod tests {
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
                 requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,
@@ -5947,6 +6006,7 @@ mod tests {
                     },
                 ],
                 requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,
@@ -6095,6 +6155,122 @@ mod tests {
             replaced[0].evidence["previous_labels_digest"],
             registered[0].evidence["labels_digest"]
         );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_transform_pool_depths_drop_runs_their_next_lapse_fails() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let default_pool = |now_ms| {
+            let depth = db
+                .transform_pool_depths(now_ms)
+                .unwrap()
+                .into_iter()
+                .find(|depth| depth.pool == DEFAULT_TRANSFORM_POOL)
+                .unwrap();
+            (depth.queued, depth.claimable)
+        };
+        // The claim counts each lapse before reclaiming, so a run one expiry
+        // short of the limit is no longer waiting; two short still is.
+        let mut now_ms = 30;
+        for expiries in 0..MAX_TRANSFORM_LEASE_EXPIRIES {
+            db.claim_transform_work("ops", "r", "", 1_000, now_ms)
+                .unwrap()
+                .unwrap();
+            now_ms += 2_000;
+            let waiting = expiries + 1 < MAX_TRANSFORM_LEASE_EXPIRIES;
+            let expected = if waiting { (1, 1) } else { (0, 0) };
+            assert_eq!(default_pool(now_ms), expected, "after {expiries} expiries");
+            if !waiting {
+                break;
+            }
+        }
+        // The run the gauges dropped is the one the next claim fails.
+        assert!(
+            db.claim_transform_work("ops", "r", "", 1_000, now_ms)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_transform_pool_depths_move_per_pool_and_drain_on_claim() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        let labels = |key: &str, value: &str| BTreeMap::from([(key.into(), value.into())]);
+        let run = |id: &str, requires: BTreeMap<String, String>, now_ms: i64| {
+            let mut transform = isolated_transform();
+            transform.transform_id = id.into();
+            transform.isolated_process.as_mut().unwrap().requires = requires;
+            transform.definition_digest.clear();
+            db.put_governed_transform(&transform.prepare().unwrap(), now_ms)
+                .unwrap();
+            db.run_governed_transform("ops", id, false, now_ms).unwrap();
+        };
+        let (gpu, arm) = (labels("accelerator", "gpu"), labels("arch", "arm"));
+        db.register_transform_runtime("ops", "g", &gpu, "local", 1)
+            .unwrap();
+        db.register_transform_runtime("elsewhere", "z", &labels("zone", "z1"), "local", 1)
+            .unwrap();
+        run("gpu1", gpu.clone(), 20);
+        run("arm1", arm.clone(), 30);
+        run("zone1", labels("zone", "z1"), 35);
+        let depth = |now_ms| {
+            db.transform_pool_depths(now_ms)
+                .unwrap()
+                .into_iter()
+                .map(|depth| {
+                    (
+                        depth.pool,
+                        (
+                            depth.queued,
+                            depth.claimable,
+                            depth.oldest_claimable_created_at_ms,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let (gpu_pool, arm_pool, zone_pool) = (
+            transform_pool(&gpu),
+            transform_pool(&arm),
+            transform_pool(&labels("zone", "z1")),
+        );
+        let before = depth(50);
+        assert_eq!(before[DEFAULT_TRANSFORM_POOL], (0, 0, None));
+        assert_eq!(before[&gpu_pool], (1, 1, Some(20)));
+        assert_eq!(before[&arm_pool], (1, 0, None));
+        assert_eq!(before[&zone_pool], (1, 0, None));
+        db.register_transform_runtime("ops", "a", &arm, "local", 40)
+            .unwrap();
+        run("gpu2", gpu.clone(), 45);
+        let queued = depth(50);
+        assert_eq!(queued[&gpu_pool], (2, 2, Some(20)));
+        assert_eq!(queued[&arm_pool], (1, 1, Some(30)));
+
+        db.claim_transform_work("ops", "g", "", 1_000, 60)
+            .unwrap()
+            .unwrap();
+        let claimed = depth(60);
+        assert_eq!(claimed[&gpu_pool], (1, 1, Some(45)));
+        assert_eq!(claimed[&arm_pool], (1, 1, Some(30)));
+        db.claim_transform_work("ops", "g", "", 1_000, 60)
+            .unwrap()
+            .unwrap();
+        let drained = depth(60);
+        assert_eq!(drained[&gpu_pool], (0, 0, None));
+        assert_eq!(drained[&arm_pool], (1, 1, Some(30)));
+        assert_eq!(drained[&zone_pool], (1, 0, None));
+        assert_eq!(depth(5_000)[&gpu_pool], (2, 2, Some(20)));
     }
 
     #[test]
@@ -6262,6 +6438,7 @@ mod tests {
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
                 requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: Some(TransformTrigger {
@@ -6896,6 +7073,7 @@ mod tests {
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
                 requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,

@@ -379,6 +379,7 @@ impl SekaiDb {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 expires_at_ms INTEGER NOT NULL,
+                charge_key TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (namespace, operation_id)
             );
             CREATE INDEX IF NOT EXISTS idx_chisei_operation_reservations_status
@@ -389,6 +390,8 @@ impl SekaiDb {
         for statement in [
             "ALTER TABLE chisei_gateway_request_aliases ADD COLUMN dispatch_started INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chisei_gateway_request_aliases ADD COLUMN dispatch_token TEXT",
+            // #1902: the budget key a reservation's charge was made under.
+            "ALTER TABLE chisei_operation_reservations ADD COLUMN charge_key TEXT NOT NULL DEFAULT ''",
         ] {
             match conn.execute(statement, []) {
                 Ok(_) => {}
