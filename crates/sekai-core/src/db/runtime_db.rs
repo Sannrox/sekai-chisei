@@ -4741,6 +4741,15 @@ impl RuntimeDb {
         }
     }
 
+    pub fn mark_decision_follow_ups_recorded(&self, instance_id: &str) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.mark_decision_follow_ups_recorded(instance_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.mark_decision_follow_ups_recorded(instance_id)
+            }),
+        }
+    }
+
     pub fn mark_admission_follow_ups_recorded(&self, instance_id: &str) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.mark_admission_follow_ups_recorded(instance_id),

@@ -362,6 +362,21 @@ impl PostgresDb {
         Ok(true)
     }
 
+    /// Marks an approver decision's follow-ups recorded (#1948); see the
+    /// SQLite store.
+    pub fn mark_decision_follow_ups_recorded(&self, instance_id: &str) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE sekai_action_instances
+                 SET body_json = jsonb_set(body_json::jsonb, '{admission_lease,decision_follow_ups_recorded}', 'true')::text
+                 WHERE instance_id = $1
+                   AND (body_json::jsonb #>> '{admission_lease,decision_follow_ups_recorded}')::boolean = false",
+                &[&instance_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// Marks the admission's follow-ups recorded (#1943); see the SQLite
     /// store.
     pub fn mark_admission_follow_ups_recorded(&self, instance_id: &str) -> Result<(), String> {
