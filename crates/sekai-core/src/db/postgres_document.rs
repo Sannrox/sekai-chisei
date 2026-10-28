@@ -6,7 +6,13 @@ use crate::db::postgres::{PostgresDb, advisory_lock_key};
 use crate::sekai::document::{DOCUMENT_UNAVAILABLE, DocumentRendition, GovernedDocument};
 
 impl PostgresDb {
-    pub fn put_governed_document(&self, document: &GovernedDocument) -> Result<(), String> {
+    /// Insert `document` unless its id is taken, under the document's advisory
+    /// lock. Returns `None` when this call stored it, or the record that
+    /// already holds the id, untouched (#1776).
+    pub fn insert_governed_document(
+        &self,
+        document: &GovernedDocument,
+    ) -> Result<Option<GovernedDocument>, String> {
         let json = serde_json::to_string(document)
             .map_err(|error| format!("encode governed document: {error}"))?;
         let mut connection = self.connection()?;
@@ -23,14 +29,12 @@ impl PostgresDb {
             &[&lock_key],
         )
         .map_err(|error| error.to_string())?;
-        let changed = tx
+        let inserted = tx
             .execute(
                 "INSERT INTO sekai_governed_documents
                     (namespace, document_id, owner, record_json)
                  VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (namespace, document_id) DO UPDATE SET
-                    record_json = EXCLUDED.record_json
-                 WHERE sekai_governed_documents.owner = EXCLUDED.owner",
+                 ON CONFLICT (namespace, document_id) DO NOTHING",
                 &[
                     &document.namespace,
                     &document.document_id,
@@ -39,11 +43,24 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Err(DOCUMENT_UNAVAILABLE.into());
-        }
+        let existing = if inserted == 0 {
+            let row = tx
+                .query_one(
+                    "SELECT record_json FROM sekai_governed_documents
+                     WHERE namespace = $1 AND document_id = $2",
+                    &[&document.namespace, &document.document_id],
+                )
+                .map_err(|error| error.to_string())?;
+            let current: String = row.get(0);
+            Some(
+                serde_json::from_str(&current)
+                    .map_err(|error| format!("decode governed document: {error}"))?,
+            )
+        } else {
+            None
+        };
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
+        Ok(existing)
     }
 
     /// Read-modify-write of one document under its advisory lock, so a check made by
