@@ -254,6 +254,12 @@ fn native_cost_uses_gateway_pricing_alias_resolution() {
     };
     let pricing = crate::pricing::parse_pricing_table("gpt-5.5=3:15").unwrap();
     assert_eq!(native_execution_cost(&plan, &response, &pricing), Some(450));
+    // An unpriced model has no cost, not a zero one.
+    let unpriced = ExecutionPlan {
+        resolved_model: "native/native-default".into(),
+        ..Default::default()
+    };
+    assert_eq!(native_execution_cost(&unpriced, &response, &pricing), None);
 }
 
 #[test]

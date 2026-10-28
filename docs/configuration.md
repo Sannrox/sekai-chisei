@@ -203,7 +203,7 @@ value to stdout.
 | `CHISEI_GATEWAY_RECOVERY_SPOOL_PATH` | `data/chisei-gateway-recovery.jsonl` | Durable receipt, usage, and refusal recovery file (process CWD-relative unless absolute) |
 | `CHISEI_GATEWAY_RECOVERY_SPOOL_MAX_BYTES` | `67108864` | Hard recovery-spool capacity; new records are refused after the file reaches this size until replay or operator cleanup frees space |
 | `CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER` | unset | Set `1` to enable supported lossy provider bridges |
-| `CHISEI_GATEWAY_PRICING` | unset | Versioned per-model `input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]` USD-per-million pricing table; class rates must be supplied to price provider cache-write premiums |
+| `CHISEI_GATEWAY_PRICING` | unset | Versioned per-model `input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]` USD-per-million pricing table for gateway ledger rows and native operation receipts; class rates must be supplied to price provider cache-write premiums |
 
 The pricing format is
 `model=input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]`, with every
@@ -212,6 +212,18 @@ cache-read rate defaults to the ordinary input rate for compatibility. Cache
 write rates have no default: when a provider reports a premium-priced write
 class, configure its 5-minute or 1-hour rate explicitly or the call cost stays
 unknown instead of being billed at a misleading ordinary-input rate.
+
+The same table prices native model calls. Each entry names a model as the
+plan resolves it, either a provider-qualified id such as
+`native/native-default` or a canonical model id such as `gpt-5.5`, which
+also prices its provider-qualified alias (`openai/gpt-5.5`). Rates are stored
+as integer micro-USD per million tokens. When a call completes, Chisei prices
+the provider-reported usage with the table in force and records the result as
+`cost_usd_micros` on the receipt's `model_called` event, next to
+`input_tokens` and `output_tokens`. The recorded cost is never recomputed from
+a later table. An unpriced model's event carries no `cost_usd_micros`, not a
+zero. The combined and Chisei processes refuse to boot when the table does
+not parse, including a model listed twice.
 
 When starting `chisei-gateway` directly, set either `CHISEI_GRPC_URL` or
 `SEKAI_SOCKET`. The gateway does not inherit the control plane's built-in
