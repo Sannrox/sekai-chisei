@@ -666,6 +666,7 @@ pub async fn plan_and_execute(
         attempt_id: String::new(),
         route_override: String::new(),
         learning_pin: None,
+        budget_work_unit: String::new(),
     };
 
     let plan = client

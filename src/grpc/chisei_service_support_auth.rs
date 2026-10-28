@@ -841,6 +841,39 @@ pub(super) fn execution_budget_scope(
     }
     format!("project:{}/agent:{}", namespace.trim(), actor.trim())
 }
+
+/// The budget chain a planned execution is checked and charged against
+/// (#1866): [`execution_budget_scope`], extended with the caller's work unit
+/// when one is named. A local caller with a work unit is placed at
+/// `project:<namespace>/agent:<user or local>`, so the work unit nests under
+/// a real chain as it does for every other caller.
+pub(super) fn planned_execution_budget_scope(
+    namespace: &str,
+    actor: &str,
+    requested_user_id: &str,
+    work_unit: &str,
+) -> Result<String, Status> {
+    let work_unit = work_unit.trim();
+    if work_unit.is_empty() {
+        return Ok(execution_budget_scope(namespace, actor, requested_user_id));
+    }
+    if work_unit.contains('/') || work_unit.len() > 256 {
+        return Err(Status::invalid_argument(
+            "budget_work_unit must be at most 256 bytes without '/'",
+        ));
+    }
+    let base = if matches!(actor, "root" | "local") {
+        let agent = if requested_user_id.trim().is_empty() {
+            actor
+        } else {
+            requested_user_id.trim()
+        };
+        format!("project:{}/agent:{agent}", namespace.trim())
+    } else {
+        execution_budget_scope(namespace, actor, requested_user_id)
+    };
+    Ok(format!("{base}/work_unit:{work_unit}"))
+}
 pub(super) fn strongest_pressure(
     left: crate::chisei::budget::PressureLevel,
     right: crate::chisei::budget::PressureLevel,
