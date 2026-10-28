@@ -109,21 +109,17 @@ impl SekaiFactReader for SekaiStore {
         caller: &str,
         namespace: &str,
     ) -> Result<ClaimResolution, SekaiFactError> {
-        use sekai_core::sekai::action_work_lifecycle::{
-            ActionWorkLifecycle, CitedActionClaim, CitedClaimResolution,
-        };
-        let resolution = read(
-            ActionWorkLifecycle::new(self.runtime()).resolve_cited_claim(
-                CitedActionClaim {
-                    effect_id: &claim.effect_id,
-                    claim_generation: claim.claim_generation,
-                    fencing_token: &claim.fencing_token,
-                },
-                caller,
-                namespace,
-                chrono::Utc::now().timestamp_millis(),
-            ),
-        )?;
+        use sekai_core::sekai::action_work_lifecycle::{CitedActionClaim, CitedClaimResolution};
+        let resolution = read(self.resolve_cited_claim(
+            CitedActionClaim {
+                effect_id: &claim.effect_id,
+                claim_generation: claim.claim_generation,
+                fencing_token: &claim.fencing_token,
+            },
+            caller,
+            namespace,
+            chrono::Utc::now().timestamp_millis(),
+        ))?;
         Ok(match resolution {
             CitedClaimResolution::Live(action_type) => ClaimResolution::Live(action_type.impact()),
             CitedClaimResolution::NotFound => ClaimResolution::NotFound,
