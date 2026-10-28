@@ -500,6 +500,7 @@ impl PostgresDb {
 
     /// Grants a parked instance and applies its object write in one
     /// transaction, matching SQLite (#1139, #1314).
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_parked_action_instance(
         &self,
         granted: &ActionInstance,

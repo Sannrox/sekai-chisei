@@ -771,6 +771,7 @@ impl SekaiDb {
     /// transaction (#1139). The target object is re-digested under the write
     /// lock, so a grant either commits both the write and the transition or
     /// neither: no orphan write, and no concurrent grant can apply twice.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_parked_action_instance(
         &self,
         granted: &ActionInstance,
