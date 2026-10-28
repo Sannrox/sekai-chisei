@@ -11,16 +11,18 @@
 use sekai_chisei::grpc::client::GatewayClient;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
-    BudgetScopeUsage, DecideGatewayExecutionRequest, DecideGatewayExecutionResponse,
-    GetBudgetUsageRequest, GetBudgetUsageResponse, RecordUsageRequest, SetBudgetLimitRequest,
-    SetModelFamilyEnablementRequest, SetNamespacePolicyRequest,
+    ActionClaimRef, BudgetScopeUsage, DecideGatewayExecutionRequest,
+    DecideGatewayExecutionResponse, GetBudgetUsageRequest, GetBudgetUsageResponse,
+    RecordUsageRequest, SetBudgetLimitRequest, SetModelFamilyEnablementRequest,
+    SetNamespacePolicyRequest,
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    ActionApprovalRequirement, ActionInstance, ClassificationIncomparablePair,
-    ClassificationLattice, ClassificationParentEdge, CreateObjectRequest,
-    DecideActionInstanceRequest, EnsureTeamNamespaceRequest, GetActionInstanceRequest,
-    GetObjectRequest, ListActionInstancesRequest, Object, PutClassificationLatticeRequest,
+    ActionApprovalRequirement, ActionInstance, ClaimActionWorkRequest,
+    ClassificationIncomparablePair, ClassificationLattice, ClassificationParentEdge,
+    CreateObjectRequest, DecideActionInstanceRequest, EnsureTeamNamespaceRequest,
+    GetActionInstanceRequest, GetObjectRequest, ListActionEffectsRequest,
+    ListActionInstancesRequest, Object, PutClassificationLatticeRequest,
     SubmitActionInstanceRequest,
 };
 use serde_json::{Value, json};
@@ -31,7 +33,7 @@ use crate::product_loop_backend_conformance::{Backend, LoopServer, bearer};
 
 const PACKAGE: &str = include_str!("../examples/game-ontology/game-v1.json");
 const PACK: &str = include_str!("../examples/game-ontology/policy-pack-v1.json");
-const ROUTING: &str = include_str!("../examples/game-ontology/routing-v1.json");
+const ROUTING: &str = include_str!("../examples/game-ontology/routing-v2.json");
 
 pub(crate) fn pack() -> Value {
     serde_json::from_str(PACK).expect("policy pack json")
@@ -539,9 +541,37 @@ async fn spy_reports_are_visible_only_to_spies() {
         .unwrap_or_else(|error| panic!("commander read: {error}\n{}", game.server.logs()));
 }
 
-/// A server with the routing config applied for one player.
+/// The routing config: one namespace route policy whose impact route rule
+/// picks the models each impact class may use (#1861).
+pub(crate) fn routing() -> Value {
+    serde_json::from_str(ROUTING).expect("routing json")
+}
+
+/// The routing config as a `SetNamespacePolicy` request, with every context
+/// admitted.
+pub(crate) fn routing_policy(routing: &Value) -> SetNamespacePolicyRequest {
+    SetNamespacePolicyRequest {
+        namespace: routing["namespace"].as_str().unwrap().into(),
+        allowed_runtimes: strings(&routing["allowed_runtimes"]),
+        allowed_models: strings(&routing["allowed_models"]),
+        default_runtime: routing["default_runtime"].as_str().unwrap().into(),
+        default_model: routing["default_model"].as_str().unwrap().into(),
+        data_class: String::new(),
+        context_admission_policy_json: json!({
+            "contract_version": "chisei.context-admission/v1",
+            "default_action": "include",
+            "unknown_action": "hold_out",
+            "rules": [],
+        })
+        .to_string(),
+        impact_route_policy_json: routing["impact_routes"].to_string(),
+    }
+}
+
+/// A server with the policy pack and the routing config applied for one
+/// player.
 struct RoutedGame {
-    server: LoopServer,
+    game: GovernedGame,
     chisei: ChiseiServiceClient<GatewayClient>,
     routing: Value,
 }
@@ -550,62 +580,43 @@ const PLAYER: &str = "red";
 
 impl RoutedGame {
     async fn start() -> Self {
-        settle_budget_day().await;
         // `native` is the local model runtime and `openai` the expensive one.
         // Neither endpoint is contacted: a decision never calls a provider.
-        let server = LoopServer::spawn_with_env(
-            &Backend::Sqlite,
-            &[
-                ("NATIVE_LLM_URL", "http://127.0.0.1:9"),
-                ("OLLAMA_URL", "http://127.0.0.1:9"),
-                ("CHISEI_GATEWAY_PROVIDED_PROVIDERS", "openai"),
-            ],
-        );
-        let routing: Value = serde_json::from_str(ROUTING).expect("routing json");
-        let mut chisei = server.chisei().await;
-        let allow_context = json!({
-            "contract_version": "chisei.context-admission/v1",
-            "default_action": "include",
-            "unknown_action": "hold_out",
-            "rules": [],
-        });
-        for route in routing["routes"].as_array().unwrap() {
+        let game = GovernedGame::start_with_env(&[
+            ("NATIVE_LLM_URL", "http://127.0.0.1:9"),
+            ("OLLAMA_URL", "http://127.0.0.1:9"),
+            ("CHISEI_GATEWAY_PROVIDED_PROVIDERS", "openai"),
+        ])
+        .await;
+        let routing = routing();
+        let mut chisei = game.server.chisei().await;
+        chisei
+            .set_namespace_policy(routing_policy(&routing))
+            .await
+            .unwrap_or_else(|error| panic!("route policy: {error}\n{}", game.server.logs()));
+        // Route admission refuses any model family not enabled for the
+        // namespace; the impact route rule narrows further by class.
+        for family in strings(&routing["enabled_families"]) {
             chisei
-                .set_namespace_policy(SetNamespacePolicyRequest {
-                    namespace: route["namespace"].as_str().unwrap().into(),
-                    allowed_runtimes: strings(&route["allowed_runtimes"]),
-                    allowed_models: strings(&route["allowed_models"]),
-                    default_runtime: route["default_runtime"].as_str().unwrap().into(),
-                    default_model: route["default_model"].as_str().unwrap().into(),
-                    data_class: String::new(),
-                    context_admission_policy_json: allow_context.to_string(),
+                .set_model_family_enablement(SetModelFamilyEnablementRequest {
+                    namespace: routing["namespace"].as_str().unwrap().into(),
+                    region_label: String::new(),
+                    family_id: family,
+                    status: "enabled".into(),
+                    reason: "game-ontology/v1 routing".into(),
                 })
                 .await
-                .unwrap_or_else(|error| panic!("route policy: {error}\n{}", server.logs()));
-            // Route admission refuses any model family not enabled for the
-            // namespace, so the expensive family exists only on its route.
-            for family in strings(&route["enabled_families"]) {
-                chisei
-                    .set_model_family_enablement(SetModelFamilyEnablementRequest {
-                        namespace: route["namespace"].as_str().unwrap().into(),
-                        region_label: String::new(),
-                        family_id: family,
-                        status: "enabled".into(),
-                        reason: "game-ontology/v1 routing".into(),
-                    })
-                    .await
-                    .unwrap_or_else(|error| panic!("family: {error}\n{}", server.logs()));
-            }
+                .unwrap_or_else(|error| panic!("family: {error}\n{}", game.server.logs()));
         }
-        let game = Self {
-            server,
+        let routed = Self {
+            game,
             chisei,
             routing,
         };
-        for budget in game.budgets("day") {
-            game.set_limit(&budget, "", "").await;
+        for budget in routed.budgets("day") {
+            routed.set_limit(&budget, "", "").await;
         }
-        game
+        routed
     }
 
     fn budgets(&self, window: &str) -> Vec<Value> {
@@ -618,21 +629,12 @@ impl RoutedGame {
             .collect()
     }
 
-    fn namespace(&self, route: &str) -> String {
-        self.routing["routes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|candidate| candidate["route"] == route)
-            .unwrap_or_else(|| panic!("no {route} route"))["namespace"]
-            .as_str()
-            .unwrap()
-            .into()
+    fn namespace(&self) -> String {
+        self.routing["namespace"].as_str().unwrap().into()
     }
 
-    /// A day limit lands on the player's flat agent scope, which every
-    /// route's chain includes. A turn limit lands on the turn's work unit
-    /// under one route's namespace.
+    /// A day limit lands on the player's flat agent scope. A turn limit
+    /// lands on the turn's work unit under the routing namespace.
     async fn set_limit(&self, budget: &Value, project: &str, turn: &str) {
         self.chisei
             .clone()
@@ -646,19 +648,27 @@ impl RoutedGame {
                 ..Default::default()
             })
             .await
-            .unwrap_or_else(|error| panic!("budget: {error}\n{}", self.server.logs()));
+            .unwrap_or_else(|error| panic!("budget: {error}\n{}", self.game.server.logs()));
     }
 
-    /// Opens a turn: each route's turn limits apply to its work unit.
+    /// Opens a turn: the turn limits apply to its work unit.
     async fn open_turn(&self, turn: &str) {
         for budget in self.budgets("turn") {
-            let namespace = self.namespace(budget["route"].as_str().unwrap());
-            self.set_limit(&budget, &namespace, turn).await;
+            self.set_limit(&budget, &self.namespace(), turn).await;
         }
     }
 
-    async fn decide(&self, route: &str, turn: &str, tokens: i32) -> DecideGatewayExecutionResponse {
-        let namespace = self.namespace(route);
+    /// Asks for the expensive model, citing `claim` when the call serves
+    /// claimed Action work.
+    async fn decide(
+        &self,
+        label: &str,
+        turn: &str,
+        tokens: i32,
+        claim: Option<ActionClaimRef>,
+        route_override: &str,
+    ) -> DecideGatewayExecutionResponse {
+        let namespace = self.namespace();
         self.chisei
             .clone()
             .decide_gateway_execution(DecideGatewayExecutionRequest {
@@ -666,7 +676,7 @@ impl RoutedGame {
                 namespace: namespace.clone(),
                 requested_model: "gpt-5.5".into(),
                 operation_class: "chat".into(),
-                correlation_operation_id: format!("{route}-{turn}-{tokens}"),
+                correlation_operation_id: format!("{label}-{turn}-{tokens}"),
                 correlation_attempt: 1,
                 estimated_tokens: tokens,
                 // A cheap-eligible class with local fallback offered: a hard
@@ -679,37 +689,101 @@ impl RoutedGame {
                 local_free_available: true,
                 user_id: PLAYER.into(),
                 expected_calls: 1,
+                action_claim: claim,
+                route_override: route_override.into(),
                 ..Default::default()
             })
             .await
-            .unwrap_or_else(|error| panic!("decide: {error}\n{}", self.server.logs()))
+            .unwrap_or_else(|error| panic!("decide: {error}\n{}", self.game.server.logs()))
             .into_inner()
     }
 
-    async fn spend(&self, route: &str, turn: &str, metric: &str, amount: i32) {
+    async fn spend(&self, turn: &str, metric: &str, amount: i32) {
         self.chisei
             .clone()
             .record_usage(RecordUsageRequest {
                 tokens_used: amount,
-                project: self.namespace(route),
+                project: self.namespace(),
                 agent: PLAYER.into(),
                 work_unit: turn.into(),
                 metric: metric.into(),
-                idempotency_key: format!("{route}-{turn}-{metric}-{amount}"),
+                idempotency_key: format!("{turn}-{metric}-{amount}"),
                 ..Default::default()
             })
             .await
-            .unwrap_or_else(|error| panic!("record usage: {error}\n{}", self.server.logs()));
+            .unwrap_or_else(|error| panic!("record usage: {error}\n{}", self.game.server.logs()));
+    }
+
+    /// The admiral grants an invasion; the game runtime claims its runtime
+    /// dispatch, the high-impact work a model call may cite.
+    async fn claim_invasion(&self, key: &str) -> ActionClaimRef {
+        let logs = || self.game.server.logs();
+        let parked = self
+            .game
+            .submit(
+                "game.planet.invade",
+                key,
+                json!({"object_id": "p-rival", "occupied_by": "commander"}),
+            )
+            .await;
+        let granted = self
+            .game
+            .decide("admiral", &parked.instance_id)
+            .await
+            .unwrap_or_else(|error| panic!("grant: {error}\n{}", logs()));
+        assert_eq!(granted.status, "admitted", "{granted:?}");
+        let mut sekai = self.game.sekai.clone();
+        let effect = sekai
+            .list_action_effects(ListActionEffectsRequest {
+                instance_id: granted.instance_id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|error| panic!("effects: {error}\n{}", logs()))
+            .into_inner()
+            .effects
+            .into_iter()
+            .find(|effect| effect.kind == "runtime_dispatch")
+            .expect("invasion runtime dispatch");
+        let claimed = sekai
+            .claim_action_work(ClaimActionWorkRequest {
+                effect_id: effect.effect_id,
+                runtime_id: "default".into(),
+                request_id: format!("claim-{key}"),
+                ttl_ms: 60_000,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("claim: {error}\n{}", logs()))
+            .into_inner()
+            .effect
+            .expect("claimed effect");
+        ActionClaimRef {
+            effect_id: claimed.effect_id,
+            claim_generation: claimed.claim_generation,
+            fencing_token: claimed.claim_fencing_token,
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn routine_actions_route_local_and_only_high_impact_ones_route_expensive() {
+async fn routine_decisions_route_local_and_only_claimed_high_impact_work_routes_expensive() {
     let game = RoutedGame::start().await;
     game.open_turn("turn-1").await;
+    let local = |decision: &DecideGatewayExecutionResponse| {
+        decision.admitted
+            && decision.resolved_runtime == "native"
+            && decision.resolved_model.ends_with("native-default")
+    };
 
-    // Allowed: a high-impact decision gets the expensive model it asks for.
-    let high_impact = game.decide("high_impact", "turn-1", 100).await;
+    // A decision step serves no Action yet: asking for the expensive model
+    // gets the local one.
+    let routine = game.decide("routine", "turn-1", 100, None, "").await;
+    assert!(local(&routine), "{routine:?}");
+    // Allowed: a call serving the granted invasion's claimed work.
+    let claim = game.claim_invasion("invade-routed").await;
+    let high_impact = game
+        .decide("claimed", "turn-1", 100, Some(claim.clone()), "")
+        .await;
     assert!(high_impact.admitted, "{high_impact:?}");
     assert_eq!(
         (
@@ -718,60 +792,64 @@ async fn routine_actions_route_local_and_only_high_impact_ones_route_expensive()
         ),
         ("openai", "gpt-5.5")
     );
-    // Refused: a routine decision asking for the same model gets the local one.
-    let routine = game.decide("routine", "turn-1", 100).await;
-    assert!(routine.admitted, "{routine:?}");
-    assert_eq!(routine.resolved_runtime, "native", "{routine:?}");
-    assert!(
-        routine.resolved_model.ends_with("native-default"),
-        "{routine:?}"
-    );
+    // A claim the caller cannot prove is unclassified, and a route override
+    // cannot pin the expensive model past the rule.
+    let forged = ActionClaimRef {
+        fencing_token: "forged".into(),
+        ..claim
+    };
+    let unproven = game.decide("forged", "turn-1", 100, Some(forged), "").await;
+    assert!(local(&unproven), "{unproven:?}");
+    let pinned = game
+        .decide("pinned", "turn-1", 100, None, "openai/gpt-5.5")
+        .await;
+    assert!(!pinned.admitted, "{pinned:?}");
+    assert_eq!(pinned.deny_reason, "policy_denied", "{pinned:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn turn_budgets_cap_tokens_and_model_calls() {
     let game = RoutedGame::start().await;
-    game.open_turn("turn-1").await;
 
-    // Refused: the routine token budget and the high-impact call budget of
-    // turn 1 are spent.
-    game.spend("routine", "turn-1", "tokens", 4000).await;
-    let tokens_out = game.decide("routine", "turn-1", 100).await;
+    // Refused: turn 1's tokens and turn 2's model calls are spent.
+    game.open_turn("turn-1").await;
+    game.spend("turn-1", "tokens", 4000).await;
+    let tokens_out = game.decide("routine", "turn-1", 100, None, "").await;
     assert!(!tokens_out.admitted, "{tokens_out:?}");
     assert_eq!(tokens_out.deny_reason, "budget_denied");
     assert!(
         tokens_out.budget_scope.ends_with("work_unit:turn-1"),
         "{tokens_out:?}"
     );
-    game.spend("high_impact", "turn-1", "requests", 2).await;
-    let calls_out = game.decide("high_impact", "turn-1", 100).await;
+    game.open_turn("turn-2").await;
+    game.spend("turn-2", "requests", 6).await;
+    let calls_out = game.decide("routine", "turn-2", 100, None, "").await;
     assert!(!calls_out.admitted, "{calls_out:?}");
     assert_eq!(calls_out.deny_reason, "budget_denied");
 
     // Allowed: the next turn opens with fresh turn budgets.
-    game.open_turn("turn-2").await;
-    for route in ["routine", "high_impact"] {
-        let next = game.decide(route, "turn-2", 100).await;
-        assert!(next.admitted, "{route}: {next:?}");
-    }
+    game.open_turn("turn-3").await;
+    let next = game.decide("routine", "turn-3", 100, None, "").await;
+    assert!(next.admitted, "{next:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exhausted_day_budget_is_a_hard_stop() {
     let game = RoutedGame::start().await;
     game.open_turn("turn-1").await;
-    let allowed = game.decide("routine", "turn-1", 100).await;
+    let allowed = game.decide("routine", "turn-1", 100, None, "").await;
     assert!(allowed.admitted, "{allowed:?}");
 
-    // Refused: once the day's tokens are spent, a fresh turn on either route
-    // stops, with no fallback to a local-free model.
-    game.spend("high_impact", "turn-1", "tokens", 40_000).await;
+    // Refused: once the day's tokens are spent, a fresh turn stops, for the
+    // expensive model too, with no fallback to a local-free model.
+    game.spend("turn-1", "tokens", 40_000).await;
     game.open_turn("turn-2").await;
-    for route in ["routine", "high_impact"] {
-        let stopped = game.decide(route, "turn-2", 100).await;
-        assert!(!stopped.admitted, "{route}: {stopped:?}");
-        assert_eq!(stopped.deny_reason, "budget_denied", "{route}");
-        assert_eq!(stopped.budget_scope, format!("agent:{PLAYER}"), "{route}");
+    let claim = game.claim_invasion("invade-day").await;
+    for (label, claim) in [("routine", None), ("claimed", Some(claim))] {
+        let stopped = game.decide(label, "turn-2", 100, claim, "").await;
+        assert!(!stopped.admitted, "{label}: {stopped:?}");
+        assert_eq!(stopped.deny_reason, "budget_denied", "{label}");
+        assert_eq!(stopped.budget_scope, format!("agent:{PLAYER}"), "{label}");
     }
 }
 
@@ -803,17 +881,16 @@ async fn budget_usage_reads_model_spend_per_scope_level() {
 
     // A decision charges nothing; settled usage does. The refused decision
     // asks for more than the turn has left and charges nothing either.
-    let admitted = game.decide("routine", "turn-1", 100).await;
+    let admitted = game.decide("routine", "turn-1", 100, None, "").await;
     assert!(admitted.admitted, "{admitted:?}");
-    game.spend("routine", "turn-1", "tokens", 3900).await;
-    game.spend("routine", "turn-1", "requests", 1).await;
-    game.spend("high_impact", "turn-1", "tokens", 500).await;
-    let refused = game.decide("routine", "turn-1", 200).await;
+    game.spend("turn-1", "tokens", 3900).await;
+    game.spend("turn-1", "requests", 1).await;
+    let refused = game.decide("routine", "turn-1", 200, None, "").await;
     assert!(!refused.admitted, "{refused:?}");
     assert_eq!(refused.deny_reason, "budget_denied");
 
     let request = GetBudgetUsageRequest {
-        project: game.namespace("routine"),
+        project: game.namespace(),
         agent: PLAYER.into(),
         work_unit: "turn-1".into(),
         ..Default::default()
@@ -823,21 +900,21 @@ async fn budget_usage_reads_model_spend_per_scope_level() {
         .clone()
         .get_budget_usage(request.clone())
         .await
-        .unwrap_or_else(|error| panic!("budget usage: {error}\n{}", game.server.logs()))
+        .unwrap_or_else(|error| panic!("budget usage: {error}\n{}", game.game.server.logs()))
         .into_inner();
     let turn = format!("project:game/agent:{PLAYER}/work_unit:turn-1");
     assert_eq!(usage.scope_id, turn);
-    // Turn: the routine route's own work unit.
+    // Turn: the namespace's own work unit.
     assert_eq!(
         level(&usage, &turn, "tokens"),
         (3900, Some(4000), Some(100))
     );
     assert_eq!(level(&usage, &turn, "requests"), (1, Some(6), Some(5)));
-    // Day: the flat agent scope every route charges.
+    // Day: the flat agent scope every turn charges.
     let day = format!("agent:{PLAYER}");
     assert_eq!(
         level(&usage, &day, "tokens"),
-        (4400, Some(40_000), Some(35_600))
+        (3900, Some(40_000), Some(36_100))
     );
     assert_eq!(level(&usage, &day, "requests"), (1, Some(40), Some(39)));
     // Project and agent-in-project have no limit but report their charge.
@@ -847,7 +924,7 @@ async fn budget_usage_reads_model_spend_per_scope_level() {
         (3900, None, None)
     );
 
-    let cli: serde_json::Value = serde_json::from_str(&game.server.sekaictl_ok(&[
+    let cli: serde_json::Value = serde_json::from_str(&game.game.server.sekaictl_ok(&[
         "admin",
         "governance",
         "budget",
@@ -877,7 +954,7 @@ async fn budget_usage_reads_model_spend_per_scope_level() {
     let denied = game
         .chisei
         .clone()
-        .get_budget_usage(bearer(&game.server.token(PLAYER), request))
+        .get_budget_usage(bearer(&game.game.server.token(PLAYER), request))
         .await
         .unwrap_err();
     assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");

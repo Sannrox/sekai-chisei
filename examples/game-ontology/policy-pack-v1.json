@@ -49,6 +49,7 @@
         "additionalProperties": false
       },
       "allowed_effect_kinds": ["notify"],
+      "impact_class": "routine",
       "policy_scope": "game-spend",
       "object_kind": "treasury",
       "object_mutation": "update"
@@ -68,6 +69,7 @@
         "additionalProperties": false
       },
       "allowed_effect_kinds": ["notify"],
+      "impact_class": "routine",
       "policy_scope": "game-attacks",
       "object_kind": "planet",
       "object_mutation": "update",
@@ -94,7 +96,8 @@
         "required": ["object_id", "occupied_by"],
         "additionalProperties": false
       },
-      "allowed_effect_kinds": ["notify"],
+      "allowed_effect_kinds": ["notify", "runtime_dispatch"],
+      "impact_class": "high_impact",
       "policy_scope": "game-invasions",
       "object_kind": "planet",
       "object_mutation": "update",

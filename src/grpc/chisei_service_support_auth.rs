@@ -1214,35 +1214,70 @@ pub(super) fn receipt_event(
         attributes,
     }
 }
+/// Persist the namespace policy object. The impact route rule is changed
+/// only as `impact_route` says; `Keep` carries the stored property over as it
+/// is in the store, never from an instance's memory (#1861). The update is a
+/// compare-and-set on the object read here, retried when another instance
+/// wrote it in between, so a concurrent update cannot drop the rule.
 pub(super) fn persist_namespace_policy(
     db: &RuntimeDb,
     namespace: &str,
     policy: &Policy,
     context_admission_policy: Option<&crate::chisei::policy::ContextAdmissionPolicy>,
+    impact_route: &ImpactRouteUpdate,
+    actor: &str,
 ) -> Result<(), String> {
-    let now = chrono::Utc::now().timestamp_millis();
+    const ATTEMPTS: usize = 4;
     let external_id = format!("policy:{namespace}");
-    let mut properties = policy_properties(policy, context_admission_policy);
-    properties.insert("namespace".to_string(), namespace.to_string());
-
-    if let Some(mut existing) = db.find_by_external_id(&external_id)? {
-        existing.name = namespace.to_string();
-        existing.namespace = namespace.to_string();
-        existing.properties = properties;
-        existing.updated = now;
-        db.update_object(&existing)
-    } else {
-        db.create_object(&Object {
-            id: format!("policy-{namespace}"),
-            kind: POLICY_KIND.to_string(),
-            name: namespace.to_string(),
-            namespace: namespace.to_string(),
-            external_id,
-            properties,
-            created: now,
-            updated: now,
-        })
+    for _ in 0..ATTEMPTS {
+        let now = chrono::Utc::now().timestamp_millis();
+        let existing = db.find_by_external_id(&external_id)?;
+        let mut properties = policy_properties(policy, context_admission_policy);
+        properties.insert("namespace".to_string(), namespace.to_string());
+        match impact_route {
+            ImpactRouteUpdate::Keep => {
+                if let Some(stored) = existing
+                    .as_ref()
+                    .and_then(|object| object.properties.get(IMPACT_ROUTE_POLICY_PROPERTY))
+                {
+                    properties.insert(IMPACT_ROUTE_POLICY_PROPERTY.into(), stored.clone());
+                }
+            }
+            ImpactRouteUpdate::Clear => {}
+            ImpactRouteUpdate::Set(rule) => {
+                properties.insert(
+                    IMPACT_ROUTE_POLICY_PROPERTY.into(),
+                    serde_json::to_string(rule).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        let Some(expected) = existing else {
+            return db.create_object(&Object {
+                id: format!("policy-{namespace}"),
+                kind: POLICY_KIND.to_string(),
+                name: namespace.to_string(),
+                namespace: namespace.to_string(),
+                external_id,
+                properties,
+                created: now,
+                updated: now,
+            });
+        };
+        let mut updated = expected.clone();
+        updated.name = namespace.to_string();
+        updated.namespace = namespace.to_string();
+        updated.properties = properties;
+        updated.updated = now.max(expected.updated + 1);
+        match db.update_object_with_authorized_snapshot(&updated, Some(&expected), actor, None) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => continue,
+            Err(error) if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
     }
+    Err("namespace policy changed concurrently; retry".into())
 }
 pub(super) fn from_proto_evaluator_definition(
     value: EvaluatorDefinition,

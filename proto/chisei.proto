@@ -312,6 +312,12 @@ message ExecutionPlan {
   // the claim again, and the model call records that result.
   string action_impact_class = 50;
   string action_claim_resolution = 51;
+  // Namespace impact route rule (#1861), empty when the namespace has none:
+  // the class the call routed as (routine | high_impact | unclassified) and
+  // the rule's decision (allowed | substituted | refused). Execution
+  // re-resolves the claim and applies the rule again before the model call.
+  string impact_route_class = 52;
+  string impact_route_decision = 53;
 }
 
 message EgressDecision {
@@ -1018,6 +1024,11 @@ message SetNamespacePolicyRequest {
   // Canonical JSON for the opt-in chisei.context-admission/v1 policy.
   // Empty preserves an existing context policy; JSON null clears it.
   string context_admission_policy_json = 7;
+  // Canonical JSON for the opt-in chisei.impact-route/v1 rule (#1861): the
+  // models each impact class may use, with an `unclassified` entry for calls
+  // that cite no live Action Work claim. Empty preserves an existing rule;
+  // JSON null clears it.
+  string impact_route_policy_json = 8;
 }
 message SetNamespacePolicyResponse { PolicyResolution resolution = 1; }
 

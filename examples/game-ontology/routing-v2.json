@@ -1,0 +1,24 @@
+{
+  "version": "game-ontology.routing/v2",
+  "package": "game-ontology/v1",
+  "namespace": "game",
+  "allowed_runtimes": ["native", "openai"],
+  "allowed_models": ["native-default", "gpt-5.5"],
+  "default_runtime": "native",
+  "default_model": "native-default",
+  "enabled_families": ["native", "openai"],
+  "impact_routes": {
+    "contract_version": "chisei.impact-route/v1",
+    "routes": {
+      "unclassified": {"allowed_models": ["native-default"]},
+      "routine": {"allowed_models": ["native-default"]},
+      "high_impact": {"allowed_models": ["native-default", "gpt-5.5"]}
+    }
+  },
+  "budgets": [
+    {"window": "turn", "metric": "tokens", "period_type": "daily", "max": 4000},
+    {"window": "turn", "metric": "requests", "period_type": "daily", "max": 6},
+    {"window": "day", "metric": "tokens", "period_type": "daily", "max": 40000},
+    {"window": "day", "metric": "requests", "period_type": "daily", "max": 40}
+  ]
+}

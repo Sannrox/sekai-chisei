@@ -7,6 +7,9 @@
 use super::*;
 
 impl ChiseiServiceImpl {
+    /// `impact` is the namespace impact route rule's entry for the call
+    /// (#1861); alias and fallback selection rank only models it permits.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn resolve_live_model(
         &self,
         model: &str,
@@ -15,6 +18,7 @@ impl ChiseiServiceImpl {
         safe_only: bool,
         safe_providers: &std::collections::HashSet<String>,
         requirements: Option<&crate::provider_profile::CapabilityRequirements>,
+        impact: Option<&crate::chisei::impact_route::ImpactRouting>,
     ) -> Result<String, String> {
         self.resolve_live_model_with_override(
             model,
@@ -24,6 +28,7 @@ impl ChiseiServiceImpl {
             safe_providers,
             requirements,
             false,
+            impact,
         )
         .await
     }
@@ -38,6 +43,7 @@ impl ChiseiServiceImpl {
         safe_providers: &std::collections::HashSet<String>,
         requirements: Option<&crate::provider_profile::CapabilityRequirements>,
         exact_override: bool,
+        impact: Option<&crate::chisei::impact_route::ImpactRouting>,
     ) -> Result<String, String> {
         validate_explicit_requested_model(model)?;
         let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
@@ -74,6 +80,7 @@ impl ChiseiServiceImpl {
             requirements,
             safe_only,
             safe_providers,
+            impact,
         };
         let needs_ollama_first = !model.contains('/')
             && model != "native-default"

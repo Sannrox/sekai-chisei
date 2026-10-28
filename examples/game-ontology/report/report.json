@@ -8,7 +8,7 @@
     "prices_sha256": "92c60c50c20e769bae43cdcc988e9af68689dd33d6cc0499f3bb263225763a23",
     "responses": "game-players.responses/v1",
     "responses_sha256": "b785ebb27b8992352bba326cf8af42774d9d271b84913d9ae62f2470e9fa393c",
-    "routing": "game-ontology.routing/v1"
+    "routing": "game-ontology.routing/v2"
   },
   "prices": [
     {
@@ -30,6 +30,7 @@
     "budgets": "GetBudgetUsage after all scenarios, for the player's user scope, which plan execution charges, and each pack Action budget subject. Each row is the scope's own level in its current period; one server plays every scenario, so usage accumulates.",
     "cost": "The cost_usd_micros of each move's model_called event. The server priced the call when it completed, from the reported usage and its CHISEI_GATEWAY_PRICING table, set to the fixture's illustrative prices.",
     "cost_per_win": "Cost divided by wins, rounded to 3 decimals; null without a win.",
+    "impact_route": "The impact_route_class and impact_route_decision of each move's model_called event. The governed namespace's impact route rule keeps the expensive model for calls citing a live claim of high_impact Action work; decision steps cite none, so they route as unclassified to the local model. The ungoverned namespace has no rule (none).",
     "routing_savings": "Counterfactual: the receipt's tokens priced at the high_impact route's table entry with the server's pricing function, minus the cost. It is not charged spend; no public RPC reads model spend per route.",
     "rule": "The pack rule a block's trigger belongs to. A parked Action's trigger is the policy scope its instance names.",
     "tokens": "Input and output tokens of each move's model_called event in its GetOperationReceipt, as the provider reported them. The replay endpoint reports the usage stored with each recording; the fixture's recordings are hand-written, so that usage is illustrative, not measured.",
@@ -137,6 +138,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "unclassified",
+            "impact_route_decision": "allowed",
             "budget_allowed": "true",
             "estimated_tokens": "139",
             "status": "succeeded"
@@ -188,6 +191,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "",
+            "impact_route_decision": "",
             "budget_allowed": "true",
             "estimated_tokens": "139",
             "status": "succeeded"
@@ -402,6 +407,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "unclassified",
+            "impact_route_decision": "allowed",
             "budget_allowed": "true",
             "estimated_tokens": "129",
             "status": "succeeded"
@@ -453,6 +460,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "unclassified",
+            "impact_route_decision": "allowed",
             "budget_allowed": "true",
             "estimated_tokens": "129",
             "status": "succeeded"
@@ -504,6 +513,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "unclassified",
+            "impact_route_decision": "allowed",
             "budget_allowed": "true",
             "estimated_tokens": "129",
             "status": "succeeded"
@@ -552,6 +563,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "",
+            "impact_route_decision": "",
             "budget_allowed": "true",
             "estimated_tokens": "129",
             "status": "succeeded"
@@ -603,6 +616,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "",
+            "impact_route_decision": "",
             "budget_allowed": "true",
             "estimated_tokens": "129",
             "status": "succeeded"
@@ -654,6 +669,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "",
+            "impact_route_decision": "",
             "budget_allowed": "true",
             "estimated_tokens": "129",
             "status": "succeeded"
@@ -849,6 +866,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "unclassified",
+            "impact_route_decision": "allowed",
             "budget_allowed": "true",
             "estimated_tokens": "133",
             "status": "succeeded"
@@ -900,6 +919,8 @@
             "runtime": "native",
             "model": "native/native-default",
             "routing_mode": "local",
+            "impact_route_class": "",
+            "impact_route_decision": "",
             "budget_allowed": "true",
             "estimated_tokens": "133",
             "status": "succeeded"

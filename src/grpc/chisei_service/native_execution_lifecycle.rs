@@ -175,7 +175,11 @@ impl ChiseiServiceImpl {
                 .remove(&requested_plan.plan_id)
                 .ok_or(Status::not_found("execution plan not found"))?;
         }
-        self.reresolve_action_impact(&mut plan, &actor);
+        if let Err(reason) = self.reresolve_action_impact(&mut plan, &actor) {
+            record_failed_operation_on(self.db.runtime(), &plan, &actor, IMPACT_ROUTE_DENIED)
+                .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(reason));
+        }
         let namespace_hint = input.namespace.trim().to_string();
         let attempt_started_at_ms = chrono::Utc::now().timestamp_millis();
 
@@ -972,6 +976,9 @@ pub(super) fn record_completed_operation_on_with_path(
                     attributes.extend(super::execution_planning::plan_action_claim_attributes(
                         plan,
                     ));
+                    attributes.extend(super::execution_planning::plan_impact_route_attributes(
+                        plan,
+                    ));
                     if let Some(path) = answer_path {
                         attributes.insert(
                             crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
@@ -1126,6 +1133,9 @@ pub(super) fn native_execution_cost(
     )
 }
 
+/// Completion reason of an execution the impact route rule refused (#1861).
+pub(super) const IMPACT_ROUTE_DENIED: &str = "impact_route_denied";
+
 pub(super) fn record_failed_operation_on(
     db: &RuntimeDb,
     plan: &ExecutionPlan,
@@ -1155,16 +1165,27 @@ pub(super) fn record_failed_operation_on(
             completed_at_ms,
             ReceiptEventKind::OutcomeRecorded,
             actor,
-            BTreeMap::from([
-                ("status".into(), "denied".into()),
-                ("completion_reason".into(), completion_reason.into()),
-                (
-                    "latency_ms".into(),
-                    completed_at_ms
-                        .saturating_sub(receipt.started_at_ms)
-                        .to_string(),
-                ),
-            ]),
+            {
+                let mut attributes = BTreeMap::from([
+                    ("status".into(), "denied".into()),
+                    ("completion_reason".into(), completion_reason.into()),
+                    (
+                        "latency_ms".into(),
+                        completed_at_ms
+                            .saturating_sub(receipt.started_at_ms)
+                            .to_string(),
+                    ),
+                ]);
+                // The claim resolution as execution saw it, which a refusal
+                // may rest on; empty when the plan cites no claim.
+                attributes.extend(super::execution_planning::plan_action_claim_attributes(
+                    plan,
+                ));
+                attributes.extend(super::execution_planning::plan_impact_route_attributes(
+                    plan,
+                ));
+                attributes
+            },
         ));
         receipt.completed_at_ms = Some(completed_at_ms);
         receipt.uncovered_surfaces.clear();

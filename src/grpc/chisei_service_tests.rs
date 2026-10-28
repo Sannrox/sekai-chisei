@@ -689,6 +689,7 @@ async fn live_model_resolution_rejects_unknown_explicit_provider() {
             false,
             &std::collections::HashSet::new(),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2272,15 +2273,27 @@ fn seed_claimed_action(
     namespace: &str,
     holder: &str,
 ) -> crate::sekai::action_effect::ActionEffect {
+    seed_claimed_action_of(db, namespace, holder, "invade", "high_impact")
+}
+
+/// Like [`seed_claimed_action`], for an Action type `type_id` of
+/// `impact_class`.
+fn seed_claimed_action_of(
+    db: &RuntimeDb,
+    namespace: &str,
+    holder: &str,
+    type_id: &str,
+    impact_class: &str,
+) -> crate::sekai::action_effect::ActionEffect {
     use crate::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType};
     db.put_governed_action_type(
         GovernedActionType {
             namespace: namespace.into(),
-            type_id: "invade".into(),
+            type_id: type_id.into(),
             version: "1".into(),
             parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
             allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            impact_class: "high_impact".into(),
+            impact_class: impact_class.into(),
             enabled: true,
             ..Default::default()
         },
@@ -2289,9 +2302,9 @@ fn seed_claimed_action(
     )
     .unwrap();
     let effect = crate::sekai::action_effect::plan_effects_for_admit(
-        "invade-instance",
+        &format!("{type_id}-instance"),
         namespace,
-        "invade-operation",
+        &format!("{type_id}-operation"),
         &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
         r#"{"runtime":"shikigami"}"#,
         1,
@@ -2302,16 +2315,16 @@ fn seed_claimed_action(
     db.put_action_effects(std::slice::from_ref(&effect))
         .unwrap();
     db.put_action_instance(&crate::sekai::action_instance::ActionInstance {
-        instance_id: "invade-instance".into(),
+        instance_id: format!("{type_id}-instance"),
         namespace: namespace.into(),
-        type_id: "invade".into(),
+        type_id: type_id.into(),
         version: "1".into(),
         principal: "agent:submitter".into(),
         delegating_actor: None,
         parameters_json: r#"{"runtime":"shikigami"}"#.into(),
-        request_digest: "invade-digest".into(),
-        idempotency_key: "invade-idem".into(),
-        operation_id: "invade-operation".into(),
+        request_digest: format!("{type_id}-digest"),
+        idempotency_key: format!("{type_id}-idem"),
+        operation_id: format!("{type_id}-operation"),
         status: crate::sekai::action_instance::STATUS_ADMITTED.into(),
         deny_reason: String::new(),
         evidence_submission_ids: Vec::new(),
@@ -2339,7 +2352,7 @@ fn seed_claimed_action(
             crate::sekai::action_work_lifecycle::ClaimActionWork {
                 effect_id: &effect.effect_id,
                 runtime_id: "shikigami",
-                request_id: "claim-1",
+                request_id: &format!("{type_id}-claim"),
                 ttl_ms: 600_000,
             },
             holder,
@@ -2399,6 +2412,8 @@ async fn planned_execution_resolves_impact_class_from_a_cited_claim() {
     .unwrap();
     assert_eq!(plan.action_impact_class, "high_impact");
     assert_eq!(plan.action_claim_resolution, "live");
+    // No impact route rule in this namespace: routing is unchanged (#1861).
+    assert!(plan.impact_route_decision.is_empty());
     // Planned while the claim is live, executed after it is acknowledged.
     let outlived = plan_for(
         "impact-outlived",
@@ -2443,6 +2458,7 @@ async fn planned_execution_resolves_impact_class_from_a_cited_claim() {
             .expect("event");
         assert_eq!(event.attributes["impact_class"], "high_impact");
         assert_eq!(event.attributes["action_claim_resolution"], "live");
+        assert_eq!(event.attributes["impact_route_applied"], "false");
         assert_eq!(
             event.attributes["action_claim_effect_id"],
             claimed.effect_id
@@ -2522,6 +2538,399 @@ async fn planned_execution_resolves_impact_class_from_a_cited_claim() {
         .unwrap();
     assert_eq!(unclaimed.action_impact_class, "");
     assert_eq!(unclaimed.action_claim_resolution, "no_claim");
+}
+
+/// Persist `rule` on `namespace`'s stored policy object, keeping the
+/// service's in-memory namespace policy (#1861).
+fn store_impact_rule(
+    service: &ChiseiServiceImpl,
+    namespace: &str,
+    rule: crate::chisei::impact_route::ImpactRoutePolicy,
+) {
+    persist_namespace_policy(
+        service.db.runtime(),
+        namespace,
+        &service.policy.effective_policy(namespace).unwrap(),
+        None,
+        &ImpactRouteUpdate::Set(rule),
+        "operator",
+    )
+    .unwrap();
+}
+
+async fn synthetic_ollama_two_models() -> AxumResponse {
+    AxumResponse::builder()
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"models":[{"name":"mistral","details":{"parameter_size":"7B","context_length":32768},"capabilities":["tools"]},{"name":"mixtral","details":{"parameter_size":"47B","context_length":32768},"capabilities":["tools"]}]}"#,
+        ))
+        .unwrap()
+}
+
+/// A managed service whose namespace allows a cheap and an expensive local
+/// model, with an impact route rule that keeps the expensive one for
+/// `high_impact` calls (#1861).
+async fn impact_routed_service() -> ChiseiServiceImpl {
+    let app = Router::new()
+        .route("/api/tags", get(synthetic_ollama_two_models))
+        .route("/v1/chat/completions", post(synthetic_native_chat));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut service = managed_ollama_execution_service(format!("http://{address}"));
+    service.sekai_facts =
+        crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&service.db));
+    service.policy.set_namespace_policy(
+        "managed-conformance",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["ollama".into()],
+            allowed_models: vec!["ollama/mistral".into(), "ollama/mixtral".into()],
+            default_runtime: "ollama".into(),
+            default_model: "ollama/mistral".into(),
+            data_class: "unclassified".into(),
+        },
+    );
+    store_impact_rule(
+        &service,
+        "managed-conformance",
+        serde_json::from_value(serde_json::json!({
+            "contract_version": crate::chisei::impact_route::IMPACT_ROUTE_POLICY_VERSION,
+            "routes": {
+                "unclassified": {"allowed_models": ["ollama/mistral"]},
+                "routine": {"allowed_models": ["ollama/mistral"]},
+                "high_impact": {"allowed_models": ["ollama/mistral", "ollama/mixtral"]},
+            },
+        }))
+        .unwrap(),
+    );
+    service
+}
+
+/// #1861: the rule constrains the router's candidates, not just its winner.
+/// A family-only rule lets an unavailable requested model fall back to an
+/// allowed installed one; an alias resolves among the class's models; an
+/// alias with no allowed candidate is refused.
+#[tokio::test]
+async fn impact_route_rule_constrains_alias_and_fallback_candidates() {
+    let service = impact_routed_service().await;
+    let context = managed_execution_context(
+        vec!["chisei.execute".into()],
+        "sekai:control-plane",
+        i64::MAX,
+    );
+    let configure =
+        |allowed_models: &[&str], default_model: &str, unclassified: serde_json::Value| {
+            service.policy.set_namespace_policy(
+                "managed-conformance",
+                crate::chisei::policy::Policy {
+                    allowed_runtimes: vec!["ollama".into()],
+                    allowed_models: allowed_models.iter().map(|model| (*model).into()).collect(),
+                    default_runtime: "ollama".into(),
+                    default_model: default_model.into(),
+                    data_class: "unclassified".into(),
+                },
+            );
+            store_impact_rule(
+                &service,
+                "managed-conformance",
+                serde_json::from_value(serde_json::json!({
+                    "contract_version": crate::chisei::impact_route::IMPACT_ROUTE_POLICY_VERSION,
+                    "routes": {"unclassified": unclassified},
+                }))
+                .unwrap(),
+            );
+        };
+    let plan = |request_id: &str, model: &str| {
+        let mut request = managed_plan_request(request_id);
+        let input = request.input.as_mut().unwrap();
+        input.preferred_runtime = "ollama".into();
+        input.preferred_model = model.into();
+        let mut request = Request::new(request);
+        attach_managed_context(&mut request, context.clone());
+        let service = &service;
+        async move { service.plan_execution(request).await }
+    };
+    let planned_model = |result: Result<Response<PlanExecutionResponse>, Status>| {
+        let plan = result.unwrap().into_inner().plan.unwrap();
+        (plan.resolved_model, plan.impact_route_decision)
+    };
+
+    // Family rule, namespace allows any model: a missing model of the
+    // `mistral` family falls back to the installed family member, not to
+    // the higher-ranked model outside it.
+    configure(
+        &[],
+        "ollama/mistral",
+        serde_json::json!({"allowed_families": ["mistral"]}),
+    );
+    let (model, decision) = planned_model(plan("fallback-family", "ollama/mistral-large").await);
+    assert_eq!(model, "ollama/mistral");
+    assert_eq!(decision, "allowed");
+
+    // Alias namespace, concrete-model rule: `capable` would pick the larger
+    // model; under the rule it resolves to the allowed one.
+    configure(
+        &["ollama/capable"],
+        "ollama/capable",
+        serde_json::json!({"allowed_models": ["ollama/mistral"]}),
+    );
+    let (model, _) = planned_model(plan("alias-allowed", "ollama/capable").await);
+    assert_eq!(model, "ollama/mistral");
+
+    // An alias whose only candidates are outside the class is refused.
+    configure(
+        &["ollama/capable"],
+        "ollama/capable",
+        serde_json::json!({"allowed_models": ["native-default"]}),
+    );
+    let refused = plan("alias-refused", "ollama/capable").await.unwrap_err();
+    assert!(
+        crate::chisei::impact_route::is_refusal(refused.message()),
+        "{refused:?}"
+    );
+}
+
+/// #1861: the namespace rule routes by the class of the cited claim. A
+/// routine or unclassified call asking for the expensive model gets the
+/// namespace default; a call citing a live `high_impact` claim keeps it;
+/// a stale claim is unclassified. Plan, policy event and model call record
+/// the class and decision.
+#[tokio::test]
+async fn impact_route_rule_routes_by_the_cited_claim_class() {
+    let service = impact_routed_service().await;
+    let context = managed_execution_context(
+        vec!["chisei.execute".into()],
+        "sekai:control-plane",
+        i64::MAX,
+    );
+    let holder = context.principal.subject.clone();
+    let high = seed_claimed_action(service.db.runtime(), "managed-conformance", &holder);
+    let routine = seed_claimed_action_of(
+        service.db.runtime(),
+        "managed-conformance",
+        &holder,
+        "scout",
+        "routine",
+    );
+    let plan_for = |request_id: &str, claim: Option<ActionClaimRef>| {
+        let mut request = managed_plan_request(request_id);
+        let input = request.input.as_mut().unwrap();
+        input.preferred_runtime = "ollama".into();
+        input.preferred_model = "ollama/mixtral".into();
+        input.action_claim = claim;
+        let mut request = Request::new(request);
+        attach_managed_context(&mut request, context.clone());
+        let service = &service;
+        async move {
+            service
+                .plan_execution(request)
+                .await
+                .unwrap()
+                .into_inner()
+                .plan
+                .unwrap()
+        }
+    };
+    let route = |plan: &ExecutionPlan| {
+        (
+            plan.resolved_model.clone(),
+            plan.impact_route_class.clone(),
+            plan.impact_route_decision.clone(),
+        )
+    };
+    let expect = |model: &str, class: &str, decision: &str| {
+        (model.to_string(), class.to_string(), decision.to_string())
+    };
+
+    let unclaimed = plan_for("route-none", None).await;
+    assert_eq!(
+        route(&unclaimed),
+        expect("ollama/mistral", "unclassified", "substituted")
+    );
+    let routine_plan = plan_for(
+        "route-routine",
+        cite_claim(&routine, routine.claim_generation),
+    )
+    .await;
+    assert_eq!(
+        route(&routine_plan),
+        expect("ollama/mistral", "routine", "substituted")
+    );
+    let high_plan = plan_for("route-high", cite_claim(&high, high.claim_generation)).await;
+    assert_eq!(
+        route(&high_plan),
+        expect("ollama/mixtral", "high_impact", "allowed")
+    );
+    let stale = plan_for("route-stale", cite_claim(&high, high.claim_generation + 1)).await;
+    assert_eq!(
+        route(&stale),
+        expect("ollama/mistral", "unclassified", "substituted")
+    );
+
+    for (plan, class, decision) in [
+        (routine_plan, "routine", "substituted"),
+        (high_plan, "high_impact", "allowed"),
+    ] {
+        let plan_id = plan.plan_id.clone();
+        let mut execute = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        attach_managed_context(&mut execute, context.clone());
+        let mut stream = service
+            .execute_plan_stream(execute)
+            .await
+            .unwrap()
+            .into_inner();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        let receipt = service
+            .db
+            .get_operation_receipt(&plan_id)
+            .unwrap()
+            .expect("receipt");
+        for kind in [
+            ReceiptEventKind::PolicyDecided,
+            ReceiptEventKind::ModelCalled,
+        ] {
+            let event = receipt
+                .events
+                .iter()
+                .find(|event| event.kind == kind)
+                .expect("event");
+            assert_eq!(event.attributes["impact_route_applied"], "true");
+            assert_eq!(event.attributes["impact_route_class"], class);
+            assert_eq!(event.attributes["impact_route_decision"], decision);
+        }
+    }
+}
+
+/// #1861: a caller cannot bypass the rule with a route override, a
+/// namespace default the class may not use refuses, and an execution whose
+/// claim lapsed after planning is refused before the model call. Each
+/// refusal is audited.
+#[tokio::test]
+async fn impact_route_rule_refuses_overrides_and_lapsed_claims() {
+    let service = impact_routed_service().await;
+    let context = managed_execution_context(
+        vec!["chisei.execute".into()],
+        "sekai:control-plane",
+        i64::MAX,
+    );
+    let high = seed_claimed_action(
+        service.db.runtime(),
+        "managed-conformance",
+        &context.principal.subject,
+    );
+    let plan_request = |request_id: &str, model: &str, claim: Option<ActionClaimRef>| {
+        let mut request = managed_plan_request(request_id);
+        let input = request.input.as_mut().unwrap();
+        input.preferred_model = model.into();
+        input.action_claim = claim;
+        let mut request = Request::new(request);
+        attach_managed_context(&mut request, context.clone());
+        request
+    };
+
+    // Managed callers may not pin routes at all; a local caller may, but
+    // not past the rule.
+    let mut override_request = managed_plan_request("route-override");
+    override_request.input.as_mut().unwrap().route_override = "ollama/mixtral".into();
+    let mut override_request = Request::new(override_request);
+    override_request
+        .metadata_mut()
+        .insert("x-principal", "local".parse().unwrap());
+    let overridden = service.plan_execution(override_request).await.unwrap_err();
+    assert_eq!(overridden.code(), tonic::Code::InvalidArgument);
+    assert!(
+        crate::chisei::impact_route::is_refusal(overridden.message()),
+        "{overridden:?}"
+    );
+    let refusals = service
+        .db
+        .list_decisions(&crate::sekai::audit::DecisionFilter {
+            action: Some("chisei.impact_route".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].target_id, "route-override");
+    assert_eq!(refusals[0].evidence["impact_route_class"], "unclassified");
+    assert_eq!(refusals[0].evidence["impact_route_decision"], "refused");
+
+    // The live high-impact claim may pin the expensive model; once acked,
+    // the execution re-resolves to unclassified and is refused.
+    let plan = service
+        .plan_execution(plan_request(
+            "route-lapsed",
+            "ollama/mixtral",
+            cite_claim(&high, high.claim_generation),
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert_eq!(plan.resolved_model, "ollama/mixtral");
+    assert_eq!(plan.impact_route_decision, "allowed");
+    service
+        .db
+        .runtime()
+        .ack_action_work(
+            &high.effect_id,
+            "shikigami",
+            high.claim_generation,
+            &high.claim_fencing_token,
+            crate::sekai::action_effect::ACK_OUTCOME_FAILED,
+            "done",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap();
+    let plan_id = plan.plan_id.clone();
+    let mut execute = Request::new(ExecutePlanRequest { plan: Some(plan) });
+    attach_managed_context(&mut execute, context.clone());
+    let lapsed = match service.execute_plan_stream(execute).await {
+        Ok(_) => panic!("lapsed claim executed"),
+        Err(status) => status,
+    };
+    assert_eq!(lapsed.code(), tonic::Code::FailedPrecondition);
+    let outcome = service
+        .db
+        .get_operation_receipt(&plan_id)
+        .unwrap()
+        .unwrap()
+        .events
+        .into_iter()
+        .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+        .expect("outcome");
+    assert_eq!(
+        outcome.attributes["completion_reason"],
+        "impact_route_denied"
+    );
+    // The outcome carries the execution-time claim resolution it rests on.
+    assert_eq!(outcome.attributes["action_claim_resolution"], "not_live");
+    assert_eq!(outcome.attributes["action_claim_effect_id"], high.effect_id);
+    assert_eq!(outcome.attributes["impact_route_class"], "unclassified");
+    assert_eq!(outcome.attributes["impact_route_decision"], "refused");
+
+    // A namespace default the class may not use leaves nothing to
+    // substitute.
+    let mut expensive_default = service
+        .policy
+        .effective_policy("managed-conformance")
+        .unwrap();
+    expensive_default.default_model = "ollama/mixtral".into();
+    service
+        .policy
+        .set_namespace_policy("managed-conformance", expensive_default);
+    let no_default = service
+        .plan_execution(plan_request("route-no-default", "", None))
+        .await
+        .unwrap_err();
+    assert!(
+        crate::chisei::impact_route::is_refusal(no_default.message()),
+        "{no_default:?}"
+    );
 }
 
 #[tokio::test]
@@ -5386,6 +5795,7 @@ fn resolve_policy_request(
         budget_route_bias: String::new(),
         route_override: String::new(),
         capability_requirements_json: Vec::new(),
+        impact_routing: None,
     }
 }
 
@@ -6549,6 +6959,7 @@ async fn set_namespace_policy_applies_to_resolve_policy() {
         default_model: "native-default".into(),
         data_class: String::new(),
         context_admission_policy_json: String::new(),
+        impact_route_policy_json: String::new(),
     }))
     .await
     .unwrap();
@@ -6582,6 +6993,7 @@ async fn policy_shadow_reports_live_differences_and_gates_activation() {
         default_model: "native-default".into(),
         data_class: String::new(),
         context_admission_policy_json: String::new(),
+        impact_route_policy_json: String::new(),
     };
     // Unsorted runtimes: the cached and the persisted baseline must agree.
     svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
@@ -6708,6 +7120,7 @@ async fn policy_shadow_observes_a_namespace_that_inherits_its_policy() {
         default_model: "native-default".into(),
         data_class: String::new(),
         context_admission_policy_json: String::new(),
+        impact_route_policy_json: String::new(),
     }))
     .await
     .unwrap();
@@ -6756,6 +7169,7 @@ async fn set_namespace_policy_normalizes_legacy_openai_family_defaults() {
             default_model: "native-default".into(),
             data_class: String::new(),
             context_admission_policy_json: String::new(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap()
@@ -6783,6 +7197,7 @@ async fn set_namespace_policy_normalizes_legacy_openai_family_defaults() {
             default_model: "gpt-5.5".into(),
             data_class: String::new(),
             context_admission_policy_json: String::new(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap_err();
@@ -6805,6 +7220,7 @@ async fn resolve_policy_prefers_agent_context_over_project_policy() {
         default_model: "native-mini".into(),
         data_class: String::new(),
         context_admission_policy_json: String::new(),
+        impact_route_policy_json: String::new(),
     }))
     .await
     .unwrap();
@@ -6816,6 +7232,7 @@ async fn resolve_policy_prefers_agent_context_over_project_policy() {
         default_model: "native-default".into(),
         data_class: String::new(),
         context_admission_policy_json: String::new(),
+        impact_route_policy_json: String::new(),
     }))
     .await
     .unwrap();
@@ -6846,6 +7263,7 @@ async fn resolve_policy_biases_to_default_model_when_namespace_regressed() {
         default_model: "native-default".into(),
         data_class: String::new(),
         context_admission_policy_json: String::new(),
+        impact_route_policy_json: String::new(),
     }))
     .await
     .unwrap();
@@ -6892,6 +7310,7 @@ async fn resolve_policy_reverts_bulk_class_to_capable_when_namespace_regressed()
         default_model: "native-default".into(),
         data_class: String::new(),
         context_admission_policy_json: String::new(),
+        impact_route_policy_json: String::new(),
     }))
     .await
     .unwrap();
@@ -6937,6 +7356,7 @@ async fn portfolio_route_is_audited_and_eval_regression_reverts_it() {
         default_model: "native-default".into(),
         data_class: String::new(),
         context_admission_policy_json: String::new(),
+        impact_route_policy_json: String::new(),
     }))
     .await
     .unwrap();
@@ -7045,6 +7465,7 @@ async fn namespace_policy_reloads_from_sekai_object_store() {
         default_model: "native-default".into(),
         data_class: String::new(),
         context_admission_policy_json: context_policy_json,
+        impact_route_policy_json: String::new(),
     }))
     .await
     .unwrap();
@@ -7075,6 +7496,193 @@ async fn namespace_policy_reloads_from_sekai_object_store() {
         ContextAdmissionAction::Qualify
     );
     let _ = fs::remove_file(path);
+}
+
+/// #1861: the impact route rule lives only in the stored namespace policy.
+/// Two instances on one store: a rule set on A binds B's next decision, an
+/// unrelated policy update on B keeps it, an invalid rule is rejected,
+/// clearing it on A frees B, and a stored rule that no longer parses refuses
+/// calls instead of routing without it.
+async fn decided_model(svc: &ChiseiServiceImpl, operation: &str) -> String {
+    let decision = svc
+        .decide_gateway_execution(decide_request(operation, ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(decision.admitted, "{decision:?}");
+    decision.resolved_model
+}
+
+async fn exercise_impact_route_rule_across_instances(open: impl Fn() -> ChiseiServiceImpl) {
+    let rule = serde_json::json!({
+        "contract_version": crate::chisei::impact_route::IMPACT_ROUTE_POLICY_VERSION,
+        "routes": {"unclassified": {"allowed_models": ["gpt-5.5-mini"]}},
+    })
+    .to_string();
+    let set = |impact_route_policy_json: &str| {
+        Request::new(SetNamespacePolicyRequest {
+            namespace: "team-a".into(),
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+            default_runtime: "openai".into(),
+            default_model: "gpt-5.5-mini".into(),
+            data_class: "internal".into(),
+            context_admission_policy_json: serde_json::to_string(
+                &crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+            )
+            .unwrap(),
+            impact_route_policy_json: impact_route_policy_json.into(),
+        })
+    };
+    let (a, b) = (open(), open());
+    a.set_namespace_policy(set("")).await.unwrap();
+    b.set_namespace_policy(set("")).await.unwrap();
+    assert_eq!(decided_model(&b, "op-before").await, "gpt-5.5");
+
+    a.set_namespace_policy(set(&rule)).await.unwrap();
+    assert!(
+        decided_model(&b, "op-ruled")
+            .await
+            .ends_with("gpt-5.5-mini")
+    );
+    // B's own update with an empty field keeps the rule as stored.
+    b.set_namespace_policy(set("")).await.unwrap();
+    assert!(decided_model(&a, "op-kept").await.ends_with("gpt-5.5-mini"));
+    let invalid = b
+        .set_namespace_policy(set(
+            r#"{"contract_version":"chisei.impact-route/v1","routes":{}}"#,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+    assert!(
+        decided_model(&b, "op-still")
+            .await
+            .ends_with("gpt-5.5-mini")
+    );
+
+    a.set_namespace_policy(set("null")).await.unwrap();
+    assert_eq!(decided_model(&b, "op-cleared").await, "gpt-5.5");
+
+    let mut object =
+        a.db.runtime()
+            .find_by_external_id("policy:team-a")
+            .unwrap()
+            .unwrap();
+    object
+        .properties
+        .insert("impact_route_policy_json".into(), "{not json".into());
+    a.db.runtime().update_object(&object).unwrap();
+    let corrupt = b
+        .decide_gateway_execution(decide_request("op-corrupt", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!corrupt.admitted, "{corrupt:?}");
+    assert_eq!(corrupt.deny_reason, "policy_denied");
+    assert!(
+        crate::chisei::impact_route::is_refusal(&corrupt.deny_message),
+        "{corrupt:?}"
+    );
+    // The denial is in the ledger with its correlation id and reason.
+    let record =
+        b.db.list_decisions(&crate::sekai::audit::DecisionFilter {
+            action: Some("gateway.decide".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .find(|decision| decision.target_id == "op-corrupt")
+        .expect("gateway decision record");
+    assert_eq!(record.outcome, "denied");
+    assert!(record.reason.contains("unreadable"), "{record:?}");
+    assert_eq!(record.evidence["impact_route_decision"], "refused");
+
+    // Planning refuses on the same rule and records why.
+    let mut plan = Request::new(PlanExecutionRequest {
+        routing_profile_id: String::new(),
+        input: Some(ExecutionInput {
+            request_id: "plan-corrupt".into(),
+            namespace: "team-a".into(),
+            spec: "hello".into(),
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+    });
+    plan.metadata_mut()
+        .insert("x-principal", "local".parse().unwrap());
+    let refused = b.plan_execution(plan).await.unwrap_err();
+    assert!(
+        crate::chisei::impact_route::is_refusal(refused.message()),
+        "{refused:?}"
+    );
+    let record =
+        b.db.list_decisions(&crate::sekai::audit::DecisionFilter {
+            action: Some("chisei.impact_route".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .find(|decision| decision.target_id == "plan-corrupt")
+        .expect("planning decision record");
+    assert!(record.reason.contains("unreadable"), "{record:?}");
+    assert_eq!(record.evidence["impact_route_decision"], "refused");
+}
+
+fn impact_route_instance(db: Arc<RuntimeDb>, path: &str) -> ChiseiServiceImpl {
+    let mut cfg = config(path);
+    cfg.gateway_provided_providers = vec!["openai".into()];
+    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
+    ChiseiServiceImpl::new(chisei.clone(), cfg)
+        .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+            shared_sekai_store(&chisei),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn impact_route_rule_is_shared_by_instances_on_one_sqlite_store() {
+    let path = std::env::temp_dir()
+        .join(format!(
+            "sekai-impact-route-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .to_string_lossy()
+        .to_string();
+    // Each instance opens its own connection to the one database file.
+    exercise_impact_route_rule_across_instances(|| {
+        impact_route_instance(
+            Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&path).unwrap()))),
+            &path,
+        )
+    })
+    .await;
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+async fn impact_route_rule_is_shared_by_instances_on_one_postgres_store() {
+    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+    exercise_impact_route_rule_across_instances(|| {
+        impact_route_instance(
+            Arc::new(RuntimeDb::Postgres(Arc::new(
+                match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+                    Ok(ca) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                        &url,
+                        4,
+                        &fs::read(ca).unwrap(),
+                    ),
+                    Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
+                }
+                .unwrap(),
+            ))),
+            ":memory:",
+        )
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -7109,6 +7717,7 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
             default_model: "gpt-5.5".into(),
             data_class: "internal".into(),
             context_admission_policy_json: include_json.clone(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -7140,6 +7749,7 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
             default_model: "gpt-5.5".into(),
             data_class: "internal".into(),
             context_admission_policy_json: "null".into(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -8898,6 +9508,7 @@ async fn set_namespace_policy_persists_data_class() {
             default_model: "native-default".into(),
             data_class: "sensitive".into(),
             context_admission_policy_json: String::new(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap()
@@ -8987,6 +9598,7 @@ async fn resolve_policy_denies_sensitive_private_unsafe_provider() {
             budget_route_bias: String::new(),
             route_override: String::new(),
             capability_requirements_json: Vec::new(),
+            impact_routing: None,
         }))
         .await
         .expect_err("sensitive private preflight should deny unsafe provider");
@@ -10498,6 +11110,140 @@ fn cache_plan_keeps_inserted_plan_when_timestamps_tie() {
     assert!(plans.contains_key(&inserted.plan_id));
 }
 
+/// #1861: the gateway decide path applies the namespace impact route rule
+/// to the class of the claim the request cites, and the decision record
+/// carries the class and decision.
+#[tokio::test]
+async fn decide_gateway_execution_applies_the_impact_route_rule() {
+    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
+
+    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut cfg = config(":memory:");
+    cfg.gateway_provided_providers = vec!["openai".into()];
+    let mut svc = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        cfg,
+    );
+    svc.sekai_facts =
+        crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&svc.db));
+    svc.policy.set_namespace_policy(
+        "team-a",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+            default_runtime: "openai".into(),
+            default_model: "gpt-5.5-mini".into(),
+            data_class: "internal".into(),
+        },
+    );
+    svc.policy
+        .set_context_admission_policy(
+            "team-a",
+            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+        )
+        .unwrap();
+    store_impact_rule(
+        &svc,
+        "team-a",
+        serde_json::from_value(serde_json::json!({
+            "contract_version": crate::chisei::impact_route::IMPACT_ROUTE_POLICY_VERSION,
+            "routes": {
+                "unclassified": {"allowed_models": ["gpt-5.5-mini"]},
+                "high_impact": {"allowed_families": ["openai"]},
+            },
+        }))
+        .unwrap(),
+    );
+    let claimed = seed_claimed_action(svc.db.runtime(), "team-a", "local");
+    let decide = |operation: &str, route_override: &str, claim: Option<ActionClaimRef>| {
+        let mut request = Request::new(DecideGatewayExecutionRequest {
+            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            requested_model: "gpt-5.5".into(),
+            operation_class: "chat".into(),
+            correlation_operation_id: operation.into(),
+            correlation_attempt: 1,
+            estimated_tokens: 10,
+            task_class: "interactive".into(),
+            preferred_runtime: "openai".into(),
+            project: "team-a".into(),
+            agent: "local".into(),
+            user_id: "local".into(),
+            route_override: route_override.into(),
+            expected_calls: 1,
+            action_claim: claim,
+            ..Default::default()
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let svc = &svc;
+        let operation = operation.to_string();
+        async move {
+            let response = svc
+                .decide_gateway_execution(request)
+                .await
+                .unwrap()
+                .into_inner();
+            let record = svc
+                .db
+                .list_decisions(&crate::sekai::audit::DecisionFilter {
+                    action: Some("gateway.decide".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|decision| decision.target_id == operation)
+                .expect("decision record");
+            (response, record.evidence)
+        }
+    };
+
+    let (routine, evidence) = decide("op-unclassified", "", None).await;
+    assert!(routine.admitted, "{routine:?}");
+    assert!(
+        routine.resolved_model.ends_with("gpt-5.5-mini"),
+        "{routine:?}"
+    );
+    assert!(
+        routine
+            .fallback_models
+            .iter()
+            .all(|model| model.ends_with("gpt-5.5-mini")),
+        "{routine:?}"
+    );
+    assert_eq!(evidence["impact_route_class"], "unclassified");
+    assert_eq!(evidence["impact_route_decision"], "substituted");
+    // The narrowed route still reports the stored policy's version.
+    assert_eq!(
+        routine.policy_version,
+        svc.policy.effective_policy("team-a").unwrap().version()
+    );
+
+    let (high, evidence) = decide(
+        "op-high",
+        "",
+        cite_claim(&claimed, claimed.claim_generation),
+    )
+    .await;
+    assert!(high.admitted, "{high:?}");
+    assert_eq!(high.resolved_model, "gpt-5.5");
+    assert_eq!(evidence["impact_route_class"], "high_impact");
+    assert_eq!(evidence["impact_route_decision"], "allowed");
+    assert_eq!(evidence["action_claim_resolution"], "live");
+
+    let (overridden, evidence) = decide("op-override", "openai/gpt-5.5", None).await;
+    assert!(!overridden.admitted, "{overridden:?}");
+    assert_eq!(overridden.deny_reason, "policy_denied");
+    assert!(
+        crate::chisei::impact_route::is_refusal(&overridden.deny_message),
+        "{overridden:?}"
+    );
+    assert_eq!(evidence["impact_route_decision"], "refused");
+}
+
 #[tokio::test]
 async fn decide_gateway_execution_admits_and_denies_closed() {
     use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
@@ -11988,10 +12734,12 @@ async fn customer_hosted_routes_serve_content_execution_from_live_state() {
     config.routing_endpoint_allowlist =
         crate::chisei::routing_profiles::endpoint_allowlist_from(&origin);
     config.routing_credential_refs = vec!["ACME".into()];
-    let service = ChiseiServiceImpl::new(
+    let mut service = ChiseiServiceImpl::new(
         crate::chisei_store::ChiseiStore::from_shared_runtime(db),
         config,
     );
+    service.sekai_facts =
+        crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&service.db));
     for namespace in ["support", "open"] {
         service
             .put_routing_profile(Request::new(PutRoutingProfileRequest {
@@ -12116,6 +12864,59 @@ async fn customer_hosted_routes_serve_content_execution_from_live_state() {
             "{namespace}"
         );
     }
+
+    // #1861: an impact route refusal terminalizes the content plan's
+    // receipt and evicts the plan, so a retry after the rule is repaired
+    // must plan again instead of calling the provider.
+    let impact_plan = service
+        .plan_content_execution(Request::new(content_request(
+            "request:content-impact",
+            "support",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    store_impact_rule(
+        &service,
+        "support",
+        serde_json::from_value(serde_json::json!({
+            "contract_version": crate::chisei::impact_route::IMPACT_ROUTE_POLICY_VERSION,
+            "routes": {"unclassified": {"allowed_models": ["hosted.acme-llm/acme-2"]}},
+        }))
+        .unwrap(),
+    );
+    let execute_impact_plan = || {
+        service.execute_content_plan_stream(Request::new(ExecuteContentPlanRequest {
+            plan: Some(impact_plan.clone()),
+            resolved_parts: resolved.clone(),
+        }))
+    };
+    let refused = match execute_impact_plan().await {
+        Ok(_) => panic!("impact route refusal executed content"),
+        Err(error) => error,
+    };
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        crate::chisei::impact_route::is_refusal(refused.message()),
+        "{refused:?}"
+    );
+    persist_namespace_policy(
+        service.db.runtime(),
+        "support",
+        &service.policy.effective_policy("support").unwrap(),
+        None,
+        &ImpactRouteUpdate::Clear,
+        "operator",
+    )
+    .unwrap();
+    let retried = match execute_impact_plan().await {
+        Ok(_) => panic!("evicted content plan executed"),
+        Err(error) => error,
+    };
+    assert_eq!(retried.code(), tonic::Code::NotFound, "{retried:?}");
+    assert_eq!(observed.authorizations.lock().unwrap().len(), 1);
 
     let before_revocation = service
         .plan_content_execution(Request::new(content_request(

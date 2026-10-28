@@ -256,7 +256,25 @@ impl ChiseiServiceImpl {
             .execution
             .clone()
             .ok_or_else(|| Status::data_loss("cached content execution plan is invalid"))?;
-        self.reresolve_action_impact(&mut execution, &actor);
+        if let Err(reason) = self.reresolve_action_impact(&mut execution, &actor) {
+            // The receipt is now terminal, so the plan must not run again;
+            // the caller plans afresh.
+            {
+                let mut plans = self
+                    .planned_content_executions
+                    .lock()
+                    .expect("planned content executions poisoned");
+                plans.remove(requested_plan_id);
+            }
+            record_failed_operation_on(
+                self.db.runtime(),
+                &execution,
+                &actor,
+                super::native_execution_lifecycle::IMPACT_ROUTE_DENIED,
+            )
+            .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(reason));
+        }
         if !execution.executable {
             return Err(Status::failed_precondition(
                 "content execution plan is not executable",

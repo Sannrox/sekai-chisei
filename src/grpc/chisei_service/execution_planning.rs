@@ -10,6 +10,7 @@
 
 use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
+use crate::chisei::impact_route::{ImpactRouteOutcome, RouteClass};
 use crate::chisei_store::ChiseiKiokuStore;
 
 const LEARNING_PIN_UNAVAILABLE: &str = "learning pin is unavailable";
@@ -31,9 +32,17 @@ impl ChiseiServiceImpl {
     /// planning may no longer hold. Overwrites the plan copy that execution
     /// records from; the planning-time result stays on the plan response and
     /// the receipt's policy event.
-    pub(super) fn reresolve_action_impact(&self, plan: &mut ExecutionPlan, actor: &str) {
+    ///
+    /// Then applies the namespace's impact route rule (#1861) to the planned
+    /// model with the class as it stands now, and returns the refusal when
+    /// the class may no longer use it. A rule that cannot be read refuses.
+    pub(super) fn reresolve_action_impact(
+        &self,
+        plan: &mut ExecutionPlan,
+        actor: &str,
+    ) -> Result<(), String> {
         let Some(input) = plan.input.as_ref() else {
-            return;
+            return Ok(());
         };
         let impact = crate::chisei::action_impact::ActionImpact::resolve(
             self.sekai_facts.reader(),
@@ -41,11 +50,58 @@ impl ChiseiServiceImpl {
             actor,
             &input.namespace,
         );
+        let routing = self.impact_routing(&input.namespace, impact.class());
         plan.action_impact_class = impact
             .class()
             .map(|class| class.as_str().to_string())
             .unwrap_or_default();
         plan.action_claim_resolution = impact.resolution.as_str().into();
+        let routing = match routing {
+            Ok(Some(routing)) => routing,
+            Ok(None) => {
+                plan.impact_route_class.clear();
+                plan.impact_route_decision.clear();
+                return Ok(());
+            }
+            Err(error) => {
+                plan.impact_route_class = RouteClass::of(impact.class()).as_str().into();
+                plan.impact_route_decision = ImpactRouteOutcome::Refused.as_str().into();
+                return Err(unreadable_impact_route(&error));
+            }
+        };
+        plan.impact_route_class = routing.class.as_str().into();
+        if let Err(reason) = routing.check_resolved(&plan.resolved_model) {
+            plan.impact_route_decision = ImpactRouteOutcome::Refused.as_str().into();
+            return Err(reason);
+        }
+        if ImpactRouteOutcome::parse(&plan.impact_route_decision).is_none() {
+            plan.impact_route_decision = ImpactRouteOutcome::Allowed.as_str().into();
+        }
+        Ok(())
+    }
+}
+
+impl ChiseiServiceImpl {
+    /// The namespace's impact route rule (#1861) as it applies to a call of
+    /// `class`, read from the stored namespace policy object on every
+    /// decision so every instance enforces the rule as last written. `None`
+    /// when the namespace has none; an unreadable or unparsable rule is an
+    /// error, which callers refuse on.
+    pub(super) fn impact_routing(
+        &self,
+        namespace: &str,
+        class: Option<crate::chisei::action_impact::ImpactClass>,
+    ) -> Result<Option<crate::chisei::impact_route::ImpactRouting>, String> {
+        let stored = self
+            .sekai_facts
+            .reader()
+            .find_by_external_id(&format!("policy:{}", namespace.trim()))
+            .map_err(|error| format!("impact route policy unavailable: {error}"))?;
+        Ok(stored
+            .map(|object| impact_route_policy_from_properties(&object.properties))
+            .transpose()?
+            .flatten()
+            .map(|rule| rule.routing(class)))
     }
 }
 
@@ -93,6 +149,34 @@ impl ChiseiServiceImpl {
         let budget_pressure = strongest_pressure(scoped_pressure, namespace_pressure);
         let namespace_hint = input.namespace.trim().to_string();
         let effective_policy = self.policy.effective_policy(&input.namespace);
+        // The namespace's impact route rule narrows the models every route
+        // below may use (#1861).
+        // An unreadable rule refuses, and the refusal is audited like any
+        // other.
+        let impact_routing = self
+            .impact_routing(&input.namespace, action_impact.class())
+            .map_err(|error| {
+                Status::failed_precondition(self.record_impact_route_refusal(
+                    &action_impact,
+                    authenticated_actor,
+                    RouteClass::of(action_impact.class()),
+                    &input,
+                    unreadable_impact_route(&error),
+                ))
+            })?;
+        let impact_call = impact_routing.as_ref().map(|routing| ImpactRouteCall {
+            routing,
+            impact: &action_impact,
+            actor: authenticated_actor,
+        });
+        let route_policy = match impact_call.as_ref() {
+            Some(call) => Some(
+                call.routing
+                    .narrow(effective_policy.as_ref())
+                    .map_err(|reason| self.refuse_impact_route(call, &input, reason))?,
+            ),
+            None => effective_policy.clone(),
+        };
         let context_admission_policy = self
             .policy
             .context_admission_policy(&input.namespace)
@@ -161,12 +245,19 @@ impl ChiseiServiceImpl {
             u64::try_from(projection_started.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
         let fallback_runtime = pipeline_req.runtime.clone();
-        let (initial_runtime, initial_model, initial_pref_runtime, initial_pref_model) = self
+        let (
+            initial_runtime,
+            initial_model,
+            initial_pref_runtime,
+            initial_pref_model,
+            initial_impact_outcome,
+        ) = self
             .resolve_model_for_run(
                 &input,
                 &fallback_runtime,
                 &initial_run,
-                effective_policy.as_ref(),
+                route_policy.as_ref(),
+                impact_call.as_ref(),
                 safe_only,
                 &safe_providers,
             )
@@ -182,6 +273,7 @@ impl ChiseiServiceImpl {
             provider_is_external,
             effective_preferred_runtime,
             effective_preferred_model,
+            impact_outcome,
         ) = if initial_provider_is_external || safe_only || template_only {
             (
                 initial_run,
@@ -191,6 +283,7 @@ impl ChiseiServiceImpl {
                 true,
                 initial_pref_runtime,
                 initial_pref_model,
+                initial_impact_outcome,
             )
         } else {
             let mut local_pipeline_req = pipe::PipelineRequest {
@@ -234,12 +327,19 @@ impl ChiseiServiceImpl {
             context_projection_latency_ms = context_projection_latency_ms.saturating_add(
                 u64::try_from(projection_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
-            let (local_runtime, local_model, local_pref_runtime, local_pref_model) = self
+            let (
+                local_runtime,
+                local_model,
+                local_pref_runtime,
+                local_pref_model,
+                local_impact_outcome,
+            ) = self
                 .resolve_model_for_run(
                     &input,
                     &local_pipeline_req.runtime,
                     &local_run,
-                    effective_policy.as_ref(),
+                    route_policy.as_ref(),
+                    impact_call.as_ref(),
                     safe_only,
                     &safe_providers,
                 )
@@ -254,6 +354,7 @@ impl ChiseiServiceImpl {
                     true,
                     initial_pref_runtime,
                     initial_pref_model,
+                    initial_impact_outcome,
                 )
             } else {
                 (
@@ -264,6 +365,7 @@ impl ChiseiServiceImpl {
                     false,
                     local_pref_runtime,
                     local_pref_model,
+                    local_impact_outcome,
                 )
             }
         };
@@ -340,14 +442,21 @@ impl ChiseiServiceImpl {
             } else {
                 self.resolve_live_model(
                     &p.model,
-                    effective_policy.as_ref(),
+                    route_policy.as_ref(),
                     final_route_bias,
                     safe_only,
                     &safe_providers,
                     None,
+                    impact_routing.as_ref(),
                 )
                 .await
-                .unwrap_or_else(|_| resolved_model.clone())
+                .ok()
+                .filter(|model| {
+                    impact_routing
+                        .as_ref()
+                        .is_none_or(|routing| routing.allows(model))
+                })
+                .unwrap_or_else(|| resolved_model.clone())
             };
             Some(ReviewPolicy {
                 confidence_threshold: p.confidence_threshold,
@@ -604,6 +713,13 @@ impl ChiseiServiceImpl {
                 .map(|class| class.as_str().to_string())
                 .unwrap_or_default(),
             action_claim_resolution: action_impact.resolution.as_str().into(),
+            impact_route_class: impact_routing
+                .as_ref()
+                .map(|routing| routing.class.as_str().into())
+                .unwrap_or_default(),
+            impact_route_decision: impact_outcome
+                .map(|outcome| outcome.as_str().into())
+                .unwrap_or_default(),
         })
     }
 
@@ -771,6 +887,7 @@ impl ChiseiServiceImpl {
                         );
                     }
                     attributes.extend(plan_action_claim_attributes(plan));
+                    attributes.extend(plan_impact_route_attributes(plan));
                     attributes
                 },
             ),
@@ -1074,17 +1191,28 @@ impl ChiseiServiceImpl {
 
     /// Resolve runtime/model and return the effective pre-policy preference
     /// that was fed into policy resolution: `(resolved_runtime, resolved_model,
-    /// preferred_runtime, preferred_model)`.
+    /// preferred_runtime, preferred_model, impact route outcome)`. With an
+    /// impact route rule, `policy` is the namespace policy narrowed to the
+    /// call's class.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn resolve_model_for_run(
         &self,
         input: &ExecutionInput,
         fallback_runtime: &str,
         run: &pipe::RunResult,
         policy: Option<&crate::chisei::policy::Policy>,
+        impact: Option<&ImpactRouteCall<'_>>,
         safe_only: bool,
         safe_providers: &std::collections::HashSet<String>,
-    ) -> Result<(String, String, String, String), Status> {
+    ) -> Result<(String, String, String, String, Option<ImpactRouteOutcome>), Status> {
         let route_override = input.route_override.trim();
+        if let Some(call) = impact
+            && !route_override.is_empty()
+        {
+            call.routing
+                .check_override(route_override)
+                .map_err(|reason| self.refuse_impact_route(call, input, reason))?;
+        }
         if !route_override.is_empty() && !route_override_allowed(policy, route_override) {
             let refusal =
                 format!("route override {route_override:?} is not allowed by namespace policy");
@@ -1133,9 +1261,30 @@ impl ChiseiServiceImpl {
         } else {
             input.preferred_runtime.clone()
         };
-        let active_route =
-            self.policy
-                .resolve(&input.namespace, &preferred_runtime, &preferred_model);
+        // The rule hands the router an allowed request, or an empty one so
+        // the router substitutes the namespace default.
+        let (routed_model, impact_outcome) = match impact {
+            Some(call) if route_override.is_empty() => {
+                let (model, outcome) = call
+                    .routing
+                    .route_request(
+                        &preferred_model,
+                        policy.map_or("", |policy| policy.default_model.as_str()),
+                    )
+                    .map_err(|reason| self.refuse_impact_route(call, input, reason))?;
+                (model, Some(outcome))
+            }
+            Some(_) => (preferred_model.as_str(), Some(ImpactRouteOutcome::Allowed)),
+            None => (preferred_model.as_str(), None),
+        };
+        let active_route = match policy.filter(|_| impact.is_some()) {
+            Some(narrowed) => self
+                .policy
+                .apply_policy(narrowed, &preferred_runtime, routed_model),
+            None => self
+                .policy
+                .resolve(&input.namespace, &preferred_runtime, routed_model),
+        };
         self.observe_policy_shadow(
             super::rpc_policy_shadow::ShadowRequest {
                 scopes: std::slice::from_ref(&input.namespace),
@@ -1172,9 +1321,21 @@ impl ChiseiServiceImpl {
                 safe_providers,
                 None,
                 !route_override.is_empty(),
+                impact.map(|call| call.routing),
             )
             .await
-            .map_err(Status::failed_precondition)?;
+            .map_err(|error| match impact {
+                // An alias with no permitted candidate is the rule's refusal.
+                Some(call) if crate::chisei::model_routing::is_routing_alias(&model) => {
+                    self.refuse_impact_route(call, input, call.routing.alias_refusal(&model))
+                }
+                _ => Status::failed_precondition(error),
+            })?;
+        if let Some(call) = impact {
+            call.routing
+                .check_resolved(&model)
+                .map_err(|reason| self.refuse_impact_route(call, input, reason))?;
+        }
         let runtime = final_runtime_for_model(policy, &runtime, &model)
             .map_err(Status::failed_precondition)?;
         // Single-plane residency (#289): fail closed before any provider contact.
@@ -1186,8 +1347,102 @@ impl ChiseiServiceImpl {
         self.policy
             .enforce_residency(&input.namespace, provider, &model, data_class)
             .map_err(Status::permission_denied)?;
-        Ok((runtime, model, preferred_runtime, preferred_model))
+        Ok((
+            runtime,
+            model,
+            preferred_runtime,
+            preferred_model,
+            impact_outcome,
+        ))
     }
+
+    /// Record a planning-time impact route refusal in the decision ledger
+    /// and return it as the planning error.
+    pub(super) fn refuse_impact_route(
+        &self,
+        call: &ImpactRouteCall<'_>,
+        input: &ExecutionInput,
+        reason: String,
+    ) -> Status {
+        Status::invalid_argument(self.record_impact_route_refusal(
+            call.impact,
+            call.actor,
+            call.routing.class,
+            input,
+            reason,
+        ))
+    }
+
+    /// Write a planning-time impact route refusal to the decision ledger and
+    /// return its reason.
+    pub(super) fn record_impact_route_refusal(
+        &self,
+        impact: &crate::chisei::action_impact::ActionImpact,
+        actor: &str,
+        class: RouteClass,
+        input: &ExecutionInput,
+        reason: String,
+    ) -> String {
+        let mut evidence = std::collections::HashMap::from([
+            ("namespace".to_string(), input.namespace.trim().to_string()),
+            ("requested_model".to_string(), input.preferred_model.clone()),
+            (
+                "route_override".to_string(),
+                input.route_override.trim().to_string(),
+            ),
+        ]);
+        evidence.extend(impact.record_attributes());
+        evidence.extend(crate::chisei::impact_route::record_attributes(Some((
+            class,
+            ImpactRouteOutcome::Refused,
+        ))));
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: actor.to_string(),
+            action: IMPACT_ROUTE_DECISION_ACTION.into(),
+            reason: reason.clone(),
+            evidence,
+            target_id: input.request_id.clone(),
+            outcome: "refused".into(),
+        });
+        reason
+    }
+}
+
+/// Refusal reason when the stored impact route rule cannot be read or
+/// parsed (#1861).
+pub(super) fn unreadable_impact_route(error: &str) -> String {
+    format!(
+        "{}: impact route policy is unreadable: {error}",
+        crate::chisei::impact_route::IMPACT_ROUTE_REFUSAL
+    )
+}
+
+/// Decision-ledger action of an impact route refusal at planning (#1861).
+pub(super) const IMPACT_ROUTE_DECISION_ACTION: &str = "chisei.impact_route";
+
+/// One model call under a namespace impact route rule (#1861).
+pub(super) struct ImpactRouteCall<'a> {
+    pub(super) routing: &'a crate::chisei::impact_route::ImpactRouting,
+    pub(super) impact: &'a crate::chisei::action_impact::ActionImpact,
+    pub(super) actor: &'a str,
+}
+
+/// Receipt attributes of the plan's impact route decision: present when the
+/// rule applied, or `impact_route_applied=false` when the call cites a claim
+/// but the namespace has no rule.
+pub(super) fn plan_impact_route_attributes(plan: &ExecutionPlan) -> BTreeMap<String, String> {
+    let applied = RouteClass::parse(&plan.impact_route_class)
+        .zip(ImpactRouteOutcome::parse(&plan.impact_route_decision));
+    let cites_claim = plan
+        .input
+        .as_ref()
+        .is_some_and(|input| input.action_claim.is_some());
+    if applied.is_none() && !cites_claim {
+        return BTreeMap::new();
+    }
+    crate::chisei::impact_route::record_attributes(applied)
 }
 
 pub(super) fn choose_preferred_model(

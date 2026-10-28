@@ -38,6 +38,7 @@ pub mod gunshi_feedback;
 pub mod gunshi_feedback_eval;
 pub mod gunshi_optimization;
 pub mod gunshi_policy;
+pub mod impact_route;
 pub mod json;
 pub mod kioku;
 pub mod learning_change;
