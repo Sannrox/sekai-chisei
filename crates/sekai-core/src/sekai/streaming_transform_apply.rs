@@ -335,8 +335,8 @@ pub fn apply(
             }
         };
         let (create, mut object) = match planned_mutation {
-            PlannedObjectMutation::Create(object) => (true, object),
-            PlannedObjectMutation::Update(object, _) => (false, object),
+            PlannedObjectMutation::Create { object, .. } => (true, object),
+            PlannedObjectMutation::Update { object, .. } => (false, object),
         };
         if object.id != authorized_id {
             return Err(StreamingApplyError::InvalidArgument(

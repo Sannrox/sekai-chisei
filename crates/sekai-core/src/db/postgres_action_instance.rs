@@ -200,6 +200,7 @@ impl PostgresDb {
     /// Applies an admission's object write only while `lease` still names the
     /// reservation's owner and generation and has not expired (#1930). A
     /// takeover bumps the generation, so a stale owner's write is refused.
+    /// Each of `references` must still be stored as planning read it (#1941).
     #[allow(clippy::too_many_arguments)]
     pub fn apply_admission_object_write(
         &self,
@@ -207,6 +208,7 @@ impl PostgresDb {
         lease: &AdmissionLease,
         write: &ParkedGrantWrite,
         expected: Option<&crate::domain::Object>,
+        references: &[crate::sekai::action_instance::PlanReference],
         actor: &str,
         attribution: &crate::sekai::audit::ChangeAttribution,
     ) -> Result<FencedAdmissionWrite<Option<crate::domain::Object>>, String> {
@@ -216,6 +218,12 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
             return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        if let Some(changed) = postgres_changed_reference(&mut tx, references)? {
+            return Err(format!(
+                "{}{changed}",
+                crate::sekai::action_instance::REFERENCE_CHANGED
+            ));
         }
         let previous = match write {
             ParkedGrantWrite::Create(object) => {
@@ -492,12 +500,14 @@ impl PostgresDb {
 
     /// Grants a parked instance and applies its object write in one
     /// transaction, matching SQLite (#1139, #1314).
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_parked_action_instance(
         &self,
         granted: &ActionInstance,
         target_object_id: &str,
         parked_object_digest: &str,
         write: Option<&ParkedGrantWrite>,
+        references: &[crate::sekai::action_instance::PlanReference],
         actor: &str,
         claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
@@ -546,6 +556,9 @@ impl PostgresDb {
             if object_state_digest(current.as_ref())? != parked_object_digest {
                 return Ok(ParkedGrantOutcome::Stale);
             }
+        }
+        if postgres_changed_reference(&mut transaction, references)?.is_some() {
+            return Ok(ParkedGrantOutcome::Stale);
         }
         let previous = match write {
             Some(ParkedGrantWrite::Create(object)) => {
@@ -726,4 +739,37 @@ pub(crate) fn postgres_admission_fence_holds<C: postgres::GenericClient>(
             now_ms,
         )
     }))
+}
+
+/// The id of the first of `references` no longer as planning read it
+/// (#1941). A present one is read `FOR SHARE` and an absent one holds its
+/// lifecycle lock, which a create takes, so each stays as read until commit;
+/// in id order, so two writers lock in one order.
+fn postgres_changed_reference(
+    tx: &mut postgres::Transaction<'_>,
+    references: &[crate::sekai::action_instance::PlanReference],
+) -> Result<Option<String>, String> {
+    use crate::sekai::action_instance::PlanReference;
+    let mut ordered: Vec<&PlanReference> = references.iter().collect();
+    ordered.sort_by(|left, right| left.id().cmp(right.id()));
+    for reference in ordered {
+        if matches!(reference, PlanReference::Absent(_)) {
+            lock_object_lifecycle(tx, reference.id())?;
+        }
+        let current = tx
+            .query_opt(
+                &format!(
+                    "SELECT {} FROM sekai_objects WHERE id = $1 FOR SHARE",
+                    crate::db::postgres_audit::OBJECT_COLUMNS
+                ),
+                &[&reference.id()],
+            )
+            .map_err(|error| error.to_string())?
+            .map(row_to_object)
+            .transpose()?;
+        if !reference.holds(current.as_ref()) {
+            return Ok(Some(reference.id().to_string()));
+        }
+    }
+    Ok(None)
 }

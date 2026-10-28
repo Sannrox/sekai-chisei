@@ -848,7 +848,10 @@ impl<'a> ActionInstanceAdmission<'a> {
                     if !expected_object_revision.is_empty()
                         && !matches!(
                             &planned,
-                            Some(action_object_mutation::PlannedObjectMutation::Update(_, snapshot))
+                            Some(action_object_mutation::PlannedObjectMutation::Update {
+                                before: snapshot,
+                                ..
+                            })
                                 if crate::sekai::action_describe_preview::object_revision(snapshot)
                                     == expected_object_revision
                         ) =>
@@ -861,10 +864,12 @@ impl<'a> ActionInstanceAdmission<'a> {
                 Ok(None) => None,
                 // The conflict check passed against one version; a write
                 // that landed since is judged afresh by a new submit.
-                Ok(Some(action_object_mutation::PlannedObjectMutation::Update(_, snapshot)))
-                    if offline_checked
-                        .as_ref()
-                        .is_some_and(|checked| !snapshot.persisted_state_matches(checked)) =>
+                Ok(Some(action_object_mutation::PlannedObjectMutation::Update {
+                    before: snapshot,
+                    ..
+                })) if offline_checked
+                    .as_ref()
+                    .is_some_and(|checked| !snapshot.persisted_state_matches(checked)) =>
                 {
                     let _ = self
                         .db
@@ -5688,6 +5693,7 @@ mod tests {
                 "rec-21",
                 &parked.parked_object_digest,
                 Some(&write),
+                &[],
                 "alice",
                 None,
             )
@@ -5704,9 +5710,28 @@ mod tests {
             STATUS_PARKED
         );
 
-        // Already decided elsewhere: no write lands.
+        // A reference the plan read changed: stale too (#1941).
         let current_digest =
             crate::sekai::action_instance::object_state_digest(Some(&object)).unwrap();
+        let mut read = object.clone();
+        read.properties.insert("title".into(), "as planned".into());
+        assert!(matches!(
+            db.grant_parked_action_instance(
+                &granted,
+                "rec-21",
+                &current_digest,
+                Some(&write),
+                &[crate::sekai::action_instance::PlanReference::Present(
+                    read.clone()
+                )],
+                "alice",
+                None,
+            )
+            .unwrap(),
+            ParkedGrantOutcome::Stale
+        ));
+
+        // Already decided elsewhere: no write lands.
         let mut denied = parked.clone();
         denied.status = STATUS_DENIED.into();
         assert!(db.decide_parked_action_instance(&denied).unwrap());
@@ -5716,6 +5741,7 @@ mod tests {
                 "rec-21",
                 &current_digest,
                 Some(&write),
+                &[],
                 "alice",
                 None,
             )

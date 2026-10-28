@@ -120,6 +120,37 @@ pub const ADMISSION_LEASE_MS: i64 = 60_000;
 /// admission reservation, or after its lease expired.
 pub const ADMISSION_FENCE_LOST: &str = "action instance admission lost its reservation";
 
+/// Prefix of the error an admission write returns when an object its plan
+/// read changed since (#1941); the object's id follows.
+pub const REFERENCE_CHANGED: &str = "admission reference changed: ";
+
+/// An object an admission's plan read, as it read it (#1941): present with
+/// its state, or absent. The write commits only while each still holds.
+#[derive(Debug, Clone)]
+pub enum PlanReference {
+    Present(crate::domain::Object),
+    Absent(String),
+}
+
+impl PlanReference {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Present(object) => &object.id,
+            Self::Absent(id) => id,
+        }
+    }
+
+    /// Whether `current`, the object stored now, is as planning read it.
+    pub fn holds(&self, current: Option<&crate::domain::Object>) -> bool {
+        match self {
+            Self::Present(read) => {
+                current.is_some_and(|current| current.persisted_state_matches(read))
+            }
+            Self::Absent(_) => current.is_none(),
+        }
+    }
+}
+
 /// The holder of an admission reservation. A takeover (#1931) bumps the
 /// generation; an owner's writes are refused once it is not current.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,12 +771,14 @@ impl SekaiDb {
     /// transaction (#1139). The target object is re-digested under the write
     /// lock, so a grant either commits both the write and the transition or
     /// neither: no orphan write, and no concurrent grant can apply twice.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_parked_action_instance(
         &self,
         granted: &ActionInstance,
         target_object_id: &str,
         parked_object_digest: &str,
         write: Option<&ParkedGrantWrite>,
+        references: &[PlanReference],
         actor: &str,
         claim: Option<&ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
@@ -794,6 +827,9 @@ impl SekaiDb {
             if object_state_digest(current.as_ref())? != parked_object_digest {
                 return Ok(ParkedGrantOutcome::Stale);
             }
+        }
+        if sqlite_changed_reference(&tx, references)?.is_some() {
+            return Ok(ParkedGrantOutcome::Stale);
         }
         let previous = match write {
             Some(ParkedGrantWrite::Create(object)) => {
@@ -905,6 +941,8 @@ impl SekaiDb {
     /// Applies an admission's object write only while `lease` still names the
     /// reservation's owner and generation and has not expired (#1930). A
     /// takeover bumps the generation, so a stale owner's write is refused.
+    /// Each of `references` must still be stored as planning read it
+    /// (#1941); a changed one fails with [`REFERENCE_CHANGED`] and its id.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_admission_object_write(
         &self,
@@ -912,6 +950,7 @@ impl SekaiDb {
         lease: &AdmissionLease,
         write: &ParkedGrantWrite,
         expected: Option<&crate::domain::Object>,
+        references: &[PlanReference],
         actor: &str,
         attribution: &crate::sekai::audit::ChangeAttribution,
     ) -> Result<FencedAdmissionWrite<Option<crate::domain::Object>>, String> {
@@ -922,6 +961,9 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?;
         if !sqlite_admission_fence_holds(&tx, instance_id, lease, true)? {
             return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        if let Some(changed) = sqlite_changed_reference(&tx, references)? {
+            return Err(format!("{REFERENCE_CHANGED}{changed}"));
         }
         let previous = match write {
             ParkedGrantWrite::Create(object) => {
@@ -1170,6 +1212,29 @@ pub(crate) fn reserve_for_test(
     (instance.instance_id, lease)
 }
 
+/// The id of the first of `references` no longer as planning read it
+/// (#1941), inside `tx`.
+fn sqlite_changed_reference(
+    tx: &rusqlite::Transaction<'_>,
+    references: &[PlanReference],
+) -> Result<Option<String>, String> {
+    for reference in references {
+        let current = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE id = ?1",
+                params![reference.id()],
+                crate::db::sekai::row_to_object,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !reference.holds(current.as_ref()) {
+            return Ok(Some(reference.id().to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether `lease` holds the instance's admission reservation inside `tx`,
 /// and, with `check_expiry`, is still live on the lease clock.
 pub(crate) fn sqlite_admission_fence_holds(
@@ -1358,8 +1423,16 @@ mod tests {
         );
         let write = ParkedGrantWrite::Create(object("rec-stale"));
         assert!(matches!(
-            db.apply_admission_object_write(&instance_id, &stale, &write, None, "a", &attribution)
-                .unwrap(),
+            db.apply_admission_object_write(
+                &instance_id,
+                &stale,
+                &write,
+                None,
+                &[],
+                "a",
+                &attribution
+            )
+            .unwrap(),
             FencedAdmissionWrite::FenceLost
         ));
         assert!(db.get_object("rec-stale").unwrap().is_none());
@@ -1403,6 +1476,7 @@ mod tests {
                 &current,
                 &write,
                 None,
+                &[],
                 "a",
                 &attribution
             )
@@ -1443,8 +1517,16 @@ mod tests {
         db.put_action_instance(&stored).unwrap();
         let write = ParkedGrantWrite::Create(object("rec-expired"));
         assert!(matches!(
-            db.apply_admission_object_write(&expired_id, &expired, &write, None, "a", &attribution)
-                .unwrap(),
+            db.apply_admission_object_write(
+                &expired_id,
+                &expired,
+                &write,
+                None,
+                &[],
+                "a",
+                &attribution
+            )
+            .unwrap(),
             FencedAdmissionWrite::FenceLost
         ));
         assert!(db.get_object("rec-expired").unwrap().is_none());
@@ -1482,6 +1564,92 @@ mod tests {
         assert_eq!(taken.admission_lease.unwrap().write_committed, Some(true));
     }
 
+    /// An admission write commits only while each reference is stored as
+    /// planning read it (#1941).
+    fn references_fence_the_admission_write(db: &crate::db::runtime_db::RuntimeDb, tag: &str) {
+        let record = |id: &str, updated| crate::domain::Object {
+            id: id.into(),
+            kind: "customer_record".into(),
+            name: id.into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 500,
+            updated,
+        };
+        let reference_id = format!("ref-{tag}");
+        db.create_object_with_audit(&record(&reference_id, 500), "a")
+            .unwrap();
+        let planned = db.get_object(&reference_id).unwrap().unwrap();
+        let mut changed = planned.clone();
+        changed.updated = 501;
+        changed.properties.insert("tier".into(), "gold".into());
+        db.update_object(&changed).unwrap();
+        let attribution = crate::sekai::audit::ChangeAttribution::default();
+        let write = ParkedGrantWrite::Create(record(&format!("new-{tag}"), 600));
+        let (stale_id, stale_lease) = reserve_for_test(db, &format!("ai-ref-stale-{tag}"), 100);
+        let error = db
+            .apply_admission_object_write(
+                &stale_id,
+                &stale_lease,
+                &write,
+                None,
+                &[PlanReference::Present(planned.clone())],
+                "a",
+                &attribution,
+            )
+            .unwrap_err();
+        assert_eq!(error, format!("{REFERENCE_CHANGED}{reference_id}"));
+        assert!(db.get_object(&format!("new-{tag}")).unwrap().is_none());
+
+        let current = db.get_object(&reference_id).unwrap().unwrap();
+        let (fresh_id, fresh_lease) = reserve_for_test(db, &format!("ai-ref-fresh-{tag}"), 100);
+        assert!(matches!(
+            db.apply_admission_object_write(
+                &fresh_id,
+                &fresh_lease,
+                &write,
+                None,
+                &[PlanReference::Present(current.clone())],
+                "a",
+                &attribution,
+            )
+            .unwrap(),
+            FencedAdmissionWrite::Applied(None)
+        ));
+
+        // A reference read as absent refuses once it exists.
+        let ghost = format!("ghost-{tag}");
+        db.create_object_with_audit(&record(&ghost, 700), "a")
+            .unwrap();
+        let (absent_id, absent_lease) = reserve_for_test(db, &format!("ai-ref-absent-{tag}"), 100);
+        let error = db
+            .apply_admission_object_write(
+                &absent_id,
+                &absent_lease,
+                &ParkedGrantWrite::Create(record(&format!("other-{tag}"), 800)),
+                None,
+                &[PlanReference::Absent(ghost.clone())],
+                "a",
+                &attribution,
+            )
+            .unwrap_err();
+        assert_eq!(error, format!("{REFERENCE_CHANGED}{ghost}"));
+    }
+
+    #[test]
+    fn sqlite_references_fence_the_admission_write() {
+        references_fence_the_admission_write(&crate::db::runtime_db::RuntimeDb::memory(), "s");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_references_fence_the_admission_write() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = crate::db::runtime_db::RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        references_fence_the_admission_write(&db, "p");
+    }
+
     #[test]
     fn sqlite_stale_admission_owner_is_fenced() {
         stale_admission_owner_is_fenced(&crate::db::runtime_db::RuntimeDb::memory());
@@ -1511,7 +1679,7 @@ mod tests {
         let attribution = crate::sekai::audit::ChangeAttribution::default();
         let same = ParkedGrantWrite::Update(object.clone());
         let error = db
-            .apply_admission_object_write(&instance_id, &lease, &same, None, "a", &attribution)
+            .apply_admission_object_write(&instance_id, &lease, &same, None, &[], "a", &attribution)
             .unwrap_err();
         assert_eq!(error, "object revision conflict");
         let advanced = ParkedGrantWrite::Update(crate::domain::Object {
@@ -1524,6 +1692,7 @@ mod tests {
                 &lease,
                 &advanced,
                 None,
+                &[],
                 "a",
                 &attribution
             )
