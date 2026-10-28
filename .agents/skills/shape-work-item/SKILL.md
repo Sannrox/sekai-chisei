@@ -1,50 +1,25 @@
 ---
 name: shape-work-item
-description: Shape a raw sekai-chisei idea, bug report, refactoring proposal, or research question into a focused GitHub Issue. Use when work needs scope, acceptance evidence, risk routing, or the correct Issue template before implementation.
+description: Shape a raw idea, bug report, refactoring proposal, or research question into a focused GitHub Issue. Use when work needs scope, acceptance evidence, risk routing, or the correct Issue template before implementation. Uses the shared Sannrox agent-kit installation.
 ---
 
 # Shape Work Item
 
-Turn intent into a decision-ready unit of work. Produce a draft unless the user
-explicitly authorizes publishing to GitHub.
+Use the canonical [shape-work-item skill](https://github.com/Sannrox/agent-kit/tree/main/skills/shape-work-item).
+Read the complete installed `~/.agents/agent-kit/skills/shape-work-item/SKILL.md` and the
+references it requires before starting. If installed at another operator-selected location
+(`$AGENT_KIT_HOME`), use that installation. This repository entrypoint contains no
+workflow implementation.
 
-## Procedure
+If the skill is missing, run `bash scripts/validate-workflow-skills.sh` from this repository
+(it clones or updates the kit), or clone it directly:
+`git clone https://github.com/Sannrox/agent-kit ~/.agents/agent-kit`. Run `git pull` in that
+checkout to get the latest version; consumers always use `main`.
 
-1. Read `AGENTS.md`, `VISION.md`, `docs/architecture.md`, and the matching form
-   under `.github/ISSUE_TEMPLATE/`. Inspect affected code or docs when named.
-   Complete when the request is framed against actual project boundaries.
-2. Search open and closed Issues, Discussions, and PRs when GitHub access is
-   available. Record possible duplicates or state that the search was not run.
-   Complete when overlapping work is linked or ruled out.
-3. Classify the work:
-   - `bug`: reproducible expected-versus-actual behavior;
-   - `feature`: a new observable operator or integration outcome;
-   - `refactor`: preserved behavior with concrete structural evidence; or
-   - `research`: a time-boxed question that ends in a decision.
-   Route sensitive/exploitable behavior to `SECURITY.md`. Route cross-boundary,
-   public-contract, trust-model, or difficult-to-reverse choices to a Design
-   Discussion before implementation. Complete when exactly one primary route
-   is selected and exceptions are explained.
-4. Draft the work item with a problem statement, observable outcome, non-goals,
-   acceptance evidence, affected boundary, and compatibility/security/data
-   risks. Preserve uncertainty as an explicit question. Complete when another
-   contributor can tell what success means without reconstructing the prompt.
-5. Recommend one type label, one status label, relevant area/risk labels, and
-   whether a milestone is justified. Do not invent priority, assignment, or a
-   milestone. Complete when every recommended label describes supplied
-   evidence.
+Run the shared skill's scripts from the repository being changed, preserving its working
+directory. Follow this repository's `AGENTS.md` (including `## Agent skill profile`) in addition to the
+canonical skill.
 
-## Output
-
-Return:
-
-1. route and rationale;
-2. possible duplicates or search limitation;
-3. issue title and body ready for the selected form;
-4. recommended labels; and
-5. unresolved questions that prevent `status:ready`.
-
-Keep implementation design out of the Issue unless it is a validated
-constraint. Do not publish, assign, close, or prioritize GitHub work without
-explicit authorization. Omit hostnames, home paths, absolute worktree paths,
-and other private environment inventory from any GitHub-facing draft.
+Keep shared fixes and instructions upstream in `Sannrox/agent-kit`. When the stub template
+changes upstream, run `bash scripts/validate-workflow-skills.sh --render`. Do not add
+repository-local helpers or copies.

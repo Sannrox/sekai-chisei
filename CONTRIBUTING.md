@@ -57,7 +57,7 @@ Separate `sekai-plane` and `chisei-plane` processes are documented in
 [two-plane processes](docs/two-plane-processes.md).
 
 Each delivered Issue is one lane: claim with
-`bash .agents/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`
 before implementing, then work in `.worktrees/issue-<issue>`. See
 [Parallel delivery lanes](docs/project-operating-system.md#parallel-delivery-lanes).
 

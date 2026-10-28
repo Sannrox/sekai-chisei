@@ -124,7 +124,7 @@ creating a second project-management tree.
 | `tests/`, `tests/fixtures/` | Change authors | Deterministic contract and regression evidence. |
 | `docs/` | Maintainers for the affected surface | Durable operator, integration, architecture, and contribution knowledge. |
 | `docs/decisions/` | Decision owner | Accepted or superseded architecture decisions with long-lived consequences. |
-| `.agents/skills/` | Maintainers | Small, repository-specific AI procedures. Only project-owned Skills are tracked; personal Skills remain ignored. |
+| `.agents/skills/` | Maintainers | Generated agent-kit stubs and small, repository-specific AI procedures. Only project-owned Skills are tracked; personal Skills remain ignored. |
 | `.github/ISSUE_TEMPLATE/` | Triage maintainer | Structured inputs for bugs, features, refactors, and research. |
 | `.github/DISCUSSION_TEMPLATE/` | Discussion owner | Prompts for significant, multi-option design work. |
 | `.github/workflows/` | Maintainers | Required checks, security scanning, packaging, and releases. |
@@ -222,10 +222,14 @@ Research produces a decision, not necessarily code.
 
 ## 4. Skill system
 
-Repository Skills live under `.agents/skills/<skill-name>/`. Each contains a
-concise `SKILL.md` and UI metadata in `agents/openai.yaml`. Add scripts only for
-deterministic logic that is otherwise repeatedly rewritten; add references
-only when a branch needs substantial project-specific material.
+The workflow Skills below are canonical in
+[Sannrox/agent-kit](https://github.com/Sannrox/agent-kit);
+`.agents/skills/<skill-name>/` holds only a generated stub for each, and the
+repository facts they read live in `AGENTS.md` (`## Shared agent skills`,
+`## Agent skill profile`). Repository-only Skills live next to the stubs as
+full folders. Add scripts only for deterministic logic that is otherwise
+repeatedly rewritten; add references only when a branch needs substantial
+project-specific material.
 
 | Skill | Purpose and use | Required inputs | Expected output | Responsibilities and boundaries |
 | --- | --- | --- | --- | --- |
@@ -260,13 +264,12 @@ Before merging a Skill, validate its metadata, run it against one realistic
 task, and confirm it changes agent behavior beyond generic instructions. Retire
 or combine Skills that overlap, go stale, or lack an owner.
 
-Suggested structure for every Skill:
+Suggested structure for a repository-only Skill (shared Skills are stubs
+holding only `SKILL.md`):
 
 ```text
 .agents/skills/<verb-led-name>/
 ├── SKILL.md
-├── agents/
-│   └── openai.yaml
 ├── scripts/       # optional deterministic automation
 ├── references/    # optional, loaded only when needed
 └── assets/        # optional output templates
@@ -298,7 +301,7 @@ confirmation, unless the lead of the same parallel run owns the stalled lane.
 
 A lane claims before it implements, under Publish or Land authority or with an
 explicit claim authorization under Implement, using
-`bash .agents/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`:
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`:
 
 - the branch `<type>/<issue>` is created on GitHub from the default branch by
   an atomic ref creation, so when two machines race exactly one claim
@@ -408,16 +411,17 @@ the default branch is an ancestor of its head; it refreshes onto `main` only
 for a conflict, a failing gate, an explicit request, or a sibling landing on a
 shared surface, not merely because `main` advanced.
 
-Landing is sequential. After each merge, fetch, recompute the frontier, and let
-the remaining lanes recheck `mergeable` against the new `main`. A failed or
-timed-out merge response may still have merged; reconcile the remote state
-before retrying.
+A lane publishes with `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>` and lands with
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh land <issue> --pr <pr>`, which squash-merges the reviewed head once
+its checks pass and reconciles an uncertain merge response before reporting.
+A lane that conflicts with a sibling's landing reports it instead of merging.
+After each merge, fetch and recompute the frontier.
 
 The lead of a parallel run keeps a ledger per lane: Issue, branch, base SHA,
 owner, state, Pull Request, evidence, blockers, and cleanup. Absolute checkout
 paths and host names stay in the private session, never on GitHub. Report
 verified outcomes, not launched work. The executable lead procedure is
-`.agents/skills/deliver-ready-issue/references/parallel-delivery.md`.
+`references/parallel-delivery.md` of the shared `deliver-ready-issue` Skill.
 
 ## 5. Documentation strategy
 
@@ -461,7 +465,7 @@ Documentation stays maintainable when:
 6. Open a PR early when design feedback is useful; mark it draft until the
    acceptance evidence is present.
 7. Respond to every actionable review thread and re-publish a Verified tip
-   (`bash scripts/gh-verified-push.sh`) before merge.
+   (`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>`) before merge.
 
 ### AI contributors
 
@@ -504,7 +508,7 @@ Maintainers own routing and project coherence:
 - close or reroute work that violates product/security boundaries;
 - facilitate Discussions and state the final decision with rationale;
 - protect required checks and CODEOWNERS surfaces;
-- publish PR tips with `bash scripts/gh-verified-push.sh` (GitHub Verified commits);
+- publish PR tips with `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>` (GitHub Verified commits);
 - squash-merge focused PRs so `main` stays linear and lands Verified;
 - promote only durable outcomes, then remove obsolete Issues/docs/Skills; and
 - publish releases from verified commits with known compatibility notes.
@@ -574,10 +578,9 @@ into `CHANGELOG.md` and commits it with the version bump.
 
 The release owner verifies Cargo/package version, migration and configuration
 notes, CI, container build, smoke behavior, and rollback/backup implications.
-Use squash merges by default for Verified linear history on `main`. Prefer
-`bash scripts/gh-verified-push.sh` for PR branch publication (GraphQL
-`createCommitOnBranch`) over plain `git push` when Verified badges matter. Do
-not rewrite protected `main`. Avoid GitHub rebase-merge when signature /
+Use squash merges by default for Verified linear history on `main`. Publish PR
+branches with `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>` (GitHub Verified commits) rather than
+plain `git push`. Do not rewrite protected `main`. Avoid GitHub rebase-merge when signature /
 Verified status must survive landing.
 
 ### Branches and commits
@@ -599,8 +602,8 @@ docs: explain PostgreSQL support boundary
 ```
 
 Keep commits reviewable and do not mix unrelated formatting or generated state.
-Agent and maintainer delivery should re-publish PR tips with
-`bash scripts/gh-verified-push.sh` so the hosted commit is GitHub-signed.
+Agent and maintainer delivery re-publish PR tips with
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>` so the hosted commit is GitHub-signed.
 
 ## 8. Automation
 

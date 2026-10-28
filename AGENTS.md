@@ -23,18 +23,23 @@ Linux images: `./build/release-images.sh`. Push: `./build/release.sh` with
 
 Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `SEKAI_BIND`, `SEKAI_SOCKET`, `SEKAI_DATA_DIR`, `SEKAI_DB_PATH`, `CHISEI_DB_PATH`, `SEKAI_DB_BACKEND`, `SEKAI_DATABASE_URL`, `CHISEI_DATABASE_URL`, `SEKAI_INSECURE`, `SEKAI_CREDENTIAL`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
 
-GitHub Issues are the planning source of truth. Read `docs/project-operating-system.md` for artifact routing, contribution lifecycles, review roles, and project-specific Skills under `.agents/skills/`.
+GitHub Issues are the planning source of truth. Read `docs/project-operating-system.md` for artifact routing, contribution lifecycles, review roles, and the Skills under `.agents/skills/`.
+
+## Parallel delivery lanes
 
 Each delivered Issue is one lane: one claim branch `<type>/<issue>` on GitHub,
 one worktree at `.worktrees/issue-<issue>` (or a dedicated clone on another
 machine), one Pull Request, one owner. Claims live on GitHub because lanes run
 on several machines; claim with
-`bash .agents/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>` before
-implementing. Agents never switch, reset, or stash the primary checkout;
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`
+before implementing. Agents never switch, reset, or stash the primary checkout;
 inspect `git status -sb` and `git worktree list` before Git or GitHub work and
-preserve other lanes. The "Parallel delivery lanes" section of
-`docs/project-operating-system.md` defines claims, the lane limit, collision
-surfaces, and serialized Git mutations. Each lane builds into its own worktree's
+preserve other lanes. Collision surfaces are `proto/`, SQLite versus
+PostgreSQL migrations, gateway versus native gRPC, and the same crate or
+ownership boundary; lanes that would both change one run in sequence. The
+"Parallel delivery lanes" section of `docs/project-operating-system.md` defines
+claims, the lane limit, release-owned shared files, and serialized Git
+mutations. Each lane builds into its own worktree's
 `target/` (the default; never point two lanes at one `CARGO_TARGET_DIR`), binds
 test ports at `:0`, and gives PostgreSQL conformance its own database through
 `scripts/postgres-conformance.sh`. `--test-threads=1` serializes tests inside one
@@ -42,7 +47,7 @@ process; it does not isolate two agents.
 
 ## Ontology Policy
 
-For work involving portable ontology definitions, classes, relations, provenance, validation, import, export, or structural queries, always use the project-local `sekai-ontology` Skill in `.agents/skills/sekai-ontology/`.
+For work involving portable ontology definitions, classes, relations, provenance, validation, import, export, or structural queries, always use the `sekai-ontology` Skill (`.agents/skills/sekai-ontology/` is its shared agent-kit stub).
 
 Create or refresh a scoped portable database with `sekai setup` (or
 `sekai setup --scope workspace|project|user`). Select a database explicitly
@@ -54,6 +59,14 @@ absent rather than inferring it. Do not use the control-plane database at
 `data/sekai.db` as a portable ontology database.
 
 Ontology classes and relations describe meaning. Directory commands record local filesystem facts (`directory init` / `directory index`) in the same portable database; those facts are not ontology classes. This repository's contributor vocabulary pack is `crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json`. Import it into a throwaway `--db` when answering product-term questions; do not treat it as a built-in server ontology or as `directory init` vocabulary.
+
+### Product vocabulary
+
+The `sekai` CLI ships its own skill, `crates/sekai-ontology/assets/SKILL.md`
+(installed by `sekai setup`). Its "Product vocabulary (this repository)"
+section lists the questions to answer from the pack, never from memory, and the
+shipping commands that answer them. `.agents/skills/sekai-ontology/` is only
+the agent-kit stub; the embedded asset stays the product source.
 
 ## Coding Style & Naming Conventions
 
@@ -69,31 +82,105 @@ Recent history uses short imperative subjects, often Conventional Commit style: 
 
 ### Verified commits on GitHub
 
-Prefer publishing PR branch tips with GitHub-signed commits so GitHub shows
-**Verified**:
+Publish and land lanes with the shared agent-kit lane script so hosted commits
+are GitHub-signed (**Verified**) and `main` stays linear:
 
-1. Implement and commit locally as usual (`commit.gpgsign` may still apply).
-2. Publish the branch tip with `bash scripts/gh-verified-push.sh` instead of a plain
-   `git push` when you want the hosted commit Verified (OpenClaw-style GraphQL
-   `createCommitOnBranch`). That path creates one server-side commit with the
-   local `HEAD` tree; committer is typically **GitHub**.
-3. New branch:  
-   `bash scripts/gh-verified-push.sh --create-branch-from origin/main --branch <topic> --sync-local`
-4. Existing PR branch:  
-   `bash scripts/gh-verified-push.sh --branch <topic> --sync-local`  
-   (uses the current remote tip as `expectedHeadOid`).
-5. Never pass `--no-gpg-sign` for local commits; if GPG fails, stop and fix it.
-6. After publish, confirm `verification.verified=true` (the script prints this).
+1. Commit locally as usual. Never pass `--no-gpg-sign`; if GPG fails, stop and
+   fix it.
+2. Publish the claim branch from the lane worktree with
+   `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}/skills/deliver-ready-issue/scripts/issue-lane.sh" push <issue>`.
+   It prints the Verified commit and resets the worktree to it, so local `HEAD`
+   is the Pull Request head.
+3. Land with
+   `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}/skills/deliver-ready-issue/scripts/issue-lane.sh" land <issue> --pr <pr>`.
+   It squash-merges the reviewed head once the required checks pass.
 
-When merging PRs, prefer **squash** (`gh pr merge --squash --delete-branch`) so
-the land commit on `main` is also GitHub-signed/Verified and history stays
-linear. Use `gh pr merge --merge` only when multi-commit history must be kept
-(original SHAs preserved). Avoid GitHub **rebase** merges when Verified history
-matters: rebase-merge rewrites commits and drops signatures. Do not rewrite
-protected `main` after merging unless the user explicitly approves; if
-protection is temporarily relaxed, restore force-push and status-check settings
-immediately after the correction.
+Avoid GitHub **rebase** merges when Verified history matters: rebase-merge
+rewrites commits and drops signatures. Do not rewrite protected `main` after
+merging unless the user explicitly approves; if protection is temporarily
+relaxed, restore force-push and status-check settings immediately after the
+correction.
 
 ## Security & Configuration Tips
 
 Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Never put hostnames, FQDNs, home directories, absolute worktree paths, LAN or employer network names, or other private environment inventory on public Issues, Pull Requests, comments, or commit messages. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, create principal-scoped credentials with `sekaictl admin access credential create <principal>` and require `authorization: Bearer <token>` on gRPC requests. `SEKAI_CREDENTIAL` is a client-side bearer input and never bootstraps server authority. Report vulnerabilities through `SECURITY.md`.
+
+## Shared agent skills
+
+The workflow Skills (`advance-issue-frontier`, `assess-change-impact`,
+`capture-project-decision`, `deliver-ready-issue`, `prepare-release`,
+`refactor-docs`, `shape-work-item`, `technical-documentation`, `verify-change`)
+and the opt-in `sekai-ontology` Skill are canonical in
+[Sannrox/agent-kit](https://github.com/Sannrox/agent-kit). There is no pin:
+this repository always uses the latest `main`. `.agents/skills/<name>/` holds
+only a generated stub that points to the shared skill; read the installed skill
+under `~/.agents/agent-kit/` (or `$AGENT_KIT_HOME`). Run
+`bash scripts/validate-workflow-skills.sh` to clone or update it; CI runs the
+same check.
+
+- Repository-specific facts the shared Skills need come from this file: the
+  structure, parallel-lane, ontology, and testing sections, plus
+  `## Agent skill profile` below for anything they do not already say. Edit
+  this file, not the stubs.
+- Never edit stubs or the vendored `scripts/validate-workflow-skills.sh` here;
+  change them upstream in agent-kit, then run
+  `bash scripts/validate-workflow-skills.sh --render` here when CI reports
+  drift.
+- Repository-only Skills live next to the stubs as full folders and stay local.
+
+## Agent skill profile
+
+Facts the shared agent-kit skills read that the sections above do not already
+state. Frame work against `VISION.md` and `docs/architecture.md` as well as
+`README.md`.
+
+Feature: a new observable operator or integration outcome.
+
+### Compatibility and failure obligations
+
+Fresh and upgraded databases; transactional audit coupling; old clients and
+configuration; error semantics; rollback and backup impact; public `proto/`,
+gateway, and client compatibility.
+
+### Additional impact boundaries
+
+- Sekai durable facts versus Chisei governed decisions;
+- gateway-compatible requests versus native gRPC execution;
+- SQLite versus implemented PostgreSQL interfaces;
+- provider-neutral behavior versus `crates/chisei-provider/` adapters;
+- namespace authorization, egress, approval, budget, audit, lineage,
+  retention, and secrets;
+- public `proto/`, configuration (`.env.example`), CLI, receipt, metrics, and
+  operator behavior.
+
+### Verification matrix
+
+Rows beyond `## Testing Guidelines`:
+
+| Surface | Required evidence |
+| --- | --- |
+| gateway | deterministic `scripts/chisei_gateway_smoke.sh` |
+| protocol | generated build, service/client/example coverage, compatibility review |
+| persistence | fresh and upgrade behavior; SQLite/PostgreSQL alignment where implemented, PostgreSQL through `scripts/postgres-conformance.sh` |
+| configuration | parsing/default tests, `.env.example`, configuration docs |
+| ADRs | `sh scripts/adr-index.sh --check` |
+| Skills / `AGENTS.md` | `bash scripts/validate-workflow-skills.sh`; keep `CLAUDE.md` identical to `AGENTS.md` |
+
+Unit or mocked tests do not establish live provider, gateway transport,
+persistence-upgrade, packaging, or soak behavior; use the real boundary with
+isolated state, ports, and credentials, or report the check as skipped.
+
+### Release audit
+
+- `Cargo.toml` version, `Cargo.lock`, and `.github/workflows/release.yml`;
+- public gRPC, gateway, and client compatibility (`compatibility.json` is
+  generated by the release workflow);
+- SQLite migrations and implemented PostgreSQL alignment;
+- configuration additions, removals, defaults, and `.env.example`;
+- security, backup, rollback, retention, and operator actions;
+- container (`./build/release-images.sh`) and binary packaging;
+- release notes drafted with `bash scripts/changelog-draft.sh <version>`,
+  edited into `CHANGELOG.md`, and committed with the version bump; upgrade and
+  migration actions first; contributors credited through GitHub's generated
+  notes;
+- no live-provider tests without intentional prerequisites.
