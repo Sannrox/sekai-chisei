@@ -1121,6 +1121,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         })
         .unwrap();
     }
@@ -1260,6 +1261,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         })
         .unwrap();
         let claimed = ActionWorkLifecycle::new(&db)
@@ -1345,6 +1347,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);
@@ -1486,6 +1489,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);
@@ -1549,6 +1553,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);

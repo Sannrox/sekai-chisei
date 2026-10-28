@@ -25,6 +25,33 @@ impl SekaiDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    /// Records an admission's receipt only while `lease` still names the
+    /// reservation's owner and generation and has not expired (#1930).
+    /// Returns whether it was recorded.
+    pub fn put_admission_receipt(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if !crate::sekai::action_instance::sqlite_admission_fence_holds(
+            &tx,
+            instance_id,
+            lease,
+            true,
+        )? {
+            return Ok(false);
+        }
+        upsert_operation_receipt(&tx, receipt)?;
+        self.append_operation_receipt_chain(&tx, receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     pub fn get_operation_receipt(
         &self,
         operation_id: &str,

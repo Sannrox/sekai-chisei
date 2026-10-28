@@ -18397,6 +18397,7 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         conflict: None,
         approval: None,
         offline: None,
+        admission_lease: None,
     }
 }
 

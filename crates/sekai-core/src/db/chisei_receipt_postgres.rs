@@ -18,6 +18,41 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    /// Records an admission's receipt only while `lease` still names the
+    /// reservation's owner and generation and has not expired (#1930).
+    /// Returns whether it was recorded.
+    pub fn put_admission_receipt(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+    ) -> Result<bool, String> {
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+        if !crate::db::postgres_action_instance::postgres_admission_fence_holds(
+            &mut tx,
+            instance_id,
+            lease,
+            true,
+        )? {
+            return Ok(false);
+        }
+        self.upsert_operation_receipt_on(&mut tx, receipt)?;
+        self.append_operation_receipt_chain(&mut tx, receipt)?;
+        // The receipt chain may have waited on its own lock; check the lease
+        // again before committing.
+        if !crate::db::postgres_action_instance::postgres_admission_fence_holds(
+            &mut tx,
+            instance_id,
+            lease,
+            true,
+        )? {
+            return Ok(false);
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     fn upsert_operation_receipt_on<C: GenericClient>(
         &self,
         client: &mut C,

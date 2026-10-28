@@ -2345,6 +2345,7 @@ fn seed_claimed_action_of(
         conflict: None,
         approval: None,
         offline: None,
+        admission_lease: None,
     })
     .unwrap();
     crate::sekai::action_work_lifecycle::ActionWorkLifecycle::new(db)

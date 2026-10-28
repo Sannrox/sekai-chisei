@@ -142,6 +142,7 @@ fn seed_action_with_act(db: &RuntimeDb, prefix: &str, delegating_actor: Option<&
         conflict: None,
         approval: None,
         offline: None,
+        admission_lease: None,
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();

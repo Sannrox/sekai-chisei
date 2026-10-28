@@ -6,7 +6,8 @@ use crate::sekai::audit::{
 use crate::sekai::object_security::ObjectSecurityPolicy;
 use std::collections::BTreeSet;
 
-const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties, created, updated";
+pub(crate) const OBJECT_COLUMNS: &str =
+    "id, kind, name, namespace, external_id, properties, created, updated";
 
 impl PostgresDb {
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {

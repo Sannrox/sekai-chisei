@@ -160,6 +160,7 @@ fn seed_effect(db: &RuntimeDb, effect_id: &str, namespace: &str, type_id: &str) 
         conflict: None,
         approval: None,
         offline: None,
+        admission_lease: None,
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();

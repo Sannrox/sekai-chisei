@@ -660,6 +660,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         };
         db.put_action_instance(&instance).unwrap();
     }
@@ -791,6 +792,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         };
         db.put_action_instance(&failed).unwrap();
         let snapshot = offer(&db, "acme", "agent:fixture", "dispatch", test_threshold()).unwrap();
