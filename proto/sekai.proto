@@ -1139,6 +1139,76 @@ message HeartbeatTransformClaimRequest {
 message HeartbeatTransformClaimResponse {
   TransformWork work = 1;
 }
+// A site agent instance's turn and, once finished, its receipt (ADR 0137).
+message AgentTurn {
+  string turn_id = 1;
+  string namespace = 2;
+  string instance_id = 3;
+  // The instance's principal; the turn acts as it.
+  string principal_id = 4;
+  // schedule, object_change or manual.
+  string cause = 5;
+  // Schedule due time, change window, or manual request id.
+  string cause_ref = 6;
+  int64 due_at_ms = 7;
+  string admitted_by = 8;
+  // pending, claimed, completed, failed or refused.
+  string status = 9;
+  string claim_owner = 10;
+  int64 claim_generation = 11;
+  string fencing_token = 12;
+  int64 claim_expires_at_ms = 13;
+  int64 created_at_ms = 14;
+  int64 finished_at_ms = 15;
+  string reason = 16;
+}
+message WakeSiteAgentInstanceRequest {
+  string namespace = 1;
+  string instance_id = 2;
+  // Idempotency key: one manual turn per request id.
+  string request_id = 3;
+}
+message WakeSiteAgentInstanceResponse {
+  AgentTurn turn = 1;
+}
+message ListClaimableAgentTurnsRequest {
+  string namespace = 1;
+  int32 limit = 2;
+}
+message ListClaimableAgentTurnsResponse {
+  repeated AgentTurn turns = 1;
+}
+message ClaimAgentTurnRequest {
+  string namespace = 1;
+  string runtime_id = 2;
+  string turn_id = 3;
+  int64 ttl_ms = 4;
+}
+message ClaimAgentTurnResponse {
+  AgentTurn turn = 1;
+}
+message HeartbeatAgentTurnClaimRequest {
+  string turn_id = 1;
+  string runtime_id = 2;
+  int64 claim_generation = 3;
+  string fencing_token = 4;
+  int64 ttl_ms = 5;
+}
+message HeartbeatAgentTurnClaimResponse {
+  AgentTurn turn = 1;
+}
+message AckAgentTurnRequest {
+  string turn_id = 1;
+  string runtime_id = 2;
+  int64 claim_generation = 3;
+  string fencing_token = 4;
+  // completed or failed.
+  string outcome = 5;
+  string reason = 6;
+}
+message AckAgentTurnResponse {
+  AgentTurn turn = 1;
+}
 message TransformRunInputRow {
   string alias = 1;
   string dataset_id = 2;
@@ -4858,6 +4928,11 @@ service SekaiService {
   rpc ListClaimableTransformWork(ListClaimableTransformWorkRequest) returns (ListClaimableTransformWorkResponse);
   rpc ClaimTransformWork(ClaimTransformWorkRequest) returns (ClaimTransformWorkResponse);
   rpc HeartbeatTransformClaim(HeartbeatTransformClaimRequest) returns (HeartbeatTransformClaimResponse);
+  rpc WakeSiteAgentInstance(WakeSiteAgentInstanceRequest) returns (WakeSiteAgentInstanceResponse);
+  rpc ListClaimableAgentTurns(ListClaimableAgentTurnsRequest) returns (ListClaimableAgentTurnsResponse);
+  rpc ClaimAgentTurn(ClaimAgentTurnRequest) returns (ClaimAgentTurnResponse);
+  rpc HeartbeatAgentTurnClaim(HeartbeatAgentTurnClaimRequest) returns (HeartbeatAgentTurnClaimResponse);
+  rpc AckAgentTurn(AckAgentTurnRequest) returns (AckAgentTurnResponse);
   rpc ReadTransformRunInputs(ReadTransformRunInputsRequest) returns (stream ReadTransformRunInputsResponse);
   rpc WriteTransformRunResult(WriteTransformRunResultRequest) returns (WriteTransformRunResultResponse);
   rpc ApplyStreamingTransformBatch(ApplyStreamingTransformBatchRequest) returns (ApplyStreamingTransformBatchResponse);

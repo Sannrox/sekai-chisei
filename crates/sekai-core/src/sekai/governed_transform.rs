@@ -363,10 +363,11 @@ pub fn compute_preview_tables(
     Ok((rows, String::new()))
 }
 
-/// Prometheus text of the transform work queue gauges, read from the store
-/// at scrape time (#1732). Only isolated-process runs are queued; other
-/// profiles run in the request. The output depends on store state only, so
-/// every plane instance on one store reports the same series.
+/// Prometheus text of the work queue gauges, read from the store at scrape
+/// time (#1732). Isolated-process runs and agent turns (ADR 0137) are
+/// queued; other transform profiles run in the request. The output depends
+/// on store state only, so every plane instance on one store reports the
+/// same series.
 pub fn transform_work_depth_metrics(
     db: &crate::db::runtime_db::RuntimeDb,
     now_ms: i64,
@@ -385,10 +386,12 @@ pub fn transform_work_depth_metrics(
                 }),
         })
         .collect();
-    Ok(crate::obs::signals::render_transform_work_depth(
-        ISOLATED_CLASS,
-        pools,
-    ))
+    let turns =
+        crate::sekai::agent_turn::pool_gauge(db, now_ms).map_err(|error| error.to_string())?;
+    Ok(crate::obs::signals::render_transform_work_depth(vec![
+        (ISOLATED_CLASS, pools),
+        (crate::sekai::agent_turn::PROFILE, vec![turns]),
+    ]))
 }
 
 #[cfg(test)]

@@ -1230,6 +1230,86 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "WakeSiteAgentInstance",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_turn.rs",
+        "docs/decisions/0137-agent-turns-share-the-scheduling-split.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListClaimableAgentTurns",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_turn.rs",
+        "docs/decisions/0137-agent-turns-share-the-scheduling-split.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ClaimAgentTurn",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_turn.rs",
+        "docs/decisions/0137-agent-turns-share-the-scheduling-split.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "HeartbeatAgentTurnClaim",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_turn.rs",
+        "docs/decisions/0137-agent-turns-share-the-scheduling-split.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "AckAgentTurn",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_turn.rs",
+        "docs/decisions/0137-agent-turns-share-the-scheduling-split.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "HeartbeatTransformClaim",
       "kind": "persistent",
       "surfaces": [

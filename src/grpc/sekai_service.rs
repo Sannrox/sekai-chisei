@@ -1,6 +1,8 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 #[path = "action_binding.rs"]
 mod action_binding;
+#[path = "agent_turn_rpc.rs"]
+mod agent_turn_rpc;
 #[path = "authorized_link_mutation.rs"]
 mod authorized_link_mutation;
 #[path = "authorized_query_lifecycle.rs"]
@@ -221,49 +223,64 @@ const MAX_LIST_LIMIT: i32 = domain::MAX_LIST_LIMIT;
 
 const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
 
+/// Delegates each trait method `name` to `self.target`, one line per route.
+/// It emits the signature `async_trait` would, so the facade stays a list of
+/// routes under the #872 ceiling. A method that only forwards to an
+/// inherent method of the same request belongs here.
+macro_rules! delegate_rpcs {
+    ($($name:ident => $target:ident($request:ty) -> $response:ty;)*) => { $(
+        fn $name<'life0, 'async_trait>(
+            &'life0 self,
+            req: Request<$request>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Response<$response>, Status>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(self.$target(req))
+        }
+    )* };
+}
+
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
+    delegate_rpcs! {
+        wake_site_agent_instance => wake_site_agent_instance_rpc(WakeSiteAgentInstanceRequest) -> WakeSiteAgentInstanceResponse;
+        list_claimable_agent_turns => list_claimable_agent_turns_rpc(ListClaimableAgentTurnsRequest) -> ListClaimableAgentTurnsResponse;
+        claim_agent_turn => claim_agent_turn_rpc(ClaimAgentTurnRequest) -> ClaimAgentTurnResponse;
+        heartbeat_agent_turn_claim => heartbeat_agent_turn_claim_rpc(HeartbeatAgentTurnClaimRequest) -> HeartbeatAgentTurnClaimResponse;
+        ack_agent_turn => ack_agent_turn_rpc(AckAgentTurnRequest) -> AckAgentTurnResponse;
+        grant_namespace_export => grant_namespace_export_rpc(GrantNamespaceExportRequest) -> GrantNamespaceExportResponse;
+        revoke_namespace_export => revoke_namespace_export_rpc(RevokeNamespaceExportRequest) -> RevokeNamespaceExportResponse;
+        publish_federated_aggregate_allowance => publish_federated_aggregate_allowance_rpc(PublishFederatedAggregateAllowanceRequest) -> PublishFederatedAggregateAllowanceResponse;
+        withdraw_federated_aggregate_allowance => withdraw_federated_aggregate_allowance_rpc(WithdrawFederatedAggregateAllowanceRequest) -> WithdrawFederatedAggregateAllowanceResponse;
+        get_federated_aggregate_allowance => get_federated_aggregate_allowance_rpc(GetFederatedAggregateAllowanceRequest) -> GetFederatedAggregateAllowanceResponse;
+        put_export_definition => put_export_definition_rpc(PutExportDefinitionRequest) -> PutExportDefinitionResponse;
+        get_export_definition => get_export_definition_rpc(GetExportDefinitionRequest) -> GetExportDefinitionResponse;
+        delete_export_definition => delete_export_definition_rpc(DeleteExportDefinitionRequest) -> DeleteExportDefinitionResponse;
+        run_export_definition => run_export_definition_rpc(RunExportDefinitionRequest) -> RunExportDefinitionResponse;
+        list_deliverable_export_artifacts => list_deliverable_export_artifacts_rpc(ListDeliverableExportArtifactsRequest) -> ListDeliverableExportArtifactsResponse;
+        acknowledge_export_delivery => acknowledge_export_delivery_rpc(AcknowledgeExportDeliveryRequest) -> AcknowledgeExportDeliveryResponse;
+        get_export_receipt => get_export_receipt_rpc(GetExportReceiptRequest) -> GetExportReceiptResponse;
+        put_export_fingerprint_policy => put_export_fingerprint_policy_rpc(PutExportFingerprintPolicyRequest) -> PutExportFingerprintPolicyResponse;
+        get_export_fingerprint_policy => get_export_fingerprint_policy_rpc(GetExportFingerprintPolicyRequest) -> GetExportFingerprintPolicyResponse;
+        trace_export => trace_export_rpc(TraceExportRequest) -> TraceExportResponse;
+        generate_definition_change_bundle => generate_visible_definition_change_bundle(GenerateDefinitionChangeBundleRequest) -> GenerateDefinitionChangeBundleResponse;
+        put_action_binding => put_action_binding_definition(PutActionBindingRequest) -> PutActionBindingResponse;
+        run_action_binding => run_action_binding_once(RunActionBindingRequest) -> RunActionBindingResponse;
+        put_fence_binding => put_fence_binding_definition(PutFenceBindingRequest) -> PutFenceBindingResponse;
+        run_fence_binding => run_fence_binding_once(RunFenceBindingRequest) -> RunFenceBindingResponse;
+        put_ezu_geo_feed => put_ezu_geo_feed_definition(PutEzuGeoFeedRequest) -> PutEzuGeoFeedResponse;
+        run_ezu_geo_feed => run_ezu_geo_feed_once(RunEzuGeoFeedRequest) -> RunEzuGeoFeedResponse;
+        backfill_ezu_geo_feed => backfill_ezu_geo_feed_once(BackfillEzuGeoFeedRequest) -> BackfillEzuGeoFeedResponse;
+    }
+
     type ReadTransformRunInputsStream = Pin<
         Box<dyn futures_util::Stream<Item = Result<ReadTransformRunInputsResponse, Status>> + Send>,
     >;
     type ExportDatasetVersionStream = ExportStream;
     type ExportObjectSetStream = ExportStream;
     type FetchExportArtifactStream = ExportStream;
-
-    async fn grant_namespace_export(
-        &self,
-        req: Request<GrantNamespaceExportRequest>,
-    ) -> Result<Response<GrantNamespaceExportResponse>, Status> {
-        self.grant_namespace_export_rpc(req).await
-    }
-
-    async fn revoke_namespace_export(
-        &self,
-        req: Request<RevokeNamespaceExportRequest>,
-    ) -> Result<Response<RevokeNamespaceExportResponse>, Status> {
-        self.revoke_namespace_export_rpc(req).await
-    }
-
-    async fn publish_federated_aggregate_allowance(
-        &self,
-        req: Request<PublishFederatedAggregateAllowanceRequest>,
-    ) -> Result<Response<PublishFederatedAggregateAllowanceResponse>, Status> {
-        self.publish_federated_aggregate_allowance_rpc(req).await
-    }
-
-    async fn withdraw_federated_aggregate_allowance(
-        &self,
-        req: Request<WithdrawFederatedAggregateAllowanceRequest>,
-    ) -> Result<Response<WithdrawFederatedAggregateAllowanceResponse>, Status> {
-        self.withdraw_federated_aggregate_allowance_rpc(req).await
-    }
-
-    async fn get_federated_aggregate_allowance(
-        &self,
-        req: Request<GetFederatedAggregateAllowanceRequest>,
-    ) -> Result<Response<GetFederatedAggregateAllowanceResponse>, Status> {
-        self.get_federated_aggregate_allowance_rpc(req).await
-    }
 
     async fn export_object_set(
         &self,
@@ -279,81 +296,11 @@ impl SekaiService for SekaiServiceImpl {
         self.export_dataset_version_rpc(req).await
     }
 
-    async fn put_export_definition(
-        &self,
-        req: Request<PutExportDefinitionRequest>,
-    ) -> Result<Response<PutExportDefinitionResponse>, Status> {
-        self.put_export_definition_rpc(req).await
-    }
-
-    async fn get_export_definition(
-        &self,
-        req: Request<GetExportDefinitionRequest>,
-    ) -> Result<Response<GetExportDefinitionResponse>, Status> {
-        self.get_export_definition_rpc(req).await
-    }
-
-    async fn delete_export_definition(
-        &self,
-        req: Request<DeleteExportDefinitionRequest>,
-    ) -> Result<Response<DeleteExportDefinitionResponse>, Status> {
-        self.delete_export_definition_rpc(req).await
-    }
-
-    async fn run_export_definition(
-        &self,
-        req: Request<RunExportDefinitionRequest>,
-    ) -> Result<Response<RunExportDefinitionResponse>, Status> {
-        self.run_export_definition_rpc(req).await
-    }
-
-    async fn list_deliverable_export_artifacts(
-        &self,
-        req: Request<ListDeliverableExportArtifactsRequest>,
-    ) -> Result<Response<ListDeliverableExportArtifactsResponse>, Status> {
-        self.list_deliverable_export_artifacts_rpc(req).await
-    }
-
     async fn fetch_export_artifact(
         &self,
         req: Request<FetchExportArtifactRequest>,
     ) -> Result<Response<Self::FetchExportArtifactStream>, Status> {
         self.fetch_export_artifact_rpc(req).await
-    }
-
-    async fn acknowledge_export_delivery(
-        &self,
-        req: Request<AcknowledgeExportDeliveryRequest>,
-    ) -> Result<Response<AcknowledgeExportDeliveryResponse>, Status> {
-        self.acknowledge_export_delivery_rpc(req).await
-    }
-
-    async fn get_export_receipt(
-        &self,
-        req: Request<GetExportReceiptRequest>,
-    ) -> Result<Response<GetExportReceiptResponse>, Status> {
-        self.get_export_receipt_rpc(req).await
-    }
-
-    async fn put_export_fingerprint_policy(
-        &self,
-        req: Request<PutExportFingerprintPolicyRequest>,
-    ) -> Result<Response<PutExportFingerprintPolicyResponse>, Status> {
-        self.put_export_fingerprint_policy_rpc(req).await
-    }
-
-    async fn get_export_fingerprint_policy(
-        &self,
-        req: Request<GetExportFingerprintPolicyRequest>,
-    ) -> Result<Response<GetExportFingerprintPolicyResponse>, Status> {
-        self.get_export_fingerprint_policy_rpc(req).await
-    }
-
-    async fn trace_export(
-        &self,
-        req: Request<TraceExportRequest>,
-    ) -> Result<Response<TraceExportResponse>, Status> {
-        self.trace_export_rpc(req).await
     }
 
     async fn acquire_lease(
@@ -620,13 +567,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListOntologyHealthTrendRequest>,
     ) -> Result<Response<ListOntologyHealthTrendResponse>, Status> {
         ontology_health_rpc::list_ontology_health_trend(self, req).await
-    }
-
-    async fn generate_definition_change_bundle(
-        &self,
-        req: Request<GenerateDefinitionChangeBundleRequest>,
-    ) -> Result<Response<GenerateDefinitionChangeBundleResponse>, Status> {
-        self.generate_visible_definition_change_bundle(req).await
     }
 
     async fn dry_run_definition_change_bundle(
@@ -1194,55 +1134,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DecideActionInstanceRequest>,
     ) -> Result<Response<DecideActionInstanceResponse>, Status> {
         rpc_actions::decide_action_instance(self, req).await
-    }
-
-    async fn put_action_binding(
-        &self,
-        req: Request<PutActionBindingRequest>,
-    ) -> Result<Response<PutActionBindingResponse>, Status> {
-        self.put_action_binding_definition(req).await
-    }
-
-    async fn run_action_binding(
-        &self,
-        req: Request<RunActionBindingRequest>,
-    ) -> Result<Response<RunActionBindingResponse>, Status> {
-        self.run_action_binding_once(req).await
-    }
-
-    async fn put_fence_binding(
-        &self,
-        req: Request<PutFenceBindingRequest>,
-    ) -> Result<Response<PutFenceBindingResponse>, Status> {
-        self.put_fence_binding_definition(req).await
-    }
-
-    async fn run_fence_binding(
-        &self,
-        req: Request<RunFenceBindingRequest>,
-    ) -> Result<Response<RunFenceBindingResponse>, Status> {
-        self.run_fence_binding_once(req).await
-    }
-
-    async fn put_ezu_geo_feed(
-        &self,
-        req: Request<PutEzuGeoFeedRequest>,
-    ) -> Result<Response<PutEzuGeoFeedResponse>, Status> {
-        self.put_ezu_geo_feed_definition(req).await
-    }
-
-    async fn run_ezu_geo_feed(
-        &self,
-        req: Request<RunEzuGeoFeedRequest>,
-    ) -> Result<Response<RunEzuGeoFeedResponse>, Status> {
-        self.run_ezu_geo_feed_once(req).await
-    }
-
-    async fn backfill_ezu_geo_feed(
-        &self,
-        req: Request<BackfillEzuGeoFeedRequest>,
-    ) -> Result<Response<BackfillEzuGeoFeedResponse>, Status> {
-        self.backfill_ezu_geo_feed_once(req).await
     }
 
     async fn describe_object_action(

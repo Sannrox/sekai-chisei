@@ -1,4 +1,5 @@
-//! Versioned runtime-claim client for Action and isolated-process transform work.
+//! Versioned runtime-claim client for Action, isolated-process transform and
+//! agent-turn work.
 //!
 //! Lives in `sekai-client` so Shikigami and kako pin one crate with
 //! `sekai-proto`. The plane remains authoritative; this module maps wire
@@ -22,11 +23,14 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::protocol::sekai::{
-    AckActionWorkRequest, AckActionWorkResponse, ApplyStreamingTransformBatchRequest,
-    ApplyStreamingTransformBatchResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
+    AckActionWorkRequest, AckActionWorkResponse, AckAgentTurnRequest, AckAgentTurnResponse,
+    AgentTurn, ApplyStreamingTransformBatchRequest, ApplyStreamingTransformBatchResponse,
+    ClaimActionWorkRequest, ClaimActionWorkResponse, ClaimAgentTurnRequest, ClaimAgentTurnResponse,
     ClaimTransformWorkRequest, ClaimTransformWorkResponse, HeartbeatActionClaimRequest,
-    HeartbeatActionClaimResponse, HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse,
+    HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
+    HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse,
     ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
+    ListClaimableAgentTurnsRequest, ListClaimableAgentTurnsResponse,
     ListClaimableTransformWorkRequest, ListClaimableTransformWorkResponse,
     ReadTransformRunInputsRequest, ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
     RegisterTransformRuntimeResponse, ReportActionClaimEventRequest,
@@ -61,6 +65,10 @@ const HEARTBEAT_TRANSFORM: &str = "/sekai.SekaiService/HeartbeatTransformClaim";
 const READ_TRANSFORM: &str = "/sekai.SekaiService/ReadTransformRunInputs";
 const WRITE_TRANSFORM: &str = "/sekai.SekaiService/WriteTransformRunResult";
 const APPLY_STREAMING_TRANSFORM: &str = "/sekai.SekaiService/ApplyStreamingTransformBatch";
+const LIST_AGENT_TURN: &str = "/sekai.SekaiService/ListClaimableAgentTurns";
+const CLAIM_AGENT_TURN: &str = "/sekai.SekaiService/ClaimAgentTurn";
+const HEARTBEAT_AGENT_TURN: &str = "/sekai.SekaiService/HeartbeatAgentTurnClaim";
+const ACK_AGENT_TURN: &str = "/sekai.SekaiService/AckAgentTurn";
 
 /// Dispatch kind a worker lists or claims. Transform work uses the isolated
 /// JobSpec profile; Action work uses `runtime_dispatch`.
@@ -171,6 +179,19 @@ impl RuntimeClaimError {
         }
     }
 
+    /// A targeted turn that is gone, held, finished, or refused because its
+    /// instance is frozen is contention, never fence loss or idle.
+    fn from_agent_turn_claim<T>(error: SdkError) -> Result<ClaimAttempt<T>, Self> {
+        match error.code {
+            SdkErrorCode::NotFound | SdkErrorCode::FailedPrecondition
+                if error.reason_code.is_none() =>
+            {
+                Ok(ClaimAttempt::Contended)
+            }
+            _ => Err(Self::from_sdk(error, false)),
+        }
+    }
+
     fn from_held_stream(error: SdkError) -> Self {
         Self::from_sdk(error, true)
     }
@@ -208,6 +229,34 @@ pub struct TransformFence {
     pub runtime_id: String,
     pub generation: i64,
     pub fencing_token: String,
+}
+
+/// Held agent-turn claim fence (ADR 0137).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTurnFence {
+    pub turn_id: String,
+    pub runtime_id: String,
+    pub generation: i64,
+    pub fencing_token: String,
+}
+
+impl AgentTurnFence {
+    /// The fence a successful claim of `turn` handed out.
+    pub fn of(turn: &AgentTurn) -> Self {
+        Self {
+            turn_id: turn.turn_id.clone(),
+            runtime_id: turn.claim_owner.clone(),
+            generation: turn.claim_generation,
+            fencing_token: turn.fencing_token.clone(),
+        }
+    }
+}
+
+/// How a worker finished an agent turn; the reason lands on its receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentTurnAck {
+    Completed { reason: String },
+    Failed { reason: String },
 }
 
 /// Terminal or park acknowledgement for Action work.
@@ -606,6 +655,108 @@ impl<'a> RuntimeClaimClient<'a> {
         }
     }
 
+    pub async fn list_agent_turns(&self, limit: i32) -> Result<Vec<AgentTurn>, RuntimeClaimError> {
+        let namespace = self.namespace()?.to_string();
+        let listed: ListClaimableAgentTurnsResponse = self
+            .list_unary(
+                LIST_AGENT_TURN,
+                ListClaimableAgentTurnsRequest { namespace, limit },
+            )
+            .await?;
+        Ok(listed.turns)
+    }
+
+    /// Claims `turn_id`. A turn that is gone, held, finished, or refused
+    /// because its instance is frozen is contention.
+    pub async fn claim_agent_turn(
+        &self,
+        runtime_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        ttl: Duration,
+    ) -> Result<ClaimAttempt<AgentTurn>, RuntimeClaimError> {
+        let namespace = self.namespace()?.to_string();
+        match self
+            .client
+            .raw()
+            .unary::<_, ClaimAgentTurnResponse>(
+                CLAIM_AGENT_TURN,
+                ClaimAgentTurnRequest {
+                    namespace,
+                    runtime_id: runtime_id.into(),
+                    turn_id: turn_id.into(),
+                    ttl_ms: duration_millis(ttl)?,
+                },
+                self.options(false),
+            )
+            .await
+        {
+            Ok(response) => Ok(response
+                .turn
+                .map_or(ClaimAttempt::Contended, ClaimAttempt::Claimed)),
+            Err(error) => RuntimeClaimError::from_agent_turn_claim(error),
+        }
+    }
+
+    /// List then claim the oldest due turn. An empty queue is idle.
+    pub async fn claim_next_agent_turn(
+        &self,
+        runtime_id: impl Into<String>,
+        ttl: Duration,
+    ) -> Result<ClaimAttempt<AgentTurn>, RuntimeClaimError> {
+        let Some(candidate) = self.list_agent_turns(1).await?.into_iter().next() else {
+            return Ok(ClaimAttempt::Idle);
+        };
+        self.claim_agent_turn(runtime_id, candidate.turn_id, ttl)
+            .await
+    }
+
+    pub async fn heartbeat_agent_turn(
+        &self,
+        fence: &AgentTurnFence,
+        ttl: Duration,
+    ) -> Result<HeartbeatAgentTurnClaimResponse, RuntimeClaimError> {
+        self.unary(
+            HEARTBEAT_AGENT_TURN,
+            HeartbeatAgentTurnClaimRequest {
+                turn_id: fence.turn_id.clone(),
+                runtime_id: fence.runtime_id.clone(),
+                claim_generation: fence.generation,
+                fencing_token: fence.fencing_token.clone(),
+                ttl_ms: duration_millis(ttl)?,
+            },
+            false,
+            true,
+        )
+        .await
+    }
+
+    /// Finishes the turn; the response carries its receipt. Retrying with
+    /// the same fence and outcome returns the same receipt.
+    pub async fn ack_agent_turn(
+        &self,
+        fence: &AgentTurnFence,
+        ack: AgentTurnAck,
+    ) -> Result<AckAgentTurnResponse, RuntimeClaimError> {
+        let (outcome, reason) = match ack {
+            AgentTurnAck::Completed { reason } => ("completed", reason),
+            AgentTurnAck::Failed { reason } => ("failed", reason),
+        };
+        self.unary(
+            ACK_AGENT_TURN,
+            AckAgentTurnRequest {
+                turn_id: fence.turn_id.clone(),
+                runtime_id: fence.runtime_id.clone(),
+                claim_generation: fence.generation,
+                fencing_token: fence.fencing_token.clone(),
+                outcome: outcome.into(),
+                reason,
+            },
+            true,
+            true,
+        )
+        .await
+    }
+
     pub async fn heartbeat_transform(
         &self,
         fence: &TransformFence,
@@ -853,6 +1004,22 @@ mod tests {
             allowlisted_reason_code(" delegator_disabled "),
             Some(DELEGATOR_DISABLED)
         );
+    }
+
+    #[test]
+    fn agent_turn_claim_refusals_are_contention() {
+        for code in [SdkErrorCode::NotFound, SdkErrorCode::FailedPrecondition] {
+            assert_eq!(
+                RuntimeClaimError::from_agent_turn_claim::<()>(SdkError::new(code)),
+                Ok(ClaimAttempt::Contended)
+            );
+        }
+        assert!(matches!(
+            RuntimeClaimError::from_agent_turn_claim::<()>(SdkError::new(
+                SdkErrorCode::Unavailable
+            )),
+            Err(RuntimeClaimError::Unavailable(_))
+        ));
     }
 
     #[test]

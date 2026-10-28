@@ -33212,3 +33212,123 @@ async fn federated_allowances_need_namespace_admin() {
     withdraw("root").await.unwrap();
     assert_eq!(get().await.unwrap_err().code(), tonic::Code::NotFound);
 }
+
+#[tokio::test]
+async fn agent_turns_wake_claim_and_ack_over_the_wire() {
+    let svc = service();
+    for (id, frozen) in [("line-7", "false"), ("line-8", "true")] {
+        svc.db
+            .runtime()
+            .create_object(&crate::domain::Object {
+                id: id.into(),
+                kind: crate::sekai::site_agent_instance::KIND.into(),
+                name: id.into(),
+                namespace: "ops".into(),
+                external_id: String::new(),
+                properties: HashMap::from([
+                    ("principal_id".to_string(), format!("agent:{id}")),
+                    ("frozen".to_string(), frozen.to_string()),
+                ]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+    }
+    let wake = |principal: &'static str, instance: &'static str| {
+        svc.wake_site_agent_instance(with_named_principal(
+            WakeSiteAgentInstanceRequest {
+                namespace: "ops".into(),
+                instance_id: instance.into(),
+                request_id: "req-1".into(),
+            },
+            principal,
+        ))
+    };
+    assert_eq!(
+        wake("tester", "line-7").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        wake("root", "line-8").await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition,
+        "a frozen instance admits no turn"
+    );
+    let turn = wake("root", "line-7")
+        .await
+        .unwrap()
+        .into_inner()
+        .turn
+        .unwrap();
+    assert_eq!(
+        (turn.cause.as_str(), turn.status.as_str()),
+        ("manual", "pending")
+    );
+    let again = wake("root", "line-7")
+        .await
+        .unwrap()
+        .into_inner()
+        .turn
+        .unwrap();
+    assert_eq!(again.turn_id, turn.turn_id, "one turn per request id");
+
+    let listed = svc
+        .list_claimable_agent_turns(with_named_principal(
+            ListClaimableAgentTurnsRequest {
+                namespace: "ops".into(),
+                limit: 10,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .turns;
+    assert_eq!(listed.len(), 1);
+    let held = svc
+        .claim_agent_turn(with_named_principal(
+            ClaimAgentTurnRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                turn_id: turn.turn_id.clone(),
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .turn
+        .unwrap();
+    let ack = |generation: i64| {
+        svc.ack_agent_turn(with_named_principal(
+            AckAgentTurnRequest {
+                turn_id: turn.turn_id.clone(),
+                runtime_id: "runner-a".into(),
+                claim_generation: generation,
+                fencing_token: held.fencing_token.clone(),
+                outcome: "completed".into(),
+                reason: "replied".into(),
+            },
+            "local",
+        ))
+    };
+    assert_eq!(
+        ack(held.claim_generation + 1).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition,
+        "a stale fence cannot acknowledge"
+    );
+    let receipt = ack(held.claim_generation)
+        .await
+        .unwrap()
+        .into_inner()
+        .turn
+        .unwrap();
+    assert_eq!(
+        (
+            receipt.status.as_str(),
+            receipt.cause.as_str(),
+            receipt.cause_ref.as_str()
+        ),
+        ("completed", "manual", "req-1")
+    );
+}

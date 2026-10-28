@@ -163,6 +163,11 @@ Edit the fixture, then regenerate with
 | `SekaiService.ListGovernedTransformRuns` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.RegisterTransformRuntime` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListClaimableTransformWork` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.WakeSiteAgentInstance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListClaimableAgentTurns` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ClaimAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.HeartbeatAgentTurnClaim` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.AckAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.HeartbeatTransformClaim` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.WriteTransformRunResult` | `sekai.datasets` | yes | example | `experimental` |
