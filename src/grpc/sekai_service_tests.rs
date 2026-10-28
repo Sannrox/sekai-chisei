@@ -33817,4 +33817,38 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
         runtime.list_governed_transforms("ops").unwrap().is_empty(),
         "ad-hoc definitions are never stored"
     );
+
+    // Scratch outputs stay out of the catalog listing and leave at expiry.
+    let listed = svc
+        .list_datasets(with_named_principal(ListDatasetsRequest {}, "alice"))
+        .await
+        .unwrap()
+        .into_inner()
+        .datasets;
+    assert!(
+        listed
+            .iter()
+            .all(|dataset| !dataset.id.starts_with("scratch-"))
+    );
+    svc.tick_governed_transforms(with_named_principal(
+        TickGovernedTransformsRequest {
+            now_ms: first.expires_at_ms,
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    assert!(
+        runtime
+            .get_dataset(&first.scratch_dataset_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .get_governed_transform_run(&receipt.run_id)
+            .unwrap()
+            .is_some(),
+        "the receipt stays"
+    );
 }

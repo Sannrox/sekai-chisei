@@ -99,10 +99,13 @@ the preview read checks; an input whose columns the caller may only partly
 read is refused. The run is keyed by namespace, caller, `session_label` and
 `idempotency_key`, so a retry returns the same run and the same key with
 another definition is refused. The output lands in a scratch dataset named
-from that identity, kept for 24 hours, and capped at 10,000 rows and 8 MiB;
+from that identity, readable only by the caller, kept for 24 hours, and capped
+at 10,000 rows and 8 MiB;
 an output over either cap fails with `transform_adhoc_output_budget` and
 writes nothing. The receipt has trigger cause `adhoc` and the session label as
-its trigger reference. The definition is never stored or listed.
+its trigger reference. The definition is never stored or listed, and scratch
+datasets stay out of `ListDatasets`. `TickGovernedTransforms` deletes expired
+scratch outputs, their rows and versions; the run and its receipt stay.
 Isolated-process ad-hoc runs are not available yet.
 
 The plane's `/metrics` exports the isolated-process queue as three gauges per

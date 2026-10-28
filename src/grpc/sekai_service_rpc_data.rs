@@ -249,14 +249,16 @@ pub(super) async fn list_datasets(
         .map_err(Status::internal)?
         .into_iter()
         .filter(|dataset| {
-            check_dataset_access(
-                service.db.runtime(),
-                &service.security,
-                &principals,
-                dataset,
-                false,
-            )
-            .is_ok()
+            // Scratch outputs of ad-hoc runs are not catalog entries.
+            !crate::sekai::adhoc_transform::is_scratch_dataset(dataset)
+                && check_dataset_access(
+                    service.db.runtime(),
+                    &service.security,
+                    &principals,
+                    dataset,
+                    false,
+                )
+                .is_ok()
                 && catalog_binding_discoverable(
                     service.db.runtime(),
                     &service.security,
@@ -4459,6 +4461,18 @@ pub(super) async fn tick_governed_transforms(
     })
     .await
     .map_err(|_| Status::internal("agent wake tick failed"))?
+    .map_err(Status::internal)?;
+    // Expired ad-hoc scratch outputs leave on the same tick (ADR 0138).
+    let sweep_service = service.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::sekai::adhoc_transform::sweep(
+            sweep_service.db.runtime(),
+            now_ms,
+            crate::sekai::adhoc_transform::SWEEP_BATCH,
+        )
+    })
+    .await
+    .map_err(|_| Status::internal("scratch sweep failed"))?
     .map_err(Status::internal)?;
     let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
     for (run_id, _, _, generation) in runtime

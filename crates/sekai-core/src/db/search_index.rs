@@ -388,7 +388,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    fn clear_object_text_on(
+    pub(crate) fn clear_object_text_on(
         conn: &Connection,
         namespace: &str,
         object_id: &str,
@@ -461,7 +461,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    fn clear_dataset_text_on(
+    pub(crate) fn clear_dataset_text_on(
         conn: &Connection,
         namespace: &str,
         dataset_id: &str,

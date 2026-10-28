@@ -444,6 +444,91 @@ impl SekaiDb {
         Ok(run)
     }
 
+    /// See [`crate::sekai::adhoc_transform::sweep`].
+    pub(crate) fn sweep_adhoc_scratch(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, String> {
+        let due: Vec<(String, String, String)> = {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT identity, dataset_id, namespace FROM sekai_adhoc_transform_run
+                     WHERE expires_at_ms <= ?1 AND dataset_id != ''
+                     ORDER BY expires_at_ms, identity LIMIT ?2",
+                )
+                .map_err(|error| error.to_string())?;
+            stmt.query_map(params![now_ms, limit.max(0)], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?
+        };
+        let mut swept = Vec::new();
+        for (identity, dataset_id, namespace) in due {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let claimed = tx
+                .execute(
+                    "UPDATE sekai_adhoc_transform_run SET dataset_id = ''
+                     WHERE identity = ?1 AND dataset_id = ?2",
+                    params![identity, dataset_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if claimed != 1 {
+                continue;
+            }
+            let object_id = format!("{dataset_id}-object");
+            // The search index's full-text tables are kept by hand.
+            let indexed: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'sekai_search_dataset_text')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if indexed {
+                SekaiDb::clear_dataset_text_on(&tx, &namespace, &dataset_id)?;
+                SekaiDb::clear_object_text_on(&tx, &namespace, &object_id)?;
+            }
+            for statement in crate::sekai::adhoc_transform::SWEEP_STATEMENTS {
+                let parameter = if statement.contains("{object}") {
+                    &object_id
+                } else {
+                    &dataset_id
+                };
+                // Some tables are created on first use of their feature.
+                let table = statement
+                    .split_whitespace()
+                    .nth(2)
+                    .ok_or("sweep statement names no table")?;
+                let present: bool = tx
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                        params![table],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !present {
+                    continue;
+                }
+                let sql = statement
+                    .replace("{dataset}", "?1")
+                    .replace("{object}", "?1");
+                tx.execute(&sql, params![parameter])
+                    .map_err(|error| error.to_string())?;
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            swept.push(dataset_id);
+        }
+        Ok(swept)
+    }
+
     /// The stored record of an ad-hoc run identity.
     pub(crate) fn adhoc_transform_record(
         &self,
