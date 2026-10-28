@@ -386,11 +386,13 @@ pub fn apply(
                 .map_err(StreamingApplyError::Internal)?,
             None => None,
         };
+        // A transform has no tenant: sharing criteria fail closed.
         match evaluate_submission_criteria(
             &type_def.submission_criteria,
             criterion_object,
             criterion_policy.as_ref(),
             &invoker,
+            &crate::sekai::action_type_criteria::no_sharing_answer,
         ) {
             CriterionDecision::Pass => {}
             CriterionDecision::Fail { criterion_id } => {

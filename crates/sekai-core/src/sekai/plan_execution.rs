@@ -708,6 +708,7 @@ mod tests {
             policy_context: None,
             visible_object: visible,
             now_ms,
+            acting_tenant: "",
         }
     }
 

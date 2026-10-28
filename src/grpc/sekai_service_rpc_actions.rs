@@ -474,6 +474,7 @@ pub(super) async fn preview_object_action(
             expected_object_revision: &inner.expected_object_revision,
             evidence_submission_ids: &[],
             policy_context: Some(&policy_context),
+            acting_tenant: acting_tenant(tenant_context.as_ref()),
         },
     )
     .map_err(map_object_action_projection_error)?;
@@ -534,6 +535,7 @@ pub(super) async fn preview_object_action(
             expected_object_revision: &inner.expected_object_revision,
             evidence_submission_ids: &inner.evidence_submission_ids,
             policy_context: Some(&policy_context),
+            acting_tenant: acting_tenant(tenant_context.as_ref()),
         },
     )
     .map_err(map_object_action_projection_error)?;
@@ -1930,6 +1932,7 @@ pub(super) async fn simulate_plan(
             policy_context: Some(&policy_context),
             visible_object: &visible,
             now_ms: now_millis(),
+            acting_tenant: acting_tenant(tenant_context.as_ref()),
         },
         &inner.namespace,
         &inner.plan_id,
@@ -2564,6 +2567,7 @@ pub(super) async fn execute_action_plan(
             policy_context: Some(&policy_context),
             visible_object: &visible,
             now_ms: now,
+            acting_tenant: tenant,
         },
     };
     let execution = match crate::sekai::plan_execution::execute_plan(

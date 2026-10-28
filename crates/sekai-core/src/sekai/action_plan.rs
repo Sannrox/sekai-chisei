@@ -238,6 +238,9 @@ pub struct SimulationContext<'a> {
     /// not be determined (the store failed).
     pub visible_object: &'a dyn Fn(&str) -> Result<Option<Object>, String>,
     pub now_ms: i64,
+    /// The tenant steps are submitted under, for cross-tenant sharing
+    /// criteria (#1860). Empty where the caller has none.
+    pub acting_tenant: &'a str,
 }
 
 fn changed_properties(planned: &PlannedObjectMutation) -> StepEffect {
@@ -407,6 +410,7 @@ pub fn simulate_step(
             expected_object_revision: &revision,
             evidence_submission_ids: &[],
             policy_context: context.policy_context,
+            acting_tenant: context.acting_tenant,
         },
     ) {
         Ok(preview) => preview,
@@ -709,6 +713,7 @@ mod tests {
             policy_context: None,
             visible_object: &visible,
             now_ms,
+            acting_tenant: "",
         };
         simulate_plan(db, &context, ns, "plan-1", simulation_id).unwrap()
     }
@@ -846,6 +851,7 @@ mod tests {
             policy_context: None,
             visible_object: &visible,
             now_ms: 1_000,
+            acting_tenant: "",
         };
         let simulation = simulate_plan(&db, &context, ns, "plan-1", "sim-1").unwrap();
         // Stored as unavailable; shown to this caller as redacted.
@@ -881,6 +887,7 @@ mod tests {
             policy_context: None,
             visible_object: &visible,
             now_ms: 2_000,
+            acting_tenant: "",
         };
         let retried = simulate_plan(&db, &context, ns, "plan-1", "sim-1").unwrap();
         assert_eq!(retried.steps[0].outcome, STEP_REDACTED);
