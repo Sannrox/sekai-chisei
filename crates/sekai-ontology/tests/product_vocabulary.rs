@@ -9,10 +9,6 @@ const PACK: &str = concat!(
     "/ontologies/sekai-chisei-product-v1.json"
 );
 const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
-const AGENT_SKILL: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../.agents/skills/sekai-ontology/SKILL.md"
-);
 const ALLOWED_SOURCES: &[&str] = &[
     "VISION.md",
     "AGENTS.md",
@@ -331,9 +327,7 @@ fn question_directory_fact_vs_ontology_class() {
 }
 
 #[test]
-fn product_skill_documents_the_five_questions_and_stays_in_sync() {
-    let agent_skill = fs::read_to_string(AGENT_SKILL).unwrap();
-    assert_eq!(agent_skill, EMBEDDED_SKILL);
+fn product_skill_documents_the_five_questions() {
     for needle in [
         "sekai-chisei-product-v1.json",
         "What is Sekai, and what is Chisei?",

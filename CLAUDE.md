@@ -62,26 +62,11 @@ Ontology classes and relations describe meaning. Directory commands record local
 
 ### Product vocabulary
 
-When the pack is present, answer these from the pack, not from memory: what
-Sekai and Chisei are; what the portable ontology database is and how it differs
-from `data/sekai.db`; what a Receipt records; what a governed Action relates to;
-and how a directory fact differs from an ontology class. Use shipping commands
-only:
-
-1. `sekai --db <tmp> init`, then
-   `sekai --db <tmp> import crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json`
-   (a throwaway file, never `data/sekai.db`).
-2. `sekai --db <tmp> --json validate`; stop if `data.valid` is not true.
-3. Answer with `explain`, `query`, or `ask` and keep every provenance `source`
-   and `locator`: `explain Sekai`, `explain Chisei`,
-   `explain "Portable Ontology Database"`,
-   `query "Portable Ontology Database" --relation distinct_from`,
-   `explain Receipt`, `ask "what does Receipt record"`,
-   `explain "Governed Action"`, `ask "what is related to Governed Action"`,
-   `explain "Directory Fact"`, `explain "Ontology Class"`.
-4. Report a missing class, relation, or provenance record as absent; do not
-   infer it. The query result is the evidence; prose in `VISION.md` is not a
-   substitute when the pack imported cleanly.
+The `sekai` CLI ships its own skill, `crates/sekai-ontology/assets/SKILL.md`
+(installed by `sekai setup`). Its "Product vocabulary (this repository)"
+section lists the questions to answer from the pack, never from memory, and the
+shipping commands that answer them. `.agents/skills/sekai-ontology/` is only
+the agent-kit stub; the embedded asset stays the product source.
 
 ## Coding Style & Naming Conventions
 
