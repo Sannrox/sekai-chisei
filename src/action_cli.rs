@@ -106,6 +106,11 @@ struct TypeFile {
     /// `routine` or `high_impact` (#1910). Empty means unclassified.
     #[serde(default)]
     impact_class: String,
+    /// Budget segment and amount parameters (#1859).
+    #[serde(default)]
+    budget_work_unit_parameter: String,
+    #[serde(default)]
+    budget_amount_parameter: String,
     #[serde(default)]
     review_queue_id: String,
     #[serde(default)]
@@ -240,6 +245,8 @@ fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxE
             last_writer_wins_properties: parsed.last_writer_wins_properties,
             offline_conflict: parsed.offline_conflict,
             impact_class: parsed.impact_class,
+            budget_work_unit_parameter: parsed.budget_work_unit_parameter,
+            budget_amount_parameter: parsed.budget_amount_parameter,
         },
         request_id,
     ))

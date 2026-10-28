@@ -19,7 +19,7 @@ use crate::db::chisei_operation_reservation::{
 };
 use crate::db::store::SekaiStore;
 use crate::sekai::action_instance::{
-    compute_request_digest_with_envelope, submit_budget_subject, validate_parameters_json,
+    compute_request_digest_with_envelope, validate_parameters_json,
 };
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionOutcome,
@@ -179,7 +179,9 @@ impl CrossStoreAdmission {
                     ActionInstanceAdmissionError::Internal(error)
                 }
             })?;
-        let budget_subject = submit_budget_subject(namespace, actor, &type_def.budget_scope);
+        let (budget_subject, budget_amount) = type_def
+            .budget_charge(namespace, actor, &request.parameters_json)
+            .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
         // The charge's key, recorded on the reservation so settlement finds
         // the charge and refunds into its period (#1902). A reacquisition is
         // keyed by the release it follows, which stays the same across
@@ -194,9 +196,12 @@ impl CrossStoreAdmission {
                 None => operation_id.clone(),
             };
             let budget_key = &charge_key;
-            if let Err(error) =
-                budget.check_and_reserve_idempotent_at(&budget_subject, 1, budget_key, now_ms)
-            {
+            if let Err(error) = budget.check_and_reserve_idempotent_at(
+                &budget_subject,
+                budget_amount,
+                budget_key,
+                now_ms,
+            ) {
                 // Only exhaustion is a refusal worth recording. Routing
                 // (home-site pins) and store failures stay retryable.
                 if !error.contains(BUDGET_EXHAUSTED) {
@@ -217,7 +222,7 @@ impl CrossStoreAdmission {
             status: RESERVATION_PENDING.into(),
             actor: actor.to_string(),
             budget_subject: budget_subject.clone(),
-            incurred_usage: 1,
+            incurred_usage: i64::from(budget_amount),
             sekai_instance_id: String::new(),
             sekai_status: String::new(),
             created_at_ms: now_ms,
@@ -829,6 +834,76 @@ mod tests {
             unscoped.budget_subject,
             "action:governed/project:acme/agent:alice"
         );
+    }
+
+    /// A type can cap total spend per turn (#1859): the turn parameter
+    /// segments the budget and the amount parameter is what each admission
+    /// charges. Spends fill the turn's cap, the next is refused naming that
+    /// budget, and the next turn starts from zero.
+    #[test]
+    fn a_per_turn_spend_cap_admits_up_to_the_cap_and_refuses_the_next() {
+        let (sekai, chisei) = dest_pair();
+        sekai
+            .runtime()
+            .put_governed_action_type(
+                GovernedActionType {
+                    namespace: "acme".into(),
+                    type_id: "spend".into(),
+                    version: "1".into(),
+                    description: "spend gold".into(),
+                    parameter_schema_json: r#"{"type":"object","properties":{"turn":{"type":"string"},"amount":{"type":"integer","minimum":0}},"required":["turn","amount"],"additionalProperties":false}"#.into(),
+                    allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
+                    enabled: true,
+                    budget_work_unit_parameter: "turn".into(),
+                    budget_amount_parameter: "amount".into(),
+                    ..Default::default()
+                },
+                "operator",
+                1,
+            )
+            .unwrap();
+        let turn =
+            |turn: &str| format!("action:governed/project:acme/agent:alice/work_unit:{turn}");
+        let budget = Arc::new(BudgetTracker::new(chisei.clone()));
+        for name in ["turn-1", "turn-2"] {
+            budget
+                .set_limit(&turn(name), 10, PeriodType::Daily)
+                .unwrap();
+        }
+        let clerk = CrossStoreAdmission::new(chisei, sekai, Some(budget.clone()));
+        let spend = |operation_id: &str, turn: &str, amount: i32| ActionInstanceAdmissionRequest {
+            type_id: "spend".into(),
+            parameters_json: format!(r#"{{"turn":"{turn}","amount":{amount}}}"#),
+            ..request(operation_id)
+        };
+
+        for (operation_id, amount, offset) in [("op-1", 4, 10), ("op-2", 6, 11)] {
+            let admitted = clerk
+                .admit(
+                    spend(operation_id, "turn-1", amount),
+                    "alice",
+                    at(offset),
+                    "",
+                    false,
+                )
+                .unwrap();
+            assert_eq!(admitted.instance.status, "admitted");
+        }
+        assert_eq!(budget.get_usage(&turn("turn-1")).tokens_used, 10);
+        let refused = clerk
+            .admit(spend("op-3", "turn-1", 1), "alice", at(12), "", false)
+            .unwrap_err();
+        assert!(
+            matches!(&refused, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains(&turn("turn-1"))),
+            "{refused:?}"
+        );
+        assert_eq!(budget.get_usage(&turn("turn-1")).tokens_used, 10);
+
+        let next_turn = clerk
+            .admit(spend("op-4", "turn-2", 7), "alice", at(13), "", false)
+            .unwrap();
+        assert_eq!(next_turn.instance.status, "admitted");
+        assert_eq!(budget.get_usage(&turn("turn-2")).tokens_used, 7);
     }
 
     /// On split stores a budget refusal leaves the same trace as on the

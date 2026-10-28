@@ -9025,6 +9025,8 @@ async fn governed_action_type_registry_put_get_list_disable() {
         last_writer_wins_properties: Vec::new(),
         offline_conflict: String::new(),
         impact_class: String::new(),
+        budget_work_unit_parameter: String::new(),
+        budget_amount_parameter: String::new(),
     };
     let put = svc
         .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
@@ -9170,6 +9172,8 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
         review_pool: vec![],
         review_agent_reviewers: vec![],
         last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
     };
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(type_def),
@@ -9387,6 +9391,8 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             last_writer_wins_properties: Vec::new(),
             offline_conflict: String::new(),
             impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-validated-action".into(),
     }))
@@ -9544,6 +9550,8 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
         review_pool: vec![],
         review_agent_reviewers: vec![],
             last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-nul".into(),
     }))
@@ -9781,6 +9789,8 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
         review_pool: vec![],
         review_agent_reviewers: vec![],
             last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-record".into(),
     }))
@@ -9869,6 +9879,8 @@ async fn submit_action_instance_propagates_one_operation_identity() {
         review_pool: vec![],
         review_agent_reviewers: vec![],
             last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-record-corr".into(),
     }))
@@ -10018,6 +10030,8 @@ async fn describe_and_preview_object_action_are_observational() {
         review_pool: vec![],
         review_agent_reviewers: vec![],
             last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-update".into(),
     }))
@@ -10197,6 +10211,8 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
         review_pool: vec![],
         review_agent_reviewers: vec![],
             last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-triage".into(),
     }))
@@ -10329,6 +10345,8 @@ async fn preview_records_typesafe_egress_after_admission() {
         review_pool: vec![],
         review_agent_reviewers: vec![],
             last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-triage-fill".into(),
     }))
@@ -10460,6 +10478,8 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
             review_pool: vec![],
             review_agent_reviewers: vec![],
             last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-triage-invalid-fill".into(),
     }))
@@ -15258,6 +15278,8 @@ fn intake_action_type(object_kind: &str) -> GovernedActionType {
         last_writer_wins_properties: Vec::new(),
         offline_conflict: String::new(),
         impact_class: String::new(),
+        budget_work_unit_parameter: String::new(),
+        budget_amount_parameter: String::new(),
     }
 }
 
@@ -26069,6 +26091,8 @@ async fn write_freeze_blocks_machine_action_submit() {
             review_pool: vec![],
             review_agent_reviewers: vec![],
             last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
+            budget_work_unit_parameter: String::new(),
+            budget_amount_parameter: String::new(),
         }),
         request_id: "put-freeze-dispatch".into(),
     }))

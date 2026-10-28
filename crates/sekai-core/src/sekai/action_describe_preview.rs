@@ -376,6 +376,9 @@ fn admit_object_action(
         None => ("allow".to_string(), "none".to_string()),
     };
 
+    // A preview has no parameters, so it checks one unit against the
+    // submitter's subject; a type that charges a parameter's amount or
+    // segments by work unit is decided in full at admission (#1859).
     let budget_subject = submit_budget_subject(&object.namespace, actor, &type_def.budget_scope);
     let budget_decision = if let Some(budget) = budget {
         if budget.check(&budget_subject, 1).is_err() {
