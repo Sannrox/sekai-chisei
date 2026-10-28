@@ -12798,3 +12798,287 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
         },
     );
 }
+
+/// Grants a tenant the namespaces named after it: `tenant-a` reads `ns-a`
+/// and `ns-a2`, not `ns-b`.
+struct TenantNamespaceExtension;
+
+impl crate::enterprise::EnterpriseExtension for TenantNamespaceExtension {
+    fn authenticate_bearer(
+        &self,
+        _bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError> {
+        Err(crate::enterprise::ExtensionError::CredentialNotFound)
+    }
+
+    fn authenticate_context(
+        &self,
+        _bearer_token: &str,
+    ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError> {
+        Err(crate::enterprise::ExtensionError::CredentialNotFound)
+    }
+
+    fn tenant_context(
+        &self,
+        _principal: &crate::enterprise::AuthenticatedPrincipal,
+    ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+        Err(crate::enterprise::ExtensionError::Unauthenticated)
+    }
+
+    fn authorize_namespace(
+        &self,
+        context: &crate::enterprise::TenantContext,
+        namespace: &str,
+        _action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        let tenant = context.tenant_id.strip_prefix("tenant-");
+        namespace
+            .strip_prefix("ns-")
+            .zip(tenant)
+            .is_some_and(|(namespace, tenant)| namespace.starts_with(tenant))
+            .then_some(())
+            .ok_or(crate::enterprise::ExtensionError::PermissionDenied)
+    }
+
+    fn authorize_unscoped_namespace(
+        &self,
+        _principal: &crate::enterprise::AuthenticatedPrincipal,
+        _namespace: &str,
+        _action: crate::enterprise::NamespaceAction,
+    ) -> Result<(), crate::enterprise::ExtensionError> {
+        Err(crate::enterprise::ExtensionError::PermissionDenied)
+    }
+}
+
+/// A Chisei service and token interceptor over one store holding
+/// [`TenantNamespaceExtension`], with receipts `(operation_id, namespace)`
+/// initiated by `actor`.
+struct TenantReadFixture {
+    svc: ChiseiServiceImpl,
+    interceptor: crate::grpc::TokenAuthInterceptor,
+    authority: crate::identity_assertion::AssertionAuthority,
+}
+
+impl TenantReadFixture {
+    fn new(actor: &str, receipts: &[(&str, &str)]) -> Self {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TenantNamespaceExtension)),
+            )
+            .unwrap(),
+        )));
+        let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db.clone());
+        let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
+        let svc = ChiseiServiceImpl::new(chisei, config(":memory:"))
+            .with_sekai_facts(facts)
+            .unwrap();
+        for &(operation_id, namespace) in receipts {
+            svc.db
+                .put_operation_receipt(&OperationReceipt {
+                    version: OPERATION_RECEIPT_VERSION.into(),
+                    operation_id: operation_id.into(),
+                    parent_operation_id: None,
+                    namespace: namespace.into(),
+                    operation_class: "execution".into(),
+                    initiating_actor: actor.into(),
+                    schema_version: "execution/v1".into(),
+                    policy_version: "implicit-allow".into(),
+                    started_at_ms: 1,
+                    completed_at_ms: Some(2),
+                    events: vec![receipt_event(
+                        operation_id,
+                        "intent",
+                        None,
+                        1,
+                        ReceiptEventKind::IntentRecorded,
+                        actor,
+                        BTreeMap::new(),
+                    )],
+                    uncovered_surfaces: Vec::new(),
+                    reporter_grants: Vec::new(),
+                    ontology_digest: None,
+                    artifact: None,
+                })
+                .unwrap();
+        }
+        let authority = crate::identity_assertion::AssertionAuthority::new(
+            "https://issuer.test",
+            "https://sekai.test",
+            b"test-hmac-key",
+        );
+        let interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+            Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+            crate::db::store::SekaiStore::from_shared_runtime(db),
+            Some(Arc::new(authority.clone())),
+        );
+        Self {
+            svc,
+            interceptor,
+            authority,
+        }
+    }
+
+    fn admit(
+        &mut self,
+        token: &dyn Fn() -> String,
+        method: &'static str,
+    ) -> (tonic::metadata::MetadataMap, tonic::Extensions) {
+        use tonic::service::Interceptor;
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token()).parse().unwrap(),
+        );
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("chisei.ChiseiService", method));
+        let (metadata, extensions, ()) = self.interceptor.call(request).unwrap().into_parts();
+        (metadata, extensions)
+    }
+
+    async fn receipt(
+        &mut self,
+        token: &dyn Fn() -> String,
+        operation_id: &str,
+    ) -> Result<OperationReceipt, Status> {
+        let (metadata, extensions) = self.admit(token, "GetOperationReceipt");
+        let response = self
+            .svc
+            .get_operation_receipt(Request::from_parts(
+                metadata,
+                extensions,
+                GetOperationReceiptRequest {
+                    operation_id: operation_id.into(),
+                    ..Default::default()
+                },
+            ))
+            .await?;
+        Ok(serde_json::from_str(&response.into_inner().receipt_json).unwrap())
+    }
+
+    async fn trend(&mut self, token: &dyn Fn() -> String, namespace: &str) -> Result<(), Status> {
+        let (metadata, extensions) = self.admit(token, "GetQualityTrend");
+        self.svc
+            .get_quality_trend(Request::from_parts(
+                metadata,
+                extensions,
+                GetQualityTrendRequest {
+                    namespace: namespace.into(),
+                    since_ms: 0,
+                    until_ms: 1_000,
+                },
+            ))
+            .await
+            .map(|_| ())
+    }
+
+    /// The error a missing receipt id returns; hidden receipts must match it.
+    async fn assert_hidden(&mut self, token: &dyn Fn() -> String, operation_id: &str) {
+        let missing = self.receipt(token, "missing").await.unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        let hidden = self.receipt(token, operation_id).await.unwrap_err();
+        assert_eq!(
+            (hidden.code(), hidden.message()),
+            (missing.code(), missing.message()),
+            "{operation_id}"
+        );
+    }
+}
+
+/// #1770: through the real token interceptor, a tenant assertion reads its
+/// own namespace's receipt and quality trend. Another tenant's receipt, or
+/// one with no namespace, reads exactly as a missing id; another tenant's
+/// trend is refused.
+#[tokio::test]
+async fn tenant_assertion_reads_only_its_own_receipts_and_quality_trend() {
+    let mut fixture = TenantReadFixture::new(
+        "subject-a",
+        &[("own", "ns-a"), ("other", "ns-b"), ("blank", "")],
+    );
+    let authority = fixture.authority.clone();
+    // Each call signs a fresh assertion: a nonce is accepted once.
+    let token = move || {
+        authority
+            .sign(&crate::identity_assertion::IdentityAssertion {
+                contract_version: crate::identity_assertion::IDENTITY_ASSERTION_VERSION.into(),
+                issuer: "https://issuer.test".into(),
+                audience: "https://sekai.test".into(),
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+                credential_kind: "human_session".into(),
+                space: None,
+                space_role: None,
+                act: None,
+                tenant_id: Some("tenant-a".into()),
+                scopes: vec!["sekai.read".into()],
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                nonce: uuid::Uuid::new_v4().to_string(),
+                device: None,
+            })
+            .unwrap()
+    };
+    let own = fixture.receipt(&token, "own").await.unwrap();
+    assert_eq!(own.namespace, "ns-a");
+    for hidden in ["other", "blank"] {
+        fixture.assert_hidden(&token, hidden).await;
+    }
+    fixture.trend(&token, "ns-a").await.unwrap();
+    assert_eq!(
+        fixture.trend(&token, "ns-b").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
+/// #1770: a service principal reads only within its live registration scope,
+/// even where the extension authorizes the whole tenant, and loses a
+/// namespace on the next request after its registration drops it.
+#[tokio::test]
+async fn service_principal_reads_follow_its_live_registration_scope() {
+    let mut fixture = TenantReadFixture::new("svc-a", &[("in-a", "ns-a"), ("in-a2", "ns-a2")]);
+    let register = |fixture: &TenantReadFixture, namespace: &str| {
+        let registration = crate::sekai::service_principal::ServicePrincipalRegistration {
+            principal: "svc-a".into(),
+            tenant_id: "tenant-a".into(),
+            namespaces: vec![namespace.into()],
+            action_types: vec!["dispatch".into()],
+            registered_by: "local".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        fixture
+            .svc
+            .db
+            .runtime()
+            .put_service_principal(&registration)
+            .unwrap();
+        registration
+    };
+    let registration = register(&fixture, "ns-a");
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let token = crate::service_token::ServiceTokenClaims::for_grant(
+        &fixture.authority,
+        &registration,
+        "svc-a-credential",
+        now_ms + 60_000,
+        now_ms,
+    )
+    .unwrap()
+    .sign(&fixture.authority)
+    .unwrap();
+    let token = move || token.clone();
+    fixture.receipt(&token, "in-a").await.unwrap();
+    fixture.trend(&token, "ns-a").await.unwrap();
+    fixture.assert_hidden(&token, "in-a2").await;
+    assert_eq!(
+        fixture.trend(&token, "ns-a2").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    // Narrowed to `ns-a2`: the same token no longer reaches `ns-a`.
+    register(&fixture, "ns-a2");
+    fixture.assert_hidden(&token, "in-a").await;
+    assert_eq!(
+        fixture.trend(&token, "ns-a").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+}

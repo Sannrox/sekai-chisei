@@ -771,6 +771,33 @@ pub(super) fn require_execution_namespace_access_with_context(
     }
     require_execution_namespace_access(facts, config, actor, namespace)
 }
+/// Authorize an enterprise context to read `namespace` on the Sekai store
+/// through the tenant path the Sekai namespace RPCs use: space role and
+/// credential scope, a service principal's live registration scope, guest
+/// and shared-space grants, and the extension's decision, with their audit.
+/// Without an in-process Sekai store the read is refused; without an
+/// extension the principal's namespace grant is required too.
+pub(super) fn require_enterprise_namespace_read(
+    facts: &dyn SekaiFactReader,
+    context: &crate::enterprise::AuthenticatedContext,
+    namespace: &str,
+) -> Result<(), Status> {
+    let namespace = canonical_namespace(namespace)?;
+    let store = facts
+        .in_process_store()
+        .map_err(|error| sekai_fact_status(error, "namespace access denied"))?;
+    let db = store.runtime();
+    crate::grpc::sekai_service::enforce_namespace_tenant_context_for(
+        db,
+        Some(context),
+        namespace,
+        crate::enterprise::NamespaceAction::Read,
+    )?;
+    if db.enterprise_extension().is_none() {
+        require_namespace_access(facts, &context.principal.subject, namespace)?;
+    }
+    Ok(())
+}
 pub(super) fn enterprise_execution_status(error: crate::enterprise::ExtensionError) -> Status {
     match error {
         crate::enterprise::ExtensionError::CredentialNotFound

@@ -82,6 +82,8 @@ use support_domain::*;
 #[path = "sekai_service_support_credentials.rs"]
 mod support_credentials;
 use support_credentials::*;
+// Chisei reads authorize a tenant context the same way (#1770).
+pub(in crate::grpc) use support_credentials::enforce_namespace_tenant_context_for;
 #[path = "sekai_service_rpc_actions.rs"]
 mod rpc_actions;
 #[path = "sekai_service_rpc_coordination.rs"]
