@@ -1627,6 +1627,24 @@ fn insert_revision_sqlite(
     Ok(revision.clone())
 }
 
+/// Store `revision` and `members` as a certified merge leaves them, for
+/// tests outside this module that need a published agent revision without
+/// running the proposal flow.
+#[cfg(test)]
+pub(crate) fn insert_merged_revision_for_test(
+    db: &crate::db::sekai::SekaiDb,
+    revision: &DefinitionRevision,
+    members: &[DefinitionMember],
+) -> Result<(), String> {
+    let mut connection = db.conn();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    insert_members_sqlite(&transaction, members)?;
+    insert_revision_sqlite(&transaction, revision)?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 fn get_agent_definition_certification_sqlite(
     connection: &rusqlite::Connection,
     namespace: &str,

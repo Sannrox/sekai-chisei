@@ -33022,3 +33022,126 @@ async fn tenant_rpcs_refuse_another_tenants_namespace(svc: &SekaiServiceImpl) {
         tonic::Code::PermissionDenied
     );
 }
+
+/// A site agent instance is an ordinary object to reads: one the caller may
+/// not see reads exactly as a missing one. Direct object writes of the kind
+/// are refused; instances change only through their Actions (ADR 0136, #1933).
+#[tokio::test]
+async fn site_agent_instances_hide_like_missing_and_refuse_direct_writes() {
+    let svc = service();
+    let kind = crate::sekai::site_agent_instance::KIND;
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "line-7".into(),
+            kind: kind.into(),
+            name: "line 7".into(),
+            namespace: "ns".into(),
+            external_id: String::new(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "restricted".into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let get = |id: &str| {
+        svc.get_object(with_named_principal(
+            GetObjectRequest { id: id.into() },
+            "bob",
+        ))
+    };
+    // Hidden reads as missing before any policy is activated, too.
+    let hidden = get("line-7").await.unwrap_err();
+    let missing = get("line-404").await.unwrap_err();
+    assert_eq!(
+        (hidden.code(), hidden.message()),
+        (missing.code(), missing.message())
+    );
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "ns".into(),
+        kind: kind.into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: None,
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = svc
+        .db
+        .runtime()
+        .put_object_security_policy(&policy, "root", "put-site-agent", 1)
+        .unwrap();
+    svc.db
+        .runtime()
+        .activate_object_security_policies(
+            "ns",
+            &BTreeMap::from([(kind.into(), revision.revision_digest)]),
+            "root",
+            "activate-site-agent",
+            2,
+        )
+        .unwrap();
+    let hidden = get("line-7").await.unwrap_err();
+    let missing = get("line-404").await.unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::NotFound);
+    assert_eq!(
+        (hidden.code(), hidden.message()),
+        (missing.code(), missing.message())
+    );
+
+    let created = svc
+        .create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "line-8".into(),
+                kind: kind.into(),
+                name: "line 8".into(),
+                namespace: "ns".into(),
+                ..Default::default()
+            }),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(created.code(), tonic::Code::PermissionDenied);
+    // A direct update answers as for a missing object.
+    for id in ["line-7", "line-404"] {
+        let updated = svc
+            .update_object(with_named_principal(
+                UpdateObjectRequest {
+                    object: Some(Object {
+                        id: id.into(),
+                        kind: "artifact".into(),
+                        name: "x".into(),
+                        namespace: "ns".into(),
+                        ..Default::default()
+                    }),
+                    lease_precondition: None,
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (updated.code(), updated.message()),
+            (tonic::Code::NotFound, "not found")
+        );
+    }
+    // A direct delete answers as for a missing object and deletes nothing.
+    for id in ["line-7", "line-404"] {
+        svc.delete_object(with_named_principal(
+            DeleteObjectRequest {
+                id: id.into(),
+                lease_precondition: None,
+            },
+            "bob",
+        ))
+        .await
+        .unwrap();
+    }
+    assert!(svc.db.runtime().get_object("line-7").unwrap().is_some());
+}

@@ -83,6 +83,7 @@ pub mod handoff;
 pub mod handoff_lifecycle;
 pub mod image;
 pub mod security_package;
+pub mod site_agent_instance;
 pub mod streaming_transform_apply;
 pub use sekai_types::json;
 pub mod lakehouse_snapshot;
