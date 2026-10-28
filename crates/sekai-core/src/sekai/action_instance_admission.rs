@@ -42,6 +42,9 @@ pub enum CrashPoint {
     AfterObjectWrite,
     /// After the receipt commits, before its follow-ups (#1943).
     AfterReceipt,
+    /// After a commit refused the write and denied the reservation, before
+    /// the denial's receipt (#1970).
+    AfterRefusal,
 }
 
 #[cfg(test)]
@@ -368,7 +371,10 @@ impl<'a> ActionInstanceAdmission<'a> {
                     applied,
                     type_def,
                 } => {
-                    return self.repair_landed(*instance, *applied, &type_def, now);
+                    return self.repair_landed(*instance, Some(*applied), &type_def, now);
+                }
+                Abandoned::Refused { instance, type_def } => {
+                    return self.repair_landed(*instance, None, &type_def, now);
                 }
                 Abandoned::Released => {}
             }
@@ -807,7 +813,7 @@ impl<'a> ActionInstanceAdmission<'a> {
 
         // Reserve the instance before mutating so concurrent same-key submits
         // replay at the idempotency insert instead of racing the object write.
-        let stored = self.db.put_action_instance(&instance).map_err(|error| {
+        let mut stored = self.db.put_action_instance(&instance).map_err(|error| {
             if error.contains("conflict") {
                 ActionInstanceAdmissionError::AlreadyExists(error)
             } else if error.contains("required") || error.contains("must") {
@@ -880,6 +886,8 @@ impl<'a> ActionInstanceAdmission<'a> {
                     ));
                 }
                 Ok(Some(planned)) => {
+                    #[cfg(test)]
+                    freeze_before_commit(self.db, &stored);
                     match action_object_mutation::apply(
                         self.db,
                         planned,
@@ -901,6 +909,20 @@ impl<'a> ActionInstanceAdmission<'a> {
                             }
                             Some(applied)
                         }
+                        // The commit found the submitting site agent frozen,
+                        // or its memory moved, and denied the reservation
+                        // (#1970): record that denial instead of the write.
+                        Err(
+                            action_object_mutation::ActionObjectMutationError::FailedPrecondition(
+                                message,
+                            ),
+                        ) if message.starts_with(action_object_mutation::SITE_AGENT_REFUSED) => {
+                            refuse(
+                                &mut stored,
+                                &message[action_object_mutation::SITE_AGENT_REFUSED.len()..],
+                            );
+                            None
+                        }
                         Err(error) => {
                             let _ = self
                                 .db
@@ -919,7 +941,12 @@ impl<'a> ActionInstanceAdmission<'a> {
         } else {
             None
         };
-        if let Err(error) = self.record_admission(
+        #[cfg(test)]
+        if stored.status == STATUS_ADMITTED && applied_object.is_none() {
+            freeze_before_commit(self.db, &stored);
+        }
+        let mut refused_at_commit = stored.status == STATUS_DENIED && status == STATUS_ADMITTED;
+        let mut recorded = self.record_admission(
             &stored,
             actor,
             &policy_scope_label,
@@ -928,11 +955,42 @@ impl<'a> ActionInstanceAdmission<'a> {
             &evidence_ids,
             planned_effects.as_deref(),
             applied_object.as_ref(),
-            ontology_digest,
+            ontology_digest.clone(),
             budget_already_reserved,
             None,
             now,
-        ) {
+        );
+        // An admitted Action that wrote nothing commits at its receipt; a
+        // freeze committed first denied it there (#1970), so record the
+        // denial instead.
+        if let Err(ActionInstanceAdmissionError::FailedPrecondition(message)) = &recorded
+            && let Some(reason) = message.strip_prefix(action_object_mutation::SITE_AGENT_REFUSED)
+        {
+            let reason = reason.to_string();
+            #[cfg(test)]
+            if crashes_at(CrashPoint::AfterRefusal) {
+                return Err(ActionInstanceAdmissionError::Internal(
+                    "injected crash after the refusal".into(),
+                ));
+            }
+            refuse(&mut stored, &reason);
+            refused_at_commit = true;
+            recorded = self.record_admission(
+                &stored,
+                actor,
+                &policy_scope_label,
+                &budget_subject,
+                budget_amount,
+                &evidence_ids,
+                None,
+                None,
+                ontology_digest,
+                budget_already_reserved,
+                None,
+                now,
+            );
+        }
+        if let Err(error) = recorded {
             let receipt_exists = self
                 .db
                 .get_operation_receipt(&stored.operation_id)
@@ -941,8 +999,9 @@ impl<'a> ActionInstanceAdmission<'a> {
                 .is_some();
             // Undo the object write and release the reservation in one fenced
             // transaction: only an owner that still holds it undoes, and a
-            // crash leaves both or neither.
-            if !receipt_exists {
+            // crash leaves both or neither. A denial the commit already made
+            // durable stays for the resubmit to finish (#1970).
+            if !receipt_exists && !refused_at_commit {
                 let undo = applied_object.as_ref().map_or(
                     crate::sekai::action_instance::AdmissionUndo::None,
                     action_object_mutation::admission_undo,
@@ -1245,7 +1304,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             force_notify_fail,
         )
         .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
-        let planned_object = plan_object_mutation(
+        let planned_object = match plan_object_mutation(
             self.db,
             &type_def,
             &instance.namespace,
@@ -1253,8 +1312,17 @@ impl<'a> ActionInstanceAdmission<'a> {
             Some(&instance.principal),
             Some(&instance.marking),
             now,
-        )
-        .map_err(map_object_mutation_error)?;
+        ) {
+            Ok(planned) => planned,
+            // A memory whose instance froze or moved since the Action parked
+            // ends denied, as when the commit refuses it (#1970).
+            Err(action_object_mutation::ActionObjectMutationError::FailedPrecondition(message))
+                if crate::sekai::site_agent_memory::is_owner_refusal(&message) =>
+            {
+                return self.finish_denied(instance, &message, &approval, now);
+            }
+            Err(error) => return Err(map_object_mutation_error(error)),
+        };
         let mut granted = instance.clone();
         granted.status = STATUS_ADMITTED.into();
         granted.deny_reason.clear();
@@ -1293,6 +1361,10 @@ impl<'a> ActionInstanceAdmission<'a> {
             }
             action_object_mutation::ParkedGrant::Stale => {
                 return self.finish_denied(instance, "stale_on_resume", &approval, now);
+            }
+            // The submitting site agent froze, or its memory moved (#1970).
+            action_object_mutation::ParkedGrant::Refused(reason) => {
+                return self.finish_denied(instance, &reason, &approval, now);
             }
             action_object_mutation::ParkedGrant::ClaimLost => {
                 return Err(ActionInstanceAdmissionError::FailedPrecondition(
@@ -1641,6 +1713,19 @@ impl<'a> ActionInstanceAdmission<'a> {
         }
         let mut taken = stored.clone();
         taken.admission_lease = Some(next.clone());
+        // A commit that refused the write left the reservation denied
+        // (#1970): finish that denial with its receipt, never release it.
+        if stored.status == STATUS_DENIED {
+            let type_def = self
+                .db
+                .get_governed_action_type(&stored.namespace, &stored.type_id, &stored.version)
+                .map_err(internal)?
+                .ok_or_else(|| internal("action type of an abandoned admission is gone".into()))?;
+            return Ok(Abandoned::Refused {
+                instance: Box::new(taken),
+                type_def: Box::new(type_def),
+            });
+        }
         // The marker the fenced write set with the object write tells
         // whether it committed, whatever happened to the object since.
         if expired.write_committed == Some(true) {
@@ -1701,7 +1786,7 @@ impl<'a> ActionInstanceAdmission<'a> {
     fn repair_landed(
         &self,
         instance: ActionInstance,
-        applied: AppliedObjectMutation,
+        applied: Option<AppliedObjectMutation>,
         type_def: &crate::sekai::governed_action_type::GovernedActionType,
         now: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
@@ -1732,13 +1817,14 @@ impl<'a> ActionInstanceAdmission<'a> {
             budget_amount,
             &instance.evidence_submission_ids,
             effects.as_deref(),
-            Some(&applied),
+            applied.as_ref(),
             instance.admission_ontology_digest.clone(),
             instance.admission_budget_already_reserved,
             None,
             now,
         )?;
-        if applied.object_present {
+        let present = applied.filter(|applied| applied.object_present);
+        if let Some(applied) = &present {
             action_object_mutation::complete_object_write(
                 self.db,
                 &applied.object,
@@ -1747,9 +1833,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             );
         }
         Ok(ActionInstanceAdmissionOutcome {
-            object_revision: applied
-                .object_present
-                .then(|| crate::sekai::action_describe_preview::object_revision(&applied.object)),
+            object_revision: present.map(|applied| {
+                crate::sekai::action_describe_preview::object_revision(&applied.object)
+            }),
             instance,
             replay: true,
         })
@@ -2019,14 +2105,26 @@ impl<'a> ActionInstanceAdmission<'a> {
         // decision on a parked instance records its receipt unfenced.
         match (approval, stored.admission_lease.as_ref()) {
             (None, Some(lease)) => {
-                if !self
+                // An admitted Action that writes no object commits here, so
+                // the freeze is checked in the receipt's transaction (#1970).
+                let check = stored.status == STATUS_ADMITTED && applied_object.is_none();
+                match self
                     .db
-                    .put_admission_receipt(&stored.instance_id, lease, &receipt)
+                    .put_admission_receipt_checked(&stored.instance_id, lease, &receipt, check)
                     .map_err(ActionInstanceAdmissionError::Internal)?
                 {
-                    return Err(ActionInstanceAdmissionError::FailedPrecondition(
-                        crate::sekai::action_instance::ADMISSION_FENCE_LOST.into(),
-                    ));
+                    crate::sekai::action_instance::FencedAdmissionWrite::Applied(()) => {}
+                    crate::sekai::action_instance::FencedAdmissionWrite::Refused(reason) => {
+                        return Err(ActionInstanceAdmissionError::FailedPrecondition(format!(
+                            "{}{reason}",
+                            action_object_mutation::SITE_AGENT_REFUSED
+                        )));
+                    }
+                    crate::sekai::action_instance::FencedAdmissionWrite::FenceLost => {
+                        return Err(ActionInstanceAdmissionError::FailedPrecondition(
+                            crate::sekai::action_instance::ADMISSION_FENCE_LOST.into(),
+                        ));
+                    }
                 }
             }
             _ => self
@@ -2508,6 +2606,12 @@ enum Abandoned {
         applied: Box<AppliedObjectMutation>,
         type_def: Box<crate::sekai::governed_action_type::GovernedActionType>,
     },
+    /// The write was refused as it committed and the reservation denied
+    /// (#1970), but its receipt never landed: record the denial.
+    Refused {
+        instance: Box<ActionInstance>,
+        type_def: Box<crate::sekai::governed_action_type::GovernedActionType>,
+    },
     /// Nothing landed; the reservation is gone.
     Released,
 }
@@ -2861,6 +2965,39 @@ fn load_criterion_object(
             Ok(Some(object))
         }
         _ => Ok(None),
+    }
+}
+
+/// Marks `stored` denied for `reason`, as the store already did, so its
+/// receipt and decision record name why (#1970).
+fn refuse(stored: &mut ActionInstance, reason: &str) {
+    stored.status = STATUS_DENIED.into();
+    stored.deny_reason = reason.into();
+}
+
+#[cfg(test)]
+thread_local! {
+    static FREEZE_BEFORE_NEXT_COMMIT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Freezes site agent instance `instance_id` just before the next admission
+/// commits, after it was planned and admitted (#1970).
+#[cfg(test)]
+pub fn freeze_before_next_commit(instance_id: &str) {
+    FREEZE_BEFORE_NEXT_COMMIT.with(|slot| *slot.borrow_mut() = Some(instance_id.into()));
+}
+
+#[cfg(test)]
+fn freeze_before_commit(db: &RuntimeDb, _stored: &ActionInstance) {
+    if let Some(id) = FREEZE_BEFORE_NEXT_COMMIT.with(|slot| slot.borrow_mut().take())
+        && let Some(mut instance) = db.get_object(&id).ok().flatten()
+    {
+        instance.properties.insert(
+            crate::sekai::site_agent_instance::FROZEN_PROPERTY.into(),
+            "true".into(),
+        );
+        let _ = db.update_object(&instance);
     }
 }
 
@@ -6282,6 +6419,71 @@ mod tests {
 
     /// Backdates the reservation's lease for `key`, as if its admission had
     /// stalled past the lease (#1931).
+    /// A refusal committed before a crash is finished as a denial with its
+    /// receipt by the resubmit, never released and re-run (#1970).
+    #[test]
+    fn a_refusal_committed_before_a_crash_is_finished_as_a_denial() {
+        let db = setup();
+        db.create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([("principal_id".into(), "alice".into())]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let key = "refused-before-crash";
+        let submit = || {
+            let mut submit = request(r#"{"runtime":"shikigami"}"#);
+            submit.idempotency_key = key.into();
+            submit
+        };
+        let admission = ActionInstanceAdmission::new(&db, None);
+        freeze_before_next_commit("line-7");
+        crash_next_admission(CrashPoint::AfterRefusal);
+        assert!(admission.admit(submit(), "alice", 10).is_err());
+        let stored = db
+            .get_action_instance_by_idempotency("acme", key)
+            .unwrap()
+            .expect("the denied reservation stays");
+        assert_eq!(stored.status, STATUS_DENIED);
+        assert!(
+            db.get_operation_receipt(&stored.operation_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Unfrozen again, the resubmit still finishes the denial.
+        let mut instance = db.get_object("line-7").unwrap().unwrap();
+        instance.properties.insert(
+            crate::sekai::site_agent_instance::FROZEN_PROPERTY.into(),
+            "false".into(),
+        );
+        db.update_object(&instance).unwrap();
+        expire_reservation(&db, key);
+        let finished = admission.admit(submit(), "alice", 20).unwrap();
+        assert!(finished.replay);
+        assert_eq!(finished.instance.instance_id, stored.instance_id);
+        assert_eq!(finished.instance.status, STATUS_DENIED);
+        assert_eq!(
+            finished.instance.deny_reason,
+            "site agent instance line-7 is frozen"
+        );
+        assert!(
+            db.get_operation_receipt(&stored.operation_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.list_action_effects_for_instance(&stored.instance_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     fn expire_reservation(db: &RuntimeDb, key: &str) {
         let mut stored = db
             .get_action_instance_by_idempotency("acme", key)

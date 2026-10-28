@@ -441,6 +441,11 @@ pub enum FencedAdmissionWrite<T> {
     Applied(T),
     /// The caller no longer holds the reservation, or its lease expired.
     FenceLost,
+    /// The submitting site agent's instance refused the write when it
+    /// committed (#1970): it froze, or the memory's instance changed
+    /// principal. The reservation was marked denied with this reason in the
+    /// same transaction, and nothing was written.
+    Refused(String),
 }
 
 /// The object write a parked grant commits with its transition.
@@ -466,6 +471,8 @@ pub enum ParkedGrantOutcome {
     },
     /// Another decision already moved the instance.
     NotParked,
+    /// The submitting site agent's instance refuses the write (#1970).
+    Refused(String),
     /// The plan execution claim the grant was made under is gone.
     ClaimLost,
     /// The target object changed since the instance parked.
@@ -800,6 +807,14 @@ impl SekaiDb {
         if status.as_deref() != Some(STATUS_PARKED) {
             return Ok(ParkedGrantOutcome::NotParked);
         }
+        let written = write.map(|write| match write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+        });
+        if let Some(reason) =
+            sqlite_site_agent_refusal(&tx, &granted.namespace, &granted.principal, written)?
+        {
+            return Ok(ParkedGrantOutcome::Refused(reason));
+        }
         if let Some(claim) = claim {
             let holder: Option<Option<String>> = tx
                 .query_row(
@@ -962,6 +977,14 @@ impl SekaiDb {
         if !sqlite_admission_fence_holds(&tx, instance_id, lease, true)? {
             return Ok(FencedAdmissionWrite::FenceLost);
         }
+        let written = match write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+        };
+        if let Some(reason) = sqlite_reservation_refusal(&tx, instance_id, Some(written))? {
+            sqlite_deny_reservation(&tx, instance_id, &reason)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(FencedAdmissionWrite::Refused(reason));
+        }
         if let Some(changed) = sqlite_changed_reference(&tx, references)? {
             return Err(format!("{REFERENCE_CHANGED}{changed}"));
         }
@@ -1100,7 +1123,8 @@ impl SekaiDb {
     /// lease has run out on the lease clock, and its commit marker is still
     /// the one read. One conditional update, so a live admission is never
     /// taken, two takers cannot both win, and a write that committed after
-    /// the read is never overwritten as uncommitted.
+    /// the read is never overwritten as uncommitted. The status must also be
+    /// the one read, so a refusal committed since (#1970) is never discarded.
     pub fn take_over_admission(
         &self,
         instance: &ActionInstance,
@@ -1120,7 +1144,8 @@ impl SekaiDb {
                    AND json_extract(body_json, '$.admission_lease.generation') = ?4
                    AND json_extract(body_json, '$.admission_lease.expires_at_ms') <= ?5
                    AND json_extract(body_json, '$.admission_lease.write_committed') = ?6
-                   AND json_extract(body_json, '$.admission_lease.receipt_recorded') = 0",
+                   AND json_extract(body_json, '$.admission_lease.receipt_recorded') = 0
+                   AND status = ?7",
                 params![
                     instance.instance_id,
                     body_json,
@@ -1128,6 +1153,7 @@ impl SekaiDb {
                     i64::try_from(expired.generation).unwrap_or(i64::MAX),
                     lease_clock_ms(),
                     expired.write_committed.unwrap_or(false),
+                    instance.status,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1237,6 +1263,106 @@ fn sqlite_changed_reference(
 
 /// Whether `lease` holds the instance's admission reservation inside `tx`,
 /// and, with `check_expiry`, is still live on the lease clock.
+/// Why the reservation's site agent refuses its write now, read in `tx`.
+pub(crate) fn sqlite_reservation_refusal(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    written: Option<&crate::domain::Object>,
+) -> Result<Option<String>, String> {
+    let (namespace, principal): (String, String) = tx
+        .query_row(
+            "SELECT namespace, principal FROM sekai_action_instances WHERE instance_id = ?1",
+            params![instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    sqlite_site_agent_refusal(tx, &namespace, &principal, written)
+}
+
+/// Why a site agent write by `principal` in `namespace` is refused as it
+/// commits (#1970): the principal's instance is frozen, or `written` is a
+/// working memory item whose instance is gone, frozen, or acts as another
+/// principal. Read in `tx`, so a freeze committing first is seen and one
+/// committing after waits.
+pub(crate) fn sqlite_site_agent_refusal(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    principal: &str,
+    written: Option<&crate::domain::Object>,
+) -> Result<Option<String>, String> {
+    use crate::sekai::{site_agent_instance as instance, site_agent_memory as memory};
+    let frozen: Option<String> = tx
+        .query_row(
+            "SELECT id FROM sekai_objects
+             WHERE kind = ?1 AND namespace = ?2
+               AND json_extract(properties, '$.principal_id') = ?3
+               AND json_extract(properties, '$.frozen') = 'true'
+             ORDER BY id LIMIT 1",
+            params![instance::KIND, namespace, principal],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(id) = frozen {
+        return Ok(Some(format!("site agent instance {id} is frozen")));
+    }
+    let Some(owner) = written
+        .filter(|object| object.kind == memory::KIND)
+        .and_then(|object| object.properties.get(memory::INSTANCE_PROPERTY))
+    else {
+        return Ok(None);
+    };
+    let current: Option<(Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT json_extract(properties, '$.principal_id'),
+                    json_extract(properties, '$.frozen')
+             FROM sekai_objects WHERE id = ?1 AND kind = ?2 AND namespace = ?3",
+            params![owner, instance::KIND, namespace],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(memory_refusal(owner, principal, current))
+}
+
+/// Why a memory write by `principal` into instance `owner` is refused, given
+/// that instance's stored `(principal_id, frozen)`.
+pub(crate) fn memory_refusal(
+    owner: &str,
+    principal: &str,
+    current: Option<(Option<String>, Option<String>)>,
+) -> Option<String> {
+    match current {
+        None => Some(format!(
+            "site agent instance {owner} not found in this namespace"
+        )),
+        Some((_, Some(frozen))) if frozen == "true" => {
+            Some(format!("site agent instance {owner} is frozen"))
+        }
+        Some((owner_principal, _)) if owner_principal.as_deref() != Some(principal) => Some(
+            format!("only the principal of site agent instance {owner} writes its memory"),
+        ),
+        Some(_) => None,
+    }
+}
+
+/// Marks the reservation denied with `reason`, in `tx`.
+pub(crate) fn sqlite_deny_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE sekai_action_instances
+         SET status = ?2, deny_reason = ?3,
+             body_json = json_set(body_json, '$.status', ?2, '$.deny_reason', ?3)
+         WHERE instance_id = ?1",
+        params![instance_id, STATUS_DENIED, reason],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub(crate) fn sqlite_admission_fence_holds(
     tx: &rusqlite::Transaction<'_>,
     instance_id: &str,
@@ -1648,6 +1774,108 @@ mod tests {
         let scratch = crate::db::postgres::ScratchDatabase::create();
         let db = crate::db::runtime_db::RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
         references_fence_the_admission_write(&db, "p");
+    }
+
+    /// A frozen site agent instance of the reservation's principal refuses
+    /// the write and the admission without an object write, and marks the
+    /// reservation denied in the same transaction (#1970).
+    fn a_frozen_site_agent_refuses_the_commit(db: &crate::db::runtime_db::RuntimeDb, tag: &str) {
+        let sample = tests::sample(STATUS_ADMITTED);
+        db.create_object_with_audit(
+            &crate::domain::Object {
+                id: format!("line-{tag}"),
+                kind: crate::sekai::site_agent_instance::KIND.into(),
+                name: format!("line-{tag}"),
+                namespace: sample.namespace.clone(),
+                external_id: String::new(),
+                properties: std::collections::HashMap::from([
+                    ("principal_id".into(), sample.principal.clone()),
+                    ("frozen".into(), "true".into()),
+                ]),
+                created: 500,
+                updated: 500,
+            },
+            "a",
+        )
+        .unwrap();
+        let reason = format!("site agent instance line-{tag} is frozen");
+        let write = ParkedGrantWrite::Create(crate::domain::Object {
+            id: format!("rec-{tag}"),
+            kind: "customer_record".into(),
+            name: format!("rec-{tag}"),
+            namespace: sample.namespace.clone(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 600,
+            updated: 600,
+        });
+        let (written_id, written_lease) = reserve_for_test(db, &format!("ai-frozen-{tag}"), 100);
+        let refused = db
+            .apply_admission_object_write(
+                &written_id,
+                &written_lease,
+                &write,
+                None,
+                &[],
+                "a",
+                &crate::sekai::audit::ChangeAttribution::default(),
+            )
+            .unwrap();
+        assert!(matches!(&refused, FencedAdmissionWrite::Refused(why) if *why == reason));
+        assert!(db.get_object(&format!("rec-{tag}")).unwrap().is_none());
+        let denied = db.get_action_instance(&written_id).unwrap().unwrap();
+        assert_eq!(
+            (denied.status.as_str(), denied.deny_reason.as_str()),
+            (STATUS_DENIED, reason.as_str())
+        );
+
+        // An Action writing no object commits at its receipt: the receipt
+        // is refused and the reservation denied in that transaction.
+        let (plain_id, plain_lease) = reserve_for_test(db, &format!("ai-plain-{tag}"), 100);
+        let plain = db.get_action_instance(&plain_id).unwrap().unwrap();
+        let receipt = sekai_domain::receipt::OperationReceipt {
+            version: sekai_domain::receipt::OPERATION_RECEIPT_VERSION.into(),
+            operation_id: plain.operation_id.clone(),
+            parent_operation_id: None,
+            namespace: plain.namespace.clone(),
+            operation_class: "action_instance".into(),
+            initiating_actor: "a".into(),
+            schema_version: "v1".into(),
+            policy_version: "v1".into(),
+            started_at_ms: 300,
+            completed_at_ms: None,
+            events: vec![],
+            uncovered_surfaces: vec![],
+            reporter_grants: vec![],
+            ontology_digest: None,
+            artifact: None,
+        };
+        assert!(matches!(
+            db.put_admission_receipt_checked(&plain_id, &plain_lease, &receipt, true).unwrap(),
+            FencedAdmissionWrite::Refused(why) if why == reason
+        ));
+        assert!(
+            db.get_operation_receipt(&plain.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.get_action_instance(&plain_id).unwrap().unwrap().status,
+            STATUS_DENIED
+        );
+    }
+
+    #[test]
+    fn sqlite_a_frozen_site_agent_refuses_the_commit() {
+        a_frozen_site_agent_refuses_the_commit(&crate::db::runtime_db::RuntimeDb::memory(), "s");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_a_frozen_site_agent_refuses_the_commit() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = crate::db::runtime_db::RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        a_frozen_site_agent_refuses_the_commit(&db, "p");
     }
 
     #[test]

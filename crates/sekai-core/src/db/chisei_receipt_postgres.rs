@@ -27,6 +27,24 @@ impl PostgresDb {
         lease: &crate::sekai::action_instance::AdmissionLease,
         receipt: &OperationReceipt,
     ) -> Result<bool, String> {
+        self.put_admission_receipt_checked(instance_id, lease, receipt, false)
+            .map(|written| {
+                matches!(
+                    written,
+                    crate::sekai::action_instance::FencedAdmissionWrite::Applied(())
+                )
+            })
+    }
+
+    /// See the SQLite store (#1970).
+    pub fn put_admission_receipt_checked(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+        check_site_agent: bool,
+    ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
+        use crate::sekai::action_instance::FencedAdmissionWrite;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         if !crate::db::postgres_action_instance::postgres_admission_fence_holds(
@@ -35,7 +53,22 @@ impl PostgresDb {
             lease,
             true,
         )? {
-            return Ok(false);
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        if check_site_agent
+            && let Some(reason) = crate::db::postgres_action_instance::postgres_reservation_refusal(
+                &mut tx,
+                instance_id,
+                None,
+            )?
+        {
+            crate::db::postgres_action_instance::postgres_deny_reservation(
+                &mut tx,
+                instance_id,
+                &reason,
+            )?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(FencedAdmissionWrite::Refused(reason));
         }
         self.upsert_operation_receipt_on(&mut tx, receipt)?;
         self.append_operation_receipt_chain(&mut tx, receipt)?;
@@ -65,10 +98,10 @@ impl PostgresDb {
             lease,
             true,
         )? {
-            return Ok(false);
+            return Ok(FencedAdmissionWrite::FenceLost);
         }
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(true)
+        Ok(FencedAdmissionWrite::Applied(()))
     }
 
     fn upsert_operation_receipt_on<C: GenericClient>(

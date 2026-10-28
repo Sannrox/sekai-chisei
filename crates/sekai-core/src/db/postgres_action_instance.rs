@@ -219,6 +219,14 @@ impl PostgresDb {
         if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
             return Ok(FencedAdmissionWrite::FenceLost);
         }
+        let written = match write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+        };
+        if let Some(reason) = postgres_reservation_refusal(&mut tx, instance_id, Some(written))? {
+            postgres_deny_reservation(&mut tx, instance_id, &reason)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(FencedAdmissionWrite::Refused(reason));
+        }
         if let Some(changed) = postgres_changed_reference(&mut tx, references)? {
             return Err(format!(
                 "{}{changed}",
@@ -423,7 +431,8 @@ impl PostgresDb {
                    AND body_json::jsonb #>> '{admission_lease,generation}' = $4
                    AND (body_json::jsonb #>> '{admission_lease,expires_at_ms}')::bigint <= $5
                    AND (body_json::jsonb #>> '{admission_lease,write_committed}')::boolean = $6
-                   AND (body_json::jsonb #>> '{admission_lease,receipt_recorded}')::boolean = false",
+                   AND (body_json::jsonb #>> '{admission_lease,receipt_recorded}')::boolean = false
+                   AND status = $7",
                 &[
                     &instance.instance_id,
                     &body_json,
@@ -431,6 +440,7 @@ impl PostgresDb {
                     &generation,
                     &now,
                     &expired.write_committed.unwrap_or(false),
+                    &instance.status,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -526,6 +536,17 @@ impl PostgresDb {
             .map(|row| row.get(0));
         if status.as_deref() != Some(STATUS_PARKED) {
             return Ok(ParkedGrantOutcome::NotParked);
+        }
+        let written = write.map(|write| match write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+        });
+        if let Some(reason) = postgres_site_agent_refusal(
+            &mut transaction,
+            &granted.namespace,
+            &granted.principal,
+            written,
+        )? {
+            return Ok(ParkedGrantOutcome::Refused(reason));
         }
         if let Some(claim) = claim {
             // Share-locked: a takeover replacing the claim commits first.
@@ -713,6 +734,95 @@ impl PostgresDb {
 /// transaction, and, with `check_expiry`, is still live on the lease clock. The row is locked
 /// `FOR SHARE`, so a takeover that bumps the generation waits for the fenced
 /// write to commit.
+/// Why the reservation's site agent refuses its write now, read in `tx`.
+pub(crate) fn postgres_reservation_refusal<C: postgres::GenericClient>(
+    client: &mut C,
+    instance_id: &str,
+    written: Option<&crate::domain::Object>,
+) -> Result<Option<String>, String> {
+    let row = client
+        .query_one(
+            "SELECT namespace, principal FROM sekai_action_instances WHERE instance_id = $1",
+            &[&instance_id],
+        )
+        .map_err(|error| error.to_string())?;
+    let (namespace, principal): (String, String) = (row.get(0), row.get(1));
+    postgres_site_agent_refusal(client, &namespace, &principal, written)
+}
+
+/// Why a site agent write is refused as it commits (#1970); see the SQLite
+/// store. The instances read are share-locked, so a freeze or principal
+/// change committing during this transaction waits for it, and one that
+/// committed first is seen.
+pub(crate) fn postgres_site_agent_refusal<C: postgres::GenericClient>(
+    client: &mut C,
+    namespace: &str,
+    principal: &str,
+    written: Option<&crate::domain::Object>,
+) -> Result<Option<String>, String> {
+    use crate::sekai::{site_agent_instance as instance, site_agent_memory as memory};
+    let frozen = client
+        .query(
+            "SELECT id, properties::jsonb ->> 'frozen' FROM sekai_objects
+             WHERE kind = $1 AND namespace = $2
+               AND properties::jsonb ->> 'principal_id' = $3
+             ORDER BY id FOR SHARE",
+            &[&instance::KIND, &namespace, &principal],
+        )
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|row| row.get::<_, Option<String>>(1).as_deref() == Some("true"))
+        .map(|row| row.get::<_, String>(0));
+    if let Some(id) = frozen {
+        return Ok(Some(format!("site agent instance {id} is frozen")));
+    }
+    let Some(owner) = written
+        .filter(|object| object.kind == memory::KIND)
+        .and_then(|object| object.properties.get(memory::INSTANCE_PROPERTY))
+    else {
+        return Ok(None);
+    };
+    let current = client
+        .query_opt(
+            "SELECT properties::jsonb ->> 'principal_id', properties::jsonb ->> 'frozen'
+             FROM sekai_objects WHERE id = $1 AND kind = $2 AND namespace = $3 FOR SHARE",
+            &[owner, &instance::KIND, &namespace],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| {
+            (
+                row.get::<_, Option<String>>(0),
+                row.get::<_, Option<String>>(1),
+            )
+        });
+    Ok(crate::sekai::action_instance::memory_refusal(
+        owner, principal, current,
+    ))
+}
+
+/// Marks the reservation denied with `reason`, in `tx`.
+pub(crate) fn postgres_deny_reservation<C: postgres::GenericClient>(
+    client: &mut C,
+    instance_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    client
+        .execute(
+            "UPDATE sekai_action_instances
+             SET status = $2, deny_reason = $3,
+                 body_json = jsonb_set(jsonb_set(body_json::jsonb, '{status}', to_jsonb($2::text)),
+                     '{deny_reason}', to_jsonb($3::text))::text
+             WHERE instance_id = $1",
+            &[
+                &instance_id,
+                &crate::sekai::action_instance::STATUS_DENIED,
+                &reason,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub(crate) fn postgres_admission_fence_holds<C: postgres::GenericClient>(
     client: &mut C,
     instance_id: &str,

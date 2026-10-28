@@ -4733,6 +4733,23 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_admission_receipt_checked(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+        check_site_agent: bool,
+    ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.put_admission_receipt_checked(instance_id, lease, receipt, check_site_agent)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_admission_receipt_checked(instance_id, lease, receipt, check_site_agent)
+            }),
+        }
+    }
+
     pub fn take_over_admission(
         &self,
         instance: &crate::sekai::action_instance::ActionInstance,
