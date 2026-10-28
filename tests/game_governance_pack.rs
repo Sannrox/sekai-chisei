@@ -132,6 +132,43 @@ pub(crate) struct GovernedGame {
     pub(crate) tokens: HashMap<&'static str, String>,
 }
 
+/// Longest a game test here runs from start to its last budget check.
+const BUDGET_DAY_MARGIN_MS: i64 = 120_000;
+
+/// How long to wait before a test starting at `now_ms` so it runs inside
+/// one daily budget period: zero unless the period ends within `margin_ms`,
+/// otherwise until just after it rolls over (#1868).
+fn wait_for_budget_day(now_ms: i64, margin_ms: i64) -> std::time::Duration {
+    use sekai_chisei::db::chisei_budget::period_start_ms;
+    // The period that contains the end of the margin starts at the rollover.
+    let rollover = period_start_ms("daily", now_ms + margin_ms);
+    if rollover <= now_ms {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_millis((rollover - now_ms + 1_000) as u64)
+}
+
+/// Daily budgets reset at the period boundary; a test that spends before it
+/// and checks after it would see a fresh budget. Start after the boundary.
+async fn settle_budget_day() {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    tokio::time::sleep(wait_for_budget_day(now_ms, BUDGET_DAY_MARGIN_MS)).await;
+}
+
+#[test]
+fn budget_day_wait_is_zero_mid_day_and_crosses_a_near_boundary() {
+    let midnight = chrono::DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    assert_eq!(
+        wait_for_budget_day(midnight - 3_600_000, BUDGET_DAY_MARGIN_MS),
+        std::time::Duration::ZERO
+    );
+    // Five seconds before midnight: wait past it, into the next period.
+    let wait = wait_for_budget_day(midnight - 5_000, BUDGET_DAY_MARGIN_MS);
+    assert_eq!(wait, std::time::Duration::from_millis(6_000));
+}
+
 impl GovernedGame {
     async fn start() -> Self {
         Self::start_with_env(&[]).await
@@ -140,6 +177,7 @@ impl GovernedGame {
     /// Like [`Self::start`], with extra server environment such as a model
     /// endpoint.
     pub(crate) async fn start_with_env(env: &[(&str, &str)]) -> Self {
+        settle_budget_day().await;
         let server = LoopServer::spawn_with_env(&Backend::Sqlite, env);
         let logs = || server.logs();
         let pack = pack();
@@ -512,6 +550,7 @@ const PLAYER: &str = "red";
 
 impl RoutedGame {
     async fn start() -> Self {
+        settle_budget_day().await;
         // `native` is the local model runtime and `openai` the expensive one.
         // Neither endpoint is contacted: a decision never calls a provider.
         let server = LoopServer::spawn_with_env(
