@@ -885,13 +885,47 @@ impl SekaiDb {
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<bool, String> {
+        self.budget_record_idempotent_for_site(
+            scope_id,
+            metric,
+            amount,
+            idempotency_key,
+            now_ms,
+            false,
+            "",
+        )
+    }
+
+    /// [`Self::budget_record_idempotent`] that, when `require_home_pin`,
+    /// refuses a positive debit of a scope homed on another site, checked
+    /// in the debit's transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn budget_record_idempotent_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<bool, String> {
         if idempotency_key.is_empty() {
-            self.budget_adjust_chain(scope_id, metric, amount, now_ms)?;
+            self.budget_adjust_chain_for_site(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+            )?;
             return Ok(true);
         }
         let chain = scope_chain(scope_id);
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO chisei_budget_usage_events
@@ -932,6 +966,15 @@ impl SekaiDb {
                 crate::obs::labels::DeduplicationEvent::IdempotentReplay,
             );
             return Ok(false);
+        }
+        // Only a new debit is pinned: a replay of a recorded one is
+        // acknowledged from any site. A refusal rolls the event back.
+        if require_home_pin && amount > 0 {
+            for scope in &chain {
+                if let Some(limit) = effective_limit(&tx, scope, metric)? {
+                    assert_home_pin(scope, &limit.home_site_id, local_site_id)?;
+                }
+            }
         }
         for scope in &chain {
             let period_type = charge_period_type(&tx, scope, metric)?;
@@ -1270,6 +1313,17 @@ pub trait ChiseiBudgetBackend: Send + Sync {
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<bool, String>;
+    #[allow(clippy::too_many_arguments)]
+    fn budget_record_idempotent_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<bool, String>;
     fn budget_limits_for_scope(
         &self,
         scope_id: &str,
@@ -1365,6 +1419,27 @@ macro_rules! forward_budget {
                 amount,
                 idempotency_key,
                 now_ms,
+            )
+        }
+        fn budget_record_idempotent_for_site(
+            &self,
+            scope_id: &str,
+            metric: &str,
+            amount: i64,
+            idempotency_key: &str,
+            now_ms: i64,
+            require_home_pin: bool,
+            local_site_id: &str,
+        ) -> Result<bool, String> {
+            <$target>::budget_record_idempotent_for_site(
+                self,
+                scope_id,
+                metric,
+                amount,
+                idempotency_key,
+                now_ms,
+                require_home_pin,
+                local_site_id,
             )
         }
         fn budget_limits_for_scope(

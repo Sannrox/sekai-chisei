@@ -201,6 +201,23 @@ impl sekai_core::sekai::action_ports::ActionBudgetPort for BudgetTracker {
     fn record(&self, subject: &str, amount: i32) {
         BudgetTracker::record(self, subject, amount)
     }
+
+    fn record_once(
+        &self,
+        subject: &str,
+        amount: i32,
+        idempotency_key: &str,
+        at_ms: i64,
+    ) -> Result<(), String> {
+        self.record_idempotent_with_metric_at(
+            subject,
+            amount,
+            METRIC_TOKENS,
+            idempotency_key,
+            at_ms,
+        )
+        .map(|_| ())
+    }
 }
 
 impl BudgetTracker {
@@ -547,18 +564,29 @@ impl BudgetTracker {
         metric: &str,
         idempotency_key: &str,
     ) -> Result<bool, String> {
-        // Idempotent record still goes through the shared store; pin is
-        // enforced on positive debits of limited scopes.
-        if amount > 0 && self.require_home_pin() {
-            self.db
-                .budget_assert_home_writable(scope_id, metric, self.local_site_id())?;
-        }
-        self.db.budget_record_idempotent(
+        self.record_idempotent_with_metric_at(scope_id, amount, metric, idempotency_key, now_ms())
+    }
+
+    /// [`Self::record_idempotent_with_metric`] in the budget period of
+    /// `at_ms`.
+    pub fn record_idempotent_with_metric_at(
+        &self,
+        scope_id: &str,
+        amount: i32,
+        metric: &str,
+        idempotency_key: &str,
+        at_ms: i64,
+    ) -> Result<bool, String> {
+        // The pin is enforced on positive debits of limited scopes, in the
+        // debit's own transaction.
+        self.db.budget_record_idempotent_for_site(
             scope_id,
             metric,
             i64::from(amount),
             idempotency_key,
-            now_ms(),
+            at_ms,
+            self.require_home_pin(),
+            self.local_site_id(),
         )
     }
 
@@ -725,6 +753,68 @@ mod tests {
             err.contains("pinned") || err.contains("home"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn foreign_home_pin_fails_closed_on_an_idempotent_debit() {
+        use sekai_core::sekai::action_ports::ActionBudgetPort;
+        let t = tracker_with(BudgetTopologyConfig {
+            mode: BudgetTopologyMode::RegionalPinned,
+            site_id: "us-east".into(),
+            partition_simulated: false,
+        });
+        t.set_limit_scoped(
+            "region:eu",
+            METRIC_TOKENS,
+            100,
+            PeriodType::Daily,
+            "eu-west",
+            "",
+        )
+        .unwrap();
+        assert!(
+            t.record_once("region:eu", 10, "op-1:budget:submit", 1_000)
+                .is_err()
+        );
+        assert_eq!(t.get_usage("region:eu").tokens_used, 0);
+    }
+
+    #[test]
+    fn a_recorded_debit_replays_from_any_site() {
+        use sekai_core::sekai::action_ports::ActionBudgetPort;
+        let db = ChiseiStore::memory();
+        let at = |site: &str| {
+            BudgetTracker::with_topology(
+                db.clone(),
+                BudgetTopologyConfig {
+                    mode: BudgetTopologyMode::RegionalPinned,
+                    site_id: site.into(),
+                    partition_simulated: false,
+                },
+            )
+        };
+        let (home, foreign) = (at("eu-west"), at("us-east"));
+        home.set_limit_scoped(
+            "region:eu",
+            METRIC_TOKENS,
+            100,
+            PeriodType::Daily,
+            "eu-west",
+            "",
+        )
+        .unwrap();
+        let now = now_ms();
+        home.record_once("region:eu", 10, "op-2:budget:submit", now)
+            .unwrap();
+        foreign
+            .record_once("region:eu", 10, "op-2:budget:submit", now)
+            .unwrap();
+        assert!(
+            foreign
+                .record_once("region:eu", 10, "op-3:budget:submit", now)
+                .is_err()
+        );
+        assert_eq!(home.get_usage("region:eu").tokens_used, 10);
     }
 
     #[test]

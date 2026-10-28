@@ -748,6 +748,38 @@ impl PostgresDb {
         Ok(out)
     }
 
+    /// Inserts the effects not already stored (#1943); see the SQLite store.
+    pub fn put_missing_action_effects(&self, effects: &[ActionEffect]) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        for effect in effects {
+            effect.validate()?;
+            let body_json = serde_json::to_string(effect).map_err(|e| e.to_string())?;
+            connection
+                .execute(
+                    "INSERT INTO sekai_action_effects
+                     (effect_id, instance_id, namespace, operation_id, kind, status,
+                      payload_json, failure_reason, created_at_ms, updated_at_ms, body_json)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                     ON CONFLICT (effect_id) DO NOTHING",
+                    &[
+                        &effect.effect_id,
+                        &effect.instance_id,
+                        &effect.namespace,
+                        &effect.operation_id,
+                        &effect.kind,
+                        &effect.status,
+                        &effect.payload_json,
+                        &effect.failure_reason,
+                        &effect.created_at_ms,
+                        &effect.updated_at_ms,
+                        &body_json,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn get_action_effect(&self, effect_id: &str) -> Result<Option<ActionEffect>, String> {
         self.connection()?
             .query_opt(

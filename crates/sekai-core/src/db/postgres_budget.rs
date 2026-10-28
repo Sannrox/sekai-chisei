@@ -502,8 +502,39 @@ impl PostgresDb {
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<bool, String> {
+        self.budget_record_idempotent_for_site(
+            scope_id,
+            metric,
+            amount,
+            idempotency_key,
+            now_ms,
+            false,
+            "",
+        )
+    }
+
+    /// [`Self::budget_record_idempotent`] with the home-site pin checked
+    /// under the scope locks, in the debit's transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn budget_record_idempotent_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<bool, String> {
         if idempotency_key.is_empty() {
-            self.budget_adjust_chain(scope_id, metric, amount, now_ms)?;
+            self.budget_adjust_chain_for_site(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+            )?;
             return Ok(true);
         }
         let chain = scope_chain(scope_id);
@@ -555,6 +586,15 @@ impl PostgresDb {
                 crate::obs::labels::DeduplicationEvent::IdempotentReplay,
             );
             return Ok(false);
+        }
+        // Only a new debit is pinned: a replay of a recorded one is
+        // acknowledged from any site. A refusal rolls the event back.
+        if require_home_pin && amount > 0 {
+            for scope in &chain {
+                if let Some(limit) = effective_limit(&mut transaction, scope, metric)? {
+                    pg_assert_home_pin(scope, &limit.home_site_id, local_site_id)?;
+                }
+            }
         }
         for scope in &chain {
             let period_type = charge_period_type(&mut transaction, scope, metric)?;

@@ -1170,6 +1170,17 @@ mod tests {
             self.recorded
                 .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
         }
+
+        fn record_once(
+            &self,
+            subject: &str,
+            amount: i32,
+            _key: &str,
+            _at_ms: i64,
+        ) -> Result<(), String> {
+            self.record(subject, amount);
+            Ok(())
+        }
     }
 
     fn budgeted_envelope(step: &str) -> WorkflowStepEnvelope {

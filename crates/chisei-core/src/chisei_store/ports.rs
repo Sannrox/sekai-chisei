@@ -119,6 +119,7 @@ chisei_store_trait! {
         fn budget_adjust_chain_for_site(&self, scope_id: &str, metric: &str, delta: i64, now_ms: i64, require_home_pin: bool, local_site_id: &str) -> Result<(), String>;
         fn budget_assert_home_writable(&self, scope_id: &str, metric: &str, local_site_id: &str) -> Result<(), String>;
         fn budget_record_idempotent(&self, scope_id: &str, metric: &str, amount: i64, idempotency_key: &str, now_ms: i64) -> Result<bool, String>;
+        fn budget_record_idempotent_for_site(&self, scope_id: &str, metric: &str, amount: i64, idempotency_key: &str, now_ms: i64, require_home_pin: bool, local_site_id: &str) -> Result<bool, String>;
         fn budget_usage(&self, scope_id: &str, metric: &str, now_ms: i64) -> Result<(i64, i64, String), String>;
         fn budget_usage_chain(&self, scope_id: &str, now_ms: i64) -> Result<Vec<sekai_core::db::chisei_budget::BudgetScopeUsage>, String>;
         fn budget_namespace_pressure(&self, namespace: &str, metric: &str, now_ms: i64) -> Result<i32, String>;

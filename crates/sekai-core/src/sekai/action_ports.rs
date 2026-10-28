@@ -13,6 +13,16 @@ use crate::sekai::governed_action_type::GovernedActionType;
 pub trait ActionBudgetPort: Send + Sync {
     fn check(&self, subject: &str, amount: i32) -> Result<(), String>;
     fn record(&self, subject: &str, amount: i32);
+    /// Debits `amount` once per `idempotency_key`, in the budget period of
+    /// `at_ms`: a repeat with the same key is a no-op, so a resumed
+    /// admission charges once, to the period it was admitted in (#1943).
+    fn record_once(
+        &self,
+        subject: &str,
+        amount: i32,
+        idempotency_key: &str,
+        at_ms: i64,
+    ) -> Result<(), String>;
 }
 
 /// System One fill provenance for a governed Action type.

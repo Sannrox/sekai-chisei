@@ -717,6 +717,16 @@ mod tests {
         }
 
         fn record(&self, _subject: &str, _amount: i32) {}
+
+        fn record_once(
+            &self,
+            _subject: &str,
+            _amount: i32,
+            _key: &str,
+            _at_ms: i64,
+        ) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[test]
