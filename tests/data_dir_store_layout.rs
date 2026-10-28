@@ -1,6 +1,7 @@
 //! `SEKAI_DATA_DIR` derives the Sekai and Chisei SQLite files when no store
 //! variable is set; each plane process opens only its own file (#1238).
-//! Retired single-store variables refuse boot with guidance (#1239).
+//! Retired single-store variables refuse boot with guidance (#1239), and so
+//! does a model price table that does not parse (#1872).
 
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -205,4 +206,28 @@ fn retired_single_store_variables_refuse_boot_with_guidance() {
         !cwd.path().join("data").exists(),
         "a refused boot must not touch the data dir"
     );
+}
+
+/// A model price table that does not parse refuses boot before any store
+/// opens, so no receipt is written unpriced by mistake (#1872).
+#[test]
+fn an_invalid_model_price_table_refuses_boot() {
+    let cwd = tempdir().unwrap();
+    for spec in ["native/native-default=1", "gpt-5.5=1:2,gpt-5.5=3:4"] {
+        let mut command = server_command(
+            env!("CARGO_BIN_EXE_sekai-chisei"),
+            cwd.path(),
+            free_port(),
+            &[("CHISEI_GATEWAY_PRICING", spec)],
+        );
+        command.stderr(Stdio::piped());
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "booted with pricing {spec:?}");
+        assert!(
+            stderr.contains("invalid CHISEI_GATEWAY_PRICING"),
+            "{stderr}"
+        );
+    }
+    assert!(!cwd.path().join("data").exists());
 }

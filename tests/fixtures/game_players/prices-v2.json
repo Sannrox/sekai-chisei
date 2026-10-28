@@ -1,0 +1,9 @@
+{
+  "version": "game-players.prices/v2",
+  "unit": "usd_micros",
+  "note": "Illustrative prices for the routing config's routes in USD per million tokens. They are not provider list prices. The harness passes them to the server as CHISEI_GATEWAY_PRICING, which prices each model call and records cost_usd_micros on its receipt.",
+  "routes": [
+    {"route": "routine", "runtime": "native", "model": "native/native-default", "input_usd_per_1m": 1, "output_usd_per_1m": 2},
+    {"route": "high_impact", "runtime": "openai", "model": "gpt-5.5", "input_usd_per_1m": 30, "output_usd_per_1m": 120}
+  ]
+}

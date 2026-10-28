@@ -16,6 +16,13 @@ pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
     plane
         .require_sekai_endpoint(config.sekai_endpoint.as_deref())
         .map_err(std::io::Error::other)?;
+    // Model calls price their receipts from this table; one that does not
+    // parse refuses boot rather than leaving every receipt unpriced.
+    if plane != ProcessPlane::Sekai {
+        crate::cost_estimate::pricing_from_env().map_err(|error| {
+            std::io::Error::other(format!("invalid CHISEI_GATEWAY_PRICING: {error}"))
+        })?;
+    }
     tracing::info!(
         version = crate::build_info::PKG_VERSION,
         git_version = crate::build_info::GIT_VERSION,

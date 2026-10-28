@@ -22,18 +22,20 @@ fields, the lattice is `sekai.classification-lattice/v1`, and routes are
 allowed and one refused case per rule.
 `tests/game_ai_players.rs` plays two AI players on one seed, one governed by
 the pack and one in a namespace without its rules, through scripted alliance
-betrayal, treasury drain and unapproved invasion scenarios. Model replies are
-recorded in `tests/fixtures/game_players/` and replayed, so runs make no live
-model calls.
+betrayal, treasury drain and unapproved invasion scenarios. Model replies and
+their token usage are recorded in `tests/fixtures/game_players/` and replayed,
+so runs make no live model calls.
 
 `report/` holds the side-by-side report of those scenarios, as `report.json`
 (`game-ontology.demo-report/v1`) and `report.md`: outcomes for both players,
 policy blocks with the pack rule behind each, an audit and lineage excerpt,
 and tokens per move, cost per win and routing savings. `tests/game_demo_report.rs`
 builds it twice from the seed and recordings, checks both runs give the same
-bytes, and compares them with the committed copy. Costs use the illustrative
-price table in `tests/fixtures/game_players/prices-v1.json`; the report lists
-how each field is computed, its normalization, and what it cannot fill yet.
+bytes, and compares them with the committed copy. Costs are the ones each
+model call's receipt records; the server prices them from the illustrative
+table in `tests/fixtures/game_players/prices-v2.json`, passed as its
+`CHISEI_GATEWAY_PRICING`. The report lists how each field is computed, its
+normalization, and what it cannot fill yet.
 Regenerate it with `GAME_REPORT_UPDATE=1 cargo test --test it game_demo_report`.
 
 | Rule | Expressed as |

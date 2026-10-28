@@ -18,6 +18,10 @@ pub struct ModelPricing {
     pub cache_write_1h_usd_micros_per_million: Option<i64>,
 }
 
+/// Parses the `CHISEI_GATEWAY_PRICING` model price table shared by the
+/// gateway ledger and native operation receipts. Rates are USD per million
+/// tokens with at most six decimals, stored as integer micro-USD. A malformed
+/// entry or a model listed twice is an error, never a silently zero price.
 pub fn parse_pricing_table(
     spec: &str,
 ) -> Result<HashMap<String, ModelPricing>, Box<dyn std::error::Error>> {
@@ -57,7 +61,7 @@ pub fn parse_pricing_table(
             .get(4)
             .map(|rate| parse_usd_micros(rate))
             .transpose()?;
-        pricing.insert(
+        let previous = pricing.insert(
             model.to_string(),
             ModelPricing {
                 input_usd_micros_per_million,
@@ -67,6 +71,9 @@ pub fn parse_pricing_table(
                 cache_write_1h_usd_micros_per_million,
             },
         );
+        if previous.is_some() {
+            return Err(format!("gateway pricing lists {model:?} more than once").into());
+        }
     }
     Ok(pricing)
 }
@@ -122,4 +129,15 @@ pub fn lookup_pricing_entry<'a>(
             })
         })
         .map(|(model, pricing)| (model.as_str(), pricing))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_model_priced_twice_is_refused() {
+        let error = parse_pricing_table("gpt-5.5=1:2,gpt-5.5=3:4").unwrap_err();
+        assert!(error.to_string().contains("more than once"), "{error}");
+    }
 }

@@ -10,8 +10,9 @@
 //! - each policy block with the server's reason and the pack rule behind it;
 //! - an audit excerpt (`GetActionInstance`, `ListDecisions`,
 //!   `GetOperationReceipt`) and a lineage excerpt (`ExplainValue`);
-//! - tokens per move, cost per win and savings from routing, priced with
-//!   `fixtures/game_players/prices-v1.json`;
+//! - tokens per move, cost per win and savings from routing, from the usage
+//!   and cost on each move's receipt, which the server priced with
+//!   `fixtures/game_players/prices-v2.json`;
 //! - budget usage and remaining limit after all scenarios (`GetBudgetUsage`).
 //!
 //! The report keeps only fields that are the same on every run: no
@@ -26,28 +27,29 @@
 //! ```
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
+use sekai_chisei::cost_estimate::cost_usd_micros;
 use sekai_chisei::grpc::pb::chisei::{GetBudgetUsageRequest, GetOperationReceiptRequest};
 use sekai_chisei::grpc::pb::sekai::{
     ExplainValueRequest, GetActionInstanceRequest, ListDecisionsRequest,
 };
-use serde::{Deserialize, Serialize};
+use sekai_chisei::pricing::{ModelPricing, parse_pricing_table};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::game_ai_players::{
-    Outcome, PLAYER, Replay, SCENARIOS, SEED, Turn, Verdict, play, start,
+    Outcome, PLAYER, PRICES, Prices, Replay, RoutePrice, SCENARIOS, SEED, Turn, Verdict, play,
+    start,
 };
 use crate::game_governance_pack::{GovernedGame, pack};
 
 const SCHEMA: &str = "game-ontology.demo-report/v1";
 const ROUTING: &str = include_str!("../examples/game-ontology/routing-v1.json");
 const RESPONSES: &str = include_str!("fixtures/game_players/responses-v1.json");
-const PRICES: &str = include_str!("fixtures/game_players/prices-v1.json");
-const PRICES_VERSION: &str = "game-players.prices/v1";
 const REPORT_DIR: &str = "examples/game-ontology/report";
 const UPDATE_ENV: &str = "GAME_REPORT_UPDATE";
 
@@ -67,15 +69,15 @@ const METHODS: [(&str, &str); 7] = [
     ),
     (
         "tokens",
-        "Input and output tokens of each move's model_called event in its GetOperationReceipt. The replay endpoint reports the same usage for every reply, because the recordings store none.",
+        "Input and output tokens of each move's model_called event in its GetOperationReceipt, as the provider reported them. The replay endpoint reports the usage stored with each recording; the fixture's recordings are hand-written, so that usage is illustrative, not measured.",
     ),
     (
         "cost",
-        "Each move's tokens priced at the route whose runtime the receipt's route_selected event names, using the fixture price table, in millicredits.",
+        "The cost_usd_micros of each move's model_called event. The server priced the call when it completed, from the reported usage and its CHISEI_GATEWAY_PRICING table, set to the fixture's illustrative prices.",
     ),
     (
         "routing_savings",
-        "Counterfactual: the same tokens priced at the high_impact route, minus the cost. It is not charged spend; no public RPC reads model spend per route.",
+        "Counterfactual: the receipt's tokens priced at the high_impact route's table entry with the server's pricing function, minus the cost. It is not charged spend; no public RPC reads model spend per route.",
     ),
     (
         "win",
@@ -100,46 +102,10 @@ const NORMALIZATION: [&str; 4] = [
 
 /// Report fields the existing public data does not fill, or fills only
 /// approximately.
-const GAPS: [(&str, &str); 2] = [
-    (
-        "#1866",
-        "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices.",
-    ),
-    (
-        "#1872",
-        "Chisei has no model price table; cost uses the fixture's illustrative prices. Recorded replies carry no token usage, so tokens per move reflect the replay endpoint.",
-    ),
-];
-
-#[derive(Deserialize, Serialize, Clone)]
-struct RoutePrice {
-    route: String,
-    runtime: String,
-    input_per_1k: i64,
-    output_per_1k: i64,
-}
-
-#[derive(Deserialize)]
-struct Prices {
-    version: String,
-    unit: String,
-    routes: Vec<RoutePrice>,
-}
-
-impl Prices {
-    fn load() -> Self {
-        let prices: Self = serde_json::from_str(PRICES).expect("prices json");
-        assert_eq!(prices.version, PRICES_VERSION);
-        prices
-    }
-
-    fn by(&self, field: impl Fn(&RoutePrice) -> &str, value: &str) -> &RoutePrice {
-        self.routes
-            .iter()
-            .find(|price| field(price) == value)
-            .unwrap_or_else(|| panic!("no price for {value}"))
-    }
-}
+const GAPS: [(&str, &str); 1] = [(
+    "#1866",
+    "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices.",
+)];
 
 fn sha256(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
@@ -208,6 +174,7 @@ struct TurnReport {
     route: String,
     input_tokens: i64,
     output_tokens: i64,
+    cost_usd_micros: i64,
 }
 
 #[derive(Serialize)]
@@ -343,12 +310,12 @@ impl Tally {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             tokens_per_move: round(tokens as f64 / self.moves as f64),
-            cost_millicredits: self.cost,
+            cost_usd_micros: self.cost,
             wins: self.wins,
-            cost_per_win_millicredits: (self.wins > 0)
+            cost_per_win_usd_micros: (self.wins > 0)
                 .then(|| round(self.cost as f64 / self.wins as f64)),
-            high_impact_cost_millicredits: self.high_impact_cost,
-            routing_savings_millicredits: self.high_impact_cost - self.cost,
+            high_impact_cost_usd_micros: self.high_impact_cost,
+            routing_savings_usd_micros: self.high_impact_cost - self.cost,
             tally: self,
         }
     }
@@ -361,11 +328,11 @@ struct Cost {
     input_tokens: i64,
     output_tokens: i64,
     tokens_per_move: f64,
-    cost_millicredits: i64,
+    cost_usd_micros: i64,
     wins: i64,
-    cost_per_win_millicredits: Option<f64>,
-    high_impact_cost_millicredits: i64,
-    routing_savings_millicredits: i64,
+    cost_per_win_usd_micros: Option<f64>,
+    high_impact_cost_usd_micros: i64,
+    routing_savings_usd_micros: i64,
     #[serde(skip)]
     tally: Tally,
 }
@@ -381,20 +348,20 @@ impl Cost {
                 format!("{} / {}", self.input_tokens, self.output_tokens),
             ),
             ("Tokens per move", self.tokens_per_move.to_string()),
-            ("Cost", self.cost_millicredits.to_string()),
+            ("Cost", self.cost_usd_micros.to_string()),
             ("Wins", self.wins.to_string()),
             (
                 "Cost per win",
-                self.cost_per_win_millicredits
+                self.cost_per_win_usd_micros
                     .map_or("n/a".into(), |cost| cost.to_string()),
             ),
             (
                 "Cost at high_impact",
-                self.high_impact_cost_millicredits.to_string(),
+                self.high_impact_cost_usd_micros.to_string(),
             ),
             (
                 "Savings from routing",
-                self.routing_savings_millicredits.to_string(),
+                self.routing_savings_usd_micros.to_string(),
             ),
         ]
     }
@@ -404,6 +371,8 @@ impl Cost {
 struct Reader<'a> {
     game: &'a GovernedGame,
     prices: Prices,
+    /// The same table the server prices with, for the counterfactual.
+    table: HashMap<String, ModelPricing>,
     /// Generated instance id to its stable label.
     labels: BTreeMap<String, String>,
 }
@@ -452,18 +421,29 @@ impl Reader<'_> {
                 .unwrap_or_default()
                 .to_string()
         };
-        let tokens = |name: &str| -> i64 { attribute("model_called", name).parse().unwrap_or(0) };
+        let number = |name: &str| attribute("model_called", name).parse::<i64>().ok();
         let runtime = attribute("route_selected", "runtime");
-        let price = self.prices.by(|price| &price.runtime, &runtime);
-        let high_impact = self.prices.by(|price| &price.route, "high_impact");
-        let (input, output) = (tokens("input_tokens"), tokens("output_tokens"));
+        let (input, output) = (
+            number("input_tokens").unwrap_or(0),
+            number("output_tokens").unwrap_or(0),
+        );
+        let high_impact = &self.prices.by(|price| &price.route, "high_impact").model;
         let tally = Tally {
             moves: 1,
             model_calls: i64::from(!attribute("model_called", "provider").is_empty()),
             input_tokens: input,
             output_tokens: output,
-            cost: input * price.input_per_1k + output * price.output_per_1k,
-            high_impact_cost: input * high_impact.input_per_1k + output * high_impact.output_per_1k,
+            cost: number("cost_usd_micros")
+                .unwrap_or_else(|| panic!("{}: receipt has no cost", turn.request_id)),
+            high_impact_cost: cost_usd_micros(
+                high_impact,
+                &self.table[high_impact],
+                input,
+                output,
+                0,
+                0,
+            )
+            .expect("high_impact cost"),
             wins: i64::from(turn.verdict == Verdict::Applied),
         };
         let model = ModelReceipt {
@@ -673,6 +653,7 @@ impl Reader<'_> {
                         .clone(),
                     input_tokens: turn_tally.input_tokens,
                     output_tokens: turn_tally.output_tokens,
+                    cost_usd_micros: turn_tally.cost,
                 });
                 audit.push(Audit {
                     player,
@@ -797,9 +778,11 @@ async fn build_report() -> Report {
             Some((id, format!("instance:{}", turn.request_id)))
         })
         .collect();
+    let prices = Prices::load();
     let reader = Reader {
         game: &game,
-        prices: Prices::load(),
+        table: parse_pricing_table(&prices.spec()).expect("price table"),
+        prices,
         labels,
     };
     let mut scenarios = Vec::new();
@@ -896,13 +879,19 @@ impl Report {
         for (name, value) in &self.inputs {
             let _ = writeln!(out, "| {name} | `{value}` |");
         }
-        out.push_str("\nCosts are in millicredits at these illustrative route prices (credits per 1000 tokens):\n\n");
-        out.push_str("| Route | Runtime | Input | Output |\n| --- | --- | --- | --- |\n");
+        out.push_str("\nCosts are in micro-USD, read from each model call's receipt. The server priced the calls with these illustrative route prices (USD per million tokens):\n\n");
+        out.push_str(
+            "| Route | Runtime | Model | Input | Output |\n| --- | --- | --- | --- | --- |\n",
+        );
         for price in &self.prices {
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {} |",
-                price.route, price.runtime, price.input_per_1k, price.output_per_1k
+                "| {} | {} | `{}` | {} | {} |",
+                price.route,
+                price.runtime,
+                price.model,
+                price.input_usd_per_1m,
+                price.output_usd_per_1m
             );
         }
 
@@ -1127,7 +1116,7 @@ async fn the_report_is_byte_identical_and_matches_the_golden_copy() {
             ("governed", "invasion_approval"),
         ]
     );
-    assert!(first.totals.governed.routing_savings_millicredits > 0);
+    assert!(first.totals.governed.routing_savings_usd_micros > 0);
 
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(REPORT_DIR);
     let files = ["report.json", "report.md"];

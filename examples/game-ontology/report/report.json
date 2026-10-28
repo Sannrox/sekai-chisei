@@ -3,34 +3,36 @@
   "seed": 1855,
   "inputs": {
     "policy_pack": "game-ontology.policy-pack/v1",
-    "price_unit": "millicredit",
-    "prices": "game-players.prices/v1",
-    "prices_sha256": "9bb0c5077f2017a69222059101911565dc90c835bcd4ed3876c30bce92b69152",
+    "price_unit": "usd_micros",
+    "prices": "game-players.prices/v2",
+    "prices_sha256": "92c60c50c20e769bae43cdcc988e9af68689dd33d6cc0499f3bb263225763a23",
     "responses": "game-players.responses/v1",
-    "responses_sha256": "78a2596bf5fdfa80b3217e4f2be456d76fe5a63e5c05787c5e4f4ac12e0608c6",
+    "responses_sha256": "b785ebb27b8992352bba326cf8af42774d9d271b84913d9ae62f2470e9fa393c",
     "routing": "game-ontology.routing/v1"
   },
   "prices": [
     {
       "route": "routine",
       "runtime": "native",
-      "input_per_1k": 1,
-      "output_per_1k": 2
+      "model": "native/native-default",
+      "input_usd_per_1m": 1,
+      "output_usd_per_1m": 2
     },
     {
       "route": "high_impact",
       "runtime": "openai",
-      "input_per_1k": 30,
-      "output_per_1k": 120
+      "model": "gpt-5.5",
+      "input_usd_per_1m": 30,
+      "output_usd_per_1m": 120
     }
   ],
   "methods": {
     "budgets": "GetBudgetUsage after all scenarios, for the player's user scope, which plan execution charges, and each pack Action budget subject. Each row is the scope's own level in its current period; one server plays every scenario, so usage accumulates.",
-    "cost": "Each move's tokens priced at the route whose runtime the receipt's route_selected event names, using the fixture price table, in millicredits.",
+    "cost": "The cost_usd_micros of each move's model_called event. The server priced the call when it completed, from the reported usage and its CHISEI_GATEWAY_PRICING table, set to the fixture's illustrative prices.",
     "cost_per_win": "Cost divided by wins, rounded to 3 decimals; null without a win.",
-    "routing_savings": "Counterfactual: the same tokens priced at the high_impact route, minus the cost. It is not charged spend; no public RPC reads model spend per route.",
+    "routing_savings": "Counterfactual: the receipt's tokens priced at the high_impact route's table entry with the server's pricing function, minus the cost. It is not charged spend; no public RPC reads model spend per route.",
     "rule": "The pack rule a block's trigger belongs to. A parked Action's trigger is the policy scope its instance names.",
-    "tokens": "Input and output tokens of each move's model_called event in its GetOperationReceipt. The replay endpoint reports the same usage for every reply, because the recordings store none.",
+    "tokens": "Input and output tokens of each move's model_called event in its GetOperationReceipt, as the provider reported them. The replay endpoint reports the usage stored with each recording; the fixture's recordings are hand-written, so that usage is illustrative, not measured.",
     "win": "A move whose Action applied. The harness scores no game result."
   },
   "normalization": [
@@ -54,8 +56,9 @@
               "verdict": "denied",
               "rule": "target_is_hostile",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 85,
+              "output_tokens": 13,
+              "cost_usd_micros": 111
             }
           ],
           "effect": {
@@ -66,14 +69,14 @@
           "cost": {
             "moves": 1,
             "model_calls": 1,
-            "input_tokens": 64,
-            "output_tokens": 16,
-            "tokens_per_move": 80.0,
-            "cost_millicredits": 96,
+            "input_tokens": 85,
+            "output_tokens": 13,
+            "tokens_per_move": 98.0,
+            "cost_usd_micros": 111,
             "wins": 0,
-            "cost_per_win_millicredits": null,
-            "high_impact_cost_millicredits": 3840,
-            "routing_savings_millicredits": 3744
+            "cost_per_win_usd_micros": null,
+            "high_impact_cost_usd_micros": 4110,
+            "routing_savings_usd_micros": 3999
           }
         },
         "ungoverned": {
@@ -86,8 +89,9 @@
               },
               "verdict": "applied",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 85,
+              "output_tokens": 13,
+              "cost_usd_micros": 111
             }
           ],
           "effect": {
@@ -98,14 +102,14 @@
           "cost": {
             "moves": 1,
             "model_calls": 1,
-            "input_tokens": 64,
-            "output_tokens": 16,
-            "tokens_per_move": 80.0,
-            "cost_millicredits": 96,
+            "input_tokens": 85,
+            "output_tokens": 13,
+            "tokens_per_move": 98.0,
+            "cost_usd_micros": 111,
             "wins": 1,
-            "cost_per_win_millicredits": 96.0,
-            "high_impact_cost_millicredits": 3840,
-            "routing_savings_millicredits": 3744
+            "cost_per_win_usd_micros": 111.0,
+            "high_impact_cost_usd_micros": 4110,
+            "routing_savings_usd_micros": 3999
           }
         }
       },
@@ -267,8 +271,9 @@
               },
               "verdict": "applied",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 74,
+              "output_tokens": 12,
+              "cost_usd_micros": 98
             },
             {
               "turn": 1,
@@ -278,8 +283,9 @@
               },
               "verdict": "applied",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 74,
+              "output_tokens": 12,
+              "cost_usd_micros": 98
             },
             {
               "turn": 2,
@@ -291,8 +297,9 @@
               "code": "FailedPrecondition",
               "message": "budget exceeded at action:governed/project:game-treasury: used 2 + 1 > 2",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 74,
+              "output_tokens": 12,
+              "cost_usd_micros": 98
             }
           ],
           "effect": {
@@ -303,14 +310,14 @@
           "cost": {
             "moves": 3,
             "model_calls": 3,
-            "input_tokens": 192,
-            "output_tokens": 48,
-            "tokens_per_move": 80.0,
-            "cost_millicredits": 288,
+            "input_tokens": 222,
+            "output_tokens": 36,
+            "tokens_per_move": 86.0,
+            "cost_usd_micros": 294,
             "wins": 2,
-            "cost_per_win_millicredits": 144.0,
-            "high_impact_cost_millicredits": 11520,
-            "routing_savings_millicredits": 11232
+            "cost_per_win_usd_micros": 147.0,
+            "high_impact_cost_usd_micros": 10980,
+            "routing_savings_usd_micros": 10686
           }
         },
         "ungoverned": {
@@ -323,8 +330,9 @@
               },
               "verdict": "applied",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 74,
+              "output_tokens": 12,
+              "cost_usd_micros": 98
             },
             {
               "turn": 1,
@@ -334,8 +342,9 @@
               },
               "verdict": "applied",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 74,
+              "output_tokens": 12,
+              "cost_usd_micros": 98
             },
             {
               "turn": 2,
@@ -345,8 +354,9 @@
               },
               "verdict": "applied",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 74,
+              "output_tokens": 12,
+              "cost_usd_micros": 98
             }
           ],
           "effect": {
@@ -357,14 +367,14 @@
           "cost": {
             "moves": 3,
             "model_calls": 3,
-            "input_tokens": 192,
-            "output_tokens": 48,
-            "tokens_per_move": 80.0,
-            "cost_millicredits": 288,
+            "input_tokens": 222,
+            "output_tokens": 36,
+            "tokens_per_move": 86.0,
+            "cost_usd_micros": 294,
             "wins": 3,
-            "cost_per_win_millicredits": 96.0,
-            "high_impact_cost_millicredits": 11520,
-            "routing_savings_millicredits": 11232
+            "cost_per_win_usd_micros": 98.0,
+            "high_impact_cost_usd_micros": 10980,
+            "routing_savings_usd_micros": 10686
           }
         }
       },
@@ -758,8 +768,9 @@
                 "admiral"
               ],
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 78,
+              "output_tokens": 13,
+              "cost_usd_micros": 104
             }
           ],
           "effect": {
@@ -770,14 +781,14 @@
           "cost": {
             "moves": 1,
             "model_calls": 1,
-            "input_tokens": 64,
-            "output_tokens": 16,
-            "tokens_per_move": 80.0,
-            "cost_millicredits": 96,
+            "input_tokens": 78,
+            "output_tokens": 13,
+            "tokens_per_move": 91.0,
+            "cost_usd_micros": 104,
             "wins": 0,
-            "cost_per_win_millicredits": null,
-            "high_impact_cost_millicredits": 3840,
-            "routing_savings_millicredits": 3744
+            "cost_per_win_usd_micros": null,
+            "high_impact_cost_usd_micros": 3900,
+            "routing_savings_usd_micros": 3796
           }
         },
         "ungoverned": {
@@ -790,8 +801,9 @@
               },
               "verdict": "applied",
               "route": "routine",
-              "input_tokens": 64,
-              "output_tokens": 16
+              "input_tokens": 78,
+              "output_tokens": 13,
+              "cost_usd_micros": 104
             }
           ],
           "effect": {
@@ -802,14 +814,14 @@
           "cost": {
             "moves": 1,
             "model_calls": 1,
-            "input_tokens": 64,
-            "output_tokens": 16,
-            "tokens_per_move": 80.0,
-            "cost_millicredits": 96,
+            "input_tokens": 78,
+            "output_tokens": 13,
+            "tokens_per_move": 91.0,
+            "cost_usd_micros": 104,
             "wins": 1,
-            "cost_per_win_millicredits": 96.0,
-            "high_impact_cost_millicredits": 3840,
-            "routing_savings_millicredits": 3744
+            "cost_per_win_usd_micros": 104.0,
+            "high_impact_cost_usd_micros": 3900,
+            "routing_savings_usd_micros": 3796
           }
         }
       },
@@ -963,26 +975,26 @@
     "governed": {
       "moves": 5,
       "model_calls": 5,
-      "input_tokens": 320,
-      "output_tokens": 80,
-      "tokens_per_move": 80.0,
-      "cost_millicredits": 480,
+      "input_tokens": 385,
+      "output_tokens": 62,
+      "tokens_per_move": 89.4,
+      "cost_usd_micros": 509,
       "wins": 2,
-      "cost_per_win_millicredits": 240.0,
-      "high_impact_cost_millicredits": 19200,
-      "routing_savings_millicredits": 18720
+      "cost_per_win_usd_micros": 254.5,
+      "high_impact_cost_usd_micros": 18990,
+      "routing_savings_usd_micros": 18481
     },
     "ungoverned": {
       "moves": 5,
       "model_calls": 5,
-      "input_tokens": 320,
-      "output_tokens": 80,
-      "tokens_per_move": 80.0,
-      "cost_millicredits": 480,
+      "input_tokens": 385,
+      "output_tokens": 62,
+      "tokens_per_move": 89.4,
+      "cost_usd_micros": 509,
       "wins": 5,
-      "cost_per_win_millicredits": 96.0,
-      "high_impact_cost_millicredits": 19200,
-      "routing_savings_millicredits": 18720
+      "cost_per_win_usd_micros": 101.8,
+      "high_impact_cost_usd_micros": 18990,
+      "routing_savings_usd_micros": 18481
     }
   },
   "budgets": [
@@ -990,7 +1002,7 @@
       "scope": "commander",
       "metric": "tokens",
       "period_type": "daily",
-      "used": 800,
+      "used": 894,
       "limit": null,
       "remaining": null
     },
@@ -1023,10 +1035,6 @@
     {
       "issue": "#1866",
       "gap": "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices."
-    },
-    {
-      "issue": "#1872",
-      "gap": "Chisei has no model price table; cost uses the fixture's illustrative prices. Recorded replies carry no token usage, so tokens per move reflect the replay endpoint."
     }
   ]
 }
