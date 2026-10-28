@@ -217,6 +217,12 @@ message ExecutionInput {
   // A missing, cross-namespace, inactive, rolled-back, changed, or otherwise
   // unusable pin fails closed with one non-disclosing error.
   LearningPin learning_pin = 19;
+  // Optional work unit (#1866). The execution is checked and charged
+  // against the budget chain `project:<namespace>/agent:<caller>`, extended
+  // with `/work_unit:<this>` when set, so per-work-unit budgets govern
+  // planned model use as they govern gateway decisions. Must not contain
+  // `/`.
+  string budget_work_unit = 20;
 }
 
 // Exact identity of a `chisei.learning-change/v1` learning: its ID and the

@@ -2174,6 +2174,94 @@ async fn managed_provider_failure_records_failed_receipt_without_route_switch() 
     assert_eq!(route.attributes["model"], "ollama/mistral");
 }
 
+/// #1866: a planned execution naming a work unit is checked and charged
+/// against the whole chain: an exhausted work-unit budget refuses it naming
+/// that budget, and within budget every level is charged.
+#[tokio::test]
+async fn planned_execution_charges_the_work_unit_budget_chain() {
+    let provider_url = spawn_synthetic_ollama_provider().await;
+    let service = managed_ollama_execution_service(provider_url);
+    let context = managed_execution_context(
+        vec!["chisei.execute".into()],
+        "sekai:control-plane",
+        i64::MAX,
+    );
+    let plan_for = |request_id: &str, work_unit: &str| {
+        let mut request = managed_plan_request(request_id);
+        request.input.as_mut().unwrap().budget_work_unit = work_unit.into();
+        let mut request = Request::new(request);
+        attach_managed_context(&mut request, context.clone());
+        request
+    };
+    let execute = |plan: ExecutionPlan| {
+        let mut request = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        attach_managed_context(&mut request, context.clone());
+        request
+    };
+
+    // Exhausted work unit: refused, naming the budget.
+    let plan = service
+        .plan_execution(plan_for("work-unit-exhausted", "turn-1"))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    let scope = plan.input.as_ref().unwrap().user_id.clone();
+    assert!(scope.ends_with("/work_unit:turn-1"), "{scope}");
+    assert!(
+        scope.starts_with("project:managed-conformance/agent:"),
+        "{scope}"
+    );
+    service
+        .budget
+        .set_limit(&scope, 1, crate::chisei::budget::PeriodType::Daily)
+        .unwrap();
+    let refused = match service.execute_plan_stream(execute(plan)).await {
+        Ok(_) => panic!("an exhausted work-unit budget started a stream"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        refused.code(),
+        tonic::Code::ResourceExhausted,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message().contains("work_unit:turn-1"),
+        "{refused:?}"
+    );
+
+    // Another work unit within budget: runs, and every level is charged.
+    let plan = service
+        .plan_execution(plan_for("work-unit-within", "turn-2"))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    let scope = plan.input.as_ref().unwrap().user_id.clone();
+    let mut stream = service
+        .execute_plan_stream(execute(plan))
+        .await
+        .unwrap()
+        .into_inner();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    let tokens: std::collections::BTreeMap<_, _> = service
+        .budget
+        .usage_chain(&scope)
+        .unwrap()
+        .into_iter()
+        .filter(|level| level.metric == crate::db::chisei_budget::METRIC_TOKENS)
+        .map(|level| (level.scope_id, level.used))
+        .collect();
+    let agent = scope.trim_end_matches("/work_unit:turn-2");
+    for level in [scope.as_str(), agent, "project:managed-conformance"] {
+        assert_eq!(tokens.get(level), Some(&10), "{level}: {tokens:?}");
+    }
+}
+
 #[tokio::test]
 async fn managed_stream_read_failure_records_failed_receipt_without_route_switch() {
     let (provider_url, requests) = spawn_synthetic_invalid_stream_ollama_provider().await;
@@ -5402,6 +5490,25 @@ fn team_execution_uses_authenticated_namespace_and_budget_scope() {
     );
     assert_eq!(execution_budget_scope("acme", "local", "forged"), "forged");
     assert_eq!(execution_budget_scope("acme", "root", ""), "default");
+    // #1866: a work unit extends the chain; a caller cannot inject segments.
+    assert_eq!(
+        planned_execution_budget_scope("acme", "alice", "forged", "turn-3").unwrap(),
+        "project:acme/agent:alice/work_unit:turn-3"
+    );
+    assert_eq!(
+        planned_execution_budget_scope("acme", "local", "", "turn-3").unwrap(),
+        "project:acme/agent:local/work_unit:turn-3"
+    );
+    assert_eq!(
+        planned_execution_budget_scope("acme", "alice", "", "").unwrap(),
+        "project:acme/agent:alice"
+    );
+    assert_eq!(
+        planned_execution_budget_scope("acme", "alice", "", "a/agent:bob")
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
     assert_eq!(
         strongest_pressure(
             crate::chisei::budget::PressureLevel::None,
