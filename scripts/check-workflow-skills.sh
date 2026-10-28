@@ -67,17 +67,20 @@ done
 
 # Parallel lanes: the lead procedure lives with deliver-ready-issue, the policy
 # lives in the project operating system, and both must stay linked.
+# Verified pushes (GraphQL createCommitOnBranch) cannot carry file modes, so
+# scripts are 100644 on main. Docs run the lane script through its interpreter
+# and this check never looks at the executable bit.
 PARALLEL_REFERENCE="$SKILLS_ROOT/deliver-ready-issue/references/parallel-delivery.md"
 LANE_SCRIPT="$SKILLS_ROOT/deliver-ready-issue/scripts/issue-lane.sh"
+LANE_RUN="bash $LANE_SCRIPT"
 require_file "$PARALLEL_REFERENCE"
 require_file "$LANE_SCRIPT"
-[ -x "$LANE_SCRIPT" ] || fail "$LANE_SCRIPT is not executable"
 require_fragment "$SKILLS_ROOT/deliver-ready-issue/SKILL.md" "references/parallel-delivery.md"
-require_fragment "$SKILLS_ROOT/deliver-ready-issue/SKILL.md" "scripts/issue-lane.sh"
-require_fragment "$SKILLS_ROOT/advance-issue-frontier/SKILL.md" "issue-lane.sh check"
+require_fragment "$SKILLS_ROOT/deliver-ready-issue/SKILL.md" "$LANE_RUN claim"
+require_fragment "$SKILLS_ROOT/advance-issue-frontier/SKILL.md" "$LANE_RUN check"
 require_line "docs/project-operating-system.md" "## Parallel delivery lanes"
 require_fragment "$PARALLEL_REFERENCE" "docs/project-operating-system.md"
-require_fragment "docs/project-operating-system.md" "issue-lane.sh claim"
+require_fragment "docs/project-operating-system.md" "$LANE_RUN claim"
 grep -Fq "/.worktrees/" .gitignore || fail ".gitignore does not ignore the /.worktrees/ lane directory"
 
 printf 'workflow skill parity check passed\n'

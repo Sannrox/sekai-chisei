@@ -149,9 +149,9 @@ mark the Issue unless documented maintainer policy requires it.
    `scripts/gh-verified-push.sh` (GraphQL `createCommitOnBranch`), not a plain
    `git push`, unless the user explicitly asks for git-protocol push:
    - Claim branch (already exists on GitHub):
-     `scripts/gh-verified-push.sh --branch <type>/<issue> --sync-local`
+     `bash scripts/gh-verified-push.sh --branch <type>/<issue> --sync-local`
    - A branch that does not exist yet (no claim was possible):
-     `scripts/gh-verified-push.sh --create-branch-from origin/main --branch <type>/<issue> --sync-local`
+     `bash scripts/gh-verified-push.sh --create-branch-from origin/main --branch <type>/<issue> --sync-local`
    - Confirm the script reports `verification.verified=true` and that the
      hosted tree matches local `HEAD`.
 4. After `--sync-local` moves the branch to the server-created commit, record
