@@ -367,6 +367,15 @@ pub(super) async fn set_namespace_policy(
                 .map_err(Status::invalid_argument)?;
             Some(context_policy)
         };
+        // An empty field keeps the rule as stored; the write reads it from
+        // the store, never from this instance's memory (#1861).
+        let impact_route = match r.impact_route_policy_json.trim() {
+            "" => ImpactRouteUpdate::Keep,
+            "null" => ImpactRouteUpdate::Clear,
+            encoded => ImpactRouteUpdate::Set(
+                parse_impact_route_policy(encoded).map_err(Status::invalid_argument)?,
+            ),
+        };
         let policy_data_class = policy.data_class.clone();
         let policy_version = policy.version();
         let current_registry = service.refresh_provider_registry_for_resolution().await?;
@@ -391,6 +400,8 @@ pub(super) async fn set_namespace_policy(
             &r.namespace,
             &policy,
             context_admission_policy.as_ref(),
+            &impact_route,
+            &actor,
         )
         .map_err(|error| {
             if error.contains("no such table") && error.contains("sekai_objects") {

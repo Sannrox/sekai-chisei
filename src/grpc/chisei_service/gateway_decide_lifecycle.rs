@@ -60,6 +60,13 @@ impl ChiseiServiceImpl {
             &actor,
             namespace,
         );
+        // The namespace's impact route rule for this call's class (#1861).
+        // A rule that cannot be read denies the call below, through the
+        // normal decision record, rather than routing without it.
+        let impact_lookup = self
+            .impact_routing(namespace, action_impact.class())
+            .map_err(|error| super::execution_planning::unreadable_impact_route(&error));
+        let impact_routing = impact_lookup.as_ref().ok().cloned().flatten();
         let domain_request = GatewayDecideRequest {
             contract_version: r.contract_version.clone(),
             namespace: namespace.into(),
@@ -249,11 +256,13 @@ impl ChiseiServiceImpl {
             budget_route_bias: route_bias.clone(),
             route_override: r.route_override.trim().to_string(),
             capability_requirements_json: r.capability_requirements_json.clone(),
+            impact_routing: impact_routing.clone(),
         };
-        let (route, policy_resolution) = match self
-            .resolve_policy_for_actor(policy_request, &actor)
-            .await
-        {
+        let resolution = match &impact_lookup {
+            Ok(_) => self.resolve_policy_for_actor(policy_request, &actor).await,
+            Err(reason) => Err(Status::invalid_argument(reason.clone())),
+        };
+        let (route, policy_resolution) = match resolution {
             Ok(resolution) => {
                 if !resolution.route_bias.trim().is_empty() {
                     route_bias = resolution.route_bias.clone();
@@ -422,6 +431,31 @@ impl ChiseiServiceImpl {
             ),
         ]);
         evidence.extend(action_impact.record_attributes());
+        // The rule's decision: refused when its refusal denied the call,
+        // otherwise whether it replaced the requested model.
+        let impact_decision = match &impact_lookup {
+            Err(_) => Some((
+                crate::chisei::impact_route::RouteClass::of(action_impact.class()),
+                crate::chisei::impact_route::ImpactRouteOutcome::Refused,
+            )),
+            Ok(routing) => routing.as_ref().map(|routing| {
+                let refused = !response.admitted
+                    && crate::chisei::impact_route::is_refusal(&response.deny_message);
+                (
+                    routing.class,
+                    if refused {
+                        crate::chisei::impact_route::ImpactRouteOutcome::Refused
+                    } else {
+                        routing.outcome_for(&domain_request.requested_model)
+                    },
+                )
+            }),
+        };
+        if impact_decision.is_some() || r.action_claim.is_some() {
+            evidence.extend(crate::chisei::impact_route::record_attributes(
+                impact_decision,
+            ));
+        }
         let _ = self.db.record_decision(&crate::sekai::audit::Decision {
             id: format!(
                 "gateway-decide:{}:{}:{}",

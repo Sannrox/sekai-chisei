@@ -244,6 +244,8 @@ lives in the separate [research index](research/README.md).
 - [Context admission policy](context-admission-policy.md) — bounded,
   namespace-scoped context use rules. Gateway fat-decide fails closed when the
   policy is missing or unavailable.
+- [Impact route policy](impact-route-policy.md) — per-namespace models for
+  each Action impact class, applied before family enablement and admission.
 - [Federation profile](federation-profile.md) — multi-control-plane trust,
   signed namespace snapshots, and imported assertion provenance.
 - [Region/site pins](region-pins.md) — single-writer pins for leases and online

@@ -304,6 +304,7 @@ pub async fn run_setup(
             default_model: default_model.clone(),
             data_class: String::new(),
             context_admission_policy_json: context_admission_policy_json.clone(),
+            impact_route_policy_json: String::new(),
         }))
         .await?;
 
@@ -320,6 +321,7 @@ pub async fn run_setup(
                 default_model: scope_default_model.clone(),
                 data_class: String::new(),
                 context_admission_policy_json: context_admission_policy_json.clone(),
+                impact_route_policy_json: String::new(),
             }))
             .await?;
     }

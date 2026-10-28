@@ -48,7 +48,7 @@ use crate::game_ai_players::{
 use crate::game_governance_pack::{GovernedGame, pack};
 
 const SCHEMA: &str = "game-ontology.demo-report/v1";
-const ROUTING: &str = include_str!("../examples/game-ontology/routing-v1.json");
+const ROUTING: &str = include_str!("../examples/game-ontology/routing-v2.json");
 const RESPONSES: &str = include_str!("fixtures/game_players/responses-v1.json");
 const REPORT_DIR: &str = "examples/game-ontology/report";
 const UPDATE_ENV: &str = "GAME_REPORT_UPDATE";
@@ -62,7 +62,7 @@ const RULES: [(&str, &str); 3] = [
 ];
 
 /// How each derived field is computed. Rendered into both forms.
-const METHODS: [(&str, &str); 7] = [
+const METHODS: [(&str, &str); 8] = [
     (
         "budgets",
         "GetBudgetUsage after all scenarios, for the player's user scope, which plan execution charges, and each pack Action budget subject. Each row is the scope's own level in its current period; one server plays every scenario, so usage accumulates.",
@@ -78,6 +78,10 @@ const METHODS: [(&str, &str); 7] = [
     (
         "routing_savings",
         "Counterfactual: the receipt's tokens priced at the high_impact route's table entry with the server's pricing function, minus the cost. It is not charged spend; no public RPC reads model spend per route.",
+    ),
+    (
+        "impact_route",
+        "The impact_route_class and impact_route_decision of each move's model_called event. The governed namespace's impact route rule keeps the expensive model for calls citing a live claim of high_impact Action work; decision steps cite none, so they route as unclassified to the local model. The ungoverned namespace has no rule (none).",
     ),
     (
         "win",
@@ -217,6 +221,10 @@ struct ModelReceipt {
     runtime: String,
     model: String,
     routing_mode: String,
+    /// The impact class the model call routed as and the namespace impact
+    /// route rule's decision (#1861).
+    impact_route_class: String,
+    impact_route_decision: String,
     budget_allowed: String,
     estimated_tokens: String,
     status: String,
@@ -453,6 +461,8 @@ impl Reader<'_> {
             runtime,
             model: attribute("route_selected", "model"),
             routing_mode: attribute("route_selected", "routing_mode"),
+            impact_route_class: attribute("model_called", "impact_route_class"),
+            impact_route_decision: attribute("model_called", "impact_route_decision"),
             budget_allowed: attribute("budget_decided", "allowed"),
             estimated_tokens: attribute("budget_decided", "estimated_tokens"),
             status: attribute("outcome_recorded", "status"),
@@ -836,6 +846,16 @@ impl Report {
     fn markdown(&self) -> String {
         let mut out = String::new();
         let cell = |text: &str| text.replace('|', "\\|");
+        let impact_route = |model: &ModelReceipt| {
+            if model.impact_route_class.is_empty() {
+                "none".to_string()
+            } else {
+                format!(
+                    "{} {}",
+                    model.impact_route_class, model.impact_route_decision
+                )
+            }
+        };
         let unset = |value: &str| {
             if value.is_empty() {
                 "(unset)".to_string()
@@ -963,11 +983,12 @@ impl Report {
             for entry in &scenario.audit {
                 let model = &entry.model;
                 let route = format!(
-                    "{} `{}` in `{}`, policy {}, budget allowed {}",
+                    "{} `{}` in `{}`, policy {}, impact route {}, budget allowed {}",
                     model.routing_mode,
                     model.model,
                     model.namespace,
                     model.route_policy_decision,
+                    impact_route(model),
                     model.budget_allowed
                 );
                 let (action, instance, record, receipt) = match &entry.action {

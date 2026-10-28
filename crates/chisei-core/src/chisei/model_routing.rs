@@ -19,6 +19,9 @@ pub struct RoutingContext<'a> {
     pub requirements: Option<&'a CapabilityRequirements>,
     pub safe_only: bool,
     pub safe_providers: &'a HashSet<String>,
+    /// The namespace impact route rule's entry for this call (#1861): alias
+    /// and fallback selection only ever rank models it permits.
+    pub impact: Option<&'a crate::chisei::impact_route::ImpactRouting>,
 }
 
 #[derive(Clone)]
@@ -194,10 +197,16 @@ fn candidate_pool(ctx: &RoutingContext<'_>) -> Vec<Candidate> {
             candidates.push(candidate);
         }
     }
+    if let Some(impact) = ctx.impact {
+        candidates.retain(|candidate| impact.allows(&candidate.model));
+    }
 
     if alias_allowed {
         for model in discover_default_candidates(ctx) {
             if let Some(candidate) = build_candidate(&model, ctx)
+                && ctx
+                    .impact
+                    .is_none_or(|impact| impact.allows(&candidate.model))
                 && !candidates
                     .iter()
                     .any(|existing| existing.model == candidate.model)
@@ -571,6 +580,12 @@ fn provider_is_available(provider: &str, config: &Config) -> bool {
     }
 }
 
+/// Whether `model` is a routing alias (`cheap`, `capable`, or a
+/// provider-scoped one) that resolves to a concrete model at routing time.
+pub fn is_routing_alias(model: &str) -> bool {
+    alias_parts(model).is_some()
+}
+
 fn alias_parts(model: &str) -> Option<(Option<&str>, &str)> {
     match model {
         "cheap" | "capable" => Some((None, model)),
@@ -741,6 +756,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "gpt-5.5");
@@ -761,6 +777,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "gpt-4.1-mini");
@@ -781,6 +798,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "openai/gpt-discovered-mini");
@@ -796,6 +814,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(fallback, "gpt-4.1-mini");
@@ -820,6 +839,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         });
         assert!(result.is_err());
     }
@@ -839,6 +859,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         });
         assert!(result.is_err());
     }
@@ -862,6 +883,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "openai/gpt-4.1");
@@ -888,6 +910,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "ollama/a-large");
@@ -919,6 +942,7 @@ mod tests {
             requirements: Some(&requirements),
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
 
@@ -956,6 +980,7 @@ mod tests {
             requirements: Some(&requirements),
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap_err();
 
@@ -982,6 +1007,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
 
@@ -1007,6 +1033,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
 
@@ -1031,6 +1058,7 @@ mod tests {
             requirements: Some(&requirements),
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap_err();
 
@@ -1051,6 +1079,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         });
         assert!(result.is_err());
     }
@@ -1070,6 +1099,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "gpt-4.1-mini");
@@ -1090,6 +1120,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "ollama/llama3.2:latest");
@@ -1110,6 +1141,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "ollama/llama3.2:latest");
@@ -1135,6 +1167,7 @@ mod tests {
             requirements: Some(&requirements),
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap_err();
 
@@ -1161,6 +1194,7 @@ mod tests {
             requirements: Some(&requirements),
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
 
@@ -1183,6 +1217,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "claude-sonnet-4-20250514");
@@ -1207,6 +1242,7 @@ mod tests {
             requirements: None,
             safe_only: true,
             safe_providers: &safe,
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "ollama/llama3.2:latest");
@@ -1227,6 +1263,7 @@ mod tests {
             requirements: None,
             safe_only: true,
             safe_providers: &safe,
+            impact: None,
         })
         .unwrap_err();
         assert!(err.contains("not safe"));
@@ -1250,6 +1287,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
+            impact: None,
         })
         .unwrap();
         assert_eq!(resolved, "openai/gpt-capable");
@@ -1274,6 +1312,7 @@ mod tests {
             requirements: None,
             safe_only,
             safe_providers: &safe,
+            impact: None,
         };
         assert!(
             resolve_override(context(false))
@@ -1307,6 +1346,7 @@ mod tests {
             requirements: None,
             safe_only: false,
             safe_providers: &safe,
+            impact: None,
         };
         assert!(
             resolve_override(fallback_context)

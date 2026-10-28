@@ -5,7 +5,8 @@
 //! `ExecutePlanStream` on the local `native` runtime. They act through the
 //! same `SubmitActionInstance`. Only the namespaces differ:
 //!
-//! - The governed player plans in the routing config's routine route and
+//! - The governed player plans in the routing config's namespace, whose
+//!   impact route rule sends these decision steps to the local model, and
 //!   acts in the namespaces of `examples/game-ontology/policy-pack-v1.json`.
 //! - The ungoverned player plans and acts in `game-free`, which registers the
 //!   pack's Action types with their submission criteria, approvers, spend
@@ -36,7 +37,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use sekai_chisei::grpc::pb::chisei::{
     ExecutePlanRequest, ExecutionInput, GetOperationReceiptRequest, PlanExecutionRequest,
-    SetModelFamilyEnablementRequest, SetNamespacePolicyRequest,
+    SetModelFamilyEnablementRequest,
 };
 use sekai_chisei::grpc::pb::sekai::{EnsureTeamNamespaceRequest, SubmitActionInstanceRequest};
 use sekai_chisei::sekai::synthetic::Rng;
@@ -45,10 +46,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use crate::game_governance_pack::{GovernedGame, pack, strings, type_namespace, write_json};
+use crate::game_governance_pack::{
+    GovernedGame, pack, routing, routing_policy, type_namespace, write_json,
+};
 use crate::product_loop_backend_conformance::bearer;
 
-const ROUTING: &str = include_str!("../examples/game-ontology/routing-v1.json");
 const RESPONSES_PATH: &str = "tests/fixtures/game_players/responses-v1.json";
 const RESPONSES: &str = include_str!("fixtures/game_players/responses-v1.json");
 const RESPONSES_VERSION: &str = "game-players.responses/v1";
@@ -440,22 +442,10 @@ struct Seat {
     object: fn(&str) -> String,
 }
 
-/// The routing config's route for routine decisions.
-fn routine_route() -> Value {
-    let routing: Value = serde_json::from_str(ROUTING).expect("routing json");
-    routing["routes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|route| route["route"] == "routine")
-        .expect("routine route")
-        .clone()
-}
-
 fn governed_seat() -> Seat {
     Seat {
         name: "governed",
-        model_namespace: routine_route()["namespace"].as_str().unwrap().into(),
+        model_namespace: routing()["namespace"].as_str().unwrap().into(),
         actions_namespace: type_namespace,
         object: str::to_string,
     }
@@ -555,29 +545,17 @@ pub(crate) async fn start(replay: &Replay) -> GovernedGame {
         ]);
     }
 
-    // Models: the governed player gets the routine route; the ungoverned
-    // namespace only has the local family enabled, with no route policy.
-    let route = routine_route();
+    // Models: the governed player gets the routing config's namespace
+    // policy and impact route rule; the ungoverned namespace only has the
+    // local family enabled, with no route policy. Decision steps cite no
+    // Action claim, so the rule routes them to the local model.
+    let routing = routing();
     let mut chisei = game.server.chisei().await;
     chisei
-        .set_namespace_policy(SetNamespacePolicyRequest {
-            namespace: route["namespace"].as_str().unwrap().into(),
-            allowed_runtimes: strings(&route["allowed_runtimes"]),
-            allowed_models: strings(&route["allowed_models"]),
-            default_runtime: route["default_runtime"].as_str().unwrap().into(),
-            default_model: route["default_model"].as_str().unwrap().into(),
-            data_class: String::new(),
-            context_admission_policy_json: json!({
-                "contract_version": "chisei.context-admission/v1",
-                "default_action": "include",
-                "unknown_action": "hold_out",
-                "rules": [],
-            })
-            .to_string(),
-        })
+        .set_namespace_policy(routing_policy(&routing))
         .await
         .unwrap_or_else(|error| panic!("route policy: {error}\n{}", logs()));
-    for namespace in [route["namespace"].as_str().unwrap(), FREE] {
+    for namespace in [routing["namespace"].as_str().unwrap(), FREE] {
         chisei
             .set_model_family_enablement(SetModelFamilyEnablementRequest {
                 namespace: namespace.into(),

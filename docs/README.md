@@ -191,6 +191,9 @@ If you want to deploy or operate the control plane:
 - [Context admission policy](context-admission-policy.md) — versioned rules
   for using or holding out epistemically qualified context. Gateway fat-decide
   requires a policy and fails closed when it is missing or unavailable.
+- [Impact route policy](impact-route-policy.md) — the models each Action
+  impact class may use in a namespace, resolved from a cited live claim and
+  never from the caller.
 - [Egress privacy scan](egress-privacy-scan.md) — leak-rule and
   known-entity checks before provider egress, the 500-object scan window, and
   the distinct truncated-scan refusal.

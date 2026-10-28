@@ -25,7 +25,7 @@ const POLICY_PACK: &str = concat!(
 
 const ROUTING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../examples/game-ontology/routing-v1.json"
+    "/../../examples/game-ontology/routing-v2.json"
 );
 
 fn sekai(arguments: &[&str]) -> std::process::Output {
@@ -251,38 +251,49 @@ fn game_policy_pack_matches_its_package() {
 #[test]
 fn game_routing_config_uses_only_known_routes_and_budgets() {
     let routing = json(ROUTING);
-    assert_eq!(routing["version"], "game-ontology.routing/v1");
+    assert_eq!(routing["version"], "game-ontology.routing/v2");
     assert_eq!(routing["package"], "game-ontology/v1");
 
-    let mut routes = BTreeSet::new();
-    let mut namespaces = BTreeSet::new();
-    for route in items(&routing, "routes") {
-        assert!(routes.insert(text(route, "route")), "duplicate {route}");
-        assert!(
-            namespaces.insert(text(route, "namespace")),
-            "shared {route}"
-        );
-        let runtimes = texts(route, "allowed_runtimes");
-        assert!(runtimes.contains(text(route, "default_runtime")), "{route}");
-        assert!(
-            texts(route, "allowed_models").contains(text(route, "default_model")),
-            "{route}"
-        );
-        // A model family is its provider runtime.
-        assert!(
-            texts(route, "enabled_families").is_subset(&runtimes),
-            "{route}"
-        );
+    // One namespace route policy; its impact route rule picks the models
+    // each impact class may use.
+    text(&routing, "namespace");
+    let runtimes = texts(&routing, "allowed_runtimes");
+    let models = texts(&routing, "allowed_models");
+    assert!(runtimes.contains(text(&routing, "default_runtime")));
+    assert!(models.contains(text(&routing, "default_model")));
+    // A model family is its provider runtime.
+    assert!(texts(&routing, "enabled_families").is_subset(&runtimes));
+    let rule = &routing["impact_routes"];
+    assert_eq!(rule["contract_version"], "chisei.impact-route/v1");
+    let classes = rule["routes"].as_object().expect("impact routes");
+    assert_eq!(
+        classes.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from(["unclassified", "routine", "high_impact"])
+    );
+    for (class, route) in classes {
+        let allowed = texts(route, "allowed_models");
+        assert!(allowed.is_subset(&models), "{class}");
+        assert!(allowed.contains(text(&routing, "default_model")), "{class}");
     }
-    assert_eq!(routes, BTreeSet::from(["routine", "high_impact"]));
+    // Only high-impact calls may use a model beyond the default.
+    for class in ["unclassified", "routine"] {
+        assert_eq!(texts(&classes[class], "allowed_models").len(), 1, "{class}");
+    }
+    for type_def in items(&json(POLICY_PACK), "action_types") {
+        if let Some(class) = type_def.get("impact_class") {
+            assert!(
+                classes.contains_key(class.as_str().expect("impact class")),
+                "{type_def}"
+            );
+        }
+    }
 
     let mut windows = BTreeSet::new();
     for budget in items(&routing, "budgets") {
         assert_budget(budget);
         let window = text(budget, "window");
         match window {
-            "turn" => assert!(routes.contains(text(budget, "route")), "{budget}"),
-            "day" => assert!(budget.get("route").is_none(), "{budget}"),
+            "turn" | "day" => assert!(budget.get("route").is_none(), "{budget}"),
             other => panic!("unknown budget window {other}"),
         }
         windows.insert((window, text(budget, "metric")));

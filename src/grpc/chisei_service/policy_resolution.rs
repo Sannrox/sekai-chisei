@@ -84,6 +84,19 @@ impl ChiseiServiceImpl {
                 };
                 (fallback, None)
             });
+        // The impact route rule narrows whichever scope's policy applies, so
+        // a narrower scope cannot widen the class's models (#1861). The
+        // resolution still reports the stored policy's scope and version.
+        let stored_policy_version = effective_policy.as_ref().map(Policy::version);
+        let impact_routing = r.impact_routing.as_ref();
+        let effective_policy = match impact_routing {
+            Some(routing) => Some(
+                routing
+                    .narrow(effective_policy.as_ref())
+                    .map_err(Status::invalid_argument)?,
+            ),
+            None => effective_policy,
+        };
         let mut regression_scopes = vec![policy_scope.as_str()];
         if !r.namespace.trim().is_empty() && r.namespace != policy_scope {
             regression_scopes.push(r.namespace.as_str());
@@ -122,6 +135,11 @@ impl ChiseiServiceImpl {
         let route_override = r.route_override.trim();
         if !route_override.is_empty() {
             validate_explicit_requested_model(route_override).map_err(Status::invalid_argument)?;
+            if let Some(routing) = impact_routing {
+                routing
+                    .check_override(route_override)
+                    .map_err(Status::invalid_argument)?;
+            }
             if !route_override_allowed(effective_policy.as_ref(), route_override) {
                 let refusal =
                     format!("route override {route_override:?} is not allowed by effective policy");
@@ -153,6 +171,22 @@ impl ChiseiServiceImpl {
             .map_err(Status::invalid_argument)?
             .map(|model| model.provider);
         let preferred_runtime = override_runtime.as_deref().unwrap_or(&r.preferred_runtime);
+        // The rule hands the router an allowed request, or an empty one so
+        // the router substitutes the namespace default.
+        let preferred_model = match impact_routing {
+            Some(routing) if route_override.is_empty() => {
+                routing
+                    .route_request(
+                        preferred_model,
+                        effective_policy
+                            .as_ref()
+                            .map_or("", |policy| policy.default_model.as_str()),
+                    )
+                    .map_err(Status::invalid_argument)?
+                    .0
+            }
+            _ => preferred_model,
+        };
         let active_route = if let Some(policy) = effective_policy.as_ref() {
             self.policy
                 .apply_policy(policy, preferred_runtime, preferred_model)
@@ -218,10 +252,17 @@ impl ChiseiServiceImpl {
                 &safe_providers,
                 capability_requirements.as_ref(),
                 !route_override.is_empty(),
+                impact_routing,
             )
             .await
             .map_err(|err| {
-                if err.starts_with("capability_unsupported:") {
+                if let Some(routing) = impact_routing
+                    && crate::chisei::model_routing::is_routing_alias(&model)
+                {
+                    // An alias with no permitted candidate is the rule's
+                    // refusal (#1861).
+                    Status::invalid_argument(routing.alias_refusal(&model))
+                } else if err.starts_with("capability_unsupported:") {
                     Status::failed_precondition(err)
                 } else if safe_only {
                     Status::permission_denied(format!(
@@ -276,6 +317,8 @@ impl ChiseiServiceImpl {
                 "hard budget cap reached and the local-free tier is blocked by the quality safety net: {safety_reason}"
             )));
         }
+        let class_allows =
+            |model: &str| impact_routing.is_none_or(|routing| routing.allows(model));
         let local_free_model = if wants_local_free {
             self.resolve_live_model(
                 "ollama/cheap",
@@ -284,9 +327,11 @@ impl ChiseiServiceImpl {
                 safe_only,
                 &safe_providers,
                 capability_requirements.as_ref(),
+                impact_routing,
             )
             .await
             .ok()
+            .filter(|model| class_allows(model))
             .and_then(|model| {
                 local_free_runtime_for_model(effective_policy.as_ref(), &model)
                     .map(|local_runtime| (local_runtime, model))
@@ -309,9 +354,11 @@ impl ChiseiServiceImpl {
                 safe_only,
                 &safe_providers,
                 capability_requirements.as_ref(),
+                impact_routing,
             )
             .await
             .ok()
+            .filter(|model| class_allows(model))
         } else {
             None
         };
@@ -382,6 +429,7 @@ impl ChiseiServiceImpl {
                 if let Ok(plan) = self.portfolio.allocate(&objective, &[demand])
                     && let Some(allocation) = plan.allocations.first()
                     && portfolio_model_allowed(effective_policy.as_ref(), &allocation.model)
+                    && class_allows(&allocation.model)
                     && portfolio_runtime_for_model(
                         effective_policy.as_ref(),
                         &runtime,
@@ -396,6 +444,7 @@ impl ChiseiServiceImpl {
                             safe_only,
                             &safe_providers,
                             capability_requirements.as_ref(),
+                            impact_routing,
                         )
                         .await
                     && proposed == allocation.model
@@ -408,6 +457,7 @@ impl ChiseiServiceImpl {
                         false,
                     )
                     && portfolio_model_allowed(effective_policy.as_ref(), &selection.model)
+                    && class_allows(&selection.model)
                     && portfolio_runtime_for_model(
                         effective_policy.as_ref(),
                         &runtime,
@@ -422,6 +472,7 @@ impl ChiseiServiceImpl {
                             safe_only,
                             &safe_providers,
                             capability_requirements.as_ref(),
+                            impact_routing,
                         )
                         .await
                     && selected == selection.model
@@ -439,6 +490,11 @@ impl ChiseiServiceImpl {
             }
         }
 
+        if let Some(routing) = impact_routing {
+            routing
+                .check_resolved(&model)
+                .map_err(Status::invalid_argument)?;
+        }
         runtime = final_runtime_for_model(effective_policy.as_ref(), &runtime, &model)
             .map_err(Status::failed_precondition)?;
         let provider = runtime.as_str();
@@ -458,6 +514,7 @@ impl ChiseiServiceImpl {
                         .map(|resolved| resolved.canonical_model)
                 })
                 .filter(|candidate| candidate != &model)
+                .filter(|candidate| class_allows(candidate))
                 .filter(|candidate| {
                     final_runtime_for_model(effective_policy.as_ref(), &runtime, candidate).is_ok()
                 })
@@ -485,14 +542,11 @@ impl ChiseiServiceImpl {
                 eval_regression_reason,
                 data_class: data_class.as_str().into(),
                 route_bias: route_bias.unwrap_or_default().to_string(),
-                policy_scope: effective_policy
+                policy_scope: stored_policy_version
                     .as_ref()
                     .map(|_| policy_scope.clone())
                     .unwrap_or_default(),
-                policy_version: effective_policy
-                    .as_ref()
-                    .map(|policy| policy.version())
-                    .unwrap_or_default(),
+                policy_version: stored_policy_version.unwrap_or_default(),
                 fallback_models,
             })
         })
@@ -607,6 +661,9 @@ pub(super) struct ResolvePolicyRequest {
     pub(super) budget_route_bias: String,
     pub(super) route_override: String,
     pub(super) capability_requirements_json: Vec<u8>,
+    /// The requested namespace's impact route rule for this call's class
+    /// (#1861); `None` when the namespace has none.
+    pub(super) impact_routing: Option<crate::chisei::impact_route::ImpactRouting>,
 }
 
 #[cfg(test)]

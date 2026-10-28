@@ -166,6 +166,38 @@ pub(super) fn context_admission_policy_from_properties(
     policy.validate()?;
     Ok(Some(policy))
 }
+/// The persisted impact route rule (#1861). Like the context admission
+/// policy, a stored value that does not parse is a durable error, never an
+/// absent rule.
+pub(super) fn impact_route_policy_from_properties(
+    properties: &std::collections::HashMap<String, String>,
+) -> Result<Option<crate::chisei::impact_route::ImpactRoutePolicy>, String> {
+    let Some(encoded) = properties
+        .get(IMPACT_ROUTE_POLICY_PROPERTY)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "null")
+    else {
+        return Ok(None);
+    };
+    parse_impact_route_policy(encoded).map(Some)
+}
+pub(super) const IMPACT_ROUTE_POLICY_PROPERTY: &str = "impact_route_policy_json";
+pub(super) fn parse_impact_route_policy(
+    encoded: &str,
+) -> Result<crate::chisei::impact_route::ImpactRoutePolicy, String> {
+    let policy = serde_json::from_str::<crate::chisei::impact_route::ImpactRoutePolicy>(encoded)
+        .map_err(|error| format!("invalid impact route policy: {error}"))?;
+    policy.validate()?;
+    Ok(policy)
+}
+/// How `SetNamespacePolicy` changes the stored impact route rule (#1861).
+pub(super) enum ImpactRouteUpdate {
+    /// Keep the rule as currently stored.
+    Keep,
+    Clear,
+    Set(crate::chisei::impact_route::ImpactRoutePolicy),
+}
 pub(super) fn policy_properties(
     policy: &Policy,
     context_admission_policy: Option<&crate::chisei::policy::ContextAdmissionPolicy>,

@@ -3385,6 +3385,7 @@ async fn seed_regressed_namespace(target: &str, db: &Arc<RuntimeDb>, namespace: 
             default_model: "gpt-5.5".to_string(),
             data_class: String::new(),
             context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -3996,6 +3997,7 @@ async fn anthropic_messages_proxy_records_usage_and_strips_accept_encoding() {
             default_model: "claude-sonnet-4-6".to_string(),
             data_class: "open".to_string(),
             context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -4302,6 +4304,7 @@ async fn gateway_key_policy_scope_rewrites_model() {
             default_model: "gpt-5.5".to_string(),
             data_class: String::new(),
             context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -4618,6 +4621,7 @@ async fn anthropic_messages_can_translate_to_openai_chat_when_policy_routes_cros
             default_model: "gpt-5.5".to_string(),
             data_class: String::new(),
             context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -4757,6 +4761,7 @@ async fn seed_cross_provider_policy(target: &str, default_model: &str, runtime: 
             default_model: default_model.to_string(),
             data_class: String::new(),
             context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
+            impact_route_policy_json: String::new(),
         }))
         .await
         .unwrap();

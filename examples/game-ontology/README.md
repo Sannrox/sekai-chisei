@@ -11,12 +11,13 @@ public gRPC API.
 
 ## Policy pack and routing config
 
-`policy-pack-v1.json` (`game-ontology.policy-pack/v1`) and `routing-v1.json`
-(`game-ontology.routing/v1`) are versioned with the package. Both use only
+`policy-pack-v1.json` (`game-ontology.policy-pack/v1`) and `routing-v2.json`
+(`game-ontology.routing/v2`) are versioned with the package. Both use only
 shipped formats: Action types are `sekaictl admin governance action type put`
 files, policies are `action policy set` scopes, budgets are `SetBudgetLimit`
-fields, the lattice is `sekai.classification-lattice/v1`, and routes are
-`SetNamespacePolicy` and model family enablement fields.
+fields, the lattice is `sekai.classification-lattice/v1`, and routing is
+`SetNamespacePolicy` fields, including its `chisei.impact-route/v1` rule, and
+model family enablement fields.
 `reference_packages.rs` checks both against the package, and
 `tests/game_governance_pack.rs` applies them to the server and shows one
 allowed and one refused case per rule.
@@ -44,10 +45,10 @@ Regenerate it with `GAME_REPORT_UPDATE=1 cargo test --test it game_demo_report`.
 | No attacks on allies | Attack and invasion types require `diplomacy` = `hostile` on the target planet. |
 | Invasion approval | Invasions resolve to a `require_approval` policy scope with `admiral` as approver. |
 | Spy-only visibility | Reports are marked `spy-only`, a lattice token only a `spy-only` ceiling dominates. |
-| Turn budgets | A turn is a budget work unit. Opening a turn sets each route's token and call limits on `project:<route namespace>/agent:<player>/work_unit:<turn>`. |
-| Day budgets | Token and call limits on the player's flat `agent:<player>` scope, which every route's chain includes. |
-| Cheap local route | The `game` namespace allows only the local `native` runtime and enables only that family. |
-| Expensive route | Only `game-high-impact` allows and enables `openai`. Callers send high-impact decisions there. |
+| Turn budgets | A turn is a budget work unit. Opening a turn sets the token and call limits on `project:game/agent:<player>/work_unit:<turn>`. |
+| Day budgets | Token and call limits on the player's flat `agent:<player>` scope, which every turn's chain includes. |
+| Cheap local route | The `game` namespace's impact route rule gives `unclassified` and `routine` calls only the local `native-default` model. Decision steps cite no Action claim, so they route there; a request for the expensive model is substituted. |
+| Expensive route | Only a `high_impact` call may use `gpt-5.5`: one citing a live claim, held by the caller, of the granted invasion's `runtime_dispatch` work. `game.planet.invade` is `high_impact`; attacks and spends are `routine`. A route override cannot pin it. |
 | Hard stop | An exhausted turn or day budget denies the decision as `budget_denied`. The local route is `native`, so local-free fallback never applies. |
 
 Known gaps, where the pack approximates or leaves a rule out:
@@ -58,8 +59,8 @@ Known gaps, where the pack approximates or leaves a rule out:
 - Alliances live in the identity extension's shared-space approvals, which
   submission criteria cannot read. The pack mirrors them as a `diplomacy`
   property the game keeps current (#1860).
-- Routing cannot pick a model by an operation's impact class, so the caller
-  chooses the high-impact namespace (#1861).
+- Both routes share the `game` namespace, so turn budgets cap the turn's
+  model use as a whole, not per route.
 - A turn's limits must be set when the turn opens; there is no default limit
   for every work unit (#1862).
 - With split stores, admission ignores an action type's `budget_scope`
