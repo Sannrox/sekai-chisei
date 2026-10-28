@@ -52,6 +52,16 @@ jobs:
       - run: cargo fmt-check
       - run: sh scripts/adr-index.sh --check
 
+  workflow-skills:
+    name: Workflow Skills
+    runs-on: ubuntu-latest
+    # Runs agent-kit main by design (no pin); keep the token read-only.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: bash scripts/validate-workflow-skills.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
