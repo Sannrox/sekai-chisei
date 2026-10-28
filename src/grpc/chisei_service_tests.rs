@@ -7513,7 +7513,11 @@ async fn decided_model(svc: &ChiseiServiceImpl, operation: &str) -> String {
     decision.resolved_model
 }
 
-async fn exercise_impact_route_rule_across_instances(open: impl Fn() -> ChiseiServiceImpl) {
+/// Returns both instances so a PostgreSQL caller can drop them off the
+/// async runtime.
+async fn exercise_impact_route_rule_across_instances(
+    open: impl Fn() -> ChiseiServiceImpl,
+) -> [ChiseiServiceImpl; 2] {
     let rule = serde_json::json!({
         "contract_version": crate::chisei::impact_route::IMPACT_ROUTE_POLICY_VERSION,
         "routes": {"unclassified": {"allowed_models": ["gpt-5.5-mini"]}},
@@ -7535,7 +7539,8 @@ async fn exercise_impact_route_rule_across_instances(open: impl Fn() -> ChiseiSe
         })
     };
     let (a, b) = (open(), open());
-    a.set_namespace_policy(set("")).await.unwrap();
+    // Start from no rule: a PostgreSQL database outlives a run.
+    a.set_namespace_policy(set("null")).await.unwrap();
     b.set_namespace_policy(set("")).await.unwrap();
     assert_eq!(decided_model(&b, "op-before").await, "gpt-5.5");
 
@@ -7627,6 +7632,8 @@ async fn exercise_impact_route_rule_across_instances(open: impl Fn() -> ChiseiSe
         .expect("planning decision record");
     assert!(record.reason.contains("unreadable"), "{record:?}");
     assert_eq!(record.evidence["impact_route_decision"], "refused");
+    a.set_namespace_policy(set("null")).await.unwrap();
+    [a, b]
 }
 
 fn impact_route_instance(db: Arc<RuntimeDb>, path: &str) -> ChiseiServiceImpl {
@@ -7651,38 +7658,55 @@ async fn impact_route_rule_is_shared_by_instances_on_one_sqlite_store() {
         .to_string_lossy()
         .to_string();
     // Each instance opens its own connection to the one database file.
-    exercise_impact_route_rule_across_instances(|| {
-        impact_route_instance(
-            Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&path).unwrap()))),
-            &path,
-        )
-    })
-    .await;
+    drop(
+        exercise_impact_route_rule_across_instances(|| {
+            impact_route_instance(
+                Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&path).unwrap()))),
+                &path,
+            )
+        })
+        .await,
+    );
     let _ = fs::remove_file(path);
 }
 
-#[tokio::test]
+// The synchronous PostgreSQL client may not block a current-thread runtime:
+// store reads move off the runtime only on a multi-thread one, as in the
+// server. The stores are connected, held and finally dropped outside async
+// context, so a failing assertion cannot drop a client on a runtime thread.
+#[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
-async fn impact_route_rule_is_shared_by_instances_on_one_postgres_store() {
+fn impact_route_rule_is_shared_by_instances_on_one_postgres_store() {
     let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
         .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    exercise_impact_route_rule_across_instances(|| {
-        impact_route_instance(
-            Arc::new(RuntimeDb::Postgres(Arc::new(
-                match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
-                    Ok(ca) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
-                        &url,
-                        4,
-                        &fs::read(ca).unwrap(),
-                    ),
-                    Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
-                }
-                .unwrap(),
-            ))),
-            ":memory:",
-        )
-    })
-    .await;
+    let connect = || {
+        Arc::new(RuntimeDb::Postgres(Arc::new(
+            match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+                Ok(ca) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                    &url,
+                    4,
+                    &fs::read(ca).unwrap(),
+                ),
+                Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
+            }
+            .unwrap(),
+        )))
+    };
+    let stores = [connect(), connect()];
+    let next = std::sync::Mutex::new(stores.to_vec());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        drop(
+            exercise_impact_route_rule_across_instances(|| {
+                impact_route_instance(next.lock().unwrap().pop().unwrap(), ":memory:")
+            })
+            .await,
+        );
+    });
+    drop(runtime);
 }
 
 #[tokio::test]
