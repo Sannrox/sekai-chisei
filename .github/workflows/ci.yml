@@ -90,7 +90,7 @@ jobs:
           fi
       - if: steps.template.outputs.run == 'true'
         run: bash scripts/check-connector-template.sh
-      - run: ./scripts/validate-ontology-deps.sh
+      - run: bash scripts/validate-ontology-deps.sh
 
   # Not a required check: it runs beside Build & Test, not after it.
   images:
@@ -103,5 +103,5 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - run: ./build/release-images.sh
+      - run: bash build/release-images.sh
       - run: docker run --rm "$(cat _output/image-tag)" sekaictl --help
