@@ -172,6 +172,42 @@ pub fn run(
     }
 }
 
+/// Scratch outputs one sweep removes at most.
+pub const SWEEP_BATCH: i64 = 256;
+
+/// Deletes up to `limit` expired scratch outputs (#1965): their rows,
+/// version snapshots, dataset, scratch object and grant. The run and its
+/// receipt stay; a replay of a swept identity returns the run with no
+/// scratch dataset. Each output is removed in its own transaction, claimed
+/// by clearing its dataset on the identity record, so planes sweeping at once
+/// remove each output once. Returns the datasets removed.
+pub fn sweep(db: &RuntimeDb, now_ms: i64, limit: i64) -> Result<Vec<String>, String> {
+    match db {
+        RuntimeDb::Sqlite(store) => store.sweep_adhoc_scratch(now_ms, limit),
+        RuntimeDb::Postgres(store) => {
+            crate::db::postgres::off_runtime(|| store.sweep_adhoc_scratch(now_ms, limit))
+        }
+    }
+}
+
+/// Statements that remove one scratch output; each takes one parameter,
+/// the dataset id (`{dataset}`) or the scratch object id (`{object}`).
+pub(crate) const SWEEP_STATEMENTS: &[&str] = &[
+    "DELETE FROM sekai_dataset_rows WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_dataset_versions WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_dataset_version_policy WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_datasets WHERE id = {dataset}",
+    "DELETE FROM sekai_grants WHERE object_id = {object}",
+    "DELETE FROM sekai_object_changes WHERE object_id = {object}",
+    "DELETE FROM sekai_objects WHERE id = {object}",
+];
+
+/// Whether `dataset` is a scratch output, kept out of catalog listings.
+pub fn is_scratch_dataset(dataset: &crate::sekai::dataset::Dataset) -> bool {
+    is_scratch_object_id(&dataset.object_id)
+}
+
 /// Whether `id` has the shape of a scratch object's id, so access checks
 /// read its stored grants rather than a plane's cache.
 pub fn is_scratch_object_id(id: &str) -> bool {
@@ -608,6 +644,37 @@ mod tests {
         assert_eq!(
             crate::sekai::markings::object_marking_token(&object),
             Some("internal")
+        );
+
+        // Retention: nothing leaves before expiry; at expiry each output
+        // leaves once, its receipt stays, and a replay finds the run.
+        assert!(sweep(db, 8_999, SWEEP_BATCH).unwrap().is_empty());
+        let swept = sweep(db, 9_000, SWEEP_BATCH).unwrap();
+        assert!(swept.contains(&first.scratch_dataset_id));
+        assert!(db.get_dataset(&first.scratch_dataset_id).unwrap().is_none());
+        assert!(
+            db.query_rows(&first.scratch_dataset_id, &Default::default())
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(
+            db.get_object(&format!("{}-object", first.scratch_dataset_id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_governed_transform_run(&first.run.run_id)
+                .unwrap()
+                .is_some()
+        );
+        let replayed = committed(db, &first_request, &first_definition)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.run.run_id, first.run.run_id);
+        assert!(replayed.scratch_dataset_id.is_empty());
+        assert!(
+            sweep(db, 9_000, SWEEP_BATCH).unwrap().is_empty(),
+            "each output leaves once"
         );
     }
 

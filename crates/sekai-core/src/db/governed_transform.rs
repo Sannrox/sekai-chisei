@@ -444,6 +444,63 @@ impl SekaiDb {
         Ok(run)
     }
 
+    /// See [`crate::sekai::adhoc_transform::sweep`].
+    pub(crate) fn sweep_adhoc_scratch(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, String> {
+        let due: Vec<(String, String)> = {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT identity, dataset_id FROM sekai_adhoc_transform_run
+                     WHERE expires_at_ms <= ?1 AND dataset_id != ''
+                     ORDER BY expires_at_ms, identity LIMIT ?2",
+                )
+                .map_err(|error| error.to_string())?;
+            stmt.query_map(params![now_ms, limit.max(0)], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?
+        };
+        let mut swept = Vec::new();
+        for (identity, dataset_id) in due {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let claimed = tx
+                .execute(
+                    "UPDATE sekai_adhoc_transform_run SET dataset_id = ''
+                     WHERE identity = ?1 AND dataset_id = ?2",
+                    params![identity, dataset_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if claimed != 1 {
+                continue;
+            }
+            let object_id = format!("{dataset_id}-object");
+            for statement in crate::sekai::adhoc_transform::SWEEP_STATEMENTS {
+                let parameter = if statement.contains("{object}") {
+                    &object_id
+                } else {
+                    &dataset_id
+                };
+                let sql = statement
+                    .replace("{dataset}", "?1")
+                    .replace("{object}", "?1");
+                tx.execute(&sql, params![parameter])
+                    .map_err(|error| error.to_string())?;
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            swept.push(dataset_id);
+        }
+        Ok(swept)
+    }
+
     /// The stored record of an ad-hoc run identity.
     pub(crate) fn adhoc_transform_record(
         &self,
