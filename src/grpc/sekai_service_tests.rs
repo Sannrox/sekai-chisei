@@ -33625,7 +33625,15 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use crate::sekai::governed_transform::CONTRACT_VERSION;
 
-    let svc = service();
+    let store = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+        store.clone(),
+    ));
+    // A second plane on the same store, its grant cache loaded before the run.
+    let other_plane =
+        SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(store));
     let runtime = svc.db.runtime();
     let column = || ColumnDef {
         name: "id".into(),
@@ -33727,6 +33735,21 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
         tonic::Code::PermissionDenied,
         "another principal cannot read the scratch output"
     );
+    let read_on_other_plane = |principal: &'static str| {
+        other_plane.query_rows(with_named_principal(
+            QueryRowsRequest {
+                dataset_id: first.scratch_dataset_id.clone(),
+                query: None,
+            },
+            principal,
+        ))
+    };
+    assert_eq!(
+        read_on_other_plane("bob").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied,
+        "another plane enforces the stored scratch grant"
+    );
+    read_on_other_plane("alice").await.unwrap();
     let again = run("open-in", "k1").await.unwrap().into_inner();
     assert!(again.replayed);
     assert_eq!(again.run.unwrap().run_id, receipt.run_id);

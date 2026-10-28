@@ -100,6 +100,7 @@ impl AdHocRequest {
 
     /// The run identity: one per namespace, caller, session and key.
     pub fn identity(&self) -> String {
+        // Each part length-prefixed, so no two distinct requests share one.
         let mut hasher = Sha256::new();
         for part in [
             &self.namespace,
@@ -107,8 +108,8 @@ impl AdHocRequest {
             &self.session_label,
             &self.idempotency_key,
         ] {
+            hasher.update((part.len() as u64).to_be_bytes());
             hasher.update(part.as_bytes());
-            hasher.update([0]);
         }
         format!("{:x}", hasher.finalize())
     }
