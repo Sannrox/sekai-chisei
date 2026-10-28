@@ -560,6 +560,10 @@ fn span_operation_id(logs: &str, expected: &str) -> String {
     }
 }
 
+// The capture lock must span the awaited work. Each test runs on its own
+// current-thread runtime, so another holder is always a different thread
+// and the wait cannot deadlock this one.
+#[allow(clippy::await_holding_lock)]
 async fn capture_submit_logs<F, Fut>(work: F) -> String
 where
     F: FnOnce() -> Fut,
@@ -579,6 +583,7 @@ where
         }
     }
 
+    let _serialized = crate::obs::tracing_capture_lock();
     let buf = Buf(Arc::new(Mutex::new(Vec::new())));
     let writer = buf.clone();
     let subscriber = tracing_subscriber::fmt()

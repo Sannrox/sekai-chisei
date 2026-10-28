@@ -24,3 +24,17 @@ pub mod console_workspace;
 pub mod correlation;
 pub mod grpc_layer;
 pub mod ops;
+
+/// Serializes tests that capture logs with a scoped subscriber (#1773).
+///
+/// Registering a scoped subscriber recomputes tracing's process-wide
+/// callsite interest and maximum level. Two tests doing so at once can
+/// leave the global level below what one of them needs, so its events are
+/// filtered before reaching its subscriber. Holding this lock while a
+/// scoped subscriber is registered keeps those recomputations apart.
+#[cfg(test)]
+pub(crate) fn tracing_capture_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

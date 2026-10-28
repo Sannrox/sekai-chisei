@@ -7452,14 +7452,15 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_governed_document(
+    /// Atomic first-writer-wins insert; see `SekaiDb::insert_governed_document`.
+    pub fn insert_governed_document(
         &self,
         document: &crate::sekai::document::GovernedDocument,
-    ) -> Result<(), String> {
+    ) -> Result<Option<crate::sekai::document::GovernedDocument>, String> {
         match self {
-            Self::Sqlite(db) => db.put_governed_document(document),
+            Self::Sqlite(db) => db.insert_governed_document(document),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.put_governed_document(document))
+                crate::db::postgres::off_runtime(|| db.insert_governed_document(document))
             }
         }
     }

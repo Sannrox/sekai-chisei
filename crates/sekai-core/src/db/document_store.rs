@@ -6,18 +6,26 @@ use super::sekai::SekaiDb;
 use crate::sekai::document::{DOCUMENT_UNAVAILABLE, DocumentRendition, GovernedDocument};
 
 impl SekaiDb {
-    pub fn put_governed_document(&self, document: &GovernedDocument) -> Result<(), String> {
+    /// Insert `document` unless its id is taken, in one write transaction.
+    /// Returns `None` when this call stored it, or the record that already
+    /// holds the id, untouched, so concurrent admissions cannot overwrite
+    /// each other (#1776).
+    pub fn insert_governed_document(
+        &self,
+        document: &GovernedDocument,
+    ) -> Result<Option<GovernedDocument>, String> {
         let json = serde_json::to_string(document)
             .map_err(|error| format!("encode governed document: {error}"))?;
-        let changed = self
-            .conn()
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let inserted = tx
             .execute(
                 "INSERT INTO sekai_governed_documents
                     (namespace, document_id, owner, record_json)
                  VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(namespace, document_id) DO UPDATE SET
-                    record_json = excluded.record_json
-                 WHERE sekai_governed_documents.owner = excluded.owner",
+                 ON CONFLICT(namespace, document_id) DO NOTHING",
                 params![
                     document.namespace,
                     document.document_id,
@@ -26,10 +34,24 @@ impl SekaiDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Err(DOCUMENT_UNAVAILABLE.into());
-        }
-        Ok(())
+        let existing = if inserted == 0 {
+            let current: String = tx
+                .query_row(
+                    "SELECT record_json FROM sekai_governed_documents
+                     WHERE namespace = ?1 AND document_id = ?2",
+                    params![document.namespace, document.document_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            Some(
+                serde_json::from_str(&current)
+                    .map_err(|error| format!("decode governed document: {error}"))?,
+            )
+        } else {
+            None
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(existing)
     }
 
     /// Read-modify-write of one document in a single write transaction, so a check made
