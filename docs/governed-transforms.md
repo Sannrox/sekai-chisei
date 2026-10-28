@@ -58,7 +58,8 @@ The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `ClaimTransformWork`, `HeartbeatTransformClaim`, `ReadTransformRunInputs`,
 `WriteTransformRunResult`, `ApplyStreamingTransformBatch`, `TickGovernedTransforms`,
 `GetTransformOutputState`, `CancelGovernedTransformRun`,
-`ShadowGovernedTransform`) are `experimental`:
+`ShadowGovernedTransform`) are `experimental`. `TickGovernedTransforms` also
+admits due site agent schedule wakes (ADR 0137):
 start the plane with `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
 feature. See [rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities`
 reports `sekai.transforms.projection`, `sekai.transforms.analytical`,

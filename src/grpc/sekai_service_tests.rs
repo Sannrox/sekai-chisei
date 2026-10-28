@@ -33332,3 +33332,47 @@ async fn agent_turns_wake_claim_and_ack_over_the_wire() {
         ("completed", "manual", "req-1")
     );
 }
+
+#[tokio::test]
+async fn transform_ticks_admit_due_agent_schedule_wakes() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("principal_id".to_string(), "agent:line-7".to_string()),
+                ("wake_policies".to_string(), "schedule:60000".to_string()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    for now_ms in [600_000, 600_001] {
+        svc.tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms },
+            "local",
+        ))
+        .await
+        .unwrap();
+    }
+    let turns = svc
+        .list_claimable_agent_turns(with_named_principal(
+            ListClaimableAgentTurnsRequest {
+                namespace: "ops".into(),
+                limit: 10,
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .turns;
+    assert_eq!(turns.len(), 1, "one turn per due time");
+    assert_eq!(turns[0].cause, "schedule");
+    assert!(turns[0].cause_ref.starts_with("schedule:60000@"));
+}
