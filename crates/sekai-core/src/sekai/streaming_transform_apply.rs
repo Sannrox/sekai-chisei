@@ -196,9 +196,10 @@ pub fn apply(
     }
     // Site agent instances change only through admitted ActionInstances
     // (ADR 0136); a streaming edit has no admission.
-    if type_def.object_kind.trim() == crate::sekai::site_agent_instance::KIND {
+    if crate::sekai::site_agent_memory::is_action_only_kind(type_def.object_kind.trim()) {
         return Err(StreamingApplyError::PermissionDenied(
-            "site agent instances change only through their governed Actions".into(),
+            "site agent instances and their memory change only through their governed Actions"
+                .into(),
         ));
     }
     // This RPC has no envelope_id. Autonomous types require a live envelope on
