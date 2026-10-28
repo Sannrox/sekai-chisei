@@ -21,6 +21,9 @@ const SERVER_KEY: &[u8] = include_bytes!("fixtures/tls/server.key");
 /// An HTTPS gRPC server on an ephemeral port with the fixture certificate;
 /// returns its target URL.
 async fn tls_server() -> String {
+    // A workspace build can enable both rustls backends; pick the one the
+    // client's `tls-ring` feature uses so the server side can start.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let tls = ServerTlsConfig::new().identity(Identity::from_pem(SERVER_CERT, SERVER_KEY));
