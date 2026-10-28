@@ -16,6 +16,12 @@ bytes, open external storage, or run an extractor. See
   `sha256` digest
 - optional expiry, hold identity, and bounded metadata
 
+Document content types are `text/plain`, `application/pdf`,
+`application/json`, `image/png`, `image/jpeg`, and DOCX
+(`application/vnd.openxmlformats-officedocument.wordprocessingml.document`).
+Renditions have their own types: `extracted_text` is `text/plain`, `preview`
+is PDF or PNG, and `thumbnail` is PNG or JPEG.
+
 A rendition is a derived child. Closed classes are `extracted_text`,
 `preview`, and `thumbnail`. Each rendition pins the parent document id, the
 parent content digest, its own content reference, and extractor identity plus

@@ -166,6 +166,7 @@ pub struct ActionInstanceAdmission<'a> {
     proposal: Option<&'a dyn ActionProposalPort>,
     tenant: &'a str,
     machine_credential: bool,
+    budget_refused: bool,
 }
 
 impl<'a> ActionInstanceAdmission<'a> {
@@ -176,7 +177,16 @@ impl<'a> ActionInstanceAdmission<'a> {
             proposal: None,
             tenant: "",
             machine_credential: false,
+            budget_refused: false,
         }
+    }
+
+    /// The budget was already refused, by a split-store reservation: record
+    /// this admission as a budget denial, never admitted or parked, and charge
+    /// nothing (#1871).
+    pub fn with_budget_refused(mut self, budget_refused: bool) -> Self {
+        self.budget_refused = budget_refused;
+        self
     }
 
     pub fn with_proposal(mut self, proposal: Option<&'a dyn ActionProposalPort>) -> Self {
@@ -192,6 +202,64 @@ impl<'a> ActionInstanceAdmission<'a> {
     pub fn with_machine_credential(mut self, machine_credential: bool) -> Self {
         self.machine_credential = machine_credential;
         self
+    }
+
+    /// The refusals [`Self::admit`] makes before it writes anything: missing
+    /// or malformed request fields, an unknown or disabled type, and
+    /// parameters its schema rejects. Reads only, so a caller that charges a
+    /// budget before admitting runs this first and never charges a request
+    /// that is refused anyway (#1864). Keep it in step with the start of
+    /// `admit`.
+    pub fn check_request(
+        &self,
+        request: &ActionInstanceAdmissionRequest,
+    ) -> Result<(), ActionInstanceAdmissionError> {
+        let namespace = request.namespace.trim();
+        require_value("namespace", namespace)?;
+        require_value("type_id", request.type_id.trim())?;
+        require_value("version", request.version.trim())?;
+        require_value("idempotency_key", request.idempotency_key.trim())?;
+        if request.idempotency_key.chars().any(char::is_whitespace) {
+            return Err(ActionInstanceAdmissionError::InvalidArgument(
+                "idempotency_key must not contain whitespace".into(),
+            ));
+        }
+        validate_parameters_json(&request.parameters_json)
+            .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        if request
+            .evidence_submission_ids
+            .iter()
+            .any(|id| id.trim().is_empty())
+        {
+            return Err(ActionInstanceAdmissionError::InvalidArgument(
+                "evidence_submission_ids must not contain empty ids".into(),
+            ));
+        }
+        let type_def = self
+            .db
+            .require_enabled_governed_action_type(namespace, &request.type_id, &request.version)
+            .map_err(|error| {
+                if error.contains("unknown") || error.contains("disabled") {
+                    ActionInstanceAdmissionError::FailedPrecondition(error)
+                } else {
+                    ActionInstanceAdmissionError::Internal(error)
+                }
+            })?;
+        crate::sekai::parameter_schema::validate_parameter_schema(&type_def.parameter_schema_json)
+            .map_err(|error| {
+                ActionInstanceAdmissionError::FailedPrecondition(format!(
+                    "governed action type parameter schema invalid: {error}"
+                ))
+            })?;
+        crate::sekai::parameter_schema::validate_parameters(
+            &type_def.parameter_schema_json,
+            &request.parameters_json,
+        )
+        .map_err(|error| {
+            ActionInstanceAdmissionError::InvalidArgument(format!(
+                "action parameters invalid: {error}"
+            ))
+        })
     }
 
     pub fn admit(
@@ -526,6 +594,13 @@ impl<'a> ActionInstanceAdmission<'a> {
             && budget.check(&budget_subject, 1).is_err()
         {
             status = STATUS_DENIED.into();
+            deny_reason = format!("action budget exhausted for {budget_subject}");
+            budget_decision = "budget_exceeded".into();
+        }
+        // Parking would let an approver grant work whose budget is gone.
+        if self.budget_refused && status != STATUS_DENIED {
+            status = STATUS_DENIED.into();
+            parked_by_autonomy = false;
             deny_reason = format!("action budget exhausted for {budget_subject}");
             budget_decision = "budget_exceeded".into();
         }
@@ -4219,6 +4294,36 @@ mod tests {
             ActionInstanceAdmissionError::FailedPrecondition(_)
                 | ActionInstanceAdmissionError::PermissionDenied(_)
         ));
+    }
+
+    /// A budget already refused upstream is recorded as a budget denial even
+    /// where policy would park the Action: a parked instance would let an
+    /// approver grant work with no budget behind it (#1871).
+    #[test]
+    fn a_refused_budget_denies_instead_of_parking() {
+        let db = approval_setup("create", &["bob"]);
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-9","title":"t"}"#,
+        );
+        request.budget_already_reserved = true;
+        let denied = ActionInstanceAdmission::new(&db, None)
+            .with_budget_refused(true)
+            .admit(request, "alice", 10)
+            .unwrap()
+            .instance;
+        assert_eq!(denied.status, STATUS_DENIED);
+        assert_eq!(denied.budget_decision, "budget_exceeded");
+        assert!(
+            denied.deny_reason.contains("action budget exhausted"),
+            "{denied:?}"
+        );
+        assert!(
+            db.list_action_instances("acme", None, Some(STATUS_PARKED), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.get_object("rec-9").unwrap().is_none());
     }
 
     #[test]

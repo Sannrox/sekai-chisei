@@ -100,14 +100,10 @@ const NORMALIZATION: [&str; 4] = [
 
 /// Report fields the existing public data does not fill, or fills only
 /// approximately.
-const GAPS: [(&str, &str); 3] = [
+const GAPS: [(&str, &str); 2] = [
     (
         "#1866",
         "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices.",
-    ),
-    (
-        "#1871",
-        "An Action submission refused by its Action budget leaves no instance, decision record or operation receipt; its audit row is empty.",
     ),
     (
         "#1872",
@@ -769,6 +765,29 @@ async fn build_report() -> Report {
     let mut outcomes = Vec::new();
     for scenario in SCENARIOS {
         outcomes.push(play(&game, SEED, scenario).await);
+    }
+    // A submit refused by its budget still records a denied instance; the
+    // refusal returned no id, so look it up by operation id (#1871).
+    let mut sekai = game.sekai.clone();
+    for turn in outcomes
+        .iter_mut()
+        .flat_map(|outcome| outcome.governed.iter_mut().chain(&mut outcome.ungoverned))
+    {
+        let Some(submission) = turn.submission.as_mut() else {
+            continue;
+        };
+        if submission.instance_id.is_some() {
+            continue;
+        }
+        submission.instance_id = sekai
+            .get_action_instance(GetActionInstanceRequest {
+                operation_id: submission.operation_id.clone(),
+                ..Default::default()
+            })
+            .await
+            .ok()
+            .and_then(|found| found.into_inner().instance)
+            .map(|instance| instance.instance_id);
     }
     let labels = outcomes
         .iter()
