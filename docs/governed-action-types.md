@@ -36,6 +36,8 @@ row for history.
 | `declared_effect_kinds` | Subset of `allowed_effect_kinds` materialized on admit. Empty means all allowed kinds |
 | `submission_criteria` | Closed object-security v1 predicates over the bound object and invoker |
 | `policy_scope` / `budget_scope` | Empty = use namespace defaults |
+| `budget_work_unit_parameter` | A required string or integer parameter whose value segments the action budget as `work_unit:<value>`, such as a turn. A limit on that scope caps the work unit. Empty means no segment |
+| `budget_amount_parameter` | A required integer parameter with `minimum` of at least 0 whose value each admission charges, such as the amount spent. Empty means one unit per admission |
 | `approvers` | Principals who may grant or deny a parked instance. Empty means namespace administrators. A submitter never decides their own instance |
 | `object_kind` | Admitted schema kind this type may create or update. Empty means admit-only |
 | `object_mutation` | `create` or `update` when `object_kind` is set. Empty means admit-only |

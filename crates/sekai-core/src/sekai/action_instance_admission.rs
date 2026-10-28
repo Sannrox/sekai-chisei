@@ -545,11 +545,13 @@ impl<'a> ActionInstanceAdmission<'a> {
             budget_decision = "deferred".into();
         }
 
-        let budget_subject = submit_budget_subject(&namespace, actor, &type_def.budget_scope);
+        let (budget_subject, budget_amount) = type_def
+            .budget_charge(&namespace, actor, &request.parameters_json)
+            .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
         if status == STATUS_ADMITTED
             && let Some(budget) = self.budget
             && !budget_already_reserved
-            && budget.check(&budget_subject, 1).is_err()
+            && budget.check(&budget_subject, budget_amount).is_err()
         {
             status = STATUS_DENIED.into();
             deny_reason = format!("action budget exhausted for {budget_subject}");
@@ -591,7 +593,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         if status == STATUS_ADMITTED
             && let Some(budget) = self.budget
             && !budget_already_reserved
-            && budget.check(&budget_subject, 1).is_err()
+            && budget.check(&budget_subject, budget_amount).is_err()
         {
             status = STATUS_DENIED.into();
             deny_reason = format!("action budget exhausted for {budget_subject}");
@@ -834,6 +836,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             actor,
             &policy_scope_label,
             &budget_subject,
+            budget_amount,
             &evidence_ids,
             planned_effects.as_deref(),
             applied_object.as_ref(),
@@ -1115,11 +1118,13 @@ impl<'a> ActionInstanceAdmission<'a> {
             ));
         }
         refuse_frozen(self.db, &decider_checks)?;
-        let budget_subject = submit_budget_subject(
-            &instance.namespace,
-            &instance.principal,
-            &type_def.budget_scope,
-        );
+        let (budget_subject, budget_amount) = type_def
+            .budget_charge(
+                &instance.namespace,
+                &instance.principal,
+                &instance.parameters_json,
+            )
+            .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
 
         let force_notify_fail =
             serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
@@ -1205,6 +1210,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             &instance.principal,
             &policy_scope_label,
             &budget_subject,
+            budget_amount,
             &granted.evidence_submission_ids,
             Some(&planned_effects),
             applied_object.as_ref(),
@@ -1287,6 +1293,8 @@ impl<'a> ActionInstanceAdmission<'a> {
             &denied.principal,
             "",
             &budget_subject,
+            // A denial charges nothing.
+            0,
             &denied.evidence_submission_ids,
             None,
             None,
@@ -1542,6 +1550,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         actor: &str,
         policy_scope: &str,
         budget_subject: &str,
+        budget_amount: i32,
         evidence_ids: &[String],
         planned_effects: Option<&[action_effect::ActionEffect]>,
         applied_object: Option<&AppliedObjectMutation>,
@@ -1804,7 +1813,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             && (stored.status == STATUS_ADMITTED
                 || (stored.status == STATUS_PARKED && stored.budget_decision == "allow"))
         {
-            budget.record(budget_subject, 1);
+            budget.record(budget_subject, budget_amount);
         }
         if stored.status == STATUS_ADMITTED {
             let effects = planned_effects.ok_or_else(|| {

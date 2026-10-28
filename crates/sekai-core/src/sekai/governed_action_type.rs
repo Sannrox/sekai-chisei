@@ -69,6 +69,16 @@ pub struct GovernedActionType {
     /// `routine` or `high_impact` (#1910). Empty means unclassified.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub impact_class: String,
+    /// A required string or integer parameter whose value segments the
+    /// action budget, such as a turn (#1859): each value is its own
+    /// `work_unit:` scope under the submitter's. Empty: no segment.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub budget_work_unit_parameter: String,
+    /// A required integer parameter with `minimum` of at least 0 whose value
+    /// an admission charges, such as the amount spent (#1859). Empty: one
+    /// unit per admission.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub budget_amount_parameter: String,
     pub enabled: bool,
     pub created_by: String,
     pub created_at_ms: i64,
@@ -166,6 +176,11 @@ impl GovernedActionType {
                 &self.parameter_schema_json,
             )?;
         }
+        validate_budget_parameters(
+            &self.budget_work_unit_parameter,
+            &self.budget_amount_parameter,
+            &schema,
+        )?;
         Ok(())
     }
 
@@ -175,6 +190,64 @@ impl GovernedActionType {
         ImpactClass::parse(&self.impact_class)
     }
 
+    /// The budget subject and amount an admission with these (already
+    /// validated) parameters charges: the submitter's subject, segmented by
+    /// the work-unit parameter's value, and the amount parameter's value or
+    /// one unit.
+    pub fn budget_charge(
+        &self,
+        namespace: &str,
+        actor: &str,
+        parameters_json: &str,
+    ) -> Result<(String, i32), String> {
+        let subject = crate::sekai::action_instance::submit_budget_subject(
+            namespace,
+            actor,
+            &self.budget_scope,
+        );
+        if self.budget_work_unit_parameter.is_empty() && self.budget_amount_parameter.is_empty() {
+            return Ok((subject, 1));
+        }
+        let parameters: serde_json::Value = serde_json::from_str(parameters_json)
+            .map_err(|error| format!("parameters_json must be JSON: {error}"))?;
+        let subject = match self.budget_work_unit_parameter.as_str() {
+            "" => subject,
+            name => {
+                let unit = match parameters.get(name) {
+                    Some(serde_json::Value::String(unit)) => unit.clone(),
+                    Some(serde_json::Value::Number(unit)) if unit.is_i64() => unit.to_string(),
+                    _ => return Err(format!("budget work unit parameter {name:?} is missing")),
+                };
+                if unit.is_empty()
+                    || unit.len() > 128
+                    || unit
+                        .chars()
+                        .any(|c| c == '/' || c.is_whitespace() || c.is_control())
+                {
+                    return Err(format!(
+                        "budget work unit parameter {name:?} must be 1 to 128 characters without '/' or whitespace"
+                    ));
+                }
+                format!("{subject}/work_unit:{unit}")
+            }
+        };
+        let amount = match self.budget_amount_parameter.as_str() {
+            "" => 1,
+            name => parameters
+                .get(name)
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|amount| i32::try_from(amount).ok())
+                .filter(|amount| *amount >= 0)
+                .ok_or_else(|| {
+                    format!(
+                        "budget amount parameter {name:?} must be an integer from 0 to {}",
+                        i32::MAX
+                    )
+                })?,
+        };
+        Ok((subject, amount))
+    }
+
     pub fn effect_kinds_to_materialize(&self) -> &[String] {
         if self.declared_effect_kinds.is_empty() {
             &self.allowed_effect_kinds
@@ -182,6 +255,57 @@ impl GovernedActionType {
             &self.declared_effect_kinds
         }
     }
+}
+
+/// Each budget parameter, when named, is a required parameter of a type that
+/// always yields a usable value: the work unit a string or an integer, the
+/// amount an integer that cannot be negative.
+fn validate_budget_parameters(
+    work_unit: &str,
+    amount: &str,
+    schema: &serde_json::Value,
+) -> Result<(), String> {
+    let required = |name: &str| {
+        schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|required| required.iter().any(|value| value.as_str() == Some(name)))
+    };
+    let property = |name: &str| {
+        schema
+            .get("properties")
+            .and_then(|properties| properties.get(name))
+    };
+    if !work_unit.is_empty() {
+        let kind = property(work_unit)
+            .and_then(|property| property.get("type"))
+            .and_then(serde_json::Value::as_str);
+        if !matches!(kind, Some("string" | "integer")) || !required(work_unit) {
+            return Err(format!(
+                "budget_work_unit_parameter {work_unit:?} must be a required string or integer parameter"
+            ));
+        }
+    }
+    if !amount.is_empty() {
+        let property = property(amount);
+        let integer = property
+            .and_then(|property| property.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("integer");
+        let non_negative = property
+            .and_then(|property| property.get("minimum"))
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|minimum| minimum >= 0);
+        if !integer || !non_negative || !required(amount) {
+            return Err(format!(
+                "budget_amount_parameter {amount:?} must be a required integer parameter with a minimum of at least 0"
+            ));
+        }
+    }
+    if !work_unit.is_empty() && work_unit == amount {
+        return Err("budget_work_unit_parameter and budget_amount_parameter must differ".into());
+    }
+    Ok(())
 }
 
 fn validate_object_binding(
@@ -267,6 +391,17 @@ pub fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
     if !t.impact_class.is_empty() {
         let object = body.as_object_mut().expect("fingerprint body is an object");
         object.insert("impact_class".into(), t.impact_class.clone().into());
+    }
+    if !t.budget_work_unit_parameter.is_empty() || !t.budget_amount_parameter.is_empty() {
+        let object = body.as_object_mut().expect("fingerprint body is an object");
+        object.insert(
+            "budget_work_unit_parameter".into(),
+            t.budget_work_unit_parameter.clone().into(),
+        );
+        object.insert(
+            "budget_amount_parameter".into(),
+            t.budget_amount_parameter.clone().into(),
+        );
     }
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }
@@ -531,6 +666,72 @@ mod tests {
             disabled_at_ms: 0,
             ..Default::default()
         }
+    }
+
+    /// Budget parameters must always yield a usable value: required, the
+    /// work unit a string or integer, the amount a non-negative integer.
+    /// Admission then charges the segmented subject and the amount (#1859).
+    #[test]
+    fn budget_parameters_segment_the_subject_and_set_the_amount() {
+        let spend = |work_unit: &str, amount: &str, amount_schema: &str| GovernedActionType {
+            parameter_schema_json: format!(
+                r#"{{"type":"object","properties":{{"turn":{{"type":"string"}},"note":{{"type":"string"}},"amount":{amount_schema}}},"required":["turn","amount"],"additionalProperties":false}}"#
+            ),
+            budget_work_unit_parameter: work_unit.into(),
+            budget_amount_parameter: amount.into(),
+            ..sample(true)
+        };
+        let counted = r#"{"type":"integer","minimum":0}"#;
+        let valid = spend("turn", "amount", counted);
+        valid.validate().unwrap();
+        for invalid in [
+            spend("note", "amount", counted),
+            spend("missing", "amount", counted),
+            spend("turn", "turn", counted),
+            spend("turn", "amount", r#"{"type":"integer"}"#),
+            spend("turn", "amount", r#"{"type":"integer","minimum":-5}"#),
+            spend("turn", "amount", r#"{"type":"number","minimum":0}"#),
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+        assert_eq!(
+            valid
+                .budget_charge("acme", "alice", r#"{"turn":"turn-3","amount":40}"#)
+                .unwrap(),
+            (
+                "action:governed/project:acme/agent:alice/work_unit:turn-3".into(),
+                40
+            )
+        );
+        assert!(
+            valid
+                .budget_charge("acme", "alice", r#"{"turn":"a/b","amount":1}"#)
+                .is_err()
+        );
+        assert!(
+            valid
+                .budget_charge("acme", "alice", r#"{"turn":"t","amount":3000000000}"#)
+                .is_err()
+        );
+        assert_eq!(
+            sample(true)
+                .budget_charge("acme", "alice", r#"{"summary":"x"}"#)
+                .unwrap(),
+            ("action:governed/project:acme/agent:alice".into(), 1)
+        );
+        // Stored types without budget parameters keep their fingerprint and
+        // stored body, and bodies written before these fields still load.
+        assert!(
+            !body_fingerprint(&sample(true))
+                .unwrap()
+                .contains("budget_amount")
+        );
+        let stored = serde_json::to_string(&sample(true)).unwrap();
+        assert!(!stored.contains("budget_work_unit") && !stored.contains("budget_amount"));
+        assert_eq!(
+            serde_json::from_str::<GovernedActionType>(&stored).unwrap(),
+            sample(true)
+        );
     }
 
     #[test]

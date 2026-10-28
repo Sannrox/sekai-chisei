@@ -2485,6 +2485,12 @@ message GovernedActionType {
   // means unclassified. A model call that cites a live Action Work claim
   // of this type resolves to it.
   string impact_class = 30;
+  // A required string or integer parameter whose value segments the action
+  // budget, such as a turn (#1859). Empty: no segment.
+  string budget_work_unit_parameter = 31;
+  // A required integer parameter, minimum at least 0, whose value admission
+  // charges, such as the amount spent (#1859). Empty: one unit.
+  string budget_amount_parameter = 32;
 }
 // What a device saw when it prepared an Action offline (#1580, ADR 0127).
 message OfflineSubmission {

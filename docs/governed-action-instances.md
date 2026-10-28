@@ -226,7 +226,10 @@ holds the record.
    `require_approval` → durable instance with `status=parked`: no object
    write, no effects, and an open receipt. See [Approval](#approval).
 8. **Budget** hierarchical subject `action:governed[/:<budget_scope>]/project:<ns>/agent:<actor>`
-   when a `BudgetTracker` is configured. Exhausted → `status=denied`.
+   when a `BudgetTracker` is configured. Exhausted → `status=denied`. A type
+   with `budget_work_unit_parameter` appends `/work_unit:<value>`, so a limit
+   set on that scope caps one turn; one with `budget_amount_parameter`
+   charges that parameter's value instead of one unit.
 9. When the type binds `object_kind` and `object_mutation`, plan one
    `CreateObject` or `UpdateObject` of that admitted kind. Unknown kind,
    reserved kind, schema-invalid record, missing update target, or
@@ -245,7 +248,7 @@ holds the record.
     prior record. If a receipt was already written, the reservation and
     record stay so same-key retry can replay. Write operation receipt events (intent, policy, a
    not-applicable routing decision, budget, and—when no claimable work
-   remains—outcome); audit decision. On admit, record one budget unit.
+   remains—outcome); audit decision. On admit, record the type's budget amount (one unit by default).
    Routing is recorded as `route_selected` with `route=not_applicable` so
    completeness does not leave `routing` uncovered. A pending
    `runtime_dispatch` leaves `completed_at_ms` unset and omits outcome so
@@ -349,7 +352,7 @@ gets an empty list.
 - The decision completes the instance's own receipt with an
   `approval_decided` event naming the approver, so `GetOperationReceipt`
   closes the loop. The audit log records `decide_action_instance`.
-- Combined Split reserves one budget unit at submit. A grant does not charge
+- Combined Split reserves the type's budget amount at submit. A grant does not charge
   again, and a denied approval keeps the unit, as submit-time denials do.
 
 Community PostgreSQL parks and decides with the same named-approver rules as
