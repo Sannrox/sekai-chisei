@@ -661,6 +661,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         };
         db.put_action_instance(&instance).unwrap();
     }
@@ -793,6 +795,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         };
         db.put_action_instance(&failed).unwrap();
         let snapshot = offer(&db, "acme", "agent:fixture", "dispatch", test_threshold()).unwrap();

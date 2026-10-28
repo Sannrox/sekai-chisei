@@ -138,6 +138,8 @@ fn seed_effect(db: &RuntimeDb, suffix: &str) {
         approval: None,
         offline: None,
         admission_lease: None,
+        admission_ontology_digest: None,
+        admission_budget_already_reserved: false,
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();

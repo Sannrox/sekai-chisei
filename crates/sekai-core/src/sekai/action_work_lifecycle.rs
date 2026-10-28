@@ -1122,6 +1122,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         })
         .unwrap();
     }
@@ -1262,6 +1264,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         })
         .unwrap();
         let claimed = ActionWorkLifecycle::new(&db)
@@ -1348,6 +1352,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);
@@ -1490,6 +1496,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);
@@ -1554,6 +1562,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         })
         .unwrap();
         let claimed = claim_effect(&db, &effect);

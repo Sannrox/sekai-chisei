@@ -101,6 +101,14 @@ pub struct ActionInstance {
     /// leases existed; those stay unfenced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_lease: Option<AdmissionLease>,
+    /// The ontology digest the submit was bound to, kept so a takeover
+    /// repairs the receipt with the original binding, not a retry's (#1931).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_ontology_digest: Option<String>,
+    /// Whether the submit's budget was already reserved upstream, kept so a
+    /// takeover charges it the way the original admission would (#1931).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admission_budget_already_reserved: bool,
 }
 
 /// How long an admission may take before its reservation is considered
@@ -119,6 +127,22 @@ pub struct AdmissionLease {
     pub owner: String,
     pub generation: u64,
     pub expires_at_ms: i64,
+    /// Set true in the same transaction as the admission's object write, so
+    /// a takeover knows the write committed whatever happened to the object
+    /// since (#1931). `None` on a lease an older binary wrote: such a
+    /// reservation is never taken over, because its writes left no marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_committed: Option<bool>,
+    /// Set true in the same transaction as the admission's receipt, so a
+    /// takeover never races a receipt that commits after it looked (#1931).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_recorded: Option<bool>,
+    /// [`object_state_digest`] of the object as the committed write
+    /// persisted it, set with `write_committed`. A takeover treats the
+    /// current object as that write only while its state still matches
+    /// (#1931).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_object_digest: Option<String>,
 }
 
 /// Wall-clock milliseconds. Leases run on the wall clock, not on the
@@ -133,12 +157,33 @@ pub fn lease_clock_ms() -> i64 {
 }
 
 impl AdmissionLease {
+    /// The lease a takeover installs: a new owner, the next generation, and
+    /// a fresh expiry (#1931).
+    pub fn succeeding(&self) -> Self {
+        Self {
+            owner: uuid::Uuid::new_v4().to_string(),
+            generation: self.generation.saturating_add(1),
+            expires_at_ms: lease_clock_ms().saturating_add(ADMISSION_LEASE_MS),
+            write_committed: self.write_committed,
+            receipt_recorded: self.receipt_recorded,
+            written_object_digest: self.written_object_digest.clone(),
+        }
+    }
+
+    /// Whether this lease has run out on the lease clock.
+    pub fn expired(&self) -> bool {
+        self.expires_at_ms <= lease_clock_ms()
+    }
+
     /// A fresh first-generation lease for one admit attempt.
     pub fn first() -> Self {
         Self {
             owner: uuid::Uuid::new_v4().to_string(),
             generation: 1,
             expires_at_ms: lease_clock_ms().saturating_add(ADMISSION_LEASE_MS),
+            write_committed: Some(false),
+            receipt_recorded: Some(false),
+            written_object_digest: None,
         }
     }
 
@@ -879,6 +924,29 @@ impl SekaiDb {
                 .ok_or_else(|| format!("object {} not found", object.id))?,
             ),
         };
+        // The state as persisted, read back in this transaction.
+        let object_id = match write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => &object.id,
+        };
+        let persisted = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE id = ?1",
+                params![object_id],
+                crate::db::sekai::row_to_object,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let written = object_state_digest(persisted.as_ref())?;
+        tx.execute(
+            "UPDATE sekai_action_instances
+             SET body_json = json_set(body_json,
+                 '$.admission_lease.write_committed', json('true'),
+                 '$.admission_lease.written_object_digest', ?2)
+             WHERE instance_id = ?1",
+            params![instance_id, written],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(FencedAdmissionWrite::Applied(previous))
     }
@@ -961,6 +1029,45 @@ impl SekaiDb {
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    /// Takes over an abandoned reservation (#1931): replaces `expired` with
+    /// `next` only while `expired` still names the owner and generation, its
+    /// lease has run out on the lease clock, and its commit marker is still
+    /// the one read. One conditional update, so a live admission is never
+    /// taken, two takers cannot both win, and a write that committed after
+    /// the read is never overwritten as uncommitted.
+    pub fn take_over_admission(
+        &self,
+        instance: &ActionInstance,
+        expired: &AdmissionLease,
+        next: &AdmissionLease,
+    ) -> Result<bool, String> {
+        self.migrate_action_instances()?;
+        let mut taken = instance.clone();
+        taken.admission_lease = Some(next.clone());
+        let body_json = serde_json::to_string(&taken).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        let updated = conn
+            .execute(
+                "UPDATE sekai_action_instances SET body_json = ?2
+                 WHERE instance_id = ?1
+                   AND json_extract(body_json, '$.admission_lease.owner') = ?3
+                   AND json_extract(body_json, '$.admission_lease.generation') = ?4
+                   AND json_extract(body_json, '$.admission_lease.expires_at_ms') <= ?5
+                   AND json_extract(body_json, '$.admission_lease.write_committed') = ?6
+                   AND json_extract(body_json, '$.admission_lease.receipt_recorded') = 0",
+                params![
+                    instance.instance_id,
+                    body_json,
+                    expired.owner,
+                    i64::try_from(expired.generation).unwrap_or(i64::MAX),
+                    lease_clock_ms(),
+                    expired.write_committed.unwrap_or(false),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(updated == 1)
     }
 
     /// Deletes the reservation only while `lease` still names its owner and
@@ -1086,6 +1193,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         }
     }
 
@@ -1168,6 +1277,9 @@ mod tests {
             owner: "recovering-owner".into(),
             generation: stale.generation + 1,
             expires_at_ms: lease_clock_ms() + ADMISSION_LEASE_MS,
+            write_committed: Some(false),
+            receipt_recorded: Some(false),
+            written_object_digest: None,
         };
         current_instance.admission_lease = Some(current.clone());
         db.delete_action_instance(&instance_id).unwrap();
@@ -1289,6 +1401,28 @@ mod tests {
             db.delete_action_instance_fenced(&expired_id, &expired)
                 .unwrap()
         );
+
+        // A takeover built from a snapshot whose commit marker went stale
+        // matches nothing: the write that committed since is never lost
+        // (#1931).
+        let (raced_id, mut snapshot) = reserve_for_test(db, "ai-raced", 100);
+        snapshot.expires_at_ms = lease_clock_ms() - 1;
+        let mut stored = db.get_action_instance(&raced_id).unwrap().unwrap();
+        let mut committed = snapshot.clone();
+        committed.write_committed = Some(true);
+        stored.admission_lease = Some(committed.clone());
+        db.delete_action_instance(&raced_id).unwrap();
+        db.put_action_instance(&stored).unwrap();
+        let mut stale = stored.clone();
+        stale.admission_lease = Some(snapshot.clone());
+        assert!(
+            !db.take_over_admission(&stale, &snapshot, &snapshot.succeeding())
+                .unwrap()
+        );
+        let next = committed.succeeding();
+        assert!(db.take_over_admission(&stored, &committed, &next).unwrap());
+        let taken = db.get_action_instance(&raced_id).unwrap().unwrap();
+        assert_eq!(taken.admission_lease.unwrap().write_committed, Some(true));
     }
 
     #[test]
@@ -1347,6 +1481,9 @@ mod tests {
             owner: "a".into(),
             generation: 2,
             expires_at_ms: 1_000,
+            write_committed: Some(false),
+            receipt_recorded: Some(false),
+            written_object_digest: None,
         };
         assert!(lease.holds(Some("a"), Some(2), Some(1_000), None));
         assert!(!lease.holds(Some("b"), Some(2), Some(1_000), None));

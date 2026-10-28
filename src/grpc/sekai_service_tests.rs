@@ -18398,6 +18398,8 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         approval: None,
         offline: None,
         admission_lease: None,
+        admission_ontology_digest: None,
+        admission_budget_already_reserved: false,
     }
 }
 

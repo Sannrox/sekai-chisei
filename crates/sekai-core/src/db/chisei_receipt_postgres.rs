@@ -39,6 +39,24 @@ impl PostgresDb {
         }
         self.upsert_operation_receipt_on(&mut tx, receipt)?;
         self.append_operation_receipt_chain(&mut tx, receipt)?;
+        // The marker a takeover checks (#1931); updating the row also makes
+        // a waiting takeover recheck its condition against this commit.
+        tx.execute(
+            "UPDATE sekai_action_instances
+             SET body_json = jsonb_set(body_json::jsonb, '{admission_lease,receipt_recorded}', 'true')::text
+             WHERE instance_id = $1",
+            &[&instance_id],
+        )
+        .map_err(|error| error.to_string())?;
+        // The marker a takeover checks (#1931); updating the row also makes
+        // a waiting takeover recheck its condition against this commit.
+        tx.execute(
+            "UPDATE sekai_action_instances
+             SET body_json = jsonb_set(body_json::jsonb, '{admission_lease,receipt_recorded}', 'true')::text
+             WHERE instance_id = $1",
+            &[&instance_id],
+        )
+        .map_err(|error| error.to_string())?;
         // The receipt chain may have waited on its own lock; check the lease
         // again before committing.
         if !crate::db::postgres_action_instance::postgres_admission_fence_holds(

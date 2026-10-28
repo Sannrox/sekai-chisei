@@ -243,6 +243,34 @@ impl PostgresDb {
                 )
             }
         };
+        // The commit marker a takeover reads (#1931), in this transaction.
+        // The state as persisted, read back in this transaction.
+        let object_id = match write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => {
+                object.id.clone()
+            }
+        };
+        let persisted = tx
+            .query_opt(
+                &format!(
+                    "SELECT {} FROM sekai_objects WHERE id = $1",
+                    crate::db::postgres_audit::OBJECT_COLUMNS
+                ),
+                &[&object_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(row_to_object)
+            .transpose()?;
+        let written = object_state_digest(persisted.as_ref())?;
+        tx.execute(
+            "UPDATE sekai_action_instances
+             SET body_json = jsonb_set(
+                 jsonb_set(body_json::jsonb, '{admission_lease,write_committed}', 'true'),
+                 '{admission_lease,written_object_digest}', to_jsonb($2::text))::text
+             WHERE instance_id = $1",
+            &[&instance_id, &written],
+        )
+        .map_err(|error| error.to_string())?;
         // Object locks taken above may have blocked past the lease; check
         // again before committing. The reservation row is already held
         // `FOR SHARE`, so this read does not wait.
@@ -332,6 +360,43 @@ impl PostgresDb {
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    /// Takes over an abandoned reservation (#1931); see the SQLite store.
+    pub fn take_over_admission(
+        &self,
+        instance: &ActionInstance,
+        expired: &AdmissionLease,
+        next: &AdmissionLease,
+    ) -> Result<bool, String> {
+        let mut taken = instance.clone();
+        taken.admission_lease = Some(next.clone());
+        let body_json = serde_json::to_string(&taken).map_err(|error| error.to_string())?;
+        let generation = i64::try_from(expired.generation)
+            .unwrap_or(i64::MAX)
+            .to_string();
+        let now = crate::sekai::action_instance::lease_clock_ms();
+        let updated = self
+            .connection()?
+            .execute(
+                "UPDATE sekai_action_instances SET body_json = $2
+                 WHERE instance_id = $1
+                   AND body_json::jsonb #>> '{admission_lease,owner}' = $3
+                   AND body_json::jsonb #>> '{admission_lease,generation}' = $4
+                   AND (body_json::jsonb #>> '{admission_lease,expires_at_ms}')::bigint <= $5
+                   AND (body_json::jsonb #>> '{admission_lease,write_committed}')::boolean = $6
+                   AND (body_json::jsonb #>> '{admission_lease,receipt_recorded}')::boolean = false",
+                &[
+                    &instance.instance_id,
+                    &body_json,
+                    &expired.owner,
+                    &generation,
+                    &now,
+                    &expired.write_committed.unwrap_or(false),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(updated == 1)
     }
 
     /// Deletes the reservation only while `lease` still names its owner and

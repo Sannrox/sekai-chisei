@@ -625,6 +625,8 @@ fn closing_record(
         conflict: None,
         approval: None,
         admission_lease: None,
+        admission_ontology_digest: None,
+        admission_budget_already_reserved: false,
     }
 }
 

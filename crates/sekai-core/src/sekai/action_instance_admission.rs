@@ -32,10 +32,37 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::cell::Cell;
 
+/// Where a test simulates a crash: admission stops there with no cleanup,
+/// as if the process died (#1931).
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CrashPoint {
+    None,
+    AfterReservation,
+    AfterObjectWrite,
+}
+
 #[cfg(test)]
 thread_local! {
+    static CRASH_NEXT_ADMISSION: Cell<CrashPoint> = const { Cell::new(CrashPoint::None) };
     static FAIL_NEXT_RECORD_ADMISSION: Cell<bool> = const { Cell::new(false) };
     static TAKE_OVER_BEFORE_NEXT_RECEIPT: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub fn crash_next_admission(point: CrashPoint) {
+    CRASH_NEXT_ADMISSION.with(|crash| crash.set(point));
+}
+
+#[cfg(test)]
+fn crashes_at(point: CrashPoint) -> bool {
+    CRASH_NEXT_ADMISSION.with(|crash| {
+        let hit = crash.get() == point;
+        if hit {
+            crash.set(CrashPoint::None);
+        }
+        hit
+    })
 }
 
 #[cfg(test)]
@@ -328,7 +355,21 @@ impl<'a> ActionInstanceAdmission<'a> {
                     "idempotency key conflict: same key with different request digest".into(),
                 ));
             }
-            return self.completed_replay(existing, now);
+            // An abandoned reservation (expired lease, no receipt) is taken
+            // over before any gate: a landed write is finished as the original
+            // submitter, and an empty one is released for a fresh, gated
+            // admission (#1931).
+            match self.take_over_abandoned(&existing)? {
+                Abandoned::Live => return self.completed_replay(existing, now),
+                Abandoned::Landed {
+                    instance,
+                    applied,
+                    type_def,
+                } => {
+                    return self.repair_landed(*instance, *applied, &type_def, now);
+                }
+                Abandoned::Released => {}
+            }
         }
 
         // The marking the instance will carry (#1706), derived here, the one
@@ -747,33 +788,10 @@ impl<'a> ActionInstanceAdmission<'a> {
                 }
             }),
             admission_lease: Some(lease.clone()),
+            admission_ontology_digest: ontology_digest.clone(),
+            admission_budget_already_reserved: budget_already_reserved,
         };
-        let planned_effects = if status == STATUS_ADMITTED {
-            let force_notify_fail =
-                serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("notify_delivery")
-                            .and_then(|delivery| delivery.as_str())
-                            .map(|delivery| delivery == "fail")
-                    })
-                    .unwrap_or(false);
-            Some(
-                action_effect::plan_effects_for_admit(
-                    &instance.instance_id,
-                    &instance.namespace,
-                    &instance.operation_id,
-                    type_def.effect_kinds_to_materialize(),
-                    &instance.parameters_json,
-                    now,
-                    force_notify_fail,
-                )
-                .map_err(ActionInstanceAdmissionError::InvalidArgument)?,
-            )
-        } else {
-            None
-        };
+        let planned_effects = plan_admission_effects(&type_def, &instance, now)?;
 
         // Reserve the instance before mutating so concurrent same-key submits
         // replay at the idempotency insert instead of racing the object write.
@@ -789,6 +807,13 @@ impl<'a> ActionInstanceAdmission<'a> {
         let replay = stored.instance_id != instance_id;
         if replay {
             return self.completed_replay(stored, now);
+        }
+
+        #[cfg(test)]
+        if crashes_at(CrashPoint::AfterReservation) {
+            return Err(ActionInstanceAdmissionError::Internal(
+                "injected crash".into(),
+            ));
         }
 
         // Same-key replay already returned above. Plan only a fresh admit so a
@@ -850,7 +875,15 @@ impl<'a> ActionInstanceAdmission<'a> {
                         &lease,
                         now,
                     ) {
-                        Ok(applied) => Some(applied),
+                        Ok(applied) => {
+                            #[cfg(test)]
+                            if crashes_at(CrashPoint::AfterObjectWrite) {
+                                return Err(ActionInstanceAdmissionError::Internal(
+                                    "injected crash".into(),
+                                ));
+                            }
+                            Some(applied)
+                        }
                         Err(error) => {
                             let _ = self
                                 .db
@@ -1568,6 +1601,155 @@ impl<'a> ActionInstanceAdmission<'a> {
         }
     }
 
+    /// Takes over a reservation whose admission was abandoned (#1931): no
+    /// receipt and an expired lease. A live admission, a legacy row without a
+    /// lease, or a lost takeover race stays [`Abandoned::Live`]. After a
+    /// takeover, a write the abandoned admission landed is reported for
+    /// repair; otherwise the reservation is released.
+    fn take_over_abandoned(
+        &self,
+        stored: &ActionInstance,
+    ) -> Result<Abandoned, ActionInstanceAdmissionError> {
+        let internal = ActionInstanceAdmissionError::Internal;
+        // A lease without markers was written by an older binary: its writes
+        // left no evidence, so it is never taken over.
+        let Some(expired) = stored.admission_lease.as_ref().filter(|lease| {
+            lease.expired() && lease.write_committed.is_some() && lease.receipt_recorded.is_some()
+        }) else {
+            return Ok(Abandoned::Live);
+        };
+        if self
+            .db
+            .get_operation_receipt(&stored.operation_id)
+            .map_err(internal)?
+            .is_some()
+        {
+            return Ok(Abandoned::Live);
+        }
+        let next = expired.succeeding();
+        if !self
+            .db
+            .take_over_admission(stored, expired, &next)
+            .map_err(internal)?
+        {
+            return Ok(Abandoned::Live);
+        }
+        let mut taken = stored.clone();
+        taken.admission_lease = Some(next.clone());
+        // The marker the fenced write set with the object write tells
+        // whether it committed, whatever happened to the object since.
+        if expired.write_committed == Some(true) {
+            // The type as it was bound, enabled or not: finishing a landed
+            // write authorizes nothing new.
+            let type_def = self
+                .db
+                .get_governed_action_type(&stored.namespace, &stored.type_id, &stored.version)
+                .map_err(internal)?
+                .ok_or_else(|| internal("action type of an abandoned admission is gone".into()))?;
+            // The current object is the committed write only while it keeps
+            // that write's kind and revision; a later edit or a replacement
+            // under the same id is not attributed to this admission.
+            let applied = match object_for_admitted_instance(self.db, stored)? {
+                Some(object)
+                    if object.kind == type_def.object_kind
+                        && expired.written_object_digest.as_deref()
+                            == crate::sekai::action_instance::object_state_digest(Some(
+                                &object,
+                            ))
+                            .ok()
+                            .as_deref() =>
+                {
+                    AppliedObjectMutation::recovered(object, &type_def.object_mutation)
+                }
+                _ => AppliedObjectMutation::recovered_deleted(
+                    &admitted_object_id(stored),
+                    &type_def.object_kind,
+                    &type_def.object_mutation,
+                ),
+            };
+            return Ok(Abandoned::Landed {
+                applied: Box::new(applied),
+                instance: Box::new(taken),
+                type_def: Box::new(type_def),
+            });
+        }
+        if self
+            .db
+            .release_admission(
+                &stored.instance_id,
+                &next,
+                &crate::sekai::action_instance::AdmissionUndo::None,
+                &stored.principal,
+            )
+            .map_err(internal)?
+        {
+            Ok(Abandoned::Released)
+        } else {
+            Ok(Abandoned::Live)
+        }
+    }
+
+    /// Records the receipt of an abandoned admission whose write landed, as
+    /// its original submitter: policy scope and budget are the stored
+    /// instance's, as on an approver's decision. The write is not repeated. A
+    /// failure keeps the reservation for the next takeover.
+    fn repair_landed(
+        &self,
+        instance: ActionInstance,
+        applied: AppliedObjectMutation,
+        type_def: &crate::sekai::governed_action_type::GovernedActionType,
+        now: i64,
+    ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        let policy_project = if type_def.policy_scope.trim().is_empty() {
+            instance.namespace.clone()
+        } else {
+            type_def.policy_scope.clone()
+        };
+        let policy_scope_label = self
+            .db
+            .resolve_action_policy(&instance.principal, &instance.namespace, &policy_project)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .map(|policy| policy.scope)
+            .unwrap_or_default();
+        let (budget_subject, budget_amount) = type_def
+            .budget_charge(
+                &instance.namespace,
+                &instance.principal,
+                &instance.parameters_json,
+            )
+            .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        let effects = plan_admission_effects(type_def, &instance, now)?;
+        self.record_admission(
+            &instance,
+            &instance.principal,
+            &policy_scope_label,
+            &budget_subject,
+            budget_amount,
+            &instance.evidence_submission_ids,
+            effects.as_deref(),
+            Some(&applied),
+            instance.admission_ontology_digest.clone(),
+            instance.admission_budget_already_reserved,
+            None,
+            now,
+        )?;
+        if applied.object_present {
+            action_object_mutation::complete_object_write(
+                self.db,
+                &applied.object,
+                &instance.principal,
+                now,
+            );
+        }
+        Ok(ActionInstanceAdmissionOutcome {
+            object_revision: applied
+                .object_present
+                .then(|| crate::sekai::action_describe_preview::object_revision(&applied.object)),
+            instance,
+            replay: true,
+        })
+    }
+
     fn completed_replay(
         &self,
         existing: ActionInstance,
@@ -1913,7 +2095,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             self.db
                 .put_action_effects(effects)
                 .map_err(ActionInstanceAdmissionError::Internal)?;
-            if let Some(applied) = applied_object {
+            if let Some(applied) = applied_object.filter(|applied| applied.object_present) {
                 // #1115: the operation receipt above is already durable, so a
                 // transient object-log failure here must not fail this
                 // already-succeeded admission back to the caller — that was
@@ -1971,11 +2153,56 @@ fn catch_up_object_log(
     }
 }
 
-fn object_for_admitted_instance(
-    db: &RuntimeDb,
+/// What a takeover found for an abandoned reservation.
+enum Abandoned {
+    /// Not abandoned (receipt recorded, lease live, legacy row, or another
+    /// taker won): answer as a replay.
+    Live,
+    /// The abandoned admission's object write landed.
+    Landed {
+        instance: Box<ActionInstance>,
+        applied: Box<AppliedObjectMutation>,
+        type_def: Box<crate::sekai::governed_action_type::GovernedActionType>,
+    },
+    /// Nothing landed; the reservation is gone.
+    Released,
+}
+
+/// The effects an admitted instance materializes when its receipt records
+/// them; none for any other status.
+fn plan_admission_effects(
+    type_def: &crate::sekai::governed_action_type::GovernedActionType,
     instance: &ActionInstance,
-) -> Result<Option<crate::domain::Object>, ActionInstanceAdmissionError> {
-    let object_id = serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
+    now: i64,
+) -> Result<Option<Vec<action_effect::ActionEffect>>, ActionInstanceAdmissionError> {
+    if instance.status != STATUS_ADMITTED {
+        return Ok(None);
+    }
+    let force_notify_fail = serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("notify_delivery")
+                .and_then(|delivery| delivery.as_str())
+                .map(|delivery| delivery == "fail")
+        })
+        .unwrap_or(false);
+    action_effect::plan_effects_for_admit(
+        &instance.instance_id,
+        &instance.namespace,
+        &instance.operation_id,
+        type_def.effect_kinds_to_materialize(),
+        &instance.parameters_json,
+        now,
+        force_notify_fail,
+    )
+    .map(Some)
+    .map_err(ActionInstanceAdmissionError::InvalidArgument)
+}
+
+/// The `object_id` parameter of `instance`, empty when it names none.
+fn admitted_object_id(instance: &ActionInstance) -> String {
+    serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
         .ok()
         .and_then(|value| {
             value
@@ -1983,7 +2210,14 @@ fn object_for_admitted_instance(
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn object_for_admitted_instance(
+    db: &RuntimeDb,
+    instance: &ActionInstance,
+) -> Result<Option<crate::domain::Object>, ActionInstanceAdmissionError> {
+    let object_id = admitted_object_id(instance);
     if object_id.trim().is_empty() {
         return Ok(None);
     }
@@ -5268,6 +5502,8 @@ mod tests {
             approval: None,
             offline: None,
             admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
         };
         db.put_action_instance(&reserved).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
@@ -5582,5 +5818,317 @@ mod tests {
         missing.parameters_json = r#"{"object_id":"attack-3","target_id":"nowhere"}"#.into();
         let refused = admission.admit(missing, "alice", 30).unwrap();
         assert_eq!(refused.instance.deny_reason, CRITERION_UNAVAILABLE);
+    }
+
+    /// Backdates the reservation's lease for `key`, as if its admission had
+    /// stalled past the lease (#1931).
+    fn expire_reservation(db: &RuntimeDb, key: &str) {
+        let mut stored = db
+            .get_action_instance_by_idempotency("acme", key)
+            .unwrap()
+            .expect("reservation");
+        let lease = stored.admission_lease.as_mut().expect("leased reservation");
+        lease.expires_at_ms = crate::sekai::action_instance::lease_clock_ms() - 1;
+        db.delete_action_instance(&stored.instance_id).unwrap();
+        db.put_action_instance(&stored).unwrap();
+    }
+
+    /// The Action instances that wrote `object_id`, from its change rows.
+    fn writers(db: &RuntimeDb, object_id: &str) -> std::collections::BTreeSet<String> {
+        db.list_object_changes(object_id, 1_000, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|change| change.writer_kind == crate::sekai::audit::WRITER_ACTION_INSTANCE)
+            .map(|change| change.writer_ref)
+            .collect()
+    }
+
+    /// A process that dies after the reservation, or after the object write,
+    /// leaves a key a resubmit recovers once its lease expires: exactly one
+    /// applied write and one receipt. A live admission is left alone (#1931).
+    fn abandoned_admissions_recover_exactly_once(db: &RuntimeDb) {
+        ensure_record_kind(db);
+        let _ = db.put_governed_action_type(record_type("create"), "operator", 1);
+        let admission = ActionInstanceAdmission::new(db, None);
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let request = |object_id: &str, key: &str| {
+            let mut request = record_request(
+                "customer.record.create",
+                &format!(r#"{{"object_id":"{object_id}","name":"Recovered"}}"#),
+            );
+            request.idempotency_key = key.into();
+            request.request_id = format!("operation-{key}");
+            request
+        };
+
+        // Crash after the reservation: nothing landed.
+        let (object, key) = (format!("rec-res-{suffix}"), format!("res-{suffix}"));
+        crash_next_admission(CrashPoint::AfterReservation);
+        assert!(
+            admission
+                .admit(request(&object, &key), "alice", 10)
+                .is_err()
+        );
+        let live = admission
+            .admit(request(&object, &key), "alice", 11)
+            .unwrap_err();
+        assert!(
+            matches!(&live, ActionInstanceAdmissionError::FailedPrecondition(message)
+                if message.contains("still in progress")),
+            "a live reservation is left alone: {live:?}"
+        );
+        expire_reservation(db, &key);
+        let recovered = admission
+            .admit(request(&object, &key), "alice", 12)
+            .unwrap();
+        assert_eq!(recovered.instance.status, STATUS_ADMITTED);
+        assert!(db.get_object(&object).unwrap().is_some());
+        assert!(
+            db.get_operation_receipt(&recovered.instance.operation_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(writers(db, &object).len(), 1);
+
+        // Crash after the object write: the receipt is repaired, not the
+        // write repeated.
+        let (object, key) = (format!("rec-obj-{suffix}"), format!("obj-{suffix}"));
+        crash_next_admission(CrashPoint::AfterObjectWrite);
+        assert!(
+            admission
+                .admit(request(&object, &key), "alice", 20)
+                .is_err()
+        );
+        let abandoned = db
+            .get_action_instance_by_idempotency("acme", &key)
+            .unwrap()
+            .expect("reservation");
+        assert!(db.get_object(&object).unwrap().is_some());
+        assert!(
+            db.get_operation_receipt(&abandoned.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        expire_reservation(db, &key);
+        let repaired = admission
+            .admit(request(&object, &key), "alice", 21)
+            .unwrap();
+        assert_eq!(repaired.instance.instance_id, abandoned.instance_id);
+        assert_eq!(repaired.instance.admission_lease.unwrap().generation, 2);
+        assert!(
+            db.get_operation_receipt(&abandoned.operation_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            writers(db, &object),
+            std::collections::BTreeSet::from([abandoned.instance_id.clone()])
+        );
+        // A later resubmit is a plain replay.
+        let replay = admission
+            .admit(request(&object, &key), "alice", 22)
+            .unwrap();
+        assert!(replay.replay);
+        assert_eq!(writers(db, &object).len(), 1);
+
+        // Crash after the object write, then the object is deleted: the
+        // receipt is still repaired and the object is not created again.
+        let (object, key) = (format!("rec-del-{suffix}"), format!("del-{suffix}"));
+        crash_next_admission(CrashPoint::AfterObjectWrite);
+        assert!(
+            admission
+                .admit(request(&object, &key), "alice", 30)
+                .is_err()
+        );
+        let abandoned = db
+            .get_action_instance_by_idempotency("acme", &key)
+            .unwrap()
+            .expect("reservation");
+        db.delete_object_with_audit(&object, "operator").unwrap();
+        expire_reservation(db, &key);
+        let repaired = admission
+            .admit(request(&object, &key), "alice", 31)
+            .unwrap();
+        assert_eq!(repaired.instance.instance_id, abandoned.instance_id);
+        assert!(
+            db.get_operation_receipt(&abandoned.operation_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(db.get_object(&object).unwrap().is_none(), "not resurrected");
+    }
+
+    #[test]
+    fn sqlite_abandoned_admissions_recover_exactly_once() {
+        abandoned_admissions_recover_exactly_once(&setup());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL test database"]
+    fn postgres_abandoned_admissions_recover_exactly_once() {
+        abandoned_admissions_recover_exactly_once(&postgres_runtime());
+    }
+
+    /// A landed write is finished even after the type was disabled, and the
+    /// repaired receipt names the original submitter, not the retrying actor
+    /// (#1931).
+    #[test]
+    fn a_landed_write_is_finished_as_its_submitter_after_the_type_is_disabled() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-disabled","name":"Recovered"}"#,
+        );
+        request.idempotency_key = "disabled-key".into();
+        request.request_id = "operation-disabled-key".into();
+        crash_next_admission(CrashPoint::AfterObjectWrite);
+        assert!(admission.admit(request.clone(), "alice", 10).is_err());
+        db.set_governed_action_type_enabled("acme", "customer.record.create", "1", false, 11)
+            .unwrap();
+        expire_reservation(&db, "disabled-key");
+        // The retry names another ontology; the receipt keeps the original.
+        request.ontology_digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        let repaired = admission.admit(request, "bob", 12).unwrap();
+        assert_eq!(repaired.instance.principal, "alice");
+        let receipt = db
+            .get_operation_receipt("operation-disabled-key")
+            .unwrap()
+            .expect("repaired receipt");
+        assert_eq!(receipt.initiating_actor, "alice");
+        assert_eq!(receipt.ontology_digest.as_deref(), Some(ONTOLOGY_DIGEST));
+        assert_eq!(writers(&db, "rec-disabled").len(), 1);
+    }
+
+    /// An update that changes no field still commits: the commit marker, not
+    /// a change row, tells the takeover to repair its receipt instead of
+    /// admitting it again (#1931).
+    #[test]
+    fn a_no_change_update_is_recovered_without_reapplying() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("update"), "operator", 1)
+            .unwrap();
+        db.create_object(&crate::domain::Object {
+            id: "rec-same".into(),
+            kind: "customer_record".into(),
+            name: "Same".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut request = record_request(
+            "customer.record.update",
+            r#"{"object_id":"rec-same","name":"Same"}"#,
+        );
+        request.idempotency_key = "same-key".into();
+        request.request_id = "operation-same-key".into();
+        crash_next_admission(CrashPoint::AfterObjectWrite);
+        assert!(admission.admit(request.clone(), "alice", 10).is_err());
+        let abandoned = db
+            .get_action_instance_by_idempotency("acme", "same-key")
+            .unwrap()
+            .expect("reservation");
+        assert_eq!(
+            abandoned.admission_lease.as_ref().unwrap().write_committed,
+            Some(true)
+        );
+        expire_reservation(&db, "same-key");
+        let repaired = admission.admit(request, "alice", 11).unwrap();
+        assert!(repaired.replay);
+        assert_eq!(repaired.instance.instance_id, abandoned.instance_id);
+        assert!(
+            db.get_operation_receipt("operation-same-key")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A lease an older binary wrote carries no markers: after expiry it is
+    /// still not taken over, since nothing records whether its write
+    /// committed (#1931).
+    #[test]
+    fn a_lease_without_markers_is_never_taken_over() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-legacy","name":"Legacy"}"#,
+        );
+        request.idempotency_key = "legacy-key".into();
+        request.request_id = "operation-legacy-key".into();
+        crash_next_admission(CrashPoint::AfterObjectWrite);
+        assert!(admission.admit(request.clone(), "alice", 10).is_err());
+        let mut stored = db
+            .get_action_instance_by_idempotency("acme", "legacy-key")
+            .unwrap()
+            .unwrap();
+        let lease = stored.admission_lease.as_mut().unwrap();
+        lease.write_committed = None;
+        lease.receipt_recorded = None;
+        lease.expires_at_ms = crate::sekai::action_instance::lease_clock_ms() - 1;
+        db.delete_action_instance(&stored.instance_id).unwrap();
+        db.put_action_instance(&stored).unwrap();
+        let refused = admission.admit(request, "alice", 11).unwrap_err();
+        assert!(
+            matches!(&refused, ActionInstanceAdmissionError::FailedPrecondition(message)
+                if message.contains("still in progress")),
+            "{refused:?}"
+        );
+        assert!(db.get_object("rec-legacy").unwrap().is_some());
+    }
+
+    /// A later edit by another writer is not the committed write: the
+    /// receipt is repaired, but the edited state is not attributed to it or
+    /// written again (#1931). (An audited delete never frees an id for a
+    /// replacement: the store refuses to reuse it.)
+    #[test]
+    fn a_later_edit_is_not_attributed_to_the_recovery() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-edited","name":"Original"}"#,
+        );
+        request.idempotency_key = "edited-key".into();
+        request.request_id = "operation-edited-key".into();
+        crash_next_admission(CrashPoint::AfterObjectWrite);
+        assert!(admission.admit(request.clone(), "alice", 10).is_err());
+        let abandoned = db
+            .get_action_instance_by_idempotency("acme", "edited-key")
+            .unwrap()
+            .unwrap();
+        let mut edited = db.get_object("rec-edited").unwrap().unwrap();
+        // The edit keeps the same `updated`: only the state digest tells it
+        // apart from the committed write.
+        edited.name = "Edited".into();
+        db.update_object(&edited).unwrap();
+        expire_reservation(&db, "edited-key");
+        let repaired = admission.admit(request, "alice", 60).unwrap();
+        assert_eq!(repaired.instance.instance_id, abandoned.instance_id);
+        assert!(
+            repaired.object_revision.is_none(),
+            "the edit is not the write"
+        );
+        assert!(
+            db.get_operation_receipt("operation-edited-key")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(db.get_object("rec-edited").unwrap().unwrap().name, "Edited");
     }
 }

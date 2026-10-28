@@ -2346,6 +2346,8 @@ fn seed_claimed_action_of(
         approval: None,
         offline: None,
         admission_lease: None,
+        admission_ontology_digest: None,
+        admission_budget_already_reserved: false,
     })
     .unwrap();
     crate::sekai::action_work_lifecycle::ActionWorkLifecycle::new(db)
