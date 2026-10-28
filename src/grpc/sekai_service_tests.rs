@@ -33500,4 +33500,21 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
     assert_eq!(woken.len(), 1, "one turn per window: {woken:?}");
     assert_eq!(woken[0].cause, agent_turn::Cause::ObjectChange);
     assert!(woken[0].cause_ref.starts_with("change:60000@"));
+
+    // A sequence below the cursor (purged history) restarts the cursor.
+    let wake = crate::sekai::agent_wake::change_cursor;
+    let at = wake(svc.db.runtime(), "line-7", "change:60000").unwrap();
+    crate::sekai::agent_wake::advance_change_cursor(
+        svc.db.runtime(),
+        "line-7",
+        "change:60000",
+        at,
+        1_000_000,
+    )
+    .unwrap();
+    tick().await;
+    assert_eq!(
+        wake(svc.db.runtime(), "line-7", "change:60000").unwrap(),
+        Some(0)
+    );
 }

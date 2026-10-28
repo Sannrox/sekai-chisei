@@ -10,7 +10,9 @@
 //! classification wakes nothing. A delete wakes nothing, since the principal
 //! can no longer be shown to read the object. Changes in one debounce window
 //! share a turn. The cursor advances after the turns are admitted, so a
-//! crash replays the page and admission dedupes it.
+//! crash replays the page and admission dedupes it. A mutation sequence
+//! below the cursor means purged history restarted it; the cursor restarts
+//! with it.
 
 use super::*;
 use crate::sekai::agent_wake::{self, WakePolicy};
@@ -28,11 +30,15 @@ impl SekaiServiceImpl {
     /// `actor`.
     pub(super) fn tick_change_wakes(&self, now_ms: i64, actor: &str) -> Result<(), String> {
         let db = self.db.runtime();
-        let schema = self.schema_definitions.snapshot().map_err(|error| {
-            map_schema_definition_lifecycle_error(error)
-                .message()
-                .to_string()
-        })?;
+        // Refreshed, so a classification another plane changed applies.
+        let schema = self
+            .schema_definitions
+            .refresh_snapshot()
+            .map_err(|error| {
+                map_schema_definition_lifecycle_error(error)
+                    .message()
+                    .to_string()
+            })?;
         for instance in agent_wake::instances(db)? {
             for (token, policy) in agent_wake::policies(&instance) {
                 if let WakePolicy::Change { debounce_ms } = policy {
@@ -59,6 +65,12 @@ impl SekaiServiceImpl {
             agent_wake::advance_change_cursor(db, &instance.id, token, None, watermark)?;
             return Ok(());
         };
+        if db.object_change_watermark(&instance.namespace)? < after {
+            // Purged history restarts the sequence; every row now is newer
+            // than the cursor's last read.
+            agent_wake::advance_change_cursor(db, &instance.id, token, Some(after), 0)?;
+            return Ok(());
+        }
         let mutations =
             db.list_committed_object_mutations_after(&instance.namespace, after, PAGE)?;
         let Some(last) = mutations.last().map(|mutation| mutation.seq) else {
