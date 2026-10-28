@@ -124,6 +124,15 @@ impl SharedSpaceGrant {
     }
 }
 
+/// Answer to [`EnterpriseExtension::tenants_share_space`] (#1860): the
+/// target namespace's owning tenant and whether it shares an approved space
+/// with the acting tenant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantSharing {
+    pub owner_tenant: String,
+    pub shared: bool,
+}
+
 /// Outcome of [`EnterpriseExtension::authorize_shared_space`].
 ///
 /// `Denied` still names the owning tenant so core can audit
@@ -892,6 +901,26 @@ pub trait EnterpriseExtension: Send + Sync {
     ) -> Result<SharedSpaceAuthorization, ExtensionError> {
         let _ = (context, namespace, action);
         Ok(SharedSpaceAuthorization::Unshared)
+    }
+
+    /// Whether `acting_tenant` shares an approved space with the tenant that
+    /// owns `target_namespace` (#1860). The extension resolves the owner,
+    /// since core keeps no namespace-to-tenant binding, and returns it for
+    /// audit. Shared means both tenants approved membership of one space,
+    /// as for [`Self::authorize_shared_space`]. Default: unavailable, so an
+    /// extension that has not implemented the lookup fails closed instead of
+    /// reporting unshared. (With no extension at all, core treats every pair
+    /// as unshared.) Core asks on every Action submit and decision and caches
+    /// nothing, so withdrawal applies to the next one.
+    fn tenants_share_space(
+        &self,
+        acting_tenant: &str,
+        target_namespace: &str,
+    ) -> Result<TenantSharing, ExtensionError> {
+        let _ = (acting_tenant, target_namespace);
+        Err(ExtensionError::Unavailable(
+            "shared-space lookup is not implemented".into(),
+        ))
     }
 
     /// Current discovery rule for a caller looking at `owner_tenant` (#1435).
