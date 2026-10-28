@@ -194,6 +194,13 @@ pub fn apply(
             "action type must bind object_kind and object_mutation".into(),
         ));
     }
+    // Site agent instances change only through admitted ActionInstances
+    // (ADR 0136); a streaming edit has no admission.
+    if type_def.object_kind.trim() == crate::sekai::site_agent_instance::KIND {
+        return Err(StreamingApplyError::PermissionDenied(
+            "site agent instances change only through their governed Actions".into(),
+        ));
+    }
     // This RPC has no envelope_id. Autonomous types require a live envelope on
     // SubmitActionInstance; refuse them here until that contract is on the wire.
     if type_def.type_id.starts_with("autonomous.") {

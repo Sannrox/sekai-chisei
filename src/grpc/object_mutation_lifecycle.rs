@@ -177,6 +177,11 @@ impl SekaiServiceImpl {
                 "catalog entries change only through RegisterCatalogEntry",
             ));
         }
+        if domain_object.kind == crate::sekai::site_agent_instance::KIND {
+            return Err(Status::permission_denied(
+                "site agent instances change only through their governed Actions",
+            ));
+        }
         let mut domain_object = domain_object;
         if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
             require_credential_admin(&principals)?;
@@ -291,6 +296,15 @@ impl SekaiServiceImpl {
             .runtime()
             .get_object(&object.id)
             .map_err(Status::internal)?;
+        // A direct update of a site agent instance is never valid, and must
+        // not reveal one the caller may not read: it answers as for a
+        // missing object, before any authorization (ADR 0136).
+        if existing
+            .as_ref()
+            .is_some_and(|current| current.kind == crate::sekai::site_agent_instance::KIND)
+        {
+            return Err(Status::not_found("not found"));
+        }
         if let Some(current) = &existing
             && evaluate_active_object_policy(
                 self.db.runtime(),
@@ -445,6 +459,10 @@ impl SekaiServiceImpl {
             || existing
                 .as_ref()
                 .is_some_and(|existing| existing.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND)
+            || domain_object.kind == crate::sekai::site_agent_instance::KIND
+            || existing
+                .as_ref()
+                .is_some_and(|existing| existing.kind == crate::sekai::site_agent_instance::KIND)
         {
             return Err(Status::permission_denied(
                 "reserved governance kind; use the dedicated action RPCs",
@@ -619,6 +637,19 @@ impl SekaiServiceImpl {
         }
         if precondition.is_none() && expected.is_none() {
             return Ok(Response::new(GuardedDeleteObjectResponse {}));
+        }
+        // Site agent instances change only through their Actions, and one a
+        // caller may not read must not be told apart from a missing one. A
+        // direct delete is never valid, so it answers as for a missing
+        // object, for every caller, and deletes nothing (ADR 0136).
+        if expected
+            .as_ref()
+            .is_some_and(|current| current.kind == crate::sekai::site_agent_instance::KIND)
+        {
+            if precondition.is_none() {
+                return Ok(Response::new(GuardedDeleteObjectResponse {}));
+            }
+            return Err(Status::not_found("not found"));
         }
         check_object_acl_with_audit(
             self.db.runtime(),

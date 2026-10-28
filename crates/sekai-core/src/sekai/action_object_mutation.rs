@@ -523,6 +523,9 @@ fn validate_object_write(
 ) -> Result<(), ActionObjectMutationError> {
     crate::sekai::feedback_package::validate_object_write(db, planned, now_ms)
         .and_then(|()| crate::sekai::security_package::validate_object_write(db, planned))
+        .and_then(|()| {
+            crate::sekai::site_agent_instance::validate_object_write(db, planned, now_ms)
+        })
         .and_then(|()| crate::sekai::function_document::validate_lineage_write(db, planned, now_ms))
         .map_err(ActionObjectMutationError::FailedPrecondition)
 }

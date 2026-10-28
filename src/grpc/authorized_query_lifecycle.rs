@@ -44,6 +44,7 @@ impl SekaiServiceImpl {
             return Err(Status::not_found("not found"));
         };
         let namespace = obj.namespace.clone();
+        let obj_kind = obj.kind.clone();
         require_purpose_for_kind(
             self.db.runtime(),
             &namespace,
@@ -63,12 +64,16 @@ impl SekaiServiceImpl {
         let (obj, marking) = match visibility {
             Ok(visible) => visible,
             Err(status) if status.code() == tonic::Code::PermissionDenied => {
-                let activated = self
-                    .db
-                    .runtime()
-                    .get_object_security_activation(&namespace)
-                    .map_err(Status::internal)?
-                    .is_some();
+                // A site agent instance the caller may not read is
+                // indistinguishable from a missing one, activated policy or
+                // not (ADR 0136).
+                let activated = obj_kind == crate::sekai::site_agent_instance::KIND
+                    || self
+                        .db
+                        .runtime()
+                        .get_object_security_activation(&namespace)
+                        .map_err(Status::internal)?
+                        .is_some();
                 return Err(map_direct_read_visibility_error(activated, status));
             }
             Err(status) => return Err(status),
