@@ -1,0 +1,200 @@
+{
+  "actions": [
+    {
+      "type_id": "security.finding.record",
+      "description": "Record a security finding. A second finding with the same signature is refused; record an occurrence instead.",
+      "object_kind": "security_finding",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "probe",
+              "review",
+              "scanner",
+              "agent",
+              "advisory"
+            ]
+          },
+          "component": {
+            "type": "string"
+          },
+          "version_range": {
+            "type": "string"
+          },
+          "problem_signature": {
+            "type": "string"
+          },
+          "reported_severity": {
+            "type": "string"
+          },
+          "evidence_refs": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "source",
+          "component",
+          "version_range",
+          "problem_signature",
+          "reported_severity"
+        ]
+      }
+    },
+    {
+      "type_id": "security.occurrence.record",
+      "description": "Record one measured occurrence of a finding. A repeated occurrence id is refused.",
+      "object_kind": "security_finding_occurrence",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "finding_id": {
+            "type": "string"
+          },
+          "occurrence_id": {
+            "type": "string"
+          },
+          "observed_at_ms": {
+            "type": "integer"
+          },
+          "evidence_refs": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "finding_id",
+          "occurrence_id",
+          "observed_at_ms"
+        ]
+      }
+    },
+    {
+      "type_id": "security.hypothesis.record",
+      "description": "Record a hypothesis about a finding. It is not a measured fact.",
+      "object_kind": "security_hypothesis",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "finding_id": {
+            "type": "string"
+          },
+          "statement": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "finding_id",
+          "statement"
+        ]
+      }
+    },
+    {
+      "type_id": "security.exposure.record",
+      "description": "Record one finding against one deployed target with a verdict.",
+      "object_kind": "security_exposure",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "finding_id": {
+            "type": "string"
+          },
+          "release": {
+            "type": "string"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "exploitable",
+              "not-reachable",
+              "mitigated",
+              "unknown"
+            ]
+          },
+          "evidence_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "finding_id",
+          "release",
+          "environment",
+          "verdict"
+        ]
+      }
+    },
+    {
+      "type_id": "security.exposure.verdict",
+      "description": "Change an exposure's verdict and the measured evidence it relies on. The target identity does not change.",
+      "object_kind": "security_exposure",
+      "object_mutation": "update",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "exploitable",
+              "not-reachable",
+              "mitigated",
+              "unknown"
+            ]
+          },
+          "evidence_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "verdict"
+        ]
+      }
+    }
+  ]
+}

@@ -206,6 +206,8 @@ const TRANSFORM_RUNTIME_LABELS_SCHEMA: &str =
     include_str!("postgres/0122_transform_runtime_labels.sql");
 const CHISEI_RESERVATION_CHARGE_KEY_SCHEMA: &str =
     include_str!("postgres/0123_chisei_reservation_charge_key.sql");
+const SECURITY_PACKAGE_IDENTITY_SCHEMA: &str =
+    include_str!("postgres/0124_security_package_identity.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -970,6 +972,12 @@ const MIGRATIONS: &[Migration] = &[
         "chisei_reservation_charge_key",
         CHISEI_RESERVATION_CHARGE_KEY_SCHEMA,
         MigrationOwner::Chisei,
+    ),
+    mig(
+        123,
+        "security_package_identity",
+        SECURITY_PACKAGE_IDENTITY_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 

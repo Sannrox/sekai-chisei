@@ -160,4 +160,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0132: Fenced incremental feed of object geo changes into Ezu](0132-ezu-geo-feed.md)
 - [ADR 0133: GeoArrow backfill for the Ezu geo feed](0133-ezu-geo-feed-backfill.md)
 - [ADR 0134: Federated queries return only suppressed aggregates](0134-federated-aggregate-queries.md)
+- [ADR 0135: Ship security findings and exposures as a types-only domain package](0135-security-finding-exposure-package.md)
 <!-- adr-index:end -->
