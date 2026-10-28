@@ -53,7 +53,7 @@ Security review and SDK generation shrink to the stable set.
 ## Validation
 
 A deterministic test compares the checked-in table and `docs/rpc-maturity.md`
-with both proto services, asserts at most 68 stable RPCs, and proves the
+with both proto services, classifies every RPC exactly once, and proves the
 default gate cannot reach an experimental RPC. Real backend cells must match
 the shrink-only SQLite-only list.
 
@@ -91,3 +91,9 @@ the shrink-only SQLite-only list.
   grants or denies a parked instance with the same named-approver rules as
   SQLite, `ListActionInstances.status` is the parked inbox, and
   `native_server_smoke` plus the generated HTTP facades consume both RPCs.
+- 2026-10-28, Issue [#1912](https://github.com/Sannrox/sekai-chisei/issues/1912):
+  the stable ceiling is removed. The stable surface is not capped; promoting
+  an RPC edits only its entry in `tests/fixtures/rpc_maturity/v1.json`. A
+  stable RPC still needs a real backend plus a consumer or a required-sibling
+  reason, and the table still fails by name on a missing, unknown, or
+  duplicate RPC.
