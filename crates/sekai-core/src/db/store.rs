@@ -43,6 +43,21 @@ impl SekaiStore {
         self.inner.clone()
     }
 
+    /// Resolve an Action Work claim cited by `caller`'s model call (#1910).
+    /// See [`ActionWorkLifecycle::resolve_cited_claim`].
+    ///
+    /// [`ActionWorkLifecycle::resolve_cited_claim`]: crate::sekai::action_work_lifecycle::ActionWorkLifecycle::resolve_cited_claim
+    pub fn resolve_cited_claim(
+        &self,
+        claim: crate::sekai::action_work_lifecycle::CitedActionClaim<'_>,
+        caller: &str,
+        namespace: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::action_work_lifecycle::CitedClaimResolution, String> {
+        crate::sekai::action_work_lifecycle::ActionWorkLifecycle::new(&self.inner)
+            .resolve_cited_claim(claim, caller, namespace, now_ms)
+    }
+
     pub fn get_object(&self, id: &str) -> Result<Option<crate::domain::Object>, String> {
         self.inner.get_object(id)
     }

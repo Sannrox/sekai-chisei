@@ -4785,6 +4785,7 @@ async fn wait_for_seeded_gateway_decision(target: &str, default_model: &str, run
         capability_requirements_json: Vec::new(),
         expected_calls: 1,
         pipeline_spec: String::new(),
+        action_claim: None,
     };
     for _ in 0..250 {
         let channel = connect_sekai(target).await.unwrap();

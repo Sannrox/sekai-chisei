@@ -8,6 +8,7 @@
 mod action_approval_adr;
 mod action_binding_adr;
 mod action_binding_backend_conformance;
+mod action_claim_impact_backend_conformance;
 mod action_governance_backend_conformance;
 mod agent_instruction_sync;
 mod autonomous_envelope_adr;

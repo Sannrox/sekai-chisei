@@ -1078,7 +1078,7 @@ fn seed_action_type(db: &RuntimeDb, namespace: &str) -> Result<(), String> {
         declared_effect_kinds: vec![],
         system_one: None,
         review_queue: Default::default(),
-        last_writer_wins_properties: Vec::new(), offline_conflict: String::new(),
+        last_writer_wins_properties: Vec::new(), offline_conflict: String::new(), impact_class: String::new(),
     };
     db.put_governed_action_type(type_def, READER, 1).map(|_| ())
 }

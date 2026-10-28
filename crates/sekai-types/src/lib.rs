@@ -16,6 +16,7 @@ pub mod evolve;
 pub mod governed_subject_provenance;
 pub mod governed_transform;
 pub mod handoff;
+pub mod impact_class;
 pub mod json;
 pub mod lease;
 pub mod lineage;

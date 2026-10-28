@@ -223,6 +223,18 @@ message ExecutionInput {
   // planned model use as they govern gateway decisions. Must not contain
   // `/`.
   string budget_work_unit = 20;
+  // Optional Action Work claim this call serves (#1910).
+  ActionClaimRef action_claim = 21;
+}
+
+// An Action Work claim cited by a model call. The plane resolves it to the
+// claimed Action type's impact class only while the claim is live and held
+// by the authenticated caller; any other claim resolves to unclassified and
+// never raises the class.
+message ActionClaimRef {
+  string effect_id = 1;
+  uint64 claim_generation = 2;
+  string fencing_token = 3;
 }
 
 // Exact identity of a `chisei.learning-change/v1` learning: its ID and the
@@ -294,6 +306,12 @@ message ExecutionPlan {
   uint32 gunshi_max_attempts = 47;
   bool gunshi_human_review_required = 48;
   repeated LearningContextReference learning_references = 49;
+  // Planning-time resolution of input.action_claim (#1910): the impact
+  // class (empty means unclassified) and how the claim resolved: no_claim |
+  // live | not_found | not_live | foreign | unavailable. Execution resolves
+  // the claim again, and the model call records that result.
+  string action_impact_class = 50;
+  string action_claim_resolution = 51;
 }
 
 message EgressDecision {
@@ -873,6 +891,9 @@ message DecideGatewayExecutionRequest {
   // The gateway receives only the governed prepared form needed when a
   // sampled outcome is retained.
   string pipeline_spec = 20;
+  // Optional Action Work claim this call serves (#1910). The decision
+  // record carries its resolution.
+  ActionClaimRef action_claim = 21;
 }
 
 message DecideGatewayExecutionResponse {
