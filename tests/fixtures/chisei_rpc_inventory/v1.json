@@ -678,6 +678,19 @@
       "product_tier": "core"
     },
     {
+      "rpc": "GetBudgetUsage",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_budget_backend_conformance.rs",
+        "crates/sekai-core/src/db/postgres_budget.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.budget"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "SetExternalActionPolicy",
       "kind": "persistent",
       "surfaces": [

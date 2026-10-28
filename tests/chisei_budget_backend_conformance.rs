@@ -95,6 +95,28 @@ fn exercise(db: &dyn BudgetHarness, prefix: &str) {
         .budget_usage(&scope, "tokens", 1_700_000_000_000)
         .unwrap();
     assert_eq!(used, 55);
+
+    // GetBudgetUsage reads the whole chain, tokens and requests per level.
+    // `global` is shared with other runs on the same database, so only the
+    // run's own scope is asserted by value.
+    let levels = db.budget_usage_chain(&scope, 1_700_000_000_000).unwrap();
+    let level = |scope_id: &str, metric: &str| {
+        levels
+            .iter()
+            .find(|level| level.scope_id == scope_id && level.metric == metric)
+            .map(|level| {
+                (
+                    level.used,
+                    level.limit,
+                    level.remaining(),
+                    level.period_type.as_str(),
+                )
+            })
+            .unwrap_or_else(|| panic!("{scope_id} {metric} missing: {levels:?}"))
+    };
+    assert_eq!(levels.len(), 4, "{levels:?}");
+    assert_eq!(level(&scope, "tokens"), (55, Some(100), Some(45), "daily"));
+    assert_eq!(level(&scope, "requests"), (0, None, None, "daily"));
 }
 
 #[test]

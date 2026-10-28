@@ -5225,6 +5225,89 @@ async fn gunshi_scorecards_require_namespace_membership() {
 }
 
 #[tokio::test]
+async fn budget_usage_reads_are_authorized_like_set_budget_limit() {
+    let svc = memory_service();
+    let request = |principal: Option<&str>| {
+        let mut request = Request::new(GetBudgetUsageRequest {
+            project: "acme".into(),
+            agent: "alice".into(),
+            ..Default::default()
+        });
+        if let Some(principal) = principal {
+            request
+                .metadata_mut()
+                .insert("x-principal", principal.parse().unwrap());
+        }
+        request
+    };
+    // Neither the scope's own agent nor the accounting principal may read.
+    for principal in ["alice", "chisei-gateway"] {
+        assert_eq!(
+            svc.get_budget_usage(request(Some(principal)))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied,
+            "{principal}"
+        );
+    }
+    svc.set_budget_limit(Request::new(SetBudgetLimitRequest {
+        project: "acme".into(),
+        max_tokens: 100,
+        period_type: "week".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    svc.budget.record("project:acme/agent:alice", 30);
+
+    let response = svc
+        .get_budget_usage(request(None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.scope_id, "project:acme/agent:alice");
+    let project = response
+        .levels
+        .iter()
+        .find(|level| level.scope_id == "project:acme" && level.metric == "tokens")
+        .unwrap();
+    assert_eq!(
+        (
+            project.used,
+            project.unlimited,
+            project.limit,
+            project.remaining
+        ),
+        (30, false, 100, 70)
+    );
+    assert_eq!(project.period_type, "weekly");
+    let leaf = response
+        .levels
+        .iter()
+        .find(|level| level.scope_id == "project:acme/agent:alice" && level.metric == "requests")
+        .unwrap();
+    assert_eq!(
+        (leaf.used, leaf.unlimited, leaf.limit, leaf.remaining),
+        (0, true, 0, 0)
+    );
+    // Reading changes nothing.
+    let again = svc
+        .get_budget_usage(request(None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.levels, response.levels);
+    assert_eq!(
+        svc.get_budget_usage(Request::new(GetBudgetUsageRequest::default()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+}
+
+#[tokio::test]
 async fn configuration_mutations_require_control_plane_administration() {
     let svc = memory_service();
     let mut budget = Request::new(SetBudgetLimitRequest {

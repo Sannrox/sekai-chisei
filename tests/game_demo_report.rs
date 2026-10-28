@@ -11,7 +11,8 @@
 //! - an audit excerpt (`GetActionInstance`, `ListDecisions`,
 //!   `GetOperationReceipt`) and a lineage excerpt (`ExplainValue`);
 //! - tokens per move, cost per win and savings from routing, priced with
-//!   `fixtures/game_players/prices-v1.json`.
+//!   `fixtures/game_players/prices-v1.json`;
+//! - budget usage and remaining limit after all scenarios (`GetBudgetUsage`).
 //!
 //! The report keeps only fields that are the same on every run: no
 //! timestamps, durations, change or decision ids, paths or hosts. Action
@@ -29,7 +30,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use sekai_chisei::grpc::pb::chisei::GetOperationReceiptRequest;
+use sekai_chisei::grpc::pb::chisei::{GetBudgetUsageRequest, GetOperationReceiptRequest};
 use sekai_chisei::grpc::pb::sekai::{
     ExplainValueRequest, GetActionInstanceRequest, ListDecisionsRequest,
 };
@@ -37,7 +38,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::game_ai_players::{Outcome, Replay, SCENARIOS, SEED, Turn, Verdict, play, start};
+use crate::game_ai_players::{
+    Outcome, PLAYER, Replay, SCENARIOS, SEED, Turn, Verdict, play, start,
+};
 use crate::game_governance_pack::{GovernedGame, pack};
 
 const SCHEMA: &str = "game-ontology.demo-report/v1";
@@ -57,7 +60,11 @@ const RULES: [(&str, &str); 3] = [
 ];
 
 /// How each derived field is computed. Rendered into both forms.
-const METHODS: [(&str, &str); 6] = [
+const METHODS: [(&str, &str); 7] = [
+    (
+        "budgets",
+        "GetBudgetUsage after all scenarios, for the player's user scope, which plan execution charges, and each pack Action budget subject. Each row is the scope's own level in its current period; one server plays every scenario, so usage accumulates.",
+    ),
     (
         "tokens",
         "Input and output tokens of each move's model_called event in its GetOperationReceipt. The replay endpoint reports the same usage for every reply, because the recordings store none.",
@@ -93,14 +100,10 @@ const NORMALIZATION: [&str; 4] = [
 
 /// Report fields the existing public data does not fill, or fills only
 /// approximately.
-const GAPS: [(&str, &str); 4] = [
+const GAPS: [(&str, &str); 3] = [
     (
         "#1866",
         "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices.",
-    ),
-    (
-        "#1870",
-        "No public RPC reads budget usage or remaining limit for a scope; tokens come from operation receipts.",
     ),
     (
         "#1871",
@@ -156,7 +159,20 @@ struct Report {
     normalization: Vec<&'static str>,
     scenarios: Vec<ScenarioReport>,
     totals: Sides<Cost>,
+    budgets: Vec<BudgetReading>,
     gaps: Vec<Gap>,
+}
+
+/// One scope's own budget level for one metric. `None` limit and remaining
+/// mean unlimited.
+#[derive(Serialize)]
+struct BudgetReading {
+    scope: String,
+    metric: String,
+    period_type: String,
+    used: i64,
+    limit: Option<i64>,
+    remaining: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -585,6 +601,47 @@ impl Reader<'_> {
         }
     }
 
+    /// The player's user scope and each pack Action budget subject, read
+    /// through `GetBudgetUsage`.
+    async fn budgets(&self) -> Vec<BudgetReading> {
+        let subjects = pack()["action_budgets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|budget| budget["subject"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let mut readings = Vec::new();
+        for subject in std::iter::once(PLAYER.to_string()).chain(subjects) {
+            let usage = self
+                .game
+                .server
+                .chisei()
+                .await
+                .get_budget_usage(GetBudgetUsageRequest {
+                    subject,
+                    ..Default::default()
+                })
+                .await
+                .expect("budget usage")
+                .into_inner();
+            readings.extend(
+                usage
+                    .levels
+                    .into_iter()
+                    .filter(|level| level.scope_id == usage.scope_id)
+                    .map(|level| BudgetReading {
+                        scope: level.scope_id,
+                        metric: level.metric,
+                        period_type: level.period_type,
+                        used: level.used,
+                        limit: (!level.unlimited).then_some(level.limit),
+                        remaining: (!level.unlimited).then_some(level.remaining),
+                    }),
+            );
+        }
+        readings
+    }
+
     async fn scenario(&self, outcome: &Outcome) -> ScenarioReport {
         let pack = pack();
         let mut players = Vec::new();
@@ -761,6 +818,7 @@ async fn build_report() -> Report {
             governed: totals[0].summary(),
             ungoverned: totals[1].summary(),
         },
+        budgets: reader.budgets().await,
         gaps: GAPS
             .iter()
             .map(|&(issue, gap)| Gap { issue, gap })
@@ -991,6 +1049,25 @@ impl Report {
 
         out.push_str("\n## Totals\n\n");
         cost_table(&mut out, &self.totals.governed, &self.totals.ungoverned);
+
+        out.push_str(
+            "\n## Budgets\n\n\
+             | Scope | Metric | Period | Used | Limit | Remaining |\n\
+             | --- | --- | --- | --- | --- | --- |\n",
+        );
+        for budget in &self.budgets {
+            let bound = |value: Option<i64>| value.map_or("unlimited".into(), |v| v.to_string());
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | {} | {} | {} | {} |",
+                budget.scope,
+                budget.metric,
+                budget.period_type,
+                budget.used,
+                bound(budget.limit),
+                bound(budget.remaining),
+            );
+        }
 
         out.push_str("\n## Methods\n\n");
         for (name, method) in &self.methods {

@@ -179,8 +179,18 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 | Cost at high_impact | 19200 | 19200 |
 | Savings from routing | 18720 | 18720 |
 
+## Budgets
+
+| Scope | Metric | Period | Used | Limit | Remaining |
+| --- | --- | --- | --- | --- | --- |
+| `commander` | tokens | daily | 800 | unlimited | unlimited |
+| `commander` | requests | daily | 0 | unlimited | unlimited |
+| `action:governed/project:game-treasury` | tokens | daily | 2 | 2 | 0 |
+| `action:governed/project:game-treasury` | requests | daily | 0 | unlimited | unlimited |
+
 ## Methods
 
+- `budgets`: GetBudgetUsage after all scenarios, for the player's user scope, which plan execution charges, and each pack Action budget subject. Each row is the scope's own level in its current period; one server plays every scenario, so usage accumulates.
 - `cost`: Each move's tokens priced at the route whose runtime the receipt's route_selected event names, using the fixture price table, in millicredits.
 - `cost_per_win`: Cost divided by wins, rounded to 3 decimals; null without a win.
 - `routing_savings`: Counterfactual: the same tokens priced at the high_impact route, minus the cost. It is not charged spend; no public RPC reads model spend per route.
@@ -198,6 +208,5 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 ## Gaps
 
 - #1866: Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices.
-- #1870: No public RPC reads budget usage or remaining limit for a scope; tokens come from operation receipts.
 - #1871: An Action submission refused by its Action budget leaves no instance, decision record or operation receipt; its audit row is empty.
 - #1872: Chisei has no model price table; cost uses the fixture's illustrative prices. Recorded replies carry no token usage, so tokens per move reflect the replay endpoint.

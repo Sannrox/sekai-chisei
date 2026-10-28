@@ -298,6 +298,41 @@ pub(super) async fn set_budget_limit(
         .map_err(Status::internal)?;
     Ok(Response::new(SetBudgetLimitResponse {}))
 }
+/// Usage, limit and remainder of every level the scope's admission checks.
+/// Authorized like `SetBudgetLimit`: limits and spend of any scope are
+/// control-plane data.
+pub(super) async fn get_budget_usage(
+    service: &ChiseiServiceImpl,
+    req: Request<GetBudgetUsageRequest>,
+) -> Result<Response<GetBudgetUsageResponse>, Status> {
+    require_control_plane_admin(&req, "budget usage read")?;
+    let r = req.into_inner();
+    let scope_id = budget_subject(
+        &r.subject,
+        &r.project,
+        &r.agent,
+        &r.key_id,
+        &r.work_unit,
+        &r.user_id,
+    )?;
+    let levels = service
+        .budget
+        .usage_chain(&scope_id)
+        .map_err(Status::internal)?
+        .into_iter()
+        .map(|level| BudgetScopeUsage {
+            unlimited: level.limit.is_none(),
+            limit: level.limit.unwrap_or_default(),
+            remaining: level.remaining().unwrap_or_default(),
+            scope_id: level.scope_id,
+            metric: level.metric,
+            period_type: level.period_type,
+            period_start: level.period_start,
+            used: level.used,
+        })
+        .collect();
+    Ok(Response::new(GetBudgetUsageResponse { scope_id, levels }))
+}
 pub(super) async fn set_namespace_policy(
     service: &ChiseiServiceImpl,
     req: Request<SetNamespacePolicyRequest>,

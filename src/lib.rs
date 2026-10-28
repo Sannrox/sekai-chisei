@@ -1,6 +1,7 @@
 pub mod action_cli;
 pub mod attest_cli;
 pub mod autonomous_envelope_cli;
+pub mod budget_cli;
 pub mod build_info {
     pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
     pub use sekai_obs::build_info::{GIT_COMMIT, GIT_VERSION};

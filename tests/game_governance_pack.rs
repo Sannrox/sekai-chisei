@@ -11,8 +11,9 @@
 use sekai_chisei::grpc::client::GatewayClient;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
-    DecideGatewayExecutionRequest, DecideGatewayExecutionResponse, RecordUsageRequest,
-    SetBudgetLimitRequest, SetModelFamilyEnablementRequest, SetNamespacePolicyRequest,
+    BudgetScopeUsage, DecideGatewayExecutionRequest, DecideGatewayExecutionResponse,
+    GetBudgetUsageRequest, GetBudgetUsageResponse, RecordUsageRequest, SetBudgetLimitRequest,
+    SetModelFamilyEnablementRequest, SetNamespacePolicyRequest,
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
@@ -131,6 +132,43 @@ pub(crate) struct GovernedGame {
     pub(crate) tokens: HashMap<&'static str, String>,
 }
 
+/// Longest a game test here runs from start to its last budget check.
+const BUDGET_DAY_MARGIN_MS: i64 = 120_000;
+
+/// How long to wait before a test starting at `now_ms` so it runs inside
+/// one daily budget period: zero unless the period ends within `margin_ms`,
+/// otherwise until just after it rolls over (#1868).
+fn wait_for_budget_day(now_ms: i64, margin_ms: i64) -> std::time::Duration {
+    use sekai_chisei::db::chisei_budget::period_start_ms;
+    // The period that contains the end of the margin starts at the rollover.
+    let rollover = period_start_ms("daily", now_ms + margin_ms);
+    if rollover <= now_ms {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_millis((rollover - now_ms + 1_000) as u64)
+}
+
+/// Daily budgets reset at the period boundary; a test that spends before it
+/// and checks after it would see a fresh budget. Start after the boundary.
+async fn settle_budget_day() {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    tokio::time::sleep(wait_for_budget_day(now_ms, BUDGET_DAY_MARGIN_MS)).await;
+}
+
+#[test]
+fn budget_day_wait_is_zero_mid_day_and_crosses_a_near_boundary() {
+    let midnight = chrono::DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    assert_eq!(
+        wait_for_budget_day(midnight - 3_600_000, BUDGET_DAY_MARGIN_MS),
+        std::time::Duration::ZERO
+    );
+    // Five seconds before midnight: wait past it, into the next period.
+    let wait = wait_for_budget_day(midnight - 5_000, BUDGET_DAY_MARGIN_MS);
+    assert_eq!(wait, std::time::Duration::from_millis(6_000));
+}
+
 impl GovernedGame {
     async fn start() -> Self {
         Self::start_with_env(&[]).await
@@ -139,6 +177,7 @@ impl GovernedGame {
     /// Like [`Self::start`], with extra server environment such as a model
     /// endpoint.
     pub(crate) async fn start_with_env(env: &[(&str, &str)]) -> Self {
+        settle_budget_day().await;
         let server = LoopServer::spawn_with_env(&Backend::Sqlite, env);
         let logs = || server.logs();
         let pack = pack();
@@ -511,6 +550,7 @@ const PLAYER: &str = "red";
 
 impl RoutedGame {
     async fn start() -> Self {
+        settle_budget_day().await;
         // `native` is the local model runtime and `openai` the expensive one.
         // Neither endpoint is contacted: a decision never calls a provider.
         let server = LoopServer::spawn_with_env(
@@ -733,4 +773,165 @@ async fn an_exhausted_day_budget_is_a_hard_stop() {
         assert_eq!(stopped.deny_reason, "budget_denied", "{route}");
         assert_eq!(stopped.budget_scope, format!("agent:{PLAYER}"), "{route}");
     }
+}
+
+/// The level of `usage` for `scope` and `metric`, as (used, limit, remaining);
+/// `None` limit and remaining for an unlimited level.
+fn level(
+    usage: &GetBudgetUsageResponse,
+    scope: &str,
+    metric: &str,
+) -> (i64, Option<i64>, Option<i64>) {
+    let found: &BudgetScopeUsage = usage
+        .levels
+        .iter()
+        .find(|level| level.scope_id == scope && level.metric == metric)
+        .unwrap_or_else(|| panic!("no {scope} {metric} level: {usage:?}"));
+    if found.unlimited {
+        (found.used, None, None)
+    } else {
+        (found.used, Some(found.limit), Some(found.remaining))
+    }
+}
+
+/// Reads model budgets through `GetBudgetUsage` and through the operator
+/// CLI, which must agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn budget_usage_reads_model_spend_per_scope_level() {
+    let game = RoutedGame::start().await;
+    game.open_turn("turn-1").await;
+
+    // A decision charges nothing; settled usage does. The refused decision
+    // asks for more than the turn has left and charges nothing either.
+    let admitted = game.decide("routine", "turn-1", 100).await;
+    assert!(admitted.admitted, "{admitted:?}");
+    game.spend("routine", "turn-1", "tokens", 3900).await;
+    game.spend("routine", "turn-1", "requests", 1).await;
+    game.spend("high_impact", "turn-1", "tokens", 500).await;
+    let refused = game.decide("routine", "turn-1", 200).await;
+    assert!(!refused.admitted, "{refused:?}");
+    assert_eq!(refused.deny_reason, "budget_denied");
+
+    let request = GetBudgetUsageRequest {
+        project: game.namespace("routine"),
+        agent: PLAYER.into(),
+        work_unit: "turn-1".into(),
+        ..Default::default()
+    };
+    let usage = game
+        .chisei
+        .clone()
+        .get_budget_usage(request.clone())
+        .await
+        .unwrap_or_else(|error| panic!("budget usage: {error}\n{}", game.server.logs()))
+        .into_inner();
+    let turn = format!("project:game/agent:{PLAYER}/work_unit:turn-1");
+    assert_eq!(usage.scope_id, turn);
+    // Turn: the routine route's own work unit.
+    assert_eq!(
+        level(&usage, &turn, "tokens"),
+        (3900, Some(4000), Some(100))
+    );
+    assert_eq!(level(&usage, &turn, "requests"), (1, Some(6), Some(5)));
+    // Day: the flat agent scope every route charges.
+    let day = format!("agent:{PLAYER}");
+    assert_eq!(
+        level(&usage, &day, "tokens"),
+        (4400, Some(40_000), Some(35_600))
+    );
+    assert_eq!(level(&usage, &day, "requests"), (1, Some(40), Some(39)));
+    // Project and agent-in-project have no limit but report their charge.
+    assert_eq!(level(&usage, "project:game", "tokens"), (3900, None, None));
+    assert_eq!(
+        level(&usage, &format!("project:game/agent:{PLAYER}"), "tokens"),
+        (3900, None, None)
+    );
+
+    let cli: serde_json::Value = serde_json::from_str(&game.server.sekaictl_ok(&[
+        "admin",
+        "governance",
+        "budget",
+        "usage",
+        "--project",
+        "game",
+        "--agent",
+        PLAYER,
+        "--work-unit",
+        "turn-1",
+        "--json",
+    ]))
+    .expect("budget usage json");
+    let cli_turn = cli["levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|level| level["scope_id"] == turn.as_str() && level["metric"] == "tokens")
+        .unwrap_or_else(|| panic!("{cli}"));
+    assert_eq!(
+        (cli_turn["used"].as_i64(), cli_turn["remaining"].as_i64()),
+        (Some(3900), Some(100))
+    );
+
+    // The player itself may not read its budget: the read is authorized like
+    // SetBudgetLimit.
+    let denied = game
+        .chisei
+        .clone()
+        .get_budget_usage(bearer(&game.server.token(PLAYER), request))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");
+}
+
+/// Reads an Action budget through `GetBudgetUsage` after admitted and
+/// refused submissions.
+#[tokio::test(flavor = "multi_thread")]
+async fn budget_usage_reads_action_budget_per_scope_level() {
+    let game = GovernedGame::start().await;
+    let spend = |amount: i64| json!({"object_id": "t-main", "spend": amount});
+    for (key, amount) in [("usage-1", 100), ("usage-2", 200)] {
+        let admitted = game.submit("game.treasury.spend", key, spend(amount)).await;
+        assert_eq!(admitted.status, "admitted", "{admitted:?}");
+    }
+    let refused = game
+        .try_submit("game.treasury.spend", "usage-3", spend(50))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+
+    let leaf = "action:governed/project:game-treasury/agent:commander";
+    let usage = game
+        .server
+        .chisei()
+        .await
+        .get_budget_usage(GetBudgetUsageRequest {
+            subject: leaf.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("budget usage: {error}\n{}", game.server.logs()))
+        .into_inner();
+    // The pack's daily cap of two spends sits on the treasury project.
+    assert_eq!(
+        level(&usage, "action:governed/project:game-treasury", "tokens"),
+        (2, Some(2), Some(0))
+    );
+    assert_eq!(level(&usage, "action:governed", "tokens"), (2, None, None));
+    assert_eq!(level(&usage, leaf, "tokens"), (2, None, None));
+    assert_eq!(level(&usage, leaf, "requests"), (0, None, None));
+
+    let denied = game
+        .server
+        .chisei()
+        .await
+        .get_budget_usage(bearer(
+            &game.tokens["commander"],
+            GetBudgetUsageRequest {
+                subject: leaf.into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");
 }
