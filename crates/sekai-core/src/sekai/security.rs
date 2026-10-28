@@ -104,8 +104,10 @@ impl SecurityChecker {
         let map = self.grants.read().unwrap();
         let m = match map.get(object_id) {
             Some(m) => m,
-            None => return true,
-        }; // no ACL = world-readable
+            // No ACL is world-readable, except a scratch output (ADR 0138):
+            // another plane may hold its grant, so this cache fails closed.
+            None => return !crate::sekai::adhoc_transform::is_scratch_object_id(object_id),
+        };
         principals
             .iter()
             .any(|p| m.get(*p).is_some_and(|(_, until)| grant_live(*until)))
@@ -115,7 +117,7 @@ impl SecurityChecker {
         let map = self.grants.read().unwrap();
         let m = match map.get(object_id) {
             Some(m) => m,
-            None => return true,
+            None => return !crate::sekai::adhoc_transform::is_scratch_object_id(object_id),
         };
         principals.iter().any(|p| {
             matches!(
@@ -413,6 +415,29 @@ impl SekaiDb {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_uncached_scratch_output_fails_closed() {
+        let checker = SecurityChecker::new();
+        let scratch = format!("scratch-{}-object", "a".repeat(32));
+        assert!(!checker.can_access(&scratch, &["anyone"]));
+        assert!(!checker.can_write(&scratch, &["anyone"]));
+        assert!(
+            checker.can_access("ordinary", &["anyone"]),
+            "no ACL stays open"
+        );
+        checker.add_grant(&Grant {
+            id: "g".into(),
+            object_id: scratch.clone(),
+            principal: "ana".into(),
+            role: Role::Admin,
+            created: 0,
+            ..Default::default()
+        });
+        assert!(checker.can_access(&scratch, &["ana"]));
+        assert!(!checker.can_access(&scratch, &["bo"]));
+    }
+
     use super::*;
 
     #[test]

@@ -4252,33 +4252,21 @@ pub(super) fn caller_can_read_run_datasets(
     principals: &[String],
     run: &crate::sekai::governed_transform::TransformRun,
 ) -> bool {
-    let transform = if run.profile == crate::sekai::governed_transform::ISOLATED_CLASS {
-        service
-            .db
-            .runtime()
-            .admitted_isolated_transform(&run.run_id)
-            .ok()
-            .flatten()
-    } else {
-        service
-            .db
-            .runtime()
-            .get_governed_transform(&run.namespace, &run.transform_id)
-            .ok()
-            .flatten()
-    };
-    let Some(transform) = transform else {
-        return false;
-    };
-    if transform.definition_digest != run.definition_digest {
-        return false;
-    }
-    let mut dataset_ids: Vec<String> = transform
-        .input_bindings()
-        .into_iter()
-        .map(|(_, dataset_id)| dataset_id)
-        .collect();
-    dataset_ids.push(transform.output_dataset_id);
+    // An ad-hoc run (ADR 0138) has no catalog definition; its inputs are
+    // the datasets it pinned and its output is its scratch dataset.
+    let dataset_ids: Vec<String> =
+        if run.trigger_cause == crate::sekai::adhoc_transform::TRANSFORM_TRIGGER_ADHOC {
+            run.input_versions
+                .keys()
+                .cloned()
+                .chain([run.transform_id.clone()])
+                .collect()
+        } else {
+            match catalog_run_datasets(service, run) {
+                Some(dataset_ids) => dataset_ids,
+                None => return false,
+            }
+        };
     for dataset_id in dataset_ids {
         let Ok(Some(dataset)) = service.db.runtime().get_dataset(&dataset_id) else {
             return false;
@@ -4296,6 +4284,39 @@ pub(super) fn caller_can_read_run_datasets(
         }
     }
     true
+}
+
+/// The input and output datasets of a run's catalog definition, when the
+/// definition the run used is still the stored one.
+fn catalog_run_datasets(
+    service: &SekaiServiceImpl,
+    run: &crate::sekai::governed_transform::TransformRun,
+) -> Option<Vec<String>> {
+    let transform = if run.profile == crate::sekai::governed_transform::ISOLATED_CLASS {
+        service
+            .db
+            .runtime()
+            .admitted_isolated_transform(&run.run_id)
+            .ok()
+            .flatten()
+    } else {
+        service
+            .db
+            .runtime()
+            .get_governed_transform(&run.namespace, &run.transform_id)
+            .ok()
+            .flatten()
+    }?;
+    if transform.definition_digest != run.definition_digest {
+        return None;
+    }
+    let mut dataset_ids: Vec<String> = transform
+        .input_bindings()
+        .into_iter()
+        .map(|(_, dataset_id)| dataset_id)
+        .collect();
+    dataset_ids.push(transform.output_dataset_id);
+    Some(dataset_ids)
 }
 
 fn to_proto_partition(
