@@ -1262,6 +1262,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         granted.decided_at_ms = now;
         granted.decided_by = decider.to_string();
         granted.approval_decision = DECISION_GRANT.into();
+        expect_decision_follow_ups(&mut granted, instance.budget_decision != "deferred");
         // Do not re-check deferred budget here. Combined Split already reserved
         // before admit; production decide passes no budget port. A second check
         // would double-charge or deny reserved RequireApproval parks.
@@ -1369,6 +1370,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         if denied.budget_decision == "deferred" {
             denied.budget_decision = "not_applicable".into();
         }
+        expect_decision_follow_ups(&mut denied, true);
         if !self
             .db
             .decide_parked_action_instance(&denied)
@@ -1398,15 +1400,6 @@ impl<'a> ActionInstanceAdmission<'a> {
             now,
         )?;
         self.remember_decision(&denied, approval.reason)?;
-        crate::sekai::agent_autonomy::revoke_if_granted(
-            self.db,
-            approval.decider,
-            &denied.namespace,
-            &denied.principal,
-            &denied.type_id,
-            now,
-        )
-        .map_err(ActionInstanceAdmissionError::Internal)?;
         Ok(ActionInstanceAdmissionOutcome {
             object_revision: None,
             instance: denied,
@@ -1555,6 +1548,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ActionInstanceAdmissionError::Internal("decided instance vanished".into())
             })?;
         if current.approval_decision == decision {
+            self.resume_decision_follow_ups(&current)?;
             if current.status == STATUS_ADMITTED
                 && let Some(object) = object_for_admitted_instance(self.db, &current)?
             {
@@ -1777,6 +1771,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         {
             self.resume_follow_ups(&existing, &receipt)?;
         }
+        self.resume_decision_follow_ups(&existing)?;
         if existing.status == STATUS_ADMITTED
             && let Some(object) = object_for_admitted_instance(self.db, &existing)?
         {
@@ -2138,12 +2133,18 @@ impl<'a> ActionInstanceAdmission<'a> {
                         decision.timestamp,
                     )
                 });
+            // The charge stays outstanding for the resume (#1943, #1948). A
+            // decision on a legacy reservation is never resumed, so it keeps
+            // its earlier behaviour: the grant stands and the failure is
+            // logged.
+            let resumable = !approver_decision
+                || stored
+                    .admission_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.decision_follow_ups_recorded.is_some());
             match charged {
                 Ok(()) => {}
-                // A submit's charge stays outstanding for its resume.
-                Err(error) if !approver_decision => return Err(internal(error)),
-                // An approver's decision is not resumed yet, so its charge
-                // stays best-effort, as before #1943; the grant stands.
+                Err(error) if resumable => return Err(internal(error)),
                 Err(error) => tracing::error!(
                     operation_id = %stored.operation_id,
                     error = %error,
@@ -2151,8 +2152,6 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ),
             }
         }
-        // Effects follow the charge: an approval is not resumed yet, so its
-        // charge must not wait on them.
         if stored.status == STATUS_ADMITTED {
             let effects = planned_effects
                 .ok_or_else(|| internal("admitted instance effects missing".into()))?;
@@ -2160,25 +2159,28 @@ impl<'a> ActionInstanceAdmission<'a> {
                 .put_missing_action_effects(effects)
                 .map_err(internal)?;
         }
-        if !approver_decision {
-            // A denied submit withdraws the principal's autonomy grant.
-            if stored.status == STATUS_DENIED {
-                crate::sekai::agent_autonomy::revoke_if_granted_before(
-                    self.db,
-                    &decision.actor,
-                    &stored.namespace,
-                    &stored.principal,
-                    &stored.type_id,
-                    decision.timestamp,
-                    decision.timestamp,
-                )
-                .map_err(internal)?;
-            }
+        // A denial withdraws the principal's autonomy grant, as it stood
+        // when denied.
+        if stored.status == STATUS_DENIED {
+            crate::sekai::agent_autonomy::revoke_if_granted_before(
+                self.db,
+                &decision.actor,
+                &stored.namespace,
+                &stored.principal,
+                &stored.type_id,
+                decision.timestamp,
+                decision.timestamp,
+            )
+            .map_err(internal)?;
+        }
+        if approver_decision {
+            self.db
+                .mark_decision_follow_ups_recorded(&stored.instance_id)
+        } else {
             self.db
                 .mark_admission_follow_ups_recorded(&stored.instance_id)
-                .map_err(internal)?;
         }
-        Ok(())
+        .map_err(internal)
     }
 
     /// Finishes a parked submit's outstanding follow-ups before anything
@@ -2259,6 +2261,111 @@ impl<'a> ActionInstanceAdmission<'a> {
             effects.as_deref(),
             false,
         )
+    }
+}
+
+impl ActionInstanceAdmission<'_> {
+    /// Finishes an approver decision's follow-ups when its lease says they
+    /// are outstanding (#1948): a crash or failure after the decision's
+    /// receipt. They are rebuilt from the decided instance and the receipt's
+    /// approval event, at that event's time and as its decider.
+    fn resume_decision_follow_ups(
+        &self,
+        stored: &ActionInstance,
+    ) -> Result<(), ActionInstanceAdmissionError> {
+        let internal = ActionInstanceAdmissionError::Internal;
+        let Some(lease) = stored
+            .admission_lease
+            .as_ref()
+            .filter(|lease| lease.decision_follow_ups_recorded == Some(false))
+        else {
+            return Ok(());
+        };
+        let Some(receipt) = self
+            .db
+            .get_operation_receipt(&stored.operation_id)
+            .map_err(internal)?
+        else {
+            return Ok(());
+        };
+        // The decision's receipt is not recorded yet: nothing to finish.
+        let Some(approved) = receipt
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == ReceiptEventKind::ApprovalDecided)
+        else {
+            return Ok(());
+        };
+        let intent = receipt
+            .events
+            .first()
+            .ok_or_else(|| internal("decision receipt has no intent".into()))?;
+        let attribute = |key: &str| intent.attributes.get(key).map(String::as_str);
+        let admitted = match (
+            attribute("object_id"),
+            attribute("object_kind"),
+            attribute("object_mutation"),
+        ) {
+            (Some(id), Some(kind), Some(mutation)) => Some(AdmittedObject { id, kind, mutation }),
+            _ => None,
+        };
+        let decision_value = approved
+            .attributes
+            .get("decision")
+            .map(String::as_str)
+            .unwrap_or(&stored.approval_decision);
+        let approval = ApprovalRecord {
+            decider: &approved.actor,
+            decision: decision_value,
+            reason: approved
+                .attributes
+                .get("reason")
+                .map(String::as_str)
+                .unwrap_or_default(),
+        };
+        let now = approved.timestamp_ms;
+        let decision = admission_decision(stored, &approved.actor, admitted, Some(&approval), now);
+        let type_def = self
+            .db
+            .get_governed_action_type(&stored.namespace, &stored.type_id, &stored.version)
+            .map_err(internal)?
+            .ok_or_else(|| internal("action type of a decided instance is gone".into()))?;
+        let (budget_subject, budget_amount) = if stored.status == STATUS_ADMITTED {
+            type_def
+                .budget_charge(
+                    &stored.namespace,
+                    &stored.principal,
+                    &stored.parameters_json,
+                )
+                .map_err(ActionInstanceAdmissionError::InvalidArgument)?
+        } else {
+            (String::new(), 0)
+        };
+        let effects = plan_admission_effects(&type_def, stored, now)?;
+        self.finish_admission(
+            stored,
+            &decision,
+            &budget_subject,
+            budget_amount,
+            lease.decision_budget_reserved.unwrap_or(true),
+            effects.as_deref(),
+            true,
+        )
+    }
+}
+
+/// Marks a decided instance's follow-ups outstanding until recorded
+/// (#1948). A lease from an older binary, or none, is left as it is: its
+/// decision is not resumed.
+fn expect_decision_follow_ups(decided: &mut ActionInstance, budget_reserved: bool) {
+    if let Some(lease) = decided
+        .admission_lease
+        .as_mut()
+        .filter(|lease| lease.follow_ups_recorded.is_some())
+    {
+        lease.decision_follow_ups_recorded = Some(false);
+        lease.decision_budget_reserved = Some(budget_reserved);
     }
 }
 
@@ -6382,6 +6489,105 @@ mod tests {
             finished.admission_lease.unwrap().follow_ups_recorded,
             Some(true)
         );
+    }
+
+    /// A crash after an approver's decision receipt leaves its follow-ups
+    /// to the replayed decision, which records the decide record, the
+    /// effects and the charge exactly once (#1948).
+    fn decision_follow_ups_are_finished_exactly_once(db: &RuntimeDb) {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let namespace = format!("decided-{suffix}");
+        let mut type_def = dispatch_type(&namespace);
+        type_def.approvers = vec!["bob".into()];
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all(&namespace);
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let mut submit = request(r#"{"runtime":"shikigami"}"#);
+        submit.namespace = namespace.clone();
+        submit.idempotency_key = format!("decided-{suffix}");
+        // Parked without a budget port: the charge is deferred to the grant.
+        let parked = ActionInstanceAdmission::new(db, None)
+            .admit(submit, "alice", 10)
+            .unwrap()
+            .instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(10),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+            keys: Default::default(),
+        };
+        let admission = ActionInstanceAdmission::new(db, Some(&budget));
+        let decide_id = format!("{}:decide", parked.operation_id);
+        let recorded = || budget.recorded.load(std::sync::atomic::Ordering::SeqCst);
+        let effects = || {
+            db.list_action_effects_for_instance(&parked.instance_id)
+                .unwrap()
+                .len()
+        };
+        crash_next_admission(CrashPoint::AfterReceipt);
+        assert!(
+            admission
+                .decide(
+                    decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                    "bob",
+                    20
+                )
+                .is_err()
+        );
+        let decided = db
+            .get_action_instance(&parked.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decided.status, STATUS_ADMITTED);
+        assert_eq!(
+            decided
+                .admission_lease
+                .as_ref()
+                .unwrap()
+                .decision_follow_ups_recorded,
+            Some(false)
+        );
+        assert!(db.get_decision(&decide_id).unwrap().is_none());
+        assert_eq!((effects(), recorded()), (0, 0));
+
+        for now in [30, 40] {
+            let replayed = admission
+                .decide(
+                    decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                    "bob",
+                    now,
+                )
+                .unwrap();
+            assert!(replayed.replay);
+            let record = db.get_decision(&decide_id).unwrap().expect("decide record");
+            assert_eq!((record.actor.as_str(), record.timestamp), ("bob", 20));
+            assert_eq!((effects(), recorded()), (1, 1));
+        }
+        let finished = db
+            .get_action_instance(&parked.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            finished
+                .admission_lease
+                .unwrap()
+                .decision_follow_ups_recorded,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sqlite_decision_follow_ups_are_finished_exactly_once() {
+        decision_follow_ups_are_finished_exactly_once(&setup());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL test database"]
+    fn postgres_decision_follow_ups_are_finished_exactly_once() {
+        decision_follow_ups_are_finished_exactly_once(&postgres_runtime());
     }
 
     #[test]

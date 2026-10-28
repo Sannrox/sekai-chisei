@@ -150,6 +150,15 @@ pub struct AdmissionLease {
     /// idempotent, so they are never resumed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_ups_recorded: Option<bool>,
+    /// The same for an approver's decision on a parked instance (#1948):
+    /// `Some(false)` from the decision's write until its decision record,
+    /// budget charge, effects and revocation are recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_follow_ups_recorded: Option<bool>,
+    /// Whether the decided admission's charge was already reserved before it
+    /// parked, so its decision charges nothing (#1948).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_budget_reserved: Option<bool>,
 }
 
 /// Wall-clock milliseconds. Leases run on the wall clock, not on the
@@ -175,6 +184,8 @@ impl AdmissionLease {
             receipt_recorded: self.receipt_recorded,
             written_object_digest: self.written_object_digest.clone(),
             follow_ups_recorded: self.follow_ups_recorded,
+            decision_follow_ups_recorded: self.decision_follow_ups_recorded,
+            decision_budget_reserved: self.decision_budget_reserved,
         }
     }
 
@@ -193,6 +204,8 @@ impl AdmissionLease {
             receipt_recorded: Some(false),
             written_object_digest: None,
             follow_ups_recorded: Some(false),
+            decision_follow_ups_recorded: None,
+            decision_budget_reserved: None,
         }
     }
 
@@ -1079,6 +1092,22 @@ impl SekaiDb {
         Ok(updated == 1)
     }
 
+    /// Marks an approver decision's follow-ups recorded (#1948); see
+    /// [`Self::mark_admission_follow_ups_recorded`].
+    pub fn mark_decision_follow_ups_recorded(&self, instance_id: &str) -> Result<(), String> {
+        self.migrate_action_instances()?;
+        self.conn()
+            .execute(
+                "UPDATE sekai_action_instances
+                 SET body_json = json_set(body_json, '$.admission_lease.decision_follow_ups_recorded', json('true'))
+                 WHERE instance_id = ?1
+                   AND json_extract(body_json, '$.admission_lease.decision_follow_ups_recorded') = 0",
+                params![instance_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// Marks the admission's follow-ups recorded (#1943). Idempotent, and
     /// unfenced: whoever finished them may say so.
     pub fn mark_admission_follow_ups_recorded(&self, instance_id: &str) -> Result<(), String> {
@@ -1306,6 +1335,8 @@ mod tests {
             receipt_recorded: Some(false),
             written_object_digest: None,
             follow_ups_recorded: Some(false),
+            decision_follow_ups_recorded: None,
+            decision_budget_reserved: None,
         };
         current_instance.admission_lease = Some(current.clone());
         db.delete_action_instance(&instance_id).unwrap();
@@ -1511,6 +1542,8 @@ mod tests {
             receipt_recorded: Some(false),
             written_object_digest: None,
             follow_ups_recorded: Some(false),
+            decision_follow_ups_recorded: None,
+            decision_budget_reserved: None,
         };
         assert!(lease.holds(Some("a"), Some(2), Some(1_000), None));
         assert!(!lease.holds(Some("b"), Some(2), Some(1_000), None));
