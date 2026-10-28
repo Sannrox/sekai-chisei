@@ -74,6 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "action" => {
             sekai_chisei::action_cli::run_action_command(args.into_iter().skip(1).collect()).await
         }
+        "budget" => {
+            sekai_chisei::budget_cli::run_budget_command(args.into_iter().skip(1).collect()).await
+        }
         "attest" => {
             sekai_chisei::attest_cli::run_attest_command(args.into_iter().skip(1).collect()).await
         }
@@ -510,6 +513,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("access"), Some("team")) => ("team", 3),
         (Some("gateway"), _) => ("gateway", 2),
         (Some("governance"), Some("action")) => ("action", 3),
+        (Some("governance"), Some("budget")) => ("budget", 3),
         (Some("governance"), Some("memory")) => ("memory", 3),
         (Some("governance"), Some("gunshi")) => ("gunshi", 3),
         (Some("governance"), Some("subject")) => ("governed-subject", 3),
@@ -704,7 +708,7 @@ fn print_admin_usage() {
            sekaictl admin gateway ...\n\
          \n\
          Governance:\n\
-           sekaictl admin governance <action|memory|gunshi|subject> ...\n\
+           sekaictl admin governance <action|budget|memory|gunshi|subject> ...\n\
          \n\
          Evaluation:\n\
            sekaictl admin evaluation plan ...\n\
@@ -792,6 +796,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "unmarked" => Some(sekai_chisei::unmarked_cli::usage().to_string()),
         "gateway" => Some(gateway_usage()),
         "action" => Some(sekai_chisei::action_cli::usage().to_string()),
+        "budget" => Some(sekai_chisei::budget_cli::usage().to_string()),
         "memory" => Some(sekai_chisei::memory_cli::usage().to_string()),
         "gunshi" => Some(sekai_chisei::gunshi_cli::usage().to_string()),
         "governed-subject" => Some(sekai_chisei::governed_subject_cli::usage().to_string()),
@@ -905,6 +910,7 @@ mod tests {
             (vec!["access", "team"], "team"),
             (vec!["gateway"], "gateway"),
             (vec!["governance", "action"], "action"),
+            (vec!["governance", "budget"], "budget"),
             (vec!["governance", "memory"], "memory"),
             (vec!["governance", "gunshi"], "gunshi"),
             (vec!["governance", "subject"], "governed-subject"),
@@ -968,6 +974,7 @@ mod tests {
             "team",
             "gateway",
             "action",
+            "budget",
             "memory",
             "gunshi",
             "governed-subject",

@@ -2867,6 +2867,19 @@ impl RuntimeDb {
         }
     }
 
+    pub fn budget_usage_chain(
+        &self,
+        scope_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<crate::db::chisei_budget::BudgetScopeUsage>, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_usage_chain(scope_id, now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.budget_usage_chain(scope_id, now_ms))
+            }
+        }
+    }
+
     pub fn cancel_work_unit(
         &self,
         work_unit_id: &str,

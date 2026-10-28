@@ -25,6 +25,7 @@
     }
   ],
   "methods": {
+    "budgets": "GetBudgetUsage after all scenarios, for the player's user scope, which plan execution charges, and each pack Action budget subject. Each row is the scope's own level in its current period; one server plays every scenario, so usage accumulates.",
     "cost": "Each move's tokens priced at the route whose runtime the receipt's route_selected event names, using the fixture price table, in millicredits.",
     "cost_per_win": "Cost divided by wins, rounded to 3 decimals; null without a win.",
     "routing_savings": "Counterfactual: the same tokens priced at the high_impact route, minus the cost. It is not charged spend; no public RPC reads model spend per route.",
@@ -958,14 +959,44 @@
       "routing_savings_millicredits": 18720
     }
   },
+  "budgets": [
+    {
+      "scope": "commander",
+      "metric": "tokens",
+      "period_type": "daily",
+      "used": 800,
+      "limit": null,
+      "remaining": null
+    },
+    {
+      "scope": "commander",
+      "metric": "requests",
+      "period_type": "daily",
+      "used": 0,
+      "limit": null,
+      "remaining": null
+    },
+    {
+      "scope": "action:governed/project:game-treasury",
+      "metric": "tokens",
+      "period_type": "daily",
+      "used": 2,
+      "limit": 2,
+      "remaining": 0
+    },
+    {
+      "scope": "action:governed/project:game-treasury",
+      "metric": "requests",
+      "period_type": "daily",
+      "used": 0,
+      "limit": null,
+      "remaining": null
+    }
+  ],
   "gaps": [
     {
       "issue": "#1866",
       "gap": "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices."
-    },
-    {
-      "issue": "#1870",
-      "gap": "No public RPC reads budget usage or remaining limit for a scope; tokens come from operation receipts."
     },
     {
       "issue": "#1871",

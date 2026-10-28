@@ -54,7 +54,7 @@ pub(crate) const SEED: u64 = 1855;
 /// The ungoverned player's namespace, for both its model calls and Actions.
 const FREE: &str = "game-free";
 /// Both players act as the pack's acting agent.
-const PLAYER: &str = "commander";
+pub(crate) const PLAYER: &str = "commander";
 
 /// One recorded model reply.
 #[derive(Clone, Serialize, Deserialize)]

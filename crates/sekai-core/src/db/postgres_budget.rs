@@ -1,5 +1,6 @@
 use crate::db::chisei_budget::{
-    BudgetTransferRecord, parent_scope_id, period_start_ms, scope_chain,
+    BUDGET_METRICS, BudgetScopeUsage, BudgetTransferRecord, UNLIMITED_PERIOD_TYPE, parent_scope_id,
+    period_start_ms, scope_chain,
 };
 use crate::db::postgres::PostgresDb;
 
@@ -592,6 +593,59 @@ impl PostgresDb {
             .map(|row| row.get(0))
             .unwrap_or(0_i64);
         Ok((used, max_amount, period_type))
+    }
+
+    /// Usage of every scope in the chain of `scope_id`, for each metric in
+    /// [`BUDGET_METRICS`], read in one repeatable-read snapshot.
+    pub fn budget_usage_chain(
+        &self,
+        scope_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<BudgetScopeUsage>, String> {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(|error| error.to_string())?;
+        let mut levels = Vec::new();
+        for scope in scope_chain(scope_id) {
+            for metric in BUDGET_METRICS {
+                let limit: Option<(i64, String)> = transaction
+                    .query_opt(
+                        "SELECT max_amount, period_type FROM chisei_budget_limits
+                         WHERE scope_id = $1 AND metric = $2",
+                        &[&scope, &metric],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .map(|row| (row.get(0), row.get(1)));
+                let period_type = limit
+                    .as_ref()
+                    .map_or(UNLIMITED_PERIOD_TYPE, |(_, period)| period.as_str())
+                    .to_string();
+                let period_start = period_start_ms(&period_type, now_ms);
+                let used = transaction
+                    .query_opt(
+                        "SELECT amount_used FROM chisei_budget_usage
+                         WHERE scope_id = $1 AND metric = $2 AND period_start = $3",
+                        &[&scope, &metric, &period_start],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .map(|row| row.get(0))
+                    .unwrap_or(0_i64);
+                levels.push(BudgetScopeUsage {
+                    scope_id: scope.clone(),
+                    metric: metric.to_string(),
+                    period_type,
+                    period_start,
+                    used,
+                    limit: limit.map(|(max_amount, _)| max_amount),
+                });
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(levels)
     }
 
     pub fn budget_namespace_pressure(
