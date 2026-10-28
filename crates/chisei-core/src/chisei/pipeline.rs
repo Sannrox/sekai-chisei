@@ -60,6 +60,10 @@ pub struct PipelineRequest {
     pub risk_score_ready: bool,
     pub risk_signals: Vec<String>,
     pub operation_risk_override: Option<OperationRisk>,
+    /// Impact class resolved at planning or decide from the Action Work
+    /// claim the call cites (#1910); execution resolves the claim again. Routing by impact class (#1861) reads `action_impact.class()`;
+    /// `None` is unclassified.
+    pub action_impact: crate::chisei::action_impact::ActionImpact,
     /// Read port for Sekai facts (context objects, grants, schemas, links).
     /// Combined and Chisei processes always have an attached Sekai.
     pub sekai_facts: SekaiFacts,
@@ -2351,6 +2355,7 @@ pub fn test_request(sekai_facts: SekaiFacts) -> PipelineRequest {
         risk_score_ready: false,
         risk_signals: vec![],
         operation_risk_override: None,
+        action_impact: Default::default(),
         pinned_learning: None,
         sekai_facts,
     }

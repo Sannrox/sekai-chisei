@@ -252,10 +252,11 @@ impl ChiseiServiceImpl {
             cached.clone()
         };
         let plan = cached.plan;
-        let execution = plan
+        let mut execution = plan
             .execution
             .clone()
             .ok_or_else(|| Status::data_loss("cached content execution plan is invalid"))?;
+        self.reresolve_action_impact(&mut execution, &actor);
         if !execution.executable {
             return Err(Status::failed_precondition(
                 "content execution plan is not executable",

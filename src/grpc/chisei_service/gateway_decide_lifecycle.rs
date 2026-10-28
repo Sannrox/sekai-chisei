@@ -52,6 +52,14 @@ impl ChiseiServiceImpl {
             });
         }
 
+        let action_impact = crate::chisei::action_impact::ActionImpact::resolve(
+            self.sekai_facts.reader(),
+            r.action_claim
+                .as_ref()
+                .map(super::execution_planning::action_claim_ref),
+            &actor,
+            namespace,
+        );
         let domain_request = GatewayDecideRequest {
             contract_version: r.contract_version.clone(),
             namespace: namespace.into(),
@@ -371,6 +379,7 @@ impl ChiseiServiceImpl {
                 model: &response.resolved_model,
                 runtime: &response.resolved_runtime,
                 task_class: &r.task_class,
+                action_impact: &action_impact,
             }) {
                 Ok(decision) => {
                     response.sampling_evaluated = true;
@@ -397,6 +406,22 @@ impl ChiseiServiceImpl {
             }
         }
 
+        let mut evidence = std::collections::HashMap::from([
+            ("namespace".into(), namespace.into()),
+            (
+                "correlation_operation_id".into(),
+                domain_request.correlation_operation_id.clone(),
+            ),
+            ("admitted".into(), response.admitted.to_string()),
+            ("deny_reason".into(), response.deny_reason.clone()),
+            ("resolved_model".into(), response.resolved_model.clone()),
+            ("budget_scope".into(), response.budget_scope.clone()),
+            (
+                "contract_version".into(),
+                GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+            ),
+        ]);
+        evidence.extend(action_impact.record_attributes());
         let _ = self.db.record_decision(&crate::sekai::audit::Decision {
             id: format!(
                 "gateway-decide:{}:{}:{}",
@@ -412,21 +437,7 @@ impl ChiseiServiceImpl {
             } else {
                 response.deny_message.clone()
             },
-            evidence: std::collections::HashMap::from([
-                ("namespace".into(), namespace.into()),
-                (
-                    "correlation_operation_id".into(),
-                    domain_request.correlation_operation_id.clone(),
-                ),
-                ("admitted".into(), response.admitted.to_string()),
-                ("deny_reason".into(), response.deny_reason.clone()),
-                ("resolved_model".into(), response.resolved_model.clone()),
-                ("budget_scope".into(), response.budget_scope.clone()),
-                (
-                    "contract_version".into(),
-                    GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                ),
-            ]),
+            evidence,
             target_id: domain_request.correlation_operation_id,
             outcome: if response.admitted {
                 "admitted".into()
@@ -482,6 +493,7 @@ impl ChiseiServiceImpl {
             risk_score_ready: false,
             risk_signals: vec![],
             operation_risk_override: None,
+            action_impact: input.action_impact.clone(),
             sekai_facts: self.sekai_facts.clone(),
         };
         let context_expansion_gate = self.pipeline_context_expansion_gate(input.namespace);

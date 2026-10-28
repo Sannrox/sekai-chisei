@@ -219,6 +219,7 @@ struct GatewayPipelineInput<'a> {
     model: &'a str,
     runtime: &'a str,
     task_class: &'a str,
+    action_impact: &'a crate::chisei::action_impact::ActionImpact,
 }
 
 struct GatewayPipelineDecision {

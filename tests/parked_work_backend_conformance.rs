@@ -20,7 +20,14 @@ fn exercise(db: RuntimeDb, prefix: &str) {
     effect.effect_id = format!("{prefix}-effect");
     db.put_action_effects(&[effect.clone()]).unwrap();
     let claimed = db
-        .claim_action_work(&effect.effect_id, "shikigami", "claim-1", 60_000, 100)
+        .claim_action_work(
+            &effect.effect_id,
+            "shikigami",
+            "claim-1",
+            "operator",
+            60_000,
+            100,
+        )
         .unwrap();
     let parked = db
         .park_action_work(
@@ -101,7 +108,14 @@ fn exercise(db: RuntimeDb, prefix: &str) {
     assert_eq!(ready.effective_lifecycle_state(), EFFECT_LIFECYCLE_READY);
 
     let resumed = db
-        .claim_action_work(&effect.effect_id, "shikigami", "claim-2", 60_000, 600)
+        .claim_action_work(
+            &effect.effect_id,
+            "shikigami",
+            "claim-2",
+            "operator",
+            60_000,
+            600,
+        )
         .unwrap();
     let active = db.get_active_continuation(&resumed).unwrap().unwrap();
     assert_eq!(active.0.resolution_id, continuation.resolution_id);

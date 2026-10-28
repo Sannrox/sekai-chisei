@@ -13,6 +13,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::chisei::action_impact::{ActionClaimRef, ClaimResolution};
 use crate::chisei::object_schema::ObjectType;
 use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::ext::*;
@@ -101,6 +102,31 @@ impl SekaiFactReader for SekaiStore {
     fn in_process_store(&self) -> Result<&SekaiStore, SekaiFactError> {
         Ok(self)
     }
+
+    fn cited_claim_resolution(
+        &self,
+        claim: &ActionClaimRef,
+        caller: &str,
+        namespace: &str,
+    ) -> Result<ClaimResolution, SekaiFactError> {
+        use sekai_core::sekai::action_work_lifecycle::{CitedActionClaim, CitedClaimResolution};
+        let resolution = read(self.resolve_cited_claim(
+            CitedActionClaim {
+                effect_id: &claim.effect_id,
+                claim_generation: claim.claim_generation,
+                fencing_token: &claim.fencing_token,
+            },
+            caller,
+            namespace,
+            chrono::Utc::now().timestamp_millis(),
+        ))?;
+        Ok(match resolution {
+            CitedClaimResolution::Live(action_type) => ClaimResolution::Live(action_type.impact()),
+            CitedClaimResolution::NotFound => ClaimResolution::NotFound,
+            CitedClaimResolution::NotLive => ClaimResolution::NotLive,
+            CitedClaimResolution::Foreign => ClaimResolution::Foreign,
+        })
+    }
 }
 
 /// Sekai fact reads Chisei depends on.
@@ -129,6 +155,18 @@ pub trait SekaiFactReader: Send + Sync {
     /// Graph-engine reads (bounded retrieval, computed properties, ontology
     /// snapshots) need the Sekai store in this process.
     fn in_process_store(&self) -> Result<&SekaiStore, SekaiFactError>;
+    /// Resolve an Action Work claim cited by `caller`'s model call in
+    /// `namespace` (#1910), with the live-fence and holder checks of Action
+    /// Work apply. A reader that cannot prove the holder refuses, and the
+    /// call resolves to unclassified.
+    fn cited_claim_resolution(
+        &self,
+        _claim: &ActionClaimRef,
+        _caller: &str,
+        _namespace: &str,
+    ) -> Result<ClaimResolution, SekaiFactError> {
+        Err(SekaiFactError::Unsupported("action claim resolution"))
+    }
 }
 
 /// Cloneable handle to the Sekai fact reader a Chisei service was built with.

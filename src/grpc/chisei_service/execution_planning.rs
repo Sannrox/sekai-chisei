@@ -14,6 +14,57 @@ use crate::chisei_store::ChiseiKiokuStore;
 
 const LEARNING_PIN_UNAVAILABLE: &str = "learning pin is unavailable";
 
+/// A model-call request's cited Action claim in Chisei's terms (#1910).
+pub(super) fn action_claim_ref(
+    claim: &ActionClaimRef,
+) -> crate::chisei::action_impact::ActionClaimRef {
+    crate::chisei::action_impact::ActionClaimRef {
+        effect_id: claim.effect_id.clone(),
+        claim_generation: claim.claim_generation,
+        fencing_token: claim.fencing_token.clone(),
+    }
+}
+
+impl ChiseiServiceImpl {
+    /// Re-resolve the plan's cited Action claim at execution time (#1910).
+    /// A cached plan outlives a claim lease, so the class decided at
+    /// planning may no longer hold. Overwrites the plan copy that execution
+    /// records from; the planning-time result stays on the plan response and
+    /// the receipt's policy event.
+    pub(super) fn reresolve_action_impact(&self, plan: &mut ExecutionPlan, actor: &str) {
+        let Some(input) = plan.input.as_ref() else {
+            return;
+        };
+        let impact = crate::chisei::action_impact::ActionImpact::resolve(
+            self.sekai_facts.reader(),
+            input.action_claim.as_ref().map(action_claim_ref),
+            actor,
+            &input.namespace,
+        );
+        plan.action_impact_class = impact
+            .class()
+            .map(|class| class.as_str().to_string())
+            .unwrap_or_default();
+        plan.action_claim_resolution = impact.resolution.as_str().into();
+    }
+}
+
+/// Receipt attributes for the plan's cited Action claim and its resolution;
+/// empty when the plan cites none.
+pub(super) fn plan_action_claim_attributes(plan: &ExecutionPlan) -> BTreeMap<String, String> {
+    plan.input
+        .as_ref()
+        .and_then(|input| input.action_claim.as_ref())
+        .map(|claim| {
+            crate::chisei::action_impact::claim_record_attributes(
+                &action_claim_ref(claim),
+                &plan.action_impact_class,
+                &plan.action_claim_resolution,
+            )
+        })
+        .unwrap_or_default()
+}
+
 impl ChiseiServiceImpl {
     pub(super) async fn plan_from_input(
         &self,
@@ -29,6 +80,12 @@ impl ChiseiServiceImpl {
             &input.user_id,
             &input.budget_work_unit,
         )?;
+        let action_impact = crate::chisei::action_impact::ActionImpact::resolve(
+            self.sekai_facts.reader(),
+            input.action_claim.as_ref().map(action_claim_ref),
+            authenticated_actor,
+            &input.namespace,
+        );
         let scoped_pressure = self.budget.scope_pressure(&normalized_user_id);
         let namespace_pressure = self
             .budget
@@ -75,6 +132,7 @@ impl ChiseiServiceImpl {
             risk_score_ready: false,
             risk_signals: vec![],
             operation_risk_override: None,
+            action_impact: action_impact.clone(),
             sekai_facts: self.sekai_facts.clone(),
         };
         let affinity = crate::chisei::affinity::get_affinity(
@@ -163,6 +221,7 @@ impl ChiseiServiceImpl {
                 risk_score_ready: false,
                 risk_signals: vec![],
                 operation_risk_override: None,
+                action_impact: action_impact.clone(),
                 sekai_facts: self.sekai_facts.clone(),
             };
             let projection_started = Instant::now();
@@ -540,6 +599,11 @@ impl ChiseiServiceImpl {
             gunshi_budget_ceiling_usd_micros: 0,
             gunshi_max_attempts: 0,
             gunshi_human_review_required: false,
+            action_impact_class: action_impact
+                .class()
+                .map(|class| class.as_str().to_string())
+                .unwrap_or_default(),
+            action_claim_resolution: action_impact.resolution.as_str().into(),
         })
     }
 
@@ -706,6 +770,7 @@ impl ChiseiServiceImpl {
                             plan.context_admission_source_digests.join(","),
                         );
                     }
+                    attributes.extend(plan_action_claim_attributes(plan));
                     attributes
                 },
             ),

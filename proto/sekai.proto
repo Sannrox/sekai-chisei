@@ -2481,6 +2481,10 @@ message GovernedActionType {
   // or last_writer_wins for last_writer_wins_properties.
   string offline_conflict = 28;
   repeated string last_writer_wins_properties = 29;
+  // Impact class of this operation (#1910): routine or high_impact. Empty
+  // means unclassified. A model call that cites a live Action Work claim
+  // of this type resolves to it.
+  string impact_class = 30;
 }
 // What a device saw when it prepared an Action offline (#1580, ADR 0127).
 message OfflineSubmission {
