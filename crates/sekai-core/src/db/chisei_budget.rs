@@ -42,6 +42,8 @@ pub struct BudgetScopeUsage {
     /// `None` when the scope has no limit for the metric. A stored limit of
     /// zero is a hard stop, not unlimited.
     pub limit: Option<i64>,
+    /// True when `limit` is the parent scope's work-unit default.
+    pub from_work_unit_default: bool,
 }
 
 impl BudgetScopeUsage {
@@ -101,6 +103,68 @@ pub fn parent_scope_id(scope_id: &str) -> String {
     }
 }
 
+/// The scope whose work-unit default governs `scope_id` when `scope_id` has
+/// no limit of its own (#1862): its parent, when its leaf is a `work_unit:`
+/// segment. Each work unit counts its own usage against the default.
+pub fn work_unit_default_scope(scope_id: &str) -> Option<&str> {
+    let (parent, leaf) = scope_id.rsplit_once('/')?;
+    leaf.starts_with("work_unit:").then_some(parent)
+}
+
+/// The limit that governs one scope and metric: its own limit, else its
+/// parent's work-unit default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffectiveLimit {
+    pub max_amount: i64,
+    pub period_type: String,
+    pub home_site_id: String,
+    pub from_work_unit_default: bool,
+}
+
+/// Reads a scope's own limit, falling back to its work-unit default, in one
+/// statement. `?3` is NULL for a scope that is not a work unit, so the
+/// fallback never matches.
+const EFFECTIVE_LIMIT_SQL: &str = "SELECT max_amount, period_type, home_site_id, 0
+     FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2
+     UNION ALL
+     SELECT max_amount, period_type, home_site_id, 1
+     FROM chisei_budget_work_unit_defaults WHERE scope_id=?3 AND metric=?2
+     ORDER BY 4 LIMIT 1";
+
+fn effective_limit(
+    conn: &rusqlite::Connection,
+    scope: &str,
+    metric: &str,
+) -> Result<Option<EffectiveLimit>, String> {
+    conn.query_row(
+        EFFECTIVE_LIMIT_SQL,
+        params![scope, metric, work_unit_default_scope(scope)],
+        |row| {
+            Ok(EffectiveLimit {
+                max_amount: row.get(0)?,
+                period_type: row.get(1)?,
+                home_site_id: row.get(2)?,
+                from_work_unit_default: row.get::<_, i64>(3)? == 1,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// The period a scope's usage is charged to: its effective limit's, or the
+/// unlimited default.
+fn charge_period_type(
+    conn: &rusqlite::Connection,
+    scope: &str,
+    metric: &str,
+) -> Result<String, String> {
+    Ok(effective_limit(conn, scope, metric)?.map_or_else(
+        || UNLIMITED_PERIOD_TYPE.to_string(),
+        |limit| limit.period_type,
+    ))
+}
+
 pub fn period_start_ms(period_type: &str, now_ms: i64) -> i64 {
     let now = chrono::DateTime::from_timestamp_millis(now_ms).unwrap_or_default();
     let date = now.date_naive();
@@ -119,6 +183,35 @@ pub fn period_start_ms(period_type: &str, now_ms: i64) -> i64 {
         .timestamp_millis()
 }
 
+/// Every metric's limit of one scope.
+const OWN_LIMITS_SQL: &str = "SELECT metric, max_amount, period_type
+     FROM chisei_budget_limits WHERE scope_id=?1 ORDER BY metric";
+
+/// Every metric's effective limit of one work unit: its own limits, plus the
+/// work-unit default (`?2`) for each metric it has no limit of its own for.
+const WORK_UNIT_LIMITS_SQL: &str = "SELECT metric, max_amount, period_type
+     FROM chisei_budget_limits WHERE scope_id=?1
+     UNION ALL
+     SELECT metric, max_amount, period_type
+     FROM chisei_budget_work_unit_defaults AS defaults
+     WHERE defaults.scope_id=?2 AND NOT EXISTS (
+       SELECT 1 FROM chisei_budget_limits AS own
+       WHERE own.scope_id=?1 AND own.metric=defaults.metric
+     )
+     ORDER BY metric";
+
+fn query_limits(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<(String, i64, String)>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    stmt.query_map(params, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())
+}
+
 impl SekaiDb {
     pub fn budget_limits_for_scope(
         &self,
@@ -128,23 +221,13 @@ impl SekaiDb {
         let conn = self.conn();
         let mut limits = Vec::new();
         for scope in scopes {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT metric, max_amount, period_type FROM chisei_budget_limits
-                     WHERE scope_id=?1 ORDER BY metric",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(params![scope], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(|e| e.to_string())?;
-            for row in rows {
-                let (metric, max_amount, period_type) = row.map_err(|e| e.to_string())?;
+            // Only a work unit reads the defaults, so a plane without budget
+            // tables still reports `chisei_budget_limits` missing.
+            let rows = match work_unit_default_scope(&scope) {
+                Some(parent) => query_limits(&conn, WORK_UNIT_LIMITS_SQL, params![scope, parent])?,
+                None => query_limits(&conn, OWN_LIMITS_SQL, params![scope])?,
+            };
+            for (metric, max_amount, period_type) in rows {
                 limits.push((scope.clone(), metric, max_amount, period_type));
             }
         }
@@ -185,6 +268,14 @@ impl SekaiDb {
                 period_start INTEGER NOT NULL,
                 amount_used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (source_scope_id, applied_scope_id, metric, period_start)
+            );
+            CREATE TABLE IF NOT EXISTS chisei_budget_work_unit_defaults (
+                scope_id TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                max_amount INTEGER NOT NULL,
+                period_type TEXT NOT NULL,
+                home_site_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (scope_id, metric)
             );
             CREATE TABLE IF NOT EXISTS chisei_budget_pools (
                 pool_id TEXT NOT NULL,
@@ -269,6 +360,50 @@ impl SekaiDb {
             enforce_pool_member_sum(&tx, pool_id, metric)?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Sets the limit every `work_unit:` child of `scope_id` without a limit
+    /// of its own gets for `metric` (#1862).
+    pub fn budget_set_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+    ) -> Result<(), String> {
+        if max_amount < 0 {
+            return Err("budget max_amount must be non-negative".into());
+        }
+        self.conn()
+            .execute(
+                "INSERT INTO chisei_budget_work_unit_defaults
+                    (scope_id, metric, max_amount, period_type, home_site_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(scope_id, metric) DO UPDATE SET
+                    max_amount = excluded.max_amount,
+                    period_type = excluded.period_type,
+                    home_site_id = excluded.home_site_id",
+                params![scope_id, metric, max_amount, period_type, home_site_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Removes `scope_id`'s work-unit default for `metric`. Removing an
+    /// unset default succeeds.
+    pub fn budget_clear_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+    ) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "DELETE FROM chisei_budget_work_unit_defaults WHERE scope_id=?1 AND metric=?2",
+                params![scope_id, metric],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     pub fn budget_set_pool_ceiling(
@@ -405,16 +540,13 @@ impl SekaiDb {
             }
         }
         for scope in &chain {
-            let limit: Option<(i64, String, String, String)> = transaction
-                .query_row(
-                    "SELECT max_amount, period_type, home_site_id, pool_id
-                     FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                    params![scope, metric],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            let Some((max_amount, period_type, home_site_id, _pool_id)) = limit else {
+            let Some(EffectiveLimit {
+                max_amount,
+                period_type,
+                home_site_id,
+                ..
+            }) = effective_limit(&transaction, scope, metric)?
+            else {
                 continue;
             };
             if require_home_pin {
@@ -437,15 +569,7 @@ impl SekaiDb {
             }
         }
         for scope in &chain {
-            let period_type = transaction
-                .query_row(
-                    "SELECT period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                    params![scope, metric],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| "daily".to_string());
+            let period_type = charge_period_type(&transaction, scope, metric)?;
             let period_start = period_start_ms(&period_type, now_ms);
             transaction
                 .execute(
@@ -496,16 +620,13 @@ impl SekaiDb {
         let chain = scope_chain(scope_id);
         let conn = self.conn();
         for scope in &chain {
-            let limit: Option<(i64, String, String)> = conn
-                .query_row(
-                    "SELECT max_amount, period_type, home_site_id
-                     FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                    params![scope, metric],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            let Some((max_amount, period_type, home_site_id)) = limit else {
+            let Some(EffectiveLimit {
+                max_amount,
+                period_type,
+                home_site_id,
+                ..
+            }) = effective_limit(&conn, scope, metric)?
+            else {
                 continue;
             };
             if require_home_pin {
@@ -539,16 +660,8 @@ impl SekaiDb {
         let chain = scope_chain(scope_id);
         let conn = self.conn();
         for scope in &chain {
-            let home: Option<String> = conn
-                .query_row(
-                    "SELECT home_site_id FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                    params![scope, metric],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            if let Some(home_site_id) = home {
-                assert_home_pin(scope, &home_site_id, local_site_id)?;
+            if let Some(limit) = effective_limit(&conn, scope, metric)? {
+                assert_home_pin(scope, &limit.home_site_id, local_site_id)?;
             }
         }
         Ok(())
@@ -583,16 +696,8 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         if require_home_pin && delta > 0 {
             for scope in &chain {
-                let home: Option<String> = tx
-                    .query_row(
-                        "SELECT home_site_id FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                        params![scope, metric],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(|e| e.to_string())?;
-                if let Some(home_site_id) = home {
-                    assert_home_pin(scope, &home_site_id, local_site_id)?;
+                if let Some(limit) = effective_limit(&tx, scope, metric)? {
+                    assert_home_pin(scope, &limit.home_site_id, local_site_id)?;
                 }
             }
         }
@@ -829,15 +934,7 @@ impl SekaiDb {
             return Ok(false);
         }
         for scope in &chain {
-            let period_type = tx
-                .query_row(
-                    "SELECT period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                    params![scope, metric],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| "daily".to_string());
+            let period_type = charge_period_type(&tx, scope, metric)?;
             let period_start = period_start_ms(&period_type, now_ms);
             tx.execute(
                 "INSERT INTO chisei_budget_usage (scope_id, metric, period_start, amount_used)
@@ -861,15 +958,10 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<(i64, i64, String), String> {
         let conn = self.conn();
-        let limit: Option<(i64, String)> = conn
-            .query_row(
-                "SELECT max_amount, period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                params![scope_id, metric],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        let (max_amount, period_type) = limit.unwrap_or((0, "daily".to_string()));
+        let (max_amount, period_type) = effective_limit(&conn, scope_id, metric)?
+            .map_or((0, UNLIMITED_PERIOD_TYPE.to_string()), |limit| {
+                (limit.max_amount, limit.period_type)
+            });
         let period_start = period_start_ms(&period_type, now_ms);
         let used: i64 = conn
             .query_row(
@@ -895,18 +987,10 @@ impl SekaiDb {
         let mut levels = Vec::new();
         for scope in scope_chain(scope_id) {
             for metric in BUDGET_METRICS {
-                let limit: Option<(i64, String)> = transaction
-                    .query_row(
-                        "SELECT max_amount, period_type FROM chisei_budget_limits
-                         WHERE scope_id=?1 AND metric=?2",
-                        params![scope, metric],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()
-                    .map_err(|e| e.to_string())?;
+                let limit = effective_limit(&transaction, &scope, metric)?;
                 let period_type = limit
                     .as_ref()
-                    .map_or(UNLIMITED_PERIOD_TYPE, |(_, period)| period.as_str())
+                    .map_or(UNLIMITED_PERIOD_TYPE, |limit| limit.period_type.as_str())
                     .to_string();
                 let period_start = period_start_ms(&period_type, now_ms);
                 let used: i64 = transaction
@@ -925,7 +1009,10 @@ impl SekaiDb {
                     period_type,
                     period_start,
                     used,
-                    limit: limit.map(|(max_amount, _)| max_amount),
+                    from_work_unit_default: limit
+                        .as_ref()
+                        .is_some_and(|limit| limit.from_work_unit_default),
+                    limit: limit.map(|limit| limit.max_amount),
                 });
             }
         }
@@ -1145,6 +1232,15 @@ pub trait ChiseiBudgetBackend: Send + Sync {
         max_amount: i64,
         period_type: &str,
     ) -> Result<(), String>;
+    fn budget_set_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+    ) -> Result<(), String>;
+    fn budget_clear_work_unit_default(&self, scope_id: &str, metric: &str) -> Result<(), String>;
     fn budget_check_and_reserve_chain(
         &self,
         scope_id: &str,
@@ -1195,6 +1291,30 @@ macro_rules! forward_budget {
             period_type: &str,
         ) -> Result<(), String> {
             <$target>::budget_set_limit(self, scope_id, metric, max_amount, period_type)
+        }
+        fn budget_set_work_unit_default(
+            &self,
+            scope_id: &str,
+            metric: &str,
+            max_amount: i64,
+            period_type: &str,
+            home_site_id: &str,
+        ) -> Result<(), String> {
+            <$target>::budget_set_work_unit_default(
+                self,
+                scope_id,
+                metric,
+                max_amount,
+                period_type,
+                home_site_id,
+            )
+        }
+        fn budget_clear_work_unit_default(
+            &self,
+            scope_id: &str,
+            metric: &str,
+        ) -> Result<(), String> {
+            <$target>::budget_clear_work_unit_default(self, scope_id, metric)
         }
         fn budget_check_and_reserve_chain(
             &self,
@@ -1282,15 +1402,7 @@ pub(crate) fn adjust_chain_tx(
 ) -> Result<(), String> {
     let chain = scope_chain(scope_id);
     for scope in &chain {
-        let period_type = tx
-            .query_row(
-                "SELECT period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                params![scope, metric],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| "daily".to_string());
+        let period_type = charge_period_type(tx, scope, metric)?;
         let period_start = period_start_ms(&period_type, now_ms);
         // Relative update under Immediate txn (mirrors Postgres) so concurrent
         // adjust/complete paths cannot lose usage via read-modify-write.

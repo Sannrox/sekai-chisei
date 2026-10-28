@@ -355,6 +355,7 @@ Edit the fixture, then regenerate with
 | `ChiseiService.RecordUsage` | `chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetBudgetLimit` | `chisei.budget` | yes | none | `stable` |
 | `ChiseiService.GetBudgetUsage` | `chisei.budget` | yes | cli | `experimental` |
+| `ChiseiService.SetBudgetWorkUnitDefault` | `chisei.budget` | yes | cli | `experimental` |
 | `ChiseiService.DecideGatewayExecution` | `chisei.policy, chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
 | `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |

@@ -208,6 +208,8 @@ const CHISEI_RESERVATION_CHARGE_KEY_SCHEMA: &str =
     include_str!("postgres/0123_chisei_reservation_charge_key.sql");
 const SECURITY_PACKAGE_IDENTITY_SCHEMA: &str =
     include_str!("postgres/0124_security_package_identity.sql");
+const BUDGET_WORK_UNIT_DEFAULTS_SCHEMA: &str =
+    include_str!("postgres/0125_budget_work_unit_defaults.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -978,6 +980,12 @@ const MIGRATIONS: &[Migration] = &[
         "security_package_identity",
         SECURITY_PACKAGE_IDENTITY_SCHEMA,
         MigrationOwner::Sekai,
+    ),
+    mig(
+        124,
+        "budget_work_unit_defaults",
+        BUDGET_WORK_UNIT_DEFAULTS_SCHEMA,
+        MigrationOwner::Chisei,
     ),
 ];
 

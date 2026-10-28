@@ -1,18 +1,22 @@
 //! `sekaictl admin governance budget` CLI: read budget usage and remaining
-//! limit for a scope through `GetBudgetUsage`.
+//! limit for a scope through `GetBudgetUsage`, and set or clear a scope's
+//! work-unit default through `SetBudgetWorkUnitDefault`.
 //!
 //! Connects to the sekai control plane (via `CHISEI_GRPC_URL` or `SEKAI_SOCKET`,
 //! defaulting to the local UDS). The scope flags mirror `SetBudgetLimit`.
 
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-use crate::grpc::pb::chisei::{GetBudgetUsageRequest, GetBudgetUsageResponse};
+use crate::grpc::pb::chisei::{
+    GetBudgetUsageRequest, GetBudgetUsageResponse, SetBudgetWorkUnitDefaultRequest,
+};
 use serde_json::json;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin governance budget usage [--subject <scope>] [--project <p>] [--agent <a>] [--work-unit <w>] [--key-id <k>] [--user <u>] [--json]"
+    "sekaictl admin governance budget usage [--subject <scope>] [--project <p>] [--agent <a>] [--work-unit <w>] [--key-id <k>] [--user <u>] [--json]
+sekaictl admin governance budget work-unit-default [--subject <scope>] [--project <p>] [--agent <a>] [--key-id <k>] [--user <u>] [--metric tokens|requests] (--max <n> [--period daily|weekly|monthly] | --clear)"
 }
 
 fn target() -> String {
@@ -30,6 +34,22 @@ pub async fn run_budget_command(args: Vec<String>) -> Result<(), BoxErr> {
                 .await?
                 .into_inner();
             print!("{}", render_usage(&response, as_json));
+            Ok(())
+        }
+        Some("work-unit-default") => {
+            let request = parse_work_unit_default(&args[1..]).map_err(std::io::Error::other)?;
+            let clear = request.clear;
+            ChiseiServiceClient::new(connect_sekai(&target()).await?)
+                .set_budget_work_unit_default(request)
+                .await?;
+            println!(
+                "{}",
+                if clear {
+                    "work-unit default cleared"
+                } else {
+                    "work-unit default set"
+                }
+            );
             Ok(())
         }
         _ => Err(std::io::Error::other(usage()).into()),
@@ -63,6 +83,50 @@ fn parse_usage(args: &[String]) -> Result<(GetBudgetUsageRequest, bool), String>
     Ok((request, as_json))
 }
 
+/// Parses `work-unit-default`: the scope flags of `usage` without
+/// `--work-unit`, and either `--max` or `--clear`.
+fn parse_work_unit_default(args: &[String]) -> Result<SetBudgetWorkUnitDefaultRequest, String> {
+    let mut request = SetBudgetWorkUnitDefaultRequest::default();
+    let mut max = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--clear" {
+            request.clear = true;
+            continue;
+        }
+        let value = args
+            .next()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{arg} requires a value"))?
+            .clone();
+        match arg.as_str() {
+            "--subject" => request.subject = value,
+            "--project" => request.project = value,
+            "--agent" => request.agent = value,
+            "--key-id" => request.key_id = value,
+            "--user" => request.user_id = value,
+            "--metric" => request.metric = value,
+            "--period" => request.period_type = value,
+            "--max" => {
+                max = Some(
+                    value
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|max| *max >= 0)
+                        .ok_or_else(|| format!("--max must be a non-negative integer: {value}"))?,
+                )
+            }
+            _ => return Err(format!("unknown budget option {arg:?}\n{}", usage())),
+        }
+    }
+    match (max, request.clear) {
+        (Some(max), false) => request.max_amount = max,
+        (None, true) => {}
+        _ => return Err(format!("set exactly one of --max and --clear\n{}", usage())),
+    }
+    Ok(request)
+}
+
 /// Renders one row per scope level and metric. An unlimited level shows
 /// `unlimited` for its limit and remainder.
 pub fn render_usage(response: &GetBudgetUsageResponse, as_json: bool) -> String {
@@ -79,6 +143,7 @@ pub fn render_usage(response: &GetBudgetUsageResponse, as_json: bool) -> String 
                     "used": level.used,
                     "limit": (!level.unlimited).then_some(level.limit),
                     "remaining": (!level.unlimited).then_some(level.remaining),
+                    "from_work_unit_default": level.from_work_unit_default,
                 })
             })
             .collect::<Vec<_>>();
@@ -137,6 +202,46 @@ mod tests {
         );
         assert!(parse_usage(&args(&["--subject"])).is_err());
         assert!(parse_usage(&args(&["--period", "daily"])).is_err());
+    }
+
+    #[test]
+    fn work_unit_default_takes_either_a_max_or_clear() {
+        let request = parse_work_unit_default(&args(&[
+            "--project",
+            "p",
+            "--agent",
+            "a",
+            "--metric",
+            "requests",
+            "--max",
+            "6",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (
+                request.agent.as_str(),
+                request.metric.as_str(),
+                request.max_amount,
+                request.clear
+            ),
+            ("a", "requests", 6, false)
+        );
+        assert!(
+            parse_work_unit_default(&args(&["--agent", "a", "--clear"]))
+                .unwrap()
+                .clear
+        );
+        for invalid in [
+            &["--agent", "a"][..],
+            &["--agent", "a", "--max", "6", "--clear"],
+            &["--agent", "a", "--max", "-1"],
+            &["--work-unit", "w", "--max", "6"],
+        ] {
+            assert!(
+                parse_work_unit_default(&args(invalid)).is_err(),
+                "{invalid:?}"
+            );
+        }
     }
 
     #[test]

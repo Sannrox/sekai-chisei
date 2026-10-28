@@ -2739,6 +2739,47 @@ impl RuntimeDb {
         }
     }
 
+    pub fn budget_set_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_set_work_unit_default(
+                scope_id,
+                metric,
+                max_amount,
+                period_type,
+                home_site_id,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.budget_set_work_unit_default(
+                    scope_id,
+                    metric,
+                    max_amount,
+                    period_type,
+                    home_site_id,
+                )
+            }),
+        }
+    }
+
+    pub fn budget_clear_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_clear_work_unit_default(scope_id, metric),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.budget_clear_work_unit_default(scope_id, metric)
+            }),
+        }
+    }
+
     pub fn budget_set_pool_ceiling(
         &self,
         pool_id: &str,

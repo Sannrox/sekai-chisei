@@ -103,6 +103,27 @@ sekaictl admin governance budget usage --project p --agent a --work-unit w --jso
 sekaictl admin governance budget usage --subject action:governed/project:p
 ```
 
+### Work-unit defaults
+
+`ChiseiService.SetBudgetWorkUnitDefault` (experimental, authorized like
+`SetBudgetLimit`) gives a scope a default limit for its work units. Every
+`<scope>/work_unit:<id>` without a limit of its own for the metric is then
+capped at that limit, and each work unit counts its own usage in its own
+period; the default is not a shared pool. A work unit's own limit overrides
+the default. The default is read from the store at each check, so a change
+applies at once to every work unit without its own limit. `clear` removes it,
+and work units without their own limit are unlimited again, as they are when
+no default is set. `GetBudgetUsage` reports a work unit's default-derived
+limit with `from_work_unit_default`. A server without work-unit defaults
+answers the RPC as unimplemented rather than setting a different limit.
+
+```sh
+# Every turn of agent red in project game gets 4000 tokens a day unless it
+# has its own limit.
+sekaictl admin governance budget work-unit-default --project game --agent red --max 4000 --period daily
+sekaictl admin governance budget work-unit-default --project game --agent red --clear
+```
+
 ### Pressure views
 
 Regional vs global (pool) pressure is meaningful only when topology exposes both: local scope usage/limits under regional modes, plus pool membership when `pool_id` is set. Single-region deployments keep today's chain pressure only.

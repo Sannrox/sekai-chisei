@@ -6069,6 +6069,110 @@ async fn budget_usage_reads_are_authorized_like_set_budget_limit() {
     );
 }
 
+/// `SetBudgetWorkUnitDefault` sets and clears a scope's work-unit default
+/// (#1862) under the authorization of `SetBudgetLimit`; `GetBudgetUsage`
+/// names the limit's source.
+#[tokio::test]
+async fn set_budget_work_unit_default_sets_and_clears_the_default() {
+    let svc = memory_service();
+    let default = |clear: bool| SetBudgetWorkUnitDefaultRequest {
+        project: "acme".into(),
+        agent: "alice".into(),
+        max_amount: 10,
+        clear,
+        ..Default::default()
+    };
+    let turn = "project:acme/agent:alice/work_unit:t1";
+
+    // Refused: a non-administrator.
+    let mut unauthorized = Request::new(default(false));
+    unauthorized
+        .metadata_mut()
+        .insert("x-principal", "alice".parse().unwrap());
+    assert_eq!(
+        svc.set_budget_work_unit_default(unauthorized)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert!(svc.budget.check(turn, 1_000).is_ok());
+
+    svc.set_budget_work_unit_default(Request::new(default(false)))
+        .await
+        .unwrap();
+    svc.budget.check_and_reserve(turn, 10).unwrap();
+    assert!(svc.budget.check(turn, 1).is_err());
+    let usage = svc
+        .get_budget_usage(Request::new(GetBudgetUsageRequest {
+            project: "acme".into(),
+            agent: "alice".into(),
+            work_unit: "t1".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let level = usage
+        .levels
+        .iter()
+        .find(|level| level.scope_id == turn && level.metric == "tokens")
+        .unwrap();
+    assert_eq!(
+        (level.limit, level.remaining, level.from_work_unit_default),
+        (10, 0, true)
+    );
+
+    svc.set_budget_work_unit_default(Request::new(default(true)))
+        .await
+        .unwrap();
+    assert!(svc.budget.check(turn, 1_000).is_ok());
+}
+
+/// `SetBudgetLimit` carries no work-unit default: the unreleased fields 10
+/// and 11 are reserved, so a client that still sends them sets the scope's
+/// own limit and never a default.
+#[tokio::test]
+async fn set_budget_limit_ignores_the_retired_work_unit_default_fields() {
+    use prost::Message;
+    let svc = memory_service();
+    let mut encoded = SetBudgetLimitRequest {
+        project: "acme".into(),
+        agent: "alice".into(),
+        max_tokens: 10,
+        ..Default::default()
+    }
+    .encode_to_vec();
+    // work_unit_default = true (field 10) and clear = false (field 11).
+    encoded.extend_from_slice(&[0x50, 0x01, 0x58, 0x00]);
+    let request = SetBudgetLimitRequest::decode(encoded.as_slice()).unwrap();
+    assert_eq!(request.encode_to_vec().len() + 4, encoded.len());
+    svc.set_budget_limit(Request::new(request)).await.unwrap();
+
+    assert!(
+        svc.budget
+            .check("project:acme/agent:alice/work_unit:t1", 11)
+            .is_err()
+    );
+    let usage = svc
+        .get_budget_usage(Request::new(GetBudgetUsageRequest {
+            project: "acme".into(),
+            agent: "alice".into(),
+            work_unit: "t1".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        usage
+            .levels
+            .iter()
+            .all(|level| !level.from_work_unit_default),
+        "{usage:?}"
+    );
+}
+
 #[tokio::test]
 async fn configuration_mutations_require_control_plane_administration() {
     let svc = memory_service();

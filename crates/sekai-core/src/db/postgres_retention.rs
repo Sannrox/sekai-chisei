@@ -946,6 +946,29 @@ fn erase_supported_subject_data(
                 .map_err(err)? as i32;
         }
     }
+    // Work-unit defaults (#1862) a principal's scope carries.
+    if postgres_relation_exists(client, "chisei_budget_work_unit_defaults")? {
+        let default_scopes = client
+            .query(
+                "SELECT DISTINCT scope_id FROM chisei_budget_work_unit_defaults",
+                &[],
+            )
+            .map_err(err)?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .filter(|scope| {
+                scope == subject || value_mentions_subject(scope, &request.subject_kind, subject)
+            })
+            .collect::<Vec<_>>();
+        for scope in default_scopes {
+            result.budget_records_deleted += client
+                .execute(
+                    "DELETE FROM chisei_budget_work_unit_defaults WHERE scope_id=$1",
+                    &[&scope],
+                )
+                .map_err(err)? as i32;
+        }
+    }
 
     for row in client
         .query(

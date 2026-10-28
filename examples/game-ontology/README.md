@@ -45,7 +45,7 @@ Regenerate it with `GAME_REPORT_UPDATE=1 cargo test --test it game_demo_report`.
 | No attacks on allies | Attack and invasion types require `diplomacy` = `hostile` on the target planet. |
 | Invasion approval | Invasions resolve to a `require_approval` policy scope with `admiral` as approver. |
 | Spy-only visibility | Reports are marked `spy-only`, a lattice token only a `spy-only` ceiling dominates. |
-| Turn budgets | A turn is a budget work unit. Opening a turn sets the token and call limits on `project:game/agent:<player>/work_unit:<turn>`. |
+| Turn budgets | A turn is a budget work unit. The token and call limits are the work-unit default (`SetBudgetWorkUnitDefault`) of `project:game/agent:<player>`, so every `work_unit:<turn>` under it gets its own budget without being set up. |
 | Day budgets | Token and call limits on the player's flat `agent:<player>` scope, which every turn's chain includes. |
 | Cheap local route | The `game` namespace's impact route rule gives `unclassified` and `routine` calls only the local `native-default` model. Decision steps cite no Action claim, so they route there; a request for the expensive model is substituted. |
 | Expensive route | Only a `high_impact` call may use `gpt-5.5`: one citing a live claim, held by the caller, of the granted invasion's `runtime_dispatch` work. `game.planet.invade` is `high_impact`; attacks and spends are `routine`. A route override cannot pin it. |
@@ -61,8 +61,6 @@ Known gaps, where the pack approximates or leaves a rule out:
   property the game keeps current (#1860).
 - Both routes share the `game` namespace, so turn budgets cap the turn's
   model use as a whole, not per route.
-- A turn's limits must be set when the turn opens; there is no default limit
-  for every work unit (#1862).
 - With split stores, admission ignores an action type's `budget_scope`
   (#1863), so treasuries keep their own namespace; a submit refused for
   invalid parameters still charges a unit there (#1864).
