@@ -450,24 +450,24 @@ impl SekaiDb {
         now_ms: i64,
         limit: i64,
     ) -> Result<Vec<String>, String> {
-        let due: Vec<(String, String)> = {
+        let due: Vec<(String, String, String)> = {
             let conn = self.conn();
             let mut stmt = conn
                 .prepare(
-                    "SELECT identity, dataset_id FROM sekai_adhoc_transform_run
+                    "SELECT identity, dataset_id, namespace FROM sekai_adhoc_transform_run
                      WHERE expires_at_ms <= ?1 AND dataset_id != ''
                      ORDER BY expires_at_ms, identity LIMIT ?2",
                 )
                 .map_err(|error| error.to_string())?;
             stmt.query_map(params![now_ms, limit.max(0)], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map_err(|error| error.to_string())?
             .collect::<Result<_, _>>()
             .map_err(|error| error.to_string())?
         };
         let mut swept = Vec::new();
-        for (identity, dataset_id) in due {
+        for (identity, dataset_id, namespace) in due {
             let mut conn = self.conn();
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -483,6 +483,19 @@ impl SekaiDb {
                 continue;
             }
             let object_id = format!("{dataset_id}-object");
+            // The search index's full-text tables are kept by hand.
+            let indexed: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'sekai_search_dataset_text')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if indexed {
+                SekaiDb::clear_dataset_text_on(&tx, &namespace, &dataset_id)?;
+                SekaiDb::clear_object_text_on(&tx, &namespace, &object_id)?;
+            }
             for statement in crate::sekai::adhoc_transform::SWEEP_STATEMENTS {
                 let parameter = if statement.contains("{object}") {
                     &object_id
