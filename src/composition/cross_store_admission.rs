@@ -120,7 +120,20 @@ impl CrossStoreAdmission {
             }
         }
 
-        let budget_subject = submit_budget_subject(namespace, actor, "");
+        // Charge the action type's budget scope, as combined admission does;
+        // the type lives in the Sekai store (#1863).
+        let type_def = self
+            .sekai
+            .runtime()
+            .require_enabled_governed_action_type(namespace, &request.type_id, &request.version)
+            .map_err(|error| {
+                if error.contains("unknown") || error.contains("disabled") {
+                    ActionInstanceAdmissionError::FailedPrecondition(error)
+                } else {
+                    ActionInstanceAdmissionError::Internal(error)
+                }
+            })?;
+        let budget_subject = submit_budget_subject(namespace, actor, &type_def.budget_scope);
         if let Some(budget) = &self.budget {
             let budget_key = if let Some(row) = existing
                 .as_ref()
@@ -530,6 +543,62 @@ mod tests {
             CrossStoreAdmission::new(chisei, sekai, Some(budget.clone())),
             budget,
         )
+    }
+
+    /// On split stores a type's `budget_scope` is charged, as on the combined
+    /// layout: it exhausts its own scope and leaves the namespace budget
+    /// alone (#1863).
+    #[test]
+    fn split_admission_charges_the_action_type_budget_scope() {
+        let (sekai, chisei) = dest_pair();
+        seed_type(&sekai);
+        sekai
+            .runtime()
+            .put_governed_action_type(
+                GovernedActionType {
+                    namespace: "acme".into(),
+                    type_id: "payout".into(),
+                    version: "1".into(),
+                    description: "pay from the treasury".into(),
+                    parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
+                    allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
+                    enabled: true,
+                    budget_scope: "treasury".into(),
+                    ..Default::default()
+                },
+                "operator",
+                1,
+            )
+            .unwrap();
+        let budget = Arc::new(BudgetTracker::new(chisei.clone()));
+        budget
+            .set_limit("action:governed", 1, PeriodType::Daily)
+            .unwrap();
+        budget
+            .set_limit("action:governed:treasury", 1, PeriodType::Daily)
+            .unwrap();
+        let clerk = CrossStoreAdmission::new(chisei, sekai, Some(budget));
+        assert!(clerk.distinct_stores());
+        let payout = |operation_id: &str| ActionInstanceAdmissionRequest {
+            type_id: "payout".into(),
+            ..request(operation_id)
+        };
+
+        let first = clerk.reserve(&payout("op-pay-1"), "alice", 10).unwrap();
+        assert_eq!(
+            first.budget_subject,
+            "action:governed:treasury/project:acme/agent:alice"
+        );
+        assert!(matches!(
+            clerk.reserve(&payout("op-pay-2"), "alice", 11),
+            Err(ActionInstanceAdmissionError::FailedPrecondition(_))
+        ));
+        // The namespace budget is still unspent.
+        let unscoped = clerk.reserve(&request("op-dispatch"), "alice", 12).unwrap();
+        assert_eq!(
+            unscoped.budget_subject,
+            "action:governed/project:acme/agent:alice"
+        );
     }
 
     #[test]

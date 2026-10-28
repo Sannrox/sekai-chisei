@@ -34,7 +34,7 @@ impl SekaiServiceImpl {
             .db
             .runtime()
             .load_ontology_registry()
-            .map_err(Status::internal)?;
+            .map_err(persistence_status)?;
         let existing = registry.get_class(&parsed.name).cloned();
         registry.remove_class(&parsed.name);
         ontology::validate_class_definition(&parsed, existing.as_ref(), &registry)
@@ -42,7 +42,7 @@ impl SekaiServiceImpl {
         self.db
             .runtime()
             .upsert_ontology_class_with_audit(&parsed, actor(principals))
-            .map_err(Status::internal)?;
+            .map_err(persistence_status)?;
         Ok(parsed)
     }
 
@@ -56,7 +56,7 @@ impl SekaiServiceImpl {
             .db
             .runtime()
             .load_ontology_registry()
-            .map_err(Status::internal)?;
+            .map_err(persistence_status)?;
         for class in registry.classes() {
             if class.name != name
                 && class
@@ -85,12 +85,12 @@ impl SekaiServiceImpl {
             .db
             .runtime()
             .list_grants(&object_id)
-            .map_err(Status::internal)?;
+            .map_err(persistence_status)?;
         if !self
             .db
             .runtime()
             .delete_ontology_class_with_audit(name, actor(principals))
-            .map_err(Status::internal)?
+            .map_err(persistence_status)?
         {
             return Err(Status::not_found("ontology class not found"));
         }
@@ -128,7 +128,7 @@ impl SekaiServiceImpl {
             .db
             .runtime()
             .load_ontology_registry()
-            .map_err(Status::internal)?;
+            .map_err(persistence_status)?;
         let existing = registry.get_relation(&parsed.name).cloned();
         registry.remove_relation(&parsed.name);
         ontology::validate_relation_definition(&parsed, existing.as_ref(), &registry)
@@ -172,7 +172,7 @@ impl SekaiServiceImpl {
             .db
             .runtime()
             .load_ontology_registry()
-            .map_err(Status::internal)?;
+            .map_err(persistence_status)?;
         if let Some(referencing) = registry
             .relations()
             .into_iter()
@@ -188,12 +188,12 @@ impl SekaiServiceImpl {
             .db
             .runtime()
             .list_grants(&object_id)
-            .map_err(Status::internal)?;
+            .map_err(persistence_status)?;
         if !self
             .db
             .runtime()
             .delete_ontology_relation_with_audit(name, actor(principals))
-            .map_err(Status::internal)?
+            .map_err(persistence_status)?
         {
             return Err(Status::not_found("ontology relation not found"));
         }
@@ -237,6 +237,18 @@ impl SekaiServiceImpl {
             .put_definition(object_type)
             .map_err(map_schema_definition_lifecycle_error)?;
         Ok(())
+    }
+}
+
+/// A storage failure as a gRPC status. SQLite lock contention that outlasted
+/// the busy timeout is `unavailable`, so callers retry it instead of reading
+/// it as a definition problem (#1851).
+fn persistence_status(error: String) -> Status {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("database is locked") || lower.contains("database is busy") {
+        Status::unavailable(error)
+    } else {
+        Status::internal(error)
     }
 }
 

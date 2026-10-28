@@ -41,6 +41,8 @@ thread_local! {
     static GENERATION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAIRING_EPOCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PAIRING_EPOCH_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Fail the n-th next pairing epoch raise (0 = the next one), once.
+    static FAIL_PAIRING_EPOCH_RAISE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1371,6 +1373,7 @@ pub fn align_split_generations(
 }
 
 pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> Result<(), String> {
+    let _pairing = layout.lock_pairing_epoch();
     if layout.cached_matched_generation().is_some() {
         // #1108: on a matched-generation cache hit this still dual-reads the
         // pairing epoch on every mutating RPC — it is the only check left
@@ -1481,8 +1484,9 @@ fn advance_pairing_epoch(layout: &CombinedStoreLayout) -> Result<(), String> {
     let next = read_runtime_pairing_epoch(&layout.sekai_runtime())?
         .max(read_runtime_pairing_epoch(&layout.chisei_runtime())?)
         .saturating_add(1);
-    write_runtime_pairing_epoch(&layout.sekai_runtime(), next)?;
-    write_runtime_pairing_epoch(&layout.chisei_runtime(), next)?;
+    raise_runtime_pairing_epoch_pending(&layout.sekai_runtime(), next)?;
+    raise_runtime_pairing_epoch(&layout.chisei_runtime(), next)?;
+    clear_runtime_pending_pairing_epoch(&layout.sekai_runtime(), next)?;
     Ok(())
 }
 
@@ -1493,13 +1497,30 @@ fn advance_pairing_epoch(layout: &CombinedStoreLayout) -> Result<(), String> {
 /// pairing epoch to disagree on — matching `pairing_epochs_match`, this
 /// reports a trivial match; the placeholder value is never written, since
 /// [`advance_pairing_epoch_from`] no-ops on an Owned layout too.
+///
+/// #1845: an advance raises Sekai and marks that epoch pending in one
+/// statement, then raises Chisei, then clears the mark. Sekai one step
+/// ahead while still marked pending at its epoch is an advance interrupted
+/// before Chisei landed; it is rolled forward here. Any other difference,
+/// a Chisei restored one step back included (its advance had cleared the
+/// mark), is a one-sided restore and stays refused.
 fn matched_pairing_epoch(layout: &CombinedStoreLayout) -> Result<Option<i64>, String> {
     if !layout.is_split() {
         return Ok(Some(0));
     }
     let sekai = read_runtime_pairing_epoch(&layout.sekai_runtime())?;
     let chisei = read_runtime_pairing_epoch(&layout.chisei_runtime())?;
-    Ok((sekai == chisei).then_some(sekai))
+    if sekai == chisei {
+        return Ok(Some(sekai));
+    }
+    if sekai == chisei.saturating_add(1)
+        && read_runtime_pending_pairing_epoch(&layout.sekai_runtime())? == sekai
+    {
+        raise_runtime_pairing_epoch(&layout.chisei_runtime(), sekai)?;
+        clear_runtime_pending_pairing_epoch(&layout.sekai_runtime(), sekai)?;
+        return Ok(Some(sekai));
+    }
+    Ok(None)
 }
 
 /// Advance from an already-known matched epoch (see [`matched_pairing_epoch`]).
@@ -1510,8 +1531,12 @@ fn advance_pairing_epoch_from(layout: &CombinedStoreLayout, current: i64) -> Res
         return Ok(());
     }
     let next = current.saturating_add(1);
-    write_runtime_pairing_epoch(&layout.sekai_runtime(), next)?;
-    write_runtime_pairing_epoch(&layout.chisei_runtime(), next)?;
+    // Sekai first, marked pending, then Chisei, then the mark cleared, each
+    // epoch only ever raised (#1845). An interrupted advance leaves Sekai
+    // one step ahead and marked, which the next check rolls forward.
+    raise_runtime_pairing_epoch_pending(&layout.sekai_runtime(), next)?;
+    raise_runtime_pairing_epoch(&layout.chisei_runtime(), next)?;
+    clear_runtime_pending_pairing_epoch(&layout.sekai_runtime(), next)?;
     Ok(())
 }
 
@@ -1658,6 +1683,14 @@ fn ensure_sqlite_cutover(conn: &Connection) -> Result<(), String> {
         &format!("ALTER TABLE {CUTOVER_TABLE} ADD COLUMN pairing_epoch INTEGER NOT NULL DEFAULT 0"),
         [],
     );
+    // #1845: the epoch an advance has written to Sekai but not yet seen land
+    // on Chisei; 0 when none is in flight.
+    let _ = conn.execute(
+        &format!(
+            "ALTER TABLE {CUTOVER_TABLE} ADD COLUMN pending_pairing_epoch INTEGER NOT NULL DEFAULT 0"
+        ),
+        [],
+    );
     Ok(())
 }
 
@@ -1793,45 +1826,194 @@ fn read_runtime_pairing_epoch(db: &RuntimeDb) -> Result<i64, String> {
     }
 }
 
+/// Raise a store's pairing epoch to at least `pairing_epoch` in one
+/// statement, never lowering it (#1845). A transient lock is retried a few
+/// times; restamp, which must reset the epoch, uses
+/// [`write_runtime_pairing_epoch`] instead.
+fn raise_runtime_pairing_epoch(db: &RuntimeDb, pairing_epoch: i64) -> Result<(), String> {
+    raise_pairing_epoch_with(db, pairing_epoch, false)
+}
+
+/// Raise Sekai's epoch and mark it pending in the same statement. The mark
+/// is set only when this write actually raises the epoch, so a stale writer
+/// cannot recreate the mark of an advance that already landed, and it is
+/// only ever raised, so it cannot replace a newer advance's mark; each
+/// writer clears only its own.
+fn raise_runtime_pairing_epoch_pending(db: &RuntimeDb, pairing_epoch: i64) -> Result<(), String> {
+    raise_pairing_epoch_with(db, pairing_epoch, true)
+}
+
+fn raise_pairing_epoch_with(
+    db: &RuntimeDb,
+    pairing_epoch: i64,
+    pending: bool,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_PAIRING_EPOCH_RAISE.with(|at| match at.get() {
+        Some(0) => {
+            at.set(None);
+            true
+        }
+        Some(n) => {
+            at.set(Some(n - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err("database is locked (injected)".into());
+    }
+    #[cfg(test)]
+    PAIRING_EPOCH_WRITES.with(|writes| writes.set(writes.get().saturating_add(1)));
+    let mut attempt = 0;
+    loop {
+        let raised = match db {
+            RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
+                ensure_sqlite_cutover(conn)?;
+                let updated = conn
+                    .execute(
+                        &format!(
+                            "UPDATE {CUTOVER_TABLE}
+                             SET pairing_epoch = MAX(pairing_epoch, ?1), raised_at_ms = ?2,
+                                 pending_pairing_epoch =
+                                     CASE WHEN ?3 AND pairing_epoch < ?1
+                                          THEN MAX(pending_pairing_epoch, ?1)
+                                          ELSE pending_pairing_epoch END
+                             WHERE id = 1"
+                        ),
+                        params![
+                            pairing_epoch,
+                            chrono::Utc::now().timestamp_millis(),
+                            pending
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+                if updated == 1 {
+                    Ok(())
+                } else {
+                    // Not generation-stamped yet: stamp it as before.
+                    write_sqlite_pairing_epoch_row(conn, pairing_epoch)
+                }
+            })?,
+            RuntimeDb::Postgres(db) => {
+                let mut conn = db.connection()?;
+                conn.batch_execute(PG_PAIRING_COLUMNS)
+                    .map_err(|error| error.to_string())?;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let updated = conn
+                    .execute(
+                        "UPDATE sekai_store_cutover
+                         SET pairing_epoch = GREATEST(pairing_epoch, $1), raised_at_ms = $2,
+                             pending_pairing_epoch =
+                                 CASE WHEN $3 AND pairing_epoch < $1
+                                      THEN GREATEST(pending_pairing_epoch, $1)
+                                      ELSE pending_pairing_epoch END
+                         WHERE id = 1",
+                        &[&pairing_epoch, &now_ms, &pending],
+                    )
+                    .map_err(|error| error.to_string())?;
+                if updated == 1 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "pairing epoch stamp affected {updated} rows, expected exactly 1; \
+                         sekai_store_cutover has no id=1 row on this store (it has not been \
+                         generation-stamped yet). Failing closed instead of a silent no-op"
+                    ))
+                }
+            }
+        };
+        match raised {
+            Err(error) if attempt < 4 && is_transient_lock(&error) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25 * attempt));
+            }
+            other => return other,
+        }
+    }
+}
+
+const PG_PAIRING_COLUMNS: &str = "ALTER TABLE IF EXISTS sekai_store_cutover
+     ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;
+ ALTER TABLE IF EXISTS sekai_store_cutover
+     ADD COLUMN IF NOT EXISTS pending_pairing_epoch BIGINT NOT NULL DEFAULT 0;";
+
+/// The epoch an interrupted advance left pending on this store, 0 if none.
+fn read_runtime_pending_pairing_epoch(db: &RuntimeDb) -> Result<i64, String> {
+    match db {
+        RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
+            ensure_sqlite_cutover(conn)?;
+            Ok(conn
+                .query_row(
+                    &format!("SELECT pending_pairing_epoch FROM {CUTOVER_TABLE} WHERE id=1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0))
+        })?,
+        RuntimeDb::Postgres(db) => {
+            let mut conn = db.connection()?;
+            match conn.query_opt(
+                "SELECT pending_pairing_epoch FROM sekai_store_cutover WHERE id = 1",
+                &[],
+            ) {
+                Ok(Some(row)) => Ok(row.get(0)),
+                Ok(None) => Ok(0),
+                Err(error)
+                    if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE)
+                        || error.code() == Some(&postgres::error::SqlState::UNDEFINED_COLUMN) =>
+                {
+                    Ok(0)
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        }
+    }
+}
+
+/// Clear the pending mark once `pairing_epoch` has landed on both stores; a
+/// newer advance's mark is left alone.
+fn clear_runtime_pending_pairing_epoch(db: &RuntimeDb, pairing_epoch: i64) -> Result<(), String> {
+    match db {
+        RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
+            ensure_sqlite_cutover(conn)?;
+            conn.execute(
+                &format!(
+                    "UPDATE {CUTOVER_TABLE} SET pending_pairing_epoch = 0
+                     WHERE id = 1 AND pending_pairing_epoch = ?1"
+                ),
+                params![pairing_epoch],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        })?,
+        RuntimeDb::Postgres(db) => {
+            let mut conn = db.connection()?;
+            conn.batch_execute(PG_PAIRING_COLUMNS)
+                .map_err(|error| error.to_string())?;
+            conn.execute(
+                "UPDATE sekai_store_cutover SET pending_pairing_epoch = 0
+                 WHERE id = 1 AND pending_pairing_epoch = $1",
+                &[&pairing_epoch],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn is_transient_lock(error: &str) -> bool {
+    error.contains("database is locked") || error.contains("database is busy")
+}
+
 fn write_runtime_pairing_epoch(db: &RuntimeDb, pairing_epoch: i64) -> Result<(), String> {
     #[cfg(test)]
     PAIRING_EPOCH_WRITES.with(|writes| writes.set(writes.get().saturating_add(1)));
     match db {
         RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
             ensure_sqlite_cutover(conn)?;
-            let generation: i64 = conn
-                .query_row(
-                    &format!("SELECT generation FROM {CUTOVER_TABLE} WHERE id=1"),
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?
-                .unwrap_or(0);
-            let fence_raised: i64 = conn
-                .query_row(
-                    &format!("SELECT fence_raised FROM {CUTOVER_TABLE} WHERE id=1"),
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?
-                .unwrap_or(0);
-            conn.execute(
-                &format!(
-                    "INSERT OR REPLACE INTO {CUTOVER_TABLE}
-                     (id, generation, fence_raised, raised_at_ms, pairing_epoch)
-                     VALUES (1, ?1, ?2, ?3, ?4)"
-                ),
-                params![
-                    generation,
-                    fence_raised,
-                    chrono::Utc::now().timestamp_millis(),
-                    pairing_epoch
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
+            write_sqlite_pairing_epoch_row(conn, pairing_epoch)
         })?,
         RuntimeDb::Postgres(db) => {
             let mut conn = db.connection()?;
@@ -1839,15 +2021,14 @@ fn write_runtime_pairing_epoch(db: &RuntimeDb, pairing_epoch: i64) -> Result<(),
             // it would surface later only as a confusing "column does not
             // exist" on the UPDATE below, or not at all if the column already
             // existed for an unrelated reason.
-            conn.batch_execute(
-                "ALTER TABLE IF EXISTS sekai_store_cutover
-                 ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;",
-            )
-            .map_err(|error| error.to_string())?;
+            conn.batch_execute(PG_PAIRING_COLUMNS)
+                .map_err(|error| error.to_string())?;
             let now_ms = chrono::Utc::now().timestamp_millis();
             let updated = conn
                 .execute(
-                    "UPDATE sekai_store_cutover SET pairing_epoch = $1, raised_at_ms = $2 WHERE id = 1",
+                    "UPDATE sekai_store_cutover
+                     SET pairing_epoch = $1, raised_at_ms = $2, pending_pairing_epoch = 0
+                     WHERE id = 1",
                     &[&pairing_epoch, &now_ms],
                 )
                 .map_err(|error| error.to_string())?;
@@ -1865,6 +2046,44 @@ fn write_runtime_pairing_epoch(db: &RuntimeDb, pairing_epoch: i64) -> Result<(),
             Ok(())
         }
     }
+}
+
+/// Set the cutover row's pairing epoch exactly, keeping its generation and
+/// fence.
+fn write_sqlite_pairing_epoch_row(conn: &Connection, pairing_epoch: i64) -> Result<(), String> {
+    let generation: i64 = conn
+        .query_row(
+            &format!("SELECT generation FROM {CUTOVER_TABLE} WHERE id=1"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(0);
+    let fence_raised: i64 = conn
+        .query_row(
+            &format!("SELECT fence_raised FROM {CUTOVER_TABLE} WHERE id=1"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(0);
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {CUTOVER_TABLE}
+             (id, generation, fence_raised, raised_at_ms, pairing_epoch)
+             VALUES (1, ?1, ?2, ?3, ?4)"
+        ),
+        params![
+            generation,
+            fence_raised,
+            chrono::Utc::now().timestamp_millis(),
+            pairing_epoch
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn list_chisei_tables(conn: &Connection, schema: &str) -> Result<Vec<String>, String> {
@@ -2679,6 +2898,142 @@ mod tests {
         write_runtime_pairing_epoch(&layout.chisei_runtime(), 999).unwrap();
         let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
         assert!(err.contains("pairing epochs"), "{err}");
+    }
+
+    /// #1845: an advance whose Chisei write fails leaves Sekai one step
+    /// ahead and marked pending; the next mutating check rolls it forward
+    /// instead of refusing, while a restore (one step back included) is
+    /// still refused.
+    #[test]
+    fn an_interrupted_epoch_advance_rolls_forward_and_a_restore_stays_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        align_split_generations(&layout).unwrap();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+
+        // The Chisei write of the next advance fails, after Sekai's landed.
+        FAIL_PAIRING_EPOCH_RAISE.with(|at| at.set(Some(1)));
+        assert!(refuse_mutating_if_generation_mismatch(&layout).is_err());
+        let sekai_epoch = read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap();
+        let chisei_epoch = read_runtime_pairing_epoch(&layout.chisei_runtime()).unwrap();
+        assert_eq!(sekai_epoch, chisei_epoch + 1);
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        assert_eq!(
+            read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap(),
+            read_runtime_pairing_epoch(&layout.chisei_runtime()).unwrap()
+        );
+
+        // A Chisei restored one step back after a completed advance is a
+        // restore, not an interrupted advance: refused.
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        let landed = read_runtime_pairing_epoch(&layout.chisei_runtime()).unwrap();
+        write_runtime_pairing_epoch(&layout.chisei_runtime(), landed - 1).unwrap();
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("pairing epochs"), "{err}");
+        write_runtime_pairing_epoch(&layout.chisei_runtime(), landed).unwrap();
+        layout.invalidate_matched_generation();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+
+        // Two steps apart, or Chisei ahead, is a restore: still refused.
+        let current = read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap();
+        write_runtime_pairing_epoch(&layout.sekai_runtime(), current + 2).unwrap();
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("pairing epochs"), "{err}");
+        write_runtime_pairing_epoch(&layout.sekai_runtime(), current).unwrap();
+        write_runtime_pairing_epoch(&layout.chisei_runtime(), current + 1).unwrap();
+        layout.invalidate_matched_generation();
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("pairing epochs"), "{err}");
+    }
+
+    /// #1845: a stale writer from another process cannot erase a newer
+    /// advance's pending mark, so that advance stays recoverable.
+    #[test]
+    fn a_stale_advance_keeps_a_newer_pending_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        align_split_generations(&layout).unwrap();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        let n = read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap();
+        // Writer C raises Sekai to n + 1 pending and dies before Chisei.
+        raise_runtime_pairing_epoch_pending(&layout.sekai_runtime(), n + 1).unwrap();
+        // A stale writer that read n - 1 replays its advance to n.
+        advance_pairing_epoch_from(&layout, n - 1).unwrap();
+        assert_eq!(
+            read_runtime_pending_pairing_epoch(&layout.sekai_runtime()).unwrap(),
+            n + 1
+        );
+        // C's advance is still rolled forward.
+        layout.invalidate_matched_generation();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        assert_eq!(
+            read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap(),
+            read_runtime_pairing_epoch(&layout.chisei_runtime()).unwrap()
+        );
+    }
+
+    /// #1845: a stale writer replaying an advance that already landed does
+    /// not recreate its pending mark, so a later one-step Chisei restore is
+    /// still refused.
+    #[test]
+    fn a_stale_replay_of_a_landed_advance_leaves_no_pending_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        align_split_generations(&layout).unwrap();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        let landed = read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap();
+        // A stale writer that read landed - 1 raises Sekai to landed again
+        // and dies before its Chisei write.
+        raise_runtime_pairing_epoch_pending(&layout.sekai_runtime(), landed).unwrap();
+        assert_eq!(
+            read_runtime_pending_pairing_epoch(&layout.sekai_runtime()).unwrap(),
+            0
+        );
+        write_runtime_pairing_epoch(&layout.chisei_runtime(), landed - 1).unwrap();
+        layout.invalidate_matched_generation();
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("pairing epochs"), "{err}");
+    }
+
+    /// #1845: many writers advancing the epoch at once on split stores never
+    /// leave them disagreeing.
+    #[test]
+    fn concurrent_mutations_keep_split_epochs_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = std::sync::Arc::new(open_dest_pair(
+            sekai.to_str().unwrap(),
+            chisei.to_str().unwrap(),
+        ));
+        align_split_generations(&layout).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let layout = layout.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..40 {
+                        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        assert_eq!(
+            read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap(),
+            read_runtime_pairing_epoch(&layout.chisei_runtime()).unwrap()
+        );
     }
 
     #[test]
