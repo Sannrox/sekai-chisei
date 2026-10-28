@@ -161,4 +161,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0133: GeoArrow backfill for the Ezu geo feed](0133-ezu-geo-feed-backfill.md)
 - [ADR 0134: Federated queries return only suppressed aggregates](0134-federated-aggregate-queries.md)
 - [ADR 0135: Ship security findings and exposures as a types-only domain package](0135-security-finding-exposure-package.md)
+- [ADR 0136: Site agent instances bind a responsibility to a certified definition and act as their principal](0136-site-agent-instances.md)
 <!-- adr-index:end -->
