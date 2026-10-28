@@ -195,6 +195,145 @@
           "verdict"
         ]
       }
+    },
+    {
+      "type_id": "security.disposition.record",
+      "description": "Record the first disposition on an exposure with its validity basis. Accepting risk on marked data needs the disposition marked at least as high as that data.",
+      "object_kind": "security_disposition",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "exposure_id": {
+            "type": "string"
+          },
+          "disposition": {
+            "type": "string",
+            "enum": [
+              "accept-risk",
+              "false-positive",
+              "mitigated",
+              "fixed"
+            ]
+          },
+          "dependency_closure_digest": {
+            "type": "string"
+          },
+          "release_digest": {
+            "type": "string"
+          },
+          "configuration_digest": {
+            "type": "string"
+          },
+          "reachable_markings": {
+            "type": "string"
+          },
+          "advisory_revision": {
+            "type": "string"
+          },
+          "asset_criticality": {
+            "type": "string"
+          },
+          "expires_at_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "access_marking": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "exposure_id",
+          "disposition",
+          "dependency_closure_digest",
+          "release_digest",
+          "configuration_digest",
+          "advisory_revision"
+        ]
+      }
+    },
+    {
+      "type_id": "security.disposition.supersede",
+      "description": "Replace a disposition with a new one on the same exposure. The previous disposition and its receipt are kept.",
+      "object_kind": "security_disposition",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "exposure_id": {
+            "type": "string"
+          },
+          "disposition": {
+            "type": "string",
+            "enum": [
+              "accept-risk",
+              "false-positive",
+              "mitigated",
+              "fixed"
+            ]
+          },
+          "dependency_closure_digest": {
+            "type": "string"
+          },
+          "release_digest": {
+            "type": "string"
+          },
+          "configuration_digest": {
+            "type": "string"
+          },
+          "reachable_markings": {
+            "type": "string"
+          },
+          "advisory_revision": {
+            "type": "string"
+          },
+          "asset_criticality": {
+            "type": "string"
+          },
+          "expires_at_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "access_marking": {
+            "type": "string"
+          },
+          "supersedes": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "object_id",
+          "exposure_id",
+          "disposition",
+          "dependency_closure_digest",
+          "release_digest",
+          "configuration_digest",
+          "advisory_revision",
+          "supersedes"
+        ]
+      }
     }
   ]
 }

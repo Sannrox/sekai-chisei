@@ -151,6 +151,87 @@
           "description": "Measured occurrence the verdict relies on; required unless the verdict is unknown."
         }
       ]
+    },
+    {
+      "name": "Disposition",
+      "description": "A decision on an exposure with the validity basis it relied on. Superseding records a new disposition; the previous one is kept.",
+      "mapped_kind": "security_disposition",
+      "ensure_kind": true,
+      "kind_description": "Security Disposition object kind",
+      "properties": [
+        {
+          "name": "exposure_id",
+          "type": "string",
+          "required": true,
+          "description": "The exposure this disposition decides."
+        },
+        {
+          "name": "disposition",
+          "type": "enum",
+          "required": true,
+          "description": "accept-risk, false-positive, mitigated, or fixed.",
+          "enum_values": [
+            "accept-risk",
+            "false-positive",
+            "mitigated",
+            "fixed"
+          ]
+        },
+        {
+          "name": "dependency_closure_digest",
+          "type": "string",
+          "required": true,
+          "description": "Validity basis: digest of the dependency closure the decision relied on."
+        },
+        {
+          "name": "release_digest",
+          "type": "string",
+          "required": true,
+          "description": "Validity basis: digest of the deployed release."
+        },
+        {
+          "name": "configuration_digest",
+          "type": "string",
+          "required": true,
+          "description": "Validity basis: digest of the configuration."
+        },
+        {
+          "name": "reachable_markings",
+          "type": "string",
+          "required": false,
+          "description": "Validity basis: comma-separated markings of data reachable from the target."
+        },
+        {
+          "name": "advisory_revision",
+          "type": "string",
+          "required": true,
+          "description": "Validity basis: revision of the advisory the decision relied on."
+        },
+        {
+          "name": "asset_criticality",
+          "type": "string",
+          "required": false,
+          "description": "Validity basis: the asset's effective criticality when decided."
+        },
+        {
+          "name": "expires_at_ms",
+          "type": "int",
+          "required": false,
+          "description": "When the decision stops holding; absent for no expiry."
+        },
+        {
+          "name": "supersedes",
+          "type": "string",
+          "required": false,
+          "description": "The disposition this one replaces; it keeps its history and receipt."
+        },
+        {
+          "name": "rationale",
+          "type": "string",
+          "required": false,
+          "description": "Why the decision was taken."
+        }
+      ]
     }
   ],
   "relations": [
@@ -177,6 +258,12 @@
       "description": "An exposure verdict relies on a measured occurrence.",
       "domain": "Exposure",
       "range": "FindingOccurrence"
+    },
+    {
+      "name": "decides",
+      "description": "A disposition decides an exposure.",
+      "domain": "Disposition",
+      "range": "Exposure"
     }
   ]
 }

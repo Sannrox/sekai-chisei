@@ -16,6 +16,16 @@
 //! - An exposure is unique per finding and deployed target (release and
 //!   environment), and its target identity cannot change.
 //!
+//! - A disposition (#1924) decides an exposure and records the validity
+//!   basis it relied on. Dispositions are never changed: superseding records
+//!   a new one that names the previous, which keeps its history and receipt.
+//!   An exposure has one first disposition and each disposition at most one
+//!   successor, so its history is a single chain.
+//! - Accepting risk on an exposure that touches marked data needs the
+//!   disposition marked at least as high as the exposure and every reachable
+//!   marking. Admission only admits a caller cleared for the marking it
+//!   writes, so a caller without that grant cannot accept the risk.
+//!
 //! Identities are stamped into `external_id` and enforced at commit by a
 //! partial unique index on `(namespace, external_id)` for these kinds; the
 //! plan-time checks here only give a precise error.
@@ -36,11 +46,20 @@ use crate::sekai::schema::{
 
 pub const PACKAGE_ID: &str = "pkg:security.finding-exposure/v1";
 pub const PACKAGE_VERSION: &str = "1";
-pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1";
+/// The current certification. Dispositions (#1924) changed the certified
+/// members, so the package is certified again under a new id that succeeds
+/// the first one where a namespace holds it.
+pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.1";
+/// Certifications this one succeeds, newest first.
+const PREVIOUS_CERTIFICATION_IDS: &[&str] = &["cert:security.finding-exposure/v1"];
 pub const KIND_FINDING: &str = "security_finding";
 pub const KIND_OCCURRENCE: &str = "security_finding_occurrence";
 pub const KIND_HYPOTHESIS: &str = "security_hypothesis";
 pub const KIND_EXPOSURE: &str = "security_exposure";
+pub const KIND_DISPOSITION: &str = "security_disposition";
+pub const ACTION_DISPOSITION_RECORD: &str = "security.disposition.record";
+pub const ACTION_DISPOSITION_SUPERSEDE: &str = "security.disposition.supersede";
+pub const DISPOSITION_ACCEPT_RISK: &str = "accept-risk";
 pub const ACTION_FINDING: &str = "security.finding.record";
 pub const ACTION_OCCURRENCE: &str = "security.occurrence.record";
 pub const ACTION_HYPOTHESIS: &str = "security.hypothesis.record";
@@ -199,6 +218,16 @@ fn certify(
     actor: &str,
     now_ms: i64,
 ) -> Result<CapabilityPackageCertification, String> {
+    let certification = certification_for(db, namespace, actor)?;
+    certify_package(db, actor, &certification, now_ms)
+}
+
+/// The package's current certification, succeeding an earlier live one.
+fn certification_for(
+    db: &RuntimeDb,
+    namespace: &str,
+    actor: &str,
+) -> Result<CapabilityPackageCertification, String> {
     let mut members = vec![
         PackageMember {
             kind: MEMBER_ONTOLOGY.into(),
@@ -226,6 +255,27 @@ fn certify(
         "sekai.ontology-product/v1".into(),
     ];
     let package_digest = package_digest_for(PACKAGE_ID, &members, &compatibility)?;
+    // An earlier live certification of this package is succeeded, not
+    // collided with, so an installed namespace upgrades in place.
+    // Installing again replays the certification as first committed.
+    let mut predecessor_id = db
+        .get_capability_package(namespace, CERTIFICATION_ID)?
+        .map(|current| current.predecessor_id)
+        .unwrap_or_default();
+    for previous in PREVIOUS_CERTIFICATION_IDS
+        .iter()
+        .filter(|_| predecessor_id.is_empty())
+    {
+        if db
+            .get_capability_package(namespace, previous)?
+            .is_some_and(|package| {
+                package.superseded_by.is_empty() && package.revocation.is_empty()
+            })
+        {
+            predecessor_id = (*previous).to_string();
+            break;
+        }
+    }
     let mut certification = CapabilityPackageCertification {
         contract_version: PACKAGE_CONTRACT.into(),
         certification_id: CERTIFICATION_ID.into(),
@@ -242,14 +292,14 @@ fn certify(
         revocation: String::new(),
         revocation_reason: String::new(),
         revoked_at_ms: 0,
-        predecessor_id: String::new(),
+        predecessor_id,
         superseded_by: String::new(),
         certification_digest: String::new(),
         admitted_by: String::new(),
         admitted_at_ms: 0,
     };
     certification.certification_digest = certification_digest_for(&certification, &package_digest)?;
-    certify_package(db, actor, &certification, now_ms)
+    Ok(certification)
 }
 
 fn fixture_digest(bytes: &[u8]) -> String {
@@ -274,6 +324,19 @@ pub fn validate_object_write(db: &RuntimeDb, object: &mut Object) -> Result<(), 
             require_finding(db, object)?;
             validate_exposure_evidence(db, object)?;
             exposure_identity(object)?
+        }
+        KIND_DISPOSITION => {
+            // Dispositions are never changed; a new decision supersedes.
+            if db.get_object(&object.id)?.is_some() {
+                return Err(
+                    "a disposition cannot be changed; supersede it with a new disposition".into(),
+                );
+            }
+            let exposure = require_exposure(db, object)?;
+            if required(object, "disposition")? == DISPOSITION_ACCEPT_RISK {
+                require_marking_for_accepted_risk(db, object, &exposure)?;
+            }
+            disposition_identity(db, object)?
         }
         _ => return Ok(()),
     };
@@ -313,6 +376,21 @@ fn duplicate_message(object: &Object, existing: &Object) -> String {
             "occurrence is already recorded as {}; a replayed observation is not a new occurrence",
             existing.id
         ),
+        KIND_DISPOSITION
+            if object
+                .properties
+                .get("supersedes")
+                .is_some_and(|id| !id.is_empty()) =>
+        {
+            format!(
+                "that disposition is already superseded by {}; supersede the latest one",
+                existing.id
+            )
+        }
+        KIND_DISPOSITION => format!(
+            "this exposure already has a disposition {}; supersede it instead",
+            existing.id
+        ),
         _ => format!(
             "an exposure for this finding and target already exists as {}",
             existing.id
@@ -328,6 +406,128 @@ fn require_finding(db: &RuntimeDb, object: &Object) -> Result<Object, String> {
         .filter(|finding| finding.namespace == object.namespace && finding.kind == KIND_FINDING)
         .ok_or_else(|| format!("finding {finding_id} not found in this namespace"))?;
     Ok(finding)
+}
+
+/// The decided exposure exists in the same namespace.
+fn require_exposure(db: &RuntimeDb, object: &Object) -> Result<Object, String> {
+    let exposure_id = required(object, "exposure_id")?;
+    db.get_object(exposure_id)?
+        .filter(|exposure| exposure.namespace == object.namespace && exposure.kind == KIND_EXPOSURE)
+        .ok_or_else(|| format!("exposure {exposure_id} not found in this namespace"))
+}
+
+/// The first disposition of an exposure, or the one successor of a previous
+/// disposition of the same exposure. Either is unique, so the history of an
+/// exposure's dispositions is one chain.
+fn disposition_identity(db: &RuntimeDb, object: &Object) -> Result<String, String> {
+    let exposure_id = required(object, "exposure_id")?;
+    let Some(previous_id) = object.properties.get("supersedes") else {
+        return Ok(format!("disposition:{exposure_id}"));
+    };
+    // Present but blank is not "no predecessor": a supersede names one.
+    if previous_id.trim().is_empty() {
+        return Err("supersedes must name the disposition being replaced".into());
+    }
+    let previous = db
+        .get_object(previous_id)?
+        .filter(|previous| {
+            previous.namespace == object.namespace && previous.kind == KIND_DISPOSITION
+        })
+        .ok_or_else(|| format!("disposition {previous_id} not found in this namespace"))?;
+    if previous.properties.get("exposure_id").map(String::as_str) != Some(exposure_id) {
+        return Err(format!(
+            "disposition {previous_id} decides a different exposure"
+        ));
+    }
+    Ok(format!("disposition-successor:{previous_id}"))
+}
+
+/// Accepting risk needs the disposition marked at least as high as the
+/// exposure and every marking of reachable data. The written marking already
+/// holds what the Action was admitted under, and admission refused any
+/// caller not cleared for it.
+fn require_marking_for_accepted_risk(
+    db: &RuntimeDb,
+    object: &Object,
+    exposure: &Object,
+) -> Result<(), String> {
+    let mut needed: Vec<String> = object
+        .properties
+        .get("reachable_markings")
+        .map(|markings| {
+            markings
+                .split(',')
+                .map(str::trim)
+                .filter(|marking| !marking.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(marking) = crate::sekai::markings::object_marking_token(exposure) {
+        needed.push(marking.to_string());
+    }
+    // A successor never needs less than any disposition before it: every
+    // earlier disposition's marking and reachable markings still apply,
+    // whatever the caller declares now and whatever lies between.
+    let mut previous_id = object
+        .properties
+        .get("supersedes")
+        .filter(|id| !id.trim().is_empty())
+        .cloned();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(id) = previous_id.take() {
+        if !visited.insert(id.clone()) {
+            return Err(format!("disposition chain through {id} loops"));
+        }
+        let Some(previous) = db.get_object(&id)?.filter(|previous| {
+            previous.kind == KIND_DISPOSITION && previous.namespace == object.namespace
+        }) else {
+            break;
+        };
+        if let Some(marking) = crate::sekai::markings::object_marking_token(&previous) {
+            needed.push(marking.to_string());
+        }
+        if let Some(markings) = previous.properties.get("reachable_markings") {
+            needed.extend(
+                markings
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|marking| !marking.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        previous_id = previous
+            .properties
+            .get("supersedes")
+            .filter(|id| !id.trim().is_empty())
+            .cloned();
+    }
+    needed.sort();
+    needed.dedup();
+    if needed.is_empty() {
+        return Ok(());
+    }
+    let lattice = db
+        .get_classification_lattice(&object.namespace)?
+        .unwrap_or_else(|| {
+            crate::sekai::classification_lattice::ClassificationLattice::default_evidence_lattice(
+                &object.namespace,
+            )
+        });
+    let held = crate::sekai::markings::object_marking_token(object).unwrap_or_default();
+    let mut uncovered = Vec::new();
+    for marking in &needed {
+        if held.is_empty() || !lattice.dominates(held, marking)? {
+            uncovered.push(marking.as_str());
+        }
+    }
+    if uncovered.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "accepting risk on data marked {} needs the disposition marked at least as high as each",
+        uncovered.join(", ")
+    ))
 }
 
 /// One exposure per finding and deployed target. The digest keeps the
@@ -505,6 +705,33 @@ mod tests {
         }
     }
 
+    /// A namespace certified before dispositions existed upgrades: the new
+    /// certification succeeds the first instead of colliding with it.
+    #[test]
+    fn an_earlier_certification_is_succeeded_on_install() {
+        let runtime = RuntimeDb::memory();
+        let earlier = crate::sekai::capability_package::CapabilityPackageCertification {
+            certification_id: PREVIOUS_CERTIFICATION_IDS[0].into(),
+            ..certification_for(&runtime, NAMESPACE, ACTOR).unwrap()
+        };
+        let mut earlier = earlier;
+        earlier.members[0].digest = fixture_digest(b"earlier members");
+        earlier.package_digest =
+            package_digest_for(PACKAGE_ID, &earlier.members, &earlier.compatibility).unwrap();
+        earlier.certification_digest =
+            certification_digest_for(&earlier, &earlier.package_digest).unwrap();
+        certify_package(&runtime, ACTOR, &earlier, 500).unwrap();
+
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        let current = get_package(&runtime, ACTOR, NAMESPACE, CERTIFICATION_ID).unwrap();
+        assert_eq!(current.predecessor_id, PREVIOUS_CERTIFICATION_IDS[0]);
+        let previous =
+            get_package(&runtime, ACTOR, NAMESPACE, PREVIOUS_CERTIFICATION_IDS[0]).unwrap();
+        assert_eq!(previous.superseded_by, CERTIFICATION_ID);
+        // Installing again is a replay.
+        install(&runtime, NAMESPACE, ACTOR, 2_000).unwrap();
+    }
+
     #[test]
     fn package_certifies_ontology_action_and_evaluation_members() {
         let runtime = installed();
@@ -658,6 +885,224 @@ mod tests {
         assert!(
             as_occurrence.contains("not a finding occurrence"),
             "{as_occurrence}"
+        );
+    }
+
+    fn with_exposure() -> RuntimeDb {
+        let runtime = installed();
+        admit(&runtime, ACTION_FINDING, finding("f-1", "sig-1"), "f").unwrap();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE,
+            exposure("e-1", VERDICT_UNKNOWN, None),
+            "e",
+        )
+        .unwrap();
+        runtime
+    }
+
+    fn disposition(object_id: &str, decision: &str, supersedes: Option<&str>) -> Value {
+        let mut parameters = json!({
+            "object_id": object_id,
+            "exposure_id": "e-1",
+            "disposition": decision,
+            "dependency_closure_digest": "sha256:closure",
+            "release_digest": "sha256:release",
+            "configuration_digest": "sha256:config",
+            "advisory_revision": "GHSA-1:3",
+            "expires_at_ms": 9_000
+        });
+        if let Some(previous) = supersedes {
+            parameters["supersedes"] = previous.into();
+        }
+        parameters
+    }
+
+    /// Admit as a caller cleared only up to `ceiling` on the default lattice.
+    fn admit_cleared(
+        runtime: &RuntimeDb,
+        type_id: &str,
+        parameters: Value,
+        key: &str,
+        ceiling: &'static str,
+    ) -> Result<(), ActionInstanceAdmissionError> {
+        let mut admission = request(type_id, &parameters, key);
+        admission.marking_gate = crate::sekai::action_instance_admission::MarkingGate::new(
+            move |marking| {
+                crate::sekai::classification_lattice::ClassificationLattice::default_evidence_lattice(
+                    NAMESPACE,
+                )
+                .dominates(ceiling, marking)
+            },
+        );
+        ActionInstanceAdmission::new(runtime, None)
+            .admit(admission, ACTOR, 2_000)
+            .map(|_| ())
+    }
+
+    /// Accepting risk on an exposure that reaches marked data needs the
+    /// disposition marked that high, and only a caller cleared for that
+    /// marking is admitted (#1924).
+    #[test]
+    fn accepting_risk_on_marked_data_needs_the_grant_for_that_marking() {
+        let runtime = with_exposure();
+        let mut accept = disposition("d-1", DISPOSITION_ACCEPT_RISK, None);
+        accept["reachable_markings"] = "internal, confidential".into();
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            accept.clone(),
+            "d1",
+        ));
+        assert!(message.contains("confidential, internal"), "{message}");
+
+        accept["access_marking"] = "confidential".into();
+        let denied = admit_cleared(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            accept.clone(),
+            "d1b",
+            "internal",
+        );
+        assert!(
+            matches!(
+                denied,
+                Err(ActionInstanceAdmissionError::PermissionDenied(_))
+            ),
+            "{denied:?}"
+        );
+        assert!(runtime.get_object("d-1").unwrap().is_none());
+
+        admit_cleared(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            accept,
+            "d1c",
+            "confidential",
+        )
+        .unwrap();
+
+        // A successor needs what the disposition it replaces needed, even if
+        // the caller declares no reachable markings now.
+        let mut lower = disposition("d-2", DISPOSITION_ACCEPT_RISK, Some("d-1"));
+        lower["access_marking"] = "internal".into();
+        let message = failed_precondition(admit_cleared(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            lower,
+            "d2",
+            "internal",
+        ));
+        assert!(message.contains("confidential"), "{message}");
+
+        // The requirement survives a non-risk disposition in between.
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-2", "fixed", Some("d-1")),
+            "d2-fixed",
+        )
+        .unwrap();
+        let message = failed_precondition(admit_cleared(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-3", DISPOSITION_ACCEPT_RISK, Some("d-2")),
+            "d3",
+            "internal",
+        ));
+        assert!(message.contains("confidential"), "{message}");
+
+        // A recorded disposition is never changed in place.
+        let mut changed = runtime.get_object("d-1").unwrap().unwrap();
+        changed
+            .properties
+            .insert("disposition".into(), "fixed".into());
+        let message = validate_object_write(&runtime, &mut changed).unwrap_err();
+        assert!(message.contains("cannot be changed"), "{message}");
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-9", "fixed", Some(" ")),
+            "d9",
+        ));
+        assert!(message.contains("supersedes must name"), "{message}");
+        let recorded = runtime.get_object("d-1").unwrap().unwrap();
+        assert_eq!(recorded.external_id, "disposition:e-1");
+        assert_eq!(recorded.properties["release_digest"], "sha256:release");
+    }
+
+    /// Superseding records a new disposition and keeps the previous one with
+    /// its receipt. An exposure's dispositions form one chain.
+    #[test]
+    fn a_superseded_disposition_keeps_its_history_and_the_chain_is_single() {
+        let runtime = with_exposure();
+        let operation_id = ActionInstanceAdmission::new(&runtime, None)
+            .admit(
+                request(
+                    ACTION_DISPOSITION_RECORD,
+                    &disposition("d-1", "false-positive", None),
+                    "d1",
+                ),
+                ACTOR,
+                2_000,
+            )
+            .unwrap()
+            .instance
+            .operation_id;
+        let first = runtime.get_object("d-1").unwrap().unwrap();
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-x", "fixed", None),
+            "dx",
+        ));
+        assert!(message.contains("supersede it instead"), "{message}");
+
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-2", "fixed", Some("d-1")),
+            "d2",
+        )
+        .unwrap();
+        let kept = runtime.get_object("d-1").unwrap().unwrap();
+        assert_eq!(
+            (kept.properties, kept.updated, kept.external_id),
+            (first.properties, first.updated, first.external_id)
+        );
+        assert_eq!(
+            runtime.get_object("d-2").unwrap().unwrap().external_id,
+            "disposition-successor:d-1"
+        );
+        assert!(
+            runtime
+                .get_operation_receipt(&operation_id)
+                .unwrap()
+                .is_some()
+        );
+
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-3", "mitigated", Some("d-1")),
+            "d3",
+        ));
+        assert!(message.contains("already superseded by d-2"), "{message}");
+        admit(&runtime, ACTION_FINDING, finding("f-2", "sig-2"), "f2").unwrap();
+        let mut other = exposure("e-2", VERDICT_UNKNOWN, None);
+        other["finding_id"] = "f-2".into();
+        admit(&runtime, ACTION_EXPOSURE, other, "e2").unwrap();
+        let mut elsewhere = disposition("d-4", "fixed", Some("d-2"));
+        elsewhere["exposure_id"] = "e-2".into();
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            elsewhere,
+            "d4",
+        ));
+        assert!(
+            message.contains("decides a different exposure"),
+            "{message}"
         );
     }
 

@@ -210,6 +210,8 @@ const SECURITY_PACKAGE_IDENTITY_SCHEMA: &str =
     include_str!("postgres/0124_security_package_identity.sql");
 const BUDGET_WORK_UNIT_DEFAULTS_SCHEMA: &str =
     include_str!("postgres/0125_budget_work_unit_defaults.sql");
+const SECURITY_DISPOSITION_IDENTITY_SCHEMA: &str =
+    include_str!("postgres/0126_security_disposition_identity.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -986,6 +988,12 @@ const MIGRATIONS: &[Migration] = &[
         "budget_work_unit_defaults",
         BUDGET_WORK_UNIT_DEFAULTS_SCHEMA,
         MigrationOwner::Chisei,
+    ),
+    mig(
+        125,
+        "security_disposition_identity",
+        SECURITY_DISPOSITION_IDENTITY_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 
