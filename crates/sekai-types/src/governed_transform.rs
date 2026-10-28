@@ -32,6 +32,8 @@ pub const ANALYTICAL_COMPUTE_CAPABILITY: &str = "sekai.transforms.analytical";
 pub const ISOLATED_COMPUTE_CAPABILITY: &str = "sekai.transforms.isolated_process";
 /// DiscoverCapabilities name for unsaved preview runs (ADR 0110).
 pub const PREVIEW_COMPUTE_CAPABILITY: &str = "sekai.transforms.preview";
+/// Caller-scoped ad-hoc runs of an inline definition (ADR 0138).
+pub const ADHOC_COMPUTE_CAPABILITY: &str = "sekai.transforms.adhoc";
 /// Preview identities are never governed run ids.
 pub const PREVIEW_ID_PREFIX: &str = "preview:";
 /// Default sample rows per input when PreviewGovernedTransform omits row_cap.

@@ -1140,6 +1140,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "RunAdHocGovernedTransform",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/adhoc_transform.rs",
+        "docs/decisions/0138-caller-scoped-ad-hoc-transform-runs.md"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PreviewGovernedTransform",
       "kind": "persistent",
       "surfaces": [

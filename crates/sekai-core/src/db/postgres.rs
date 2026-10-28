@@ -216,6 +216,7 @@ const FEDERATED_ALLOWANCES_SCHEMA: &str = include_str!("postgres/0127_federated_
 const AGENT_TURNS_SCHEMA: &str = include_str!("postgres/0128_agent_turns.sql");
 const AGENT_WAKE_CURSORS_SCHEMA: &str = include_str!("postgres/0129_agent_wake_cursors.sql");
 const PACKAGE_FEED_CURSORS_SCHEMA: &str = include_str!("postgres/0130_package_feed_cursors.sql");
+const ADHOC_TRANSFORM_RUNS_SCHEMA: &str = include_str!("postgres/0131_adhoc_transform_runs.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1021,6 +1022,12 @@ const MIGRATIONS: &[Migration] = &[
         129,
         "package_feed_cursors",
         PACKAGE_FEED_CURSORS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        130,
+        "adhoc_transform_runs",
+        ADHOC_TRANSFORM_RUNS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

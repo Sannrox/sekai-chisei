@@ -11,6 +11,7 @@ pub mod action_policy;
 pub mod action_ports;
 pub mod action_type_criteria;
 pub mod action_work_lifecycle;
+pub mod adhoc_transform;
 pub mod agent_autonomy;
 pub mod agent_definition;
 pub mod agent_dry_run;

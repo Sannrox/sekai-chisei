@@ -144,6 +144,123 @@ impl PostgresDb {
         self.run_governed_transform_owned(namespace, transform_id, incremental, now_ms, "", "")
     }
 
+    /// See [`crate::db::sekai::SekaiDb::run_adhoc_transform`]; the identity
+    /// is serialized by an advisory lock.
+    pub fn run_adhoc_transform(
+        &self,
+        request: &crate::sekai::adhoc_transform::AdHocRequest,
+        transform: &GovernedTransform,
+        budget: &crate::sekai::adhoc_transform::OutputBudget,
+        expires_at_ms: i64,
+        tenant_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::adhoc_transform::AdHocRun, String> {
+        use crate::sekai::adhoc_transform::{
+            ADHOC_IDENTITY_CONFLICT, AdHocRun, TRANSFORM_TRIGGER_ADHOC, scratch_columns,
+            scratch_object,
+        };
+        let identity = request.identity();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 468))",
+            &[&identity],
+        )
+        .map_err(|error| error.to_string())?;
+        let existing = tx
+            .query_opt(
+                "SELECT definition_digest, run_id, dataset_id, expires_at_ms
+                 FROM sekai_adhoc_transform_run WHERE identity = $1",
+                &[&identity],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                    row.get::<_, i64>(3),
+                )
+            });
+        if let Some((digest, run_id, dataset_id, expires_at_ms)) = existing {
+            if digest != transform.definition_digest {
+                return Err(ADHOC_IDENTITY_CONFLICT.into());
+            }
+            let run = load_transform_run_pg(&mut tx, &run_id)?.ok_or("ad-hoc run not found")?;
+            return Ok(AdHocRun {
+                run,
+                scratch_dataset_id: dataset_id,
+                expires_at_ms,
+                replayed: true,
+            });
+        }
+        let object = scratch_object(request, now_ms);
+        crate::db::postgres_audit::insert_created_object_in(
+            &mut tx,
+            &object,
+            &request.caller,
+            None,
+            &crate::sekai::audit::ChangeAttribution::default(),
+        )?;
+        tx.execute(
+            "INSERT INTO sekai_datasets (id,name,columns,object_id,created,partition_keys)
+             VALUES ($1,$1,'[]',$2,$3,$4)",
+            &[
+                &transform.output_dataset_id,
+                &object.id,
+                &now_ms,
+                &crate::sekai::dataset::encode_partition_keys(&[])?,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        let run = run_in_process_tx_pg(
+            &mut tx,
+            transform,
+            &crate::db::governed_transform::InProcessRun {
+                incremental: false,
+                trigger_cause: TRANSFORM_TRIGGER_ADHOC,
+                trigger_ref: &request.session_label,
+                now_ms,
+                tenant_id,
+                stored: false,
+                output_budget: Some(budget),
+            },
+        )?;
+        let output = live_output_rows_pg(&mut tx, &transform.output_dataset_id)?;
+        tx.execute(
+            "UPDATE sekai_datasets SET columns = $2 WHERE id = $1",
+            &[&transform.output_dataset_id, &scratch_columns(&output)],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_adhoc_transform_run
+             (identity, namespace, caller, session_label, definition_digest, run_id, dataset_id,
+              expires_at_ms, created_at_ms)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            &[
+                &identity,
+                &request.namespace,
+                &request.caller,
+                &request.session_label,
+                &transform.definition_digest,
+                &run.run_id,
+                &transform.output_dataset_id,
+                &expires_at_ms,
+                &now_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(AdHocRun {
+            run,
+            scratch_dataset_id: transform.output_dataset_id.clone(),
+            expires_at_ms,
+            replayed: false,
+        })
+    }
+
     pub fn run_governed_transform_owned(
         &self,
         namespace: &str,
@@ -183,163 +300,19 @@ impl PostgresDb {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(run);
         }
-        let bindings = transform.input_bindings();
-        let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
-        lock_ids.push(transform.output_dataset_id.as_str());
-        lock_transform_datasets(&mut tx, &lock_ids)?;
-        // Compute is measured from here, once the dataset locks are held, until
-        // this run's output is written, before downstream triggers run (#1651).
-        let started = std::time::Instant::now();
-        let stored = load_checkpoint(&mut tx, namespace, transform_id)?;
-        let output_keys = load_dataset_partition_keys_pg(&mut tx, &transform.output_dataset_id)?;
-        let (mut incremental, checkpoint) = bind_checkpoint(
-            incremental,
-            stored,
-            &transform.definition_digest,
-            &output_keys,
-        );
-        if !transform.allows_incremental() {
-            incremental = false;
-        }
-        if incremental && unversioned_input_pg(&mut tx, &bindings)? {
-            // A pin is a full dataset version. Incremental would load a delta,
-            // then snapshot the rest unbounded; rebuild fully while there is no version.
-            incremental = false;
-        }
-        let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
-        let mut load_budget = InputLoadBudget::for_transform(&transform);
-        let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
-        let mut input_object_tokens: Vec<Option<String>> = Vec::new();
-        for (alias, dataset_id) in &bindings {
-            loaded.push((
-                alias.clone(),
-                load_dataset_column_names(&mut tx, dataset_id)?,
-                load_row_records(&mut tx, dataset_id, after_id, load_budget.as_mut())?,
-            ));
-            let object_id = load_dataset_object_id(&mut tx, dataset_id)?;
-            input_object_tokens.push(load_object_marking_token(&mut tx, &object_id)?);
-            if load_budget
-                .as_ref()
-                .is_some_and(|budget| budget.exceeded.is_some())
-            {
-                break;
-            }
-        }
-        if let Some(budget) = load_budget.as_mut() {
-            budget.expire_if_past();
-        }
-        let output_object_id = load_dataset_object_id(&mut tx, &transform.output_dataset_id)?;
-        if !output_object_id.trim().is_empty() {
-            lock_object_lifecycle(&mut tx, &output_object_id)?;
-        }
-        let prior_token = load_object_marking_token(&mut tx, &output_object_id)?;
-        let marking_rows: Vec<&std::collections::HashMap<String, String>> = loaded
-            .iter()
-            .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row))
-            .collect();
-        let (markings_in, markings_out) = derive_transform_markings(
-            crate::db::postgres_object_security_terms::load_classification_lattice(
-                &mut tx, namespace,
-            )?
-            .as_ref(),
-            input_object_tokens.iter().map(|token| token.as_deref()),
-            prior_token.as_deref(),
-            marking_rows,
-        )?;
-        if let Some(budget) = load_budget.as_mut() {
-            budget.expire_if_past();
-        }
-        let tables: Vec<TransformInputRows<'_>> = loaded
-            .iter()
-            .map(|(alias, columns, records)| TransformInputRows {
-                alias,
-                records,
-                columns,
-            })
-            .collect();
-        let deadline = load_budget.as_ref().map(|budget| budget.deadline());
-        let (mut run, output_rows) =
-            if let Some(reason) = load_budget.and_then(|budget| budget.exceeded) {
-                (
-                    budget_quarantined_run(
-                        &transform,
-                        checkpoint.as_ref(),
-                        incremental,
-                        now_ms,
-                        Uuid::new_v4().to_string(),
-                        loaded
-                            .iter()
-                            .map(|(_, _, records)| records.len() as i32)
-                            .sum(),
-                        reason,
-                    ),
-                    Vec::new(),
-                )
-            } else {
-                compute_run_tables_until(
-                    &transform,
-                    checkpoint.as_ref(),
-                    &tables,
-                    incremental,
-                    now_ms,
-                    Uuid::new_v4().to_string(),
-                    deadline,
-                )
-            };
-        run.markings_in = markings_in;
-        run.markings_out = markings_out;
-        run.stamp_trigger(TRANSFORM_TRIGGER_MANUAL, "");
-        run.input_partitions = input_receipts_from_loaded_pg(&mut tx, &bindings, &loaded)?;
-        run.input_versions = input_version_pins_pg(&mut tx, &bindings, now_ms, !run.quarantined)?;
-        if run.quarantined {
-            if !incremental {
-                let live = live_output_rows_pg(&mut tx, &transform.output_dataset_id)?;
-                let keys = load_dataset_partition_keys_pg(&mut tx, &transform.output_dataset_id)?;
-                run.output_digest = dataset_digest(&keys, &live);
-            }
-            insert_transform_run(&mut tx, &run)?;
-            record_in_process_finish_pg(&mut tx, &run.run_id, started)?;
-            after_run_committed_pg(&mut tx, &transform, &run, now_ms)?;
-            persist_transform_usage_pending_pg(&mut tx, &run.run_id, tenant_id, now_ms)?;
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok(run);
-        }
-        require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
-        persist_computed_output_pg(
+        let run = run_in_process_tx_pg(
             &mut tx,
             &transform,
-            &bindings,
-            &loaded,
-            incremental,
-            checkpoint.as_ref(),
-            &output_rows,
-            &mut run,
+            &crate::db::governed_transform::InProcessRun {
+                incremental,
+                trigger_cause: TRANSFORM_TRIGGER_MANUAL,
+                trigger_ref: "",
+                now_ms,
+                tenant_id,
+                stored: true,
+                output_budget: None,
+            },
         )?;
-        stamp_object_marking(&mut tx, &output_object_id, &run, now_ms)?;
-        insert_transform_run(&mut tx, &run)?;
-        record_in_process_finish_pg(&mut tx, &run.run_id, started)?;
-        record_run_output_version_pg(&mut tx, &run.run_id, &transform.output_dataset_id)?;
-        tx.execute(
-            "INSERT INTO sekai_governed_transform_checkpoint
-             (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
-             VALUES ($1,$2,$3,$4,$5,$6)
-             ON CONFLICT (namespace, transform_id) DO UPDATE SET
-                definition_digest = EXCLUDED.definition_digest,
-                last_input_row_id = EXCLUDED.last_input_row_id,
-                live_run_id = EXCLUDED.live_run_id,
-                live_output_digest = EXCLUDED.live_output_digest",
-            &[
-                &namespace,
-                &transform_id,
-                &transform.definition_digest,
-                &run.last_input_row_id,
-                &run.run_id,
-                &run.output_digest,
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        after_run_committed_pg(&mut tx, &transform, &run, now_ms)?;
-        persist_transform_usage_pending_pg(&mut tx, &run.run_id, tenant_id, now_ms)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
@@ -1533,6 +1506,192 @@ impl PostgresDb {
         })?;
         Ok(receipt)
     }
+}
+
+/// Runs `transform` in process inside `tx` and records the run; the caller
+/// commits. See [`crate::db::governed_transform::InProcessRun`].
+pub(crate) fn run_in_process_tx_pg(
+    tx: &mut postgres::Transaction<'_>,
+    transform: &GovernedTransform,
+    options: &crate::db::governed_transform::InProcessRun<'_>,
+) -> Result<TransformRun, String> {
+    let crate::db::governed_transform::InProcessRun {
+        incremental,
+        trigger_cause,
+        trigger_ref,
+        now_ms,
+        tenant_id,
+        stored,
+        output_budget,
+    } = *options;
+    let namespace = transform.namespace.as_str();
+    let transform_id = transform.transform_id.as_str();
+    let bindings = transform.input_bindings();
+    let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
+    lock_ids.push(transform.output_dataset_id.as_str());
+    lock_transform_datasets(tx, &lock_ids)?;
+    // Compute is measured from here, once the dataset locks are held, until
+    // this run's output is written, before downstream triggers run (#1651).
+    let started = std::time::Instant::now();
+    let checkpoint_row = if stored {
+        load_checkpoint(tx, namespace, transform_id)?
+    } else {
+        None
+    };
+    let output_keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
+    let (mut incremental, checkpoint) = bind_checkpoint(
+        incremental && stored,
+        checkpoint_row,
+        &transform.definition_digest,
+        &output_keys,
+    );
+    if !transform.allows_incremental() {
+        incremental = false;
+    }
+    if incremental && unversioned_input_pg(tx, &bindings)? {
+        // A pin is a full dataset version. Incremental would load a delta,
+        // then snapshot the rest unbounded; rebuild fully while there is no version.
+        incremental = false;
+    }
+    let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
+    let mut load_budget = InputLoadBudget::for_transform(transform);
+    let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
+    let mut input_object_tokens: Vec<Option<String>> = Vec::new();
+    for (alias, dataset_id) in &bindings {
+        loaded.push((
+            alias.clone(),
+            load_dataset_column_names(tx, dataset_id)?,
+            load_row_records(tx, dataset_id, after_id, load_budget.as_mut())?,
+        ));
+        let object_id = load_dataset_object_id(tx, dataset_id)?;
+        input_object_tokens.push(load_object_marking_token(tx, &object_id)?);
+        if load_budget
+            .as_ref()
+            .is_some_and(|budget| budget.exceeded.is_some())
+        {
+            break;
+        }
+    }
+    if let Some(budget) = load_budget.as_mut() {
+        budget.expire_if_past();
+    }
+    let output_object_id = load_dataset_object_id(tx, &transform.output_dataset_id)?;
+    if !output_object_id.trim().is_empty() {
+        lock_object_lifecycle(tx, &output_object_id)?;
+    }
+    let prior_token = load_object_marking_token(tx, &output_object_id)?;
+    let marking_rows: Vec<&std::collections::HashMap<String, String>> = loaded
+        .iter()
+        .flat_map(|(_, _, records)| records.iter().map(|(_, row)| row))
+        .collect();
+    let (markings_in, markings_out) = derive_transform_markings(
+        crate::db::postgres_object_security_terms::load_classification_lattice(tx, namespace)?
+            .as_ref(),
+        input_object_tokens.iter().map(|token| token.as_deref()),
+        prior_token.as_deref(),
+        marking_rows,
+    )?;
+    if let Some(budget) = load_budget.as_mut() {
+        budget.expire_if_past();
+    }
+    let tables: Vec<TransformInputRows<'_>> = loaded
+        .iter()
+        .map(|(alias, columns, records)| TransformInputRows {
+            alias,
+            records,
+            columns,
+        })
+        .collect();
+    let deadline = load_budget.as_ref().map(|budget| budget.deadline());
+    let (mut run, output_rows) =
+        if let Some(reason) = load_budget.and_then(|budget| budget.exceeded) {
+            (
+                budget_quarantined_run(
+                    transform,
+                    checkpoint.as_ref(),
+                    incremental,
+                    now_ms,
+                    Uuid::new_v4().to_string(),
+                    loaded
+                        .iter()
+                        .map(|(_, _, records)| records.len() as i32)
+                        .sum(),
+                    reason,
+                ),
+                Vec::new(),
+            )
+        } else {
+            compute_run_tables_until(
+                transform,
+                checkpoint.as_ref(),
+                &tables,
+                incremental,
+                now_ms,
+                Uuid::new_v4().to_string(),
+                deadline,
+            )
+        };
+    run.markings_in = markings_in;
+    run.markings_out = markings_out;
+    run.stamp_trigger(trigger_cause, trigger_ref);
+    run.input_partitions = input_receipts_from_loaded_pg(tx, &bindings, &loaded)?;
+    run.input_versions = input_version_pins_pg(tx, &bindings, now_ms, !run.quarantined)?;
+    if run.quarantined {
+        if !incremental {
+            let live = live_output_rows_pg(tx, &transform.output_dataset_id)?;
+            let keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
+            run.output_digest = dataset_digest(&keys, &live);
+        }
+        insert_transform_run(tx, &run)?;
+        record_in_process_finish_pg(tx, &run.run_id, started)?;
+        if stored {
+            after_run_committed_pg(tx, transform, &run, now_ms)?;
+        }
+        persist_transform_usage_pending_pg(tx, &run.run_id, tenant_id, now_ms)?;
+        return Ok(run);
+    }
+    if let Some(budget) = output_budget {
+        budget.admit(&output_rows)?;
+    }
+    require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
+    persist_computed_output_pg(
+        tx,
+        transform,
+        &bindings,
+        &loaded,
+        incremental,
+        checkpoint.as_ref(),
+        &output_rows,
+        &mut run,
+    )?;
+    stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
+    insert_transform_run(tx, &run)?;
+    record_in_process_finish_pg(tx, &run.run_id, started)?;
+    record_run_output_version_pg(tx, &run.run_id, &transform.output_dataset_id)?;
+    if stored {
+        tx.execute(
+        "INSERT INTO sekai_governed_transform_checkpoint
+         (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (namespace, transform_id) DO UPDATE SET
+            definition_digest = EXCLUDED.definition_digest,
+            last_input_row_id = EXCLUDED.last_input_row_id,
+            live_run_id = EXCLUDED.live_run_id,
+            live_output_digest = EXCLUDED.live_output_digest",
+        &[
+            &namespace,
+            &transform_id,
+            &transform.definition_digest,
+            &run.last_input_row_id,
+            &run.run_id,
+            &run.output_digest,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+        after_run_committed_pg(tx, transform, &run, now_ms)?;
+    }
+    persist_transform_usage_pending_pg(tx, &run.run_id, tenant_id, now_ms)?;
+    Ok(run)
 }
 
 pub fn lock_transform_datasets(

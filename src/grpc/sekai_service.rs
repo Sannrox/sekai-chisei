@@ -1445,6 +1445,13 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<RunGovernedTransformResponse>, Status> {
         rpc_data::run_governed_transform(self, req).await
     }
+    async fn run_ad_hoc_governed_transform(
+        &self,
+        req: Request<RunAdHocGovernedTransformRequest>,
+    ) -> Result<Response<RunAdHocGovernedTransformResponse>, Status> {
+        rpc_data::run_adhoc_governed_transform(self, req).await
+    }
+
     async fn preview_governed_transform(
         &self,
         req: Request<PreviewGovernedTransformRequest>,

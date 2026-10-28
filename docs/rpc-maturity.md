@@ -157,6 +157,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.RunAdHocGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PreviewGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.ListGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |

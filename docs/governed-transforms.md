@@ -93,6 +93,18 @@ and a repeated key is refused. Only planes from this release honor
 declare requirements once every plane serving the store is upgraded.
 Definitions without `requires` keep their digest.
 
+Experimental `RunAdHocGovernedTransform` (ADR 0138) runs an inline analytical
+definition once for any caller with read access to the namespace. Inputs pass
+the preview read checks; an input whose columns the caller may only partly
+read is refused. The run is keyed by namespace, caller, `session_label` and
+`idempotency_key`, so a retry returns the same run and the same key with
+another definition is refused. The output lands in a scratch dataset named
+from that identity, kept for 24 hours, and capped at 10,000 rows and 8 MiB;
+an output over either cap fails with `transform_adhoc_output_budget` and
+writes nothing. The receipt has trigger cause `adhoc` and the session label as
+its trigger reference. The definition is never stored or listed.
+Isolated-process ad-hoc runs are not available yet.
+
 The plane's `/metrics` exports the isolated-process queue as three gauges per
 `profile` (`isolated_process`; other profiles run in the request) and worker
 `pool` (#1732, ADR 0129):

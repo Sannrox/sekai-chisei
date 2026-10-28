@@ -260,6 +260,17 @@ impl SekaiDb {
                     created_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (run_id, checkpoint)
                 );
+                CREATE TABLE IF NOT EXISTS sekai_adhoc_transform_run (
+                    identity TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    caller TEXT NOT NULL,
+                    session_label TEXT NOT NULL,
+                    definition_digest TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    expires_at_ms INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS sekai_transform_runtime (
                     namespace TEXT NOT NULL,
                     runtime_id TEXT NOT NULL,
@@ -431,6 +442,121 @@ impl SekaiDb {
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
+    }
+
+    /// Runs an ad-hoc definition into its scratch dataset in one
+    /// transaction (ADR 0138): a repeated identity returns its run, another
+    /// definition under it is refused, and an over-budget output writes
+    /// nothing.
+    pub fn run_adhoc_transform(
+        &self,
+        request: &crate::sekai::adhoc_transform::AdHocRequest,
+        transform: &GovernedTransform,
+        budget: &crate::sekai::adhoc_transform::OutputBudget,
+        expires_at_ms: i64,
+        tenant_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::adhoc_transform::AdHocRun, String> {
+        use crate::sekai::adhoc_transform::{
+            ADHOC_IDENTITY_CONFLICT, AdHocRun, TRANSFORM_TRIGGER_ADHOC, scratch_columns,
+            scratch_object,
+        };
+        let identity = request.identity();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing = tx
+            .query_row(
+                "SELECT definition_digest, run_id, dataset_id, expires_at_ms
+                 FROM sekai_adhoc_transform_run WHERE identity = ?1",
+                params![identity],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((digest, run_id, dataset_id, expires_at_ms)) = existing {
+            if digest != transform.definition_digest {
+                return Err(ADHOC_IDENTITY_CONFLICT.into());
+            }
+            let run = load_transform_run(&tx, &run_id)?.ok_or("ad-hoc run not found")?;
+            return Ok(AdHocRun {
+                run,
+                scratch_dataset_id: dataset_id,
+                expires_at_ms,
+                replayed: true,
+            });
+        }
+        let object = scratch_object(request, now_ms);
+        crate::sekai::audit::insert_created_object_in(
+            &tx,
+            &object,
+            &request.caller,
+            None,
+            &crate::sekai::audit::ChangeAttribution::default(),
+        )?;
+        tx.execute(
+            "INSERT INTO sekai_datasets (id,name,columns,object_id,created,partition_keys)
+             VALUES (?1,?1,'[]',?2,?3,?4)",
+            params![
+                transform.output_dataset_id,
+                object.id,
+                now_ms,
+                crate::sekai::dataset::encode_partition_keys(&[])?
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        let run = run_in_process_tx(
+            &tx,
+            transform,
+            &InProcessRun {
+                incremental: false,
+                trigger_cause: TRANSFORM_TRIGGER_ADHOC,
+                trigger_ref: &request.session_label,
+                now_ms,
+                tenant_id,
+                stored: false,
+                output_budget: Some(budget),
+            },
+        )?;
+        let output = live_output_rows(&tx, &transform.output_dataset_id)?;
+        tx.execute(
+            "UPDATE sekai_datasets SET columns = ?2 WHERE id = ?1",
+            params![transform.output_dataset_id, scratch_columns(&output)],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_adhoc_transform_run
+             (identity, namespace, caller, session_label, definition_digest, run_id, dataset_id,
+              expires_at_ms, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                identity,
+                request.namespace,
+                request.caller,
+                request.session_label,
+                transform.definition_digest,
+                run.run_id,
+                transform.output_dataset_id,
+                expires_at_ms,
+                now_ms
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(AdHocRun {
+            run,
+            scratch_dataset_id: transform.output_dataset_id.clone(),
+            expires_at_ms,
+            replayed: false,
+        })
     }
 
     /// Admits unowned in-process work inside this transform transaction.
@@ -1601,6 +1727,53 @@ fn run_governed_transform_tx(
         clear_pending_for_transform(tx, &transform.namespace, &transform.transform_id)?;
         return Ok(run);
     }
+    run_in_process_tx(
+        tx,
+        &transform,
+        &InProcessRun {
+            incremental,
+            trigger_cause,
+            trigger_ref,
+            now_ms,
+            tenant_id,
+            stored: true,
+            output_budget: None,
+        },
+    )
+}
+
+/// How one in-process run of a loaded definition commits. A stored
+/// definition keeps its incremental checkpoint and fires its downstream
+/// triggers; an ad-hoc one (ADR 0138) does neither and may carry an output
+/// budget, checked before anything is written.
+#[derive(Clone, Copy)]
+pub(crate) struct InProcessRun<'a> {
+    pub incremental: bool,
+    pub trigger_cause: &'a str,
+    pub trigger_ref: &'a str,
+    pub now_ms: i64,
+    pub tenant_id: &'a str,
+    pub stored: bool,
+    pub output_budget: Option<&'a crate::sekai::adhoc_transform::OutputBudget>,
+}
+
+/// Runs `transform` in process inside `tx` and records the run.
+pub(crate) fn run_in_process_tx(
+    tx: &Transaction<'_>,
+    transform: &GovernedTransform,
+    options: &InProcessRun<'_>,
+) -> Result<TransformRun, String> {
+    let InProcessRun {
+        incremental,
+        trigger_cause,
+        trigger_ref,
+        now_ms,
+        tenant_id,
+        stored,
+        output_budget,
+    } = *options;
+    let namespace = transform.namespace.as_str();
+    let transform_id = transform.transform_id.as_str();
     // In-process compute is measured from here until this run's output is
     // written, before downstream triggers run (#1651).
     let started = std::time::Instant::now();
@@ -1613,11 +1786,15 @@ fn run_governed_transform_tx(
     if !dataset_exists(tx, &transform.output_dataset_id)? {
         return Err("dataset not found".into());
     }
-    let stored = load_checkpoint(tx, namespace, transform_id)?;
+    let checkpoint_row = if stored {
+        load_checkpoint(tx, namespace, transform_id)?
+    } else {
+        None
+    };
     let output_keys = load_dataset_partition_keys(tx, &transform.output_dataset_id)?;
     let (mut incremental, checkpoint) = bind_checkpoint(
-        incremental,
-        stored,
+        incremental && stored,
+        checkpoint_row,
         &transform.definition_digest,
         &output_keys,
     );
@@ -1630,7 +1807,7 @@ fn run_governed_transform_tx(
         incremental = false;
     }
     let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
-    let mut load_budget = InputLoadBudget::for_transform(&transform);
+    let mut load_budget = InputLoadBudget::for_transform(transform);
     let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
     let mut input_object_tokens: Vec<Option<String>> = Vec::new();
     for (alias, dataset_id) in &bindings {
@@ -1680,7 +1857,7 @@ fn run_governed_transform_tx(
         if let Some(reason) = load_budget.and_then(|budget| budget.exceeded) {
             (
                 budget_quarantined_run(
-                    &transform,
+                    transform,
                     checkpoint.as_ref(),
                     incremental,
                     now_ms,
@@ -1695,7 +1872,7 @@ fn run_governed_transform_tx(
             )
         } else {
             compute_run_tables_until(
-                &transform,
+                transform,
                 checkpoint.as_ref(),
                 &tables,
                 incremental,
@@ -1715,14 +1892,19 @@ fn run_governed_transform_tx(
         }
         insert_transform_run(tx, &run)?;
         record_in_process_finish(tx, &run.run_id, started)?;
-        after_run_committed_tx(tx, &transform, &run, now_ms)?;
+        if stored {
+            after_run_committed_tx(tx, transform, &run, now_ms)?;
+        }
         persist_transform_usage_pending_tx(tx, &run.run_id, tenant_id, now_ms)?;
         return Ok(run);
+    }
+    if let Some(budget) = output_budget {
+        budget.admit(&output_rows)?;
     }
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
     persist_computed_output(
         tx,
-        &transform,
+        transform,
         &bindings,
         &loaded,
         incremental,
@@ -1732,7 +1914,8 @@ fn run_governed_transform_tx(
     )?;
     stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
     insert_transform_run(tx, &run)?;
-    tx.execute(
+    if stored {
+        tx.execute(
         "INSERT OR REPLACE INTO sekai_governed_transform_checkpoint
          (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
          VALUES (?1,?2,?3,?4,?5,?6)",
@@ -1746,9 +1929,12 @@ fn run_governed_transform_tx(
         ],
     )
     .map_err(|error| error.to_string())?;
+    }
     record_in_process_finish(tx, &run.run_id, started)?;
     record_run_output_version(tx, &run.run_id, &transform.output_dataset_id)?;
-    after_run_committed_tx(tx, &transform, &run, now_ms)?;
+    if stored {
+        after_run_committed_tx(tx, transform, &run, now_ms)?;
+    }
     persist_transform_usage_pending_tx(tx, &run.run_id, tenant_id, now_ms)?;
     Ok(run)
 }
