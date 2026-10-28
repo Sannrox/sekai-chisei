@@ -40,6 +40,8 @@ pub enum CrashPoint {
     None,
     AfterReservation,
     AfterObjectWrite,
+    /// After the receipt commits, before its follow-ups (#1943).
+    AfterReceipt,
 }
 
 #[cfg(test)]
@@ -949,17 +951,6 @@ impl<'a> ActionInstanceAdmission<'a> {
         if let Some(applied) = &applied_object {
             action_object_mutation::complete_object_write(self.db, &applied.object, actor, now);
         }
-        if stored.status == STATUS_DENIED {
-            crate::sekai::agent_autonomy::revoke_if_granted(
-                self.db,
-                actor,
-                &stored.namespace,
-                &stored.principal,
-                &stored.type_id,
-                now,
-            )
-            .map_err(ActionInstanceAdmissionError::Internal)?;
-        }
         Ok(ActionInstanceAdmissionOutcome {
             object_revision: applied_object.as_ref().map(|applied| {
                 crate::sekai::action_describe_preview::object_revision(&applied.object)
@@ -1024,7 +1015,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         {
             return Err(access_denied());
         }
-        let mut instance = instance;
+        let mut instance = self.finish_parked_submit(instance)?;
         instance.review = crate::sekai::review_queue::mark_decision(
             &type_def.review_queue,
             &instance.review,
@@ -1476,6 +1467,11 @@ impl<'a> ActionInstanceAdmission<'a> {
                 let exhausted = parked.len() < 100;
                 offset += parked.len();
                 for instance in parked {
+                    // An instance whose submit cannot finish yet is left
+                    // parked; the next sweep or a decision retries it.
+                    let Ok(instance) = self.finish_parked_submit(instance) else {
+                        continue;
+                    };
                     let Some(type_def) = self
                         .db
                         .get_governed_action_type(
@@ -1765,15 +1761,21 @@ impl<'a> ActionInstanceAdmission<'a> {
         existing: ActionInstance,
         now: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
-        if self
+        let Some(receipt) = self
             .db
             .get_operation_receipt(&existing.operation_id)
             .map_err(ActionInstanceAdmissionError::Internal)?
-            .is_none()
-        {
+        else {
             return Err(ActionInstanceAdmissionError::FailedPrecondition(
                 "action instance admission is still in progress".into(),
             ));
+        };
+        if existing
+            .admission_lease
+            .as_ref()
+            .is_some_and(|lease| lease.follow_ups_recorded == Some(false))
+        {
+            self.resume_follow_ups(&existing, &receipt)?;
         }
         if existing.status == STATUS_ADMITTED
             && let Some(object) = object_for_admitted_instance(self.db, &existing)?
@@ -1898,12 +1900,10 @@ impl<'a> ActionInstanceAdmission<'a> {
             ("decision".into(), stored.policy_decision.clone()),
             ("action".into(), SUBMIT_POLICY_ACTION.into()),
         ]);
-        let mut evidence = HashMap::new();
         // A parked instance names what parked it and who may decide (#1867).
         if let Some(approval) = &stored.approval {
             for (key, value) in approval_attributes(approval) {
-                policy_attributes.insert(key.into(), value.clone());
-                evidence.insert(key.into(), value);
+                policy_attributes.insert(key.into(), value);
             }
         }
         let mut events = vec![
@@ -2035,92 +2035,314 @@ impl<'a> ActionInstanceAdmission<'a> {
                 .map_err(ActionInstanceAdmissionError::Internal)?,
         }
 
-        evidence.extend([
-            ("instance_id".into(), stored.instance_id.clone()),
-            ("type_id".into(), stored.type_id.clone()),
-            ("version".into(), stored.version.clone()),
-            ("request_digest".into(), stored.request_digest.clone()),
-            ("idempotency_key".into(), stored.idempotency_key.clone()),
-            ("operation_id".into(), stored.operation_id.clone()),
-            ("status".into(), stored.status.clone()),
-            ("policy_decision".into(), stored.policy_decision.clone()),
-            ("budget_decision".into(), stored.budget_decision.clone()),
-            ("parameters_untrusted".into(), "true".into()),
-        ]);
-        if let Some(actor) = stored.delegating_actor.as_ref() {
-            evidence.insert("act".into(), actor.clone());
+        #[cfg(test)]
+        if crashes_at(CrashPoint::AfterReceipt) {
+            return Err(ActionInstanceAdmissionError::Internal(
+                "injected crash after the receipt".into(),
+            ));
         }
-        if let Some(applied) = applied_object {
-            evidence.insert("object_id".into(), applied.object_id.clone());
-            evidence.insert("object_kind".into(), applied.object_kind.clone());
-            evidence.insert("object_mutation".into(), applied.mutation.clone());
-        }
-        if !stored.deny_reason.is_empty() {
-            evidence.insert("deny_reason".into(), stored.deny_reason.clone());
-        }
-        if let Some(approval) = approval {
-            evidence.insert("approver".into(), approval.decider.to_string());
-            evidence.insert("approval_decision".into(), approval.decision.to_string());
-        }
-        self.db
-            .record_decision(&audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: now,
-                actor: approval
-                    .map_or(actor, |approval| approval.decider)
-                    .to_string(),
-                action: if approval.is_some() {
-                    "decide_action_instance".into()
-                } else {
-                    "submit_action_instance".into()
-                },
-                reason: if stored.status == STATUS_PARKED {
-                    "action_instance_parked".into()
-                } else if stored.status == STATUS_ADMITTED {
-                    "action_instance_admitted".into()
-                } else if approval.is_some_and(|approval| approval.decision == DECISION_DENY) {
-                    "action_instance_approver_denied".into()
-                } else if stored.budget_decision == "budget_exceeded" {
-                    "action_instance_budget_denied".into()
-                } else {
-                    "action_instance_policy_denied".into()
-                },
-                evidence,
-                target_id: stored.instance_id.clone(),
-                outcome: stored.status.clone(),
-            })
-            .map_err(ActionInstanceAdmissionError::Internal)?;
-
-        if !budget_already_reserved
-            && let Some(budget) = self.budget
-            && (stored.status == STATUS_ADMITTED
-                || (stored.status == STATUS_PARKED && stored.budget_decision == "allow"))
+        let decision = admission_decision(
+            stored,
+            actor,
+            applied_object.map(|applied| AdmittedObject {
+                id: &applied.object_id,
+                kind: &applied.object_kind,
+                mutation: &applied.mutation,
+            }),
+            approval,
+            now,
+        );
+        self.finish_admission(
+            stored,
+            &decision,
+            budget_subject,
+            budget_amount,
+            budget_already_reserved,
+            planned_effects,
+            approval.is_some(),
+        )?;
+        if stored.status == STATUS_ADMITTED
+            && let Some(applied) = applied_object.filter(|applied| applied.object_present)
         {
-            budget.record(budget_subject, budget_amount);
-        }
-        if stored.status == STATUS_ADMITTED {
-            let effects = planned_effects.ok_or_else(|| {
-                ActionInstanceAdmissionError::Internal("admitted instance effects missing".into())
-            })?;
-            self.db
-                .put_action_effects(effects)
-                .map_err(ActionInstanceAdmissionError::Internal)?;
-            if let Some(applied) = applied_object.filter(|applied| applied.object_present) {
-                // #1115: the operation receipt above is already durable, so a
-                // transient object-log failure here must not fail this
-                // already-succeeded admission back to the caller — that was
-                // the bug: this path used `?` while the replay catch-up path
-                // (completed_replay) already treated the identical failure as
-                // best-effort. Both now go through the same helper.
-                catch_up_object_log(
-                    operation_id,
-                    &applied.object_id,
-                    &applied.object_kind,
-                    &applied.object,
-                );
-            }
+            // #1115: the operation receipt above is already durable, so a
+            // transient object-log failure here must not fail this
+            // already-succeeded admission back to the caller — that was
+            // the bug: this path used `?` while the replay catch-up path
+            // (completed_replay) already treated the identical failure as
+            // best-effort. Both now go through the same helper.
+            catch_up_object_log(
+                operation_id,
+                &applied.object_id,
+                &applied.object_kind,
+                &applied.object,
+            );
         }
         Ok(())
+    }
+
+    /// Records what follows a receipt: the decision record, the budget
+    /// charge, the planned effects, and for a denied submit the autonomy
+    /// grant's revocation (#1943). Each step is idempotent: the
+    /// decision and effect ids and the budget key derive from the operation.
+    /// So a replay that finds the receipt can finish them, and a concurrent
+    /// finisher changes nothing. Once an admission's follow-ups are all
+    /// recorded, its lease says so.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_admission(
+        &self,
+        stored: &ActionInstance,
+        decision: &audit::Decision,
+        budget_subject: &str,
+        budget_amount: i32,
+        budget_already_reserved: bool,
+        planned_effects: Option<&[action_effect::ActionEffect]>,
+        approver_decision: bool,
+    ) -> Result<(), ActionInstanceAdmissionError> {
+        let internal = ActionInstanceAdmissionError::Internal;
+        if let Err(error) = self
+            .db
+            .record_decisions_idempotently(std::slice::from_ref(decision))
+        {
+            // A concurrent finisher may have inserted the same record first.
+            if self
+                .db
+                .get_decision(&decision.id)
+                .map_err(internal)?
+                .as_ref()
+                != Some(decision)
+            {
+                return Err(internal(error));
+            }
+        }
+        // A charge is owed when the admission's budget decision allowed it.
+        // Without the port that allowed it, the charge stays outstanding.
+        if !budget_already_reserved
+            && stored.budget_decision == "allow"
+            && (stored.status == STATUS_ADMITTED || stored.status == STATUS_PARKED)
+        {
+            let step = if approver_decision {
+                "decide"
+            } else {
+                "submit"
+            };
+            let charged = self
+                .budget
+                .ok_or_else(|| {
+                    "the budget port that allowed this admission is not configured".to_string()
+                })
+                .and_then(|budget| {
+                    budget.record_once(
+                        budget_subject,
+                        budget_amount,
+                        &format!("{}:budget:{step}", stored.operation_id),
+                        decision.timestamp,
+                    )
+                });
+            match charged {
+                Ok(()) => {}
+                // A submit's charge stays outstanding for its resume.
+                Err(error) if !approver_decision => return Err(internal(error)),
+                // An approver's decision is not resumed yet, so its charge
+                // stays best-effort, as before #1943; the grant stands.
+                Err(error) => tracing::error!(
+                    operation_id = %stored.operation_id,
+                    error = %error,
+                    "approval budget charge failed; the grant stands without it"
+                ),
+            }
+        }
+        // Effects follow the charge: an approval is not resumed yet, so its
+        // charge must not wait on them.
+        if stored.status == STATUS_ADMITTED {
+            let effects = planned_effects
+                .ok_or_else(|| internal("admitted instance effects missing".into()))?;
+            self.db
+                .put_missing_action_effects(effects)
+                .map_err(internal)?;
+        }
+        if !approver_decision {
+            // A denied submit withdraws the principal's autonomy grant.
+            if stored.status == STATUS_DENIED {
+                crate::sekai::agent_autonomy::revoke_if_granted_before(
+                    self.db,
+                    &decision.actor,
+                    &stored.namespace,
+                    &stored.principal,
+                    &stored.type_id,
+                    decision.timestamp,
+                    decision.timestamp,
+                )
+                .map_err(internal)?;
+            }
+            self.db
+                .mark_admission_follow_ups_recorded(&stored.instance_id)
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+
+    /// Finishes a parked submit's outstanding follow-ups before anything
+    /// changes the instance or its receipt, which they are rebuilt from
+    /// (#1943). Answers the instance with its marker set, so writing it back
+    /// keeps the marker.
+    fn finish_parked_submit(
+        &self,
+        mut instance: ActionInstance,
+    ) -> Result<ActionInstance, ActionInstanceAdmissionError> {
+        let Some(lease) = instance
+            .admission_lease
+            .as_mut()
+            .filter(|lease| lease.follow_ups_recorded == Some(false))
+        else {
+            return Ok(instance);
+        };
+        lease.follow_ups_recorded = Some(true);
+        let receipt = self
+            .db
+            .get_operation_receipt(&instance.operation_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .ok_or_else(|| {
+                ActionInstanceAdmissionError::FailedPrecondition(
+                    "action instance admission is still in progress".into(),
+                )
+            })?;
+        self.resume_follow_ups(&instance, &receipt)?;
+        Ok(instance)
+    }
+
+    /// Finishes the follow-ups of an admission whose receipt is recorded but
+    /// whose lease does not say they are (#1943): a crash or failure after
+    /// the receipt. It rebuilds them from the stored instance and its
+    /// receipt, at the receipt's time, as the receipt's actor.
+    fn resume_follow_ups(
+        &self,
+        stored: &ActionInstance,
+        receipt: &OperationReceipt,
+    ) -> Result<(), ActionInstanceAdmissionError> {
+        let internal = ActionInstanceAdmissionError::Internal;
+        let intent = receipt
+            .events
+            .first()
+            .ok_or_else(|| internal("admission receipt has no intent".into()))?;
+        let now = intent.timestamp_ms;
+        // The type as it was bound, enabled or not: finishing an admission
+        // authorizes nothing new.
+        let type_def = self
+            .db
+            .get_governed_action_type(&stored.namespace, &stored.type_id, &stored.version)
+            .map_err(internal)?
+            .ok_or_else(|| internal("action type of an admission is gone".into()))?;
+        let (budget_subject, budget_amount) = type_def
+            .budget_charge(
+                &stored.namespace,
+                &stored.principal,
+                &stored.parameters_json,
+            )
+            .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        let attribute = |key: &str| intent.attributes.get(key).map(String::as_str);
+        let admitted = match (
+            attribute("object_id"),
+            attribute("object_kind"),
+            attribute("object_mutation"),
+        ) {
+            (Some(id), Some(kind), Some(mutation)) => Some(AdmittedObject { id, kind, mutation }),
+            _ => None,
+        };
+        let decision = admission_decision(stored, &receipt.initiating_actor, admitted, None, now);
+        let effects = plan_admission_effects(&type_def, stored, now)?;
+        self.finish_admission(
+            stored,
+            &decision,
+            &budget_subject,
+            budget_amount,
+            stored.admission_budget_already_reserved,
+            effects.as_deref(),
+            false,
+        )
+    }
+}
+
+/// The object an admission wrote, as its receipt and decision name it.
+#[derive(Clone, Copy)]
+struct AdmittedObject<'a> {
+    id: &'a str,
+    kind: &'a str,
+    mutation: &'a str,
+}
+
+/// The decision record of an admission, or of an approver's decision on a
+/// parked one. Its id derives from the operation, so recording it again is a
+/// no-op (#1943).
+fn admission_decision(
+    stored: &ActionInstance,
+    actor: &str,
+    admitted: Option<AdmittedObject<'_>>,
+    approval: Option<&ApprovalRecord<'_>>,
+    now: i64,
+) -> audit::Decision {
+    let mut evidence: HashMap<String, String> = stored
+        .approval
+        .as_ref()
+        .map(|requirement| {
+            approval_attributes(requirement)
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect()
+        })
+        .unwrap_or_default();
+    evidence.extend([
+        ("instance_id".into(), stored.instance_id.clone()),
+        ("type_id".into(), stored.type_id.clone()),
+        ("version".into(), stored.version.clone()),
+        ("request_digest".into(), stored.request_digest.clone()),
+        ("idempotency_key".into(), stored.idempotency_key.clone()),
+        ("operation_id".into(), stored.operation_id.clone()),
+        ("status".into(), stored.status.clone()),
+        ("policy_decision".into(), stored.policy_decision.clone()),
+        ("budget_decision".into(), stored.budget_decision.clone()),
+        ("parameters_untrusted".into(), "true".into()),
+    ]);
+    if let Some(actor) = stored.delegating_actor.as_ref() {
+        evidence.insert("act".into(), actor.clone());
+    }
+    if let Some(admitted) = admitted {
+        evidence.insert("object_id".into(), admitted.id.into());
+        evidence.insert("object_kind".into(), admitted.kind.into());
+        evidence.insert("object_mutation".into(), admitted.mutation.into());
+    }
+    if !stored.deny_reason.is_empty() {
+        evidence.insert("deny_reason".into(), stored.deny_reason.clone());
+    }
+    if let Some(approval) = approval {
+        evidence.insert("approver".into(), approval.decider.to_string());
+        evidence.insert("approval_decision".into(), approval.decision.to_string());
+    }
+    let step = if approval.is_some() {
+        "decide"
+    } else {
+        "submit"
+    };
+    audit::Decision {
+        id: format!("{}:{step}", stored.operation_id),
+        timestamp: now,
+        actor: approval
+            .map_or(actor, |approval| approval.decider)
+            .to_string(),
+        action: format!("{step}_action_instance"),
+        reason: if stored.status == STATUS_PARKED {
+            "action_instance_parked".into()
+        } else if stored.status == STATUS_ADMITTED {
+            "action_instance_admitted".into()
+        } else if approval.is_some_and(|approval| approval.decision == DECISION_DENY) {
+            "action_instance_approver_denied".into()
+        } else if stored.budget_decision == "budget_exceeded" {
+            "action_instance_budget_denied".into()
+        } else {
+            "action_instance_policy_denied".into()
+        },
+        evidence,
+        target_id: stored.instance_id.clone(),
+        outcome: stored.status.clone(),
     }
 }
 
@@ -2717,9 +2939,15 @@ mod tests {
 
     fn setup() -> RuntimeDb {
         let db = RuntimeDb::memory();
-        db.put_governed_action_type(
-            GovernedActionType {
-                namespace: "acme".into(),
+        db.put_governed_action_type(dispatch_type("acme"), "operator", 1)
+            .unwrap();
+        db
+    }
+
+    /// The runtime-dispatch type the plain admission tests submit.
+    fn dispatch_type(namespace: &str) -> GovernedActionType {
+        GovernedActionType {
+                namespace: namespace.into(),
                 type_id: "dispatch".into(),
                 version: "1".into(),
                 description: "dispatch work".into(),
@@ -2735,12 +2963,7 @@ mod tests {
                 updated_at_ms: 0,
                 disabled_at_ms: 0,
                 ..Default::default()
-            },
-            "operator",
-            1,
-        )
-        .unwrap();
-        db
+            }
     }
 
     fn postgres_runtime() -> RuntimeDb {
@@ -2802,6 +3025,7 @@ mod tests {
     struct CountingBudget {
         remaining: std::sync::atomic::AtomicI32,
         recorded: std::sync::atomic::AtomicI32,
+        keys: std::sync::Mutex<std::collections::BTreeSet<String>>,
     }
 
     impl ActionBudgetPort for CountingBudget {
@@ -2818,6 +3042,19 @@ mod tests {
                 .fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
             self.recorded
                 .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn record_once(
+            &self,
+            subject: &str,
+            amount: i32,
+            key: &str,
+            _at_ms: i64,
+        ) -> Result<(), String> {
+            if self.keys.lock().unwrap().insert(key.into()) {
+                self.record(subject, amount);
+            }
+            Ok(())
         }
     }
 
@@ -3358,6 +3595,7 @@ mod tests {
         let budget = CountingBudget {
             remaining: std::sync::atomic::AtomicI32::new(1),
             recorded: std::sync::atomic::AtomicI32::new(0),
+            keys: Default::default(),
         };
         let admitted = ActionInstanceAdmission::new(&db, Some(&budget))
             .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
@@ -3373,6 +3611,7 @@ mod tests {
         let budget = CountingBudget {
             remaining: std::sync::atomic::AtomicI32::new(0),
             recorded: std::sync::atomic::AtomicI32::new(0),
+            keys: Default::default(),
         };
         let denied = ActionInstanceAdmission::new(&db, Some(&budget))
             .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
@@ -3388,6 +3627,7 @@ mod tests {
         let budget = CountingBudget {
             remaining: std::sync::atomic::AtomicI32::new(0),
             recorded: std::sync::atomic::AtomicI32::new(0),
+            keys: Default::default(),
         };
         let denied = ActionInstanceAdmission::new(&db, Some(&budget))
             .admit(request(r#"{"runtime":"shikigami"}"#), "agent:bot", 10)
@@ -3403,6 +3643,7 @@ mod tests {
         let budget = CountingBudget {
             remaining: std::sync::atomic::AtomicI32::new(1),
             recorded: std::sync::atomic::AtomicI32::new(0),
+            keys: Default::default(),
         };
         let admission = ActionInstanceAdmission::new(&db, Some(&budget));
         let mut first = request(r#"{"runtime":"shikigami"}"#);
@@ -4728,15 +4969,28 @@ mod tests {
         policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
         db.upsert_action_policy(&policy).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
-        let parked = admission
-            .admit(
-                record_request("customer.record.create", r#"{"object_id":"rec-sla"}"#),
-                "alice",
-                10,
-            )
+        // A crash after the receipt leaves the submit's follow-ups for the
+        // sweep, which finishes them before it denies (#1943).
+        crash_next_admission(CrashPoint::AfterReceipt);
+        assert!(
+            admission
+                .admit(
+                    record_request("customer.record.create", r#"{"object_id":"rec-sla"}"#),
+                    "alice",
+                    10,
+                )
+                .is_err()
+        );
+        let parked = db
+            .list_action_instances("acme", None, Some(STATUS_PARKED), 10)
             .unwrap()
-            .instance;
+            .remove(0);
         let (reassigned, denied) = admission.escalate_due("acme", 16).unwrap();
+        let submit = db
+            .get_decision(&format!("{}:submit", parked.operation_id))
+            .unwrap()
+            .expect("submit record");
+        assert_eq!(submit.outcome, STATUS_PARKED);
         assert_eq!(reassigned, 0);
         assert_eq!(denied, 1);
         let stored = db
@@ -4868,6 +5122,69 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// A parked submit whose follow-ups a crash left outstanding finishes
+    /// them before an approver's decision changes the instance (#1943).
+    #[test]
+    fn a_decision_first_finishes_the_parked_submit_follow_ups() {
+        let db = approval_setup("create", &["bob"]);
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-11","title":"t"}"#,
+        );
+        crash_next_admission(CrashPoint::AfterReceipt);
+        assert!(admission.admit(request, "alice", 10).is_err());
+        let parked = db
+            .list_action_instances("acme", None, Some(STATUS_PARKED), 10)
+            .unwrap()
+            .remove(0);
+        let submitted = format!("{}:submit", parked.operation_id);
+        assert!(db.get_decision(&submitted).unwrap().is_none());
+
+        let granted = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap();
+        assert_eq!(granted.instance.status, STATUS_ADMITTED);
+        let submit = db.get_decision(&submitted).unwrap().expect("submit record");
+        assert_eq!(submit.outcome, STATUS_PARKED);
+        assert_eq!((submit.actor.as_str(), submit.timestamp), ("alice", 10));
+        assert!(
+            db.get_decision(&format!("{}:decide", parked.operation_id))
+                .unwrap()
+                .is_some()
+        );
+        // The decision keeps the marker, so replays never rebuild the submit
+        // from the granted instance.
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .admission_lease
+                .unwrap()
+                .follow_ups_recorded,
+            Some(true)
+        );
+        let replay = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-11","title":"t"}"#,
+        );
+        assert!(admission.admit(replay, "alice", 30).unwrap().replay);
+        assert!(
+            admission
+                .decide(
+                    decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                    "bob",
+                    31,
+                )
+                .unwrap()
+                .replay
         );
     }
 
@@ -5966,6 +6283,134 @@ mod tests {
                 .is_some()
         );
         assert!(db.get_object(&object).unwrap().is_none(), "not resurrected");
+    }
+
+    /// A crash after the receipt leaves its follow-ups to the resubmit,
+    /// which records the decision, the budget charge and the effects
+    /// exactly once (#1943).
+    fn follow_ups_after_the_receipt_are_finished_exactly_once(db: &RuntimeDb) {
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(10),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+            keys: Default::default(),
+        };
+        let admission = ActionInstanceAdmission::new(db, Some(&budget));
+        // A namespace of its own: the PostgreSQL test database is shared.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let namespace = format!("after-receipt-{suffix}");
+        db.put_governed_action_type(dispatch_type(&namespace), "operator", 1)
+            .unwrap();
+        let key = format!("after-receipt-{suffix}");
+        let submit = || {
+            let mut submit = request(r#"{"runtime":"shikigami"}"#);
+            submit.namespace = namespace.clone();
+            submit.idempotency_key = key.clone();
+            submit
+        };
+        let decisions = |instance_id: &str| {
+            db.list_decisions(&crate::sekai::audit::DecisionFilter {
+                target_id: Some(instance_id.into()),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let recorded = || budget.recorded.load(std::sync::atomic::Ordering::SeqCst);
+
+        crash_next_admission(CrashPoint::AfterReceipt);
+        assert!(admission.admit(submit(), "alice", 10).is_err());
+        let stored = db
+            .get_action_instance_by_idempotency(&namespace, &key)
+            .unwrap()
+            .expect("instance");
+        assert!(
+            db.get_operation_receipt(&stored.operation_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(decisions(&stored.instance_id).is_empty());
+        assert!(
+            db.list_action_effects_for_instance(&stored.instance_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(recorded(), 0);
+        assert_eq!(
+            stored.admission_lease.as_ref().unwrap().follow_ups_recorded,
+            Some(false)
+        );
+
+        // A replay without the budget port that allowed the charge leaves
+        // the follow-ups outstanding rather than dropping the charge.
+        assert!(
+            ActionInstanceAdmission::new(db, None)
+                .admit(submit(), "bob", 15)
+                .is_err()
+        );
+        assert_eq!(recorded(), 0);
+        assert_eq!(
+            db.get_action_instance(&stored.instance_id)
+                .unwrap()
+                .unwrap()
+                .admission_lease
+                .unwrap()
+                .follow_ups_recorded,
+            Some(false)
+        );
+
+        for now in [20, 30] {
+            let replayed = admission.admit(submit(), "bob", now).unwrap();
+            assert!(replayed.replay);
+            let recorded_decisions = decisions(&stored.instance_id);
+            assert_eq!(recorded_decisions.len(), 1);
+            let decision = &recorded_decisions[0];
+            assert_eq!(decision.id, format!("{}:submit", stored.operation_id));
+            assert_eq!((decision.actor.as_str(), decision.timestamp), ("alice", 10));
+            assert_eq!(
+                db.list_action_effects_for_instance(&stored.instance_id)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(recorded(), 1);
+        }
+        let finished = db
+            .get_action_instance(&stored.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            finished.admission_lease.unwrap().follow_ups_recorded,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sqlite_follow_ups_after_the_receipt_are_finished_exactly_once() {
+        follow_ups_after_the_receipt_are_finished_exactly_once(&setup());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL test database"]
+    fn postgres_follow_ups_after_the_receipt_are_finished_exactly_once() {
+        follow_ups_after_the_receipt_are_finished_exactly_once(&postgres_runtime());
+    }
+
+    /// An admission that finished in one pass needs no resume: its lease
+    /// says its follow-ups are recorded (#1943).
+    #[test]
+    fn a_finished_admission_marks_its_follow_ups_recorded() {
+        let db = setup();
+        let admitted = ActionInstanceAdmission::new(&db, None)
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        let stored = db
+            .get_action_instance(&admitted.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.admission_lease.unwrap().follow_ups_recorded,
+            Some(true)
+        );
     }
 
     #[test]

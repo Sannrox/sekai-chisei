@@ -558,6 +558,14 @@ fn normalize_ttl_ms(ttl_ms: i64) -> Result<i64, String> {
     Ok(ttl)
 }
 
+/// The id of an admission's effect of `kind`. It is derived from the
+/// operation, so a resumed admission plans the same effects (#1943); a
+/// type names each kind at most once.
+fn admission_effect_id(operation_id: &str, kind: &str) -> String {
+    let digest = sha256_hex(format!("{operation_id}\u{1f}{kind}").as_bytes());
+    format!("gax-{}", &digest[..32])
+}
+
 /// Build initial effect records for an admitted instance from the type's allowed kinds.
 pub fn plan_effects_for_admit(
     instance_id: &str,
@@ -590,7 +598,7 @@ pub fn plan_effects_for_admit(
                     "parameters_digest": sha256_hex(parameters_json.as_bytes()),
                 });
                 effects.push(ActionEffect {
-                    effect_id: format!("gax-{}", uuid::Uuid::new_v4().simple()),
+                    effect_id: admission_effect_id(operation_id, kind),
                     instance_id: instance_id.into(),
                     namespace: namespace.into(),
                     operation_id: operation_id.into(),
@@ -656,7 +664,7 @@ pub fn plan_effects_for_admit(
                     )
                 };
                 effects.push(ActionEffect {
-                    effect_id: format!("gax-{}", uuid::Uuid::new_v4().simple()),
+                    effect_id: admission_effect_id(operation_id, kind),
                     instance_id: instance_id.into(),
                     namespace: namespace.into(),
                     operation_id: operation_id.into(),
@@ -723,7 +731,7 @@ pub fn plan_effects_for_admit(
                     )
                 };
                 effects.push(ActionEffect {
-                    effect_id: format!("gax-{}", uuid::Uuid::new_v4().simple()),
+                    effect_id: admission_effect_id(operation_id, kind),
                     instance_id: instance_id.into(),
                     namespace: namespace.into(),
                     operation_id: operation_id.into(),
@@ -1000,6 +1008,38 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         Ok(effect.clone())
+    }
+
+    /// Inserts the effects whose ids are not stored yet; stored ones keep
+    /// their progress (#1943).
+    pub fn put_missing_action_effects(&self, effects: &[ActionEffect]) -> Result<(), String> {
+        self.migrate_action_effects()?;
+        let conn = self.conn();
+        for effect in effects {
+            effect.validate()?;
+            let body_json = serde_json::to_string(effect).map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT OR IGNORE INTO sekai_action_effects
+                 (effect_id, instance_id, namespace, operation_id, kind, status,
+                  payload_json, failure_reason, created_at_ms, updated_at_ms, body_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    effect.effect_id,
+                    effect.instance_id,
+                    effect.namespace,
+                    effect.operation_id,
+                    effect.kind,
+                    effect.status,
+                    effect.payload_json,
+                    effect.failure_reason,
+                    effect.created_at_ms,
+                    effect.updated_at_ms,
+                    body_json,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn put_action_effects(
