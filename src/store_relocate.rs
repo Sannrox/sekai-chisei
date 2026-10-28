@@ -2741,6 +2741,7 @@ mod tests {
                 conflict: None,
                 approval: None,
                 offline: None,
+                admission_lease: None,
             })
             .unwrap();
     }

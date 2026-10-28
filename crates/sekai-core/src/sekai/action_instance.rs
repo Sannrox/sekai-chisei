@@ -95,6 +95,66 @@ pub struct ActionInstance {
     /// parked or was stored before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalRequirement>,
+    /// Who holds the admission reservation, and until when (#1930). The
+    /// object write and the receipt are accepted only from this owner and
+    /// generation while the lease is live. `None` on instances stored before
+    /// leases existed; those stay unfenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_lease: Option<AdmissionLease>,
+}
+
+/// How long an admission may take before its reservation is considered
+/// abandoned. Below the plan execution lease, which waits on in-progress
+/// admissions.
+pub const ADMISSION_LEASE_MS: i64 = 60_000;
+
+/// Refusal when a write arrives from an owner that no longer holds the
+/// admission reservation, or after its lease expired.
+pub const ADMISSION_FENCE_LOST: &str = "action instance admission lost its reservation";
+
+/// The holder of an admission reservation. A takeover (#1931) bumps the
+/// generation; an owner's writes are refused once it is not current.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionLease {
+    pub owner: String,
+    pub generation: u64,
+    pub expires_at_ms: i64,
+}
+
+/// Wall-clock milliseconds. Leases run on the wall clock, not on the
+/// request's `now`, so a writer that stalls past its lease is refused at the
+/// write itself.
+pub fn lease_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+impl AdmissionLease {
+    /// A fresh first-generation lease for one admit attempt.
+    pub fn first() -> Self {
+        Self {
+            owner: uuid::Uuid::new_v4().to_string(),
+            generation: 1,
+            expires_at_ms: lease_clock_ms().saturating_add(ADMISSION_LEASE_MS),
+        }
+    }
+
+    /// Whether the stored lease fields name this holder and, when
+    /// `now_ms` is given, are still live at that time.
+    pub fn holds(
+        &self,
+        owner: Option<&str>,
+        generation: Option<i64>,
+        expires_at_ms: Option<i64>,
+        now_ms: Option<i64>,
+    ) -> bool {
+        owner == Some(self.owner.as_str())
+            && generation == i64::try_from(self.generation).ok()
+            && now_ms.is_none_or(|now| expires_at_ms.is_some_and(|expires| expires > now))
+    }
 }
 
 /// What required approval for a parked instance, and who is entitled to
@@ -258,6 +318,31 @@ pub fn submit_budget_subject(namespace: &str, actor: &str, budget_scope: &str) -
         return format!("{root}/project:{}", namespace.trim());
     }
     format!("{root}/project:{}/agent:{}", namespace.trim(), actor.trim())
+}
+
+/// How releasing an admission reservation undoes its object write. The undo
+/// applies only while no later write changed the object.
+#[derive(Debug, Clone)]
+pub enum AdmissionUndo {
+    None,
+    /// Remove the created object, if it is still exactly as created.
+    AbortCreate {
+        object_id: String,
+        object_kind: String,
+    },
+    /// Restore `previous`, if the object still carries the admission's write.
+    RestoreUpdate {
+        previous: crate::domain::Object,
+        applied_updated: i64,
+    },
+}
+
+/// Result of a fenced admission write.
+#[derive(Debug, Clone)]
+pub enum FencedAdmissionWrite<T> {
+    Applied(T),
+    /// The caller no longer holds the reservation, or its lease expired.
+    FenceLost,
 }
 
 /// The object write a parked grant commits with its transition.
@@ -749,13 +834,219 @@ impl SekaiDb {
         .map(|_| ())
         .map_err(|error| error.to_string())
     }
+
+    /// Applies an admission's object write only while `lease` still names the
+    /// reservation's owner and generation and has not expired (#1930). A
+    /// takeover bumps the generation, so a stale owner's write is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_admission_object_write(
+        &self,
+        instance_id: &str,
+        lease: &AdmissionLease,
+        write: &ParkedGrantWrite,
+        expected: Option<&crate::domain::Object>,
+        actor: &str,
+        attribution: &crate::sekai::audit::ChangeAttribution,
+    ) -> Result<FencedAdmissionWrite<Option<crate::domain::Object>>, String> {
+        self.migrate_action_instances()?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if !sqlite_admission_fence_holds(&tx, instance_id, lease, true)? {
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        let previous = match write {
+            ParkedGrantWrite::Create(object) => {
+                crate::sekai::audit::insert_created_object_in(
+                    &tx,
+                    object,
+                    actor,
+                    None,
+                    attribution,
+                )?;
+                None
+            }
+            ParkedGrantWrite::Update(object) => Some(
+                crate::sekai::audit::update_object_in(
+                    &tx,
+                    object,
+                    expected,
+                    actor,
+                    None,
+                    attribution,
+                )?
+                .ok_or_else(|| format!("object {} not found", object.id))?,
+            ),
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(FencedAdmissionWrite::Applied(previous))
+    }
+
+    /// Releases a failed admission in one transaction: while `lease` still
+    /// names the reservation's owner and generation, undoes its object write
+    /// and deletes the reservation (#1930). A crash leaves either both or
+    /// neither. Expiry is not checked: an owner may always clean up. Returns
+    /// whether this owner released it.
+    pub fn release_admission(
+        &self,
+        instance_id: &str,
+        lease: &AdmissionLease,
+        undo: &AdmissionUndo,
+        actor: &str,
+    ) -> Result<bool, String> {
+        self.migrate_action_instances()?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if !sqlite_admission_fence_holds(&tx, instance_id, lease, false)? {
+            return Ok(false);
+        }
+        let current = |id: &str| {
+            tx.query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE id = ?1",
+                params![id],
+                crate::db::sekai::row_to_object,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+        };
+        match undo {
+            AdmissionUndo::None => {}
+            AdmissionUndo::AbortCreate {
+                object_id,
+                object_kind,
+            } => {
+                if current(object_id)?.is_some_and(|object| {
+                    object.kind == *object_kind && object.created == object.updated
+                }) {
+                    tx.execute(
+                        "DELETE FROM sekai_objects WHERE id = ?1",
+                        params![object_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    tx.execute(
+                        "DELETE FROM sekai_object_changes WHERE object_id = ?1",
+                        params![object_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            AdmissionUndo::RestoreUpdate {
+                previous,
+                applied_updated,
+            } => {
+                if let Some(object) = current(&previous.id)?
+                    && object.updated == *applied_updated
+                {
+                    let mut restored = previous.clone();
+                    restored.updated = object.updated.saturating_add(1);
+                    crate::sekai::audit::update_object_in(
+                        &tx,
+                        &restored,
+                        None,
+                        actor,
+                        None,
+                        &crate::sekai::audit::ChangeAttribution::default(),
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "DELETE FROM sekai_action_instances WHERE instance_id = ?1",
+            params![instance_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// Deletes the reservation only while `lease` still names its owner and
+    /// generation, so a stale owner's compensation cannot remove a newer
+    /// owner's row. Expiry is not checked: an owner may always clean up.
+    pub fn delete_action_instance_fenced(
+        &self,
+        instance_id: &str,
+        lease: &AdmissionLease,
+    ) -> Result<bool, String> {
+        self.migrate_action_instances()?;
+        let conn = self.conn();
+        let deleted = conn
+            .execute(
+                "DELETE FROM sekai_action_instances
+                 WHERE instance_id = ?1
+                   AND json_extract(body_json, '$.admission_lease.owner') = ?2
+                   AND json_extract(body_json, '$.admission_lease.generation') = ?3",
+                params![
+                    instance_id,
+                    lease.owner,
+                    i64::try_from(lease.generation).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(deleted == 1)
+    }
+}
+
+/// Stores a leased reservation, as admission does before its object write,
+/// and returns its instance id and lease.
+#[cfg(test)]
+pub(crate) fn reserve_for_test(
+    db: &crate::db::runtime_db::RuntimeDb,
+    instance_id: &str,
+    now_ms: i64,
+) -> (String, AdmissionLease) {
+    let _ = now_ms;
+    let lease = AdmissionLease::first();
+    let mut instance = tests::sample(STATUS_ADMITTED);
+    instance.instance_id = instance_id.into();
+    instance.idempotency_key = format!("key-{instance_id}");
+    instance.operation_id = format!("op-{instance_id}");
+    instance.admission_lease = Some(lease.clone());
+    db.put_action_instance(&instance).unwrap();
+    (instance.instance_id, lease)
+}
+
+/// Whether `lease` holds the instance's admission reservation inside `tx`,
+/// and, with `check_expiry`, is still live on the lease clock.
+pub(crate) fn sqlite_admission_fence_holds(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    lease: &AdmissionLease,
+    check_expiry: bool,
+) -> Result<bool, String> {
+    let stored = tx
+        .query_row(
+            "SELECT json_extract(body_json, '$.admission_lease.owner'),
+                    json_extract(body_json, '$.admission_lease.generation'),
+                    json_extract(body_json, '$.admission_lease.expires_at_ms')
+             FROM sekai_action_instances WHERE instance_id = ?1",
+            params![instance_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    // Read the clock after the row read, so time spent waiting for the
+    // transaction lock counts against the lease.
+    let now_ms = check_expiry.then(lease_clock_ms);
+    Ok(stored.is_some_and(|(owner, generation, expires)| {
+        lease.holds(owner.as_deref(), generation, expires, now_ms)
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample(status: &str) -> ActionInstance {
+    pub(super) fn sample(status: &str) -> ActionInstance {
         ActionInstance {
             autonomous_envelope_id: String::new(),
             parked_object_digest: String::new(),
@@ -794,6 +1085,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         }
     }
 
@@ -863,5 +1155,204 @@ mod tests {
             submit_budget_subject("acme", "tester", "reviews"),
             "action:governed:reviews/project:acme/agent:tester"
         );
+    }
+
+    /// After a takeover the first owner is stale: its object write, receipt,
+    /// and compensation delete are refused, while the current owner's go
+    /// through (#1930).
+    fn stale_admission_owner_is_fenced(db: &crate::db::runtime_db::RuntimeDb) {
+        let (instance_id, stale) = reserve_for_test(db, "ai-fence", 100);
+        // Simulate the follow-up takeover: same reservation, next generation.
+        let mut current_instance = db.get_action_instance(&instance_id).unwrap().unwrap();
+        let current = AdmissionLease {
+            owner: "recovering-owner".into(),
+            generation: stale.generation + 1,
+            expires_at_ms: lease_clock_ms() + ADMISSION_LEASE_MS,
+        };
+        current_instance.admission_lease = Some(current.clone());
+        db.delete_action_instance(&instance_id).unwrap();
+        db.put_action_instance(&current_instance).unwrap();
+
+        let object = |id: &str| crate::domain::Object {
+            id: id.into(),
+            kind: "customer_record".into(),
+            name: id.into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 300,
+            updated: 300,
+        };
+        let attribution = crate::sekai::audit::ChangeAttribution::action(
+            &instance_id,
+            &current_instance.operation_id,
+        );
+        let write = ParkedGrantWrite::Create(object("rec-stale"));
+        assert!(matches!(
+            db.apply_admission_object_write(&instance_id, &stale, &write, None, "a", &attribution)
+                .unwrap(),
+            FencedAdmissionWrite::FenceLost
+        ));
+        assert!(db.get_object("rec-stale").unwrap().is_none());
+
+        let receipt = sekai_domain::receipt::OperationReceipt {
+            version: sekai_domain::receipt::OPERATION_RECEIPT_VERSION.into(),
+            operation_id: current_instance.operation_id.clone(),
+            parent_operation_id: None,
+            namespace: "acme".into(),
+            operation_class: "action_instance".into(),
+            initiating_actor: "a".into(),
+            schema_version: "v1".into(),
+            policy_version: "v1".into(),
+            started_at_ms: 300,
+            completed_at_ms: None,
+            events: vec![],
+            uncovered_surfaces: vec![],
+            reporter_grants: vec![],
+            ontology_digest: None,
+            artifact: None,
+        };
+        assert!(
+            !db.put_admission_receipt(&instance_id, &stale, &receipt)
+                .unwrap()
+        );
+        assert!(
+            db.get_operation_receipt(&current_instance.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !db.delete_action_instance_fenced(&instance_id, &stale)
+                .unwrap()
+        );
+        assert!(db.get_action_instance(&instance_id).unwrap().is_some());
+
+        let write = ParkedGrantWrite::Create(object("rec-current"));
+        assert!(matches!(
+            db.apply_admission_object_write(
+                &instance_id,
+                &current,
+                &write,
+                None,
+                "a",
+                &attribution
+            )
+            .unwrap(),
+            FencedAdmissionWrite::Applied(None)
+        ));
+        assert!(db.get_object("rec-current").unwrap().is_some());
+        assert!(
+            db.put_admission_receipt(&instance_id, &current, &receipt)
+                .unwrap()
+        );
+        // Release undoes the write and drops the reservation together, and
+        // only for the current owner.
+        let undo = AdmissionUndo::AbortCreate {
+            object_id: "rec-current".into(),
+            object_kind: "customer_record".into(),
+        };
+        assert!(
+            !db.release_admission(&instance_id, &stale, &undo, "a")
+                .unwrap()
+        );
+        assert!(db.get_object("rec-current").unwrap().is_some());
+        assert!(db.get_action_instance(&instance_id).unwrap().is_some());
+        assert!(
+            db.release_admission(&instance_id, &current, &undo, "a")
+                .unwrap()
+        );
+        assert!(db.get_object("rec-current").unwrap().is_none());
+        assert!(db.get_action_instance(&instance_id).unwrap().is_none());
+
+        // An expired lease is refused at the write and the receipt, though
+        // its owner can still release the reservation.
+        let (expired_id, mut expired) = reserve_for_test(db, "ai-expired", 100);
+        expired.expires_at_ms = lease_clock_ms() - 1;
+        let mut stored = db.get_action_instance(&expired_id).unwrap().unwrap();
+        stored.admission_lease = Some(expired.clone());
+        db.delete_action_instance(&expired_id).unwrap();
+        db.put_action_instance(&stored).unwrap();
+        let write = ParkedGrantWrite::Create(object("rec-expired"));
+        assert!(matches!(
+            db.apply_admission_object_write(&expired_id, &expired, &write, None, "a", &attribution)
+                .unwrap(),
+            FencedAdmissionWrite::FenceLost
+        ));
+        assert!(db.get_object("rec-expired").unwrap().is_none());
+        let mut late = receipt.clone();
+        late.operation_id = stored.operation_id.clone();
+        assert!(
+            !db.put_admission_receipt(&expired_id, &expired, &late)
+                .unwrap()
+        );
+        assert!(
+            db.delete_action_instance_fenced(&expired_id, &expired)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn sqlite_stale_admission_owner_is_fenced() {
+        stale_admission_owner_is_fenced(&crate::db::runtime_db::RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_stale_admission_owner_is_fenced() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = crate::db::runtime_db::RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        stale_admission_owner_is_fenced(&db);
+
+        // PostgreSQL keeps its monotonic revision token on a fenced update:
+        // one that does not advance `updated` is a revision conflict.
+        let (instance_id, lease) = reserve_for_test(&db, "ai-revision", 100);
+        let object = crate::domain::Object {
+            id: "rec-revision".into(),
+            kind: "customer_record".into(),
+            name: "rec-revision".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 500,
+            updated: 500,
+        };
+        db.create_object_with_audit(&object, "a").unwrap();
+        let attribution = crate::sekai::audit::ChangeAttribution::default();
+        let same = ParkedGrantWrite::Update(object.clone());
+        let error = db
+            .apply_admission_object_write(&instance_id, &lease, &same, None, "a", &attribution)
+            .unwrap_err();
+        assert_eq!(error, "object revision conflict");
+        let advanced = ParkedGrantWrite::Update(crate::domain::Object {
+            updated: 501,
+            ..object
+        });
+        assert!(matches!(
+            db.apply_admission_object_write(
+                &instance_id,
+                &lease,
+                &advanced,
+                None,
+                "a",
+                &attribution
+            )
+            .unwrap(),
+            FencedAdmissionWrite::Applied(Some(_))
+        ));
+    }
+
+    #[test]
+    fn a_lease_holds_only_for_its_owner_generation_and_live_window() {
+        let lease = AdmissionLease {
+            owner: "a".into(),
+            generation: 2,
+            expires_at_ms: 1_000,
+        };
+        assert!(lease.holds(Some("a"), Some(2), Some(1_000), None));
+        assert!(!lease.holds(Some("b"), Some(2), Some(1_000), None));
+        assert!(!lease.holds(Some("a"), Some(3), Some(1_000), None));
+        assert!(!lease.holds(None, None, None, None));
+        assert!(lease.holds(Some("a"), Some(2), Some(1_000), Some(999)));
+        assert!(!lease.holds(Some("a"), Some(2), Some(1_000), Some(1_000)));
     }
 }

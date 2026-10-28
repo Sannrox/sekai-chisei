@@ -624,6 +624,7 @@ fn closing_record(
         offline: None,
         conflict: None,
         approval: None,
+        admission_lease: None,
     }
 }
 

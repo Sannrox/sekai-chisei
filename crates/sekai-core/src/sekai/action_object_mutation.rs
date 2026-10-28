@@ -354,14 +354,20 @@ fn plan_catalog_curation(
 
 /// Applies an admitted Action's object write. Its change rows carry the
 /// Action's attribution (operation, instance and receipt), so history links
-/// to the operation by stored id.
+/// to the operation by stored id. The write commits only while `lease` still
+/// holds the instance's admission reservation (#1930).
 pub fn apply(
     db: &RuntimeDb,
     planned: PlannedObjectMutation,
     actor: &str,
     attribution: &crate::sekai::audit::ChangeAttribution,
+    instance_id: &str,
+    lease: &crate::sekai::action_instance::AdmissionLease,
     now_ms: i64,
 ) -> Result<AppliedObjectMutation, ActionObjectMutationError> {
+    use crate::sekai::action_instance::{
+        ADMISSION_FENCE_LOST, FencedAdmissionWrite, ParkedGrantWrite,
+    };
     let mutation = planned.mutation().to_string();
     let (mut object, snapshot) = match planned {
         PlannedObjectMutation::Create(object) => (object, None),
@@ -372,40 +378,58 @@ pub fn apply(
         object.created = now_ms;
     }
     object.updated = now_ms;
+    if object.kind != "namespace"
+        && ((created && object.id.starts_with("namespace:"))
+            || object.external_id.starts_with("namespace:"))
+    {
+        return Err(ActionObjectMutationError::FailedPrecondition(
+            "namespace:* identities are reserved for namespace boundaries".into(),
+        ));
+    }
     let object_id = object.id.clone();
     let object_kind = object.kind.clone();
     let object_external_id = object.external_id.clone();
     let applied_updated = object.updated;
-    let previous = if created {
-        db.create_object_attributed(&object, actor, None, attribution)
-            .map_err(|error| {
-                if object_kind == KIND_OBSERVATION && unique_constraint_failed(&error) {
-                    ActionObjectMutationError::FailedPrecondition(format!(
-                        "observation external identity {object_external_id} already exists"
-                    ))
-                } else {
-                    ActionObjectMutationError::Internal(error)
-                }
-            })?;
-        None
+    let write = if created {
+        ParkedGrantWrite::Create(object)
     } else {
-        Some(
-            db.update_object_attributed(&object, snapshot.as_deref(), actor, None, attribution)
-                .map_err(|error| {
-                    if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION {
-                        ActionObjectMutationError::FailedPrecondition(format!(
-                            "object {object_id} changed since the Action was planned; submit again"
-                        ))
-                    } else {
-                        ActionObjectMutationError::Internal(error)
-                    }
-                })?
-                .ok_or_else(|| {
-                    ActionObjectMutationError::FailedPrecondition(format!(
-                        "object {object_id} not found"
-                    ))
-                })?,
+        ParkedGrantWrite::Update(object)
+    };
+    let previous = match db
+        .apply_admission_object_write(
+            instance_id,
+            lease,
+            &write,
+            snapshot.as_deref(),
+            actor,
+            attribution,
         )
+        .map_err(|error| {
+            if created && object_kind == KIND_OBSERVATION && unique_constraint_failed(&error) {
+                ActionObjectMutationError::FailedPrecondition(format!(
+                    "observation external identity {object_external_id} already exists"
+                ))
+            } else if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION {
+                ActionObjectMutationError::FailedPrecondition(format!(
+                    "object {object_id} changed since the Action was planned; submit again"
+                ))
+            } else if error.ends_with("not found") {
+                ActionObjectMutationError::FailedPrecondition(format!(
+                    "object {object_id} not found"
+                ))
+            } else {
+                ActionObjectMutationError::Internal(error)
+            }
+        })? {
+        FencedAdmissionWrite::Applied(previous) => previous,
+        FencedAdmissionWrite::FenceLost => {
+            return Err(ActionObjectMutationError::FailedPrecondition(
+                ADMISSION_FENCE_LOST.into(),
+            ));
+        }
+    };
+    let object = match write {
+        ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
     };
     Ok(AppliedObjectMutation {
         object_id,
@@ -510,6 +534,27 @@ pub fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_m
     let _ = crate::sekai::function_document::complete_lineage_write(db, actor, object, now_ms);
     if object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
         let _ = crate::sekai::catalog_criticality::sync_outbox(db, object, now_ms);
+    }
+}
+
+/// How releasing a failed admission undoes this write (#1930), with the
+/// same conditions as [`compensate`].
+pub fn admission_undo(
+    applied: &AppliedObjectMutation,
+) -> crate::sekai::action_instance::AdmissionUndo {
+    use crate::sekai::action_instance::AdmissionUndo;
+    if applied.created {
+        return AdmissionUndo::AbortCreate {
+            object_id: applied.object_id.clone(),
+            object_kind: applied.object_kind.clone(),
+        };
+    }
+    match &applied.previous {
+        Some(previous) => AdmissionUndo::RestoreUpdate {
+            previous: previous.clone(),
+            applied_updated: applied.applied_updated,
+        },
+        None => AdmissionUndo::None,
     }
 }
 
@@ -799,7 +844,17 @@ mod tests {
         )
         .unwrap()
         .expect("planned");
-        let applied = apply(&db, planned, "alice", &Default::default(), 10).unwrap();
+        let reserved1 = crate::sekai::action_instance::reserve_for_test(&db, "ai-apply-1", 10);
+        let applied = apply(
+            &db,
+            planned,
+            "alice",
+            &Default::default(),
+            &reserved1.0,
+            &reserved1.1,
+            10,
+        )
+        .unwrap();
         compensate(&db, &applied, "alice");
         let planned = plan(
             &db,
@@ -812,7 +867,17 @@ mod tests {
         )
         .unwrap()
         .expect("planned after abort");
-        apply(&db, planned, "alice", &Default::default(), 20).unwrap();
+        let reserved2 = crate::sekai::action_instance::reserve_for_test(&db, "ai-apply-2", 20);
+        apply(
+            &db,
+            planned,
+            "alice",
+            &Default::default(),
+            &reserved2.0,
+            &reserved2.1,
+            20,
+        )
+        .unwrap();
         assert_eq!(
             db.get_object("rec-abort").unwrap().unwrap().kind,
             "customer_record"
@@ -859,7 +924,17 @@ mod tests {
         )
         .unwrap()
         .expect("planned");
-        apply(&db, planned, "alice", &Default::default(), 10).unwrap();
+        let reserved3 = crate::sekai::action_instance::reserve_for_test(&db, "ai-apply-3", 10);
+        apply(
+            &db,
+            planned,
+            "alice",
+            &Default::default(),
+            &reserved3.0,
+            &reserved3.1,
+            10,
+        )
+        .unwrap();
         let update = GovernedActionType {
             object_mutation: OBJECT_MUTATION_UPDATE.into(),
             type_id: "customer.record.update".into(),
@@ -876,7 +951,17 @@ mod tests {
         )
         .unwrap()
         .expect("planned");
-        let applied = apply(&db, planned, "alice", &Default::default(), 20).unwrap();
+        let reserved4 = crate::sekai::action_instance::reserve_for_test(&db, "ai-apply-4", 20);
+        let applied = apply(
+            &db,
+            planned,
+            "alice",
+            &Default::default(),
+            &reserved4.0,
+            &reserved4.1,
+            20,
+        )
+        .unwrap();
         assert_eq!(
             db.get_object("rec-restore")
                 .unwrap()
@@ -939,7 +1024,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(marking(&created).as_deref(), Some("confidential"));
-        apply(&db, created.unwrap(), "alice", &Default::default(), 10).unwrap();
+        let reserved5 = crate::sekai::action_instance::reserve_for_test(&db, "ai-apply-5", 10);
+        apply(
+            &db,
+            created.unwrap(),
+            "alice",
+            &Default::default(),
+            &reserved5.0,
+            &reserved5.1,
+            10,
+        )
+        .unwrap();
         // An update cannot lower the object's marking through a parameter,
         // and keeps the stricter of the object's and the Action's.
         let update = GovernedActionType {

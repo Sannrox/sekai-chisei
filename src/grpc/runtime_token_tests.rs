@@ -137,6 +137,7 @@ fn seed_effect(db: &RuntimeDb, suffix: &str) {
         conflict: None,
         approval: None,
         offline: None,
+        admission_lease: None,
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();

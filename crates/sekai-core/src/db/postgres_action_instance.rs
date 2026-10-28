@@ -5,7 +5,8 @@ use crate::db::postgres_audit::{
     insert_created_object_in, lock_object_lifecycle, row_to_object, update_object_in,
 };
 use crate::sekai::action_instance::{
-    ActionInstance, ParkedGrantOutcome, ParkedGrantWrite, STATUS_PARKED, object_state_digest,
+    ActionInstance, AdmissionLease, AdmissionUndo, FencedAdmissionWrite, ParkedGrantOutcome,
+    ParkedGrantWrite, STATUS_PARKED, object_state_digest,
 };
 
 impl PostgresDb {
@@ -194,6 +195,166 @@ impl PostgresDb {
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    /// Applies an admission's object write only while `lease` still names the
+    /// reservation's owner and generation and has not expired (#1930). A
+    /// takeover bumps the generation, so a stale owner's write is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_admission_object_write(
+        &self,
+        instance_id: &str,
+        lease: &AdmissionLease,
+        write: &ParkedGrantWrite,
+        expected: Option<&crate::domain::Object>,
+        actor: &str,
+        attribution: &crate::sekai::audit::ChangeAttribution,
+    ) -> Result<FencedAdmissionWrite<Option<crate::domain::Object>>, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        let previous = match write {
+            ParkedGrantWrite::Create(object) => {
+                insert_created_object_in(&mut tx, object, actor, None, attribution)?;
+                None
+            }
+            ParkedGrantWrite::Update(object) => {
+                // Keep PostgreSQL's monotonic revision token: an update that
+                // does not advance `updated` is a revision conflict, as on
+                // every other PostgreSQL object update.
+                lock_object_lifecycle(&mut tx, &object.id)?;
+                let stored: Option<i64> = tx
+                    .query_opt(
+                        "SELECT updated FROM sekai_objects WHERE id = $1 FOR UPDATE",
+                        &[&object.id],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .map(|row| row.get(0));
+                if stored.is_some_and(|stored| object.updated <= stored) {
+                    return Err("object revision conflict".into());
+                }
+                Some(
+                    update_object_in(&mut tx, object, expected, actor, None, attribution)?
+                        .ok_or_else(|| format!("object {} not found", object.id))?,
+                )
+            }
+        };
+        // Object locks taken above may have blocked past the lease; check
+        // again before committing. The reservation row is already held
+        // `FOR SHARE`, so this read does not wait.
+        if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(FencedAdmissionWrite::Applied(previous))
+    }
+
+    /// Releases a failed admission in one transaction: while `lease` still
+    /// names the reservation's owner and generation, undoes its object write
+    /// and deletes the reservation (#1930). Returns whether this owner
+    /// released it.
+    pub fn release_admission(
+        &self,
+        instance_id: &str,
+        lease: &AdmissionLease,
+        undo: &AdmissionUndo,
+        actor: &str,
+    ) -> Result<bool, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        if !postgres_admission_fence_holds(&mut tx, instance_id, lease, false)? {
+            return Ok(false);
+        }
+        fn current(
+            tx: &mut postgres::Transaction<'_>,
+            id: &str,
+        ) -> Result<Option<crate::domain::Object>, String> {
+            lock_object_lifecycle(tx, id)?;
+            tx.query_opt(
+                &format!(
+                    "SELECT {} FROM sekai_objects WHERE id = $1 FOR UPDATE",
+                    crate::db::postgres_audit::OBJECT_COLUMNS
+                ),
+                &[&id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(row_to_object)
+            .transpose()
+        }
+        match undo {
+            AdmissionUndo::None => {}
+            AdmissionUndo::AbortCreate {
+                object_id,
+                object_kind,
+            } => {
+                if current(&mut tx, object_id)?.is_some_and(|object| {
+                    object.kind == *object_kind && object.created == object.updated
+                }) {
+                    tx.execute("DELETE FROM sekai_objects WHERE id = $1", &[object_id])
+                        .map_err(|error| error.to_string())?;
+                    tx.execute(
+                        "DELETE FROM sekai_object_changes WHERE object_id = $1",
+                        &[object_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            AdmissionUndo::RestoreUpdate {
+                previous,
+                applied_updated,
+            } => {
+                if let Some(object) = current(&mut tx, &previous.id)?
+                    && object.updated == *applied_updated
+                {
+                    let mut restored = previous.clone();
+                    restored.updated = object.updated.saturating_add(1);
+                    update_object_in(
+                        &mut tx,
+                        &restored,
+                        None,
+                        actor,
+                        None,
+                        &crate::sekai::audit::ChangeAttribution::default(),
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "DELETE FROM sekai_action_instances WHERE instance_id = $1",
+            &[&instance_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// Deletes the reservation only while `lease` still names its owner and
+    /// generation. Expiry is not checked: an owner may always clean up.
+    pub fn delete_action_instance_fenced(
+        &self,
+        instance_id: &str,
+        lease: &AdmissionLease,
+    ) -> Result<bool, String> {
+        let generation = i64::try_from(lease.generation)
+            .unwrap_or(i64::MAX)
+            .to_string();
+        let deleted = self
+            .connection()?
+            .execute(
+                "DELETE FROM sekai_action_instances
+                 WHERE instance_id = $1
+                   AND body_json::jsonb #>> '{admission_lease,owner}' = $2
+                   AND body_json::jsonb #>> '{admission_lease,generation}' = $3",
+                &[&instance_id, &lease.owner, &generation],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(deleted == 1)
     }
 
     /// Moves a parked instance to its decided state. Returns false when the
@@ -438,4 +599,36 @@ impl PostgresDb {
         self.put_decision_memory(&memory)?;
         Ok(true)
     }
+}
+
+/// Whether `lease` holds the instance's admission reservation inside the
+/// transaction, and, with `check_expiry`, is still live on the lease clock. The row is locked
+/// `FOR SHARE`, so a takeover that bumps the generation waits for the fenced
+/// write to commit.
+pub(crate) fn postgres_admission_fence_holds<C: postgres::GenericClient>(
+    client: &mut C,
+    instance_id: &str,
+    lease: &AdmissionLease,
+    check_expiry: bool,
+) -> Result<bool, String> {
+    let stored = client
+        .query_opt(
+            "SELECT body_json::jsonb #>> '{admission_lease,owner}',
+                    (body_json::jsonb #>> '{admission_lease,generation}')::bigint,
+                    (body_json::jsonb #>> '{admission_lease,expires_at_ms}')::bigint
+             FROM sekai_action_instances WHERE instance_id = $1 FOR SHARE",
+            &[&instance_id],
+        )
+        .map_err(|error| error.to_string())?;
+    // Read the clock after `FOR SHARE` returns, so time spent waiting for
+    // the row lock counts against the lease.
+    let now_ms = check_expiry.then(crate::sekai::action_instance::lease_clock_ms);
+    Ok(stored.is_some_and(|row| {
+        lease.holds(
+            row.get::<_, Option<String>>(0).as_deref(),
+            row.get(1),
+            row.get(2),
+            now_ms,
+        )
+    }))
 }

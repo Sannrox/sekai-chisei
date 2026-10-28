@@ -34,11 +34,19 @@ use std::cell::Cell;
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_RECORD_ADMISSION: Cell<bool> = const { Cell::new(false) };
+    static TAKE_OVER_BEFORE_NEXT_RECEIPT: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
 pub fn fail_next_record_admission() {
     FAIL_NEXT_RECORD_ADMISSION.with(|flag| flag.set(true));
+}
+
+/// Simulates a takeover between the next admission's object write and its
+/// receipt: the reservation moves to a newer generation (#1930).
+#[cfg(test)]
+pub fn take_over_before_next_receipt() {
+    TAKE_OVER_BEFORE_NEXT_RECEIPT.with(|flag| flag.set(true));
 }
 
 /// Receipt attribute naming the marking reading the receipt needs (#1706):
@@ -664,6 +672,9 @@ impl<'a> ActionInstanceAdmission<'a> {
         } else {
             String::new()
         };
+        // This attempt's hold on the reservation: its object write, receipt,
+        // and compensation are fenced on it (#1930).
+        let lease = crate::sekai::action_instance::AdmissionLease::first();
         let instance = ActionInstance {
             instance_id: instance_id.clone(),
             namespace: namespace.clone(),
@@ -719,6 +730,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                     ApprovalRequirement::new(&policy_scope_label, policy_rule, &type_def.approvers)
                 }
             }),
+            admission_lease: Some(lease.clone()),
         };
         let planned_effects = if status == STATUS_ADMITTED {
             let force_notify_fail =
@@ -788,7 +800,9 @@ impl<'a> ActionInstanceAdmission<'a> {
                                     == expected_object_revision
                         ) =>
                 {
-                    let _ = self.db.delete_action_instance(&stored.instance_id);
+                    let _ = self
+                        .db
+                        .delete_action_instance_fenced(&stored.instance_id, &lease);
                     return Err(object_changed());
                 }
                 Ok(None) => None,
@@ -799,7 +813,9 @@ impl<'a> ActionInstanceAdmission<'a> {
                         .as_ref()
                         .is_some_and(|checked| !snapshot.persisted_state_matches(checked)) =>
                 {
-                    let _ = self.db.delete_action_instance(&stored.instance_id);
+                    let _ = self
+                        .db
+                        .delete_action_instance_fenced(&stored.instance_id, &lease);
                     return Err(ActionInstanceAdmissionError::FailedPrecondition(
                         "the object changed while the offline Action was admitted; submit it again"
                             .into(),
@@ -814,17 +830,23 @@ impl<'a> ActionInstanceAdmission<'a> {
                             &stored.instance_id,
                             &stored.operation_id,
                         ),
+                        &stored.instance_id,
+                        &lease,
                         now,
                     ) {
                         Ok(applied) => Some(applied),
                         Err(error) => {
-                            let _ = self.db.delete_action_instance(&stored.instance_id);
+                            let _ = self
+                                .db
+                                .delete_action_instance_fenced(&stored.instance_id, &lease);
                             return Err(map_object_mutation_error(error));
                         }
                     }
                 }
                 Err(error) => {
-                    let _ = self.db.delete_action_instance(&stored.instance_id);
+                    let _ = self
+                        .db
+                        .delete_action_instance_fenced(&stored.instance_id, &lease);
                     return Err(map_object_mutation_error(error));
                 }
             }
@@ -851,11 +873,17 @@ impl<'a> ActionInstanceAdmission<'a> {
                 .ok()
                 .flatten()
                 .is_some();
+            // Undo the object write and release the reservation in one fenced
+            // transaction: only an owner that still holds it undoes, and a
+            // crash leaves both or neither.
             if !receipt_exists {
-                if let Some(applied) = &applied_object {
-                    action_object_mutation::compensate(self.db, applied, actor);
-                }
-                let _ = self.db.delete_action_instance(&stored.instance_id);
+                let undo = applied_object.as_ref().map_or(
+                    crate::sekai::action_instance::AdmissionUndo::None,
+                    action_object_mutation::admission_undo,
+                );
+                let _ = self
+                    .db
+                    .release_admission(&stored.instance_id, &lease, &undo, actor);
             }
             return Err(error);
         }
@@ -1748,9 +1776,40 @@ impl<'a> ActionInstanceAdmission<'a> {
             ontology_digest,
             artifact: None,
         };
-        self.db
-            .put_operation_receipt(&receipt)
-            .map_err(ActionInstanceAdmissionError::Internal)?;
+        #[cfg(test)]
+        if TAKE_OVER_BEFORE_NEXT_RECEIPT.with(|flag| flag.replace(false))
+            && let Some(mut taken) = self
+                .db
+                .get_action_instance(&stored.instance_id)
+                .map_err(ActionInstanceAdmissionError::Internal)?
+            && let Some(lease) = taken.admission_lease.as_mut()
+        {
+            lease.owner = "recovering-owner".into();
+            lease.generation += 1;
+            self.db
+                .delete_action_instance(&stored.instance_id)
+                .and_then(|()| self.db.put_action_instance(&taken).map(|_| ()))
+                .map_err(ActionInstanceAdmissionError::Internal)?;
+        }
+        // The admission receipt is fenced on the reservation's lease; a
+        // decision on a parked instance records its receipt unfenced.
+        match (approval, stored.admission_lease.as_ref()) {
+            (None, Some(lease)) => {
+                if !self
+                    .db
+                    .put_admission_receipt(&stored.instance_id, lease, &receipt)
+                    .map_err(ActionInstanceAdmissionError::Internal)?
+                {
+                    return Err(ActionInstanceAdmissionError::FailedPrecondition(
+                        crate::sekai::action_instance::ADMISSION_FENCE_LOST.into(),
+                    ));
+                }
+            }
+            _ => self
+                .db
+                .put_operation_receipt(&receipt)
+                .map_err(ActionInstanceAdmissionError::Internal)?,
+        }
 
         evidence.extend([
             ("instance_id".into(), stored.instance_id.clone()),
@@ -3806,6 +3865,46 @@ mod tests {
         });
     }
 
+    /// A takeover between the object write and the receipt leaves the first
+    /// owner stale: its receipt is refused, and it neither undoes the write
+    /// nor removes the newer owner's reservation (#1930).
+    #[test]
+    fn a_stale_owner_neither_records_nor_compensates() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        take_over_before_next_receipt();
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-taken","name":"Taken"}"#,
+        );
+        request.idempotency_key = "record-taken".into();
+        request.request_id = "operation-taken".into();
+        let error = ActionInstanceAdmission::new(&db, None)
+            .admit(request, "alice", 10)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ActionInstanceAdmissionError::FailedPrecondition(message)
+                    if message == crate::sekai::action_instance::ADMISSION_FENCE_LOST
+            ),
+            "{error:?}"
+        );
+        assert!(
+            db.get_operation_receipt("operation-taken")
+                .unwrap()
+                .is_none()
+        );
+        assert!(db.get_object("rec-taken").unwrap().is_some());
+        let reservation = db
+            .get_action_instance_by_idempotency("acme", "record-taken")
+            .unwrap()
+            .expect("the newer owner's reservation stays");
+        assert_eq!(reservation.admission_lease.unwrap().generation, 2);
+    }
+
     #[test]
     fn failed_record_admission_does_not_ingest_so_retry_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -5057,6 +5156,7 @@ mod tests {
             conflict: None,
             approval: None,
             offline: None,
+            admission_lease: None,
         };
         db.put_action_instance(&reserved).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);

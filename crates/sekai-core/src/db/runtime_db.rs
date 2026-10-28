@@ -4601,6 +4601,84 @@ impl RuntimeDb {
         }
     }
 
+    /// See [`crate::sekai::action_instance::AdmissionLease`] (#1930).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_admission_object_write(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        write: &crate::sekai::action_instance::ParkedGrantWrite,
+        expected: Option<&crate::domain::Object>,
+        actor: &str,
+        attribution: &crate::sekai::audit::ChangeAttribution,
+    ) -> Result<
+        crate::sekai::action_instance::FencedAdmissionWrite<Option<crate::domain::Object>>,
+        String,
+    > {
+        match self {
+            Self::Sqlite(db) => db.apply_admission_object_write(
+                instance_id,
+                lease,
+                write,
+                expected,
+                actor,
+                attribution,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.apply_admission_object_write(
+                    instance_id,
+                    lease,
+                    write,
+                    expected,
+                    actor,
+                    attribution,
+                )
+            }),
+        }
+    }
+
+    pub fn put_admission_receipt(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.put_admission_receipt(instance_id, lease, receipt),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_admission_receipt(instance_id, lease, receipt)
+            }),
+        }
+    }
+
+    pub fn release_admission(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        undo: &crate::sekai::action_instance::AdmissionUndo,
+        actor: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.release_admission(instance_id, lease, undo, actor),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.release_admission(instance_id, lease, undo, actor)
+            }),
+        }
+    }
+
+    pub fn delete_action_instance_fenced(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.delete_action_instance_fenced(instance_id, lease),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.delete_action_instance_fenced(instance_id, lease)
+            }),
+        }
+    }
+
     pub fn delete_action_instance(&self, instance_id: &str) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.delete_action_instance(instance_id),
