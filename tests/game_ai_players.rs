@@ -312,9 +312,13 @@ pub(crate) enum Verdict {
     Denied {
         rule: String,
     },
-    /// The Action policy parked it for an approver.
+    /// The Action policy parked it for an approver: the policy decision, the
+    /// scope and clause that required approval, and who may decide.
     Parked {
         policy: String,
+        scope: String,
+        rule: String,
+        approvers: Vec<String>,
     },
     /// Admission refused the submission.
     Refused {
@@ -621,9 +625,17 @@ async fn act(
         "denied" => Verdict::Denied {
             rule: instance.deny_reason,
         },
-        "parked" => Verdict::Parked {
-            policy: instance.policy_decision,
-        },
+        "parked" => {
+            let approval = instance
+                .approval
+                .unwrap_or_else(|| panic!("{key}: parked without approval detail"));
+            Verdict::Parked {
+                policy: instance.policy_decision,
+                scope: approval.policy_scope,
+                rule: approval.rule,
+                approvers: approval.approvers,
+            }
+        }
         other => panic!("{key}: unexpected status {other}: {instance:?}"),
     };
     (verdict, Some(submission))
@@ -730,7 +742,22 @@ async fn unapproved_invasion_waits_for_the_admiral_only_when_governed() {
     assert_eq!(outcome.governed[0].decision, outcome.ungoverned[0].decision);
     assert_eq!(outcome.governed[0].decision["action"], "invade");
     match &outcome.governed[0].verdict {
-        Verdict::Parked { policy } => assert!(policy.contains("require_approval"), "{policy}"),
+        Verdict::Parked {
+            policy,
+            scope,
+            rule,
+            approvers,
+        } => {
+            assert!(policy.contains("require_approval"), "{policy}");
+            assert_eq!(
+                (scope.as_str(), rule.as_str(), approvers.as_slice()),
+                (
+                    "project:game-invasions",
+                    "default_decision",
+                    ["admiral".to_string()].as_slice()
+                )
+            );
+        }
         other => panic!("governed invasion: {other:?}"),
     }
     assert_eq!(outcome.ungoverned[0].verdict, Verdict::Applied);

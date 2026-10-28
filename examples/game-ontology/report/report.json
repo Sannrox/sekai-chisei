@@ -28,7 +28,7 @@
     "cost": "Each move's tokens priced at the route whose runtime the receipt's route_selected event names, using the fixture price table, in millicredits.",
     "cost_per_win": "Cost divided by wins, rounded to 3 decimals; null without a win.",
     "routing_savings": "Counterfactual: the same tokens priced at the high_impact route, minus the cost. It is not charged spend; no public RPC reads model spend per route.",
-    "rule": "The pack rule a block's trigger belongs to. A parked Action does not name its policy scope, so its trigger is the scope the pack gives the Action type.",
+    "rule": "The pack rule a block's trigger belongs to. A parked Action's trigger is the policy scope its instance names.",
     "tokens": "Input and output tokens of each move's model_called event in its GetOperationReceipt. The replay endpoint reports the same usage for every reply, because the recordings store none.",
     "win": "A move whose Action applied. The harness scores no game result."
   },
@@ -725,6 +725,11 @@
               },
               "verdict": "parked",
               "policy": "require_approval",
+              "scope": "project:game-invasions",
+              "rule": "default_decision",
+              "approvers": [
+                "admiral"
+              ],
               "route": "routine",
               "input_tokens": 64,
               "output_tokens": 16
@@ -957,10 +962,6 @@
     {
       "issue": "#1866",
       "gap": "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices."
-    },
-    {
-      "issue": "#1867",
-      "gap": "A parked Action names neither the policy scope nor the approvers; the invasion block's trigger comes from the pack."
     },
     {
       "issue": "#1870",

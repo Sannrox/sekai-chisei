@@ -9,9 +9,9 @@
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_instance::{
-    ActionInstance, DECISION_DENY, DECISION_GRANT, STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED,
-    SUBMIT_POLICY_ACTION, compute_request_digest_with_envelope, submit_budget_subject,
-    validate_parameters_json,
+    ActionInstance, ApprovalRequirement, DECISION_DENY, DECISION_GRANT, RULE_AGENT_PROPOSE_ONLY,
+    STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED, SUBMIT_POLICY_ACTION,
+    compute_request_digest_with_envelope, submit_budget_subject, validate_parameters_json,
 };
 use crate::sekai::action_object_mutation::{
     ActionObjectMutationError, AppliedObjectMutation, plan as plan_object_mutation,
@@ -416,12 +416,17 @@ impl<'a> ActionInstanceAdmission<'a> {
             .db
             .resolve_action_policy(actor, &namespace, &policy_project)
             .map_err(ActionInstanceAdmissionError::Internal)?;
-        let (policy_decision, policy_scope_label) = match &resolved_policy {
-            Some(policy) => (
-                policy.decide(SUBMIT_POLICY_ACTION, RiskClass::Write),
-                policy.scope.clone(),
+        let (policy_decision, policy_rule, policy_scope_label) = match &resolved_policy {
+            Some(policy) => {
+                let (decision, rule) =
+                    policy.decide_with_rule(SUBMIT_POLICY_ACTION, RiskClass::Write);
+                (decision, rule.to_string(), policy.scope.clone())
+            }
+            None => (
+                action_policy::ActionDecision::Allow,
+                String::new(),
+                String::new(),
             ),
-            None => (action_policy::ActionDecision::Allow, String::new()),
         };
 
         let instance_id = format!("gai-{}", uuid::Uuid::new_v4().simple());
@@ -482,6 +487,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             deny_reason = format!("action budget exhausted for {budget_subject}");
             budget_decision = "budget_exceeded".into();
         }
+        let mut parked_by_autonomy = false;
         match &autonomy {
             Some(crate::sekai::agent_autonomy::AdmissionAutonomy::AutoApply { .. })
                 if status != STATUS_DENIED =>
@@ -502,6 +508,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 if status == STATUS_ADMITTED =>
             {
                 status = STATUS_PARKED.into();
+                parked_by_autonomy = true;
                 policy_decision_text = "require_approval".into();
                 if !budget_already_reserved {
                     budget_decision = if self.budget.is_some() {
@@ -624,6 +631,17 @@ impl<'a> ActionInstanceAdmission<'a> {
             marking,
             offline: request.offline.clone(),
             conflict,
+            approval: (status == STATUS_PARKED).then(|| {
+                if parked_by_autonomy {
+                    ApprovalRequirement::new(
+                        "",
+                        RULE_AGENT_PROPOSE_ONLY.into(),
+                        &type_def.approvers,
+                    )
+                } else {
+                    ApprovalRequirement::new(&policy_scope_label, policy_rule, &type_def.approvers)
+                }
+            }),
         };
         let planned_effects = if status == STATUS_ADMITTED {
             let force_notify_fail =
@@ -1540,6 +1558,18 @@ impl<'a> ActionInstanceAdmission<'a> {
         // the decision completes it.
         let await_runtime_dispatch = stored.status == STATUS_PARKED
             || (stored.status == STATUS_ADMITTED && has_pending_runtime_dispatch(planned_effects));
+        let mut policy_attributes = BTreeMap::from([
+            ("decision".into(), stored.policy_decision.clone()),
+            ("action".into(), SUBMIT_POLICY_ACTION.into()),
+        ]);
+        let mut evidence = HashMap::new();
+        // A parked instance names what parked it and who may decide (#1867).
+        if let Some(approval) = &stored.approval {
+            for (key, value) in approval_attributes(approval) {
+                policy_attributes.insert(key.into(), value.clone());
+                evidence.insert(key.into(), value);
+            }
+        }
         let mut events = vec![
             event(
                 "intent",
@@ -1551,10 +1581,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 "policy",
                 Some(format!("{operation_id}:intent")),
                 ReceiptEventKind::PolicyDecided,
-                BTreeMap::from([
-                    ("decision".into(), stored.policy_decision.clone()),
-                    ("action".into(), SUBMIT_POLICY_ACTION.into()),
-                ]),
+                policy_attributes,
             ),
             event(
                 "routing",
@@ -1641,7 +1668,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             .put_operation_receipt(&receipt)
             .map_err(ActionInstanceAdmissionError::Internal)?;
 
-        let mut evidence = HashMap::from([
+        evidence.extend([
             ("instance_id".into(), stored.instance_id.clone()),
             ("type_id".into(), stored.type_id.clone()),
             ("version".into(), stored.version.clone()),
@@ -1728,6 +1755,20 @@ impl<'a> ActionInstanceAdmission<'a> {
         }
         Ok(())
     }
+}
+
+/// Receipt and decision-record attributes for a parked instance's approval
+/// requirement. Empty values are left out; approvers join with commas.
+fn approval_attributes(approval: &ApprovalRequirement) -> Vec<(&'static str, String)> {
+    [
+        ("approval_policy_scope", approval.policy_scope.clone()),
+        ("approval_rule", approval.rule.clone()),
+        ("approvers", approval.approvers.join(",")),
+        ("approver_role", approval.approver_role.clone()),
+    ]
+    .into_iter()
+    .filter(|(_, value)| !value.is_empty())
+    .collect()
 }
 
 /// #1115: post-receipt object-log ingest is best-effort by design (ADR
@@ -4263,6 +4304,80 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_instance_names_its_rule_and_approvers_in_the_audit_record() {
+        let db = approval_setup("create", &["bob", "carol"]);
+        let mut policy = db.get_action_policy("acme").unwrap().unwrap();
+        policy.action_overrides.insert(
+            SUBMIT_POLICY_ACTION.into(),
+            crate::sekai::action_policy::ActionDecision::RequireApproval,
+        );
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let parked = admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-13"}"#),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        let expected = ApprovalRequirement {
+            policy_scope: "acme".into(),
+            rule: "action_override:submit_action_instance".into(),
+            approvers: vec!["bob".into(), "carol".into()],
+            approver_role: String::new(),
+        };
+        assert_eq!(parked.approval.as_ref(), Some(&expected));
+        let stored = db
+            .get_action_instance(&parked.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.approval.as_ref(), Some(&expected));
+
+        let receipt = db
+            .get_operation_receipt("operation-record")
+            .unwrap()
+            .unwrap();
+        let policy_event = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::PolicyDecided)
+            .unwrap();
+        let parked_record = db
+            .list_decisions(&audit::DecisionFilter {
+                target_id: Some(parked.instance_id.clone()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|decision| decision.reason == "action_instance_parked")
+            .unwrap();
+        let policy_attributes: HashMap<String, String> =
+            policy_event.attributes.clone().into_iter().collect();
+        for attributes in [&policy_attributes, &parked_record.evidence] {
+            assert_eq!(attributes["approval_policy_scope"], "acme");
+            assert_eq!(
+                attributes["approval_rule"],
+                "action_override:submit_action_instance"
+            );
+            assert_eq!(attributes["approvers"], "bob,carol");
+            assert!(!attributes.contains_key("approver_role"));
+        }
+
+        // The decision keeps what required it.
+        let granted = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(granted.status, STATUS_ADMITTED);
+        assert_eq!(granted.approval, Some(expected));
+    }
+
+    #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
     fn postgres_require_approval_parks_lists_and_a_named_approver_grants() {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -4298,6 +4413,14 @@ mod tests {
             .unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].instance_id, parked.instance_id);
+        assert_eq!(inbox[0].approval, parked.approval);
+        assert_eq!(
+            parked
+                .approval
+                .as_ref()
+                .map(|approval| approval.rule.as_str()),
+            Some("default_decision")
+        );
         for principal in ["alice", "carol"] {
             let error = admission
                 .decide(
@@ -4396,6 +4519,12 @@ mod tests {
             )
             .unwrap()
             .instance;
+        let approval = parked.approval.as_ref().unwrap();
+        assert!(approval.approvers.is_empty());
+        assert_eq!(
+            approval.approver_role,
+            crate::sekai::action_instance::APPROVER_ROLE_NAMESPACE_ADMIN
+        );
         assert!(matches!(
             admission.decide(
                 decision(&parked.instance_id, DECISION_GRANT, "bob"),
@@ -4812,6 +4941,7 @@ mod tests {
             resource_tenant: String::new(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         };
         db.put_action_instance(&reserved).unwrap();

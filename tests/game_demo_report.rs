@@ -80,7 +80,7 @@ const METHODS: [(&str, &str); 6] = [
     ),
     (
         "rule",
-        "The pack rule a block's trigger belongs to. A parked Action does not name its policy scope, so its trigger is the scope the pack gives the Action type.",
+        "The pack rule a block's trigger belongs to. A parked Action's trigger is the policy scope its instance names.",
     ),
 ];
 
@@ -93,14 +93,10 @@ const NORMALIZATION: [&str; 4] = [
 
 /// Report fields the existing public data does not fill, or fills only
 /// approximately.
-const GAPS: [(&str, &str); 5] = [
+const GAPS: [(&str, &str); 4] = [
     (
         "#1866",
         "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices.",
-    ),
-    (
-        "#1867",
-        "A parked Action names neither the policy scope nor the approvers; the invasion block's trigger comes from the pack.",
     ),
     (
         "#1870",
@@ -663,21 +659,8 @@ fn block(pack: &Value, player: &'static str, turn: usize, played: &Turn) -> Opti
     let (verdict, mechanism, trigger, server_reason) = match &played.verdict {
         Verdict::Applied | Verdict::Held => return None,
         Verdict::Denied { rule } => ("denied", "submission_criterion", rule.clone(), rule.clone()),
-        Verdict::Parked { policy } => {
-            let scope = pack["action_types"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|type_def| type_def["type_id"] == type_id)
-                .expect("pack type")["policy_scope"]
-                .as_str()
-                .unwrap();
-            (
-                "parked",
-                "action_policy",
-                format!("project:{scope}"),
-                policy.clone(),
-            )
+        Verdict::Parked { policy, scope, .. } => {
+            ("parked", "action_policy", scope.clone(), policy.clone())
         }
         Verdict::Refused { message, .. } => {
             let subject = pack["action_budgets"]
@@ -804,7 +787,15 @@ impl Report {
             Verdict::Applied => "applied".to_string(),
             Verdict::Held => "held".to_string(),
             Verdict::Denied { rule } => format!("denied: `{rule}`"),
-            Verdict::Parked { policy } => format!("parked: `{policy}`"),
+            Verdict::Parked {
+                policy,
+                scope,
+                rule,
+                approvers,
+            } => format!(
+                "parked: `{policy}` by `{scope}` `{rule}`, approvers `{}`",
+                approvers.join(",")
+            ),
             Verdict::Refused { code, message } => format!("refused ({code}): {message}"),
         };
         let cost_table = |out: &mut String, governed: &Cost, ungoverned: &Cost| {

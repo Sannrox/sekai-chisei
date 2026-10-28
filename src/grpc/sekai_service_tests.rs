@@ -18365,6 +18365,7 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         resource_tenant: String::new(),
         marking: String::new(),
         conflict: None,
+        approval: None,
         offline: None,
     }
 }

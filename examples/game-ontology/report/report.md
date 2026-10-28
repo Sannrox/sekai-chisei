@@ -125,7 +125,7 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 
 | Turn | Decision | Governed | Ungoverned |
 | --- | --- | --- | --- |
-| 0 | `{"action":"invade","planet":"p-rival"}` | parked: `require_approval` | applied |
+| 0 | `{"action":"invade","planet":"p-rival"}` | parked: `require_approval` by `project:game-invasions` `default_decision`, approvers `admiral` | applied |
 
 `p-rival.occupied_by` afterwards: `(unset)`
 
@@ -184,7 +184,7 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 - `cost`: Each move's tokens priced at the route whose runtime the receipt's route_selected event names, using the fixture price table, in millicredits.
 - `cost_per_win`: Cost divided by wins, rounded to 3 decimals; null without a win.
 - `routing_savings`: Counterfactual: the same tokens priced at the high_impact route, minus the cost. It is not charged spend; no public RPC reads model spend per route.
-- `rule`: The pack rule a block's trigger belongs to. A parked Action does not name its policy scope, so its trigger is the scope the pack gives the Action type.
+- `rule`: The pack rule a block's trigger belongs to. A parked Action's trigger is the policy scope its instance names.
 - `tokens`: Input and output tokens of each move's model_called event in its GetOperationReceipt. The replay endpoint reports the same usage for every reply, because the recordings store none.
 - `win`: A move whose Action applied. The harness scores no game result.
 
@@ -198,7 +198,6 @@ Costs are in millicredits at these illustrative route prices (credits per 1000 t
 ## Gaps
 
 - #1866: Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices.
-- #1867: A parked Action names neither the policy scope nor the approvers; the invasion block's trigger comes from the pack.
 - #1870: No public RPC reads budget usage or remaining limit for a scope; tokens come from operation receipts.
 - #1871: An Action submission refused by its Action budget leaves no instance, decision record or operation receipt; its audit row is empty.
 - #1872: Chisei has no model price table; cost uses the fixture's illustrative prices. Recorded replies carry no token usage, so tokens per move reflect the replay endpoint.

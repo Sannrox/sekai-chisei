@@ -2520,6 +2520,7 @@ mod tests {
                 system_one_fill_json: String::new(),
                 marking: String::new(),
                 conflict: None,
+                approval: None,
                 offline: None,
             })
             .unwrap();

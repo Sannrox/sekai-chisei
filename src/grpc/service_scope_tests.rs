@@ -158,6 +158,7 @@ fn seed_effect(db: &RuntimeDb, effect_id: &str, namespace: &str, type_id: &str) 
         resource_tenant: String::new(),
         marking: String::new(),
         conflict: None,
+        approval: None,
         offline: None,
     })
     .unwrap();
