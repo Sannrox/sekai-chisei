@@ -18,7 +18,8 @@ use crate::sekai::action_object_mutation::{
 };
 use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 use crate::sekai::action_type_criteria::{
-    CRITERION_UNAVAILABLE, CriterionDecision, evaluate_submission_criteria, invoker_context,
+    ActionSubmissionCriterion, CRITERION_UNAVAILABLE, CriterionDecision, SharingAnswer,
+    evaluate_submission_criteria, invoker_context,
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
 use crate::sekai::{action_effect, action_object_mutation, action_policy, audit, object_log};
@@ -476,11 +477,26 @@ impl<'a> ActionInstanceAdmission<'a> {
             None => None,
         };
         let invoker = invoker_context(actor, Some(&request.policy_context));
+        let sharing_audit = SharingAudit {
+            actor,
+            namespace: &namespace,
+            type_id: &type_def.type_id,
+            now,
+        };
         let criterion_decision = evaluate_submission_criteria(
             &type_def.submission_criteria,
             criterion_object.as_ref(),
             criterion_policy.as_ref(),
             &invoker,
+            &|criterion| {
+                resolve_sharing(
+                    self.db,
+                    tenant.as_ref(),
+                    &request.parameters_json,
+                    criterion,
+                    Some(&sharing_audit),
+                )
+            },
         );
 
         let policy_project = if type_def.policy_scope.trim().is_empty() {
@@ -1032,11 +1048,27 @@ impl<'a> ActionInstanceAdmission<'a> {
                 })?,
             None => None,
         };
+        // Sharing is asked for the submitter's tenant, not the decider's.
+        let sharing_audit = SharingAudit {
+            actor: decider,
+            namespace: &instance.namespace,
+            type_id: &instance.type_id,
+            now,
+        };
         match evaluate_submission_criteria(
             &type_def.submission_criteria,
             criterion_object.as_ref(),
             criterion_policy.as_ref(),
             &invoker_context(&instance.principal, None),
+            &|criterion| {
+                resolve_sharing(
+                    self.db,
+                    &instance.admission_tenant,
+                    &instance.parameters_json,
+                    criterion,
+                    Some(&sharing_audit),
+                )
+            },
         ) {
             CriterionDecision::Pass => {}
             CriterionDecision::Fail { criterion_id } => {
@@ -2137,6 +2169,85 @@ fn target_object_digest(
         .map_err(ActionInstanceAdmissionError::Internal)?;
     crate::sekai::action_instance::object_state_digest(object.as_ref())
         .map_err(ActionInstanceAdmissionError::Internal)
+}
+
+/// Audit action for a cross-tenant sharing criterion check (#1860).
+pub const SHARING_CRITERION_DECISION: &str = "action_criterion_sharing";
+
+/// Who asks a sharing criterion, for its audit decision.
+pub(crate) struct SharingAudit<'a> {
+    pub actor: &'a str,
+    pub namespace: &'a str,
+    pub type_id: &'a str,
+    pub now: i64,
+}
+
+/// Answers a sharing criterion (#1860, ADR 0077 amendment). Loads the target
+/// object the criterion's parameter names, in any namespace, and asks the
+/// identity extension whether `acting_tenant` shares an approved space with
+/// its owner. Nothing about the target reaches the caller. No extension
+/// means unshared; a missing target, a missing tenant under an extension,
+/// or an extension error is unavailable. With `audit`, records the decision
+/// and the owning tenant.
+pub(crate) fn resolve_sharing(
+    db: &RuntimeDb,
+    acting_tenant: &str,
+    parameters_json: &str,
+    criterion: &ActionSubmissionCriterion,
+    audit: Option<&SharingAudit<'_>>,
+) -> SharingAnswer {
+    let target = serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()
+        .and_then(|parameters| {
+            parameters
+                .get(criterion.property.trim())
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|id| !id.is_empty())
+        .and_then(|id| db.get_object(&id).ok().flatten());
+    let (answer, owner_tenant) = match (&target, db.enterprise_extension()) {
+        (None, _) => (SharingAnswer::Unavailable, String::new()),
+        (Some(_), None) => (SharingAnswer::NotShared, String::new()),
+        (Some(_), Some(_)) if acting_tenant.trim().is_empty() => {
+            (SharingAnswer::Unavailable, String::new())
+        }
+        (Some(target), Some(extension)) => {
+            match extension.tenants_share_space(acting_tenant, &target.namespace) {
+                Ok(sharing) if sharing.shared => (SharingAnswer::Shared, sharing.owner_tenant),
+                Ok(sharing) => (SharingAnswer::NotShared, sharing.owner_tenant),
+                Err(_) => (SharingAnswer::Unavailable, String::new()),
+            }
+        }
+    };
+    if let Some(audit) = audit {
+        let mut evidence = std::collections::HashMap::from([
+            ("criterion_id".to_string(), criterion.criterion_id.clone()),
+            ("namespace".to_string(), audit.namespace.to_string()),
+            ("type_id".to_string(), audit.type_id.to_string()),
+            ("acting_tenant".to_string(), acting_tenant.to_string()),
+            ("owner_tenant".to_string(), owner_tenant),
+        ]);
+        if let Some(target) = &target {
+            evidence.insert("target_namespace".into(), target.namespace.clone());
+        }
+        let (reason, outcome) = match answer {
+            SharingAnswer::NotShared => ("no_shared_space", "allow"),
+            SharingAnswer::Shared => ("shared_space", "deny"),
+            SharingAnswer::Unavailable => (CRITERION_UNAVAILABLE, "deny"),
+        };
+        let _ = db.record_decision(&audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: audit.now,
+            actor: audit.actor.to_string(),
+            action: SHARING_CRITERION_DECISION.into(),
+            reason: reason.into(),
+            evidence,
+            target_id: target.map(|target| target.id).unwrap_or_default(),
+            outcome: outcome.into(),
+        });
+    }
+    answer
 }
 
 fn load_criterion_object(
@@ -5220,5 +5331,256 @@ mod tests {
         admitted.request_id = "operation-record-8-ready".into();
         let admitted = admission.admit(admitted, "alice", 20).unwrap();
         assert_eq!(admitted.instance.status, STATUS_ADMITTED);
+    }
+
+    /// Red and blue tenants with one alliance space whose approval a test
+    /// can withdraw. Blue owns the `blue` namespace.
+    struct AllianceExtension {
+        allied: std::sync::Mutex<bool>,
+    }
+
+    impl crate::enterprise::EnterpriseExtension for AllianceExtension {
+        fn authenticate_bearer(
+            &self,
+            _: &str,
+        ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn authenticate_context(
+            &self,
+            _: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn tenant_context(
+            &self,
+            _: &crate::enterprise::AuthenticatedPrincipal,
+        ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::Unauthenticated)
+        }
+
+        fn authorize_namespace(
+            &self,
+            _: &crate::enterprise::TenantContext,
+            _: &str,
+            _: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Ok(())
+        }
+
+        fn authorize_unscoped_namespace(
+            &self,
+            _: &crate::enterprise::AuthenticatedPrincipal,
+            _: &str,
+            _: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+
+        fn tenants_share_space(
+            &self,
+            acting_tenant: &str,
+            target_namespace: &str,
+        ) -> Result<crate::enterprise::TenantSharing, crate::enterprise::ExtensionError> {
+            let owner_tenant = if target_namespace == "blue" {
+                "blue"
+            } else {
+                "red"
+            };
+            Ok(crate::enterprise::TenantSharing {
+                owner_tenant: owner_tenant.into(),
+                shared: acting_tenant == "red"
+                    && owner_tenant == "blue"
+                    && *self.allied.lock().unwrap(),
+            })
+        }
+    }
+
+    /// An extension that implements only the required methods.
+    struct NoSharingLookup;
+
+    impl crate::enterprise::EnterpriseExtension for NoSharingLookup {
+        fn authenticate_bearer(
+            &self,
+            _: &str,
+        ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn authenticate_context(
+            &self,
+            _: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn tenant_context(
+            &self,
+            _: &crate::enterprise::AuthenticatedPrincipal,
+        ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::Unauthenticated)
+        }
+
+        fn authorize_namespace(
+            &self,
+            _: &crate::enterprise::TenantContext,
+            _: &str,
+            _: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Ok(())
+        }
+
+        fn authorize_unscoped_namespace(
+            &self,
+            _: &crate::enterprise::AuthenticatedPrincipal,
+            _: &str,
+            _: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+    }
+
+    /// An installed extension that has not implemented the sharing lookup
+    /// fails closed instead of reporting unshared (#1860).
+    #[test]
+    fn an_extension_without_the_sharing_lookup_fails_closed() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(std::sync::Arc::new(NoSharingLookup)),
+            )
+            .unwrap(),
+        ));
+        ensure_record_kind(&db);
+        db.create_object(&crate::domain::Object {
+            id: "planet-blue".into(),
+            kind: "customer_record".into(),
+            name: "Blue planet".into(),
+            namespace: "blue".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let mut type_def = record_type("create");
+        type_def.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"target_id":{"type":"string"}},"required":["object_id","target_id"],"additionalProperties":false}"#.into();
+        type_def.submission_criteria = vec![
+            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+                criterion_id: "not_allied".into(),
+                kind: crate::sekai::action_type_criteria::CRITERION_KIND_SHARES_NO_SPACE.into(),
+                property: "target_id".into(),
+                value: String::new(),
+            },
+        ];
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let refused = ActionInstanceAdmission::new(&db, None)
+            .with_tenant("red")
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"attack-1","target_id":"planet-blue"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap();
+        assert_eq!(refused.instance.status, STATUS_DENIED);
+        assert_eq!(refused.instance.deny_reason, CRITERION_UNAVAILABLE);
+    }
+
+    /// An Action against an allied tenant's object is denied while the
+    /// tenants share an approved space, and admitted after the space is
+    /// withdrawn, with no property sync on the target (#1860).
+    #[test]
+    fn sharing_criterion_follows_the_live_alliance() {
+        let extension = std::sync::Arc::new(AllianceExtension {
+            allied: std::sync::Mutex::new(true),
+        });
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(extension.clone()),
+            )
+            .unwrap(),
+        ));
+        ensure_record_kind(&db);
+        db.create_object(&crate::domain::Object {
+            id: "planet-blue".into(),
+            kind: "customer_record".into(),
+            name: "Blue planet".into(),
+            namespace: "blue".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let mut type_def = record_type("create");
+        type_def.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"target_id":{"type":"string"}},"required":["object_id","target_id"],"additionalProperties":false}"#.into();
+        type_def.submission_criteria = vec![
+            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+                criterion_id: "not_allied".into(),
+                kind: crate::sekai::action_type_criteria::CRITERION_KIND_SHARES_NO_SPACE.into(),
+                property: "target_id".into(),
+                value: String::new(),
+            },
+        ];
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None).with_tenant("red");
+        let attack = |object_id: &str, key: &str| {
+            let mut request = record_request(
+                "customer.record.create",
+                &format!(r#"{{"object_id":"{object_id}","target_id":"planet-blue"}}"#),
+            );
+            request.idempotency_key = key.into();
+            request.request_id = format!("operation-{key}");
+            request
+        };
+        let denied = admission
+            .admit(attack("attack-1", "attack-1"), "alice", 10)
+            .unwrap();
+        assert_eq!(denied.instance.status, STATUS_DENIED);
+        assert_eq!(denied.instance.deny_reason, "not_allied");
+        assert!(db.get_object("attack-1").unwrap().is_none());
+
+        *extension.allied.lock().unwrap() = false;
+        let admitted = admission
+            .admit(attack("attack-2", "attack-2"), "alice", 20)
+            .unwrap();
+        assert_eq!(admitted.instance.status, STATUS_ADMITTED);
+        assert!(db.get_object("attack-2").unwrap().is_some());
+        let planet = db.get_object("planet-blue").unwrap().unwrap();
+        assert!(
+            planet.properties.is_empty(),
+            "no property sync on the target"
+        );
+
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some(SHARING_CRITERION_DECISION.into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(|decision| {
+            decision.evidence.get("owner_tenant").map(String::as_str) == Some("blue")
+                && decision.target_id == "planet-blue"
+        }));
+
+        // A target that does not exist fails closed.
+        let mut missing = attack("attack-3", "attack-3");
+        missing.parameters_json = r#"{"object_id":"attack-3","target_id":"nowhere"}"#.into();
+        let refused = admission.admit(missing, "alice", 30).unwrap();
+        assert_eq!(refused.instance.deny_reason, CRITERION_UNAVAILABLE);
     }
 }

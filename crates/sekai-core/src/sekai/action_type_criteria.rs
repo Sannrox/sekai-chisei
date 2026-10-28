@@ -14,6 +14,10 @@ pub const CRITERION_KIND_ALLOW_ALL: &str = "allow_all";
 pub const CRITERION_KIND_SUBJECT_EQUALS_PROPERTY: &str = "subject_equals_property";
 pub const CRITERION_KIND_REQUIRED_SCOPE_EQUALS: &str = "required_scope_equals";
 pub const CRITERION_KIND_PROPERTY_EQUALS: &str = "property_equals";
+/// Passes only when the acting tenant and the target object's owning tenant
+/// share no approved space (#1860, ADR 0077 amendment). `property` names the
+/// parameter holding the target object id.
+pub const CRITERION_KIND_SHARES_NO_SPACE: &str = "actor_shares_no_space_with_target_owner";
 pub const CRITERION_UNAVAILABLE: &str = "unavailable";
 
 const RESERVED_CRITERION_IDS: &[&str] = &[
@@ -38,6 +42,22 @@ pub struct ActionSubmissionCriterion {
     pub value: String,
 }
 
+/// The identity extension's answer for a sharing criterion, resolved by the
+/// caller so evaluation stays pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharingAnswer {
+    NotShared,
+    Shared,
+    /// No target, no tenant, or an extension error: fails closed.
+    Unavailable,
+}
+
+/// For callers with no tenant (streaming transform apply): every sharing
+/// criterion is unavailable.
+pub fn no_sharing_answer(_criterion: &ActionSubmissionCriterion) -> SharingAnswer {
+    SharingAnswer::Unavailable
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CriterionDecision {
     Pass,
@@ -59,6 +79,13 @@ impl ActionSubmissionCriterion {
         }
         if self.criterion_id != criterion_id {
             return Err("criterion_id must not include surrounding whitespace".into());
+        }
+        if self.is_sharing() {
+            reject_unused_fields(self, true, false)?;
+            if self.property.chars().any(char::is_whitespace) {
+                return Err("criterion property must name a parameter".into());
+            }
+            return Ok(());
         }
         let predicate = self.predicate()?;
         predicate.validate()?;
@@ -91,12 +118,21 @@ impl ActionSubmissionCriterion {
                 })
             }
             other => Err(format!(
-                "unknown criterion kind {other:?}; allowed: {CRITERION_KIND_ALLOW_ALL}, {CRITERION_KIND_SUBJECT_EQUALS_PROPERTY}, {CRITERION_KIND_REQUIRED_SCOPE_EQUALS}, {CRITERION_KIND_PROPERTY_EQUALS}"
+                "unknown criterion kind {other:?}; allowed: {CRITERION_KIND_ALLOW_ALL}, {CRITERION_KIND_SUBJECT_EQUALS_PROPERTY}, {CRITERION_KIND_REQUIRED_SCOPE_EQUALS}, {CRITERION_KIND_PROPERTY_EQUALS}, {CRITERION_KIND_SHARES_NO_SPACE}"
             )),
         }
     }
 
+    /// A cross-tenant sharing criterion, answered by the identity extension
+    /// rather than an object-security predicate.
+    pub fn is_sharing(&self) -> bool {
+        self.kind.trim() == CRITERION_KIND_SHARES_NO_SPACE
+    }
+
     pub fn requires_object(&self) -> Result<bool, String> {
+        if self.is_sharing() {
+            return Ok(false);
+        }
         Ok(matches!(
             self.predicate()?,
             ObjectSecurityPredicate::SubjectEqualsProperty { .. }
@@ -179,14 +215,29 @@ pub fn invoker_context(
     context.normalized()
 }
 
+/// Evaluates criteria in order and stops at the first that does not pass.
+/// `sharing` answers each sharing criterion; callers without a tenant pass
+/// [`no_sharing_answer`].
 pub fn evaluate_submission_criteria(
     criteria: &[ActionSubmissionCriterion],
     object: Option<&Object>,
     policy: Option<&ObjectSecurityPolicy>,
     invoker: &PrincipalPolicyContext,
+    sharing: &dyn Fn(&ActionSubmissionCriterion) -> SharingAnswer,
 ) -> CriterionDecision {
     let invoker = invoker.clone().normalized();
     for criterion in criteria {
+        if criterion.is_sharing() {
+            match sharing(criterion) {
+                SharingAnswer::NotShared => continue,
+                SharingAnswer::Shared => {
+                    return CriterionDecision::Fail {
+                        criterion_id: criterion.criterion_id.clone(),
+                    };
+                }
+                SharingAnswer::Unavailable => return CriterionDecision::Unavailable,
+            }
+        }
         match evaluate_one(criterion, object, policy, &invoker) {
             CriterionDecision::Pass => {}
             other => return other,
@@ -336,6 +387,7 @@ mod tests {
             Some(&object_with("state", "draft")),
             None,
             &PrincipalPolicyContext::default(),
+            &no_sharing_answer,
         );
         assert_eq!(
             decision,
@@ -358,6 +410,7 @@ mod tests {
             Some(&object_with("secret", "no")),
             Some(&grants(&["state"])),
             &PrincipalPolicyContext::default(),
+            &no_sharing_answer,
         );
         assert_eq!(decision, CriterionDecision::Unavailable);
         assert!(!format!("{decision:?}").contains("secret"));
@@ -377,7 +430,7 @@ mod tests {
             scopes: vec!["action.operator".into()],
         };
         assert_eq!(
-            evaluate_submission_criteria(&[scoped], None, None, &invoker),
+            evaluate_submission_criteria(&[scoped], None, None, &invoker, &no_sharing_answer),
             CriterionDecision::Pass
         );
     }
@@ -394,5 +447,62 @@ mod tests {
         );
         let error = validate_submission_criteria(&[property], "", "").unwrap_err();
         assert!(error.contains("object_kind"), "{error}");
+    }
+
+    fn sharing(criterion_id: &str) -> ActionSubmissionCriterion {
+        ActionSubmissionCriterion {
+            criterion_id: criterion_id.into(),
+            kind: CRITERION_KIND_SHARES_NO_SPACE.into(),
+            property: "target_id".into(),
+            value: String::new(),
+        }
+    }
+
+    #[test]
+    fn sharing_criterion_names_a_parameter_and_needs_no_object() {
+        let criterion = sharing("not_allied");
+        criterion.validate().unwrap();
+        assert!(!criterion.requires_object().unwrap());
+        validate_submission_criteria(&[criterion], "", "").unwrap();
+        assert!(
+            ActionSubmissionCriterion {
+                property: String::new(),
+                ..sharing("x")
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ActionSubmissionCriterion {
+                value: "true".into(),
+                ..sharing("x")
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sharing_criterion_fails_while_shared_and_fails_closed_when_unknown() {
+        let criteria = [sharing("not_allied")];
+        let invoker = PrincipalPolicyContext::default();
+        let decide = |answer: SharingAnswer| {
+            evaluate_submission_criteria(&criteria, None, None, &invoker, &move |_| answer.clone())
+        };
+        assert_eq!(decide(SharingAnswer::NotShared), CriterionDecision::Pass);
+        assert_eq!(
+            decide(SharingAnswer::Shared),
+            CriterionDecision::Fail {
+                criterion_id: "not_allied".into()
+            }
+        );
+        assert_eq!(
+            decide(SharingAnswer::Unavailable),
+            CriterionDecision::Unavailable
+        );
+        assert_eq!(
+            evaluate_submission_criteria(&criteria, None, None, &invoker, &no_sharing_answer),
+            CriterionDecision::Unavailable
+        );
     }
 }

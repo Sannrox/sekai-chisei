@@ -2435,6 +2435,7 @@ message VerifyAttestationResponse {
 message ActionSubmissionCriterion {
   string criterion_id = 1;
   // allow_all | subject_equals_property | required_scope_equals | property_equals
+  // | actor_shares_no_space_with_target_owner
   string kind = 2;
   string property = 3;
   string value = 4;

@@ -8,7 +8,9 @@
 - Supersedes: none
 - Superseded by: none
 - Related: [ADR 0020](0020-shared-type-revisions-and-object-sync.md),
-  [ADR 0063](0063-object-action-describe-preview.md)
+  [ADR 0063](0063-object-action-describe-preview.md),
+  [ADR 0099](0099-shared-identity-and-tenancy.md)
+- Amended by: cross-tenant sharing predicate (#1860), below
 
 ## Context
 
@@ -34,6 +36,22 @@ additive type contract.
    failure does not rewrite the Action instance outcome.
 4. This ADR does not invent a webhook document family or a second submit
    RPC. Function-backed validation waits on #882.
+
+## Amendment 2026-10-28
+
+#1860 adds one closed predicate, `actor_shares_no_space_with_target_owner`.
+It passes only when the acting tenant and the target object's owning tenant
+share no approved space. Its `property` names a parameter holding the target
+object id. Core loads that object internally in any namespace, discloses
+nothing about it to the caller, and asks the installed identity extension
+(ADR 0099) with the acting tenant and the target's namespace. The extension
+resolves the owning tenant, since core keeps no namespace-to-tenant binding,
+and returns shared or unshared with that owner. With no extension the answer is
+unshared. The question is asked on every submit and decision, so a withdrawn
+space applies to the next one. An extension error, a missing target, or a
+caller with no tenant (streaming transform apply) fails closed as
+`unavailable`. The audit decision records the owning tenant. Preview names the
+failing criterion but never the space or the other tenant.
 
 ## Alternatives considered
 

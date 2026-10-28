@@ -58,6 +58,9 @@ pub struct ObjectActionPreviewRequest<'a> {
     pub expected_object_revision: &'a str,
     pub evidence_submission_ids: &'a [String],
     pub policy_context: Option<&'a PrincipalPolicyContext>,
+    /// The caller's tenant, for cross-tenant sharing criteria (#1860).
+    /// Empty where the caller has none.
+    pub acting_tenant: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +299,8 @@ fn admit_object_action(
         expected_object_updated_ms,
         expected_object_revision,
         policy_context,
+        parameters_json,
+        acting_tenant,
         ..
     } = request;
     let type_def = match load_object_bound_type(db, object, type_id, version) {
@@ -337,11 +342,26 @@ fn admit_object_action(
         Err(error) => return Err(ObjectActionProjectionError::Store(error)),
     };
     let invoker = invoker_context(actor, *policy_context);
+    // Preview asks the same question as submit but records nothing. The
+    // parameterless preflight before function fill has no target yet: it
+    // defers sharing, and the full preview admits again with parameters.
     match evaluate_submission_criteria(
         &type_def.submission_criteria,
         Some(bound_object),
         policy.as_ref(),
         &invoker,
+        &|criterion| {
+            if parameters_json.trim().is_empty() {
+                return crate::sekai::action_type_criteria::SharingAnswer::NotShared;
+            }
+            crate::sekai::action_instance_admission::resolve_sharing(
+                db,
+                acting_tenant,
+                parameters_json,
+                criterion,
+                None,
+            )
+        },
     ) {
         CriterionDecision::Pass => {}
         CriterionDecision::Fail { criterion_id } => {
@@ -659,6 +679,7 @@ mod tests {
                 expected_object_revision: &object_revision(&object),
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
@@ -722,6 +743,7 @@ mod tests {
                 expected_object_revision: &object_revision(&object),
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
@@ -771,6 +793,7 @@ mod tests {
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
@@ -790,6 +813,7 @@ mod tests {
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
@@ -814,6 +838,7 @@ mod tests {
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
@@ -832,6 +857,7 @@ mod tests {
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
@@ -850,6 +876,7 @@ mod tests {
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
@@ -871,6 +898,7 @@ mod tests {
             expected_object_revision: "",
             evidence_submission_ids: &[],
             policy_context: None,
+            acting_tenant: "",
         }
     }
 
@@ -911,6 +939,7 @@ mod tests {
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
@@ -971,12 +1000,65 @@ mod tests {
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();
         assert_eq!(preview.outcome, PREVIEW_INVALID);
         assert_eq!(preview.reason_code, "ready_for_review");
         assert_eq!(preview.failing_criterion, "ready_for_review");
+    }
+
+    /// The parameterless preflight defers a sharing criterion instead of
+    /// refusing every preview; the full preview applies it (#1860).
+    #[test]
+    fn preview_preflight_defers_sharing_until_parameters_exist() {
+        let (db, object) = setup();
+        let mut type_def = update_type();
+        type_def.version = "3".into();
+        type_def.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"target_id":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into();
+        type_def.submission_criteria = vec![
+            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+                criterion_id: "not_allied".into(),
+                kind: crate::sekai::action_type_criteria::CRITERION_KIND_SHARES_NO_SPACE.into(),
+                property: "target_id".into(),
+                value: String::new(),
+            },
+        ];
+        db.put_governed_action_type(type_def, "operator", 3)
+            .unwrap();
+        let request = |parameters_json| ObjectActionPreviewRequest {
+            actor: "alice",
+            object: &object,
+            type_id: "customer.record.update",
+            version: "3",
+            parameters_json,
+            expected_object_updated_ms: object.updated,
+            expected_object_revision: "",
+            evidence_submission_ids: &[],
+            policy_context: None,
+            acting_tenant: "",
+        };
+        let preflight = preview_object_action_admission(&db, None, request("")).unwrap();
+        assert_ne!(preflight.outcome, PREVIEW_UNAVAILABLE);
+        // No extension: the target's owner shares nothing, so it passes.
+        let full = preview_object_action(
+            &db,
+            None,
+            None,
+            request(r#"{"object_id":"cust-1","target_id":"cust-1"}"#),
+        )
+        .unwrap();
+        assert_eq!(full.outcome, PREVIEW_VALID, "{full:?}");
+        // A target that does not exist still fails closed.
+        let missing = preview_object_action(
+            &db,
+            None,
+            None,
+            request(r#"{"object_id":"cust-1","target_id":"nowhere"}"#),
+        )
+        .unwrap();
+        assert_eq!(missing.outcome, PREVIEW_UNAVAILABLE);
     }
 
     #[test]
@@ -1042,6 +1124,7 @@ mod tests {
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
                 policy_context: None,
+                acting_tenant: "",
             },
         )
         .unwrap();

@@ -88,7 +88,11 @@ are never copied into audit or receipt evidence.
 
 `submission_criteria` reuse the shipped object-security v1 predicate kinds
 (`allow_all`, `subject_equals_property`, `required_scope_equals`,
-`property_equals`). Object-property criteria require an update-bound type.
+`property_equals`), plus `actor_shares_no_space_with_target_owner` (ADR 0077
+amendment, #1860). That kind's `property` names a parameter holding a target
+object id in any namespace; it passes only when the acting tenant and the
+target's owning tenant share no approved space, as the identity extension
+answers on each submit. Object-property criteria require an update-bound type.
 Preview names the first failing visible criterion; submit rechecks live state
 and refuses with the same `criterion_id`. A criterion that names a hidden or
 ungranted property fails closed as `unavailable` and does not leak the

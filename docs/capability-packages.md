@@ -21,8 +21,15 @@ Closed member kinds are `change_set`, `action_type`, `ontology`, and
 (`pkg:feedback.evidence-finding/v1`, ADR 0095) certifies ontology, Action
 type, and evaluation members from `tests/fixtures/feedback/`. The security
 finding and exposure package (`pkg:security.finding-exposure/v1`, ADR 0135)
-certifies the same member kinds from `tests/fixtures/security/`. Neither
-packages live instances, and neither is a runtime grant.
+certifies the same member kinds from `tests/fixtures/security/`. Its
+dispositions (#1924) record a decision on an exposure (`accept-risk`,
+`false-positive`, `mitigated` or `fixed`) with the validity basis it relied
+on: dependency closure, release and configuration digests, reachable
+markings, advisory revision, and an optional expiry. Superseding records a
+new disposition and keeps the previous one with its receipt. Accepting risk
+on marked data needs the disposition marked at least as high as that data,
+so only a caller cleared for those markings can accept it. Neither package
+ships live instances, and neither is a runtime grant.
 
 ## Operator workflow
 
