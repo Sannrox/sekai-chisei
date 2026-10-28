@@ -79,12 +79,28 @@ impl CrossStoreAdmission {
         &SystemOneProposal
     }
 
+    /// The reservation step alone, as [`Self::admit`] runs it; tests drive it
+    /// directly to stop admission between its steps.
+    #[cfg(test)]
     pub(crate) fn reserve(
         &self,
         request: &ActionInstanceAdmissionRequest,
         actor: &str,
         now_ms: i64,
     ) -> Result<OperationReservation, ActionInstanceAdmissionError> {
+        self.try_reserve(request, actor, now_ms)?
+            .map_err(ActionInstanceAdmissionError::FailedPrecondition)
+    }
+
+    /// [`Self::reserve`], with a budget refusal kept apart from other errors so
+    /// [`Self::admit`] can record it: the inner error is the exhaustion
+    /// message. A refusal stores and charges nothing.
+    fn try_reserve(
+        &self,
+        request: &ActionInstanceAdmissionRequest,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<Result<OperationReservation, String>, ActionInstanceAdmissionError> {
         let namespace = request.namespace.trim();
         require_value("namespace", namespace)?;
         require_value("type_id", request.type_id.trim())?;
@@ -116,8 +132,37 @@ impl CrossStoreAdmission {
                 ));
             }
             if existing.status != RESERVATION_RELEASED {
-                return Ok(existing.clone());
+                return Ok(Ok(existing.clone()));
             }
+        }
+        // Sekai may already hold this operation as a denial recorded by a
+        // budget refusal (by the budget, or by policy first), which has no
+        // reservation; any other denial has a finalized one and returned
+        // above. Charge nothing and persist nothing: Sekai admission replays
+        // a matching retry, after which `repair_replayed` writes its receipt,
+        // and refuses a changed one. Admitted work is reserved as before
+        // (#1871).
+        if let Some(denied) = self
+            .sekai
+            .runtime()
+            .get_action_instance_by_operation_id(&operation_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .filter(|instance| instance.status == crate::sekai::action_instance::STATUS_DENIED)
+        {
+            return Ok(Ok(OperationReservation {
+                namespace: namespace.to_string(),
+                operation_id: operation_id.clone(),
+                request_digest: request_digest.clone(),
+                status: RESERVATION_FINALIZED.into(),
+                actor: actor.to_string(),
+                budget_subject: String::new(),
+                incurred_usage: 0,
+                sekai_instance_id: denied.instance_id,
+                sekai_status: denied.status,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                expires_at_ms: now_ms,
+            }));
         }
 
         // Charge the action type's budget scope, as combined admission does;
@@ -143,15 +188,19 @@ impl CrossStoreAdmission {
             } else {
                 operation_id.clone()
             };
-            budget
-                .check_and_reserve_idempotent(&budget_subject, 1, &budget_key)
-                .map_err(|error| {
-                    if error.contains("exceeded") || error.contains("budget") {
+            if let Err(error) = budget.check_and_reserve_idempotent(&budget_subject, 1, &budget_key)
+            {
+                // Only exhaustion is a refusal worth recording. Routing
+                // (home-site pins) and store failures stay retryable.
+                if !error.contains(BUDGET_EXHAUSTED) {
+                    return Err(if error.contains("exceeded") || error.contains("budget") {
                         ActionInstanceAdmissionError::FailedPrecondition(error)
                     } else {
                         ActionInstanceAdmissionError::Internal(error)
-                    }
-                })?;
+                    });
+                }
+                return Ok(Err(error));
+            }
         }
 
         let reservation = OperationReservation {
@@ -175,7 +224,43 @@ impl CrossStoreAdmission {
         if self.distinct_stores {
             self.write_decision_receipt(&stored, None, now_ms)?;
         }
-        Ok(stored)
+        Ok(Ok(stored))
+    }
+
+    /// Record a budget refusal as combined admission does: Sekai admission
+    /// stores the denied instance, its receipt and an
+    /// `action_instance_budget_denied` decision, never parks it, and charges
+    /// nothing. No Chisei reservation is written, so a concurrent attempt's
+    /// reservation is never overwritten; a retry adopts the recorded outcome
+    /// in [`Self::try_reserve`] and [`Self::repair_replayed`] writes its
+    /// receipt (#1871). The caller gets the budget refusal, as before,
+    /// unless another attempt committed the operation first.
+    fn record_budget_refusal(
+        &self,
+        mut request: ActionInstanceAdmissionRequest,
+        refusal: String,
+        actor: &str,
+        now_ms: i64,
+        tenant: &str,
+        machine_credential: bool,
+    ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        let refused = ActionInstanceAdmissionError::FailedPrecondition(refusal);
+        request.budget_already_reserved = true;
+        match ActionInstanceAdmission::new(self.sekai.runtime(), None)
+            .with_proposal(Some(self.proposal_port()))
+            .with_tenant(tenant)
+            .with_machine_credential(machine_credential)
+            .with_budget_refused(true)
+            .admit(request, actor, now_ms)
+        {
+            // Another attempt committed this operation first; answer it.
+            Ok(outcome) if outcome.replay => Ok(outcome),
+            // A store failure: the denial may not be recorded, so say so.
+            Err(error @ ActionInstanceAdmissionError::Internal(_)) => Err(error),
+            // Recorded as denied, or refused before recording (a freeze, a
+            // missing clearance): answer with the budget refusal.
+            _ => Err(refused),
+        }
     }
 
     pub(crate) fn submit_sekai(
@@ -316,7 +401,19 @@ impl CrossStoreAdmission {
             ActionInstanceAdmission::new(self.sekai.runtime(), self.budget_port())
                 .check_request(&request)?;
         }
-        let reserved = self.reserve(&request, actor, now_ms)?;
+        let reserved = match self.try_reserve(&request, actor, now_ms)? {
+            Ok(reserved) => reserved,
+            Err(refusal) => {
+                return self.record_budget_refusal(
+                    request,
+                    refusal,
+                    actor,
+                    now_ms,
+                    tenant,
+                    machine_credential,
+                );
+            }
+        };
         let outcome = match self.submit_sekai(request, actor, now_ms, tenant, machine_credential) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -338,8 +435,45 @@ impl CrossStoreAdmission {
             status: outcome.instance.status.clone(),
             marking: outcome.instance.marking.clone(),
         };
-        self.finalize(&reserved, Some(&commit), now_ms)?;
+        if reserved.is_pending() {
+            self.finalize(&reserved, Some(&commit), now_ms)?;
+        } else {
+            self.repair_replayed(&reserved, &commit, now_ms)?;
+        }
         Ok(outcome)
+    }
+
+    /// A replay reached a finalized or adopted reservation, and Sekai matched
+    /// the retry to its commit. On split stores, give a recorded budget
+    /// refusal its Chisei receipt. Only where no live reservation exists: a
+    /// live one, possibly a concurrent attempt's charge, keeps its row and
+    /// receipt. No reservation row is written, so none can be overwritten;
+    /// retries keep adopting the Sekai outcome without charging (#1871).
+    fn repair_replayed(
+        &self,
+        reserved: &OperationReservation,
+        commit: &SekaiCommitRef,
+        now_ms: i64,
+    ) -> Result<(), ActionInstanceAdmissionError> {
+        if !self.distinct_stores {
+            return Ok(());
+        }
+        let internal = ActionInstanceAdmissionError::Internal;
+        let live = self
+            .chisei
+            .get_operation_reservation(&reserved.namespace, &reserved.operation_id)
+            .map_err(internal)?
+            .is_some_and(|row| row.status != RESERVATION_RELEASED);
+        if live
+            || self
+                .chisei
+                .get_operation_receipt(&reserved.operation_id)
+                .map_err(internal)?
+                .is_some_and(|receipt| receipt_reflects(&receipt, reserved))
+        {
+            return Ok(());
+        }
+        self.write_decision_receipt(reserved, Some(&commit.marking), now_ms)
     }
 
     /// `marking` is the committed instance's (#1706); the receipt then needs
@@ -479,6 +613,24 @@ fn resolve_operation_id(request_id: &str) -> Result<String, ActionInstanceAdmiss
     Ok(request_id.to_string())
 }
 
+/// Whether a reservation receipt already records `reservation` as it stands:
+/// its status and Sekai instance. A receipt left by an earlier pending or
+/// released attempt does not (#1871).
+fn receipt_reflects(receipt: &OperationReceipt, reservation: &OperationReservation) -> bool {
+    receipt.events.iter().any(|event| {
+        event.attributes.get("reservation_status") == Some(&reservation.status)
+            && event
+                .attributes
+                .get("sekai_commit_instance_id")
+                .map_or(reservation.sekai_instance_id.is_empty(), |id| {
+                    id == &reservation.sekai_instance_id
+                })
+    })
+}
+
+/// How both budget stores word exhaustion (`budget exceeded at <scope>: ...`).
+const BUDGET_EXHAUSTED: &str = "budget exceeded at ";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +757,177 @@ mod tests {
             unscoped.budget_subject,
             "action:governed/project:acme/agent:alice"
         );
+    }
+
+    /// On split stores a budget refusal leaves the same trace as on the
+    /// combined layout: a denied decision naming the budget, with no usage
+    /// charged, and a retry replays it without charging (#1871).
+    #[test]
+    fn budget_refusal_is_recorded_like_other_refusals() {
+        let (sekai, chisei) = dest_pair();
+        seed_type(&sekai);
+        let budget = Arc::new(BudgetTracker::new(chisei.clone()));
+        budget
+            .set_limit("action:governed", 1, PeriodType::Daily)
+            .unwrap();
+        let clerk = CrossStoreAdmission::new(chisei, sekai, Some(budget.clone()));
+        let used = || budget.get_usage("action:governed").tokens_used;
+
+        let admitted = clerk
+            .admit(request("op-1"), "alice", 10, "", false)
+            .unwrap();
+        assert_eq!(admitted.instance.status, "admitted");
+        let refused = clerk
+            .admit(request("op-2"), "alice", 11, "", false)
+            .unwrap_err();
+        assert!(
+            matches!(refused, ActionInstanceAdmissionError::FailedPrecondition(_)),
+            "{refused:?}"
+        );
+        assert_eq!(used(), 1);
+
+        let decisions = clerk
+            .sekai
+            .runtime()
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("submit_action_instance".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let denied = decisions
+            .iter()
+            .find(|decision| decision.reason == "action_instance_budget_denied")
+            .unwrap_or_else(|| panic!("no budget denial in {decisions:?}"));
+        assert_eq!(denied.outcome, "denied");
+        assert!(
+            denied.evidence["deny_reason"].contains("action:governed/project:acme/agent:alice"),
+            "{denied:?}"
+        );
+
+        let _ = clerk.admit(request("op-2"), "alice", 12, "", false);
+        assert_eq!(used(), 1);
+    }
+
+    /// A budget failure that is not exhaustion, here a scope pinned to another
+    /// site, stays retryable: nothing is recorded or charged (#1871).
+    #[test]
+    fn a_budget_routing_failure_is_not_recorded_as_a_denial() {
+        let (sekai, chisei) = dest_pair();
+        seed_type(&sekai);
+        let budget = Arc::new(BudgetTracker::with_topology(
+            chisei.clone(),
+            crate::chisei::budget::BudgetTopologyConfig {
+                mode: crate::chisei::budget::BudgetTopologyMode::RegionalPinned,
+                site_id: "this-site".into(),
+                partition_simulated: false,
+            },
+        ));
+        budget
+            .set_limit_scoped(
+                "action:governed",
+                crate::db::chisei_budget::METRIC_TOKENS,
+                8,
+                PeriodType::Daily,
+                "another-site",
+                "",
+            )
+            .unwrap();
+        let clerk = CrossStoreAdmission::new(chisei, sekai, Some(budget));
+
+        let error = clerk
+            .admit(request("op-pinned"), "alice", 10, "", false)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("another-site"), "{error:?}");
+        assert!(
+            clerk
+                .sekai
+                .runtime()
+                .get_action_instance_by_operation_id("op-pinned")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            clerk
+                .chisei
+                .get_operation_reservation("acme", "op-pinned")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A budget refusal Sekai recorded before its reservation write was lost
+    /// is adopted on retry: replayed, and charged nothing (#1871).
+    #[test]
+    fn a_recorded_refusal_without_a_reservation_is_not_charged_on_retry() {
+        let (clerk, budget) = clerk_with_budget();
+        // An earlier attempt left a released reservation behind.
+        let earlier = clerk.reserve(&request("op-lost"), "alice", 5).unwrap();
+        clerk.release(&earlier, 6).unwrap();
+        let mut lost = request("op-lost");
+        lost.budget_already_reserved = true;
+        let recorded = ActionInstanceAdmission::new(clerk.sekai.runtime(), None)
+            .with_budget_refused(true)
+            .admit(lost, "alice", 10)
+            .unwrap();
+        assert_eq!(recorded.instance.status, "denied");
+
+        // A changed retry is refused and leaves nothing behind that would
+        // block the original.
+        let changed = ActionInstanceAdmissionRequest {
+            parameters_json: r#"{"runtime":"other"}"#.into(),
+            ..request("op-lost")
+        };
+        assert!(clerk.admit(changed, "alice", 11, "", false).is_err());
+        let retried = clerk
+            .admit(request("op-lost"), "alice", 12, "", false)
+            .unwrap();
+        assert!(retried.replay);
+        assert_eq!(retried.instance.instance_id, recorded.instance.instance_id);
+        assert_eq!(budget.get_usage("action:governed").tokens_used, 0);
+        // The retry wrote the refusal's receipt over the earlier attempt's
+        // stale one, and left the released row with nothing charged.
+        let receipt = clerk
+            .chisei
+            .get_operation_receipt("op-lost")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.events[0].attributes["reservation_status"],
+            RESERVATION_FINALIZED
+        );
+        assert_eq!(
+            receipt.events[0].attributes["sekai_commit_instance_id"],
+            recorded.instance.instance_id
+        );
+        let row = clerk
+            .chisei
+            .get_operation_reservation("acme", "op-lost")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, RESERVATION_RELEASED);
+        assert_eq!(row.incurred_usage, 0);
+    }
+
+    /// Only a denial is adopted without charge: admitted work whose
+    /// reservation was released is charged again on retry, as before (#1871).
+    #[test]
+    fn a_released_admission_is_charged_again_on_retry() {
+        let (clerk, budget) = clerk_with_budget();
+        let used = || budget.get_usage("action:governed").tokens_used;
+        let reserved = clerk.reserve(&request("op-late"), "alice", 5).unwrap();
+        let admitted = clerk
+            .submit_sekai(request("op-late"), "alice", 6, "", false)
+            .unwrap();
+        assert_eq!(admitted.instance.status, "admitted");
+        clerk.release(&reserved, 7).unwrap();
+        assert_eq!(used(), 0);
+
+        let replayed = clerk
+            .admit(request("op-late"), "alice", 8, "", false)
+            .unwrap();
+        assert!(replayed.replay);
+        assert_eq!(used(), 1);
     }
 
     #[test]

@@ -166,6 +166,7 @@ pub struct ActionInstanceAdmission<'a> {
     proposal: Option<&'a dyn ActionProposalPort>,
     tenant: &'a str,
     machine_credential: bool,
+    budget_refused: bool,
 }
 
 impl<'a> ActionInstanceAdmission<'a> {
@@ -176,7 +177,16 @@ impl<'a> ActionInstanceAdmission<'a> {
             proposal: None,
             tenant: "",
             machine_credential: false,
+            budget_refused: false,
         }
+    }
+
+    /// The budget was already refused, by a split-store reservation: record
+    /// this admission as a budget denial, never admitted or parked, and charge
+    /// nothing (#1871).
+    pub fn with_budget_refused(mut self, budget_refused: bool) -> Self {
+        self.budget_refused = budget_refused;
+        self
     }
 
     pub fn with_proposal(mut self, proposal: Option<&'a dyn ActionProposalPort>) -> Self {
@@ -584,6 +594,13 @@ impl<'a> ActionInstanceAdmission<'a> {
             && budget.check(&budget_subject, 1).is_err()
         {
             status = STATUS_DENIED.into();
+            deny_reason = format!("action budget exhausted for {budget_subject}");
+            budget_decision = "budget_exceeded".into();
+        }
+        // Parking would let an approver grant work whose budget is gone.
+        if self.budget_refused && status != STATUS_DENIED {
+            status = STATUS_DENIED.into();
+            parked_by_autonomy = false;
             deny_reason = format!("action budget exhausted for {budget_subject}");
             budget_decision = "budget_exceeded".into();
         }
@@ -4277,6 +4294,36 @@ mod tests {
             ActionInstanceAdmissionError::FailedPrecondition(_)
                 | ActionInstanceAdmissionError::PermissionDenied(_)
         ));
+    }
+
+    /// A budget already refused upstream is recorded as a budget denial even
+    /// where policy would park the Action: a parked instance would let an
+    /// approver grant work with no budget behind it (#1871).
+    #[test]
+    fn a_refused_budget_denies_instead_of_parking() {
+        let db = approval_setup("create", &["bob"]);
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-9","title":"t"}"#,
+        );
+        request.budget_already_reserved = true;
+        let denied = ActionInstanceAdmission::new(&db, None)
+            .with_budget_refused(true)
+            .admit(request, "alice", 10)
+            .unwrap()
+            .instance;
+        assert_eq!(denied.status, STATUS_DENIED);
+        assert_eq!(denied.budget_decision, "budget_exceeded");
+        assert!(
+            denied.deny_reason.contains("action budget exhausted"),
+            "{denied:?}"
+        );
+        assert!(
+            db.list_action_instances("acme", None, Some(STATUS_PARKED), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.get_object("rec-9").unwrap().is_none());
     }
 
     #[test]

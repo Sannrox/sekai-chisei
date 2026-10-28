@@ -501,9 +501,35 @@
           "action": {
             "type_id": "game.treasury.spend",
             "operation_id": "operation-TreasuryDrain-governed-2",
-            "instance": null,
-            "decision_record": null,
-            "receipt": null
+            "instance": {
+              "instance": "instance:TreasuryDrain-governed-2",
+              "status": "denied",
+              "deny_reason": "action budget exhausted for action:governed/project:game-treasury/agent:commander",
+              "policy_decision": "allow",
+              "budget_decision": "budget_exceeded"
+            },
+            "decision_record": {
+              "actor": "commander",
+              "action": "submit_action_instance",
+              "reason": "action_instance_budget_denied",
+              "outcome": "denied"
+            },
+            "receipt": {
+              "complete": false,
+              "missing_surfaces": [
+                "intent",
+                "outcome",
+                "policy",
+                "routing"
+              ],
+              "schema_version": "typed-hop/v1",
+              "events": {
+                "budget_decided": {
+                  "sekai_commit_instance_id": "instance:TreasuryDrain-governed-2",
+                  "sekai_commit_status": "denied"
+                }
+              }
+            }
           }
         },
         {
@@ -997,10 +1023,6 @@
     {
       "issue": "#1866",
       "gap": "Plan execution charges model use only to the flat user budget scope, so per-route and per-turn model spend is neither charged nor readable; routing savings are counterfactual prices."
-    },
-    {
-      "issue": "#1871",
-      "gap": "An Action submission refused by its Action budget leaves no instance, decision record or operation receipt; its audit row is empty."
     },
     {
       "issue": "#1872",
