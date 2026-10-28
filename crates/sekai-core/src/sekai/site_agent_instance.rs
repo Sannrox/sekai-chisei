@@ -11,7 +11,9 @@
 //! another namespace, and an `agent_member` that is not an agent member of
 //! it. An update re-checks only when the revision or member changes.
 //! SQLite is the reference store; PostgreSQL refuses instance writes until a
-//! parity slice (ADR 0136). Freeze, wakes and memory are later slices.
+//! parity slice (ADR 0136). Freezing (#1934) is its own pair of Actions: a
+//! frozen instance admits no new wake and no new Action submitted by its
+//! principal. Wakes and memory are later slices.
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
@@ -27,6 +29,11 @@ pub const CONTRACT: &str = "sekai.site-agent-instance/v1";
 pub const KIND: &str = "site_agent_instance";
 pub const ACTION_CREATE: &str = "site_agent.instance.create";
 pub const ACTION_UPDATE: &str = "site_agent.instance.update";
+pub const ACTION_FREEZE: &str = "site_agent.instance.freeze";
+pub const ACTION_UNFREEZE: &str = "site_agent.instance.unfreeze";
+/// `"true"` while the instance is frozen; set only by the freeze and
+/// unfreeze Actions (#1934).
+pub const FROZEN_PROPERTY: &str = "frozen";
 pub const ACTION_VERSION: &str = "1";
 
 /// `(name, required, description)` of each instance property.
@@ -67,6 +74,11 @@ pub fn install(db: &RuntimeDb, namespace: &str, actor: &str, now_ms: i64) -> Res
         description: "Site agent instance (sekai.site-agent-instance/v1)".into(),
         properties: PROPERTIES
             .iter()
+            .chain(&[(
+                FROZEN_PROPERTY,
+                false,
+                "\"true\" while frozen; set by the freeze and unfreeze Actions.",
+            )])
             .map(|(name, required, description)| PropertyDef {
                 name: (*name).into(),
                 prop_type: PropertyType::String,
@@ -119,22 +131,85 @@ pub fn install(db: &RuntimeDb, namespace: &str, actor: &str, now_ms: i64) -> Res
             "properties": properties,
             "required": required,
         });
-        db.put_governed_action_type(
-            GovernedActionType {
-                namespace: namespace.into(),
-                type_id: type_id.into(),
-                version: ACTION_VERSION.into(),
-                description: format!("{type_id}: write a {CONTRACT} instance"),
-                parameter_schema_json: schema.to_string(),
-                allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
-                object_kind: KIND.into(),
-                object_mutation: mutation.into(),
-                enabled: true,
-                ..Default::default()
+        put_action(db, namespace, type_id, mutation, schema, actor, now_ms)?;
+    }
+    // Freeze and unfreeze set only the flag; create and update never can.
+    for (type_id, frozen) in [(ACTION_FREEZE, "true"), (ACTION_UNFREEZE, "false")] {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "object_id": {"type": "string"},
+                FROZEN_PROPERTY: {"type": "string", "enum": [frozen]},
             },
+            "required": ["object_id", FROZEN_PROPERTY],
+        });
+        put_action(
+            db,
+            namespace,
+            type_id,
+            OBJECT_MUTATION_UPDATE,
+            schema,
             actor,
             now_ms,
         )?;
+    }
+    Ok(())
+}
+
+fn put_action(
+    db: &RuntimeDb,
+    namespace: &str,
+    type_id: &str,
+    mutation: &str,
+    schema: serde_json::Value,
+    actor: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    db.put_governed_action_type(
+        GovernedActionType {
+            namespace: namespace.into(),
+            type_id: type_id.into(),
+            version: ACTION_VERSION.into(),
+            description: format!("{type_id}: write a {CONTRACT} instance"),
+            parameter_schema_json: schema.to_string(),
+            allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+            object_kind: KIND.into(),
+            object_mutation: mutation.into(),
+            enabled: true,
+            ..Default::default()
+        },
+        actor,
+        now_ms,
+    )?;
+    Ok(())
+}
+
+/// The frozen instance in `namespace` whose principal is `principal`, if
+/// any. Action admission refuses that principal's new Actions while one is
+/// frozen, and wake admission (#1611) refuses the instance's wakes.
+pub fn frozen_instance_for(
+    db: &RuntimeDb,
+    namespace: &str,
+    principal: &str,
+) -> Result<Option<String>, String> {
+    if principal.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(db
+        .find_by_property(KIND, "principal_id", principal)?
+        .into_iter()
+        .find(|instance| {
+            instance.namespace == namespace
+                && instance.properties.get(FROZEN_PROPERTY).map(String::as_str) == Some("true")
+        })
+        .map(|instance| instance.id))
+}
+
+/// Refuse a wake of `instance` while it is frozen (#1934).
+pub fn require_not_frozen(instance: &Object) -> Result<(), String> {
+    if instance.properties.get(FROZEN_PROPERTY).map(String::as_str) == Some("true") {
+        return Err(format!("site agent instance {} is frozen", instance.id));
     }
     Ok(())
 }
@@ -280,6 +355,16 @@ mod tests {
         parameters: Value,
         key: &str,
     ) -> Result<String, ActionInstanceAdmissionError> {
+        admit_as(runtime, type_id, parameters, key, ACTOR).map(|instance| instance.operation_id)
+    }
+
+    fn admit_as(
+        runtime: &RuntimeDb,
+        type_id: &str,
+        parameters: Value,
+        key: &str,
+        actor: &str,
+    ) -> Result<crate::sekai::action_instance::ActionInstance, ActionInstanceAdmissionError> {
         ActionInstanceAdmission::new(runtime, None)
             .admit(
                 ActionInstanceAdmissionRequest {
@@ -302,10 +387,10 @@ mod tests {
                     offline: None,
                     expected_object_revision: String::new(),
                 },
-                ACTOR,
+                actor,
                 2_000,
             )
-            .map(|admitted| admitted.instance.operation_id)
+            .map(|admitted| admitted.instance)
     }
 
     fn instance(digest: &str, member: &str) -> Value {
@@ -385,5 +470,72 @@ mod tests {
             "rebind",
         ));
         assert!(message.contains("no current certification"), "{message}");
+    }
+
+    /// A frozen instance's principal is refused new Actions with a named,
+    /// recorded denial; other principals are not; unfreeze restores
+    /// admission (#1934).
+    #[test]
+    fn freezing_refuses_the_instance_principal_until_unfrozen() {
+        let runtime = RuntimeDb::memory();
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        let certified = published_revision(&runtime, "", true);
+        admit(
+            &runtime,
+            ACTION_CREATE,
+            instance(&certified, "triage"),
+            "create",
+        )
+        .unwrap();
+        let principal = "org:line-7-agent";
+        let touch = |key: &str, actor: &str| {
+            admit_as(
+                &runtime,
+                ACTION_UPDATE,
+                json!({"object_id": "line-7", "responsibility": format!("line:{key}")}),
+                key,
+                actor,
+            )
+            .unwrap()
+        };
+        assert_eq!(touch("before", principal).status, "admitted");
+
+        admit(
+            &runtime,
+            ACTION_FREEZE,
+            json!({"object_id": "line-7", "frozen": "true"}),
+            "freeze",
+        )
+        .unwrap();
+        assert!(require_not_frozen(&runtime.get_object("line-7").unwrap().unwrap()).is_err());
+        let refused = touch("frozen", principal);
+        assert_eq!(refused.status, "denied");
+        assert_eq!(refused.deny_reason, "site agent instance line-7 is frozen");
+        assert!(
+            runtime
+                .get_operation_receipt(&refused.operation_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(touch("other", ACTOR).status, "admitted");
+        // Create and update cannot set the flag; only the freeze pair can.
+        assert!(
+            admit(
+                &runtime,
+                ACTION_UPDATE,
+                json!({"object_id": "line-7", "frozen": "false"}),
+                "sneak",
+            )
+            .is_err()
+        );
+
+        admit(
+            &runtime,
+            ACTION_UNFREEZE,
+            json!({"object_id": "line-7", "frozen": "false"}),
+            "thaw",
+        )
+        .unwrap();
+        assert_eq!(touch("after", principal).status, "admitted");
     }
 }
