@@ -2160,6 +2160,13 @@ pub(super) async fn run_adhoc_governed_transform(
             "isolated-process ad-hoc runs are not available yet",
         ));
     }
+    // The analytical profile carries the input memory and time budgets that
+    // bound a reader-callable run before its output is checked.
+    if transform.analytical.is_none() {
+        return Err(Status::invalid_argument(
+            "ad-hoc runs need the analytical profile",
+        ));
+    }
     // Read limits per input; the run refuses a row with any other key.
     let column_allowlists =
         authorize_preview_inputs(service, &principals, tenant_context.as_ref(), &transform)?;

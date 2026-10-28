@@ -33690,13 +33690,8 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
                     contract_version: CONTRACT_VERSION.into(),
                     namespace: "ops".into(),
                     input_dataset_id: input.into(),
-                    steps: vec![TransformStep {
-                        kind: "project".into(),
-                        column: String::new(),
-                        op: String::new(),
-                        value: String::new(),
-                        columns: vec!["id".into()],
-                    }],
+                    profile: crate::sekai::governed_transform::ANALYTICAL_CLASS.into(),
+                    sql: "SELECT id FROM input".into(),
                     ..GovernedTransform::default()
                 }),
                 session_label: "explore".into(),
@@ -33770,6 +33765,34 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
     assert!(again.replayed);
     assert_eq!(again.run.unwrap().run_id, receipt.run_id);
 
+    let unbounded = svc
+        .run_ad_hoc_governed_transform(with_named_principal(
+            RunAdHocGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    input_dataset_id: "open-in".into(),
+                    steps: vec![TransformStep {
+                        kind: "project".into(),
+                        column: String::new(),
+                        op: String::new(),
+                        value: String::new(),
+                        columns: vec!["id".into()],
+                    }],
+                    ..GovernedTransform::default()
+                }),
+                session_label: "explore".into(),
+                idempotency_key: "k9".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unbounded.code(),
+        tonic::Code::InvalidArgument,
+        "a definition without execution budgets is refused"
+    );
     let denied = run("private-in", "k2").await.unwrap_err();
     assert_eq!(
         denied.code(),
