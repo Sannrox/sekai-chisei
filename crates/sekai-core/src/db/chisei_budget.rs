@@ -596,37 +596,7 @@ impl SekaiDb {
                 }
             }
         }
-        for scope in &chain {
-            let period_type = tx
-                .query_row(
-                    "SELECT period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
-                    params![scope, metric],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| "daily".to_string());
-            let period_start = period_start_ms(&period_type, now_ms);
-            // Relative update under Immediate txn (mirrors Postgres) so concurrent
-            // adjust/complete paths cannot lose usage via read-modify-write.
-            tx.execute(
-                "INSERT INTO chisei_budget_usage (scope_id, metric, period_start, amount_used)
-                 VALUES (?1, ?2, ?3, MAX(0, ?4))
-                 ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
-                    amount_used = MAX(0, amount_used + ?4)",
-                params![scope, metric, period_start, delta],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO chisei_budget_attributions
-                   (source_scope_id,applied_scope_id,metric,period_start,amount_used)
-                 VALUES (?1,?2,?3,?4,MAX(0,?5))
-                 ON CONFLICT(source_scope_id,applied_scope_id,metric,period_start)
-                 DO UPDATE SET amount_used=MAX(0,amount_used+?5)",
-                params![scope_id, scope, metric, period_start, delta],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        adjust_chain_tx(&tx, scope_id, metric, delta, now_ms)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -1298,6 +1268,51 @@ impl ChiseiBudgetBackend for SekaiDb {
 }
 impl ChiseiBudgetBackend for crate::db::postgres::PostgresDb {
     forward_budget!(crate::db::postgres::PostgresDb);
+}
+
+/// Add `delta` to `scope_id` and every ancestor's usage and attribution, in
+/// the caller's write transaction, so a caller can pair it atomically with
+/// another write, such as releasing a reservation (#1902).
+pub(crate) fn adjust_chain_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scope_id: &str,
+    metric: &str,
+    delta: i64,
+    now_ms: i64,
+) -> Result<(), String> {
+    let chain = scope_chain(scope_id);
+    for scope in &chain {
+        let period_type = tx
+            .query_row(
+                "SELECT period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
+                params![scope, metric],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "daily".to_string());
+        let period_start = period_start_ms(&period_type, now_ms);
+        // Relative update under Immediate txn (mirrors Postgres) so concurrent
+        // adjust/complete paths cannot lose usage via read-modify-write.
+        tx.execute(
+            "INSERT INTO chisei_budget_usage (scope_id, metric, period_start, amount_used)
+             VALUES (?1, ?2, ?3, MAX(0, ?4))
+             ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
+                amount_used = MAX(0, amount_used + ?4)",
+            params![scope, metric, period_start, delta],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO chisei_budget_attributions
+               (source_scope_id,applied_scope_id,metric,period_start,amount_used)
+             VALUES (?1,?2,?3,?4,MAX(0,?5))
+             ON CONFLICT(source_scope_id,applied_scope_id,metric,period_start)
+             DO UPDATE SET amount_used=MAX(0,amount_used+?5)",
+            params![scope_id, scope, metric, period_start, delta],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -162,6 +162,7 @@ impl CrossStoreAdmission {
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
                 expires_at_ms: now_ms,
+                charge_key: String::new(),
             }));
         }
 
@@ -179,16 +180,22 @@ impl CrossStoreAdmission {
                 }
             })?;
         let budget_subject = submit_budget_subject(namespace, actor, &type_def.budget_scope);
+        // The charge's key, recorded on the reservation so settlement finds
+        // the charge and refunds into its period (#1902). A reacquisition is
+        // keyed by the release it follows, which stays the same across
+        // retries until the row is rewritten.
+        let mut charge_key = String::new();
         if let Some(budget) = &self.budget {
-            let budget_key = if let Some(row) = existing
+            charge_key = match existing
                 .as_ref()
                 .filter(|row| row.status == RESERVATION_RELEASED)
             {
-                format!("{operation_id}:reacquire:{}", row.updated_at_ms)
-            } else {
-                operation_id.clone()
+                Some(row) => format!("{operation_id}:reacquire:{}", row.updated_at_ms),
+                None => operation_id.clone(),
             };
-            if let Err(error) = budget.check_and_reserve_idempotent(&budget_subject, 1, &budget_key)
+            let budget_key = &charge_key;
+            if let Err(error) =
+                budget.check_and_reserve_idempotent_at(&budget_subject, 1, budget_key, now_ms)
             {
                 // Only exhaustion is a refusal worth recording. Routing
                 // (home-site pins) and store failures stay retryable.
@@ -216,6 +223,7 @@ impl CrossStoreAdmission {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(self.reservation_ttl_ms),
+            charge_key,
         };
         let stored = self
             .chisei
@@ -317,22 +325,72 @@ impl CrossStoreAdmission {
         if !reservation.is_pending() {
             return Ok(reservation.clone());
         }
-        if reservation.incurred_usage > 0
-            && let Some(budget) = &self.budget
-        {
-            budget.adjust(
-                &reservation.budget_subject,
-                reservation.incurred_usage as i32,
-                0,
-            );
+        let next = OperationReservation {
+            status: RESERVATION_RELEASED.into(),
+            updated_at_ms: now_ms,
+            incurred_usage: 0,
+            ..reservation.clone()
+        };
+        self.settle(&next)
+    }
+
+    /// Store `next` for a pending reservation and refund its charge in one
+    /// store write, only while the row is pending: racing callers refund once,
+    /// and a crash leaves both writes or neither (#1902). The store refunds
+    /// into the budget period the charge was reserved in.
+    fn settle(
+        &self,
+        next: &OperationReservation,
+    ) -> Result<OperationReservation, ActionInstanceAdmissionError> {
+        let refund = self
+            .budget
+            .as_ref()
+            .map(|_| crate::db::chisei_budget::METRIC_TOKENS);
+        Ok(self
+            .chisei
+            .settle_pending_reservation(next, refund)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .unwrap_or_else(|| next.clone()))
+    }
+
+    /// A pending reservation whose operation Sekai committed as a budget
+    /// denial, recorded by a concurrent attempt after this one reserved. A
+    /// budget denial charges nothing: finalize the reservation with no usage,
+    /// refunding once however many callers race here, and record the
+    /// refusal's receipt (#1902).
+    fn settle_budget_denial(
+        &self,
+        reservation: &OperationReservation,
+        commit: &SekaiCommitRef,
+        now_ms: i64,
+    ) -> Result<OperationReservation, ActionInstanceAdmissionError> {
+        // Finalized, not released: retries replay the committed denial
+        // instead of being admitted afresh.
+        let settled = self.settle(&OperationReservation {
+            status: RESERVATION_FINALIZED.into(),
+            incurred_usage: 0,
+            sekai_instance_id: commit.instance_id.clone(),
+            sekai_status: commit.status.clone(),
+            updated_at_ms: now_ms,
+            ..reservation.clone()
+        })?;
+        if self.distinct_stores {
+            self.write_decision_receipt(&settled, Some(&commit.marking), now_ms)?;
         }
-        let mut next = reservation.clone();
-        next.status = RESERVATION_RELEASED.into();
-        next.updated_at_ms = now_ms;
-        next.incurred_usage = 0;
-        self.chisei
-            .put_operation_reservation(&next)
-            .map_err(ActionInstanceAdmissionError::Internal)
+        Ok(settled)
+    }
+
+    /// Whether Sekai committed `operation_id` as a budget denial.
+    fn committed_budget_denial(
+        &self,
+        operation_id: &str,
+    ) -> Result<bool, ActionInstanceAdmissionError> {
+        Ok(self
+            .sekai
+            .runtime()
+            .get_action_instance_by_operation_id(operation_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .is_some_and(|instance| instance.budget_decision == "budget_exceeded"))
     }
 
     pub(crate) fn reconcile_one(
@@ -348,6 +406,9 @@ impl CrossStoreAdmission {
             .lookup_commit(&reservation.operation_id)
             .map_err(ActionInstanceAdmissionError::Internal)
         {
+            Ok(Some(commit)) if self.committed_budget_denial(&reservation.operation_id)? => {
+                self.settle_budget_denial(reservation, &commit, now_ms)
+            }
             Ok(Some(commit)) => self.finalize(reservation, Some(&commit), now_ms),
             Ok(None) if now_ms >= reservation.expires_at_ms => self.release(reservation, now_ms),
             Ok(None) => Ok(reservation.clone()),
@@ -435,7 +496,9 @@ impl CrossStoreAdmission {
             status: outcome.instance.status.clone(),
             marking: outcome.instance.marking.clone(),
         };
-        if reserved.is_pending() {
+        if reserved.is_pending() && outcome.instance.budget_decision == "budget_exceeded" {
+            self.settle_budget_denial(&reserved, &commit, now_ms)?;
+        } else if reserved.is_pending() {
             self.finalize(&reserved, Some(&commit), now_ms)?;
         } else {
             self.repair_replayed(&reserved, &commit, now_ms)?;
@@ -638,6 +701,13 @@ mod tests {
     use crate::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType};
     use tempfile::tempdir;
 
+    /// A time `offset` ms after this test run began. Budget periods follow
+    /// the wall clock, so tests that refund a charge use real times.
+    fn at(offset: i64) -> i64 {
+        static START: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *START.get_or_init(|| chrono::Utc::now().timestamp_millis()) + offset
+    }
+
     fn dest_pair() -> (SekaiStore, ChiseiStore) {
         let dir = tempdir().unwrap();
         let sekai = dir.path().join("sekai.db");
@@ -742,17 +812,19 @@ mod tests {
             ..request(operation_id)
         };
 
-        let first = clerk.reserve(&payout("op-pay-1"), "alice", 10).unwrap();
+        let first = clerk.reserve(&payout("op-pay-1"), "alice", at(10)).unwrap();
         assert_eq!(
             first.budget_subject,
             "action:governed:treasury/project:acme/agent:alice"
         );
         assert!(matches!(
-            clerk.reserve(&payout("op-pay-2"), "alice", 11),
+            clerk.reserve(&payout("op-pay-2"), "alice", at(11)),
             Err(ActionInstanceAdmissionError::FailedPrecondition(_))
         ));
         // The namespace budget is still unspent.
-        let unscoped = clerk.reserve(&request("op-dispatch"), "alice", 12).unwrap();
+        let unscoped = clerk
+            .reserve(&request("op-dispatch"), "alice", at(12))
+            .unwrap();
         assert_eq!(
             unscoped.budget_subject,
             "action:governed/project:acme/agent:alice"
@@ -774,11 +846,11 @@ mod tests {
         let used = || budget.get_usage("action:governed").tokens_used;
 
         let admitted = clerk
-            .admit(request("op-1"), "alice", 10, "", false)
+            .admit(request("op-1"), "alice", at(10), "", false)
             .unwrap();
         assert_eq!(admitted.instance.status, "admitted");
         let refused = clerk
-            .admit(request("op-2"), "alice", 11, "", false)
+            .admit(request("op-2"), "alice", at(11), "", false)
             .unwrap_err();
         assert!(
             matches!(refused, ActionInstanceAdmissionError::FailedPrecondition(_)),
@@ -805,7 +877,7 @@ mod tests {
             "{denied:?}"
         );
 
-        let _ = clerk.admit(request("op-2"), "alice", 12, "", false);
+        let _ = clerk.admit(request("op-2"), "alice", at(12), "", false);
         assert_eq!(used(), 1);
     }
 
@@ -836,7 +908,7 @@ mod tests {
         let clerk = CrossStoreAdmission::new(chisei, sekai, Some(budget));
 
         let error = clerk
-            .admit(request("op-pinned"), "alice", 10, "", false)
+            .admit(request("op-pinned"), "alice", at(10), "", false)
             .unwrap_err();
         assert!(format!("{error:?}").contains("another-site"), "{error:?}");
         assert!(
@@ -862,13 +934,13 @@ mod tests {
     fn a_recorded_refusal_without_a_reservation_is_not_charged_on_retry() {
         let (clerk, budget) = clerk_with_budget();
         // An earlier attempt left a released reservation behind.
-        let earlier = clerk.reserve(&request("op-lost"), "alice", 5).unwrap();
-        clerk.release(&earlier, 6).unwrap();
+        let earlier = clerk.reserve(&request("op-lost"), "alice", at(5)).unwrap();
+        clerk.release(&earlier, at(6)).unwrap();
         let mut lost = request("op-lost");
         lost.budget_already_reserved = true;
         let recorded = ActionInstanceAdmission::new(clerk.sekai.runtime(), None)
             .with_budget_refused(true)
-            .admit(lost, "alice", 10)
+            .admit(lost, "alice", at(10))
             .unwrap();
         assert_eq!(recorded.instance.status, "denied");
 
@@ -878,9 +950,9 @@ mod tests {
             parameters_json: r#"{"runtime":"other"}"#.into(),
             ..request("op-lost")
         };
-        assert!(clerk.admit(changed, "alice", 11, "", false).is_err());
+        assert!(clerk.admit(changed, "alice", at(11), "", false).is_err());
         let retried = clerk
-            .admit(request("op-lost"), "alice", 12, "", false)
+            .admit(request("op-lost"), "alice", at(12), "", false)
             .unwrap();
         assert!(retried.replay);
         assert_eq!(retried.instance.instance_id, recorded.instance.instance_id);
@@ -915,25 +987,147 @@ mod tests {
     fn a_released_admission_is_charged_again_on_retry() {
         let (clerk, budget) = clerk_with_budget();
         let used = || budget.get_usage("action:governed").tokens_used;
-        let reserved = clerk.reserve(&request("op-late"), "alice", 5).unwrap();
+        let reserved = clerk.reserve(&request("op-late"), "alice", at(5)).unwrap();
         let admitted = clerk
-            .submit_sekai(request("op-late"), "alice", 6, "", false)
+            .submit_sekai(request("op-late"), "alice", at(6), "", false)
             .unwrap();
         assert_eq!(admitted.instance.status, "admitted");
-        clerk.release(&reserved, 7).unwrap();
+        clerk.release(&reserved, at(7)).unwrap();
         assert_eq!(used(), 0);
 
         let replayed = clerk
-            .admit(request("op-late"), "alice", 8, "", false)
+            .admit(request("op-late"), "alice", at(8), "", false)
             .unwrap();
         assert!(replayed.replay);
         assert_eq!(used(), 1);
     }
 
+    /// `op-race` reserved one unit, then a concurrent attempt recorded it as
+    /// a budget denial. Another operation's unit stays charged throughout, so
+    /// a double refund would show below it.
+    fn raced_budget_denial() -> (
+        CrossStoreAdmission,
+        Arc<BudgetTracker>,
+        OperationReservation,
+    ) {
+        let (clerk, budget) = clerk_with_budget();
+        clerk
+            .admit(request("op-other"), "alice", at(1), "", false)
+            .unwrap();
+        let reserved = clerk.reserve(&request("op-race"), "bob", at(5)).unwrap();
+        assert_eq!(budget.get_usage("action:governed").tokens_used, 2);
+        let mut refused = request("op-race");
+        refused.budget_already_reserved = true;
+        ActionInstanceAdmission::new(clerk.sekai.runtime(), None)
+            .with_budget_refused(true)
+            .admit(refused, "alice", at(6))
+            .unwrap();
+        (clerk, budget, reserved)
+    }
+
+    /// The attempt that reserved gets its charge back when it replays the
+    /// concurrent budget denial (#1902).
+    #[test]
+    fn replaying_a_concurrent_budget_denial_refunds_the_reservation() {
+        let (clerk, budget, _) = raced_budget_denial();
+        let replayed = clerk
+            .admit(request("op-race"), "bob", at(7), "", false)
+            .unwrap();
+        assert!(replayed.replay);
+        assert_eq!(budget.get_usage("action:governed").tokens_used, 1);
+        let row = clerk
+            .chisei
+            .get_operation_reservation("acme", "op-race")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, RESERVATION_FINALIZED);
+        assert_eq!(row.incurred_usage, 0);
+    }
+
+    /// A reacquired reservation records the release it follows, so replaying
+    /// a concurrent budget denial refunds its own charge (#1902).
+    #[test]
+    fn a_reacquired_reservation_refunds_its_own_charge() {
+        let (clerk, budget) = clerk_with_budget();
+        let used = || budget.get_usage("action:governed").tokens_used;
+        clerk
+            .admit(request("op-other"), "alice", at(1), "", false)
+            .unwrap();
+        let first = clerk.reserve(&request("op-again"), "bob", at(5)).unwrap();
+        clerk.release(&first, at(6)).unwrap();
+        assert_eq!(used(), 1);
+        let again = clerk.reserve(&request("op-again"), "bob", at(7)).unwrap();
+        assert_eq!(again.charge_key, format!("op-again:reacquire:{}", at(6)));
+        assert_eq!(used(), 2);
+        let mut refused = request("op-again");
+        refused.budget_already_reserved = true;
+        ActionInstanceAdmission::new(clerk.sekai.runtime(), None)
+            .with_budget_refused(true)
+            .admit(refused, "alice", at(8))
+            .unwrap();
+
+        let replayed = clerk
+            .admit(request("op-again"), "bob", at(9), "", false)
+            .unwrap();
+        assert!(replayed.replay);
+        assert_eq!(used(), 1);
+    }
+
+    /// A stale release of an earlier acquisition leaves a later one of the
+    /// same operation pending and charged (#1902).
+    #[test]
+    fn a_stale_release_does_not_settle_a_later_acquisition() {
+        let (clerk, budget) = clerk_with_budget();
+        let first = clerk.reserve(&request("op-gen"), "bob", at(5)).unwrap();
+        clerk.release(&first, at(6)).unwrap();
+        let again = clerk.reserve(&request("op-gen"), "bob", at(7)).unwrap();
+        assert_eq!(budget.get_usage("action:governed").tokens_used, 1);
+
+        clerk.release(&first, at(8)).unwrap();
+        let row = clerk
+            .chisei
+            .get_operation_reservation("acme", "op-gen")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, RESERVATION_PENDING);
+        assert_eq!(row.charge_key, again.charge_key);
+        assert_eq!(row.incurred_usage, 1);
+        assert_eq!(budget.get_usage("action:governed").tokens_used, 1);
+    }
+
+    /// Racing releases of one reservation refund it once (#1902).
+    #[test]
+    fn releasing_one_reservation_twice_refunds_once() {
+        let (clerk, budget, reserved) = raced_budget_denial();
+        std::thread::scope(|scope| {
+            for offset in [7, 8] {
+                let (clerk, reserved) = (&clerk, &reserved);
+                scope.spawn(move || clerk.release(reserved, at(offset)).unwrap());
+            }
+        });
+        assert_eq!(budget.get_usage("action:governed").tokens_used, 1);
+    }
+
+    /// Reconciliation that reaches the reservation first refunds it, and the
+    /// replay after it refunds nothing more (#1902).
+    #[test]
+    fn reconciliation_refunds_a_concurrent_budget_denial_once() {
+        let (clerk, budget, _) = raced_budget_denial();
+        clerk.reconcile_pending(at(7)).unwrap();
+        assert_eq!(budget.get_usage("action:governed").tokens_used, 1);
+        let replayed = clerk
+            .admit(request("op-race"), "bob", at(8), "", false)
+            .unwrap();
+        assert!(replayed.replay);
+        assert_eq!(budget.get_usage("action:governed").tokens_used, 1);
+    }
+
     #[test]
     fn crash_after_reserve_keeps_pending() {
         let (clerk, _) = clerk_with_budget();
-        let reserved = clerk.reserve(&request("op-reserve"), "alice", 10).unwrap();
+        let reserved = clerk
+            .reserve(&request("op-reserve"), "alice", at(10))
+            .unwrap();
         assert_eq!(reserved.status, RESERVATION_PENDING);
         assert!(
             clerk
@@ -943,7 +1137,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let again = clerk.reconcile_one(&reserved, 11).unwrap();
+        let again = clerk.reconcile_one(&reserved, at(11)).unwrap();
         assert_eq!(again.status, RESERVATION_PENDING);
     }
 
@@ -951,8 +1145,8 @@ mod tests {
     fn crash_after_commit_reconcile_finalizes() {
         let (clerk, _) = clerk_with_budget();
         let req = request("op-commit");
-        let _reserved = clerk.reserve(&req, "alice", 10).unwrap();
-        let outcome = clerk.submit_sekai(req, "alice", 11, "", false).unwrap();
+        let _reserved = clerk.reserve(&req, "alice", at(10)).unwrap();
+        let outcome = clerk.submit_sekai(req, "alice", at(11), "", false).unwrap();
         assert_eq!(outcome.instance.status, "admitted");
         let still = clerk
             .chisei
@@ -960,7 +1154,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(still.status, RESERVATION_PENDING);
-        let finalized = clerk.reconcile_one(&still, 12).unwrap();
+        let finalized = clerk.reconcile_one(&still, at(12)).unwrap();
         assert_eq!(finalized.status, RESERVATION_FINALIZED);
         assert_eq!(finalized.sekai_instance_id, outcome.instance.instance_id);
         assert_ne!(finalized.sekai_status, "rejected");
@@ -969,13 +1163,13 @@ mod tests {
     #[test]
     fn duplicate_identity_is_idempotent_and_digest_mismatch_fails_closed() {
         let (clerk, _) = clerk_with_budget();
-        let first = clerk.reserve(&request("op-dup"), "alice", 10).unwrap();
-        let replay = clerk.reserve(&request("op-dup"), "alice", 11).unwrap();
+        let first = clerk.reserve(&request("op-dup"), "alice", at(10)).unwrap();
+        let replay = clerk.reserve(&request("op-dup"), "alice", at(11)).unwrap();
         assert_eq!(first.request_digest, replay.request_digest);
         assert_eq!(replay.status, RESERVATION_PENDING);
         let mut conflict = request("op-dup");
         conflict.parameters_json = r#"{"runtime":"other"}"#.into();
-        let error = clerk.reserve(&conflict, "alice", 12).unwrap_err();
+        let error = clerk.reserve(&conflict, "alice", at(12)).unwrap_err();
         assert!(matches!(
             error,
             ActionInstanceAdmissionError::AlreadyExists(_)
@@ -990,7 +1184,9 @@ mod tests {
         let used_before = budget.get_usage("action:governed").tokens_used;
         let mut invalid = request("op-invalid");
         invalid.parameters_json = r#"{"runtime":7}"#.into();
-        let error = clerk.admit(invalid, "alice", 10, "", false).unwrap_err();
+        let error = clerk
+            .admit(invalid, "alice", at(10), "", false)
+            .unwrap_err();
         assert!(
             matches!(error, ActionInstanceAdmissionError::InvalidArgument(_)),
             "{error:?}"
@@ -1004,7 +1200,7 @@ mod tests {
                 .is_none()
         );
         clerk
-            .admit(request("op-valid"), "alice", 11, "", false)
+            .admit(request("op-valid"), "alice", at(11), "", false)
             .unwrap();
         assert_eq!(
             budget.get_usage("action:governed").tokens_used,
@@ -1029,7 +1225,7 @@ mod tests {
             .unwrap();
         let used_before = budget.get_usage("action:governed").tokens_used;
         let error = clerk
-            .admit(request("op-frozen"), "alice", 10, "", false)
+            .admit(request("op-frozen"), "alice", at(10), "", false)
             .unwrap_err();
         assert!(
             matches!(error, ActionInstanceAdmissionError::FailedPrecondition(reason) if reason.contains("write freeze"))
@@ -1063,7 +1259,7 @@ mod tests {
             })
             .unwrap();
         clerk
-            .admit(request("op-frozen"), "alice", 20, "", false)
+            .admit(request("op-frozen"), "alice", at(20), "", false)
             .unwrap();
         assert!(budget.get_usage("action:governed").tokens_used > used_before);
         assert_eq!(
@@ -1080,10 +1276,10 @@ mod tests {
     #[test]
     fn rejected_mutation_keeps_reserved_usage() {
         let (clerk, budget) = clerk_with_budget();
-        let reserved = clerk.reserve(&request("op-deny"), "alice", 10).unwrap();
+        let reserved = clerk.reserve(&request("op-deny"), "alice", at(10)).unwrap();
         let used_after_reserve = budget.get_usage("action:governed").tokens_used;
         assert!(used_after_reserve >= 1);
-        clerk.finalize(&reserved, None, 11).unwrap();
+        clerk.finalize(&reserved, None, at(11)).unwrap();
         assert_eq!(
             budget.get_usage("action:governed").tokens_used,
             used_after_reserve
@@ -1095,10 +1291,12 @@ mod tests {
         let (sekai, chisei) = dest_pair();
         seed_type(&sekai);
         let clerk = CrossStoreAdmission::new(chisei, sekai, None).with_reservation_ttl_ms(5);
-        let reserved = clerk.reserve(&request("op-timeout"), "alice", 10).unwrap();
-        let after = clerk.reconcile_one(&reserved, 12).unwrap();
+        let reserved = clerk
+            .reserve(&request("op-timeout"), "alice", at(10))
+            .unwrap();
+        let after = clerk.reconcile_one(&reserved, at(12)).unwrap();
         assert_eq!(after.status, RESERVATION_PENDING);
-        let released = clerk.reconcile_one(&reserved, 20).unwrap();
+        let released = clerk.reconcile_one(&reserved, at(20)).unwrap();
         assert_eq!(released.status, RESERVATION_RELEASED);
     }
 
@@ -1107,7 +1305,7 @@ mod tests {
         let (clerk, _) = clerk_with_budget();
         assert!(clerk.distinct_stores());
         let outcome = clerk
-            .admit(request("op-receipts"), "alice", 10, "", false)
+            .admit(request("op-receipts"), "alice", at(10), "", false)
             .unwrap();
         let chisei_receipt = clerk
             .chisei
@@ -1145,7 +1343,7 @@ mod tests {
         let clerk = CrossStoreAdmission::new(chisei, sekai, None);
         assert!(!clerk.distinct_stores());
         clerk
-            .admit(request("op-shared"), "alice", 10, "", false)
+            .admit(request("op-shared"), "alice", at(10), "", false)
             .unwrap();
         let receipt = clerk
             .chisei

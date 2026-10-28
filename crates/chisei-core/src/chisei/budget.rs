@@ -347,11 +347,23 @@ impl BudgetTracker {
         estimated: i32,
         idempotency_key: &str,
     ) -> Result<(), String> {
+        self.check_and_reserve_idempotent_at(scope_id, estimated, idempotency_key, now_ms())
+    }
+
+    /// [`Self::check_and_reserve_idempotent`] in the budget period of `now_ms`,
+    /// for a caller that records the charge's time to refund it later.
+    pub fn check_and_reserve_idempotent_at(
+        &self,
+        scope_id: &str,
+        estimated: i32,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
         self.db.budget_check_and_reserve_chain_for_site(
             scope_id,
             METRIC_TOKENS,
             i64::from(estimated),
-            now_ms(),
+            now_ms,
             Some(idempotency_key),
             self.require_home_pin(),
             self.local_site_id(),

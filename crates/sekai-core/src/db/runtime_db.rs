@@ -2410,6 +2410,19 @@ impl RuntimeDb {
         }
     }
 
+    pub fn settle_pending_reservation(
+        &self,
+        next: &OperationReservation,
+        refund_metric: Option<&str>,
+    ) -> Result<Option<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.settle_pending_reservation(next, refund_metric),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.settle_pending_reservation(next, refund_metric)
+            }),
+        }
+    }
+
     pub fn list_pending_operation_reservations(
         &self,
         limit: usize,
