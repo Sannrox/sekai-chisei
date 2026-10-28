@@ -775,7 +775,12 @@ fn guest_namespace_rpc(service: &str, method: &str) -> bool {
 fn enterprise_namespace_rpc(service: &str, method: &str) -> bool {
     let chisei = matches!(
         method,
-        "PlanExecution" | "ExecutePlanStream" | "PlanContentExecution" | "ExecuteContentPlanStream"
+        "PlanExecution"
+            | "ExecutePlanStream"
+            | "PlanContentExecution"
+            | "ExecuteContentPlanStream"
+            | "GetOperationReceipt"
+            | "GetQualityTrend"
     );
     let expected = if chisei {
         "chisei.ChiseiService"
@@ -889,6 +894,11 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExecutePlanStream"
             | "PlanContentExecution"
             | "ExecuteContentPlanStream"
+            // Admitted for tenant assertions (#1770): the trend authorizes the
+            // request's namespace, and a receipt outside the tenant's
+            // namespaces reads as not found.
+            | "GetOperationReceipt"
+            | "GetQualityTrend"
             | "ListSchemaTypes"
             | "ListGovernedTransforms"
             | "ListGovernedTransformRuns"
@@ -2607,6 +2617,15 @@ mod tests {
             "QueryObjectPolicyAudit",
         ] {
             assert!(enterprise_namespace_method(method), "{method}");
+        }
+        // #1770: Chisei reads, admitted only on their own service.
+        for method in ["GetOperationReceipt", "GetQualityTrend"] {
+            assert!(enterprise_namespace_rpc("chisei.ChiseiService", method));
+            assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
+            assert_eq!(
+                rpc_namespace_action(method),
+                crate::enterprise::NamespaceAction::Read
+            );
         }
         for method in [
             // ADR 0111: closing a proposal stays with unscoped credentials.

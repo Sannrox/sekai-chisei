@@ -27,6 +27,25 @@ checks the allowlist and the space actions, and
 `admitted_tenant_rpcs_refuse_another_tenants_namespace` checks the tenant
 refusal of each one, with a successful call on the tenant's own namespace.
 
+## Added in #1770
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `ChiseiService.GetQualityTrend` | request | read |
+| `ChiseiService.GetOperationReceipt` | stored receipt | read |
+
+Both authorize the namespace on the same tenant path as the Sekai
+namespace RPCs, so a service principal is also held to its current
+registration scope. `GetOperationReceipt` names no namespace, so the handler
+checks the stored receipt's namespace before answering. The receipt must
+also name the assertion's subject as its initiating actor; enterprise
+contexts get no administrative inspection and no request-alias lookup. A
+receipt outside the tenant's namespaces, one with no namespace, another
+principal's receipt, or a failed lookup returns the same `NOT_FOUND` as a
+missing id. `tenant_assertion_reads_only_its_own_receipts_and_quality_trend` and
+`service_principal_reads_follow_its_live_registration_scope` cover both RPCs
+through the token interceptor.
+
 ## Not available to tenant credentials
 
 `CloseDefinitionProposal` stays with unscoped credentials

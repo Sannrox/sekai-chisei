@@ -43,6 +43,11 @@ enterprise plans remain bound to the authenticated tenant (or to the
 credential for an unscoped enterprise context), in addition to the principal
 subject.
 
+`GetQualityTrend` and `GetOperationReceipt` accept enterprise contexts as
+namespace reads ([tenant assertion RPCs](tenant-assertion-rpcs.md)). A
+receipt whose stored namespace the context may not read answers `NOT_FOUND`,
+as a missing id does.
+
 ## Space roles and delegation
 
 A signed assertion may carry `space`, `space_role`, and `act`. Absent space

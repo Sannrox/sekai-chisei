@@ -799,7 +799,12 @@ impl SekaiDb {
     ) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        // IMMEDIATE takes the write lock up front: a deferred transaction that
+        // reads first fails at once with "database is locked" when it must
+        // upgrade while another connection writes, instead of waiting (#1851).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let existed = transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sekai_ontology_classes WHERE name = ?1)",
@@ -861,7 +866,12 @@ impl SekaiDb {
     ) -> Result<bool, String> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        // IMMEDIATE takes the write lock up front: a deferred transaction that
+        // reads first fails at once with "database is locked" when it must
+        // upgrade while another connection writes, instead of waiting (#1851).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let class_reference = transaction
             .query_row(
                 "SELECT name FROM sekai_ontology_classes
@@ -986,7 +996,12 @@ impl SekaiDb {
     ) -> Result<bool, String> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        // IMMEDIATE takes the write lock up front: a deferred transaction that
+        // reads first fails at once with "database is locked" when it must
+        // upgrade while another connection writes, instead of waiting (#1851).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let inverse_reference = transaction
             .query_row(
                 "SELECT name FROM sekai_ontology_relations
@@ -1414,6 +1429,38 @@ mod tests {
 
     fn registry_with(classes: &[&str]) -> OntologyRegistry {
         OntologyRegistry::from_parts(classes.iter().map(|name| class(name)).collect(), Vec::new())
+    }
+
+    /// A class upsert that starts while another connection holds the write
+    /// lock waits for it instead of failing with "database is locked" when
+    /// it would upgrade from a stale read (#1851).
+    #[test]
+    fn class_upsert_waits_for_a_concurrent_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SekaiDb::new(directory.path().join("ontology.db").to_str().unwrap()).unwrap();
+        db.upsert_ontology_class(&class("Seed")).unwrap();
+        let (locked, held) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut conn = db.conn();
+                let writer = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                writer
+                    .execute(
+                        "UPDATE sekai_ontology_classes SET description = 'held' WHERE name = 'Seed'",
+                        [],
+                    )
+                    .unwrap();
+                locked.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                writer.commit().unwrap();
+            });
+            held.recv().unwrap();
+            db.upsert_ontology_class_with_audit(&class("Person"), "admin")
+                .unwrap();
+        });
+        assert!(db.get_ontology_class("Person").unwrap().is_some());
     }
 
     #[test]
