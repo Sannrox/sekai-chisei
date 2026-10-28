@@ -23,6 +23,34 @@ pub struct BudgetTransferRecord {
     pub created_at: i64,
 }
 
+/// Metrics a budget usage read reports for each scope level.
+pub const BUDGET_METRICS: [&str; 2] = [METRIC_TOKENS, METRIC_REQUESTS];
+
+/// Period a scope without a limit charges its usage to. Enforcement uses the
+/// same default when it records usage at an unbounded level.
+pub const UNLIMITED_PERIOD_TYPE: &str = "daily";
+
+/// One scope level's usage for one metric in the current period of its limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetScopeUsage {
+    pub scope_id: String,
+    pub metric: String,
+    pub period_type: String,
+    /// Start of the current period, Unix milliseconds UTC.
+    pub period_start: i64,
+    pub used: i64,
+    /// `None` when the scope has no limit for the metric. A stored limit of
+    /// zero is a hard stop, not unlimited.
+    pub limit: Option<i64>,
+}
+
+impl BudgetScopeUsage {
+    /// Headroom left in the period, floored at zero. `None` when unlimited.
+    pub fn remaining(&self) -> Option<i64> {
+        self.limit.map(|limit| (limit - self.used).max(0))
+    }
+}
+
 /// Root of every budget scope chain. A bare `global` limit applies to every
 /// scope in the system; leaving it unset preserves today's "no limit = allow"
 /// behavior at that level.
@@ -885,6 +913,56 @@ impl SekaiDb {
         Ok((used, max_amount, period_type))
     }
 
+    /// Usage of every scope in the chain of `scope_id`, for each metric in
+    /// [`BUDGET_METRICS`], read in one transaction so the levels agree.
+    pub fn budget_usage_chain(
+        &self,
+        scope_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<BudgetScopeUsage>, String> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        let mut levels = Vec::new();
+        for scope in scope_chain(scope_id) {
+            for metric in BUDGET_METRICS {
+                let limit: Option<(i64, String)> = transaction
+                    .query_row(
+                        "SELECT max_amount, period_type FROM chisei_budget_limits
+                         WHERE scope_id=?1 AND metric=?2",
+                        params![scope, metric],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                let period_type = limit
+                    .as_ref()
+                    .map_or(UNLIMITED_PERIOD_TYPE, |(_, period)| period.as_str())
+                    .to_string();
+                let period_start = period_start_ms(&period_type, now_ms);
+                let used: i64 = transaction
+                    .query_row(
+                        "SELECT amount_used FROM chisei_budget_usage
+                         WHERE scope_id=?1 AND metric=?2 AND period_start=?3",
+                        params![scope, metric, period_start],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(0);
+                levels.push(BudgetScopeUsage {
+                    scope_id: scope.clone(),
+                    metric: metric.to_string(),
+                    period_type,
+                    period_start,
+                    used,
+                    limit: limit.map(|(max_amount, _)| max_amount),
+                });
+            }
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(levels)
+    }
+
     #[cfg(feature = "gateway-test-support")]
     #[doc(hidden)]
     pub fn gateway_test_budget_usage(
@@ -1130,6 +1208,11 @@ pub trait ChiseiBudgetBackend: Send + Sync {
         &self,
         scope_id: &str,
     ) -> Result<Vec<(String, String, i64, String)>, String>;
+    fn budget_usage_chain(
+        &self,
+        scope_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<BudgetScopeUsage>, String>;
 }
 
 macro_rules! forward_budget {
@@ -1199,6 +1282,13 @@ macro_rules! forward_budget {
             scope_id: &str,
         ) -> Result<Vec<(String, String, i64, String)>, String> {
             <$target>::budget_limits_for_scope(self, scope_id)
+        }
+        fn budget_usage_chain(
+            &self,
+            scope_id: &str,
+            now_ms: i64,
+        ) -> Result<Vec<BudgetScopeUsage>, String> {
+            <$target>::budget_usage_chain(self, scope_id, now_ms)
         }
     };
 }
