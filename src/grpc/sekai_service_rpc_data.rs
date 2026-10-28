@@ -4014,6 +4014,11 @@ fn to_proto_transform(
             .as_ref()
             .map(|spec| super::transform_placement_rpc::labels_to_proto(&spec.requires))
             .unwrap_or_default(),
+        code: transform
+            .isolated_process
+            .as_ref()
+            .map(|spec| spec.code.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -4066,7 +4071,18 @@ fn from_proto_isolated(
                 "requires applies only to the isolated_process profile",
             ));
         }
+        if !proto.code.is_empty() {
+            return Err(Status::invalid_argument(
+                "code applies only to the isolated_process profile",
+            ));
+        }
         return Ok(None);
+    }
+    // The engine needs something to run (#1605).
+    if proto.code.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "an isolated_process transform requires code for its engine",
+        ));
     }
     Ok(Some(
         crate::sekai::governed_transform::IsolatedProcessSpec {
@@ -4084,6 +4100,7 @@ fn from_proto_isolated(
                 "requires",
                 &proto.requires,
             )?,
+            code: proto.code.clone(),
         },
     ))
 }

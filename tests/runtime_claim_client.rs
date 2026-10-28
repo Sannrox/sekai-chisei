@@ -170,6 +170,9 @@ fn seed_dataset_rows(db: &RuntimeDb, dataset_id: &str, rows: &[HashMap<String, S
     }
 }
 
+/// The code the seeded isolated-process transform runs (#1605).
+const TRANSFORM_CODE: &str = "print('transform')";
+
 fn seed_transform(db: &RuntimeDb, prefix: &str, requires: &[(&str, &str)]) {
     db.ensure_team_namespace(NAMESPACE, PRINCIPAL, Role::Admin, PRINCIPAL)
         .unwrap();
@@ -210,6 +213,7 @@ fn seed_transform(db: &RuntimeDb, prefix: &str, requires: &[(&str, &str)]) {
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
+            code: TRANSFORM_CODE.into(),
         }),
         schedule: None,
         trigger: None,
@@ -342,6 +346,10 @@ async fn exercise_transform(db: RuntimeDb, prefix: &str) {
         ClaimAttempt::Claimed(claimed) => claimed,
         other => panic!("expected claimed transform, got {other:?}"),
     };
+    // The claimed transform carries the code the runner executes (#1605).
+    let transform = claimed.transform.as_ref().expect("claimed transform");
+    assert_eq!(transform.code, TRANSFORM_CODE);
+    assert_eq!(transform.engine, "python");
     let work = claimed.work.expect("claimed work");
     let fence = TransformFence::from_work(&work, "runner-a");
 

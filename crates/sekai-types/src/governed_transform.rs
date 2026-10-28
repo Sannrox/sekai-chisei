@@ -155,6 +155,11 @@ pub struct IsolatedProcessSpec {
     /// definitions written before placement existed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub requires: BTreeMap<String, String>,
+    /// The code `engine` runs, SQL or Python source (#1605). Required on a
+    /// new put; empty on definitions stored before it existed, which keep
+    /// their digest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,6 +563,12 @@ pub fn definition_digest(transform: &GovernedTransform) -> String {
         if let Ok(inputs) = serde_json::to_vec(&spec.inputs) {
             hasher.update((inputs.len() as u64).to_le_bytes());
             hasher.update(inputs);
+        }
+        // Hashed only when present, so definitions stored before code
+        // existed keep their digest (#1605).
+        if !spec.code.is_empty() {
+            hash_field(&mut hasher, "code");
+            hash_field(&mut hasher, &spec.code);
         }
         // Hashed only when present, so unconstrained definitions keep their
         // earlier digest and admitted runs stay valid.
