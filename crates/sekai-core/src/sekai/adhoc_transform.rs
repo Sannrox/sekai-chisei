@@ -143,40 +143,32 @@ pub struct AdHocRun {
     pub replayed: bool,
 }
 
-/// Runs the bound, prepared `transform` for `request`. A repeated identity
-/// returns its run; the same identity with another definition is refused.
+/// One ad-hoc submission: who asks, the bound and prepared definition, and
+/// the limits it runs under.
+#[derive(Clone, Copy)]
+pub struct AdHocSubmission<'a> {
+    pub request: &'a AdHocRequest,
+    pub transform: &'a GovernedTransform,
+    pub budget: &'a OutputBudget,
+    /// Per input dataset, the columns the caller may read.
+    pub column_allowlists: &'a HashMap<String, Vec<String>>,
+    pub expires_at_ms: i64,
+    pub tenant_id: &'a str,
+}
+
+/// Runs `submission`. A repeated identity returns its run; the same identity
+/// with another definition is refused.
 pub fn run(
     db: &RuntimeDb,
-    request: &AdHocRequest,
-    transform: &GovernedTransform,
-    budget: &OutputBudget,
-    column_allowlists: &HashMap<String, Vec<String>>,
-    expires_at_ms: i64,
-    tenant_id: &str,
+    submission: &AdHocSubmission<'_>,
     now_ms: i64,
 ) -> Result<AdHocRun, String> {
-    request.validate()?;
+    submission.request.validate()?;
     match db {
-        RuntimeDb::Sqlite(store) => store.run_adhoc_transform(
-            request,
-            transform,
-            budget,
-            column_allowlists,
-            expires_at_ms,
-            tenant_id,
-            now_ms,
-        ),
-        RuntimeDb::Postgres(store) => crate::db::postgres::off_runtime(|| {
-            store.run_adhoc_transform(
-                request,
-                transform,
-                budget,
-                column_allowlists,
-                expires_at_ms,
-                tenant_id,
-                now_ms,
-            )
-        }),
+        RuntimeDb::Sqlite(store) => store.run_adhoc_transform(submission, now_ms),
+        RuntimeDb::Postgres(store) => {
+            crate::db::postgres::off_runtime(|| store.run_adhoc_transform(submission, now_ms))
+        }
     }
 }
 
@@ -382,6 +374,31 @@ mod tests {
 
     /// Run, replay, conflicting definition, output budget and a session
     /// chain on one store (#1964).
+    #[allow(clippy::too_many_arguments)]
+    fn run_with(
+        db: &RuntimeDb,
+        request: &AdHocRequest,
+        transform: &GovernedTransform,
+        budget: &OutputBudget,
+        column_allowlists: &HashMap<String, Vec<String>>,
+        expires_at_ms: i64,
+        tenant_id: &str,
+        now_ms: i64,
+    ) -> Result<AdHocRun, String> {
+        run(
+            db,
+            &AdHocSubmission {
+                request,
+                transform,
+                budget,
+                column_allowlists,
+                expires_at_ms,
+                tenant_id,
+            },
+            now_ms,
+        )
+    }
+
     fn adhoc_contract(db: &RuntimeDb, ns: &str) {
         let input = format!("{ns}-in");
         db.create_dataset(&crate::sekai::dataset::Dataset {
@@ -413,7 +430,7 @@ mod tests {
 
         let first_request = ask("k1");
         let first_definition = bound(&first_request, filter(&input, "yes"));
-        let first = run(
+        let first = run_with(
             db,
             &first_request,
             &first_definition,
@@ -456,7 +473,7 @@ mod tests {
 
         let limited = ask("k5");
         assert_eq!(
-            run(
+            run_with(
                 db,
                 &limited,
                 &bound(&limited, filter(&input, "yes")),
@@ -476,7 +493,7 @@ mod tests {
                 .is_none()
         );
 
-        let again = run(
+        let again = run_with(
             db,
             &first_request,
             &first_definition,
@@ -490,7 +507,7 @@ mod tests {
         assert!(again.replayed);
         assert_eq!(again.run.run_id, first.run.run_id);
         assert_eq!(
-            run(
+            run_with(
                 db,
                 &first_request,
                 &bound(&first_request, filter(&input, "no")),
@@ -510,7 +527,7 @@ mod tests {
             max_bytes: 1_000,
         };
         assert_eq!(
-            run(
+            run_with(
                 db,
                 &tight,
                 &bound(&tight, filter(&input, "yes")),
@@ -531,7 +548,7 @@ mod tests {
 
         // A later run in the session reads the first output.
         let chained_request = ask("k3");
-        let chained = run(
+        let chained = run_with(
             db,
             &chained_request,
             &bound(&chained_request, filter(&first.scratch_dataset_id, "yes")),
@@ -571,7 +588,7 @@ mod tests {
         .unwrap();
         db.append_rows(&marked, &[row("9", "yes")]).unwrap();
         let marking_request = ask("k4");
-        let marked_run = run(
+        let marked_run = run_with(
             db,
             &marking_request,
             &bound(&marking_request, filter(&marked, "yes")),

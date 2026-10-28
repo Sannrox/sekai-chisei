@@ -164,14 +164,17 @@ impl PostgresDb {
     /// is serialized by an advisory lock.
     pub fn run_adhoc_transform(
         &self,
-        request: &crate::sekai::adhoc_transform::AdHocRequest,
-        transform: &GovernedTransform,
-        budget: &crate::sekai::adhoc_transform::OutputBudget,
-        column_allowlists: &HashMap<String, Vec<String>>,
-        expires_at_ms: i64,
-        tenant_id: &str,
+        submission: &crate::sekai::adhoc_transform::AdHocSubmission<'_>,
         now_ms: i64,
     ) -> Result<crate::sekai::adhoc_transform::AdHocRun, String> {
+        let crate::sekai::adhoc_transform::AdHocSubmission {
+            request,
+            transform,
+            budget,
+            column_allowlists,
+            expires_at_ms,
+            tenant_id,
+        } = *submission;
         use crate::sekai::adhoc_transform::{
             ADHOC_IDENTITY_CONFLICT, AdHocRun, TRANSFORM_TRIGGER_ADHOC, scratch_columns,
             scratch_grant, scratch_object,

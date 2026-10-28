@@ -2204,12 +2204,14 @@ pub(super) async fn run_adhoc_governed_transform(
     let now = now_millis();
     let outcome = match crate::sekai::adhoc_transform::run(
         service.db.runtime(),
-        &request,
-        &transform,
-        &OutputBudget::default(),
-        &column_allowlists,
-        now.saturating_add(DEFAULT_SCRATCH_RETENTION_MS),
-        owner_tenant,
+        &crate::sekai::adhoc_transform::AdHocSubmission {
+            request: &request,
+            transform: &transform,
+            budget: &OutputBudget::default(),
+            column_allowlists: &column_allowlists,
+            expires_at_ms: now.saturating_add(DEFAULT_SCRATCH_RETENTION_MS),
+            tenant_id: owner_tenant,
+        },
         now,
     ) {
         Ok(outcome) => outcome,
