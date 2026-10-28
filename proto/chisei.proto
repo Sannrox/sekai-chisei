@@ -974,8 +974,34 @@ message SetBudgetLimitRequest {
   // Optional metric selector to set a scoped budget for a specific metric.
   // Supported values: "tokens" (default) and "requests".
   string metric = 9;
+  // Unreleased work-unit default flags, moved to SetBudgetWorkUnitDefault.
+  reserved 10, 11;
+  reserved "work_unit_default", "clear";
 }
 message SetBudgetLimitResponse {}
+
+// Sets or clears a scope's default work-unit limit (#1862). Every
+// `work_unit:` scope directly under the resolved scope that has no limit of
+// its own for the metric gets this limit, and each work unit counts its own
+// usage against it in its own period; it is not a shared pool. An explicit
+// work-unit limit overrides it. The scope fields resolve as in
+// SetBudgetLimitRequest; a default has no work unit of its own.
+message SetBudgetWorkUnitDefaultRequest {
+  string subject = 1;
+  string project = 2;
+  string agent = 3;
+  string key_id = 4;
+  string user_id = 5;
+  // "tokens" (default) or "requests".
+  string metric = 6;
+  int32 max_amount = 7;
+  string period_type = 8;
+  // Removes the default for the metric instead of setting it; the scope's
+  // work units without their own limit are unlimited again. `max_amount`
+  // and `period_type` are ignored.
+  bool clear = 9;
+}
+message SetBudgetWorkUnitDefaultResponse {}
 
 // Reads budget usage for a scope. The scope fields resolve exactly as in
 // SetBudgetLimitRequest; an Action budget subject goes in `subject`.
@@ -1005,6 +1031,9 @@ message BudgetScopeUsage {
   int64 limit = 7;
   // `limit - used`, floored at zero.
   int64 remaining = 8;
+  // True when `limit` is the work-unit default its parent scope sets
+  // (#1862), not the level's own limit.
+  bool from_work_unit_default = 9;
 }
 message GetBudgetUsageResponse {
   // The resolved scope id.
@@ -1965,6 +1994,9 @@ service ChiseiService {
   // Read-only usage, limit and remainder per scope level; same authorization
   // as SetBudgetLimit.
   rpc GetBudgetUsage(GetBudgetUsageRequest) returns (GetBudgetUsageResponse);
+  // Sets or clears the default limit of a scope's work units (#1862).
+  // Authorized as SetBudgetLimit.
+  rpc SetBudgetWorkUnitDefault(SetBudgetWorkUnitDefaultRequest) returns (SetBudgetWorkUnitDefaultResponse);
   // Single fat decide for gateway PEP thinning (Issue #163).
   rpc DecideGatewayExecution(DecideGatewayExecutionRequest) returns (DecideGatewayExecutionResponse);
 

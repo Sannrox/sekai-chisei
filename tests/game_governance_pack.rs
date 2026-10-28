@@ -13,8 +13,8 @@ use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
     ActionClaimRef, BudgetScopeUsage, DecideGatewayExecutionRequest,
     DecideGatewayExecutionResponse, GetBudgetUsageRequest, GetBudgetUsageResponse,
-    RecordUsageRequest, SetBudgetLimitRequest, SetModelFamilyEnablementRequest,
-    SetNamespacePolicyRequest,
+    RecordUsageRequest, SetBudgetLimitRequest, SetBudgetWorkUnitDefaultRequest,
+    SetModelFamilyEnablementRequest, SetNamespacePolicyRequest,
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
@@ -614,7 +614,10 @@ impl RoutedGame {
             routing,
         };
         for budget in routed.budgets("day") {
-            routed.set_limit(&budget, "", "").await;
+            routed.set_day_limit(&budget).await;
+        }
+        for budget in routed.budgets("turn") {
+            routed.set_turn_default(&budget).await;
         }
         routed
     }
@@ -633,15 +636,12 @@ impl RoutedGame {
         self.routing["namespace"].as_str().unwrap().into()
     }
 
-    /// A day limit lands on the player's flat agent scope. A turn limit
-    /// lands on the turn's work unit under the routing namespace.
-    async fn set_limit(&self, budget: &Value, project: &str, turn: &str) {
+    /// A day limit lands on the player's flat agent scope.
+    async fn set_day_limit(&self, budget: &Value) {
         self.chisei
             .clone()
             .set_budget_limit(SetBudgetLimitRequest {
-                project: project.into(),
                 agent: PLAYER.into(),
-                work_unit: turn.into(),
                 metric: budget["metric"].as_str().unwrap().into(),
                 period_type: budget["period_type"].as_str().unwrap().into(),
                 max_tokens: budget["max"].as_i64().unwrap() as i32,
@@ -651,11 +651,21 @@ impl RoutedGame {
             .unwrap_or_else(|error| panic!("budget: {error}\n{}", self.game.server.logs()));
     }
 
-    /// Opens a turn: the turn limits apply to its work unit.
-    async fn open_turn(&self, turn: &str) {
-        for budget in self.budgets("turn") {
-            self.set_limit(&budget, &self.namespace(), turn).await;
-        }
+    /// A turn limit is the work-unit default of the player under the routing
+    /// namespace, so every turn gets its own budget without being set up.
+    async fn set_turn_default(&self, budget: &Value) {
+        self.chisei
+            .clone()
+            .set_budget_work_unit_default(SetBudgetWorkUnitDefaultRequest {
+                project: self.namespace(),
+                agent: PLAYER.into(),
+                metric: budget["metric"].as_str().unwrap().into(),
+                period_type: budget["period_type"].as_str().unwrap().into(),
+                max_amount: budget["max"].as_i64().unwrap() as i32,
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|error| panic!("turn default: {error}\n{}", self.game.server.logs()));
     }
 
     /// Asks for the expensive model, citing `claim` when the call serves
@@ -768,7 +778,6 @@ impl RoutedGame {
 #[tokio::test(flavor = "multi_thread")]
 async fn routine_decisions_route_local_and_only_claimed_high_impact_work_routes_expensive() {
     let game = RoutedGame::start().await;
-    game.open_turn("turn-1").await;
     let local = |decision: &DecideGatewayExecutionResponse| {
         decision.admitted
             && decision.resolved_runtime == "native"
@@ -812,7 +821,6 @@ async fn turn_budgets_cap_tokens_and_model_calls() {
     let game = RoutedGame::start().await;
 
     // Refused: turn 1's tokens and turn 2's model calls are spent.
-    game.open_turn("turn-1").await;
     game.spend("turn-1", "tokens", 4000).await;
     let tokens_out = game.decide("routine", "turn-1", 100, None, "").await;
     assert!(!tokens_out.admitted, "{tokens_out:?}");
@@ -821,14 +829,12 @@ async fn turn_budgets_cap_tokens_and_model_calls() {
         tokens_out.budget_scope.ends_with("work_unit:turn-1"),
         "{tokens_out:?}"
     );
-    game.open_turn("turn-2").await;
     game.spend("turn-2", "requests", 6).await;
     let calls_out = game.decide("routine", "turn-2", 100, None, "").await;
     assert!(!calls_out.admitted, "{calls_out:?}");
     assert_eq!(calls_out.deny_reason, "budget_denied");
 
-    // Allowed: the next turn opens with fresh turn budgets.
-    game.open_turn("turn-3").await;
+    // Allowed: the next turn starts with fresh turn budgets.
     let next = game.decide("routine", "turn-3", 100, None, "").await;
     assert!(next.admitted, "{next:?}");
 }
@@ -836,14 +842,12 @@ async fn turn_budgets_cap_tokens_and_model_calls() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exhausted_day_budget_is_a_hard_stop() {
     let game = RoutedGame::start().await;
-    game.open_turn("turn-1").await;
     let allowed = game.decide("routine", "turn-1", 100, None, "").await;
     assert!(allowed.admitted, "{allowed:?}");
 
     // Refused: once the day's tokens are spent, a fresh turn stops, for the
     // expensive model too, with no fallback to a local-free model.
     game.spend("turn-1", "tokens", 40_000).await;
-    game.open_turn("turn-2").await;
     let claim = game.claim_invasion("invade-day").await;
     for (label, claim) in [("routine", None), ("claimed", Some(claim))] {
         let stopped = game.decide(label, "turn-2", 100, claim, "").await;
@@ -877,7 +881,6 @@ fn level(
 #[tokio::test(flavor = "multi_thread")]
 async fn budget_usage_reads_model_spend_per_scope_level() {
     let game = RoutedGame::start().await;
-    game.open_turn("turn-1").await;
 
     // A decision charges nothing; settled usage does. The refused decision
     // asks for more than the turn has left and charges nothing either.
@@ -904,12 +907,20 @@ async fn budget_usage_reads_model_spend_per_scope_level() {
         .into_inner();
     let turn = format!("project:game/agent:{PLAYER}/work_unit:turn-1");
     assert_eq!(usage.scope_id, turn);
-    // Turn: the namespace's own work unit.
+    // Turn: the namespace's own work unit, capped by the player's default.
     assert_eq!(
         level(&usage, &turn, "tokens"),
         (3900, Some(4000), Some(100))
     );
     assert_eq!(level(&usage, &turn, "requests"), (1, Some(6), Some(5)));
+    let from_default = |scope: &str| {
+        usage
+            .levels
+            .iter()
+            .filter(|level| level.scope_id == scope)
+            .all(|level| level.from_work_unit_default)
+    };
+    assert!(from_default(&turn), "{usage:?}");
     // Day: the flat agent scope every turn charges.
     let day = format!("agent:{PLAYER}");
     assert_eq!(
@@ -917,6 +928,7 @@ async fn budget_usage_reads_model_spend_per_scope_level() {
         (3900, Some(40_000), Some(36_100))
     );
     assert_eq!(level(&usage, &day, "requests"), (1, Some(40), Some(39)));
+    assert!(!from_default(&day), "{usage:?}");
     // Project and agent-in-project have no limit but report their charge.
     assert_eq!(level(&usage, "project:game", "tokens"), (3900, None, None));
     assert_eq!(
@@ -945,8 +957,12 @@ async fn budget_usage_reads_model_spend_per_scope_level() {
         .find(|level| level["scope_id"] == turn.as_str() && level["metric"] == "tokens")
         .unwrap_or_else(|| panic!("{cli}"));
     assert_eq!(
-        (cli_turn["used"].as_i64(), cli_turn["remaining"].as_i64()),
-        (Some(3900), Some(100))
+        (
+            cli_turn["used"].as_i64(),
+            cli_turn["remaining"].as_i64(),
+            cli_turn["from_work_unit_default"].as_bool()
+        ),
+        (Some(3900), Some(100), Some(true))
     );
 
     // The player itself may not read its budget: the read is authorized like

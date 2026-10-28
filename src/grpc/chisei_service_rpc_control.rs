@@ -298,6 +298,30 @@ pub(super) async fn set_budget_limit(
         .map_err(Status::internal)?;
     Ok(Response::new(SetBudgetLimitResponse {}))
 }
+/// Sets or clears the default limit of a scope's work units (#1862). Its own
+/// RPC, so a server without work-unit defaults refuses it as unimplemented
+/// instead of applying the limit to the scope itself. Authorized like
+/// `SetBudgetLimit`.
+pub(super) async fn set_budget_work_unit_default(
+    service: &ChiseiServiceImpl,
+    req: Request<SetBudgetWorkUnitDefaultRequest>,
+) -> Result<Response<SetBudgetWorkUnitDefaultResponse>, Status> {
+    require_control_plane_admin(&req, "budget mutation")?;
+    let r = req.into_inner();
+    let metric = budget_metric(&r.metric)?;
+    let scope_id = budget_subject(&r.subject, &r.project, &r.agent, &r.key_id, "", &r.user_id)?;
+    if r.clear {
+        service.budget.clear_work_unit_default(&scope_id, metric)
+    } else {
+        let period = crate::chisei::budget::PeriodType::parse_strict(&r.period_type)
+            .map_err(Status::invalid_argument)?;
+        service
+            .budget
+            .set_work_unit_default(&scope_id, metric, r.max_amount, period)
+    }
+    .map_err(Status::internal)?;
+    Ok(Response::new(SetBudgetWorkUnitDefaultResponse {}))
+}
 /// Usage, limit and remainder of every level the scope's admission checks.
 /// Authorized like `SetBudgetLimit`: limits and spend of any scope are
 /// control-plane data.
@@ -322,6 +346,7 @@ pub(super) async fn get_budget_usage(
         .into_iter()
         .map(|level| BudgetScopeUsage {
             unlimited: level.limit.is_none(),
+            from_work_unit_default: level.from_work_unit_default,
             limit: level.limit.unwrap_or_default(),
             remaining: level.remaining().unwrap_or_default(),
             scope_id: level.scope_id,

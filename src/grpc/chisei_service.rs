@@ -701,6 +701,13 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_control::get_budget_usage(self, req).await
     }
 
+    async fn set_budget_work_unit_default(
+        &self,
+        req: Request<SetBudgetWorkUnitDefaultRequest>,
+    ) -> Result<Response<SetBudgetWorkUnitDefaultResponse>, Status> {
+        rpc_control::set_budget_work_unit_default(self, req).await
+    }
+
     async fn set_namespace_policy(
         &self,
         req: Request<SetNamespacePolicyRequest>,

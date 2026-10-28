@@ -1489,30 +1489,37 @@ impl SekaiDb {
                     .map_err(|e| e.to_string())? as i32;
             }
 
-            let matching_limit_rows = {
-                let mut stmt = tx
-                    .prepare("SELECT rowid, scope_id FROM chisei_budget_limits")
-                    .map_err(|e| e.to_string())?;
-                stmt.query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .filter_map(|(rowid, scope_id)| {
-                    principal_matches_subject(&scope_id, &request.subject_kind, &request.subject)
+            // A scope's own limits and the work-unit defaults it carries.
+            for table in ["chisei_budget_limits", "chisei_budget_work_unit_defaults"] {
+                let matching_limit_rows = {
+                    let mut stmt = tx
+                        .prepare(&format!("SELECT rowid, scope_id FROM {table}"))
+                        .map_err(|e| e.to_string())?;
+                    stmt.query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter_map(|(rowid, scope_id)| {
+                        principal_matches_subject(
+                            &scope_id,
+                            &request.subject_kind,
+                            &request.subject,
+                        )
                         .then_some(rowid)
-                })
-                .collect::<Vec<_>>()
-            };
-            for rowid in matching_limit_rows {
-                result.budget_records_deleted +=
-                    tx.execute(
-                        "DELETE FROM chisei_budget_limits WHERE rowid=?1",
-                        params![rowid],
-                    )
-                    .map_err(|e| e.to_string())? as i32;
+                    })
+                    .collect::<Vec<_>>()
+                };
+                for rowid in matching_limit_rows {
+                    result.budget_records_deleted +=
+                        tx.execute(
+                            &format!("DELETE FROM {table} WHERE rowid=?1"),
+                            params![rowid],
+                        )
+                        .map_err(|e| e.to_string())? as i32;
+                }
             }
         }
 
@@ -4634,7 +4641,12 @@ mod tests {
                    ('project:p/agent:erase-agent','tokens','project:p',100,'daily'),
                    ('project:p/agent:keep-agent','tokens','project:p',100,'daily'),
                    ('project:p','tokens','global',1000,'weekly'),
-                   ('global','tokens','',10000,'monthly');",
+                   ('global','tokens','',10000,'monthly');
+                 INSERT INTO chisei_budget_work_unit_defaults
+                   (scope_id,metric,max_amount,period_type)
+                 VALUES
+                   ('project:p/agent:erase-agent','tokens',10,'daily'),
+                   ('project:p/agent:keep-agent','tokens',10,'daily');",
             )
             .unwrap();
         }
@@ -4817,7 +4829,7 @@ mod tests {
 
         assert_eq!(result.llm_calls_deleted, 6);
         assert_eq!(result.task_observations_deleted, 5);
-        assert_eq!(result.budget_records_deleted, 11);
+        assert_eq!(result.budget_records_deleted, 12);
         assert_eq!(result.audit_tombstoned, 6);
         assert_eq!(result.object_changes_tombstoned, 5);
         assert_eq!(result.objects_deleted, 4);
@@ -4915,12 +4927,13 @@ mod tests {
             .query_row(
                 "SELECT
                    (SELECT COUNT(*) FROM chisei_budget_limits) +
-                   (SELECT COUNT(*) FROM chisei_budget_usage)",
+                   (SELECT COUNT(*) FROM chisei_budget_usage) +
+                   (SELECT COUNT(*) FROM chisei_budget_work_unit_defaults)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(remaining_budget_records, 8);
+        assert_eq!(remaining_budget_records, 9);
         let ancestor_budget_usage: i64 = db
             .conn()
             .query_row(

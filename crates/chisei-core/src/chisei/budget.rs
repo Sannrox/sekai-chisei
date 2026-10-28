@@ -280,6 +280,41 @@ impl BudgetTracker {
             )
     }
 
+    /// Sets the default limit of `scope_id`'s work units (#1862): every
+    /// `scope_id/work_unit:<id>` scope without a limit of its own for
+    /// `metric` is capped at `max_amount` per `period`, each work unit
+    /// counting its own usage. An explicit work-unit limit overrides it.
+    pub fn set_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i32,
+        period: PeriodType,
+    ) -> Result<(), String> {
+        let home = if self.require_home_pin() {
+            self.local_site_id()
+        } else {
+            ""
+        };
+        self.db
+            .budget_set_work_unit_default(
+                scope_id,
+                metric,
+                i64::from(max_amount),
+                period.as_str(),
+                home,
+            )
+            .inspect_err(
+                |err| tracing::error!(error = %err, scope_id, "failed to persist work-unit default"),
+            )
+    }
+
+    /// Removes `scope_id`'s work-unit default for `metric`; its work units
+    /// without a limit of their own are unlimited again.
+    pub fn clear_work_unit_default(&self, scope_id: &str, metric: &str) -> Result<(), String> {
+        self.db.budget_clear_work_unit_default(scope_id, metric)
+    }
+
     /// Declare a pooled combined ceiling for scopes sharing `pool_id`.
     pub fn set_pool_ceiling(
         &self,

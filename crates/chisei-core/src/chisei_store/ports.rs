@@ -112,6 +112,8 @@ chisei_store_trait! {
     pub trait ChiseiBudgetStore {
         fn budget_set_limit_scoped(&self, scope_id: &str, metric: &str, max_amount: i64, period_type: &str, home_site_id: &str, pool_id: &str) -> Result<(), String>;
         fn budget_set_pool_ceiling(&self, pool_id: &str, metric: &str, max_amount: i64, period_type: &str) -> Result<(), String>;
+        fn budget_set_work_unit_default(&self, scope_id: &str, metric: &str, max_amount: i64, period_type: &str, home_site_id: &str) -> Result<(), String>;
+        fn budget_clear_work_unit_default(&self, scope_id: &str, metric: &str) -> Result<(), String>;
         fn budget_check_chain_for_site(&self, scope_id: &str, metric: &str, amount: i64, now_ms: i64, require_home_pin: bool, local_site_id: &str, partition_simulated: bool) -> Result<(), String>;
         fn budget_check_and_reserve_chain_for_site(&self, scope_id: &str, metric: &str, amount: i64, now_ms: i64, idempotency_key: Option<&str>, require_home_pin: bool, local_site_id: &str, partition_simulated: bool) -> Result<(), String>;
         fn budget_adjust_chain_for_site(&self, scope_id: &str, metric: &str, delta: i64, now_ms: i64, require_home_pin: bool, local_site_id: &str) -> Result<(), String>;

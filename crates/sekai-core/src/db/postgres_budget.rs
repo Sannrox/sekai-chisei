@@ -1,8 +1,49 @@
 use crate::db::chisei_budget::{
-    BUDGET_METRICS, BudgetScopeUsage, BudgetTransferRecord, UNLIMITED_PERIOD_TYPE, parent_scope_id,
-    period_start_ms, scope_chain,
+    BUDGET_METRICS, BudgetScopeUsage, BudgetTransferRecord, EffectiveLimit, UNLIMITED_PERIOD_TYPE,
+    parent_scope_id, period_start_ms, scope_chain, work_unit_default_scope,
 };
 use crate::db::postgres::PostgresDb;
+use postgres::GenericClient;
+
+/// A scope's own limit, falling back to its parent's work-unit default
+/// (#1862), read in one statement. `$3` is NULL for a scope that is not a
+/// work unit, so the fallback never matches.
+fn effective_limit(
+    client: &mut impl GenericClient,
+    scope: &str,
+    metric: &str,
+) -> Result<Option<EffectiveLimit>, String> {
+    Ok(client
+        .query_opt(
+            "SELECT max_amount, period_type, home_site_id, 0
+             FROM chisei_budget_limits WHERE scope_id = $1 AND metric = $2
+             UNION ALL
+             SELECT max_amount, period_type, home_site_id, 1
+             FROM chisei_budget_work_unit_defaults WHERE scope_id = $3 AND metric = $2
+             ORDER BY 4 LIMIT 1",
+            &[&scope, &metric, &work_unit_default_scope(scope)],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| EffectiveLimit {
+            max_amount: row.get(0),
+            period_type: row.get(1),
+            home_site_id: row.get(2),
+            from_work_unit_default: row.get::<_, i32>(3) == 1,
+        }))
+}
+
+/// The period a scope's usage is charged to: its effective limit's, or the
+/// unlimited default.
+fn charge_period_type(
+    client: &mut impl GenericClient,
+    scope: &str,
+    metric: &str,
+) -> Result<String, String> {
+    Ok(effective_limit(client, scope, metric)?.map_or_else(
+        || UNLIMITED_PERIOD_TYPE.to_string(),
+        |limit| limit.period_type,
+    ))
+}
 
 impl PostgresDb {
     pub fn budget_limits_for_scope(
@@ -13,11 +54,21 @@ impl PostgresDb {
         let mut connection = self.connection()?;
         let mut limits = Vec::new();
         for scope in scopes {
+            // Own limits, plus the work-unit default for each metric the
+            // scope has no limit of its own for.
             let rows = connection
                 .query(
-                    "SELECT metric, max_amount, period_type FROM chisei_budget_limits
-                     WHERE scope_id = $1 ORDER BY metric",
-                    &[&scope],
+                    "SELECT metric, max_amount, period_type
+                     FROM chisei_budget_limits WHERE scope_id = $1
+                     UNION ALL
+                     SELECT metric, max_amount, period_type
+                     FROM chisei_budget_work_unit_defaults AS defaults
+                     WHERE defaults.scope_id = $2 AND NOT EXISTS (
+                       SELECT 1 FROM chisei_budget_limits AS own
+                       WHERE own.scope_id = $1 AND own.metric = defaults.metric
+                     )
+                     ORDER BY metric",
+                    &[&scope, &work_unit_default_scope(&scope)],
                 )
                 .map_err(|error| {
                     crate::db::postgres::missing_relation_or(error, "chisei_budget_limits")
@@ -86,6 +137,50 @@ impl PostgresDb {
             pg_enforce_pool_member_sum(&mut tx, pool_id, metric)?;
         }
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Sets the limit every `work_unit:` child of `scope_id` without a limit
+    /// of its own gets for `metric` (#1862).
+    pub fn budget_set_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+    ) -> Result<(), String> {
+        if max_amount < 0 {
+            return Err("budget max_amount must be non-negative".into());
+        }
+        self.connection()?
+            .execute(
+                "INSERT INTO chisei_budget_work_unit_defaults
+                    (scope_id, metric, max_amount, period_type, home_site_id)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT(scope_id, metric) DO UPDATE SET
+                    max_amount = excluded.max_amount,
+                    period_type = excluded.period_type,
+                    home_site_id = excluded.home_site_id",
+                &[&scope_id, &metric, &max_amount, &period_type, &home_site_id],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Removes `scope_id`'s work-unit default for `metric`. Removing an
+    /// unset default succeeds.
+    pub fn budget_clear_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "DELETE FROM chisei_budget_work_unit_defaults WHERE scope_id = $1 AND metric = $2",
+                &[&scope_id, &metric],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub fn budget_set_pool_ceiling(
@@ -239,18 +334,15 @@ impl PostgresDb {
         }
 
         for scope in &chain {
-            let limit = transaction
-                .query_opt(
-                    "SELECT max_amount, period_type, home_site_id
-                     FROM chisei_budget_limits
-                     WHERE scope_id = $1 AND metric = $2",
-                    &[&scope, &metric],
-                )
-                .map_err(|error| error.to_string())?;
-            let Some(limit) = limit else { continue };
-            let max_amount: i64 = limit.get(0);
-            let period_type: String = limit.get(1);
-            let home_site_id: String = limit.get(2);
+            let Some(EffectiveLimit {
+                max_amount,
+                period_type,
+                home_site_id,
+                ..
+            }) = effective_limit(&mut transaction, scope, metric)?
+            else {
+                continue;
+            };
             if require_home_pin {
                 pg_assert_home_pin(scope, &home_site_id, local_site_id)?;
             }
@@ -272,15 +364,7 @@ impl PostgresDb {
         }
 
         for scope in &chain {
-            let period_type = transaction
-                .query_opt(
-                    "SELECT period_type FROM chisei_budget_limits
-                     WHERE scope_id = $1 AND metric = $2",
-                    &[&scope, &metric],
-                )
-                .map_err(|error| error.to_string())?
-                .map(|row| row.get::<_, String>(0))
-                .unwrap_or_else(|| "daily".to_string());
+            let period_type = charge_period_type(&mut transaction, scope, metric)?;
             let period_start = period_start_ms(&period_type, now_ms);
             transaction
                 .execute(
@@ -332,17 +416,15 @@ impl PostgresDb {
         let chain = scope_chain(scope_id);
         let mut connection = self.connection()?;
         for scope in chain {
-            let limit = connection
-                .query_opt(
-                    "SELECT max_amount, period_type, home_site_id FROM chisei_budget_limits
-                     WHERE scope_id = $1 AND metric = $2",
-                    &[&scope, &metric],
-                )
-                .map_err(|error| error.to_string())?;
-            let Some(limit) = limit else { continue };
-            let max_amount: i64 = limit.get(0);
-            let period_type: String = limit.get(1);
-            let home_site_id: String = limit.get(2);
+            let Some(EffectiveLimit {
+                max_amount,
+                period_type,
+                home_site_id,
+                ..
+            }) = effective_limit(&mut *connection, &scope, metric)?
+            else {
+                continue;
+            };
             if require_home_pin {
                 pg_assert_home_pin(&scope, &home_site_id, local_site_id)?;
             }
@@ -374,16 +456,8 @@ impl PostgresDb {
         let chain = scope_chain(scope_id);
         let mut connection = self.connection()?;
         for scope in chain {
-            let home = connection
-                .query_opt(
-                    "SELECT home_site_id FROM chisei_budget_limits
-                     WHERE scope_id = $1 AND metric = $2",
-                    &[&scope, &metric],
-                )
-                .map_err(|error| error.to_string())?;
-            if let Some(row) = home {
-                let home_site_id: String = row.get(0);
-                pg_assert_home_pin(&scope, &home_site_id, local_site_id)?;
+            if let Some(limit) = effective_limit(&mut *connection, &scope, metric)? {
+                pg_assert_home_pin(&scope, &limit.home_site_id, local_site_id)?;
             }
         }
         Ok(())
@@ -483,15 +557,7 @@ impl PostgresDb {
             return Ok(false);
         }
         for scope in &chain {
-            let period_type = transaction
-                .query_opt(
-                    "SELECT period_type FROM chisei_budget_limits
-                     WHERE scope_id = $1 AND metric = $2",
-                    &[&scope, &metric],
-                )
-                .map_err(|error| error.to_string())?
-                .map(|row| row.get::<_, String>(0))
-                .unwrap_or_else(|| "daily".to_string());
+            let period_type = charge_period_type(&mut transaction, scope, metric)?;
             let period_start = period_start_ms(&period_type, now_ms);
             transaction
                 .execute(
@@ -528,16 +594,10 @@ impl PostgresDb {
         now_ms: i64,
     ) -> Result<(i64, i64, String), String> {
         let mut connection = self.connection()?;
-        let limit = connection
-            .query_opt(
-                "SELECT max_amount, period_type FROM chisei_budget_limits
-                 WHERE scope_id = $1 AND metric = $2",
-                &[&scope_id, &metric],
-            )
-            .map_err(|error| error.to_string())?;
-        let (max_amount, period_type) = limit
-            .map(|row| (row.get(0), row.get(1)))
-            .unwrap_or((0_i64, "daily".to_string()));
+        let (max_amount, period_type) = effective_limit(&mut *connection, scope_id, metric)?
+            .map_or((0, UNLIMITED_PERIOD_TYPE.to_string()), |limit| {
+                (limit.max_amount, limit.period_type)
+            });
         let period_start = period_start_ms(&period_type, now_ms);
         let used = connection
             .query_opt(
@@ -568,17 +628,10 @@ impl PostgresDb {
         let mut levels = Vec::new();
         for scope in scope_chain(scope_id) {
             for metric in BUDGET_METRICS {
-                let limit: Option<(i64, String)> = transaction
-                    .query_opt(
-                        "SELECT max_amount, period_type FROM chisei_budget_limits
-                         WHERE scope_id = $1 AND metric = $2",
-                        &[&scope, &metric],
-                    )
-                    .map_err(|error| error.to_string())?
-                    .map(|row| (row.get(0), row.get(1)));
+                let limit = effective_limit(&mut transaction, &scope, metric)?;
                 let period_type = limit
                     .as_ref()
-                    .map_or(UNLIMITED_PERIOD_TYPE, |(_, period)| period.as_str())
+                    .map_or(UNLIMITED_PERIOD_TYPE, |limit| limit.period_type.as_str())
                     .to_string();
                 let period_start = period_start_ms(&period_type, now_ms);
                 let used = transaction
@@ -596,7 +649,10 @@ impl PostgresDb {
                     period_type,
                     period_start,
                     used,
-                    limit: limit.map(|(max_amount, _)| max_amount),
+                    from_work_unit_default: limit
+                        .as_ref()
+                        .is_some_and(|limit| limit.from_work_unit_default),
+                    limit: limit.map(|limit| limit.max_amount),
                 });
             }
         }
@@ -986,15 +1042,7 @@ pub(crate) fn adjust_chain_tx(
             .map_err(|error| format!("lock budget scope {scope}: {error}"))?;
     }
     for scope in &chain {
-        let period_type = transaction
-            .query_opt(
-                "SELECT period_type FROM chisei_budget_limits
-                 WHERE scope_id = $1 AND metric = $2",
-                &[&scope, &metric],
-            )
-            .map_err(|error| error.to_string())?
-            .map(|row| row.get::<_, String>(0))
-            .unwrap_or_else(|| "daily".to_string());
+        let period_type = charge_period_type(transaction, scope, metric)?;
         let period_start = period_start_ms(&period_type, now_ms);
         transaction
             .execute(
