@@ -143,6 +143,13 @@ pub struct AdmissionLease {
     /// (#1931).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_object_digest: Option<String>,
+    /// Set true once the decision record, budget charge and effects that
+    /// follow the receipt are all recorded (#1943). A replay that finds a
+    /// receipt with this still false finishes them; each is idempotent.
+    /// `None` on a lease an older binary wrote: its follow-ups are not
+    /// idempotent, so they are never resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_ups_recorded: Option<bool>,
 }
 
 /// Wall-clock milliseconds. Leases run on the wall clock, not on the
@@ -167,6 +174,7 @@ impl AdmissionLease {
             write_committed: self.write_committed,
             receipt_recorded: self.receipt_recorded,
             written_object_digest: self.written_object_digest.clone(),
+            follow_ups_recorded: self.follow_ups_recorded,
         }
     }
 
@@ -184,6 +192,7 @@ impl AdmissionLease {
             write_committed: Some(false),
             receipt_recorded: Some(false),
             written_object_digest: None,
+            follow_ups_recorded: Some(false),
         }
     }
 
@@ -1070,6 +1079,22 @@ impl SekaiDb {
         Ok(updated == 1)
     }
 
+    /// Marks the admission's follow-ups recorded (#1943). Idempotent, and
+    /// unfenced: whoever finished them may say so.
+    pub fn mark_admission_follow_ups_recorded(&self, instance_id: &str) -> Result<(), String> {
+        self.migrate_action_instances()?;
+        self.conn()
+            .execute(
+                "UPDATE sekai_action_instances
+                 SET body_json = json_set(body_json, '$.admission_lease.follow_ups_recorded', json('true'))
+                 WHERE instance_id = ?1
+                   AND json_extract(body_json, '$.admission_lease.follow_ups_recorded') = 0",
+                params![instance_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// Deletes the reservation only while `lease` still names its owner and
     /// generation, so a stale owner's compensation cannot remove a newer
     /// owner's row. Expiry is not checked: an owner may always clean up.
@@ -1280,6 +1305,7 @@ mod tests {
             write_committed: Some(false),
             receipt_recorded: Some(false),
             written_object_digest: None,
+            follow_ups_recorded: Some(false),
         };
         current_instance.admission_lease = Some(current.clone());
         db.delete_action_instance(&instance_id).unwrap();
@@ -1484,6 +1510,7 @@ mod tests {
             write_committed: Some(false),
             receipt_recorded: Some(false),
             written_object_digest: None,
+            follow_ups_recorded: Some(false),
         };
         assert!(lease.holds(Some("a"), Some(2), Some(1_000), None));
         assert!(!lease.holds(Some("b"), Some(2), Some(1_000), None));

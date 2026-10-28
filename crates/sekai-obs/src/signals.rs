@@ -269,9 +269,14 @@ pub struct TransformPoolGauge {
 /// recorder, which keeps every series it has seen: a pool that is gone from
 /// the store is absent from the next scrape, and the output is a function of
 /// the snapshot alone, identical on every plane reading the same store.
-/// `pool` values must already be bounded, non-identifying labels.
-pub fn render_transform_work_depth(profile: &str, pools: Vec<TransformPoolGauge>) -> String {
-    let pools = fold_transform_pools(pools);
+/// `pool` values must already be bounded, non-identifying labels. Each
+/// profile (the isolated-process transform queue, the `agent-turn` queue of
+/// ADR 0137) renders under one HELP and TYPE header per family.
+pub fn render_transform_work_depth(profiles: Vec<(&str, Vec<TransformPoolGauge>)>) -> String {
+    let profiles: Vec<_> = profiles
+        .into_iter()
+        .map(|(profile, pools)| (profile, fold_transform_pools(pools)))
+        .collect();
     let mut out = String::new();
     for (name, help, value) in [
         (
@@ -291,12 +296,14 @@ pub fn render_transform_work_depth(profile: &str, pools: Vec<TransformPoolGauge>
         ),
     ] {
         out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
-        for gauge in &pools {
-            out.push_str(&format!(
-                "{name}{{profile=\"{profile}\",pool=\"{}\"}} {}\n",
-                gauge.pool,
-                value(gauge)
-            ));
+        for (profile, pools) in &profiles {
+            for gauge in pools {
+                out.push_str(&format!(
+                    "{name}{{profile=\"{profile}\",pool=\"{}\"}} {}\n",
+                    gauge.pool,
+                    value(gauge)
+                ));
+            }
         }
     }
     out
@@ -388,11 +395,11 @@ mod tests {
             .collect();
         let mut reversed = pools.clone();
         reversed.reverse();
-        let rendered = render_transform_work_depth("isolated_process", pools);
+        let rendered = render_transform_work_depth(vec![("isolated_process", pools)]);
         // Two refreshers seeing one store state in any order render the same.
         assert_eq!(
             rendered,
-            render_transform_work_depth("isolated_process", reversed)
+            render_transform_work_depth(vec![("isolated_process", reversed)])
         );
         let series = |pool: &str| {
             rendered
@@ -413,8 +420,10 @@ mod tests {
         assert!(rendered.contains(&format!(
             r#"{TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE}{{profile="isolated_process",pool="other"}} 34"#
         )));
-        let small =
-            render_transform_work_depth("isolated_process", vec![depth("default".into(), 1)]);
+        let small = render_transform_work_depth(vec![(
+            "isolated_process",
+            vec![depth("default".into(), 1)],
+        )]);
         assert!(!small.contains("pool=\"other\""));
     }
 

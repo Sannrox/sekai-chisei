@@ -826,6 +826,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "PublishFederatedAggregateAllowance"
             | "WithdrawFederatedAggregateAllowance"
             | "GetFederatedAggregateAllowance"
+            // Manual agent wakes (#1950): namespace admin per call.
+            | "WakeSiteAgentInstance"
             | "ExportObjectSet"
             | "ExportDatasetVersion"
             | "GetExportReceipt"

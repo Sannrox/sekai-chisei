@@ -2908,6 +2908,41 @@ impl RuntimeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn budget_record_idempotent_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_record_idempotent_for_site(
+                scope_id,
+                metric,
+                amount,
+                idempotency_key,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.budget_record_idempotent_for_site(
+                    scope_id,
+                    metric,
+                    amount,
+                    idempotency_key,
+                    now_ms,
+                    require_home_pin,
+                    local_site_id,
+                )
+            }),
+        }
+    }
+
     pub fn budget_record_idempotent(
         &self,
         scope_id: &str,
@@ -4706,6 +4741,15 @@ impl RuntimeDb {
         }
     }
 
+    pub fn mark_admission_follow_ups_recorded(&self, instance_id: &str) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.mark_admission_follow_ups_recorded(instance_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.mark_admission_follow_ups_recorded(instance_id)
+            }),
+        }
+    }
+
     pub fn release_admission(
         &self,
         instance_id: &str,
@@ -4816,6 +4860,20 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.put_action_effects(effects),
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.put_action_effects(effects))
+            }
+        }
+    }
+
+    /// Inserts the effects not already stored, by effect id, leaving stored
+    /// ones as they are (#1943).
+    pub fn put_missing_action_effects(
+        &self,
+        effects: &[crate::sekai::action_effect::ActionEffect],
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_missing_action_effects(effects),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_missing_action_effects(effects))
             }
         }
     }

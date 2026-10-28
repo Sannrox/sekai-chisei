@@ -16,6 +16,7 @@ pub mod agent_definition;
 pub mod agent_dry_run;
 pub mod agent_promotion;
 pub mod agent_shadow;
+pub mod agent_turn;
 pub mod attestation;
 pub mod audit;
 pub mod autonomous_envelope;

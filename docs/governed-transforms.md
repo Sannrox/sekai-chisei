@@ -116,6 +116,11 @@ and the series depend on that state alone, so every plane on one store
 reports the same series. Registrations do not expire, so a pool whose workers
 were scaled to zero still reads claimable.
 
+The same three gauges carry the site agent turn queue as `profile="agent-turn"`
+with one `default` pool (#1950, ADR 0137): queued counts unfinished turns no
+live claim holds, claimable those already due, and the age runs from the
+oldest claimable turn's due time.
+
 A scaler reads them as follows:
 
 - `claimable` above 0 or a growing oldest age: add workers to that pool.

@@ -771,6 +771,51 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "WakeSiteAgentInstance",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListClaimableAgentTurns",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ClaimAgentTurn",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "HeartbeatAgentTurnClaim",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "AckAgentTurn",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "HeartbeatTransformClaim",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

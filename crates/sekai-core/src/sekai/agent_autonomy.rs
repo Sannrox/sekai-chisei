@@ -278,10 +278,40 @@ pub fn revoke_auto_apply(
     reason: &str,
     now_ms: i64,
 ) -> Result<Option<AgentAutonomyGrant>, String> {
+    revoke_granted_by(
+        db,
+        actor,
+        namespace,
+        principal,
+        type_id,
+        reason,
+        i64::MAX,
+        now_ms,
+    )
+}
+
+/// Revokes the grant only when it was issued at or before
+/// `granted_by_ms`. The cutoff is checked on the grant the store's
+/// compare-and-set then replaces, so a replacement issued later is never
+/// revoked (#1943).
+#[allow(clippy::too_many_arguments)]
+fn revoke_granted_by(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    principal: &str,
+    type_id: &str,
+    reason: &str,
+    granted_by_ms: i64,
+    now_ms: i64,
+) -> Result<Option<AgentAutonomyGrant>, String> {
     required("actor", actor)?;
     required("reason", reason)?;
     require_positive(now_ms)?;
-    let Some(current) = db.get_agent_autonomy(namespace, principal, type_id)? else {
+    let Some(current) = db
+        .get_agent_autonomy(namespace, principal, type_id)?
+        .filter(|grant| grant.granted_at_ms <= granted_by_ms)
+    else {
         return Ok(None);
     };
     if current.status == STATUS_REVOKED {
@@ -297,10 +327,13 @@ pub fn revoke_auto_apply(
         if error != CONCURRENT_CHANGE {
             return Err(error);
         }
-        let current = db.get_agent_autonomy(namespace, principal, type_id)?;
-        if let Some(grant) = current.as_ref()
-            && grant.status == STATUS_REVOKED
-        {
+        let current = db
+            .get_agent_autonomy(namespace, principal, type_id)?
+            .filter(|grant| grant.granted_at_ms <= granted_by_ms);
+        let Some(grant) = current.as_ref() else {
+            return Ok(None);
+        };
+        if grant.status == STATUS_REVOKED {
             ensure_revoke_receipt(db, actor, grant, now_ms)?;
             return Ok(current);
         }
@@ -410,6 +443,33 @@ pub fn revoke_if_granted(
         principal,
         type_id,
         REASON_REJECTED,
+        now_ms,
+    ))
+}
+
+/// [`revoke_if_granted`] for the grant a denied admission at
+/// `admitted_at_ms` rejected: a grant issued after it is a replacement and
+/// is left alone, so a resumed admission never revokes it (#1943).
+pub fn revoke_if_granted_before(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    principal: &str,
+    type_id: &str,
+    admitted_at_ms: i64,
+    now_ms: i64,
+) -> Result<(), String> {
+    if !actor_is_agent(db, principal) {
+        return Ok(());
+    }
+    revoke_result(revoke_granted_by(
+        db,
+        actor,
+        namespace,
+        principal,
+        type_id,
+        REASON_REJECTED,
+        admitted_at_ms,
         now_ms,
     ))
 }
