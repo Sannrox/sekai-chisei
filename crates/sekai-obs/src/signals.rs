@@ -34,6 +34,14 @@ pub const DEDUPLICATION_TOTAL: &str = "sekai_deduplication_events_total";
 pub const LOOKUP_FIRST_TOTAL: &str = "sekai_lookup_first_total";
 pub const EVALUATION_STEP_TOTAL: &str = "sekai_evaluation_step_total";
 pub const EVALUATION_STEP_DURATION: &str = "sekai_evaluation_step_duration_seconds";
+pub const TRANSFORM_WORK_QUEUED: &str = "sekai_transform_work_queued";
+pub const TRANSFORM_WORK_CLAIMABLE: &str = "sekai_transform_work_claimable";
+pub const TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE: &str =
+    "sekai_transform_work_oldest_claimable_age_seconds";
+/// Named worker pools exported per profile besides `default`; later pools
+/// in label order fold into [`TRANSFORM_POOL_OTHER`].
+pub const MAX_TRANSFORM_POOLS: usize = 32;
+pub const TRANSFORM_POOL_OTHER: &str = "other";
 
 /// Register descriptions for every signal family.
 ///
@@ -247,6 +255,87 @@ pub fn record_evaluation_step(
     .record(elapsed.as_secs_f64());
 }
 
+/// Queue depth of one transform worker pool at one refresh (#1732).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransformPoolGauge {
+    pub pool: String,
+    pub queued: u64,
+    pub claimable: u64,
+    pub oldest_claimable_age_seconds: f64,
+}
+
+/// Prometheus text for the transform work queue gauges of one snapshot,
+/// appended to a scrape (#1732). Rendered here rather than through the
+/// recorder, which keeps every series it has seen: a pool that is gone from
+/// the store is absent from the next scrape, and the output is a function of
+/// the snapshot alone, identical on every plane reading the same store.
+/// `pool` values must already be bounded, non-identifying labels.
+pub fn render_transform_work_depth(profile: &str, pools: Vec<TransformPoolGauge>) -> String {
+    let pools = fold_transform_pools(pools);
+    let mut out = String::new();
+    for (name, help, value) in [
+        (
+            TRANSFORM_WORK_QUEUED,
+            "Transform runs waiting for a worker, by profile and pool",
+            (|gauge: &TransformPoolGauge| gauge.queued as f64) as fn(&TransformPoolGauge) -> f64,
+        ),
+        (
+            TRANSFORM_WORK_CLAIMABLE,
+            "Waiting transform runs a registered runtime may claim, by profile and pool",
+            |gauge| gauge.claimable as f64,
+        ),
+        (
+            TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE,
+            "Age of the oldest claimable transform run, 0 when none, by profile and pool",
+            |gauge| gauge.oldest_claimable_age_seconds,
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+        for gauge in &pools {
+            out.push_str(&format!(
+                "{name}{{profile=\"{profile}\",pool=\"{}\"}} {}\n",
+                gauge.pool,
+                value(gauge)
+            ));
+        }
+    }
+    out
+}
+
+/// Bounds a snapshot to `default` plus [`MAX_TRANSFORM_POOLS`] pools named
+/// in label order; later pools are summed into `other` (oldest age is the
+/// maximum), which is present only when something overflowed.
+fn fold_transform_pools(mut pools: Vec<TransformPoolGauge>) -> Vec<TransformPoolGauge> {
+    pools.sort_by(|left, right| {
+        (left.pool != "default")
+            .cmp(&(right.pool != "default"))
+            .then_with(|| left.pool.cmp(&right.pool))
+    });
+    let named = MAX_TRANSFORM_POOLS
+        + usize::from(pools.first().is_some_and(|gauge| gauge.pool == "default"));
+    if pools.len() <= named {
+        return pools;
+    }
+    let other = pools.split_off(named).into_iter().fold(
+        TransformPoolGauge {
+            pool: TRANSFORM_POOL_OTHER.into(),
+            queued: 0,
+            claimable: 0,
+            oldest_claimable_age_seconds: 0.0,
+        },
+        |mut other, gauge| {
+            other.queued += gauge.queued;
+            other.claimable += gauge.claimable;
+            other.oldest_claimable_age_seconds = other
+                .oldest_claimable_age_seconds
+                .max(gauge.oldest_claimable_age_seconds);
+            other
+        },
+    );
+    pools.push(other);
+    pools
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +361,9 @@ mod tests {
             LOOKUP_FIRST_TOTAL,
             EVALUATION_STEP_TOTAL,
             EVALUATION_STEP_DURATION,
+            TRANSFORM_WORK_QUEUED,
+            TRANSFORM_WORK_CLAIMABLE,
+            TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE,
         ] {
             assert!(name.starts_with("sekai_"), "{name} lacks the sekai_ prefix");
             assert!(
@@ -280,6 +372,50 @@ mod tests {
                 "{name} is not a valid Prometheus metric name"
             );
         }
+    }
+
+    #[test]
+    fn transform_pools_fold_by_label_whatever_the_input_order() {
+        let depth = |pool: String, queued: u64| TransformPoolGauge {
+            pool,
+            queued,
+            claimable: queued,
+            oldest_claimable_age_seconds: queued as f64,
+        };
+        let pools: Vec<_> = (0..MAX_TRANSFORM_POOLS as u64 + 2)
+            .map(|index| depth(format!("p{index:02}"), index + 1))
+            .chain([depth("default".into(), 0)])
+            .collect();
+        let mut reversed = pools.clone();
+        reversed.reverse();
+        let rendered = render_transform_work_depth("isolated_process", pools);
+        // Two refreshers seeing one store state in any order render the same.
+        assert_eq!(
+            rendered,
+            render_transform_work_depth("isolated_process", reversed)
+        );
+        let series = |pool: &str| {
+            rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with(&format!(
+                        r#"{TRANSFORM_WORK_QUEUED}{{profile="isolated_process",pool="{pool}"}} "#
+                    ))
+                })
+                .map(|line| line.rsplit(' ').next().unwrap().to_string())
+        };
+        // `default` and the first pools by label are named; the last two fold.
+        assert_eq!(series("default").as_deref(), Some("0"));
+        assert_eq!(series("p00").as_deref(), Some("1"));
+        assert_eq!(series("p31").as_deref(), Some("32"));
+        assert_eq!(series("p32"), None);
+        assert_eq!(series(TRANSFORM_POOL_OTHER).as_deref(), Some("67"));
+        assert!(rendered.contains(&format!(
+            r#"{TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE}{{profile="isolated_process",pool="other"}} 34"#
+        )));
+        let small =
+            render_transform_work_depth("isolated_process", vec![depth("default".into(), 1)]);
+        assert!(!small.contains("pool=\"other\""));
     }
 
     #[test]
@@ -307,6 +443,7 @@ mod tests {
             POOL_CHECKOUT,
             DURABILITY_LAG,
             EVALUATION_STEP_DURATION,
+            TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE,
         ] {
             assert!(
                 name.ends_with("_seconds"),

@@ -71,7 +71,9 @@ curl --fail http://127.0.0.1:9464/metrics
 
 - `/healthz` reports process health.
 - `/readyz` verifies that the service is ready to handle governed work.
-- `/metrics` exports Prometheus metrics.
+- `/metrics` exports Prometheus metrics. On a process serving Sekai, each
+  scrape also reads the transform work queue gauges from the store; see
+  [governed-transforms.md](governed-transforms.md).
 - `/console/*` is the authenticated operator shell (principal Bearer login,
   HttpOnly session cookie, namespace context). It always fails closed without a
   valid session. See [operator-console.md](operator-console.md) for local and

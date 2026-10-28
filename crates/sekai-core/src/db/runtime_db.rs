@@ -678,6 +678,19 @@ impl RuntimeDb {
         }
     }
 
+    /// Transform work queue depth per worker pool (#1732).
+    pub fn transform_pool_depths(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformPoolDepth>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_pool_depths(now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_pool_depths(now_ms))
+            }
+        }
+    }
+
     pub fn list_claimable_transform_work(
         &self,
         namespace: &str,

@@ -881,6 +881,93 @@ pub fn placement_labels_digest(labels: &BTreeMap<String, String>) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// Worker pool of runs without placement requirements (#1732).
+pub const DEFAULT_TRANSFORM_POOL: &str = "default";
+
+/// Metric label of the worker pool serving runs that require `requires`:
+/// `default` when empty, else the first 16 hex characters of its
+/// [`placement_labels_digest`], the digest the ledger records for a runtime
+/// registering an equal set. A digest, not the labels: requirements come from
+/// tenant-authored definitions and must not reach a metric label.
+pub fn transform_pool(requires: &BTreeMap<String, String>) -> String {
+    if requires.is_empty() {
+        return DEFAULT_TRANSFORM_POOL.into();
+    }
+    let digest = placement_labels_digest(requires);
+    digest["sha256:".len()..].chars().take(16).collect()
+}
+
+/// Waiting runs sharing a namespace and admitted definition: one row of the
+/// store's queue-depth aggregate (#1732). Waiting is pending, or claimed with
+/// a lapsed lease whose reclaim, counting the lapse, stays under
+/// [`MAX_TRANSFORM_LEASE_EXPIRIES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransformQueueGroup {
+    pub namespace: String,
+    pub definition_json: String,
+    pub runs: u64,
+    pub oldest_created_at_ms: i64,
+}
+
+/// Queue depth of one worker pool, summed over namespaces (#1732).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransformPoolDepth {
+    pub pool: String,
+    /// Waiting runs, including those no registered runtime may claim.
+    pub queued: u64,
+    /// Waiting runs some runtime registered in their namespace may claim.
+    pub claimable: u64,
+    /// Admission time of the oldest claimable run, `None` when none is.
+    pub oldest_claimable_created_at_ms: Option<i64>,
+}
+
+/// Folds aggregate rows into per-pool depth, ordered by pool. The pools are
+/// `default`, those of waiting runs, and those of every registered label set
+/// (0 when nothing waits, so a pool scaled to zero stays visible); the result
+/// depends on store state only. A group is claimable when it has no
+/// requirements or a runtime in its namespace meets them, the same test the
+/// claim applies; a definition that does not parse is claimable, as there.
+pub fn transform_pool_depths(
+    groups: &[TransformQueueGroup],
+    registered: &[(String, BTreeMap<String, String>)],
+) -> Vec<TransformPoolDepth> {
+    let empty = |pool: String| TransformPoolDepth {
+        pool,
+        queued: 0,
+        claimable: 0,
+        oldest_claimable_created_at_ms: None,
+    };
+    let mut pools = BTreeMap::from([(
+        DEFAULT_TRANSFORM_POOL.to_string(),
+        empty(DEFAULT_TRANSFORM_POOL.into()),
+    )]);
+    for (_, labels) in registered {
+        let pool = transform_pool(labels);
+        pools.entry(pool.clone()).or_insert_with(|| empty(pool));
+    }
+    for group in groups {
+        let requires = admitted_placement_requires(&group.definition_json).unwrap_or_default();
+        let claimable = requires.is_empty()
+            || registered.iter().any(|(namespace, labels)| {
+                *namespace == group.namespace && placement_satisfied(&requires, labels)
+            });
+        let pool = transform_pool(&requires);
+        let depth = pools.entry(pool.clone()).or_insert_with(|| empty(pool));
+        depth.queued += group.runs;
+        if claimable {
+            depth.claimable += group.runs;
+            depth.oldest_claimable_created_at_ms = Some(
+                depth
+                    .oldest_claimable_created_at_ms
+                    .map_or(group.oldest_created_at_ms, |oldest| {
+                        oldest.min(group.oldest_created_at_ms)
+                    }),
+            );
+        }
+    }
+    pools.into_values().collect()
+}
+
 /// Ledger record of one registration, written in the upsert's transaction.
 /// `previous` is the set it replaced, `None` for a first registration.
 pub fn transform_runtime_decision(

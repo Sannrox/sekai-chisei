@@ -30,7 +30,7 @@ Governed transforms have grown a scheduler and dependency graph (#1387), a publi
    - `sekai_transform_work_claimable`;
    - `sekai_transform_work_oldest_claimable_age_seconds`.
 
-   They carry no tenant or namespace labels, which keeps cardinality bounded and leaks nothing. A pool is the placement-label set a run requires; runs without requirements are `default`. Autoscalers scale a pool on claimable depth and oldest age. Delivery: #1732.
+   They carry no tenant or namespace labels, which keeps cardinality bounded and leaks nothing. A pool is the placement-label set a run requires; runs without requirements are `default`. Autoscalers scale a pool on claimable depth and oldest age. Queued above claimable means no registered runtime meets the requirements, so a new pool is needed. Every plane instance reads the shared store and reports the same values, so scalers aggregate with `max`. Definitions and the pool label form: [governed-transforms.md](../governed-transforms.md). Delivery: #1732.
 2. **Liveness, lease expiry and fencing.**
    - A claim lasts the `ttl_ms` the worker asks for, within the plane's bounds, and the worker heartbeats at most every third of it.
    - Each claim carries a generation and a fencing token. A lapsed claim may be reclaimed, which raises the generation.

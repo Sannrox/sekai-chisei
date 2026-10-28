@@ -1201,6 +1201,7 @@ pub fn run_for_plane(
                 ops_port,
                 db.clone(),
                 Some(chisei_db.clone()),
+                plane.serves_sekai().then(|| db.clone()),
                 provider_registry_state_path.clone(),
                 credential_store.clone(),
                 assertion_authority.clone(),
