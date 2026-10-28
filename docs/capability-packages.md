@@ -28,7 +28,15 @@ on: dependency closure, release and configuration digests, reachable
 markings, advisory revision, and an optional expiry. Superseding records a
 new disposition and keeps the previous one with its receipt. Accepting risk
 on marked data needs the disposition marked at least as high as that data,
-so only a caller cleared for those markings can accept it. Neither package
+so only a caller cleared for those markings can accept it. The exposure
+records the current facts of its target through `security.exposure.basis`. A
+disposition returns to `needs-review` (#1925) when one of those facts differs
+from its basis, or when its expiry passes: `security.disposition.reopen`
+supersedes it with a `needs-review` disposition that names the fact, and its
+receipt's idempotency key names it too. The package functions
+`reopen_changed_basis` and `reopen_expired` find those dispositions from the
+committed object-change feed and the stored expiry, and reopen each once.
+Neither package
 ships live instances, and neither is a runtime grant.
 
 ## Operator workflow

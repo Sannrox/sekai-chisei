@@ -26,6 +26,14 @@
 //!   marking. Admission only admits a caller cleared for the marking it
 //!   writes, so a caller without that grant cannot accept the risk.
 //!
+//! - A disposition returns to `needs-review` (#1925) when a fact of its
+//!   validity basis changes or it expires. The exposure records the current
+//!   facts of its deployed target, and a reopen is a governed Action that
+//!   supersedes the chain head with a `needs-review` disposition naming the
+//!   fact. The exposure is open again while that disposition heads its
+//!   chain. The reopen's id derives from the disposition it reopens, so a
+//!   repeated pass reopens it once.
+//!
 //! Identities are stamped into `external_id` and enforced at commit by a
 //! partial unique index on `(namespace, external_id)` for these kinds; the
 //! plan-time checks here only give a precise error.
@@ -49,9 +57,12 @@ pub const PACKAGE_VERSION: &str = "1";
 /// The current certification. Dispositions (#1924) changed the certified
 /// members, so the package is certified again under a new id that succeeds
 /// the first one where a namespace holds it.
-pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.1";
+pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.2";
 /// Certifications this one succeeds, newest first.
-const PREVIOUS_CERTIFICATION_IDS: &[&str] = &["cert:security.finding-exposure/v1"];
+const PREVIOUS_CERTIFICATION_IDS: &[&str] = &[
+    "cert:security.finding-exposure/v1.1",
+    "cert:security.finding-exposure/v1",
+];
 pub const KIND_FINDING: &str = "security_finding";
 pub const KIND_OCCURRENCE: &str = "security_finding_occurrence";
 pub const KIND_HYPOTHESIS: &str = "security_hypothesis";
@@ -59,7 +70,32 @@ pub const KIND_EXPOSURE: &str = "security_exposure";
 pub const KIND_DISPOSITION: &str = "security_disposition";
 pub const ACTION_DISPOSITION_RECORD: &str = "security.disposition.record";
 pub const ACTION_DISPOSITION_SUPERSEDE: &str = "security.disposition.supersede";
+pub const ACTION_DISPOSITION_REOPEN: &str = "security.disposition.reopen";
+pub const ACTION_EXPOSURE_BASIS: &str = "security.exposure.basis";
 pub const DISPOSITION_ACCEPT_RISK: &str = "accept-risk";
+pub const DISPOSITION_NEEDS_REVIEW: &str = "needs-review";
+/// Validity basis facts an exposure records the current value of.
+pub const BASIS_FACTS: [&str; 5] = [
+    "dependency_closure_digest",
+    "release_digest",
+    "configuration_digest",
+    "reachable_markings",
+    "advisory_revision",
+];
+/// An exposure's reachable markings when no marked data is reachable.
+pub const NO_MARKINGS: &str = "none";
+/// The reopened fact of a disposition that expired.
+pub const FACT_EXPIRES_AT: &str = "expires_at_ms";
+/// Properties a reopen copies from the disposition it reopens.
+const CARRIED_BASIS: [&str; 7] = [
+    "dependency_closure_digest",
+    "release_digest",
+    "configuration_digest",
+    "reachable_markings",
+    "advisory_revision",
+    "asset_criticality",
+    "expires_at_ms",
+];
 pub const ACTION_FINDING: &str = "security.finding.record";
 pub const ACTION_OCCURRENCE: &str = "security.occurrence.record";
 pub const ACTION_HYPOTHESIS: &str = "security.hypothesis.record";
@@ -309,7 +345,11 @@ fn fixture_digest(bytes: &[u8]) -> String {
 /// Package write rules on top of the ObjectType schema. Stamps each kind's
 /// identity into `external_id` and checks references to other package
 /// objects. Other kinds pass through.
-pub fn validate_object_write(db: &RuntimeDb, object: &mut Object) -> Result<(), String> {
+pub fn validate_object_write(
+    db: &RuntimeDb,
+    object: &mut Object,
+    now_ms: i64,
+) -> Result<(), String> {
     let identity = match object.kind.as_str() {
         KIND_FINDING => format!("finding:{}", required(object, "problem_signature")?),
         KIND_OCCURRENCE => {
@@ -322,6 +362,18 @@ pub fn validate_object_write(db: &RuntimeDb, object: &mut Object) -> Result<(), 
         }
         KIND_EXPOSURE => {
             require_finding(db, object)?;
+            // A blank fact leaves no trace in the change feed, so it could
+            // not reopen anything; an empty markings list is `none`.
+            if let Some(fact) = BASIS_FACTS.into_iter().find(|fact| {
+                object
+                    .properties
+                    .get(*fact)
+                    .is_some_and(|value| value.trim().is_empty())
+            }) {
+                return Err(format!(
+                    "{fact} must name a value; record no reachable markings as {NO_MARKINGS}"
+                ));
+            }
             validate_exposure_evidence(db, object)?;
             exposure_identity(object)?
         }
@@ -333,8 +385,12 @@ pub fn validate_object_write(db: &RuntimeDb, object: &mut Object) -> Result<(), 
                 );
             }
             let exposure = require_exposure(db, object)?;
-            if required(object, "disposition")? == DISPOSITION_ACCEPT_RISK {
-                require_marking_for_accepted_risk(db, object, &exposure)?;
+            match required(object, "disposition")? {
+                DISPOSITION_ACCEPT_RISK => {
+                    require_marking_for_accepted_risk(db, object, &exposure)?;
+                }
+                DISPOSITION_NEEDS_REVIEW => validate_reopen(db, object, &exposure, now_ms)?,
+                _ => {}
             }
             disposition_identity(db, object)?
         }
@@ -442,6 +498,452 @@ fn disposition_identity(db: &RuntimeDb, object: &Object) -> Result<String, Strin
     Ok(format!("disposition-successor:{previous_id}"))
 }
 
+/// A `needs-review` disposition reopens the one it supersedes, which must not
+/// already be a reopen. It carries that disposition's basis unchanged and
+/// names the fact that reopened it: a basis fact whose current value on the
+/// exposure differs, or the expiry once it passed. Its marking is at least
+/// the reopened disposition's.
+fn validate_reopen(
+    db: &RuntimeDb,
+    object: &mut Object,
+    exposure: &Object,
+    now_ms: i64,
+) -> Result<(), String> {
+    let previous_id = required(object, "supersedes")
+        .map_err(|_| "a reopen supersedes the disposition it reopens".to_string())?
+        .to_string();
+    let previous_id = previous_id.as_str();
+    let previous = db
+        .get_object(previous_id)?
+        .filter(|previous| {
+            previous.namespace == object.namespace && previous.kind == KIND_DISPOSITION
+        })
+        .ok_or_else(|| format!("disposition {previous_id} not found in this namespace"))?;
+    if previous.properties.get("disposition").map(String::as_str) == Some(DISPOSITION_NEEDS_REVIEW)
+    {
+        return Err(format!("disposition {previous_id} already needs review"));
+    }
+    for fact in CARRIED_BASIS {
+        if object.properties.get(fact) != previous.properties.get(fact) {
+            return Err(format!(
+                "a reopen carries the basis of disposition {previous_id} unchanged; {fact} differs"
+            ));
+        }
+    }
+    let fact = required(object, "reopened_fact")?.to_string();
+    let value = if fact == FACT_EXPIRES_AT {
+        let expires = previous
+            .properties
+            .get(FACT_EXPIRES_AT)
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| format!("disposition {previous_id} has no expiry"))?;
+        if expires > now_ms {
+            return Err(format!("disposition {previous_id} has not expired"));
+        }
+        expires.to_string()
+    } else if BASIS_FACTS.contains(&fact.as_str()) {
+        let current = exposure
+            .properties
+            .get(&fact)
+            .ok_or_else(|| format!("the exposure records no current {fact}"))?;
+        if !basis_differs(&previous, &fact, current) {
+            return Err(format!(
+                "{fact} still matches disposition {previous_id}; it is not reopened"
+            ));
+        }
+        current.clone()
+    } else {
+        return Err(format!("{fact} is not a validity basis fact"));
+    };
+    if object
+        .properties
+        .get("reopened_value")
+        .is_some_and(|named| *named != value)
+    {
+        return Err(format!("reopened_value does not match the current {fact}"));
+    }
+    object.properties.insert("reopened_value".into(), value);
+    // The reopen copies the exposure's current value and the reopened
+    // disposition's basis, so it is marked at least as high as both.
+    let lattice = namespace_lattice(db, &object.namespace)?;
+    let held = crate::sekai::markings::object_marking_token(object).unwrap_or_default();
+    for needed in [&previous, exposure]
+        .into_iter()
+        .filter_map(crate::sekai::markings::object_marking_token)
+    {
+        if held.is_empty() || !lattice.dominates(held, needed)? {
+            return Err(format!(
+                "a reopen of disposition {previous_id} needs a marking at least {needed}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn namespace_lattice(
+    db: &RuntimeDb,
+    namespace: &str,
+) -> Result<crate::sekai::classification_lattice::ClassificationLattice, String> {
+    Ok(db
+        .get_classification_lattice(namespace)?
+        .unwrap_or_else(|| {
+            crate::sekai::classification_lattice::ClassificationLattice::default_evidence_lattice(
+                namespace,
+            )
+        }))
+}
+
+/// Whether the exposure's current value of `fact` differs from the
+/// disposition's basis. Reachable markings compare as sets, and absent, empty
+/// and `none` all mean no reachable markings, so clearing them is a change.
+fn basis_differs(disposition: &Object, fact: &str, current: &str) -> bool {
+    let recorded = disposition.properties.get(fact).map_or("", String::as_str);
+    if fact != "reachable_markings" {
+        return recorded != current;
+    }
+    let markings = |value: &str| -> std::collections::BTreeSet<String> {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|marking| !marking.is_empty() && *marking != NO_MARKINGS)
+            .map(str::to_string)
+            .collect()
+    };
+    markings(recorded) != markings(current)
+}
+
+/// The marking a reopen of `previous` is written under: the join of the
+/// reopened disposition's and the exposure's, which it copies values from.
+fn reopen_marking(db: &RuntimeDb, previous: &Object) -> Result<Option<String>, String> {
+    let exposure = previous
+        .properties
+        .get("exposure_id")
+        .map(|id| db.get_object(id))
+        .transpose()?
+        .flatten();
+    let lattice = namespace_lattice(db, &previous.namespace)?;
+    let mut joined: Option<String> = None;
+    for marking in [Some(previous), exposure.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(crate::sekai::markings::object_marking_token)
+    {
+        joined = Some(match joined {
+            None => marking.to_string(),
+            Some(held) => lattice.join(&held, marking)?.ok_or_else(|| {
+                format!(
+                    "disposition {} and its exposure have markings {held} and {marking} with no common bound",
+                    previous.id
+                )
+            })?,
+        });
+    }
+    Ok(joined)
+}
+
+/// The disposition that heads an exposure's chain: its first disposition,
+/// or the latest successor. `None` while the exposure has none.
+pub fn disposition_chain_head(
+    db: &RuntimeDb,
+    namespace: &str,
+    exposure_id: &str,
+) -> Result<Option<Object>, String> {
+    let in_chain = |identity: String| -> Result<Option<Object>, String> {
+        Ok(db
+            .find_all_by_external_id(&identity)?
+            .into_iter()
+            .find(|object| object.namespace == namespace && object.kind == KIND_DISPOSITION))
+    };
+    let Some(mut head) = in_chain(format!("disposition:{exposure_id}"))? else {
+        return Ok(None);
+    };
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(next) = in_chain(format!("disposition-successor:{}", head.id))? {
+        if !visited.insert(next.id.clone()) {
+            return Err(format!("disposition chain through {} loops", next.id));
+        }
+        head = next;
+    }
+    Ok(Some(head))
+}
+
+/// What one pass over basis changes did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReopenPass {
+    /// The feed position to resume the next pass after.
+    pub next_seq: u64,
+    /// Ids of the `needs-review` dispositions this pass wrote.
+    pub reopened: Vec<String>,
+}
+
+/// Reopens the dispositions whose basis no longer matches their exposure
+/// (#1925). Reads the committed object-change feed of `namespace` after
+/// `after_seq` (the feed object-change subscriptions are built on) for
+/// changes to exposure basis facts and for new dispositions. Each changed exposure whose chain head
+/// differs in a basis fact is reopened as `actor`. A repeated pass, or one
+/// restarted from an earlier position, reopens nothing twice.
+pub fn reopen_changed_basis(
+    db: &RuntimeDb,
+    namespace: &str,
+    actor: &str,
+    after_seq: u64,
+    now_ms: i64,
+) -> Result<ReopenPass, String> {
+    const PAGE: i32 = 500;
+    let mut read_to = after_seq;
+    // Each changed exposure, with the feed position of its first change.
+    let mut changed = std::collections::BTreeMap::new();
+    loop {
+        let page = db.list_committed_object_mutations_after(namespace, read_to, PAGE)?;
+        for mutation in &page {
+            read_to = read_to.max(mutation.seq);
+            let field = mutation.change.field.as_str();
+            let field = field.strip_prefix("properties.").unwrap_or(field);
+            let exposure_id =
+                if mutation.object_kind == KIND_EXPOSURE && BASIS_FACTS.contains(&field) {
+                    Some(mutation.change.object_id.clone())
+                } else if mutation.object_kind == KIND_DISPOSITION && field == "_created" {
+                    // A new chain head is checked against the current facts too:
+                    // a decision recorded on an outdated basis reopens.
+                    db.get_object(&mutation.change.object_id)?
+                        .and_then(|disposition| disposition.properties.get("exposure_id").cloned())
+                } else {
+                    None
+                };
+            if let Some(exposure_id) = exposure_id {
+                changed.entry(exposure_id).or_insert(mutation.seq);
+            }
+        }
+        if page.len() < PAGE as usize {
+            break;
+        }
+    }
+    let mut reopened = Vec::new();
+    // A change whose reopen is still unresolved (awaiting approval) is read
+    // again by the next pass, so the cursor stops before it.
+    let mut next_seq = read_to;
+    for (exposure_id, first_seq) in changed {
+        let Some(exposure) = db
+            .get_object(&exposure_id)?
+            .filter(|exposure| exposure.namespace == namespace && exposure.kind == KIND_EXPOSURE)
+        else {
+            continue;
+        };
+        let Some(head) = disposition_chain_head(db, namespace, &exposure_id)? else {
+            continue;
+        };
+        if is_reopen(&head) {
+            continue;
+        }
+        let differing = BASIS_FACTS.into_iter().find(|fact| {
+            exposure
+                .properties
+                .get(*fact)
+                .is_some_and(|current| basis_differs(&head, fact, current))
+        });
+        let Some(fact) = differing else {
+            continue;
+        };
+        match reopen(db, actor, &head, fact, now_ms)? {
+            Reopened::Written(id) => reopened.push(id),
+            // The chain moved on (a concurrent successor, which may still
+            // carry the old basis) or awaits an approver: the next pass
+            // reads this change again and looks at the head it then finds.
+            Reopened::Superseded | Reopened::AwaitingApproval => {
+                next_seq = next_seq.min(first_seq.saturating_sub(1));
+            }
+        }
+    }
+    Ok(ReopenPass { next_seq, reopened })
+}
+
+/// Reopens the dispositions heading their chain whose expiry passed by
+/// `now_ms` (#1925). A repeated pass reopens nothing twice.
+pub fn reopen_expired(
+    db: &RuntimeDb,
+    namespace: &str,
+    actor: &str,
+    now_ms: i64,
+) -> Result<Vec<String>, String> {
+    const PAGE: i32 = 500;
+    let mut expired = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = db.list_objects(&crate::domain::ListFilter {
+            kind: Some(KIND_DISPOSITION.into()),
+            namespace: Some(namespace.into()),
+            limit: PAGE,
+            offset,
+            ..Default::default()
+        })?;
+        offset += page.len() as i32;
+        expired.extend(
+            page.iter()
+                .filter(|disposition| {
+                    !is_reopen(disposition)
+                        && disposition
+                            .properties
+                            .get(FACT_EXPIRES_AT)
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .is_some_and(|expires| expires <= now_ms)
+                })
+                .cloned(),
+        );
+        if page.len() < PAGE as usize {
+            break;
+        }
+    }
+    let mut reopened = Vec::new();
+    for disposition in expired {
+        // Only the head of a chain is in force; a superseded one is history.
+        if !successor_of(db, &disposition)?.is_empty() {
+            continue;
+        }
+        if let Reopened::Written(id) = reopen(db, actor, &disposition, FACT_EXPIRES_AT, now_ms)? {
+            reopened.push(id);
+        }
+    }
+    Ok(reopened)
+}
+
+fn is_reopen(disposition: &Object) -> bool {
+    disposition
+        .properties
+        .get("disposition")
+        .map(String::as_str)
+        == Some(DISPOSITION_NEEDS_REVIEW)
+}
+
+fn successor_of(db: &RuntimeDb, disposition: &Object) -> Result<Vec<Object>, String> {
+    Ok(db
+        .find_all_by_external_id(&format!("disposition-successor:{}", disposition.id))?
+        .into_iter()
+        .filter(|object| {
+            object.namespace == disposition.namespace && object.kind == KIND_DISPOSITION
+        })
+        .collect())
+}
+
+/// What one reopen attempt did.
+enum Reopened {
+    /// This reopen superseded the disposition.
+    Written(String),
+    /// Another writer moved the chain on first.
+    Superseded,
+    /// Policy parked it for an approver; a later pass looks again.
+    AwaitingApproval,
+}
+
+/// Admits the reopen of `previous` for `fact` as `actor`. Its object id
+/// derives from `previous`, so it supersedes the disposition at most once,
+/// and its idempotency key names the fact in the receipt.
+fn reopen(
+    db: &RuntimeDb,
+    actor: &str,
+    previous: &Object,
+    fact: &str,
+    now_ms: i64,
+) -> Result<Reopened, String> {
+    let object_id = format!(
+        "disposition-reopen-{}",
+        &format!("{:x}", Sha256::digest(previous.id.as_bytes()))[..24]
+    );
+    let mut parameters = serde_json::json!({
+        "object_id": object_id,
+        "exposure_id": previous.properties.get("exposure_id").cloned().unwrap_or_default(),
+        "disposition": DISPOSITION_NEEDS_REVIEW,
+        "supersedes": previous.id,
+        "reopened_fact": fact,
+    });
+    for carried in CARRIED_BASIS {
+        if let Some(value) = previous.properties.get(carried) {
+            parameters[carried] = if carried == FACT_EXPIRES_AT {
+                value
+                    .parse::<i64>()
+                    .map(serde_json::Value::from)
+                    .map_err(|_| format!("disposition {} has an invalid expiry", previous.id))?
+            } else {
+                value.clone().into()
+            };
+        }
+    }
+    if let Some(marking) = reopen_marking(db, previous)? {
+        parameters["access_marking"] = marking.into();
+    }
+    // The key names the fact for the receipt and pins the request: a reopen
+    // whose parameters changed (a raised marking) is a new request, not a
+    // conflicting replay.
+    let key = format!(
+        "security.reopen:{}:{fact}:{}",
+        previous.id,
+        &format!("{:x}", Sha256::digest(parameters.to_string().as_bytes()))[..16]
+    );
+    let admit = |idempotency_key: String| {
+        let request = crate::sekai::action_instance_admission::ActionInstanceAdmissionRequest {
+            namespace: previous.namespace.clone(),
+            type_id: ACTION_DISPOSITION_REOPEN.into(),
+            version: PACKAGE_VERSION.into(),
+            parameters_json: parameters.to_string(),
+            idempotency_key,
+            evidence_submission_ids: Vec::new(),
+            request_id: String::new(),
+            ontology_digest: String::new(),
+            autonomous_envelope_id: String::new(),
+            policy_context: Default::default(),
+            delegating_actor: None,
+            budget_already_reserved: false,
+            resource_tenant: String::new(),
+            binding_markings: Vec::new(),
+            source_object_id: String::new(),
+            marking_gate: Default::default(),
+            expected_object_revision: String::new(),
+            offline: None,
+        };
+        crate::sekai::action_instance_admission::ActionInstanceAdmission::new(db, None)
+            .admit(request, actor, now_ms)
+    };
+    use crate::sekai::action_instance::{STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED};
+    // A denial is final for its key. A pass that replays a denied attempt
+    // moves on to the next attempt key, so a changed policy takes effect.
+    // Attempt keys are numbered, so a pending attempt is found again by its
+    // replay instead of being submitted twice; the reopen's object id still
+    // allows one successor. Each pass adds at most one denied attempt, so a
+    // pass walks only the denials earlier passes recorded.
+    let mut attempt: u64 = 0;
+    let mut outcome = admit(key.clone());
+    while let Ok(denied) = &outcome
+        && denied.replay
+        && denied.instance.status == STATUS_DENIED
+    {
+        attempt += 1;
+        outcome = admit(format!("{key}:attempt-{attempt}"));
+    }
+    match outcome {
+        Ok(admitted) if admitted.instance.status == STATUS_ADMITTED => {
+            // Admission answers for the instance; the chain says whether
+            // this reopen is what superseded the disposition.
+            if successor_of(db, previous)?
+                .iter()
+                .any(|successor| successor.id == object_id)
+            {
+                Ok(Reopened::Written(object_id))
+            } else {
+                Ok(Reopened::Superseded)
+            }
+        }
+        // Awaits its approver; a grant writes the same reopen.
+        Ok(parked) if parked.instance.status == STATUS_PARKED => Ok(Reopened::AwaitingApproval),
+        Ok(denied) => Err(format!(
+            "reopen of disposition {} was {}: {}",
+            previous.id, denied.instance.status, denied.instance.deny_reason
+        )),
+        // A concurrent pass reopened it for another fact, or someone
+        // superseded it: the chain moved on without this reopen.
+        Err(_) if !successor_of(db, previous)?.is_empty() => Ok(Reopened::Superseded),
+        Err(error) => Err(format!("reopen of disposition {}: {error:?}", previous.id)),
+    }
+}
+
 /// Accepting risk needs the disposition marked at least as high as the
 /// exposure and every marking of reachable data. The written marking already
 /// holds what the Action was admitted under, and admission refused any
@@ -458,13 +960,24 @@ fn require_marking_for_accepted_risk(
             markings
                 .split(',')
                 .map(str::trim)
-                .filter(|marking| !marking.is_empty())
+                .filter(|marking| !marking.is_empty() && *marking != NO_MARKINGS)
                 .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default();
     if let Some(marking) = crate::sekai::markings::object_marking_token(exposure) {
         needed.push(marking.to_string());
+    }
+    // The exposure's current reachable markings bind too, whatever the
+    // caller declares.
+    if let Some(markings) = exposure.properties.get("reachable_markings") {
+        needed.extend(
+            markings
+                .split(',')
+                .map(str::trim)
+                .filter(|marking| !marking.is_empty() && *marking != NO_MARKINGS)
+                .map(str::to_string),
+        );
     }
     // A successor never needs less than any disposition before it: every
     // earlier disposition's marking and reachable markings still apply,
@@ -492,7 +1005,7 @@ fn require_marking_for_accepted_risk(
                 markings
                     .split(',')
                     .map(str::trim)
-                    .filter(|marking| !marking.is_empty())
+                    .filter(|marking| !marking.is_empty() && *marking != NO_MARKINGS)
                     .map(str::to_string),
             );
         }
@@ -1017,7 +1530,7 @@ mod tests {
         changed
             .properties
             .insert("disposition".into(), "fixed".into());
-        let message = validate_object_write(&runtime, &mut changed).unwrap_err();
+        let message = validate_object_write(&runtime, &mut changed, 2_000).unwrap_err();
         assert!(message.contains("cannot be changed"), "{message}");
         let message = failed_precondition(admit(
             &runtime,
@@ -1232,5 +1745,435 @@ mod tests {
             .filter_map(|id| runtime.get_object(id).unwrap())
             .count();
         assert_eq!(stored, 1);
+    }
+
+    fn basis(closure: &str) -> Value {
+        json!({ "object_id": "e-1", "dependency_closure_digest": closure })
+    }
+
+    fn head(runtime: &RuntimeDb) -> Object {
+        disposition_chain_head(runtime, NAMESPACE, "e-1")
+            .unwrap()
+            .expect("a disposition")
+    }
+
+    /// A false positive bound to closure A returns to needs-review once the
+    /// exposure's closure is B, and the receipt names the changed fact; a
+    /// repeated or restarted pass reopens nothing twice (#1925).
+    #[test]
+    fn a_changed_closure_returns_a_false_positive_to_needs_review() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        // The same closure changes nothing.
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            basis("sha256:closure"),
+            "b-a",
+        )
+        .unwrap();
+        let unchanged = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 3_000).unwrap();
+        assert!(unchanged.reopened.is_empty());
+        assert_eq!(head(&runtime).id, "d-1");
+
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            basis("sha256:closure-b"),
+            "b-b",
+        )
+        .unwrap();
+        let pass =
+            reopen_changed_basis(&runtime, NAMESPACE, ACTOR, unchanged.next_seq, 3_000).unwrap();
+        assert_eq!(pass.reopened.len(), 1);
+        let reopened = head(&runtime);
+        assert_eq!(reopened.id, pass.reopened[0]);
+        assert_eq!(reopened.properties["disposition"], DISPOSITION_NEEDS_REVIEW);
+        assert_eq!(reopened.properties["supersedes"], "d-1");
+        assert_eq!(
+            reopened.properties["reopened_fact"],
+            "dependency_closure_digest"
+        );
+        assert_eq!(reopened.properties["reopened_value"], "sha256:closure-b");
+        assert_eq!(
+            reopened.properties["dependency_closure_digest"],
+            "sha256:closure"
+        );
+        let instance = runtime
+            .list_action_instances(NAMESPACE, None, None, 50)
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.type_id == ACTION_DISPOSITION_REOPEN)
+            .expect("reopen instance");
+        let key = instance.idempotency_key.clone();
+        assert!(
+            key.starts_with("security.reopen:d-1:dependency_closure_digest:"),
+            "{key}"
+        );
+        let receipt = runtime
+            .get_operation_receipt(&instance.operation_id)
+            .unwrap()
+            .expect("receipt");
+        assert_eq!(receipt.events[0].attributes["idempotency_key"], key);
+        assert_eq!(receipt.events[0].attributes["object_id"], reopened.id);
+
+        // Passes from the start again reopen nothing twice.
+        for _ in 0..2 {
+            assert!(
+                reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 4_000)
+                    .unwrap()
+                    .reopened
+                    .is_empty()
+            );
+        }
+        assert_eq!(head(&runtime).id, reopened.id);
+    }
+
+    /// A disposition returns to needs-review at its expiry, once, also
+    /// after a restart (#1925).
+    #[test]
+    fn an_expired_disposition_reopens_once_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekai.db");
+        let open = || {
+            RuntimeDb::Sqlite(Arc::new(
+                SekaiDb::new(path.to_str().expect("utf-8 path")).expect("file sqlite"),
+            ))
+        };
+        let runtime = open();
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        admit(&runtime, ACTION_FINDING, finding("f-1", "sig-1"), "f").unwrap();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE,
+            exposure("e-1", VERDICT_UNKNOWN, None),
+            "e",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "mitigated", None),
+            "d-1",
+        )
+        .unwrap();
+        assert!(
+            reopen_expired(&runtime, NAMESPACE, ACTOR, 8_999)
+                .unwrap()
+                .is_empty()
+        );
+        let reopened = reopen_expired(&runtime, NAMESPACE, ACTOR, 9_000).unwrap();
+        assert_eq!(reopened.len(), 1);
+        drop(runtime);
+
+        let restarted = open();
+        assert!(
+            reopen_expired(&restarted, NAMESPACE, ACTOR, 10_000)
+                .unwrap()
+                .is_empty()
+        );
+        let head = head(&restarted);
+        assert_eq!(head.id, reopened[0]);
+        assert_eq!(head.properties["reopened_fact"], FACT_EXPIRES_AT);
+        assert_eq!(head.properties["reopened_value"], "9000");
+        let dispositions = restarted
+            .list_objects(&crate::domain::ListFilter {
+                kind: Some(KIND_DISPOSITION.into()),
+                namespace: Some(NAMESPACE.into()),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(dispositions.len(), 2);
+    }
+
+    /// A reopen is refused unless its fact really changed or the expiry
+    /// passed, and it carries the reopened basis unchanged (#1925).
+    #[test]
+    fn a_reopen_must_be_warranted() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        let mut reopen = disposition("d-2", DISPOSITION_NEEDS_REVIEW, Some("d-1"));
+        reopen["reopened_fact"] = "dependency_closure_digest".into();
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_DISPOSITION_REOPEN,
+            reopen.clone(),
+            "r-1",
+        ));
+        assert!(
+            message.contains("no current dependency_closure_digest"),
+            "{message}"
+        );
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            basis("sha256:closure"),
+            "b",
+        )
+        .unwrap();
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_DISPOSITION_REOPEN,
+            reopen.clone(),
+            "r-2",
+        ));
+        assert!(message.contains("still matches"), "{message}");
+
+        let mut early = reopen.clone();
+        early["reopened_fact"] = FACT_EXPIRES_AT.into();
+        let message = failed_precondition(admit(&runtime, ACTION_DISPOSITION_REOPEN, early, "r-3"));
+        assert!(message.contains("has not expired"), "{message}");
+
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            basis("sha256:closure-b"),
+            "b-2",
+        )
+        .unwrap();
+        let mut altered = reopen.clone();
+        altered["release_digest"] = "sha256:other".into();
+        let message =
+            failed_precondition(admit(&runtime, ACTION_DISPOSITION_REOPEN, altered, "r-4"));
+        assert!(message.contains("unchanged"), "{message}");
+        admit(&runtime, ACTION_DISPOSITION_REOPEN, reopen, "r-5").unwrap();
+        assert_eq!(head(&runtime).id, "d-2");
+    }
+
+    /// Clearing a basis fact is a change: reachable markings recorded as
+    /// `none` reopen a disposition that relied on some. A blank value is
+    /// refused (#1925).
+    #[test]
+    fn a_cleared_basis_fact_reopens_its_disposition() {
+        let runtime = with_exposure();
+        let mut decided = disposition("d-1", "false-positive", None);
+        decided["reachable_markings"] = "internal".into();
+        admit(&runtime, ACTION_DISPOSITION_RECORD, decided, "d-1").unwrap();
+        assert!(
+            admit(
+                &runtime,
+                ACTION_EXPOSURE_BASIS,
+                json!({ "object_id": "e-1", "reachable_markings": "" }),
+                "blank",
+            )
+            .is_err()
+        );
+        // The same list in another order changes nothing.
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            json!({ "object_id": "e-1", "reachable_markings": " internal" }),
+            "same",
+        )
+        .unwrap();
+        assert!(
+            reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 3_000)
+                .unwrap()
+                .reopened
+                .is_empty()
+        );
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            json!({ "object_id": "e-1", "reachable_markings": NO_MARKINGS }),
+            "b",
+        )
+        .unwrap();
+        let pass = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 3_000).unwrap();
+        assert_eq!(pass.reopened.len(), 1);
+        let reopened = head(&runtime);
+        assert_eq!(reopened.properties["reopened_fact"], "reachable_markings");
+        assert_eq!(reopened.properties["reopened_value"], NO_MARKINGS);
+    }
+
+    /// A reopen copies the exposure's current value, so it is marked at
+    /// least as high as the exposure, not only the reopened disposition
+    /// (#1925).
+    #[test]
+    fn a_reopen_is_marked_at_least_as_high_as_its_exposure() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        let mut exposure = runtime.get_object("e-1").unwrap().unwrap();
+        exposure
+            .properties
+            .insert("access_marking".into(), "confidential".into());
+        exposure.properties.insert(
+            "dependency_closure_digest".into(),
+            "sha256:closure-b".into(),
+        );
+        runtime.update_object(&exposure).unwrap();
+
+        let mut reopen = disposition("d-2", DISPOSITION_NEEDS_REVIEW, Some("d-1"));
+        reopen["reopened_fact"] = "dependency_closure_digest".into();
+        reopen["access_marking"] = "internal".into();
+        let message = failed_precondition(admit_cleared(
+            &runtime,
+            ACTION_DISPOSITION_REOPEN,
+            reopen,
+            "r-low",
+            "internal",
+        ));
+        assert!(message.contains("at least confidential"), "{message}");
+
+        assert_eq!(
+            reopen_expired(&runtime, NAMESPACE, ACTOR, 9_000)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            head(&runtime)
+                .properties
+                .get("access_marking")
+                .map(String::as_str),
+            Some("confidential")
+        );
+    }
+
+    /// Accepting risk needs clearance for the exposure's current reachable
+    /// markings even when the disposition declares none (#1925).
+    #[test]
+    fn accepting_risk_honours_the_exposures_current_reachable_markings() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            json!({ "object_id": "e-1", "reachable_markings": "confidential" }),
+            "b",
+        )
+        .unwrap();
+        let mut accept = disposition("d-1", DISPOSITION_ACCEPT_RISK, None);
+        accept["access_marking"] = "internal".into();
+        let message = failed_precondition(admit_cleared(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            accept,
+            "d-1",
+            "internal",
+        ));
+        assert!(message.contains("confidential"), "{message}");
+    }
+
+    /// A reopen that admission parks or denies reports nothing reopened,
+    /// and a pass still holding the change retries it (#1925).
+    #[test]
+    fn a_reopen_admission_did_not_write_is_not_reported() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all(NAMESPACE);
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        runtime.upsert_action_policy(&policy).unwrap();
+        assert!(reopen_expired(&runtime, NAMESPACE, ACTOR, 9_000).is_err());
+        assert_eq!(head(&runtime).id, "d-1");
+
+        // Once policy allows it, the next pass reopens it.
+        runtime
+            .upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
+                NAMESPACE,
+            ))
+            .unwrap();
+        assert_eq!(
+            reopen_expired(&runtime, NAMESPACE, ACTOR, 9_500)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_ne!(head(&runtime).id, "d-1");
+    }
+
+    /// A reopen parked for an approver keeps its change for the next pass,
+    /// so a decision against it does not lose the change (#1925).
+    #[test]
+    fn a_parked_reopen_keeps_its_change_for_the_next_pass() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            basis("sha256:closure-b"),
+            "b",
+        )
+        .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all(NAMESPACE);
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        runtime.upsert_action_policy(&policy).unwrap();
+        let parked = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 3_000).unwrap();
+        assert!(parked.reopened.is_empty());
+        // The cursor stops before the basis change, so the next pass reads
+        // it again.
+        let change_seq = runtime
+            .list_committed_object_mutations_after(NAMESPACE, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|mutation| mutation.change.field.ends_with("dependency_closure_digest"))
+            .unwrap()
+            .seq;
+        assert!(parked.next_seq < change_seq);
+        assert_eq!(head(&runtime).id, "d-1");
+        // Until its approver decides, every pass holds the change.
+        let again =
+            reopen_changed_basis(&runtime, NAMESPACE, ACTOR, parked.next_seq, 4_000).unwrap();
+        assert!(again.reopened.is_empty());
+        assert_eq!(again.next_seq, parked.next_seq);
+    }
+
+    /// A disposition recorded on a basis the exposure no longer has is
+    /// reopened, even when the exposure's change was read before (#1925).
+    #[test]
+    fn a_decision_on_an_outdated_basis_reopens() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            basis("sha256:closure-b"),
+            "b",
+        )
+        .unwrap();
+        let first = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 3_000).unwrap();
+        assert!(first.reopened.is_empty());
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        let pass = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, first.next_seq, 4_000).unwrap();
+        assert_eq!(pass.reopened.len(), 1);
+        assert_eq!(
+            head(&runtime).properties["reopened_fact"],
+            "dependency_closure_digest"
+        );
     }
 }

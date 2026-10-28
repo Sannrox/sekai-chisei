@@ -334,6 +334,120 @@
           "supersedes"
         ]
       }
+    },
+    {
+      "type_id": "security.disposition.reopen",
+      "description": "Return a disposition to needs-review because a fact of its validity basis changed or it expired. The previous disposition and its receipt are kept.",
+      "object_kind": "security_disposition",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "exposure_id": {
+            "type": "string"
+          },
+          "disposition": {
+            "type": "string",
+            "enum": [
+              "needs-review"
+            ]
+          },
+          "dependency_closure_digest": {
+            "type": "string"
+          },
+          "release_digest": {
+            "type": "string"
+          },
+          "configuration_digest": {
+            "type": "string"
+          },
+          "reachable_markings": {
+            "type": "string"
+          },
+          "advisory_revision": {
+            "type": "string"
+          },
+          "asset_criticality": {
+            "type": "string"
+          },
+          "expires_at_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "access_marking": {
+            "type": "string"
+          },
+          "supersedes": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reopened_fact": {
+            "type": "string",
+            "enum": [
+              "dependency_closure_digest",
+              "release_digest",
+              "configuration_digest",
+              "reachable_markings",
+              "advisory_revision",
+              "expires_at_ms"
+            ]
+          },
+          "reopened_value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "exposure_id",
+          "disposition",
+          "dependency_closure_digest",
+          "release_digest",
+          "configuration_digest",
+          "advisory_revision",
+          "supersedes",
+          "reopened_fact"
+        ]
+      }
+    },
+    {
+      "type_id": "security.exposure.basis",
+      "description": "Record the current facts of an exposure's deployed target. A disposition whose basis no longer matches them returns to needs-review.",
+      "object_kind": "security_exposure",
+      "object_mutation": "update",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "dependency_closure_digest": {
+            "type": "string"
+          },
+          "release_digest": {
+            "type": "string"
+          },
+          "configuration_digest": {
+            "type": "string"
+          },
+          "reachable_markings": {
+            "type": "string"
+          },
+          "advisory_revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id"
+        ]
+      }
     }
   ]
 }

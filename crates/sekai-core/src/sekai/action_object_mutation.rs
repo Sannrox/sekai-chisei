@@ -527,7 +527,7 @@ fn validate_object_write(
     now_ms: i64,
 ) -> Result<(), ActionObjectMutationError> {
     crate::sekai::feedback_package::validate_object_write(db, planned, now_ms)
-        .and_then(|()| crate::sekai::security_package::validate_object_write(db, planned))
+        .and_then(|()| crate::sekai::security_package::validate_object_write(db, planned, now_ms))
         .and_then(|()| {
             crate::sekai::site_agent_instance::validate_object_write(db, planned, now_ms)
         })
