@@ -21,6 +21,8 @@ use crate::sekai::governed_transform::{GovernedTransform, TransformRun};
 pub const TRANSFORM_TRIGGER_ADHOC: &str = "adhoc";
 /// Error of a run whose output exceeds the plane budget.
 pub const ADHOC_OUTPUT_BUDGET: &str = "transform_adhoc_output_budget";
+/// Error of a run reading a column the caller may not read.
+pub const ADHOC_COLUMN_DENIED: &str = "transform_adhoc_column_denied";
 /// Error of a retried identity carrying a different definition.
 pub const ADHOC_IDENTITY_CONFLICT: &str =
     "an ad-hoc run with this session and idempotency key ran a different definition";
@@ -147,17 +149,32 @@ pub fn run(
     request: &AdHocRequest,
     transform: &GovernedTransform,
     budget: &OutputBudget,
+    column_allowlists: &HashMap<String, Vec<String>>,
     expires_at_ms: i64,
     tenant_id: &str,
     now_ms: i64,
 ) -> Result<AdHocRun, String> {
     request.validate()?;
     match db {
-        RuntimeDb::Sqlite(store) => {
-            store.run_adhoc_transform(request, transform, budget, expires_at_ms, tenant_id, now_ms)
-        }
+        RuntimeDb::Sqlite(store) => store.run_adhoc_transform(
+            request,
+            transform,
+            budget,
+            column_allowlists,
+            expires_at_ms,
+            tenant_id,
+            now_ms,
+        ),
         RuntimeDb::Postgres(store) => crate::db::postgres::off_runtime(|| {
-            store.run_adhoc_transform(request, transform, budget, expires_at_ms, tenant_id, now_ms)
+            store.run_adhoc_transform(
+                request,
+                transform,
+                budget,
+                column_allowlists,
+                expires_at_ms,
+                tenant_id,
+                now_ms,
+            )
         }),
     }
 }
@@ -178,6 +195,39 @@ pub(crate) fn scratch_object(request: &AdHocRequest, now_ms: i64) -> crate::doma
         created: now_ms,
         updated: now_ms,
     }
+}
+
+/// The grant that keeps a scratch output to its caller.
+pub fn scratch_grant(request: &AdHocRequest, now_ms: i64) -> crate::sekai::security::Grant {
+    let object_id = format!("{}-object", request.scratch_dataset_id());
+    crate::sekai::security::Grant {
+        id: format!("{object_id}-owner"),
+        object_id,
+        principal: request.caller.clone(),
+        role: crate::sekai::security::Role::Admin,
+        created: now_ms,
+        ..Default::default()
+    }
+}
+
+/// Refuses rows carrying a key outside `allowed`, when a caller's read of
+/// the dataset is limited to it. A run reads whole rows, so a hidden key
+/// would otherwise reach the output.
+pub(crate) fn require_allowed_columns(
+    allowed: Option<&Vec<String>>,
+    records: &[crate::sekai::dataset::DatasetRowRecord],
+) -> Result<(), String> {
+    let Some(allowed) = allowed else {
+        return Ok(());
+    };
+    if records
+        .iter()
+        .flat_map(|(_, row)| row.keys())
+        .any(|key| !allowed.contains(key))
+    {
+        return Err(ADHOC_COLUMN_DENIED.into());
+    }
+    Ok(())
 }
 
 /// Column definitions of the scratch dataset, from its output rows.
@@ -313,6 +363,7 @@ mod tests {
         };
         let bound = |request: &AdHocRequest, transform| request.bind(transform).prepare().unwrap();
         let budget = OutputBudget::default();
+        let none = HashMap::new();
 
         let first_request = ask("k1");
         let first_definition = bound(&first_request, filter(&input, "yes"));
@@ -321,6 +372,7 @@ mod tests {
             &first_request,
             &first_definition,
             &budget,
+            &none,
             9_000,
             "",
             100,
@@ -334,11 +386,46 @@ mod tests {
             .unwrap();
         assert_eq!(output.len(), 2);
 
+        let grants = db
+            .list_grants(&format!("{}-object", first.scratch_dataset_id))
+            .unwrap();
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| grant.principal.as_str())
+                .collect::<Vec<_>>(),
+            ["ana"],
+            "only the caller holds the scratch output"
+        );
+
+        let limited = ask("k5");
+        assert_eq!(
+            run(
+                db,
+                &limited,
+                &bound(&limited, filter(&input, "yes")),
+                &budget,
+                &HashMap::from([(input.clone(), vec!["id".to_string()])]),
+                9_000,
+                "",
+                150,
+            )
+            .unwrap_err(),
+            ADHOC_COLUMN_DENIED,
+            "a row key the caller may not read refuses the run"
+        );
+        assert!(
+            db.get_dataset(&limited.scratch_dataset_id())
+                .unwrap()
+                .is_none()
+        );
+
         let again = run(
             db,
             &first_request,
             &first_definition,
             &budget,
+            &none,
             9_000,
             "",
             200,
@@ -352,6 +439,7 @@ mod tests {
                 &first_request,
                 &bound(&first_request, filter(&input, "no")),
                 &budget,
+                &none,
                 9_000,
                 "",
                 300
@@ -371,6 +459,7 @@ mod tests {
                 &tight,
                 &bound(&tight, filter(&input, "yes")),
                 &small,
+                &none,
                 9_000,
                 "",
                 400
@@ -391,6 +480,7 @@ mod tests {
             &chained_request,
             &bound(&chained_request, filter(&first.scratch_dataset_id, "yes")),
             &budget,
+            &none,
             9_000,
             "",
             500,
@@ -430,6 +520,7 @@ mod tests {
             &marking_request,
             &bound(&marking_request, filter(&marked, "yes")),
             &budget,
+            &none,
             9_000,
             "",
             600,

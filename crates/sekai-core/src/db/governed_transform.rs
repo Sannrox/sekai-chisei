@@ -453,13 +453,14 @@ impl SekaiDb {
         request: &crate::sekai::adhoc_transform::AdHocRequest,
         transform: &GovernedTransform,
         budget: &crate::sekai::adhoc_transform::OutputBudget,
+        column_allowlists: &HashMap<String, Vec<String>>,
         expires_at_ms: i64,
         tenant_id: &str,
         now_ms: i64,
     ) -> Result<crate::sekai::adhoc_transform::AdHocRun, String> {
         use crate::sekai::adhoc_transform::{
             ADHOC_IDENTITY_CONFLICT, AdHocRun, TRANSFORM_TRIGGER_ADHOC, scratch_columns,
-            scratch_object,
+            scratch_grant, scratch_object,
         };
         let identity = request.identity();
         let mut conn = self.conn();
@@ -502,6 +503,21 @@ impl SekaiDb {
             None,
             &crate::sekai::audit::ChangeAttribution::default(),
         )?;
+        // Only the caller reads the scratch output: an object without an
+        // ACL is open to everyone.
+        let grant = scratch_grant(request, now_ms);
+        tx.execute(
+            "INSERT INTO sekai_grants (id, object_id, principal, role, created)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                grant.id,
+                grant.object_id,
+                grant.principal,
+                grant.role.as_str(),
+                grant.created
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO sekai_datasets (id,name,columns,object_id,created,partition_keys)
              VALUES (?1,?1,'[]',?2,?3,?4)",
@@ -524,6 +540,7 @@ impl SekaiDb {
                 tenant_id,
                 stored: false,
                 output_budget: Some(budget),
+                column_allowlists: Some(column_allowlists),
             },
         )?;
         let output = live_output_rows(&tx, &transform.output_dataset_id)?;
@@ -1738,6 +1755,7 @@ fn run_governed_transform_tx(
             tenant_id,
             stored: true,
             output_budget: None,
+            column_allowlists: None,
         },
     )
 }
@@ -1755,6 +1773,9 @@ pub(crate) struct InProcessRun<'a> {
     pub tenant_id: &'a str,
     pub stored: bool,
     pub output_budget: Option<&'a crate::sekai::adhoc_transform::OutputBudget>,
+    /// Per input dataset, the columns the caller may read; a loaded row
+    /// with any other key refuses the run (ad-hoc runs, ADR 0138).
+    pub column_allowlists: Option<&'a HashMap<String, Vec<String>>>,
 }
 
 /// Runs `transform` in process inside `tx` and records the run.
@@ -1771,6 +1792,7 @@ pub(crate) fn run_in_process_tx(
         tenant_id,
         stored,
         output_budget,
+        column_allowlists,
     } = *options;
     let namespace = transform.namespace.as_str();
     let transform_id = transform.transform_id.as_str();
@@ -1811,10 +1833,15 @@ pub(crate) fn run_in_process_tx(
     let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
     let mut input_object_tokens: Vec<Option<String>> = Vec::new();
     for (alias, dataset_id) in &bindings {
+        let records = list_row_records_after(tx, dataset_id, after_id, load_budget.as_mut())?;
+        crate::sekai::adhoc_transform::require_allowed_columns(
+            column_allowlists.and_then(|allowlists| allowlists.get(dataset_id)),
+            &records,
+        )?;
         loaded.push((
             alias.clone(),
             load_dataset_column_names(tx, dataset_id)?,
-            list_row_records_after(tx, dataset_id, after_id, load_budget.as_mut())?,
+            records,
         ));
         let object_id = load_dataset_object_id(tx, dataset_id)?;
         input_object_tokens.push(load_object_marking_token(tx, &object_id)?);

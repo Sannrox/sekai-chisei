@@ -2112,16 +2112,16 @@ fn governed_transform_from_proto(
 }
 
 /// Runs an inline definition once with the caller's read authority into a
-/// scratch output (ADR 0138, #1964). Inputs pass the preview read checks,
-/// and an input whose columns the caller may only partly read is refused,
-/// since a full run would expose the rest.
+/// scratch output only the caller may read (ADR 0138, #1964). Inputs pass
+/// the preview read checks; a row carrying a column the caller may not read
+/// refuses the run, since a full run would expose it.
 pub(super) async fn run_adhoc_governed_transform(
     service: &SekaiServiceImpl,
     req: Request<RunAdHocGovernedTransformRequest>,
 ) -> Result<Response<RunAdHocGovernedTransformResponse>, Status> {
     use crate::sekai::adhoc_transform::{
-        ADHOC_IDENTITY_CONFLICT, ADHOC_OUTPUT_BUDGET, AdHocRequest, DEFAULT_SCRATCH_RETENTION_MS,
-        OutputBudget,
+        ADHOC_COLUMN_DENIED, ADHOC_IDENTITY_CONFLICT, ADHOC_OUTPUT_BUDGET, AdHocRequest,
+        DEFAULT_SCRATCH_RETENTION_MS, OutputBudget, scratch_grant,
     };
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
@@ -2160,23 +2160,9 @@ pub(super) async fn run_adhoc_governed_transform(
             "isolated-process ad-hoc runs are not available yet",
         ));
     }
+    // Read limits per input; the run refuses a row with any other key.
     let column_allowlists =
         authorize_preview_inputs(service, &principals, tenant_context.as_ref(), &transform)?;
-    for (dataset_id, allowed) in &column_allowlists {
-        let dataset = service
-            .db
-            .runtime()
-            .get_dataset(dataset_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("dataset not found"))?;
-        if dataset
-            .columns
-            .iter()
-            .any(|column| !allowed.contains(&column.name))
-        {
-            return Err(Status::permission_denied("access denied"));
-        }
-    }
     let quota = service.quota_runtime();
     let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
     let held = admit_tenant_transform(
@@ -2197,6 +2183,7 @@ pub(super) async fn run_adhoc_governed_transform(
         &request,
         &transform,
         &OutputBudget::default(),
+        &column_allowlists,
         now.saturating_add(DEFAULT_SCRATCH_RETENTION_MS),
         owner_tenant,
         now,
@@ -2204,7 +2191,9 @@ pub(super) async fn run_adhoc_governed_transform(
         Ok(outcome) => outcome,
         Err(error) => {
             abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
-            return Err(if error == ADHOC_OUTPUT_BUDGET {
+            return Err(if error == ADHOC_COLUMN_DENIED {
+                Status::permission_denied("access denied")
+            } else if error == ADHOC_OUTPUT_BUDGET {
                 Status::resource_exhausted(error)
             } else if error == ADHOC_IDENTITY_CONFLICT {
                 Status::already_exists(error)
@@ -2216,6 +2205,8 @@ pub(super) async fn run_adhoc_governed_transform(
     if outcome.replayed {
         abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
     } else {
+        // The store holds the scratch grant; this plane's cache learns it now.
+        service.security.add_grant(&scratch_grant(&request, now));
         let recorded = record_tenant_transform_usage(
             quota.as_ref(),
             tenant_context

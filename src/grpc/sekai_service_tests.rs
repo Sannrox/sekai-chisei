@@ -33712,6 +33712,21 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
             .len(),
         2
     );
+    let foreign = svc
+        .query_rows(with_named_principal(
+            QueryRowsRequest {
+                dataset_id: first.scratch_dataset_id.clone(),
+                query: None,
+            },
+            "bob",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        foreign.code(),
+        tonic::Code::PermissionDenied,
+        "another principal cannot read the scratch output"
+    );
     let again = run("open-in", "k1").await.unwrap().into_inner();
     assert!(again.replayed);
     assert_eq!(again.run.unwrap().run_id, receipt.run_id);
