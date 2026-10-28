@@ -1,9 +1,13 @@
-//! Schedule wakes of site agent instances (ADR 0137, #1951).
+//! Schedule and change wakes of site agent instances (ADR 0137, #1951,
+//! #1952).
 //!
 //! An instance's `wake_policies` holds self-describing tokens, not
 //! references to a separate record: `schedule:<every_ms>` wakes it every
-//! `every_ms`, at least [`MIN_EVERY_MS`]. The instance's governed update
-//! Action is the only way to change them, so a change leaves a receipt.
+//! `every_ms`, at least [`MIN_EVERY_MS`]; `change:<debounce_ms>` wakes it
+//! when an object in its responsibility changes, at most once per window of
+//! `debounce_ms`, at least [`MIN_DEBOUNCE_MS`]. The instance's governed
+//! update Action is the only way to change them, so a change leaves a
+//! receipt.
 //!
 //! Each tick admits one turn per instance, token and due time, with cause
 //! `schedule` and cause reference `<token>@<due_ms>`. The turn identity makes
@@ -13,23 +17,34 @@
 //! the latest due time is admitted: a tick after an outage does not backfill
 //! the fires it missed. A frozen instance's fire is refused and audited by
 //! turn admission.
+//!
+//! Change wakes read committed object mutations after a durable cursor per
+//! instance and token. The plane's gRPC layer decides what the instance's
+//! principal may see; this module keeps the cursor and the window rule.
 
+use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+use crate::db::postgres::{PostgresDb, off_runtime};
 use crate::db::runtime_db::RuntimeDb;
-use crate::domain::ListFilter;
+use crate::db::sekai::SekaiDb;
+use crate::domain::{ListFilter, Object};
 use crate::sekai::agent_turn::{self, AgentTurn, Cause, TurnError, Wake};
 use crate::sekai::site_agent_instance::{KIND, WAKE_POLICIES_PROPERTY};
 
 /// Shortest schedule interval an instance may declare.
 pub const MIN_EVERY_MS: i64 = 60_000;
+/// Shortest change debounce window an instance may declare.
+pub const MIN_DEBOUNCE_MS: i64 = 1_000;
 const SCHEDULE_PREFIX: &str = "schedule:";
+const CHANGE_PREFIX: &str = "change:";
 const PAGE: i32 = 500;
 
 /// One parsed wake token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakePolicy {
     Schedule { every_ms: i64 },
+    Change { debounce_ms: i64 },
 }
 
 /// Parses a comma-separated `wake_policies` value into `(token, policy)`
@@ -44,18 +59,23 @@ pub fn parse(value: &str) -> Result<Vec<(&str, WakePolicy)>, String> {
 }
 
 fn parse_token(token: &str) -> Result<WakePolicy, String> {
-    let every_ms = token
-        .strip_prefix(SCHEDULE_PREFIX)
-        .and_then(|every| every.parse::<i64>().ok())
-        .ok_or_else(|| {
-            format!("unknown wake policy {token}; expected {SCHEDULE_PREFIX}<every_ms>")
-        })?;
-    if every_ms < MIN_EVERY_MS {
-        return Err(format!(
-            "wake policy {token} fires more often than every {MIN_EVERY_MS} ms"
-        ));
+    let interval = |prefix: &str, min: i64| -> Option<Result<i64, String>> {
+        let value = token.strip_prefix(prefix)?;
+        Some(match value.parse::<i64>() {
+            Ok(ms) if ms >= min => Ok(ms),
+            Ok(_) => Err(format!("wake policy {token} is shorter than {min} ms")),
+            Err(_) => Err(format!("wake policy {token} has no interval in ms")),
+        })
+    };
+    if let Some(every_ms) = interval(SCHEDULE_PREFIX, MIN_EVERY_MS) {
+        return every_ms.map(|every_ms| WakePolicy::Schedule { every_ms });
     }
-    Ok(WakePolicy::Schedule { every_ms })
+    if let Some(debounce_ms) = interval(CHANGE_PREFIX, MIN_DEBOUNCE_MS) {
+        return debounce_ms.map(|debounce_ms| WakePolicy::Change { debounce_ms });
+    }
+    Err(format!(
+        "unknown wake policy {token}; expected {SCHEDULE_PREFIX}<every_ms> or {CHANGE_PREFIX}<debounce_ms>"
+    ))
 }
 
 /// The latest due time at or before `now_ms` of an `every_ms` schedule on
@@ -67,48 +87,263 @@ pub fn due_at(instance_id: &str, every_ms: i64, now_ms: i64) -> i64 {
     now_ms.saturating_sub(phase).div_euclid(every_ms) * every_ms + phase
 }
 
+/// Every site agent instance, in id order.
+pub fn instances(db: &RuntimeDb) -> Result<Vec<Object>, String> {
+    let mut all = Vec::new();
+    loop {
+        let page = db.list_objects(&ListFilter {
+            kind: Some(KIND.into()),
+            limit: PAGE,
+            offset: i32::try_from(all.len()).map_err(|error| error.to_string())?,
+            ..Default::default()
+        })?;
+        let done = page.len() < PAGE as usize;
+        all.extend(page);
+        if done {
+            return Ok(all);
+        }
+    }
+}
+
+/// The parsed wake tokens of `instance`; none when its value is malformed.
+pub fn policies(instance: &Object) -> Vec<(String, WakePolicy)> {
+    let value = instance
+        .properties
+        .get(WAKE_POLICIES_PROPERTY)
+        .map(String::as_str)
+        .unwrap_or_default();
+    parse(value)
+        .map(|policies| {
+            policies
+                .into_iter()
+                .map(|(token, policy)| (token.to_string(), policy))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Admits the due schedule turn of every instance, as `actor`. An instance
 /// that is frozen, gone, or carries a malformed token is skipped; the turns
 /// returned are those due now, new or already admitted.
 pub fn tick(db: &RuntimeDb, now_ms: i64, actor: &str) -> Result<Vec<AgentTurn>, String> {
     let mut turns = Vec::new();
-    let mut offset = 0;
-    loop {
-        let page = db.list_objects(&ListFilter {
-            kind: Some(KIND.into()),
-            limit: PAGE,
-            offset,
-            ..Default::default()
-        })?;
-        for instance in &page {
-            let value = instance
-                .properties
-                .get(WAKE_POLICIES_PROPERTY)
-                .map(String::as_str)
-                .unwrap_or_default();
-            let Ok(policies) = parse(value) else {
+    for instance in instances(db)? {
+        for (token, policy) in policies(&instance) {
+            let WakePolicy::Schedule { every_ms } = policy else {
                 continue;
             };
-            for (token, WakePolicy::Schedule { every_ms }) in policies {
-                let due = due_at(&instance.id, every_ms, now_ms);
-                let wake = Wake {
-                    namespace: instance.namespace.clone(),
-                    instance_id: instance.id.clone(),
-                    cause: Cause::Schedule,
-                    cause_ref: format!("{token}@{due}"),
-                    due_at_ms: due,
-                };
-                match agent_turn::admit(db, wake, actor, now_ms) {
-                    Ok(turn) => turns.push(turn),
-                    Err(TurnError::Frozen(_) | TurnError::NotFound) => {}
-                    Err(error) => return Err(error.to_string()),
-                }
+            let due = due_at(&instance.id, every_ms, now_ms);
+            let wake = Wake {
+                namespace: instance.namespace.clone(),
+                instance_id: instance.id.clone(),
+                cause: Cause::Schedule,
+                cause_ref: format!("{token}@{due}"),
+                due_at_ms: due,
+            };
+            if let Some(turn) = admit_or_skip(db, wake, actor, now_ms)? {
+                turns.push(turn);
             }
         }
-        if page.len() < PAGE as usize {
-            return Ok(turns);
+    }
+    Ok(turns)
+}
+
+/// Admits the change turn of the debounce window holding `committed_at_ms`.
+/// Changes in one window share a turn, due when the window closes.
+pub fn admit_change(
+    db: &RuntimeDb,
+    instance: &Object,
+    token: &str,
+    debounce_ms: i64,
+    committed_at_ms: i64,
+    actor: &str,
+    now_ms: i64,
+) -> Result<Option<AgentTurn>, String> {
+    let window = committed_at_ms - committed_at_ms.rem_euclid(debounce_ms);
+    let wake = Wake {
+        namespace: instance.namespace.clone(),
+        instance_id: instance.id.clone(),
+        cause: Cause::ObjectChange,
+        cause_ref: format!("{token}@{window}"),
+        due_at_ms: window.saturating_add(debounce_ms),
+    };
+    admit_or_skip(db, wake, actor, now_ms)
+}
+
+/// A frozen instance's refusal is audited by admission; a gone one is
+/// skipped.
+fn admit_or_skip(
+    db: &RuntimeDb,
+    wake: Wake,
+    actor: &str,
+    now_ms: i64,
+) -> Result<Option<AgentTurn>, String> {
+    match agent_turn::admit(db, wake, actor, now_ms) {
+        Ok(turn) => Ok(Some(turn)),
+        Err(TurnError::Frozen(_) | TurnError::NotFound) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Where a change token has read to: the sequence of the last mutation read
+/// and that mutation's change id. Sequences can be reused after history is
+/// purged, so a reader confirms the id is still at the sequence before
+/// reading after it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangeCursor {
+    pub seq: u64,
+    pub change_id: String,
+}
+
+/// The cursor of a change token; `None` before its first tick.
+pub fn change_cursor(
+    db: &RuntimeDb,
+    instance_id: &str,
+    token: &str,
+) -> Result<Option<ChangeCursor>, String> {
+    let row = match db {
+        RuntimeDb::Sqlite(store) => store.agent_wake_cursor(instance_id, token),
+        RuntimeDb::Postgres(store) => off_runtime(|| store.agent_wake_cursor(instance_id, token)),
+    }?;
+    row.map(|(seq, change_id)| {
+        Ok(ChangeCursor {
+            seq: u64::try_from(seq).map_err(|error| error.to_string())?,
+            change_id,
+        })
+    })
+    .transpose()
+}
+
+/// Moves the cursor from `previous` to `next`; false when another plane
+/// moved it first. Admissions are idempotent, so the loser loses nothing.
+pub fn advance_change_cursor(
+    db: &RuntimeDb,
+    instance_id: &str,
+    token: &str,
+    previous: Option<&ChangeCursor>,
+    next: &ChangeCursor,
+) -> Result<bool, String> {
+    let to_i64 = |seq: u64| i64::try_from(seq).map_err(|error| error.to_string());
+    let previous = previous
+        .map(|cursor| Ok::<_, String>((to_i64(cursor.seq)?, cursor.change_id.as_str())))
+        .transpose()?;
+    let next = (to_i64(next.seq)?, next.change_id.as_str());
+    match db {
+        RuntimeDb::Sqlite(store) => {
+            store.advance_agent_wake_cursor(instance_id, token, previous, next)
         }
-        offset += PAGE;
+        RuntimeDb::Postgres(store) => {
+            off_runtime(|| store.advance_agent_wake_cursor(instance_id, token, previous, next))
+        }
+    }
+}
+
+const CREATE_SQLITE: &str = "
+CREATE TABLE IF NOT EXISTS sekai_agent_wake_cursor (
+    instance_id TEXT NOT NULL,
+    token TEXT NOT NULL,
+    after_seq INTEGER NOT NULL,
+    change_id TEXT NOT NULL,
+    PRIMARY KEY (instance_id, token)
+);
+";
+
+type CursorRow = (i64, String);
+
+impl SekaiDb {
+    pub(crate) fn migrate_agent_wake_cursors(&self) -> Result<(), String> {
+        self.conn()
+            .execute_batch(CREATE_SQLITE)
+            .map_err(|error| error.to_string())
+    }
+
+    fn agent_wake_cursor(
+        &self,
+        instance_id: &str,
+        token: &str,
+    ) -> Result<Option<CursorRow>, String> {
+        self.conn()
+            .query_row(
+                "SELECT after_seq, change_id FROM sekai_agent_wake_cursor
+                 WHERE instance_id = ?1 AND token = ?2",
+                params![instance_id, token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    fn advance_agent_wake_cursor(
+        &self,
+        instance_id: &str,
+        token: &str,
+        previous: Option<(i64, &str)>,
+        next: (i64, &str),
+    ) -> Result<bool, String> {
+        let conn = self.conn();
+        let changed = match previous {
+            None => conn.execute(
+                "INSERT INTO sekai_agent_wake_cursor (instance_id, token, after_seq, change_id)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (instance_id, token) DO NOTHING",
+                params![instance_id, token, next.0, next.1],
+            ),
+            Some(previous) => conn.execute(
+                "UPDATE sekai_agent_wake_cursor SET after_seq = ?5, change_id = ?6
+                 WHERE instance_id = ?1 AND token = ?2 AND after_seq = ?3 AND change_id = ?4",
+                params![instance_id, token, previous.0, previous.1, next.0, next.1],
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+}
+
+impl PostgresDb {
+    fn agent_wake_cursor(
+        &self,
+        instance_id: &str,
+        token: &str,
+    ) -> Result<Option<CursorRow>, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT after_seq, change_id FROM sekai_agent_wake_cursor
+                 WHERE instance_id = $1 AND token = $2",
+                &[&instance_id, &token],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| (row.get(0), row.get(1))))
+    }
+
+    fn advance_agent_wake_cursor(
+        &self,
+        instance_id: &str,
+        token: &str,
+        previous: Option<(i64, &str)>,
+        next: (i64, &str),
+    ) -> Result<bool, String> {
+        let mut connection = self.connection()?;
+        let changed = match previous {
+            None => connection.execute(
+                "INSERT INTO sekai_agent_wake_cursor (instance_id, token, after_seq, change_id)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (instance_id, token) DO NOTHING",
+                &[&instance_id, &token, &next.0, &next.1],
+            ),
+            Some(previous) => connection.execute(
+                "UPDATE sekai_agent_wake_cursor SET after_seq = $5, change_id = $6
+                 WHERE instance_id = $1 AND token = $2 AND after_seq = $3 AND change_id = $4",
+                &[
+                    &instance_id,
+                    &token,
+                    &previous.0,
+                    &previous.1,
+                    &next.0,
+                    &next.1,
+                ],
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(changed == 1)
     }
 }
 
@@ -132,8 +367,16 @@ mod tests {
             ]
         );
         assert!(parse("").unwrap().is_empty());
-        assert!(parse("schedule:59999").is_err(), "below the minimum");
+        assert!(
+            parse("schedule:59999").is_err(),
+            "below the minimum interval"
+        );
         assert!(parse("nightly").is_err(), "unknown form");
+        assert_eq!(
+            parse("change:5000").unwrap(),
+            vec![("change:5000", WakePolicy::Change { debounce_ms: 5_000 })]
+        );
+        assert!(parse("change:999").is_err(), "below the minimum window");
         assert!(parse("schedule:60000,schedule:x").is_err());
     }
 
@@ -153,6 +396,63 @@ mod tests {
             a.rem_euclid(every),
             due_at("line-8", every, 10 * every).rem_euclid(every),
             "instances on one interval are spread"
+        );
+    }
+
+    /// A change cursor starts absent, moves only from the value a caller
+    /// read, and refuses a racing advance.
+    fn cursor_contract(db: &RuntimeDb, instance: &str) {
+        let token = "change:5000";
+        let at = |seq, id: &str| ChangeCursor {
+            seq,
+            change_id: id.into(),
+        };
+        assert_eq!(change_cursor(db, instance, token).unwrap(), None);
+        assert!(advance_change_cursor(db, instance, token, None, &at(7, "a")).unwrap());
+        assert!(!advance_change_cursor(db, instance, token, None, &at(9, "b")).unwrap());
+        assert_eq!(
+            change_cursor(db, instance, token).unwrap(),
+            Some(at(7, "a"))
+        );
+        assert!(
+            advance_change_cursor(db, instance, token, Some(&at(7, "a")), &at(12, "c")).unwrap()
+        );
+        assert!(
+            !advance_change_cursor(db, instance, token, Some(&at(7, "a")), &at(15, "d")).unwrap(),
+            "a stale advance loses"
+        );
+        assert!(
+            !advance_change_cursor(db, instance, token, Some(&at(12, "x")), &at(15, "d")).unwrap(),
+            "the change id is part of the fence"
+        );
+        assert_eq!(
+            change_cursor(db, instance, token).unwrap(),
+            Some(at(12, "c"))
+        );
+    }
+
+    #[test]
+    fn sqlite_change_cursors_follow_the_contract() {
+        cursor_contract(&RuntimeDb::memory(), "line-7");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_change_cursors_follow_the_contract() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
+        let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                &url,
+                4,
+                &std::fs::read(path).unwrap(),
+            ),
+            Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
+        };
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(db.unwrap()));
+        cursor_contract(
+            &db,
+            &format!("wake-{}-{}", std::process::id(), uuid::Uuid::new_v4()),
         );
     }
 

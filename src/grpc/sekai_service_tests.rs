@@ -33376,3 +33376,157 @@ async fn transform_ticks_admit_due_agent_schedule_wakes() {
     assert_eq!(turns[0].cause, "schedule");
     assert!(turns[0].cause_ref.starts_with("schedule:60000@"));
 }
+
+/// #1952: change wakes read as the instance principal. A change to a
+/// restricted field wakes nothing, a burst of visible changes in one window
+/// yields one turn, and an object outside the responsibility wakes nothing.
+#[tokio::test]
+async fn change_wakes_coalesce_and_ignore_hidden_fields() {
+    use crate::sekai::agent_turn;
+    use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
+    let db = Arc::new(RuntimeDb::memory());
+    let property = |name: &str, classification: &str| PropertyDef {
+        name: name.into(),
+        prop_type: PropertyType::String,
+        required: false,
+        description: String::new(),
+        enum_values: Vec::new(),
+        link_kind: String::new(),
+        compute_expr: String::new(),
+        classification: classification.into(),
+        struct_fields: Vec::new(),
+    };
+    db.upsert_object_type(&ObjectType {
+        kind: "ticket".into(),
+        description: "Ticket".into(),
+        properties: vec![property("status", "public"), property("cost", "sensitive")],
+        is_builtin: false,
+        implements: Vec::new(),
+    })
+    .unwrap();
+    let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db));
+    let (_, grants) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace("ops", "agent:line-7", security::Role::Viewer, "local")
+        .unwrap();
+    for grant in grants {
+        svc.security.add_grant(&grant);
+    }
+    let ticket = |id: &str, status: &str, cost: &str| Object {
+        id: id.into(),
+        kind: "ticket".into(),
+        name: id.into(),
+        namespace: "ops".into(),
+        external_id: format!("ops:{id}"),
+        properties: HashMap::from([
+            ("status".into(), status.into()),
+            ("cost".into(), cost.into()),
+        ]),
+        created: 0,
+        updated: 0,
+    };
+    for id in ["t-1", "t-2"] {
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(ticket(id, "open", "1")),
+                lease_precondition: None,
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+    }
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("principal_id".to_string(), "agent:line-7".to_string()),
+                ("responsibility".to_string(), "t-1".to_string()),
+                ("wake_policies".to_string(), "change:60000".to_string()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let tick = || async {
+        svc.tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms: 0 },
+            "local",
+        ))
+        .await
+        .unwrap();
+    };
+    let svc_ref = &svc;
+    let update = |id: &'static str, status: &'static str, cost: &'static str| async move {
+        let mut object = ticket(id, status, cost);
+        object.updated = svc_ref
+            .db
+            .runtime()
+            .get_object(id)
+            .unwrap()
+            .unwrap()
+            .updated;
+        svc_ref
+            .update_object(with_named_principal(
+                UpdateObjectRequest {
+                    object: Some(object),
+                    lease_precondition: None,
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+    };
+    let turns = || agent_turn::list_claimable(svc.db.runtime(), "ops", i64::MAX / 2, 10).unwrap();
+    tick().await;
+    assert!(turns().is_empty(), "history before the token wakes nothing");
+
+    update("t-1", "open", "2").await;
+    tick().await;
+    assert!(turns().is_empty(), "a hidden field wakes nothing");
+
+    update("t-1", "triage", "2").await;
+    update("t-1", "closed", "2").await;
+    update("t-2", "closed", "1").await;
+    tick().await;
+    tick().await;
+    let woken = turns();
+    assert_eq!(woken.len(), 1, "one turn per window: {woken:?}");
+    assert_eq!(woken[0].cause, agent_turn::Cause::ObjectChange);
+    assert!(woken[0].cause_ref.starts_with("change:60000@"));
+
+    // A cursor whose change id is no longer at its sequence (purged and
+    // reused history) restarts from the beginning, and the replayed changes
+    // admit nothing new.
+    let wake = crate::sekai::agent_wake::change_cursor;
+    let at = wake(svc.db.runtime(), "line-7", "change:60000")
+        .unwrap()
+        .unwrap();
+    let mut reused = at.clone();
+    reused.change_id = "purged".into();
+    crate::sekai::agent_wake::advance_change_cursor(
+        svc.db.runtime(),
+        "line-7",
+        "change:60000",
+        Some(&at),
+        &reused,
+    )
+    .unwrap();
+    tick().await;
+    assert_eq!(
+        wake(svc.db.runtime(), "line-7", "change:60000").unwrap(),
+        Some(Default::default())
+    );
+    tick().await;
+    assert_eq!(turns().len(), 1, "a replay admits nothing new");
+    assert_eq!(
+        wake(svc.db.runtime(), "line-7", "change:60000").unwrap(),
+        Some(at)
+    );
+}
