@@ -66,6 +66,7 @@ pub use sekai_types::evidence_vocabulary;
 pub mod execution_evidence;
 pub mod external_permit;
 pub mod ezu_geo_feed;
+pub mod federated_aggregate;
 pub mod federation_conflict;
 pub mod federation_network;
 pub mod federation_profile;
