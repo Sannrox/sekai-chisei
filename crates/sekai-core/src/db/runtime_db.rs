@@ -4692,6 +4692,20 @@ impl RuntimeDb {
         }
     }
 
+    pub fn take_over_admission(
+        &self,
+        instance: &crate::sekai::action_instance::ActionInstance,
+        expired: &crate::sekai::action_instance::AdmissionLease,
+        next: &crate::sekai::action_instance::AdmissionLease,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.take_over_admission(instance, expired, next),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.take_over_admission(instance, expired, next))
+            }
+        }
+    }
+
     pub fn release_admission(
         &self,
         instance_id: &str,

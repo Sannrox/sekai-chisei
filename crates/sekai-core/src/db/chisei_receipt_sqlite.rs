@@ -48,6 +48,14 @@ impl SekaiDb {
         }
         upsert_operation_receipt(&tx, receipt)?;
         self.append_operation_receipt_chain(&tx, receipt)?;
+        // The marker a takeover checks (#1931), in this transaction.
+        tx.execute(
+            "UPDATE sekai_action_instances
+             SET body_json = json_set(body_json, '$.admission_lease.receipt_recorded', json('true'))
+             WHERE instance_id = ?1",
+            rusqlite::params![instance_id],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }

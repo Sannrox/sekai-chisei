@@ -57,6 +57,9 @@ pub struct AppliedObjectMutation {
     pub object: Object,
     previous: Option<Object>,
     applied_updated: i64,
+    /// False when a recovered write's object was deleted since (#1931): the
+    /// receipt still names it, but nothing writes its old state again.
+    pub object_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +442,7 @@ pub fn apply(
         object,
         previous,
         applied_updated,
+        object_present: true,
     })
 }
 
@@ -510,6 +514,7 @@ pub fn grant_parked(
                     applied_updated: object.updated,
                     object,
                     previous,
+                    object_present: true,
                 })
             }))
         }
@@ -537,6 +542,42 @@ pub fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_m
     let _ = crate::sekai::function_document::complete_lineage_write(db, actor, object, now_ms);
     if object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
         let _ = crate::sekai::catalog_criticality::sync_outbox(db, object, now_ms);
+    }
+}
+
+impl AppliedObjectMutation {
+    /// The write an abandoned admission already committed, found again by a
+    /// takeover (#1931) so its receipt can be recorded. No previous state is
+    /// kept: a landed write is never undone.
+    pub fn recovered(object: Object, mutation: &str) -> Self {
+        Self {
+            object_id: object.id.clone(),
+            object_kind: object.kind.clone(),
+            created: mutation == OBJECT_MUTATION_CREATE,
+            mutation: mutation.to_string(),
+            applied_updated: object.updated,
+            object,
+            previous: None,
+            object_present: true,
+        }
+    }
+
+    /// A recovered write whose object was deleted after it committed.
+    pub fn recovered_deleted(object_id: &str, object_kind: &str, mutation: &str) -> Self {
+        let object = Object {
+            id: object_id.to_string(),
+            kind: object_kind.to_string(),
+            name: object_id.to_string(),
+            namespace: String::new(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        };
+        Self {
+            object_present: false,
+            ..Self::recovered(object, mutation)
+        }
     }
 }
 

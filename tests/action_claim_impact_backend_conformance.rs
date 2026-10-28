@@ -75,6 +75,8 @@ fn seed_effect(db: &RuntimeDb, namespace: &str, prefix: &str) -> ActionEffect {
         approval: None,
         offline: None,
         admission_lease: None,
+        admission_ontology_digest: None,
+        admission_budget_already_reserved: false,
     })
     .unwrap();
     effect
