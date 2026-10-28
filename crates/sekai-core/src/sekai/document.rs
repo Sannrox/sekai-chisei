@@ -42,6 +42,7 @@ const MEDIA_PDF: &str = "application/pdf";
 const MEDIA_JSON: &str = "application/json";
 const MEDIA_PNG: &str = "image/png";
 const MEDIA_JPEG: &str = "image/jpeg";
+const MEDIA_DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -645,7 +646,7 @@ fn supported_media_type(media_type: &str, class: Option<&str>) -> bool {
         Some(RENDITION_THUMBNAIL) => matches!(media_type, MEDIA_PNG | MEDIA_JPEG),
         None => matches!(
             media_type,
-            MEDIA_TEXT_PLAIN | MEDIA_PDF | MEDIA_JSON | MEDIA_PNG | MEDIA_JPEG
+            MEDIA_TEXT_PLAIN | MEDIA_PDF | MEDIA_JSON | MEDIA_PNG | MEDIA_JPEG | MEDIA_DOCX
         ),
         Some(_) => false,
     }
@@ -1049,6 +1050,29 @@ mod tests {
         assert_eq!(
             retrieve(&runtime, &["secret"], "case-review", Some("internal")).unwrap_err(),
             DOCUMENT_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn a_docx_document_is_admitted_with_its_extracted_text() {
+        let runtime = db();
+        pin_ceiling(&runtime, "analyst", "internal");
+        let mut docx = document();
+        docx.content_ref = content_ref(MEDIA_DOCX);
+        docx.content_digest = content_digest_for(&docx.content_ref).unwrap();
+        admit_document(&runtime, "analyst", &docx, 1_000).unwrap();
+        let mut text = rendition();
+        text.parent_content_digest = docx.content_digest.clone();
+        attach_rendition(&runtime, "analyst", &text, 1_500).unwrap();
+        // Renditions keep their own rules: DOCX is a source format only.
+        let mut docx_preview = rendition();
+        docx_preview.rendition_id = "rend:preview".into();
+        docx_preview.class = RENDITION_PREVIEW.into();
+        docx_preview.parent_content_digest = docx.content_digest.clone();
+        docx_preview.content_ref.media_type = MEDIA_DOCX.into();
+        assert_eq!(
+            attach_rendition(&runtime, "analyst", &docx_preview, 1_600).unwrap_err(),
+            FORMAT_UNSUPPORTED
         );
     }
 
