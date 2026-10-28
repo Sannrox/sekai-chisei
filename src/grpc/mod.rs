@@ -1688,6 +1688,7 @@ fn spawn_service_background_tasks(
         spawn_catalog_reconciler(db.clone());
         spawn_export_sweeper(db.clone());
         spawn_execution_evidence_reconciler(db.clone());
+        spawn_security_reopener(db.clone(), sekai_svc.clone());
     }
     if plane == ProcessPlane::Combined
         && let Some(clerk) = &sekai_svc.cross_store
@@ -1789,6 +1790,92 @@ fn spawn_export_sweeper(db: Arc<RuntimeDb>) {
             }
         }
     });
+}
+
+/// Principal the security disposition reopener runs as (#1954). Unset, the
+/// reopener does not run.
+const SECURITY_REOPEN_RUN_AS_ENV: &str = "SEKAI_SECURITY_REOPEN_RUN_AS";
+
+/// Reopen security dispositions whose validity basis changed or expired
+/// (#1925, #1954), in every namespace with the security package installed.
+/// The pass runs as the operator-configured principal, through the same
+/// namespace-write and freeze checks as an Action binding's run. Safe on
+/// every instance at once: the feed cursor moves by compare-and-set and a
+/// reopen supersedes its disposition at most once.
+fn spawn_security_reopener(db: Arc<RuntimeDb>, sekai: Arc<sekai_service::SekaiServiceImpl>) {
+    let Some(run_as) = std::env::var(SECURITY_REOPEN_RUN_AS_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    tracing::info!(%run_as, "security disposition reopener enabled");
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let (db, sekai, run_as) = (db.clone(), sekai.clone(), run_as.clone());
+            let result = tokio::task::spawn_blocking(move || {
+                run_security_reopen(&db, &sekai, &run_as, chrono::Utc::now().timestamp_millis())
+            })
+            .await;
+            match result {
+                Ok(Ok(skipped)) if skipped.is_empty() => {}
+                Ok(Ok(skipped)) => {
+                    tracing::warn!(?skipped, "security reopen skipped namespaces")
+                }
+                Ok(Err(error)) => tracing::error!(%error, "security reopen failed"),
+                Err(error) => tracing::error!(%error, "security reopen task failed"),
+            }
+        }
+    });
+}
+
+/// One reopen pass over every namespace with the security package. A
+/// namespace whose checks refuse `run_as`, or whose pass fails, is skipped
+/// and retried on the next tick; answers those with the reason.
+fn run_security_reopen(
+    db: &RuntimeDb,
+    sekai: &sekai_service::SekaiServiceImpl,
+    run_as: &str,
+    now_ms: i64,
+) -> Result<Vec<(String, String)>, String> {
+    use crate::sekai::action_instance_admission::ActionInstanceAdmission;
+    use crate::sekai::security_package::{
+        ACTION_DISPOSITION_REOPEN, PACKAGE_ID, run_reopen_pass_with,
+    };
+    let mut skipped = Vec::new();
+    for namespace in db.list_live_package_namespaces(PACKAGE_ID)? {
+        let (tenant, resource_tenant) =
+            match sekai.prepare_bound_run(None, &namespace, run_as, ACTION_DISPOSITION_REOPEN) {
+                Ok(tenants) => tenants,
+                Err(status) => {
+                    skipped.push((namespace, status.message().to_string()));
+                    continue;
+                }
+            };
+        // Submitted as an Action binding's run submits: the principal's
+        // clearance gates the marking the reopen carries (#1706), and its
+        // tenant and machine credential apply.
+        let gate = sekai.bound_marking_gate(run_as, &namespace);
+        let submit = |mut request: crate::sekai::action_instance_admission::ActionInstanceAdmissionRequest| {
+            request.marking_gate = gate.clone();
+            request.resource_tenant = resource_tenant.clone();
+            request.request_id = format!("op-{}", request.idempotency_key);
+            match &sekai.cross_store {
+                Some(clerk) => clerk.admit(request, run_as, now_ms, &tenant, true),
+                None => ActionInstanceAdmission::new(db, None)
+                    .with_tenant(&tenant)
+                    .with_machine_credential(true)
+                    .admit(request, run_as, now_ms),
+            }
+        };
+        if let Err(error) = run_reopen_pass_with(db, &namespace, now_ms, &submit) {
+            skipped.push((namespace, error));
+        }
+    }
+    Ok(skipped)
 }
 
 /// Keep object-type catalog entries in line with each published ontology
@@ -1917,6 +2004,134 @@ mod service_token_tests;
 mod tests {
     use super::*;
     use tonic::service::Interceptor;
+
+    /// The reopener runs only as a principal with namespace write, and a
+    /// namespace that refuses it is skipped, not reopened (#1954).
+    #[test]
+    fn the_security_reopener_runs_only_with_namespace_write() {
+        use crate::sekai::security_package::{self as package, ACTION_EXPOSURE_BASIS};
+        let db = Arc::new(RuntimeDb::memory());
+        let svc = sekai_service::SekaiServiceImpl::new(
+            crate::db::store::SekaiStore::from_shared_runtime(db.clone()),
+        );
+        package::install(&db, "ops", "reviewer", 1_000).unwrap();
+        let admit = |type_id: &str, parameters: serde_json::Value, key: &str| {
+            crate::sekai::action_instance_admission::ActionInstanceAdmission::new(&db, None)
+                .admit(
+                    crate::sekai::action_instance_admission::ActionInstanceAdmissionRequest {
+                        namespace: "ops".into(),
+                        type_id: type_id.into(),
+                        version: package::PACKAGE_VERSION.into(),
+                        parameters_json: parameters.to_string(),
+                        idempotency_key: key.into(),
+                        evidence_submission_ids: Vec::new(),
+                        request_id: String::new(),
+                        ontology_digest: String::new(),
+                        autonomous_envelope_id: String::new(),
+                        policy_context: Default::default(),
+                        delegating_actor: None,
+                        budget_already_reserved: false,
+                        resource_tenant: String::new(),
+                        binding_markings: Vec::new(),
+                        source_object_id: String::new(),
+                        marking_gate: Default::default(),
+                        expected_object_revision: String::new(),
+                        offline: None,
+                    },
+                    "reviewer",
+                    2_000,
+                )
+                .unwrap()
+        };
+        admit(
+            package::ACTION_FINDING,
+            serde_json::json!({"object_id": "f-1", "source": "scanner", "component": "c",
+                "version_range": "<1", "problem_signature": "sig", "reported_severity": "high"}),
+            "f",
+        );
+        admit(
+            package::ACTION_EXPOSURE,
+            serde_json::json!({"object_id": "e-1", "finding_id": "f-1", "release": "r",
+                "environment": "prod", "verdict": "unknown"}),
+            "e",
+        );
+        admit(
+            package::ACTION_DISPOSITION_RECORD,
+            serde_json::json!({"object_id": "d-1", "exposure_id": "e-1",
+                "disposition": "false-positive", "dependency_closure_digest": "sha256:a",
+                "release_digest": "sha256:r", "configuration_digest": "sha256:c",
+                "advisory_revision": "1"}),
+            "d",
+        );
+        admit(
+            ACTION_EXPOSURE_BASIS,
+            serde_json::json!({"object_id": "e-1", "dependency_closure_digest": "sha256:b"}),
+            "b",
+        );
+
+        // A team-managed namespace refuses a principal without its grant.
+        db.ensure_team_namespace(
+            "ops",
+            "svc-owner",
+            crate::sekai::security::Role::Editor,
+            "local",
+        )
+        .unwrap();
+        let skipped = run_security_reopen(&db, &svc, "svc-reopener", 3_000).unwrap();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(
+            package::disposition_chain_head(&db, "ops", "e-1")
+                .unwrap()
+                .unwrap()
+                .id,
+            "d-1"
+        );
+
+        let (_, grants) = db
+            .ensure_team_namespace(
+                "ops",
+                "svc-reopener",
+                crate::sekai::security::Role::Editor,
+                "local",
+            )
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        // Write alone is not clearance: a marked exposure stays as it is.
+        let mut exposure = db.get_object("e-1").unwrap().unwrap();
+        exposure
+            .properties
+            .insert("access_marking".into(), "restricted".into());
+        db.update_object(&exposure).unwrap();
+        let refused = run_security_reopen(&db, &svc, "svc-reopener", 3_000).unwrap();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(
+            package::disposition_chain_head(&db, "ops", "e-1")
+                .unwrap()
+                .unwrap()
+                .id,
+            "d-1"
+        );
+        exposure.properties.remove("access_marking");
+        db.update_object(&exposure).unwrap();
+        assert!(
+            run_security_reopen(&db, &svc, "svc-reopener", 3_000)
+                .unwrap()
+                .is_empty()
+        );
+        let head = package::disposition_chain_head(&db, "ops", "e-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            head.properties["disposition"],
+            package::DISPOSITION_NEEDS_REVIEW
+        );
+        assert_eq!(
+            head.properties["reopened_fact"],
+            "dependency_closure_digest"
+        );
+    }
 
     fn in_memory_db() -> Arc<RuntimeDb> {
         Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(

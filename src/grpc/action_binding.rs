@@ -399,7 +399,17 @@ impl SekaiServiceImpl {
     /// grants decide both what it reads and what it may submit, and a write
     /// freeze on its tenant or the resource tenant stops the run. Returns
     /// the acting tenant and the shared-space resource tenant.
-    pub(super) fn prepare_bound_run(
+    /// The clearance gate a bound run submits under: its service
+    /// principal must be cleared for the marking an instance carries.
+    pub(crate) fn bound_marking_gate(
+        &self,
+        run_as: &str,
+        namespace: &str,
+    ) -> crate::sekai::action_instance_admission::MarkingGate {
+        super::rpc_actions::submitter_marking_gate(self, &[run_as.to_string()], namespace)
+    }
+
+    pub(crate) fn prepare_bound_run(
         &self,
         tenant_context: Option<&RequestEnterpriseContext>,
         namespace: &str,

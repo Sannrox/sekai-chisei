@@ -215,6 +215,7 @@ const SECURITY_DISPOSITION_IDENTITY_SCHEMA: &str =
 const FEDERATED_ALLOWANCES_SCHEMA: &str = include_str!("postgres/0127_federated_allowances.sql");
 const AGENT_TURNS_SCHEMA: &str = include_str!("postgres/0128_agent_turns.sql");
 const AGENT_WAKE_CURSORS_SCHEMA: &str = include_str!("postgres/0129_agent_wake_cursors.sql");
+const PACKAGE_FEED_CURSORS_SCHEMA: &str = include_str!("postgres/0130_package_feed_cursors.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1014,6 +1015,12 @@ const MIGRATIONS: &[Migration] = &[
         128,
         "agent_wake_cursors",
         AGENT_WAKE_CURSORS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        129,
+        "package_feed_cursors",
+        PACKAGE_FEED_CURSORS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

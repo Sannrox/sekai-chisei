@@ -749,6 +749,8 @@ pub struct ReopenPass {
     pub next_seq: u64,
     /// Ids of the `needs-review` dispositions this pass wrote.
     pub reopened: Vec<String>,
+    /// Reopens that failed; their changes are read again by the next pass.
+    pub failures: Vec<String>,
 }
 
 /// Reopens the dispositions whose basis no longer matches their exposure
@@ -763,6 +765,40 @@ pub fn reopen_changed_basis(
     actor: &str,
     after_seq: u64,
     now_ms: i64,
+) -> Result<ReopenPass, String> {
+    reopen_changed_basis_with(
+        db,
+        namespace,
+        after_seq,
+        &plain_admission(db, actor, now_ms),
+    )
+}
+
+/// Submits a reopen. The server passes one that admits as its configured
+/// principal with that principal's clearance gate and tenant, as an Action
+/// binding's run does (#1954).
+pub type ReopenAdmit<'a> = dyn Fn(
+        crate::sekai::action_instance_admission::ActionInstanceAdmissionRequest,
+    ) -> Result<
+        crate::sekai::action_instance_admission::ActionInstanceAdmissionOutcome,
+        crate::sekai::action_instance_admission::ActionInstanceAdmissionError,
+    > + 'a;
+
+/// Admission as `actor` with no clearance gate, for an in-process caller
+/// that already holds the authority.
+fn plain_admission<'a>(db: &'a RuntimeDb, actor: &'a str, now_ms: i64) -> Box<ReopenAdmit<'a>> {
+    Box::new(move |request| {
+        crate::sekai::action_instance_admission::ActionInstanceAdmission::new(db, None)
+            .admit(request, actor, now_ms)
+    })
+}
+
+/// [`reopen_changed_basis`] submitting through `admit`.
+pub fn reopen_changed_basis_with(
+    db: &RuntimeDb,
+    namespace: &str,
+    after_seq: u64,
+    admit: &ReopenAdmit<'_>,
 ) -> Result<ReopenPass, String> {
     const PAGE: i32 = 500;
     let mut read_to = after_seq;
@@ -797,6 +833,7 @@ pub fn reopen_changed_basis(
     // A change whose reopen is still unresolved (awaiting approval) is read
     // again by the next pass, so the cursor stops before it.
     let mut next_seq = read_to;
+    let mut failures = Vec::new();
     for (exposure_id, first_seq) in changed {
         let Some(exposure) = db
             .get_object(&exposure_id)?
@@ -819,7 +856,17 @@ pub fn reopen_changed_basis(
         let Some(fact) = differing else {
             continue;
         };
-        match reopen(db, actor, &head, fact, now_ms)? {
+        // One refused reopen does not hold up the others; its change is
+        // read again by the next pass.
+        let attempt = match reopen(db, admit, &head, fact) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                failures.push(error);
+                next_seq = next_seq.min(first_seq.saturating_sub(1));
+                continue;
+            }
+        };
+        match attempt {
             Reopened::Written(id) => reopened.push(id),
             // The chain moved on (a concurrent successor, which may still
             // carry the old basis) or awaits an approver: the next pass
@@ -829,7 +876,11 @@ pub fn reopen_changed_basis(
             }
         }
     }
-    Ok(ReopenPass { next_seq, reopened })
+    Ok(ReopenPass {
+        next_seq,
+        reopened,
+        failures,
+    })
 }
 
 /// Reopens the dispositions heading their chain whose expiry passed by
@@ -839,6 +890,16 @@ pub fn reopen_expired(
     namespace: &str,
     actor: &str,
     now_ms: i64,
+) -> Result<Vec<String>, String> {
+    reopen_expired_with(db, namespace, now_ms, &plain_admission(db, actor, now_ms))
+}
+
+/// [`reopen_expired`] submitting through `admit`.
+pub fn reopen_expired_with(
+    db: &RuntimeDb,
+    namespace: &str,
+    now_ms: i64,
+    admit: &ReopenAdmit<'_>,
 ) -> Result<Vec<String>, String> {
     const PAGE: i32 = 500;
     let mut expired = Vec::new();
@@ -869,16 +930,148 @@ pub fn reopen_expired(
         }
     }
     let mut reopened = Vec::new();
+    let mut failures = Vec::new();
     for disposition in expired {
         // Only the head of a chain is in force; a superseded one is history.
         if !successor_of(db, &disposition)?.is_empty() {
             continue;
         }
-        if let Reopened::Written(id) = reopen(db, actor, &disposition, FACT_EXPIRES_AT, now_ms)? {
-            reopened.push(id);
+        // One refused reopen does not hold up the others.
+        match reopen(db, admit, &disposition, FACT_EXPIRES_AT) {
+            Ok(Reopened::Written(id)) => reopened.push(id),
+            Ok(_) => {}
+            Err(error) => failures.push(error),
         }
     }
-    Ok(reopened)
+    if failures.is_empty() {
+        Ok(reopened)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// The feed consumer id of the reopen pass.
+pub const REOPEN_CONSUMER: &str = "security.disposition-reopen";
+
+/// Runs one reopen pass over `namespace` as `actor` (#1954): basis changes
+/// since the namespace's durable feed cursor, then a sweep of every chain
+/// head for an expiry or a basis its exposure no longer has.
+/// The cursor moves by compare-and-set, so instances running the pass at
+/// once never move it backwards; a repeated pass reopens nothing twice.
+/// Answers the ids of the dispositions it wrote, or the reopens that failed
+/// after every other one was tried.
+pub fn run_reopen_pass(
+    db: &RuntimeDb,
+    namespace: &str,
+    actor: &str,
+    now_ms: i64,
+) -> Result<Vec<String>, String> {
+    run_reopen_pass_with(db, namespace, now_ms, &plain_admission(db, actor, now_ms))
+}
+
+/// Reopens every disposition heading its chain whose expiry passed or whose
+/// basis differs from its exposure's current facts. A full sweep, so it
+/// needs no feed position; a repeated sweep reopens nothing twice.
+pub fn reopen_stale_heads_with(
+    db: &RuntimeDb,
+    namespace: &str,
+    now_ms: i64,
+    admit: &ReopenAdmit<'_>,
+) -> Result<Vec<String>, String> {
+    const PAGE: i32 = 500;
+    let mut heads = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = db.list_objects(&crate::domain::ListFilter {
+            kind: Some(KIND_DISPOSITION.into()),
+            namespace: Some(namespace.into()),
+            limit: PAGE,
+            offset,
+            ..Default::default()
+        })?;
+        let full = page.len() == PAGE as usize;
+        offset += page.len() as i32;
+        heads.extend(
+            page.into_iter()
+                .filter(|disposition| !is_reopen(disposition)),
+        );
+        if !full {
+            break;
+        }
+    }
+    let mut reopened = Vec::new();
+    let mut failures = Vec::new();
+    for head in heads {
+        if !successor_of(db, &head)?.is_empty() {
+            continue;
+        }
+        let expired = head
+            .properties
+            .get(FACT_EXPIRES_AT)
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|expires| expires <= now_ms);
+        let fact = if expired {
+            Some(FACT_EXPIRES_AT)
+        } else {
+            let exposure = head
+                .properties
+                .get("exposure_id")
+                .map(|id| db.get_object(id))
+                .transpose()?
+                .flatten()
+                .filter(|exposure| exposure.kind == KIND_EXPOSURE);
+            exposure.and_then(|exposure| {
+                BASIS_FACTS.into_iter().find(|fact| {
+                    exposure
+                        .properties
+                        .get(*fact)
+                        .is_some_and(|current| basis_differs(&head, fact, current))
+                })
+            })
+        };
+        let Some(fact) = fact else { continue };
+        // One refused reopen does not hold up the others.
+        match reopen(db, admit, &head, fact) {
+            Ok(Reopened::Written(id)) => reopened.push(id),
+            Ok(_) => {}
+            Err(error) => failures.push(error),
+        }
+    }
+    if failures.is_empty() {
+        Ok(reopened)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// [`run_reopen_pass`] submitting through `admit`.
+pub fn run_reopen_pass_with(
+    db: &RuntimeDb,
+    namespace: &str,
+    now_ms: i64,
+    admit: &ReopenAdmit<'_>,
+) -> Result<Vec<String>, String> {
+    let cursor = db.get_package_feed_cursor(namespace, REOPEN_CONSUMER)?;
+    let pass = reopen_changed_basis_with(db, namespace, cursor.unwrap_or(0), admit)?;
+    if cursor != Some(pass.next_seq) {
+        // Lost to another instance's pass: it read the same changes.
+        db.advance_package_feed_cursor(namespace, REOPEN_CONSUMER, cursor, pass.next_seq)?;
+    }
+    let mut reopened = pass.reopened;
+    let mut failures = pass.failures;
+    // The sweep runs whatever the feed pass met. It also catches a basis
+    // change the feed position passed before its transaction committed:
+    // feed positions are allocated before commit, so the cursor is a fast
+    // path, never the only check.
+    match reopen_stale_heads_with(db, namespace, now_ms, admit) {
+        Ok(expired) => reopened.extend(expired),
+        Err(error) => failures.push(error),
+    }
+    if failures.is_empty() {
+        Ok(reopened)
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 fn is_reopen(disposition: &Object) -> bool {
@@ -909,15 +1102,14 @@ enum Reopened {
     AwaitingApproval,
 }
 
-/// Admits the reopen of `previous` for `fact` as `actor`. Its object id
+/// Admits the reopen of `previous` for `fact` through `admit`. Its object id
 /// derives from `previous`, so it supersedes the disposition at most once,
 /// and its idempotency key names the fact in the receipt.
 fn reopen(
     db: &RuntimeDb,
-    actor: &str,
+    submit: &ReopenAdmit<'_>,
     previous: &Object,
     fact: &str,
-    now_ms: i64,
 ) -> Result<Reopened, String> {
     let object_id = format!(
         "disposition-reopen-{}",
@@ -974,8 +1166,7 @@ fn reopen(
             expected_object_revision: String::new(),
             offline: None,
         };
-        crate::sekai::action_instance_admission::ActionInstanceAdmission::new(db, None)
-            .admit(request, actor, now_ms)
+        submit(request)
     };
     use crate::sekai::action_instance::{STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED};
     // A denial is final for its key. A pass that replays a denied attempt
@@ -2322,6 +2513,138 @@ mod tests {
         .unwrap();
         let pass = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, first.next_seq, 4_000).unwrap();
         assert_eq!(pass.reopened.len(), 1);
+        assert_eq!(
+            head(&runtime).properties["reopened_fact"],
+            "dependency_closure_digest"
+        );
+    }
+
+    /// Two instances running the pass at once reopen a changed and an
+    /// expired disposition once each, and the cursor only moves forward
+    /// (#1954).
+    #[test]
+    fn concurrent_reopen_passes_reopen_each_disposition_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekai.db");
+        let runtime = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(path.to_str().expect("utf-8 path")).expect("file sqlite"),
+        )));
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        admit(&runtime, ACTION_FINDING, finding("f-1", "sig-1"), "f").unwrap();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE,
+            exposure("e-1", VERDICT_UNKNOWN, None),
+            "e",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE,
+            json!({
+                "object_id": "e-2",
+                "finding_id": "f-1",
+                "release": "api@1.5.0",
+                "environment": "prod",
+                "verdict": VERDICT_UNKNOWN
+            }),
+            "e-2",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        let mut expiring = disposition("d-2", "mitigated", None);
+        expiring["exposure_id"] = "e-2".into();
+        admit(&runtime, ACTION_DISPOSITION_RECORD, expiring, "d-2").unwrap();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            basis("sha256:closure-b"),
+            "b",
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.list_live_package_namespaces(PACKAGE_ID).unwrap(),
+            vec![NAMESPACE.to_string()]
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let (runtime, barrier) = (Arc::clone(&runtime), Arc::clone(&barrier));
+                thread::spawn(move || {
+                    barrier.wait();
+                    run_reopen_pass(&runtime, NAMESPACE, ACTOR, 9_500)
+                })
+            })
+            .collect();
+        for worker in workers {
+            // A pass that lost a race on the store is retried; the stored
+            // chains below are the outcome either way.
+            if worker.join().unwrap().is_err() {
+                run_reopen_pass(&runtime, NAMESPACE, ACTOR, 9_500).unwrap();
+            }
+        }
+        for exposure_id in ["e-1", "e-2"] {
+            let head = disposition_chain_head(&runtime, NAMESPACE, exposure_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(head.properties["disposition"], DISPOSITION_NEEDS_REVIEW);
+        }
+        assert!(
+            run_reopen_pass(&runtime, NAMESPACE, ACTOR, 9_600)
+                .unwrap()
+                .is_empty()
+        );
+        let cursor = runtime
+            .get_package_feed_cursor(NAMESPACE, REOPEN_CONSUMER)
+            .unwrap()
+            .unwrap();
+        assert!(cursor > 0);
+        let dispositions = runtime
+            .list_objects(&crate::domain::ListFilter {
+                kind: Some(KIND_DISPOSITION.into()),
+                namespace: Some(NAMESPACE.into()),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(dispositions.len(), 4);
+    }
+
+    /// A basis change the feed cursor already passed is still reopened by
+    /// the pass's sweep (#1954): feed positions are allocated before commit,
+    /// so a late commit can land behind the cursor.
+    #[test]
+    fn the_pass_sweep_catches_a_change_behind_the_cursor() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_EXPOSURE_BASIS,
+            basis("sha256:closure-b"),
+            "b",
+        )
+        .unwrap();
+        // The cursor is already past the change, as after a late commit.
+        assert!(
+            runtime
+                .advance_package_feed_cursor(NAMESPACE, REOPEN_CONSUMER, None, u64::MAX >> 1)
+                .unwrap()
+        );
+        let reopened = run_reopen_pass(&runtime, NAMESPACE, ACTOR, 3_000).unwrap();
+        assert_eq!(reopened.len(), 1);
         assert_eq!(
             head(&runtime).properties["reopened_fact"],
             "dependency_closure_digest"

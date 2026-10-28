@@ -6,6 +6,76 @@ use super::sekai::SekaiDb;
 use crate::sekai::capability_package::{CapabilityPackageCertification, PACKAGE_UNAVAILABLE};
 
 impl SekaiDb {
+    /// Namespaces holding a live certification of `package_id`.
+    pub fn list_live_package_namespaces(&self, package_id: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT namespace FROM sekai_capability_packages
+                 WHERE json_extract(record_json, '$.package_id') = ?1
+                   AND json_extract(record_json, '$.superseded_by') = ''
+                   AND json_extract(record_json, '$.revocation') = ''
+                 ORDER BY namespace",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![package_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// The change-feed position a package consumer resumes after in
+    /// `namespace`; `None` before its first pass.
+    pub fn get_package_feed_cursor(
+        &self,
+        namespace: &str,
+        consumer: &str,
+    ) -> Result<Option<u64>, String> {
+        self.conn()
+            .query_row(
+                "SELECT next_seq FROM sekai_package_feed_cursors
+                 WHERE namespace = ?1 AND consumer = ?2",
+                params![namespace, consumer],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+            .map(|seq| seq.map(|seq| seq.max(0) as u64))
+    }
+
+    /// Moves the consumer's cursor from `expected` to `next`; false when
+    /// another pass moved it first.
+    pub fn advance_package_feed_cursor(
+        &self,
+        namespace: &str,
+        consumer: &str,
+        expected: Option<u64>,
+        next: u64,
+    ) -> Result<bool, String> {
+        let next = i64::try_from(next).map_err(|_| "feed position overflows".to_string())?;
+        let conn = self.conn();
+        let changed = match expected {
+            None => conn.execute(
+                "INSERT INTO sekai_package_feed_cursors (namespace, consumer, next_seq)
+                 VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+                params![namespace, consumer, next],
+            ),
+            Some(expected) => conn.execute(
+                "UPDATE sekai_package_feed_cursors SET next_seq = ?3
+                 WHERE namespace = ?1 AND consumer = ?2 AND next_seq = ?4",
+                params![
+                    namespace,
+                    consumer,
+                    next,
+                    i64::try_from(expected).map_err(|_| "feed position overflows".to_string())?
+                ],
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
     pub fn get_capability_package(
         &self,
         namespace: &str,

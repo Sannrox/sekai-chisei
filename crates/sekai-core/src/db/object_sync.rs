@@ -725,6 +725,12 @@ impl SekaiDb {
                 )
                 WHERE json_extract(record_json, '$.superseded_by') = ''
                   AND json_extract(record_json, '$.revocation') = '';
+                CREATE TABLE IF NOT EXISTS sekai_package_feed_cursors (
+                    namespace TEXT NOT NULL,
+                    consumer TEXT NOT NULL,
+                    next_seq INTEGER NOT NULL,
+                    PRIMARY KEY(namespace, consumer)
+                );
                 CREATE TABLE IF NOT EXISTS sekai_federation_network_contracts (
                     namespace TEXT NOT NULL,
                     contract_id TEXT NOT NULL,
