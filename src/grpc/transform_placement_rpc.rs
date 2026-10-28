@@ -319,6 +319,48 @@ mod tests {
         );
     }
 
+    /// An isolated-process put needs code; code on any other profile is
+    /// refused rather than dropped (#1605).
+    #[tokio::test]
+    async fn isolated_code_is_required_and_profile_bound() {
+        let svc = service();
+        let mut missing = isolated("nocode", Vec::new());
+        missing.code.clear();
+        let error = svc
+            .put_governed_transform(as_admin(PutGovernedTransformRequest {
+                transform: Some(missing),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "an isolated_process transform requires code for its engine"
+        );
+        let in_process = svc
+            .put_governed_transform(as_admin(PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    transform_id: "proj".into(),
+                    input_dataset_id: "in".into(),
+                    output_dataset_id: "out".into(),
+                    steps: vec![TransformStep {
+                        kind: "project".into(),
+                        columns: vec!["id".into()],
+                        ..Default::default()
+                    }],
+                    code: "SELECT 1".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            in_process.message(),
+            "code applies only to the isolated_process profile"
+        );
+    }
+
     #[tokio::test]
     async fn registration_requires_credential_admin() {
         let svc = service();
