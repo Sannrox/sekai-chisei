@@ -972,6 +972,7 @@ fn test_direct_context_survives_default_denied_expansion() {
         risk_score_ready: false,
         risk_signals: vec![],
         operation_risk_override: None,
+        action_impact: Default::default(),
         pinned_learning: None,
         sekai_facts: shared_facts(&db),
     };

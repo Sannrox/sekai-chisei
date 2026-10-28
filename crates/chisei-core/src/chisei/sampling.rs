@@ -163,6 +163,7 @@ mod tests {
             risk_score_ready: false,
             risk_signals: vec![],
             operation_risk_override: None,
+            action_impact: Default::default(),
             pinned_learning: None,
             sekai_facts: Default::default(),
         }

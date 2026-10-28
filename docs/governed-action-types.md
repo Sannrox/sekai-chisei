@@ -42,6 +42,7 @@ row for history.
 | `enabled` | Fail-closed gate for submit ([#397](governed-action-instances.md) uses `require_enabled`) |
 | `offline_conflict` | How an Action prepared offline meets an object changed since the device read it: `reject_any` (empty), `reject_touched`, or `last_writer_wins`. See [ADR 0127](decisions/0127-offline-governed-actions.md) |
 | `last_writer_wins_properties` | The properties `last_writer_wins` may overwrite. Set only with that rule |
+| `impact_class` | `routine` or `high_impact`; any other value is refused. Empty means unclassified. A model call (`ExecutionInput` or `DecideGatewayExecutionRequest`) may cite an Action Work claim as `action_claim`; while that claim is live and was taken by the calling principal in the call's namespace, the call takes this class. A missing, stale, expired or foreign claim resolves to unclassified, and so does any claim when the Chisei plane reads Sekai over its hop, which cannot prove the holder. The plan, the receipt's policy and model call events, and the gateway decision record carry `impact_class`, `action_claim_resolution`, `action_claim_effect_id` and `action_claim_generation`, never the fencing token |
 | `system_one` | Optional Function bind. Pinned model plus question-to-parameter map. Empty means preview does not fill. See [ADR 0084](decisions/0084-system-one-action-function.md) |
 
 ## Operator CLI

@@ -24,7 +24,6 @@ pub const MATURITY_DOCS: &str = include_str!("../docs/rpc-maturity.md");
 pub const EXPERIMENTAL_ENV: &str = "SEKAI_EXPERIMENTAL_RPCS";
 pub const EXPERIMENTAL_FEATURE: &str = "experimental-rpcs";
 pub const EXPERIMENTAL_CAPABILITY: &str = "sekai.rpc.experimental";
-pub const STABLE_LIMIT: usize = 68;
 
 const EXPERIMENTAL_MESSAGE: &str =
     "rpc is experimental; enable SEKAI_EXPERIMENTAL_RPCS=1 or the experimental-rpcs build feature";
@@ -65,7 +64,6 @@ pub struct RpcMaturityEntry {
 pub struct RpcMaturityTable {
     pub version: String,
     pub issue: u64,
-    pub stable_limit: usize,
     pub experimental_env: String,
     pub experimental_feature: String,
     pub entries: Vec<RpcMaturityEntry>,
@@ -92,12 +90,6 @@ impl RpcMaturityTable {
                 self.issue
             ));
         }
-        if self.stable_limit != STABLE_LIMIT {
-            return Err(format!(
-                "stable_limit must be {STABLE_LIMIT}, got {}",
-                self.stable_limit
-            ));
-        }
         if self.experimental_env != EXPERIMENTAL_ENV {
             return Err(format!(
                 "experimental_env must be {EXPERIMENTAL_ENV}, got {}",
@@ -112,7 +104,6 @@ impl RpcMaturityTable {
         }
         let proto = proto_rpc_keys()?;
         let mut seen = BTreeSet::new();
-        let mut stable = 0usize;
         for entry in &self.entries {
             if entry.rpc.trim().is_empty() || entry.rpc != entry.rpc.trim() {
                 return Err("maturity table contains an empty or padded rpc name".into());
@@ -142,11 +133,10 @@ impl RpcMaturityTable {
             if !proto.contains(&key) {
                 return Err(format!("maturity rpc {key} is not in proto"));
             }
-            if entry.classification == RpcClassification::Stable {
-                stable += 1;
-                if entry.real_backend == "fixture only" {
-                    return Err(format!("fixture-only rpc {} cannot be stable", entry.rpc));
-                }
+            if entry.classification == RpcClassification::Stable
+                && entry.real_backend == "fixture only"
+            {
+                return Err(format!("fixture-only rpc {} cannot be stable", entry.rpc));
             }
         }
         if seen != proto {
@@ -154,11 +144,6 @@ impl RpcMaturityTable {
             return Err(format!(
                 "maturity table is missing proto RPCs: {}",
                 missing.join(", ")
-            ));
-        }
-        if stable > STABLE_LIMIT {
-            return Err(format!(
-                "stable RPC count {stable} exceeds the {STABLE_LIMIT} target"
             ));
         }
         Ok(())
@@ -490,7 +475,7 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
-    fn table_matches_proto_and_stays_within_the_stable_limit() {
+    fn table_matches_proto_and_keeps_fixture_only_rpcs_unstable() {
         let table = RpcMaturityTable::load().expect("maturity table");
         assert!(
             table
@@ -529,6 +514,18 @@ mod tests {
                 "{rpc} is used by the gateway host"
             );
         }
+    }
+
+    /// The stable surface is uncapped: promoting an RPC edits only its entry.
+    #[test]
+    fn promoting_every_backed_rpc_to_stable_validates() {
+        let mut table = RpcMaturityTable::load().expect("maturity table");
+        for entry in &mut table.entries {
+            if entry.real_backend != "fixture only" {
+                entry.classification = RpcClassification::Stable;
+            }
+        }
+        table.validate().expect("no stable ceiling");
     }
 
     #[test]

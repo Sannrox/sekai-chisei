@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 use tonic::transport::Channel;
 
+use crate::chisei::action_impact::{ActionClaimRef, ClaimResolution};
 use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::chisei::sekai_commit::{SekaiCommitLookup, SekaiCommitRef};
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
@@ -276,6 +277,20 @@ impl SekaiFactReader for RemoteSekaiFactReader {
             "graph retrieval over the Sekai hop",
         ))
     }
+
+    fn cited_claim_resolution(
+        &self,
+        _: &ActionClaimRef,
+        _: &str,
+        _: &str,
+    ) -> Result<ClaimResolution, SekaiFactError> {
+        // The hop authenticates as this plane, not the caller, and no RPC
+        // proves which principal holds a claim. Refuse, so the call resolves
+        // to unclassified rather than trusting the citation.
+        Err(SekaiFactError::Unsupported(
+            "action claim over the Sekai hop",
+        ))
+    }
 }
 
 /// Walk ListObjects pages until the complete matching set (or the caller's
@@ -458,6 +473,26 @@ async fn lookup_on_channel(
 mod tests {
     use super::*;
     use crate::chisei::principal::PrincipalRole;
+
+    /// #1910: the hop cannot prove the caller holds a claim, so a cited
+    /// claim resolves to unclassified without contacting Sekai.
+    #[test]
+    fn hop_never_classifies_a_cited_claim() {
+        let reader = RemoteSekaiFactReader::new("http://127.0.0.1:1".into(), None);
+        let impact = crate::chisei::action_impact::ActionImpact::resolve(
+            &reader,
+            Some(ActionClaimRef {
+                effect_id: "gax-1".into(),
+                claim_generation: 1,
+                fencing_token: "fx-1".into(),
+            }),
+            "agent:alice",
+            "acme",
+        );
+        assert_eq!(impact.resolution, ClaimResolution::Unavailable);
+        assert_eq!(impact.class(), None);
+        assert!(reader.hop.channel.get().is_none());
+    }
 
     #[test]
     fn lookup_outside_runtime_reports_connect_error() {

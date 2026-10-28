@@ -109,7 +109,7 @@ impl ChiseiServiceImpl {
         requested_plan: ExecutionPlan,
     ) -> Result<<Self as ChiseiService>::ExecutePlanStreamStream, Status> {
         self.require_in_process_namespace_policy()?;
-        let plan = {
+        let mut plan = {
             let mut plans = self
                 .planned_executions
                 .lock()
@@ -175,6 +175,7 @@ impl ChiseiServiceImpl {
                 .remove(&requested_plan.plan_id)
                 .ok_or(Status::not_found("execution plan not found"))?;
         }
+        self.reresolve_action_impact(&mut plan, &actor);
         let namespace_hint = input.namespace.trim().to_string();
         let attempt_started_at_ms = chrono::Utc::now().timestamp_millis();
 
@@ -968,6 +969,9 @@ pub(super) fn record_completed_operation_on_with_path(
                     if let Some(cost_usd_micros) = cost_usd_micros {
                         attributes.insert("cost_usd_micros".into(), cost_usd_micros.to_string());
                     }
+                    attributes.extend(super::execution_planning::plan_action_claim_attributes(
+                        plan,
+                    ));
                     if let Some(path) = answer_path {
                         attributes.insert(
                             crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),

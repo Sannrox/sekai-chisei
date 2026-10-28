@@ -94,12 +94,7 @@ impl PostgresDb {
             validate_no_nul("runtime_id", runtime_id)?;
             validate_no_nul("fencing_token", fencing_token_in)?;
         }
-        if effect.claim_expires_at_ms <= now_ms {
-            return Err("claim lease expired".into());
-        }
-        if !effect.fence_matches(runtime_id, generation, fencing_token_in) {
-            return Err("fencing token or generation mismatch".into());
-        }
+        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
         if effect.max_park_cycles > 0 && effect.park_count >= effect.max_park_cycles {
             use crate::sekai::action_effect::{
                 EFFECT_LIFECYCLE_DEAD_LETTERED, EFFECT_STATUS_DEAD_LETTERED,
@@ -661,7 +656,6 @@ impl PostgresDb {
         request_id: &str,
         now_ms: i64,
     ) -> Result<bool, String> {
-        use crate::sekai::action_effect::EFFECT_STATUS_CLAIMED;
         validate_request_id(request_id)?;
         if !matches!(
             kind,
@@ -695,12 +689,9 @@ impl PostgresDb {
             return Ok(true);
         }
         let effect = pg_load_effect(&mut tx, effect_id, true)?;
-        if effect.status != EFFECT_STATUS_CLAIMED
-            || effect.claim_expires_at_ms <= now_ms
-            || !effect.fence_matches(runtime_id, generation, fencing_token)
-        {
-            return Err("claim event has no live matching fence".into());
-        }
+        effect
+            .require_live_fence(runtime_id, generation, fencing_token, now_ms)
+            .map_err(|_| "claim event has no live matching fence".to_string())?;
         let body = serde_json::json!({
             "effect_id": effect_id, "operation_id": effect.operation_id,
             "park_generation": effect.park_generation, "resolution_id": effect.active_resolution_id,
@@ -945,6 +936,7 @@ impl PostgresDb {
         effect_id: &str,
         runtime_id: &str,
         request_id: &str,
+        principal: &str,
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
@@ -1029,6 +1021,7 @@ impl PostgresDb {
         effect.claim_fencing_token = token;
         effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
         effect.claim_request_id = request_id.into();
+        effect.claim_principal = principal.into();
         effect.updated_at_ms = now_ms;
         effect.failure_reason.clear();
         pg_update_effect(&mut tx, &effect)?;
@@ -1045,7 +1038,6 @@ impl PostgresDb {
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
-        use crate::sekai::action_effect::EFFECT_STATUS_CLAIMED;
         let ttl = if ttl_ms <= 0 { 60_000 } else { ttl_ms };
         if ttl > 24 * 60 * 60 * 1_000 {
             return Err("ttl_ms exceeds max".into());
@@ -1057,15 +1049,7 @@ impl PostgresDb {
             validate_no_nul("runtime_id", runtime_id)?;
             validate_no_nul("fencing_token", fencing_token_in)?;
         }
-        if effect.status != EFFECT_STATUS_CLAIMED {
-            return Err(format!("effect not claimed (status={})", effect.status));
-        }
-        if effect.claim_expires_at_ms <= now_ms {
-            return Err("claim lease expired".into());
-        }
-        if !effect.fence_matches(runtime_id, generation, fencing_token_in) {
-            return Err("fencing token or generation mismatch".into());
-        }
+        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
         effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
         effect.updated_at_ms = now_ms;
         pg_update_effect(&mut tx, &effect)?;
@@ -1086,8 +1070,8 @@ impl PostgresDb {
     ) -> Result<ActionEffect, String> {
         use crate::sekai::action_effect::{
             ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, EFFECT_LIFECYCLE_AWAITING_CONTINUATION,
-            EFFECT_LIFECYCLE_COMPLETED, EFFECT_LIFECYCLE_FAILED, EFFECT_STATUS_CLAIMED,
-            EFFECT_STATUS_COMPLETED, EFFECT_STATUS_FAILED, EFFECT_STATUS_PARKED,
+            EFFECT_LIFECYCLE_COMPLETED, EFFECT_LIFECYCLE_FAILED, EFFECT_STATUS_COMPLETED,
+            EFFECT_STATUS_FAILED, EFFECT_STATUS_PARKED,
         };
         use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
         validate_no_nul("reason", reason)?;
@@ -1116,15 +1100,7 @@ impl PostgresDb {
         if effect.status == status {
             return Ok(effect);
         }
-        if effect.status != EFFECT_STATUS_CLAIMED {
-            return Err(format!("effect not claimed (status={})", effect.status));
-        }
-        if effect.claim_expires_at_ms <= now_ms {
-            return Err("claim lease expired".into());
-        }
-        if !effect.fence_matches(runtime_id, generation, fencing_token_in) {
-            return Err("fencing token or generation mismatch".into());
-        }
+        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
         effect.status = status.into();
         effect.lifecycle_state = match status {
             EFFECT_STATUS_COMPLETED => EFFECT_LIFECYCLE_COMPLETED,

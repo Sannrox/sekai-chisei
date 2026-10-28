@@ -1,7 +1,6 @@
 {
   "version": "sekai.rpc-maturity/v1",
   "issue": 871,
-  "stable_limit": 68,
   "experimental_env": "SEKAI_EXPERIMENTAL_RPCS",
   "experimental_feature": "experimental-rpcs",
   "entries": [

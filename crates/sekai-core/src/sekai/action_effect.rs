@@ -81,6 +81,11 @@ pub struct ActionEffect {
     /// Idempotency key for the last successful claim request.
     #[serde(default)]
     pub claim_request_id: String,
+    /// Authenticated principal that took the current claim (#1910). Empty
+    /// on claims taken before it was recorded; such a claim never classifies
+    /// a model call.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub claim_principal: String,
     #[serde(default)]
     pub park_generation: u64,
     #[serde(default)]
@@ -499,6 +504,29 @@ impl ActionEffect {
         }
     }
 
+    /// The fence every call on claimed work requires (heartbeat, park, ack,
+    /// claim events, and a model call citing the claim): the effect is
+    /// claimed, its lease has not expired, and owner, generation and token
+    /// match.
+    pub fn require_live_fence(
+        &self,
+        owner: &str,
+        generation: u64,
+        fencing_token: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        if self.status != EFFECT_STATUS_CLAIMED {
+            return Err(format!("effect not claimed (status={})", self.status));
+        }
+        if self.claim_expires_at_ms <= now_ms {
+            return Err("claim lease expired".into());
+        }
+        if !self.fence_matches(owner, generation, fencing_token) {
+            return Err("fencing token or generation mismatch".into());
+        }
+        Ok(())
+    }
+
     pub fn fence_matches(&self, owner: &str, generation: u64, fencing_token: &str) -> bool {
         self.claim_owner == owner
             && self.claim_generation == generation
@@ -577,6 +605,7 @@ pub fn plan_effects_for_admit(
                     claim_fencing_token: String::new(),
                     claim_expires_at_ms: 0,
                     claim_request_id: String::new(),
+                    claim_principal: String::new(),
                     park_generation: 0,
                     active_resolution_id: String::new(),
                     claim_attempt_count: 0,
@@ -642,6 +671,7 @@ pub fn plan_effects_for_admit(
                     claim_fencing_token: String::new(),
                     claim_expires_at_ms: 0,
                     claim_request_id: String::new(),
+                    claim_principal: String::new(),
                     park_generation: 0,
                     active_resolution_id: String::new(),
                     claim_attempt_count: 0,
@@ -708,6 +738,7 @@ pub fn plan_effects_for_admit(
                     claim_fencing_token: String::new(),
                     claim_expires_at_ms: 0,
                     claim_request_id: String::new(),
+                    claim_principal: String::new(),
                     park_generation: 0,
                     active_resolution_id: String::new(),
                     claim_attempt_count: 0,
@@ -1195,6 +1226,7 @@ impl SekaiDb {
         effect_id: &str,
         runtime_id: &str,
         request_id: &str,
+        principal: &str,
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
@@ -1266,6 +1298,7 @@ impl SekaiDb {
         effect.claim_fencing_token = fencing_token(effect_id, generation, runtime_id);
         effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
         effect.claim_request_id = request_id.into();
+        effect.claim_principal = principal.into();
         effect.updated_at_ms = now_ms;
         effect.failure_reason.clear();
         self.update_action_effect_lifecycle(&effect)
@@ -1288,15 +1321,7 @@ impl SekaiDb {
             validate_no_nul("runtime_id", runtime_id)?;
             validate_no_nul("fencing_token", fencing_token_in)?;
         }
-        if effect.status != EFFECT_STATUS_CLAIMED {
-            return Err(format!("effect not claimed (status={})", effect.status));
-        }
-        if effect.claim_expires_at_ms <= now_ms {
-            return Err("claim lease expired".into());
-        }
-        if !effect.fence_matches(runtime_id, generation, fencing_token_in) {
-            return Err("fencing token or generation mismatch".into());
-        }
+        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
         effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
         effect.updated_at_ms = now_ms;
         self.update_action_effect_lifecycle(&effect)
@@ -1340,15 +1365,7 @@ impl SekaiDb {
         if effect.status == status {
             return Ok(effect);
         }
-        if effect.status != EFFECT_STATUS_CLAIMED {
-            return Err(format!("effect not claimed (status={})", effect.status));
-        }
-        if effect.claim_expires_at_ms <= now_ms {
-            return Err("claim lease expired".into());
-        }
-        if !effect.fence_matches(runtime_id, generation, fencing_token_in) {
-            return Err("fencing token or generation mismatch".into());
-        }
+        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
         effect.status = status.into();
         effect.lifecycle_state = match status {
             EFFECT_STATUS_COMPLETED => EFFECT_LIFECYCLE_COMPLETED,
@@ -1444,12 +1461,7 @@ impl SekaiDb {
             validate_no_nul("runtime_id", runtime_id)?;
             validate_no_nul("fencing_token", fencing_token_in)?;
         }
-        if effect.claim_expires_at_ms <= now_ms {
-            return Err("claim lease expired".into());
-        }
-        if !effect.fence_matches(runtime_id, generation, fencing_token_in) {
-            return Err("fencing token or generation mismatch".into());
-        }
+        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
         if effect.max_park_cycles > 0 && effect.park_count >= effect.max_park_cycles {
             effect.status = EFFECT_STATUS_DEAD_LETTERED.into();
             effect.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
@@ -2043,12 +2055,9 @@ impl SekaiDb {
             return Ok(true);
         }
         let effect = load_effect_tx(&tx, effect_id)?;
-        if effect.status != EFFECT_STATUS_CLAIMED
-            || effect.claim_expires_at_ms <= now_ms
-            || !effect.fence_matches(runtime_id, generation, fencing_token)
-        {
-            return Err("claim event has no live matching fence".into());
-        }
+        effect
+            .require_live_fence(runtime_id, generation, fencing_token, now_ms)
+            .map_err(|_| "claim event has no live matching fence".to_string())?;
         let body = serde_json::json!({
             "effect_id": effect_id,
             "operation_id": effect.operation_id,
@@ -2450,8 +2459,15 @@ mod tests {
             .list_pending_runtime_dispatch_effects_page("acme", 1, None)
             .unwrap()
             .remove(0);
-        db.claim_action_work(&first.effect_id, "worker", "claim-first", 1000, 100)
-            .unwrap();
+        db.claim_action_work(
+            &first.effect_id,
+            "worker",
+            "claim-first",
+            "operator",
+            1000,
+            100,
+        )
+        .unwrap();
         let cursor = Some((first.created_at_ms, first.effect_id.as_str()));
         let pending = db
             .list_pending_runtime_dispatch_effects_page("acme", 10, cursor)
@@ -2552,6 +2568,7 @@ mod tests {
                 &effect.effect_id,
                 "legacy-worker",
                 "legacy-claim",
+                "operator",
                 1000,
                 100,
             )
@@ -2767,12 +2784,19 @@ mod tests {
         assert_eq!(claimable.len(), 1);
 
         assert!(
-            db.claim_action_work(&effect_id, "shikigami", "request\0id", 1000, 100)
-                .is_err()
+            db.claim_action_work(
+                &effect_id,
+                "shikigami",
+                "request\0id",
+                "operator",
+                1000,
+                100
+            )
+            .is_err()
         );
 
         let claimed = db
-            .claim_action_work(&effect_id, "shikigami", "req-1", 1000, 100)
+            .claim_action_work(&effect_id, "shikigami", "req-1", "operator", 1000, 100)
             .unwrap();
         assert_eq!(claimed.status, EFFECT_STATUS_CLAIMED);
         assert_eq!(claimed.claim_generation, 1);
@@ -2780,7 +2804,7 @@ mod tests {
 
         // Double claim by other runtime fails
         let err = db
-            .claim_action_work(&effect_id, "other", "req-2", 1000, 150)
+            .claim_action_work(&effect_id, "other", "req-2", "operator", 1000, 150)
             .unwrap_err();
         assert!(
             err.contains("already claimed") || err.contains("not claimable"),
@@ -2789,7 +2813,7 @@ mod tests {
 
         // Idempotent same request
         let replay = db
-            .claim_action_work(&effect_id, "shikigami", "req-1", 1000, 160)
+            .claim_action_work(&effect_id, "shikigami", "req-1", "operator", 1000, 160)
             .unwrap();
         assert_eq!(replay.claim_generation, 1);
 
@@ -2814,7 +2838,7 @@ mod tests {
 
         // Expiry reclaim
         let reclaimed = db
-            .claim_action_work(&effect_id, "other", "req-3", 1000, 10_000)
+            .claim_action_work(&effect_id, "other", "req-3", "operator", 1000, 10_000)
             .unwrap();
         assert_eq!(reclaimed.claim_owner, "other");
         assert_eq!(reclaimed.claim_generation, 2);
@@ -2849,7 +2873,14 @@ mod tests {
         .remove(0);
         db.put_action_effect(&effect).unwrap();
         let claimed = db
-            .claim_action_work(&effect.effect_id, "shikigami", "claim-1", 60_000, 100)
+            .claim_action_work(
+                &effect.effect_id,
+                "shikigami",
+                "claim-1",
+                "operator",
+                60_000,
+                100,
+            )
             .unwrap();
         let parked = db
             .park_action_work(
@@ -2920,7 +2951,14 @@ mod tests {
         assert_eq!(continuation.park_generation, 1);
 
         let reclaimed = db
-            .claim_action_work(&effect.effect_id, "shikigami", "claim-2", 60_000, 500)
+            .claim_action_work(
+                &effect.effect_id,
+                "shikigami",
+                "claim-2",
+                "operator",
+                60_000,
+                500,
+            )
             .unwrap();
         assert_eq!(reclaimed.claim_generation, 2);
         let active = db.get_active_continuation(&reclaimed).unwrap().unwrap();
@@ -2944,7 +2982,7 @@ mod tests {
         .remove(0);
         db.put_action_effect(&effect).unwrap();
         let claimed = db
-            .claim_action_work(&effect.effect_id, "runtime", "claim", 1_000, 10)
+            .claim_action_work(&effect.effect_id, "runtime", "claim", "operator", 1_000, 10)
             .unwrap();
         db.park_action_work(
             &effect.effect_id,
