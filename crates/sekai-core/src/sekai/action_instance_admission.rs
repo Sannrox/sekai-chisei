@@ -194,6 +194,64 @@ impl<'a> ActionInstanceAdmission<'a> {
         self
     }
 
+    /// The refusals [`Self::admit`] makes before it writes anything: missing
+    /// or malformed request fields, an unknown or disabled type, and
+    /// parameters its schema rejects. Reads only, so a caller that charges a
+    /// budget before admitting runs this first and never charges a request
+    /// that is refused anyway (#1864). Keep it in step with the start of
+    /// `admit`.
+    pub fn check_request(
+        &self,
+        request: &ActionInstanceAdmissionRequest,
+    ) -> Result<(), ActionInstanceAdmissionError> {
+        let namespace = request.namespace.trim();
+        require_value("namespace", namespace)?;
+        require_value("type_id", request.type_id.trim())?;
+        require_value("version", request.version.trim())?;
+        require_value("idempotency_key", request.idempotency_key.trim())?;
+        if request.idempotency_key.chars().any(char::is_whitespace) {
+            return Err(ActionInstanceAdmissionError::InvalidArgument(
+                "idempotency_key must not contain whitespace".into(),
+            ));
+        }
+        validate_parameters_json(&request.parameters_json)
+            .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        if request
+            .evidence_submission_ids
+            .iter()
+            .any(|id| id.trim().is_empty())
+        {
+            return Err(ActionInstanceAdmissionError::InvalidArgument(
+                "evidence_submission_ids must not contain empty ids".into(),
+            ));
+        }
+        let type_def = self
+            .db
+            .require_enabled_governed_action_type(namespace, &request.type_id, &request.version)
+            .map_err(|error| {
+                if error.contains("unknown") || error.contains("disabled") {
+                    ActionInstanceAdmissionError::FailedPrecondition(error)
+                } else {
+                    ActionInstanceAdmissionError::Internal(error)
+                }
+            })?;
+        crate::sekai::parameter_schema::validate_parameter_schema(&type_def.parameter_schema_json)
+            .map_err(|error| {
+                ActionInstanceAdmissionError::FailedPrecondition(format!(
+                    "governed action type parameter schema invalid: {error}"
+                ))
+            })?;
+        crate::sekai::parameter_schema::validate_parameters(
+            &type_def.parameter_schema_json,
+            &request.parameters_json,
+        )
+        .map_err(|error| {
+            ActionInstanceAdmissionError::InvalidArgument(format!(
+                "action parameters invalid: {error}"
+            ))
+        })
+    }
+
     pub fn admit(
         &self,
         request: ActionInstanceAdmissionRequest,

@@ -309,6 +309,12 @@ impl CrossStoreAdmission {
                 tenant,
                 machine_credential,
             )?;
+            // A fresh request Sekai would refuse before writing, invalid
+            // parameters among them, is refused before any budget is
+            // reserved (#1864). A replay of an existing reservation skips
+            // this, so it still returns its committed outcome.
+            ActionInstanceAdmission::new(self.sekai.runtime(), self.budget_port())
+                .check_request(&request)?;
         }
         let reserved = self.reserve(&request, actor, now_ms)?;
         let outcome = match self.submit_sekai(request, actor, now_ms, tenant, machine_credential) {
@@ -651,6 +657,36 @@ mod tests {
             error,
             ActionInstanceAdmissionError::AlreadyExists(_)
         ));
+    }
+
+    /// #1864: on distinct stores, a submit refused for invalid parameters
+    /// reserves nothing; only the admitted one consumes a unit.
+    #[test]
+    fn invalid_parameters_are_refused_before_any_budget_is_reserved() {
+        let (clerk, budget) = clerk_with_budget();
+        let used_before = budget.get_usage("action:governed").tokens_used;
+        let mut invalid = request("op-invalid");
+        invalid.parameters_json = r#"{"runtime":7}"#.into();
+        let error = clerk.admit(invalid, "alice", 10, "", false).unwrap_err();
+        assert!(
+            matches!(error, ActionInstanceAdmissionError::InvalidArgument(_)),
+            "{error:?}"
+        );
+        assert_eq!(budget.get_usage("action:governed").tokens_used, used_before);
+        assert!(
+            clerk
+                .chisei
+                .get_operation_reservation("acme", "op-invalid")
+                .unwrap()
+                .is_none()
+        );
+        clerk
+            .admit(request("op-valid"), "alice", 11, "", false)
+            .unwrap();
+        assert_eq!(
+            budget.get_usage("action:governed").tokens_used,
+            used_before + 1
+        );
     }
 
     #[test]
