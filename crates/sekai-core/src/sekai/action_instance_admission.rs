@@ -609,6 +609,16 @@ impl<'a> ActionInstanceAdmission<'a> {
             policy_decision_text = "require_approval".into();
             budget_decision = "deferred".into();
         }
+        // A frozen site agent instance admits no new Action on its behalf
+        // (#1934). The denial is recorded like any other, so it is audited.
+        if status != STATUS_DENIED
+            && let Some(instance_id) =
+                crate::sekai::site_agent_instance::frozen_instance_for(self.db, &namespace, actor)
+                    .map_err(ActionInstanceAdmissionError::Internal)?
+        {
+            status = STATUS_DENIED.into();
+            deny_reason = format!("site agent instance {instance_id} is frozen");
+        }
 
         let (budget_subject, budget_amount) = type_def
             .budget_charge(&namespace, actor, &request.parameters_json)
