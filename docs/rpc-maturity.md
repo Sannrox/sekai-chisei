@@ -130,6 +130,9 @@ Edit the fixture, then regenerate with
 | `SekaiService.EvaluateObjectSet` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.GrantNamespaceExport` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RevokeNamespaceExport` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.PublishFederatedAggregateAllowance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.WithdrawFederatedAggregateAllowance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetFederatedAggregateAllowance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ExportObjectSet` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ExportDatasetVersion` | `sekai.dataset, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetExportReceipt` | `sekai.graph, sekai.audit` | yes | none | `experimental` |

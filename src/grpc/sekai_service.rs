@@ -15,6 +15,8 @@ mod catalog_rpc;
 mod computed_response;
 #[path = "data_export_rpc.rs"]
 mod data_export_rpc;
+#[path = "federated_allowance_rpc.rs"]
+mod federated_allowance_rpc;
 use data_export_rpc::{
     EXPORT_BATCH, ExportCaller, ExportStream, ExportWriter, PreparedExport, export_grantee,
     run_export,
@@ -240,6 +242,27 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<RevokeNamespaceExportRequest>,
     ) -> Result<Response<RevokeNamespaceExportResponse>, Status> {
         self.revoke_namespace_export_rpc(req).await
+    }
+
+    async fn publish_federated_aggregate_allowance(
+        &self,
+        req: Request<PublishFederatedAggregateAllowanceRequest>,
+    ) -> Result<Response<PublishFederatedAggregateAllowanceResponse>, Status> {
+        self.publish_federated_aggregate_allowance_rpc(req).await
+    }
+
+    async fn withdraw_federated_aggregate_allowance(
+        &self,
+        req: Request<WithdrawFederatedAggregateAllowanceRequest>,
+    ) -> Result<Response<WithdrawFederatedAggregateAllowanceResponse>, Status> {
+        self.withdraw_federated_aggregate_allowance_rpc(req).await
+    }
+
+    async fn get_federated_aggregate_allowance(
+        &self,
+        req: Request<GetFederatedAggregateAllowanceRequest>,
+    ) -> Result<Response<GetFederatedAggregateAllowanceResponse>, Status> {
+        self.get_federated_aggregate_allowance_rpc(req).await
     }
 
     async fn export_object_set(

@@ -377,6 +377,7 @@ impl SekaiDb {
         // Sekai-owned, as their PostgreSQL migrations are.
         self.migrate_action_plans()?;
         self.migrate_export_grants()?;
+        self.migrate_federated_allowances()?;
         self.migrate_ontology_health_trends()?;
         self.migrate_catalog_criticality_outbox()?;
         Ok(())
