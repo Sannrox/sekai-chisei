@@ -677,7 +677,6 @@ fn marking_unavailable(error: String) -> Status {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::time::Instant;
     use tonic::metadata::MetadataValue;
 
     fn service_from(db: RuntimeDb) -> SekaiServiceImpl {
@@ -1018,8 +1017,10 @@ mod tests {
         assert_eq!(link_ids, ["xy", "xz", "yz"]);
     }
 
+    /// The page is capped and the count is exact, whatever the machine load:
+    /// this asserts work done, not elapsed time (#1919).
     #[tokio::test]
-    async fn ten_thousand_neighbors_return_a_capped_page_and_a_count_within_budget() {
+    async fn ten_thousand_neighbors_return_a_capped_page_and_an_exact_count() {
         let db = RuntimeDb::memory();
         add(&db, "hub", "node");
         for index in 0..10_000 {
@@ -1038,12 +1039,10 @@ mod tests {
         }
         let mut req = neighborhood_req("hub", 1);
         req.limit = 50;
-        let started = Instant::now();
         let response = expand_neighborhood(&svc, as_tester(req))
             .await
             .unwrap()
             .into_inner();
-        let elapsed = started.elapsed();
         assert_eq!(response.objects.len(), 50);
         assert_eq!(
             response.total_count, 10_001,
@@ -1059,7 +1058,5 @@ mod tests {
                 .iter()
                 .all(|id| !id.starts_with("hidden"))
         );
-        // About 2.5 s alone in a debug build; the margin absorbs a loaded shared machine.
-        assert!(elapsed.as_secs() < 30, "took {elapsed:?}");
     }
 }
