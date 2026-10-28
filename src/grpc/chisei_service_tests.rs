@@ -2208,11 +2208,8 @@ async fn planned_execution_charges_the_work_unit_budget_chain() {
         .plan
         .unwrap();
     let scope = plan.input.as_ref().unwrap().user_id.clone();
-    assert!(scope.ends_with("/work_unit:turn-1"), "{scope}");
-    assert!(
-        scope.starts_with("project:managed-conformance/agent:"),
-        "{scope}"
-    );
+    assert!(scope.ends_with("/work_unit:turn-1"));
+    assert!(scope.starts_with("project:managed-conformance/agent:"));
     service
         .budget
         .set_limit(&scope, 1, crate::chisei::budget::PeriodType::Daily)
@@ -2258,7 +2255,7 @@ async fn planned_execution_charges_the_work_unit_budget_chain() {
         .collect();
     let agent = scope.trim_end_matches("/work_unit:turn-2");
     for level in [scope.as_str(), agent, "project:managed-conformance"] {
-        assert_eq!(tokens.get(level), Some(&10), "{level}: {tokens:?}");
+        assert!(tokens.get(level) == Some(&10));
     }
 }
 
