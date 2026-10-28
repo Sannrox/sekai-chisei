@@ -414,54 +414,58 @@ pub fn validate_object_write(
 }
 
 /// The objects [`validate_object_write`] reads for `object`, as they are
-/// now: its finding, its evidence, its exposure, and every disposition it
-/// supersedes back to the first (#1941). The admission write commits only
+/// now, present or absent: its finding, its evidence, its exposure, and every
+/// disposition it supersedes back to the first (#1941). The admission write commits only
 /// while each is unchanged, so a reference changed between plan and commit,
 /// such as a raised exposure marking, refuses the write. Other kinds read
 /// nothing.
-pub fn references(db: &RuntimeDb, object: &Object) -> Result<Vec<Object>, String> {
+pub fn references(
+    db: &RuntimeDb,
+    object: &Object,
+) -> Result<Vec<crate::sekai::action_instance::PlanReference>, String> {
+    use crate::sekai::action_instance::PlanReference;
     let mut references = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
+    let mut read = |id: String| -> Result<Option<Object>, String> {
+        let found = db.get_object(&id)?;
+        references.push(match &found {
+            Some(found) => PlanReference::Present(found.clone()),
+            None => PlanReference::Absent(id),
+        });
+        Ok(found)
+    };
+    let mut previous = None;
     for id in reference_ids(object) {
-        if seen.insert(id.clone())
-            && let Some(found) = db.get_object(&id)?
-        {
-            references.push(found);
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let found = read(id.clone())?;
+        if object.properties.get("supersedes") == Some(&id) {
+            previous = found;
         }
     }
     if object.kind == KIND_DISPOSITION {
-        // The rest of the supersede chain, as far as it resolves; the rules
-        // stop at the same place.
-        let mut previous = references
-            .iter()
-            .find(|found| {
-                Some(found.id.as_str()) == object.properties.get("supersedes").map(String::as_str)
-            })
-            .and_then(|found| found.properties.get("supersedes"))
-            .filter(|id| !id.trim().is_empty())
-            .cloned();
-        while let Some(id) = previous.take() {
+        // The rest of the supersede chain, through its first missing link;
+        // the rules stop at the same place, and a link created later
+        // refuses the write.
+        let mut next = previous
+            .and_then(|found| found.properties.get("supersedes").cloned())
+            .filter(|id| !id.trim().is_empty());
+        while let Some(id) = next.take() {
             if !seen.insert(id.clone()) {
                 break;
             }
-            let Some(found) = db.get_object(&id)? else {
-                break;
-            };
-            previous = found
-                .properties
-                .get("supersedes")
-                .filter(|id| !id.trim().is_empty())
-                .cloned();
-            references.push(found);
+            next = read(id)?
+                .and_then(|found| found.properties.get("supersedes").cloned())
+                .filter(|id| !id.trim().is_empty());
         }
     }
     Ok(references)
 }
 
-/// The objects the rules for `object` require to exist: its finding, its
-/// measured evidence, its exposure and the disposition it supersedes. Once
-/// the rules pass, each must be among the [`references`] read before them.
-pub fn reference_ids(object: &Object) -> Vec<String> {
+/// The objects the rules for `object` read first: its finding, its measured
+/// evidence, its exposure and the disposition it supersedes.
+fn reference_ids(object: &Object) -> Vec<String> {
     let property = |name: &str| {
         object
             .properties
@@ -2189,7 +2193,7 @@ mod tests {
             planned
                 .references()
                 .iter()
-                .any(|reference| reference.id == "e-1"),
+                .any(|reference| reference.id() == "e-1"),
             "the exposure is a reference"
         );
         let mut raised = runtime.get_object("e-1").unwrap().unwrap();

@@ -4630,7 +4630,7 @@ impl RuntimeDb {
         target_object_id: &str,
         parked_object_digest: &str,
         write: Option<&crate::sekai::action_instance::ParkedGrantWrite>,
-        references: &[crate::domain::Object],
+        references: &[crate::sekai::action_instance::PlanReference],
         actor: &str,
         claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     ) -> Result<crate::sekai::action_instance::ParkedGrantOutcome, String> {
@@ -4688,7 +4688,7 @@ impl RuntimeDb {
         lease: &crate::sekai::action_instance::AdmissionLease,
         write: &crate::sekai::action_instance::ParkedGrantWrite,
         expected: Option<&crate::domain::Object>,
-        references: &[crate::domain::Object],
+        references: &[crate::sekai::action_instance::PlanReference],
         actor: &str,
         attribution: &crate::sekai::audit::ChangeAttribution,
     ) -> Result<

@@ -5721,7 +5721,9 @@ mod tests {
                 "rec-21",
                 &current_digest,
                 Some(&write),
-                std::slice::from_ref(&read),
+                &[crate::sekai::action_instance::PlanReference::Present(
+                    read.clone()
+                )],
                 "alice",
                 None,
             )

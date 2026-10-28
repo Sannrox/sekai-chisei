@@ -6,6 +6,7 @@
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{KIND_CAPABILITY, KIND_EXTERNAL_EVIDENCE, Object, is_valid_property_key};
+use crate::sekai::action_instance::PlanReference;
 use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
 use crate::sekai::feedback_package::KIND_OBSERVATION;
 use crate::sekai::governed_action_type::{
@@ -66,7 +67,7 @@ pub struct AppliedObjectMutation {
 pub enum PlannedObjectMutation {
     Create {
         object: Object,
-        references: Vec<Object>,
+        references: Vec<PlanReference>,
     },
     /// `before` is the object as planning read it; the write applies only if
     /// it is unchanged, so a concurrent change (a raised marking among them)
@@ -74,7 +75,7 @@ pub enum PlannedObjectMutation {
     Update {
         object: Object,
         before: Box<Object>,
-        references: Vec<Object>,
+        references: Vec<PlanReference>,
     },
 }
 
@@ -94,8 +95,9 @@ impl PlannedObjectMutation {
     }
 
     /// The other objects package rules read while planning, as they read
-    /// them (#1941). The admission write refuses the commit if any changed.
-    pub fn references(&self) -> &[Object] {
+    /// them, present or absent (#1941). The admission write refuses the
+    /// commit if any changed.
+    pub fn references(&self) -> &[PlanReference] {
         match self {
             Self::Create { references, .. } | Self::Update { references, .. } => references,
         }
@@ -209,7 +211,6 @@ pub fn plan(
             validate_object_schema(db, &planned)?;
             let references = package_references(db, &planned)?;
             validate_object_write(db, &mut planned, now_ms)?;
-            require_fenced(&planned, &references)?;
             Ok(Some(PlannedObjectMutation::Create {
                 object: planned,
                 references,
@@ -261,7 +262,6 @@ pub fn plan(
             validate_object_schema(db, &planned)?;
             let references = package_references(db, &planned)?;
             validate_object_write(db, &mut planned, now_ms)?;
-            require_fenced(&planned, &references)?;
             Ok(Some(PlannedObjectMutation::Update {
                 object: planned,
                 before: snapshot,
@@ -386,7 +386,6 @@ fn plan_catalog_curation(
     )?;
     let references = package_references(db, &planned)?;
     validate_object_write(db, &mut planned, now_ms)?;
-    require_fenced(&planned, &references)?;
     Ok(PlannedObjectMutation::Update {
         object: planned,
         before: Box::new(existing),
@@ -576,31 +575,14 @@ pub fn grant_parked(
     })
 }
 
-/// Every reference the package rules needed was there when the references
-/// were read. One that appeared since, while the rules ran, would otherwise
-/// escape the fence (#1941).
-fn require_fenced(
-    planned: &Object,
-    references: &[Object],
-) -> Result<(), ActionObjectMutationError> {
-    match crate::sekai::security_package::reference_ids(planned)
-        .into_iter()
-        .find(|id| !references.iter().any(|reference| reference.id == *id))
-    {
-        Some(id) => Err(ActionObjectMutationError::FailedPrecondition(format!(
-            "object {id} changed since the Action was planned; submit again"
-        ))),
-        None => Ok(()),
-    }
-}
-
 /// The objects package rules will read for `planned`, read before they run:
 /// if one changes after this read, during the rules or before the commit, the
-/// admission write refuses (#1941).
+/// admission write refuses (#1941). One absent now that the rules then find
+/// was created meanwhile, and refuses the same way.
 fn package_references(
     db: &RuntimeDb,
     planned: &Object,
-) -> Result<Vec<Object>, ActionObjectMutationError> {
+) -> Result<Vec<PlanReference>, ActionObjectMutationError> {
     crate::sekai::security_package::references(db, planned)
         .map_err(ActionObjectMutationError::Internal)
 }

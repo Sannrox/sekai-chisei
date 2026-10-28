@@ -208,7 +208,7 @@ impl PostgresDb {
         lease: &AdmissionLease,
         write: &ParkedGrantWrite,
         expected: Option<&crate::domain::Object>,
-        references: &[crate::domain::Object],
+        references: &[crate::sekai::action_instance::PlanReference],
         actor: &str,
         attribution: &crate::sekai::audit::ChangeAttribution,
     ) -> Result<FencedAdmissionWrite<Option<crate::domain::Object>>, String> {
@@ -506,7 +506,7 @@ impl PostgresDb {
         target_object_id: &str,
         parked_object_digest: &str,
         write: Option<&ParkedGrantWrite>,
-        references: &[crate::domain::Object],
+        references: &[crate::sekai::action_instance::PlanReference],
         actor: &str,
         claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
@@ -740,29 +740,34 @@ pub(crate) fn postgres_admission_fence_holds<C: postgres::GenericClient>(
     }))
 }
 
-/// The id of the first of `references` no longer stored as planning read it
-/// (#1941). Each is read `FOR SHARE`, so it stays as read until commit, in id
-/// order, so two writers lock in one order.
+/// The id of the first of `references` no longer as planning read it
+/// (#1941). A present one is read `FOR SHARE` and an absent one holds its
+/// lifecycle lock, which a create takes, so each stays as read until commit;
+/// in id order, so two writers lock in one order.
 fn postgres_changed_reference(
     tx: &mut postgres::Transaction<'_>,
-    references: &[crate::domain::Object],
+    references: &[crate::sekai::action_instance::PlanReference],
 ) -> Result<Option<String>, String> {
-    let mut ordered: Vec<&crate::domain::Object> = references.iter().collect();
-    ordered.sort_by(|left, right| left.id.cmp(&right.id));
+    use crate::sekai::action_instance::PlanReference;
+    let mut ordered: Vec<&PlanReference> = references.iter().collect();
+    ordered.sort_by(|left, right| left.id().cmp(right.id()));
     for reference in ordered {
+        if matches!(reference, PlanReference::Absent(_)) {
+            lock_object_lifecycle(tx, reference.id())?;
+        }
         let current = tx
             .query_opt(
                 &format!(
                     "SELECT {} FROM sekai_objects WHERE id = $1 FOR SHARE",
                     crate::db::postgres_audit::OBJECT_COLUMNS
                 ),
-                &[&reference.id],
+                &[&reference.id()],
             )
             .map_err(|error| error.to_string())?
             .map(row_to_object)
             .transpose()?;
-        if !current.is_some_and(|current| current.persisted_state_matches(reference)) {
-            return Ok(Some(reference.id.clone()));
+        if !reference.holds(current.as_ref()) {
+            return Ok(Some(reference.id().to_string()));
         }
     }
     Ok(None)

@@ -124,6 +124,33 @@ pub const ADMISSION_FENCE_LOST: &str = "action instance admission lost its reser
 /// read changed since (#1941); the object's id follows.
 pub const REFERENCE_CHANGED: &str = "admission reference changed: ";
 
+/// An object an admission's plan read, as it read it (#1941): present with
+/// its state, or absent. The write commits only while each still holds.
+#[derive(Debug, Clone)]
+pub enum PlanReference {
+    Present(crate::domain::Object),
+    Absent(String),
+}
+
+impl PlanReference {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Present(object) => &object.id,
+            Self::Absent(id) => id,
+        }
+    }
+
+    /// Whether `current`, the object stored now, is as planning read it.
+    pub fn holds(&self, current: Option<&crate::domain::Object>) -> bool {
+        match self {
+            Self::Present(read) => {
+                current.is_some_and(|current| current.persisted_state_matches(read))
+            }
+            Self::Absent(_) => current.is_none(),
+        }
+    }
+}
+
 /// The holder of an admission reservation. A takeover (#1931) bumps the
 /// generation; an owner's writes are refused once it is not current.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -750,7 +777,7 @@ impl SekaiDb {
         target_object_id: &str,
         parked_object_digest: &str,
         write: Option<&ParkedGrantWrite>,
-        references: &[crate::domain::Object],
+        references: &[PlanReference],
         actor: &str,
         claim: Option<&ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
@@ -922,7 +949,7 @@ impl SekaiDb {
         lease: &AdmissionLease,
         write: &ParkedGrantWrite,
         expected: Option<&crate::domain::Object>,
-        references: &[crate::domain::Object],
+        references: &[PlanReference],
         actor: &str,
         attribution: &crate::sekai::audit::ChangeAttribution,
     ) -> Result<FencedAdmissionWrite<Option<crate::domain::Object>>, String> {
@@ -1184,24 +1211,24 @@ pub(crate) fn reserve_for_test(
     (instance.instance_id, lease)
 }
 
-/// The id of the first of `references` no longer stored as planning read it
+/// The id of the first of `references` no longer as planning read it
 /// (#1941), inside `tx`.
 fn sqlite_changed_reference(
     tx: &rusqlite::Transaction<'_>,
-    references: &[crate::domain::Object],
+    references: &[PlanReference],
 ) -> Result<Option<String>, String> {
     for reference in references {
         let current = tx
             .query_row(
                 "SELECT id, kind, name, namespace, external_id, properties, created, updated
                  FROM sekai_objects WHERE id = ?1",
-                params![reference.id],
+                params![reference.id()],
                 crate::db::sekai::row_to_object,
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if !current.is_some_and(|current| current.persisted_state_matches(reference)) {
-            return Ok(Some(reference.id.clone()));
+        if !reference.holds(current.as_ref()) {
+            return Ok(Some(reference.id().to_string()));
         }
     }
     Ok(None)
@@ -1566,7 +1593,7 @@ mod tests {
                 &stale_lease,
                 &write,
                 None,
-                std::slice::from_ref(&planned),
+                &[PlanReference::Present(planned.clone())],
                 "a",
                 &attribution,
             )
@@ -1582,13 +1609,31 @@ mod tests {
                 &fresh_lease,
                 &write,
                 None,
-                std::slice::from_ref(&current),
+                &[PlanReference::Present(current.clone())],
                 "a",
                 &attribution,
             )
             .unwrap(),
             FencedAdmissionWrite::Applied(None)
         ));
+
+        // A reference read as absent refuses once it exists.
+        let ghost = format!("ghost-{tag}");
+        db.create_object_with_audit(&record(&ghost, 700), "a")
+            .unwrap();
+        let (absent_id, absent_lease) = reserve_for_test(db, &format!("ai-ref-absent-{tag}"), 100);
+        let error = db
+            .apply_admission_object_write(
+                &absent_id,
+                &absent_lease,
+                &ParkedGrantWrite::Create(record(&format!("other-{tag}"), 800)),
+                None,
+                &[PlanReference::Absent(ghost.clone())],
+                "a",
+                &attribution,
+            )
+            .unwrap_err();
+        assert_eq!(error, format!("{REFERENCE_CHANGED}{ghost}"));
     }
 
     #[test]
