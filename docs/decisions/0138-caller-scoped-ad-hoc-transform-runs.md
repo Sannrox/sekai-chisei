@@ -51,9 +51,10 @@ dataset lifetime of its own, so the boundary is recorded here.
    truncated.
 5. **Governed like any run.** Markings propagate from inputs to the output
    (`markings_in`, `markings_out`). The run is signed into the receipt chain
-   with its definition digest, engine, runtime image, input versions and
-   `session_label`. The new receipt field is empty on existing receipts and
-   left out of their digest when empty, so existing digests stay stable.
+   with its definition digest, engine, runtime image and input versions, like
+   any run. Its trigger cause is `adhoc` and its trigger reference is the
+   `session_label`, so the receipt names the session without a new receipt
+   field, and existing receipt digests are untouched.
 6. **Same engines and queue.** `analytical` runs execute in-process (ADR
    0101). `isolated_process` runs use the existing transform claim queue (ADR
    0102) with an `adhoc` mark, so workers claim them with the published claim
