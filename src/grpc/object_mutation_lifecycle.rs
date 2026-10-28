@@ -177,9 +177,9 @@ impl SekaiServiceImpl {
                 "catalog entries change only through RegisterCatalogEntry",
             ));
         }
-        if domain_object.kind == crate::sekai::site_agent_instance::KIND {
+        if crate::sekai::site_agent_memory::is_action_only_kind(&domain_object.kind) {
             return Err(Status::permission_denied(
-                "site agent instances change only through their governed Actions",
+                "site agent instances and their memory change only through their governed Actions",
             ));
         }
         let mut domain_object = domain_object;
@@ -299,10 +299,9 @@ impl SekaiServiceImpl {
         // A direct update of a site agent instance is never valid, and must
         // not reveal one the caller may not read: it answers as for a
         // missing object, before any authorization (ADR 0136).
-        if existing
-            .as_ref()
-            .is_some_and(|current| current.kind == crate::sekai::site_agent_instance::KIND)
-        {
+        if existing.as_ref().is_some_and(|current| {
+            crate::sekai::site_agent_memory::is_action_only_kind(&current.kind)
+        }) {
             return Err(Status::not_found("not found"));
         }
         if let Some(current) = &existing
@@ -459,10 +458,10 @@ impl SekaiServiceImpl {
             || existing
                 .as_ref()
                 .is_some_and(|existing| existing.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND)
-            || domain_object.kind == crate::sekai::site_agent_instance::KIND
-            || existing
-                .as_ref()
-                .is_some_and(|existing| existing.kind == crate::sekai::site_agent_instance::KIND)
+            || crate::sekai::site_agent_memory::is_action_only_kind(&domain_object.kind)
+            || existing.as_ref().is_some_and(|existing| {
+                crate::sekai::site_agent_memory::is_action_only_kind(&existing.kind)
+            })
         {
             return Err(Status::permission_denied(
                 "reserved governance kind; use the dedicated action RPCs",
@@ -642,10 +641,9 @@ impl SekaiServiceImpl {
         // caller may not read must not be told apart from a missing one. A
         // direct delete is never valid, so it answers as for a missing
         // object, for every caller, and deletes nothing (ADR 0136).
-        if expected
-            .as_ref()
-            .is_some_and(|current| current.kind == crate::sekai::site_agent_instance::KIND)
-        {
+        if expected.as_ref().is_some_and(|current| {
+            crate::sekai::site_agent_memory::is_action_only_kind(&current.kind)
+        }) {
             if precondition.is_none() {
                 return Ok(Response::new(GuardedDeleteObjectResponse {}));
             }

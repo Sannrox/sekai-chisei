@@ -210,7 +210,7 @@ pub fn plan(
             inherit_marking(db, namespace, &mut planned, None, marking)?;
             validate_object_schema(db, &planned)?;
             let references = package_references(db, &planned)?;
-            validate_object_write(db, &mut planned, now_ms)?;
+            validate_object_write(db, &mut planned, submitter, now_ms)?;
             Ok(Some(PlannedObjectMutation::Create {
                 object: planned,
                 references,
@@ -261,7 +261,7 @@ pub fn plan(
             )?;
             validate_object_schema(db, &planned)?;
             let references = package_references(db, &planned)?;
-            validate_object_write(db, &mut planned, now_ms)?;
+            validate_object_write(db, &mut planned, submitter, now_ms)?;
             Ok(Some(PlannedObjectMutation::Update {
                 object: planned,
                 before: snapshot,
@@ -385,7 +385,7 @@ fn plan_catalog_curation(
         },
     )?;
     let references = package_references(db, &planned)?;
-    validate_object_write(db, &mut planned, now_ms)?;
+    validate_object_write(db, &mut planned, submitter, now_ms)?;
     Ok(PlannedObjectMutation::Update {
         object: planned,
         before: Box::new(existing),
@@ -590,12 +590,16 @@ fn package_references(
 fn validate_object_write(
     db: &RuntimeDb,
     planned: &mut Object,
+    submitter: Option<&str>,
     now_ms: i64,
 ) -> Result<(), ActionObjectMutationError> {
     crate::sekai::feedback_package::validate_object_write(db, planned, now_ms)
         .and_then(|()| crate::sekai::security_package::validate_object_write(db, planned, now_ms))
         .and_then(|()| {
             crate::sekai::site_agent_instance::validate_object_write(db, planned, now_ms)
+        })
+        .and_then(|()| {
+            crate::sekai::site_agent_memory::validate_object_write(db, planned, submitter)
         })
         .and_then(|()| crate::sekai::function_document::validate_lineage_write(db, planned, now_ms))
         .map_err(ActionObjectMutationError::FailedPrecondition)

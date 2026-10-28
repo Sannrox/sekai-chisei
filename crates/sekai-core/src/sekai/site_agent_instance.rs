@@ -13,8 +13,8 @@
 //! SQLite is the reference store; PostgreSQL refuses instance writes until a
 //! parity slice (ADR 0136). Freezing (#1934) is its own pair of Actions: a
 //! frozen instance admits no new wake and no new Action submitted by its
-//! principal. Schedule wakes (#1951) read `wake_policies`; memory is a later
-//! slice.
+//! principal. Schedule wakes (#1951) read `wake_policies`; working memory is
+//! `site_agent_memory` (ADR 0139).
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;

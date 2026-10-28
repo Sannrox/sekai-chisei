@@ -164,4 +164,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0136: Site agent instances bind a responsibility to a certified definition and act as their principal](0136-site-agent-instances.md)
 - [ADR 0137: Agent turns use the transform scheduling ownership split](0137-agent-turns-share-the-scheduling-split.md)
 - [ADR 0138: Caller-scoped ad-hoc governed transform runs](0138-caller-scoped-ad-hoc-transform-runs.md)
+- [ADR 0139: Site agent working memory is governed objects the instance writes](0139-site-agent-working-memory.md)
 <!-- adr-index:end -->

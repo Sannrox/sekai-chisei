@@ -67,7 +67,7 @@ impl SekaiServiceImpl {
                 // A site agent instance the caller may not read is
                 // indistinguishable from a missing one, activated policy or
                 // not (ADR 0136).
-                let activated = obj_kind == crate::sekai::site_agent_instance::KIND
+                let activated = crate::sekai::site_agent_memory::is_action_only_kind(&obj_kind)
                     || self
                         .db
                         .runtime()
