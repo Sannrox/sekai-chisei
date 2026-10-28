@@ -140,6 +140,7 @@ fn seed_action_with_act(db: &RuntimeDb, prefix: &str, delegating_actor: Option<&
         resource_tenant: String::new(),
         marking: String::new(),
         conflict: None,
+        approval: None,
         offline: None,
     })
     .unwrap();

@@ -43,6 +43,26 @@ impl ActionDecision {
     }
 }
 
+/// The clause of an `ActionPolicy` that decided an action. Displays as
+/// `action_override:<action>`, `risk_override:<class>`, or
+/// `default_decision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRule<'a> {
+    ActionOverride(&'a str),
+    RiskOverride(RiskClass),
+    Default,
+}
+
+impl std::fmt::Display for PolicyRule<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PolicyRule::ActionOverride(action) => write!(formatter, "action_override:{action}"),
+            PolicyRule::RiskOverride(risk) => write!(formatter, "risk_override:{}", risk.as_str()),
+            PolicyRule::Default => formatter.write_str("default_decision"),
+        }
+    }
+}
+
 /// A governed-action policy for a single scope (e.g. `agent:codex-app` or a
 /// namespace). Resolution precedence for a given action is: per-action
 /// override, then per-risk-class override, then the scope default.
@@ -76,13 +96,23 @@ impl ActionPolicy {
 
     /// Resolve the decision for an action given its name and risk class.
     pub fn decide(&self, action: &str, risk: RiskClass) -> ActionDecision {
+        self.decide_with_rule(action, risk).0
+    }
+
+    /// `decide`, plus the clause that rendered the decision, for callers
+    /// that must explain it (a parked Action names its rule, #1867).
+    pub fn decide_with_rule<'a>(
+        &self,
+        action: &'a str,
+        risk: RiskClass,
+    ) -> (ActionDecision, PolicyRule<'a>) {
         if let Some(decision) = self.action_overrides.get(action) {
-            return *decision;
+            return (*decision, PolicyRule::ActionOverride(action));
         }
         if let Some(decision) = self.risk_overrides.get(&risk) {
-            return *decision;
+            return (*decision, PolicyRule::RiskOverride(risk));
         }
-        self.default_decision
+        (self.default_decision, PolicyRule::Default)
     }
 
     /// Serialize to a Sekai object property map (mirrors namespace policy

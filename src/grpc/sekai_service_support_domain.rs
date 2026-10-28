@@ -519,6 +519,14 @@ pub(super) fn to_proto_action_instance(
                 current_updated_ms: conflict.current_updated_ms,
                 properties: conflict.properties.clone(),
             }),
+        approval: domain.approval.as_ref().map(|approval| {
+            crate::grpc::pb::sekai::ActionApprovalRequirement {
+                policy_scope: approval.policy_scope.clone(),
+                rule: approval.rule.clone(),
+                approvers: approval.approvers.clone(),
+                approver_role: approval.approver_role.clone(),
+            }
+        }),
     }
 }
 fn to_proto_offline_submission(

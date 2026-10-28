@@ -623,6 +623,7 @@ fn closing_record(
         marking: String::new(),
         offline: None,
         conflict: None,
+        approval: None,
     }
 }
 

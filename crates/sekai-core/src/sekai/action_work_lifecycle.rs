@@ -1052,6 +1052,7 @@ mod tests {
             resource_tenant: String::new(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         })
         .unwrap();
@@ -1190,6 +1191,7 @@ mod tests {
             resource_tenant: String::new(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         })
         .unwrap();
@@ -1274,6 +1276,7 @@ mod tests {
             resource_tenant: String::new(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         })
         .unwrap();
@@ -1414,6 +1417,7 @@ mod tests {
             resource_tenant: "tenant-test".into(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         })
         .unwrap();
@@ -1476,6 +1480,7 @@ mod tests {
             resource_tenant: String::new(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         })
         .unwrap();

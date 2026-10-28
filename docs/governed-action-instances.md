@@ -312,6 +312,16 @@ gets an empty list.
   type declares none, a namespace administrator. The submitter never decides
   their own instance. Every refusal, including an unknown instance, answers
   `PERMISSION_DENIED` with `access denied`.
+- **Why it parked (#1867).** A parked instance carries `approval`: the
+  Action policy scope and the clause that required approval
+  (`action_override:<action>`, `risk_override:<class>`, or
+  `default_decision`; `agent_autonomy:propose_only` with an empty scope when
+  agent autonomy parked an allowed submit), the type's `approvers`, and
+  `approver_role=namespace_admin` when it names none. Admission records it at
+  park time and keeps it after the decision. The policy event of the receipt
+  and the `submit_action_instance` decision record carry the same fields as
+  `approval_policy_scope`, `approval_rule`, `approvers`, and `approver_role`.
+  Instances parked before this field existed have no `approval`.
 - **Review queues (#1455).** A type may set `review_queue_id`, an optional
   numeric `review_threshold` on a parameter, an SLA, a pool, and escalation
   (`auto_deny` or `reassign`). Matching parked instances record the queue and

@@ -658,6 +658,7 @@ mod tests {
             resource_tenant: String::new(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         };
         db.put_action_instance(&instance).unwrap();
@@ -788,6 +789,7 @@ mod tests {
             resource_tenant: String::new(),
             marking: String::new(),
             conflict: None,
+            approval: None,
             offline: None,
         };
         db.put_action_instance(&failed).unwrap();

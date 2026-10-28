@@ -2536,6 +2536,23 @@ message ActionInstance {
   // Set when an offline Action met a changed object; the instance is denied
   // with deny_reason offline_conflict.
   ActionConflict conflict = 27;
+  // Why the instance parked and who may decide it (#1867). Set when it
+  // parked, kept after the decision; unset for an instance that never parked.
+  ActionApprovalRequirement approval = 28;
+}
+// What required approval for a parked ActionInstance, as admission saw it.
+message ActionApprovalRequirement {
+  // Action policy scope whose rule required approval, e.g. project:<scope>.
+  // Empty when agent autonomy parked a submit the policy allowed.
+  string policy_scope = 1;
+  // action_override:<action> | risk_override:<class> | default_decision |
+  // agent_autonomy:propose_only
+  string rule = 2;
+  // Principals the Action type names as approvers. The submitter never
+  // decides their own instance, even when listed.
+  repeated string approvers = 3;
+  // namespace_admin when the type names no approvers, else empty.
+  string approver_role = 4;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;

@@ -16,9 +16,10 @@ use sekai_chisei::grpc::pb::chisei::{
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    ActionInstance, ClassificationIncomparablePair, ClassificationLattice,
-    ClassificationParentEdge, CreateObjectRequest, DecideActionInstanceRequest,
-    EnsureTeamNamespaceRequest, GetObjectRequest, Object, PutClassificationLatticeRequest,
+    ActionApprovalRequirement, ActionInstance, ClassificationIncomparablePair,
+    ClassificationLattice, ClassificationParentEdge, CreateObjectRequest,
+    DecideActionInstanceRequest, EnsureTeamNamespaceRequest, GetActionInstanceRequest,
+    GetObjectRequest, ListActionInstancesRequest, Object, PutClassificationLatticeRequest,
     SubmitActionInstanceRequest,
 };
 use serde_json::{Value, json};
@@ -424,6 +425,44 @@ async fn invasions_apply_only_after_the_admiral_grants() {
         )
         .await;
     assert_eq!(parked.status, "parked", "{parked:?}");
+    // The park names the policy rule that required approval and the admiral.
+    let approval = ActionApprovalRequirement {
+        policy_scope: "project:game-invasions".into(),
+        rule: "default_decision".into(),
+        approvers: vec!["admiral".into()],
+        approver_role: String::new(),
+    };
+    assert_eq!(parked.approval.as_ref(), Some(&approval), "{parked:?}");
+    let read = game
+        .sekai
+        .clone()
+        .get_action_instance(GetActionInstanceRequest {
+            instance_id: parked.instance_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("read instance")
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(read.approval.as_ref(), Some(&approval));
+    let inbox = game
+        .sekai
+        .clone()
+        .list_action_instances(bearer(
+            &game.tokens["admiral"],
+            ListActionInstancesRequest {
+                namespace: parked.namespace.clone(),
+                decidable_by_caller: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("admiral inbox")
+        .into_inner()
+        .instances;
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    assert_eq!(inbox[0].approval.as_ref(), Some(&approval));
 
     // Refused: the submitting agent cannot approve its own invasion.
     let self_approval = game
