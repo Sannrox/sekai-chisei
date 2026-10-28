@@ -185,19 +185,33 @@ fn admit_or_skip(
     }
 }
 
-/// The mutation sequence a change token has read up to; `None` before its
-/// first tick.
+/// Where a change token has read to: the sequence of the last mutation read
+/// and that mutation's change id. Sequences can be reused after history is
+/// purged, so a reader confirms the id is still at the sequence before
+/// reading after it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangeCursor {
+    pub seq: u64,
+    pub change_id: String,
+}
+
+/// The cursor of a change token; `None` before its first tick.
 pub fn change_cursor(
     db: &RuntimeDb,
     instance_id: &str,
     token: &str,
-) -> Result<Option<u64>, String> {
-    let seq = match db {
+) -> Result<Option<ChangeCursor>, String> {
+    let row = match db {
         RuntimeDb::Sqlite(store) => store.agent_wake_cursor(instance_id, token),
         RuntimeDb::Postgres(store) => off_runtime(|| store.agent_wake_cursor(instance_id, token)),
     }?;
-    seq.map(|seq| u64::try_from(seq).map_err(|error| error.to_string()))
-        .transpose()
+    row.map(|(seq, change_id)| {
+        Ok(ChangeCursor {
+            seq: u64::try_from(seq).map_err(|error| error.to_string())?,
+            change_id,
+        })
+    })
+    .transpose()
 }
 
 /// Moves the cursor from `previous` to `next`; false when another plane
@@ -206,12 +220,14 @@ pub fn advance_change_cursor(
     db: &RuntimeDb,
     instance_id: &str,
     token: &str,
-    previous: Option<u64>,
-    next: u64,
+    previous: Option<&ChangeCursor>,
+    next: &ChangeCursor,
 ) -> Result<bool, String> {
     let to_i64 = |seq: u64| i64::try_from(seq).map_err(|error| error.to_string());
-    let previous = previous.map(to_i64).transpose()?;
-    let next = to_i64(next)?;
+    let previous = previous
+        .map(|cursor| Ok::<_, String>((to_i64(cursor.seq)?, cursor.change_id.as_str())))
+        .transpose()?;
+    let next = (to_i64(next.seq)?, next.change_id.as_str());
     match db {
         RuntimeDb::Sqlite(store) => {
             store.advance_agent_wake_cursor(instance_id, token, previous, next)
@@ -227,9 +243,12 @@ CREATE TABLE IF NOT EXISTS sekai_agent_wake_cursor (
     instance_id TEXT NOT NULL,
     token TEXT NOT NULL,
     after_seq INTEGER NOT NULL,
+    change_id TEXT NOT NULL,
     PRIMARY KEY (instance_id, token)
 );
 ";
+
+type CursorRow = (i64, String);
 
 impl SekaiDb {
     pub(crate) fn migrate_agent_wake_cursors(&self) -> Result<(), String> {
@@ -238,12 +257,17 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    fn agent_wake_cursor(&self, instance_id: &str, token: &str) -> Result<Option<i64>, String> {
+    fn agent_wake_cursor(
+        &self,
+        instance_id: &str,
+        token: &str,
+    ) -> Result<Option<CursorRow>, String> {
         self.conn()
             .query_row(
-                "SELECT after_seq FROM sekai_agent_wake_cursor WHERE instance_id = ?1 AND token = ?2",
+                "SELECT after_seq, change_id FROM sekai_agent_wake_cursor
+                 WHERE instance_id = ?1 AND token = ?2",
                 params![instance_id, token],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())
@@ -253,20 +277,20 @@ impl SekaiDb {
         &self,
         instance_id: &str,
         token: &str,
-        previous: Option<i64>,
-        next: i64,
+        previous: Option<(i64, &str)>,
+        next: (i64, &str),
     ) -> Result<bool, String> {
         let conn = self.conn();
         let changed = match previous {
             None => conn.execute(
-                "INSERT INTO sekai_agent_wake_cursor (instance_id, token, after_seq)
-                 VALUES (?1, ?2, ?3) ON CONFLICT (instance_id, token) DO NOTHING",
-                params![instance_id, token, next],
+                "INSERT INTO sekai_agent_wake_cursor (instance_id, token, after_seq, change_id)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (instance_id, token) DO NOTHING",
+                params![instance_id, token, next.0, next.1],
             ),
             Some(previous) => conn.execute(
-                "UPDATE sekai_agent_wake_cursor SET after_seq = ?4
-                 WHERE instance_id = ?1 AND token = ?2 AND after_seq = ?3",
-                params![instance_id, token, previous, next],
+                "UPDATE sekai_agent_wake_cursor SET after_seq = ?5, change_id = ?6
+                 WHERE instance_id = ?1 AND token = ?2 AND after_seq = ?3 AND change_id = ?4",
+                params![instance_id, token, previous.0, previous.1, next.0, next.1],
             ),
         }
         .map_err(|error| error.to_string())?;
@@ -275,35 +299,47 @@ impl SekaiDb {
 }
 
 impl PostgresDb {
-    fn agent_wake_cursor(&self, instance_id: &str, token: &str) -> Result<Option<i64>, String> {
+    fn agent_wake_cursor(
+        &self,
+        instance_id: &str,
+        token: &str,
+    ) -> Result<Option<CursorRow>, String> {
         Ok(self
             .connection()?
             .query_opt(
-                "SELECT after_seq FROM sekai_agent_wake_cursor WHERE instance_id = $1 AND token = $2",
+                "SELECT after_seq, change_id FROM sekai_agent_wake_cursor
+                 WHERE instance_id = $1 AND token = $2",
                 &[&instance_id, &token],
             )
             .map_err(|error| error.to_string())?
-            .map(|row| row.get(0)))
+            .map(|row| (row.get(0), row.get(1))))
     }
 
     fn advance_agent_wake_cursor(
         &self,
         instance_id: &str,
         token: &str,
-        previous: Option<i64>,
-        next: i64,
+        previous: Option<(i64, &str)>,
+        next: (i64, &str),
     ) -> Result<bool, String> {
         let mut connection = self.connection()?;
         let changed = match previous {
             None => connection.execute(
-                "INSERT INTO sekai_agent_wake_cursor (instance_id, token, after_seq)
-                 VALUES ($1, $2, $3) ON CONFLICT (instance_id, token) DO NOTHING",
-                &[&instance_id, &token, &next],
+                "INSERT INTO sekai_agent_wake_cursor (instance_id, token, after_seq, change_id)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (instance_id, token) DO NOTHING",
+                &[&instance_id, &token, &next.0, &next.1],
             ),
             Some(previous) => connection.execute(
-                "UPDATE sekai_agent_wake_cursor SET after_seq = $4
-                 WHERE instance_id = $1 AND token = $2 AND after_seq = $3",
-                &[&instance_id, &token, &previous, &next],
+                "UPDATE sekai_agent_wake_cursor SET after_seq = $5, change_id = $6
+                 WHERE instance_id = $1 AND token = $2 AND after_seq = $3 AND change_id = $4",
+                &[
+                    &instance_id,
+                    &token,
+                    &previous.0,
+                    &previous.1,
+                    &next.0,
+                    &next.1,
+                ],
             ),
         }
         .map_err(|error| error.to_string())?;
@@ -367,16 +403,32 @@ mod tests {
     /// read, and refuses a racing advance.
     fn cursor_contract(db: &RuntimeDb, instance: &str) {
         let token = "change:5000";
+        let at = |seq, id: &str| ChangeCursor {
+            seq,
+            change_id: id.into(),
+        };
         assert_eq!(change_cursor(db, instance, token).unwrap(), None);
-        assert!(advance_change_cursor(db, instance, token, None, 7).unwrap());
-        assert!(!advance_change_cursor(db, instance, token, None, 9).unwrap());
-        assert_eq!(change_cursor(db, instance, token).unwrap(), Some(7));
-        assert!(advance_change_cursor(db, instance, token, Some(7), 12).unwrap());
+        assert!(advance_change_cursor(db, instance, token, None, &at(7, "a")).unwrap());
+        assert!(!advance_change_cursor(db, instance, token, None, &at(9, "b")).unwrap());
+        assert_eq!(
+            change_cursor(db, instance, token).unwrap(),
+            Some(at(7, "a"))
+        );
         assert!(
-            !advance_change_cursor(db, instance, token, Some(7), 15).unwrap(),
+            advance_change_cursor(db, instance, token, Some(&at(7, "a")), &at(12, "c")).unwrap()
+        );
+        assert!(
+            !advance_change_cursor(db, instance, token, Some(&at(7, "a")), &at(15, "d")).unwrap(),
             "a stale advance loses"
         );
-        assert_eq!(change_cursor(db, instance, token).unwrap(), Some(12));
+        assert!(
+            !advance_change_cursor(db, instance, token, Some(&at(12, "x")), &at(15, "d")).unwrap(),
+            "the change id is part of the fence"
+        );
+        assert_eq!(
+            change_cursor(db, instance, token).unwrap(),
+            Some(at(12, "c"))
+        );
     }
 
     #[test]

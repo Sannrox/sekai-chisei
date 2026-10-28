@@ -81,7 +81,9 @@ principal can no longer be shown to read the object. Changes in one window
 of `debounce_ms` share one turn, due when the window closes, with cause
 reference `<token>@<window_start_ms>`. The cursor advances after admission
 with a compare-and-set, so a crash or a second plane replays the page and
-admission dedupes it. The responsibility is a list of object ids; an
+admission dedupes it. The cursor keeps the change id at its sequence; when
+purged history has reused or removed that sequence, it restarts from the
+beginning and the replay dedupes the same way. The responsibility is a list of object ids; an
 ObjectSet responsibility is a later slice.
 
 ## Alternatives considered

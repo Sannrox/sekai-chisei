@@ -10,9 +10,10 @@
 //! classification wakes nothing. A delete wakes nothing, since the principal
 //! can no longer be shown to read the object. Changes in one debounce window
 //! share a turn. The cursor advances after the turns are admitted, so a
-//! crash replays the page and admission dedupes it. A mutation sequence
-//! below the cursor means purged history restarted it; the cursor restarts
-//! with it.
+//! crash replays the page and admission dedupes it. The cursor keeps the
+//! change id at its sequence; when purged history has reused or removed that
+//! sequence, the cursor restarts from the beginning, and the replayed changes
+//! dedupe against the turns already admitted.
 
 use super::*;
 use crate::sekai::agent_wake::{self, WakePolicy};
@@ -62,18 +63,22 @@ impl SekaiServiceImpl {
         let Some(after) = agent_wake::change_cursor(db, &instance.id, token)? else {
             // A new token starts at the present; earlier history wakes nothing.
             let watermark = db.object_change_watermark(&instance.namespace)?;
-            agent_wake::advance_change_cursor(db, &instance.id, token, None, watermark)?;
+            let start = mutation_at(db, &instance.namespace, watermark)?.unwrap_or_default();
+            agent_wake::advance_change_cursor(db, &instance.id, token, None, &start)?;
             return Ok(());
         };
-        if db.object_change_watermark(&instance.namespace)? < after {
-            // Purged history restarts the sequence; every row now is newer
-            // than the cursor's last read.
-            agent_wake::advance_change_cursor(db, &instance.id, token, Some(after), 0)?;
+        if after.seq > 0
+            && mutation_at(db, &instance.namespace, after.seq)?.as_ref() != Some(&after)
+        {
+            // Purged history can reuse sequences; reread from the start.
+            // Replayed changes map to windows already admitted, which dedupe.
+            let start = agent_wake::ChangeCursor::default();
+            agent_wake::advance_change_cursor(db, &instance.id, token, Some(&after), &start)?;
             return Ok(());
         }
         let mutations =
-            db.list_committed_object_mutations_after(&instance.namespace, after, PAGE)?;
-        let Some(last) = mutations.last().map(|mutation| mutation.seq) else {
+            db.list_committed_object_mutations_after(&instance.namespace, after.seq, PAGE)?;
+        let Some(last) = mutations.last().map(cursor_of) else {
             return Ok(());
         };
         let responsibility: std::collections::BTreeSet<&str> = instance
@@ -140,7 +145,7 @@ impl SekaiServiceImpl {
                 }
             }
         }
-        agent_wake::advance_change_cursor(db, &instance.id, token, Some(after), last)?;
+        agent_wake::advance_change_cursor(db, &instance.id, token, Some(&after), &last)?;
         Ok(())
     }
 
@@ -216,4 +221,27 @@ impl SekaiServiceImpl {
         });
         Ok(!restricted || can_read_restricted_properties(&self.security, object, principals))
     }
+}
+
+fn cursor_of(mutation: &CommittedObjectMutation) -> agent_wake::ChangeCursor {
+    agent_wake::ChangeCursor {
+        seq: mutation.seq,
+        change_id: mutation.change.id.clone(),
+    }
+}
+
+/// The cursor naming the mutation at `seq`, if one is there.
+fn mutation_at(
+    db: &RuntimeDb,
+    namespace: &str,
+    seq: u64,
+) -> Result<Option<agent_wake::ChangeCursor>, String> {
+    if seq == 0 {
+        return Ok(None);
+    }
+    Ok(db
+        .list_committed_object_mutations_after(namespace, seq - 1, 1)?
+        .first()
+        .filter(|mutation| mutation.seq == seq)
+        .map(cursor_of))
 }

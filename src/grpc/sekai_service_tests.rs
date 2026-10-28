@@ -33501,20 +33501,32 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
     assert_eq!(woken[0].cause, agent_turn::Cause::ObjectChange);
     assert!(woken[0].cause_ref.starts_with("change:60000@"));
 
-    // A sequence below the cursor (purged history) restarts the cursor.
+    // A cursor whose change id is no longer at its sequence (purged and
+    // reused history) restarts from the beginning, and the replayed changes
+    // admit nothing new.
     let wake = crate::sekai::agent_wake::change_cursor;
-    let at = wake(svc.db.runtime(), "line-7", "change:60000").unwrap();
+    let at = wake(svc.db.runtime(), "line-7", "change:60000")
+        .unwrap()
+        .unwrap();
+    let mut reused = at.clone();
+    reused.change_id = "purged".into();
     crate::sekai::agent_wake::advance_change_cursor(
         svc.db.runtime(),
         "line-7",
         "change:60000",
-        at,
-        1_000_000,
+        Some(&at),
+        &reused,
     )
     .unwrap();
     tick().await;
     assert_eq!(
         wake(svc.db.runtime(), "line-7", "change:60000").unwrap(),
-        Some(0)
+        Some(Default::default())
+    );
+    tick().await;
+    assert_eq!(turns().len(), 1, "a replay admits nothing new");
+    assert_eq!(
+        wake(svc.db.runtime(), "line-7", "change:60000").unwrap(),
+        Some(at)
     );
 }
