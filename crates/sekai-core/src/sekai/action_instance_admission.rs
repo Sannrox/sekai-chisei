@@ -5693,6 +5693,7 @@ mod tests {
                 "rec-21",
                 &parked.parked_object_digest,
                 Some(&write),
+                &[],
                 "alice",
                 None,
             )
@@ -5709,9 +5710,26 @@ mod tests {
             STATUS_PARKED
         );
 
-        // Already decided elsewhere: no write lands.
+        // A reference the plan read changed: stale too (#1941).
         let current_digest =
             crate::sekai::action_instance::object_state_digest(Some(&object)).unwrap();
+        let mut read = object.clone();
+        read.properties.insert("title".into(), "as planned".into());
+        assert!(matches!(
+            db.grant_parked_action_instance(
+                &granted,
+                "rec-21",
+                &current_digest,
+                Some(&write),
+                std::slice::from_ref(&read),
+                "alice",
+                None,
+            )
+            .unwrap(),
+            ParkedGrantOutcome::Stale
+        ));
+
+        // Already decided elsewhere: no write lands.
         let mut denied = parked.clone();
         denied.status = STATUS_DENIED.into();
         assert!(db.decide_parked_action_instance(&denied).unwrap());
@@ -5721,6 +5739,7 @@ mod tests {
                 "rec-21",
                 &current_digest,
                 Some(&write),
+                &[],
                 "alice",
                 None,
             )

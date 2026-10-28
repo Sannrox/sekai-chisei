@@ -1244,6 +1244,7 @@ mod tests {
                 "",
                 "",
                 None,
+                &[],
                 PLANNER,
                 Some(&crate::sekai::action_instance::ExecutionClaim {
                     plan_id: "plan-1".into(),

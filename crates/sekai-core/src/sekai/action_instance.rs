@@ -750,6 +750,7 @@ impl SekaiDb {
         target_object_id: &str,
         parked_object_digest: &str,
         write: Option<&ParkedGrantWrite>,
+        references: &[crate::domain::Object],
         actor: &str,
         claim: Option<&ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
@@ -798,6 +799,9 @@ impl SekaiDb {
             if object_state_digest(current.as_ref())? != parked_object_digest {
                 return Ok(ParkedGrantOutcome::Stale);
             }
+        }
+        if sqlite_changed_reference(&tx, references)?.is_some() {
+            return Ok(ParkedGrantOutcome::Stale);
         }
         let previous = match write {
             Some(ParkedGrantWrite::Create(object)) => {
@@ -930,19 +934,8 @@ impl SekaiDb {
         if !sqlite_admission_fence_holds(&tx, instance_id, lease, true)? {
             return Ok(FencedAdmissionWrite::FenceLost);
         }
-        for reference in references {
-            let current = tx
-                .query_row(
-                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
-                     FROM sekai_objects WHERE id = ?1",
-                    params![reference.id],
-                    crate::db::sekai::row_to_object,
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            if !current.is_some_and(|current| current.persisted_state_matches(reference)) {
-                return Err(format!("{REFERENCE_CHANGED}{}", reference.id));
-            }
+        if let Some(changed) = sqlite_changed_reference(&tx, references)? {
+            return Err(format!("{REFERENCE_CHANGED}{changed}"));
         }
         let previous = match write {
             ParkedGrantWrite::Create(object) => {
@@ -1189,6 +1182,29 @@ pub(crate) fn reserve_for_test(
     instance.admission_lease = Some(lease.clone());
     db.put_action_instance(&instance).unwrap();
     (instance.instance_id, lease)
+}
+
+/// The id of the first of `references` no longer stored as planning read it
+/// (#1941), inside `tx`.
+fn sqlite_changed_reference(
+    tx: &rusqlite::Transaction<'_>,
+    references: &[crate::domain::Object],
+) -> Result<Option<String>, String> {
+    for reference in references {
+        let current = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE id = ?1",
+                params![reference.id],
+                crate::db::sekai::row_to_object,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !current.is_some_and(|current| current.persisted_state_matches(reference)) {
+            return Ok(Some(reference.id.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether `lease` holds the instance's admission reservation inside `tx`,

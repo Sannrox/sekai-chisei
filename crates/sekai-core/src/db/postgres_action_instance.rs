@@ -219,30 +219,11 @@ impl PostgresDb {
         if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
             return Ok(FencedAdmissionWrite::FenceLost);
         }
-        // Each reference must be stored as planning read it, and stays so
-        // until commit: `FOR SHARE` holds off a concurrent change (#1941).
-        // Ids in order, so two admissions lock in one order.
-        let mut ordered: Vec<&crate::domain::Object> = references.iter().collect();
-        ordered.sort_by(|left, right| left.id.cmp(&right.id));
-        for reference in ordered {
-            let current = tx
-                .query_opt(
-                    &format!(
-                        "SELECT {} FROM sekai_objects WHERE id = $1 FOR SHARE",
-                        crate::db::postgres_audit::OBJECT_COLUMNS
-                    ),
-                    &[&reference.id],
-                )
-                .map_err(|error| error.to_string())?
-                .map(row_to_object)
-                .transpose()?;
-            if !current.is_some_and(|current| current.persisted_state_matches(reference)) {
-                return Err(format!(
-                    "{}{}",
-                    crate::sekai::action_instance::REFERENCE_CHANGED,
-                    reference.id
-                ));
-            }
+        if let Some(changed) = postgres_changed_reference(&mut tx, references)? {
+            return Err(format!(
+                "{}{changed}",
+                crate::sekai::action_instance::REFERENCE_CHANGED
+            ));
         }
         let previous = match write {
             ParkedGrantWrite::Create(object) => {
@@ -525,6 +506,7 @@ impl PostgresDb {
         target_object_id: &str,
         parked_object_digest: &str,
         write: Option<&ParkedGrantWrite>,
+        references: &[crate::domain::Object],
         actor: &str,
         claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
@@ -573,6 +555,9 @@ impl PostgresDb {
             if object_state_digest(current.as_ref())? != parked_object_digest {
                 return Ok(ParkedGrantOutcome::Stale);
             }
+        }
+        if postgres_changed_reference(&mut transaction, references)?.is_some() {
+            return Ok(ParkedGrantOutcome::Stale);
         }
         let previous = match write {
             Some(ParkedGrantWrite::Create(object)) => {
@@ -753,4 +738,32 @@ pub(crate) fn postgres_admission_fence_holds<C: postgres::GenericClient>(
             now_ms,
         )
     }))
+}
+
+/// The id of the first of `references` no longer stored as planning read it
+/// (#1941). Each is read `FOR SHARE`, so it stays as read until commit, in id
+/// order, so two writers lock in one order.
+fn postgres_changed_reference(
+    tx: &mut postgres::Transaction<'_>,
+    references: &[crate::domain::Object],
+) -> Result<Option<String>, String> {
+    let mut ordered: Vec<&crate::domain::Object> = references.iter().collect();
+    ordered.sort_by(|left, right| left.id.cmp(&right.id));
+    for reference in ordered {
+        let current = tx
+            .query_opt(
+                &format!(
+                    "SELECT {} FROM sekai_objects WHERE id = $1 FOR SHARE",
+                    crate::db::postgres_audit::OBJECT_COLUMNS
+                ),
+                &[&reference.id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(row_to_object)
+            .transpose()?;
+        if !current.is_some_and(|current| current.persisted_state_matches(reference)) {
+            return Ok(Some(reference.id.clone()));
+        }
+    }
+    Ok(None)
 }

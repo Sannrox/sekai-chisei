@@ -4630,6 +4630,7 @@ impl RuntimeDb {
         target_object_id: &str,
         parked_object_digest: &str,
         write: Option<&crate::sekai::action_instance::ParkedGrantWrite>,
+        references: &[crate::domain::Object],
         actor: &str,
         claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     ) -> Result<crate::sekai::action_instance::ParkedGrantOutcome, String> {
@@ -4639,6 +4640,7 @@ impl RuntimeDb {
                 target_object_id,
                 parked_object_digest,
                 write,
+                references,
                 actor,
                 claim,
             ),
@@ -4648,6 +4650,7 @@ impl RuntimeDb {
                     target_object_id,
                     parked_object_digest,
                     write,
+                    references,
                     actor,
                     claim,
                 )

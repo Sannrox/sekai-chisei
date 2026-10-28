@@ -420,35 +420,26 @@ pub fn validate_object_write(
 /// such as a raised exposure marking, refuses the write. Other kinds read
 /// nothing.
 pub fn references(db: &RuntimeDb, object: &Object) -> Result<Vec<Object>, String> {
-    let property = |name: &str| {
-        object
-            .properties
-            .get(name)
-            .map(String::as_str)
-            .filter(|id| !id.trim().is_empty())
-    };
-    let ids: Vec<&str> = match object.kind.as_str() {
-        KIND_OCCURRENCE | KIND_HYPOTHESIS => property("finding_id").into_iter().collect(),
-        KIND_EXPOSURE => [property("finding_id"), property("evidence_id")]
-            .into_iter()
-            .flatten()
-            .collect(),
-        KIND_DISPOSITION => property("exposure_id").into_iter().collect(),
-        _ => return Ok(Vec::new()),
-    };
     let mut references = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    for id in ids {
-        if seen.insert(id.to_string())
-            && let Some(found) = db.get_object(id)?
+    for id in reference_ids(object) {
+        if seen.insert(id.clone())
+            && let Some(found) = db.get_object(&id)?
         {
             references.push(found);
         }
     }
     if object.kind == KIND_DISPOSITION {
-        // The supersede chain, as far as it resolves; the rules stop at the
-        // same place.
-        let mut previous = property("supersedes").map(str::to_string);
+        // The rest of the supersede chain, as far as it resolves; the rules
+        // stop at the same place.
+        let mut previous = references
+            .iter()
+            .find(|found| {
+                Some(found.id.as_str()) == object.properties.get("supersedes").map(String::as_str)
+            })
+            .and_then(|found| found.properties.get("supersedes"))
+            .filter(|id| !id.trim().is_empty())
+            .cloned();
         while let Some(id) = previous.take() {
             if !seen.insert(id.clone()) {
                 break;
@@ -465,6 +456,32 @@ pub fn references(db: &RuntimeDb, object: &Object) -> Result<Vec<Object>, String
         }
     }
     Ok(references)
+}
+
+/// The objects the rules for `object` require to exist: its finding, its
+/// measured evidence, its exposure and the disposition it supersedes. Once
+/// the rules pass, each must be among the [`references`] read before them.
+pub fn reference_ids(object: &Object) -> Vec<String> {
+    let property = |name: &str| {
+        object
+            .properties
+            .get(name)
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+    };
+    let measured = object.properties.get("verdict").map(String::as_str) != Some(VERDICT_UNKNOWN);
+    match object.kind.as_str() {
+        KIND_OCCURRENCE | KIND_HYPOTHESIS => property("finding_id").into_iter().collect(),
+        KIND_EXPOSURE => property("finding_id")
+            .into_iter()
+            .chain(property("evidence_id").filter(|_| measured))
+            .collect(),
+        KIND_DISPOSITION => property("exposure_id")
+            .into_iter()
+            .chain(property("supersedes"))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn required<'a>(object: &'a Object, property: &str) -> Result<&'a str, String> {

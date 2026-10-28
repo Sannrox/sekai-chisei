@@ -209,6 +209,7 @@ pub fn plan(
             validate_object_schema(db, &planned)?;
             let references = package_references(db, &planned)?;
             validate_object_write(db, &mut planned, now_ms)?;
+            require_fenced(&planned, &references)?;
             Ok(Some(PlannedObjectMutation::Create {
                 object: planned,
                 references,
@@ -260,6 +261,7 @@ pub fn plan(
             validate_object_schema(db, &planned)?;
             let references = package_references(db, &planned)?;
             validate_object_write(db, &mut planned, now_ms)?;
+            require_fenced(&planned, &references)?;
             Ok(Some(PlannedObjectMutation::Update {
                 object: planned,
                 before: snapshot,
@@ -384,6 +386,7 @@ fn plan_catalog_curation(
     )?;
     let references = package_references(db, &planned)?;
     validate_object_write(db, &mut planned, now_ms)?;
+    require_fenced(&planned, &references)?;
     Ok(PlannedObjectMutation::Update {
         object: planned,
         before: Box::new(existing),
@@ -503,7 +506,8 @@ pub enum ParkedGrant {
 
 /// Applies the planned write and moves the parked instance to `granted` in
 /// one transaction, so a crash or a concurrent decision can never leave the
-/// write without the grant (#1139).
+/// write without the grant (#1139). A reference the plan read that changed
+/// since makes the grant stale, as a changed target does (#1941).
 #[allow(clippy::too_many_arguments)]
 pub fn grant_parked(
     db: &RuntimeDb,
@@ -516,6 +520,10 @@ pub fn grant_parked(
     now_ms: i64,
 ) -> Result<ParkedGrant, ActionObjectMutationError> {
     use crate::sekai::action_instance::{ParkedGrantOutcome, ParkedGrantWrite};
+    let references = planned
+        .as_ref()
+        .map(|planned| planned.references().to_vec())
+        .unwrap_or_default();
     let prepared = planned.map(|planned| {
         let mutation = planned.mutation().to_string();
         let created = mutation == OBJECT_MUTATION_CREATE;
@@ -542,6 +550,7 @@ pub fn grant_parked(
             target_object_id,
             parked_object_digest,
             write.as_ref(),
+            &references,
             actor,
             claim,
         )
@@ -565,6 +574,24 @@ pub fn grant_parked(
             }))
         }
     })
+}
+
+/// Every reference the package rules needed was there when the references
+/// were read. One that appeared since, while the rules ran, would otherwise
+/// escape the fence (#1941).
+fn require_fenced(
+    planned: &Object,
+    references: &[Object],
+) -> Result<(), ActionObjectMutationError> {
+    match crate::sekai::security_package::reference_ids(planned)
+        .into_iter()
+        .find(|id| !references.iter().any(|reference| reference.id == *id))
+    {
+        Some(id) => Err(ActionObjectMutationError::FailedPrecondition(format!(
+            "object {id} changed since the Action was planned; submit again"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The objects package rules will read for `planned`, read before they run:
