@@ -200,6 +200,7 @@ impl PostgresDb {
     /// Applies an admission's object write only while `lease` still names the
     /// reservation's owner and generation and has not expired (#1930). A
     /// takeover bumps the generation, so a stale owner's write is refused.
+    /// Each of `references` must still be stored as planning read it (#1941).
     #[allow(clippy::too_many_arguments)]
     pub fn apply_admission_object_write(
         &self,
@@ -207,6 +208,7 @@ impl PostgresDb {
         lease: &AdmissionLease,
         write: &ParkedGrantWrite,
         expected: Option<&crate::domain::Object>,
+        references: &[crate::domain::Object],
         actor: &str,
         attribution: &crate::sekai::audit::ChangeAttribution,
     ) -> Result<FencedAdmissionWrite<Option<crate::domain::Object>>, String> {
@@ -216,6 +218,31 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
             return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        // Each reference must be stored as planning read it, and stays so
+        // until commit: `FOR SHARE` holds off a concurrent change (#1941).
+        // Ids in order, so two admissions lock in one order.
+        let mut ordered: Vec<&crate::domain::Object> = references.iter().collect();
+        ordered.sort_by(|left, right| left.id.cmp(&right.id));
+        for reference in ordered {
+            let current = tx
+                .query_opt(
+                    &format!(
+                        "SELECT {} FROM sekai_objects WHERE id = $1 FOR SHARE",
+                        crate::db::postgres_audit::OBJECT_COLUMNS
+                    ),
+                    &[&reference.id],
+                )
+                .map_err(|error| error.to_string())?
+                .map(row_to_object)
+                .transpose()?;
+            if !current.is_some_and(|current| current.persisted_state_matches(reference)) {
+                return Err(format!(
+                    "{}{}",
+                    crate::sekai::action_instance::REFERENCE_CHANGED,
+                    reference.id
+                ));
+            }
         }
         let previous = match write {
             ParkedGrantWrite::Create(object) => {

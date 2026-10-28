@@ -64,18 +64,40 @@ pub struct AppliedObjectMutation {
 
 #[derive(Debug, Clone)]
 pub enum PlannedObjectMutation {
-    Create(Object),
-    /// The object to write and the object as planning read it; the write
-    /// applies only if it is unchanged, so a concurrent change (a raised
-    /// marking among them) is never overwritten by a stale plan.
-    Update(Object, Box<Object>),
+    Create {
+        object: Object,
+        references: Vec<Object>,
+    },
+    /// `before` is the object as planning read it; the write applies only if
+    /// it is unchanged, so a concurrent change (a raised marking among them)
+    /// is never overwritten by a stale plan.
+    Update {
+        object: Object,
+        before: Box<Object>,
+        references: Vec<Object>,
+    },
 }
 
 impl PlannedObjectMutation {
     fn mutation(&self) -> &'static str {
         match self {
-            Self::Create(_) => OBJECT_MUTATION_CREATE,
-            Self::Update(..) => OBJECT_MUTATION_UPDATE,
+            Self::Create { .. } => OBJECT_MUTATION_CREATE,
+            Self::Update { .. } => OBJECT_MUTATION_UPDATE,
+        }
+    }
+
+    /// The object to write.
+    pub fn object(&self) -> &Object {
+        match self {
+            Self::Create { object, .. } | Self::Update { object, .. } => object,
+        }
+    }
+
+    /// The other objects package rules read while planning, as they read
+    /// them (#1941). The admission write refuses the commit if any changed.
+    pub fn references(&self) -> &[Object] {
+        match self {
+            Self::Create { references, .. } | Self::Update { references, .. } => references,
         }
     }
 }
@@ -185,8 +207,12 @@ pub fn plan(
             };
             inherit_marking(db, namespace, &mut planned, None, marking)?;
             validate_object_schema(db, &planned)?;
+            let references = package_references(db, &planned)?;
             validate_object_write(db, &mut planned, now_ms)?;
-            Ok(Some(PlannedObjectMutation::Create(planned)))
+            Ok(Some(PlannedObjectMutation::Create {
+                object: planned,
+                references,
+            }))
         }
         OBJECT_MUTATION_UPDATE => {
             let existing = existing.ok_or_else(|| {
@@ -232,8 +258,13 @@ pub fn plan(
                 marking,
             )?;
             validate_object_schema(db, &planned)?;
+            let references = package_references(db, &planned)?;
             validate_object_write(db, &mut planned, now_ms)?;
-            Ok(Some(PlannedObjectMutation::Update(planned, snapshot)))
+            Ok(Some(PlannedObjectMutation::Update {
+                object: planned,
+                before: snapshot,
+                references,
+            }))
         }
         other => Err(ActionObjectMutationError::FailedPrecondition(format!(
             "unknown object_mutation {other:?}"
@@ -351,8 +382,13 @@ fn plan_catalog_curation(
             }
         },
     )?;
+    let references = package_references(db, &planned)?;
     validate_object_write(db, &mut planned, now_ms)?;
-    Ok(PlannedObjectMutation::Update(planned, Box::new(existing)))
+    Ok(PlannedObjectMutation::Update {
+        object: planned,
+        before: Box::new(existing),
+        references,
+    })
 }
 
 /// Applies an admitted Action's object write. Its change rows carry the
@@ -372,9 +408,13 @@ pub fn apply(
         ADMISSION_FENCE_LOST, FencedAdmissionWrite, ParkedGrantWrite,
     };
     let mutation = planned.mutation().to_string();
-    let (mut object, snapshot) = match planned {
-        PlannedObjectMutation::Create(object) => (object, None),
-        PlannedObjectMutation::Update(object, snapshot) => (object, Some(snapshot)),
+    let (mut object, snapshot, references) = match planned {
+        PlannedObjectMutation::Create { object, references } => (object, None, references),
+        PlannedObjectMutation::Update {
+            object,
+            before,
+            references,
+        } => (object, Some(before), references),
     };
     let created = mutation == OBJECT_MUTATION_CREATE;
     if created {
@@ -404,6 +444,7 @@ pub fn apply(
             lease,
             &write,
             snapshot.as_deref(),
+            &references,
             actor,
             attribution,
         )
@@ -411,6 +452,12 @@ pub fn apply(
             if created && object_kind == KIND_OBSERVATION && unique_constraint_failed(&error) {
                 ActionObjectMutationError::FailedPrecondition(format!(
                     "observation external identity {object_external_id} already exists"
+                ))
+            } else if let Some(reference) =
+                error.strip_prefix(crate::sekai::action_instance::REFERENCE_CHANGED)
+            {
+                ActionObjectMutationError::FailedPrecondition(format!(
+                    "object {reference} changed since the Action was planned; submit again"
                 ))
             } else if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION {
                 ActionObjectMutationError::FailedPrecondition(format!(
@@ -473,9 +520,8 @@ pub fn grant_parked(
         let mutation = planned.mutation().to_string();
         let created = mutation == OBJECT_MUTATION_CREATE;
         let mut object = match planned {
-            PlannedObjectMutation::Create(object) | PlannedObjectMutation::Update(object, _) => {
-                object
-            }
+            PlannedObjectMutation::Create { object, .. }
+            | PlannedObjectMutation::Update { object, .. } => object,
         };
         if created {
             object.created = now_ms;
@@ -519,6 +565,17 @@ pub fn grant_parked(
             }))
         }
     })
+}
+
+/// The objects package rules will read for `planned`, read before they run:
+/// if one changes after this read, during the rules or before the commit, the
+/// admission write refuses (#1941).
+fn package_references(
+    db: &RuntimeDb,
+    planned: &Object,
+) -> Result<Vec<Object>, ActionObjectMutationError> {
+    crate::sekai::security_package::references(db, planned)
+        .map_err(ActionObjectMutationError::Internal)
 }
 
 fn validate_object_write(
@@ -1051,9 +1108,9 @@ mod tests {
             ..Default::default()
         };
         let marking = |planned: &Option<PlannedObjectMutation>| match planned {
-            Some(
-                PlannedObjectMutation::Create(object) | PlannedObjectMutation::Update(object, _),
-            ) => crate::sekai::markings::object_marking_token(object).map(str::to_string),
+            Some(planned) => {
+                crate::sekai::markings::object_marking_token(planned.object()).map(str::to_string)
+            }
             None => None,
         };
         // A created object carries the Action's marking.

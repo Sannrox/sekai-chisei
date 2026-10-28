@@ -848,7 +848,10 @@ impl<'a> ActionInstanceAdmission<'a> {
                     if !expected_object_revision.is_empty()
                         && !matches!(
                             &planned,
-                            Some(action_object_mutation::PlannedObjectMutation::Update(_, snapshot))
+                            Some(action_object_mutation::PlannedObjectMutation::Update {
+                                before: snapshot,
+                                ..
+                            })
                                 if crate::sekai::action_describe_preview::object_revision(snapshot)
                                     == expected_object_revision
                         ) =>
@@ -861,10 +864,12 @@ impl<'a> ActionInstanceAdmission<'a> {
                 Ok(None) => None,
                 // The conflict check passed against one version; a write
                 // that landed since is judged afresh by a new submit.
-                Ok(Some(action_object_mutation::PlannedObjectMutation::Update(_, snapshot)))
-                    if offline_checked
-                        .as_ref()
-                        .is_some_and(|checked| !snapshot.persisted_state_matches(checked)) =>
+                Ok(Some(action_object_mutation::PlannedObjectMutation::Update {
+                    before: snapshot,
+                    ..
+                })) if offline_checked
+                    .as_ref()
+                    .is_some_and(|checked| !snapshot.persisted_state_matches(checked)) =>
                 {
                     let _ = self
                         .db

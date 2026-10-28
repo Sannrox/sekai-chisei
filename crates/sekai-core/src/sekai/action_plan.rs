@@ -245,8 +245,8 @@ pub struct SimulationContext<'a> {
 
 fn changed_properties(planned: &PlannedObjectMutation) -> StepEffect {
     let (object, before) = match planned {
-        PlannedObjectMutation::Create(object) => (object, None),
-        PlannedObjectMutation::Update(object, before) => (object, Some(before.as_ref())),
+        PlannedObjectMutation::Create { object, .. } => (object, None),
+        PlannedObjectMutation::Update { object, before, .. } => (object, Some(before.as_ref())),
     };
     let mut changed: Vec<String> = object
         .properties
@@ -274,8 +274,8 @@ fn changed_properties(planned: &PlannedObjectMutation) -> StepEffect {
         object_id: object.id.clone(),
         object_kind: object.kind.clone(),
         mutation: match planned {
-            PlannedObjectMutation::Create(_) => "create",
-            PlannedObjectMutation::Update(..) => "update",
+            PlannedObjectMutation::Create { .. } => "create",
+            PlannedObjectMutation::Update { .. } => "update",
         }
         .into(),
         changed_properties: changed,
@@ -371,7 +371,7 @@ fn predicted_effect(
     Ok(match planned {
         // The planner reads the object again; its before-image must be the
         // revision the step records, or the effect would not match it.
-        Some(PlannedObjectMutation::Update(_, ref before))
+        Some(PlannedObjectMutation::Update { ref before, .. })
             if action_describe_preview::object_revision(before) != revision =>
         {
             Predicted::Stale

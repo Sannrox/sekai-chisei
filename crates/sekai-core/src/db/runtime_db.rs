@@ -4685,6 +4685,7 @@ impl RuntimeDb {
         lease: &crate::sekai::action_instance::AdmissionLease,
         write: &crate::sekai::action_instance::ParkedGrantWrite,
         expected: Option<&crate::domain::Object>,
+        references: &[crate::domain::Object],
         actor: &str,
         attribution: &crate::sekai::audit::ChangeAttribution,
     ) -> Result<
@@ -4697,6 +4698,7 @@ impl RuntimeDb {
                 lease,
                 write,
                 expected,
+                references,
                 actor,
                 attribution,
             ),
@@ -4706,6 +4708,7 @@ impl RuntimeDb {
                     lease,
                     write,
                     expected,
+                    references,
                     actor,
                     attribution,
                 )

@@ -413,6 +413,60 @@ pub fn validate_object_write(
     Ok(())
 }
 
+/// The objects [`validate_object_write`] reads for `object`, as they are
+/// now: its finding, its evidence, its exposure, and every disposition it
+/// supersedes back to the first (#1941). The admission write commits only
+/// while each is unchanged, so a reference changed between plan and commit,
+/// such as a raised exposure marking, refuses the write. Other kinds read
+/// nothing.
+pub fn references(db: &RuntimeDb, object: &Object) -> Result<Vec<Object>, String> {
+    let property = |name: &str| {
+        object
+            .properties
+            .get(name)
+            .map(String::as_str)
+            .filter(|id| !id.trim().is_empty())
+    };
+    let ids: Vec<&str> = match object.kind.as_str() {
+        KIND_OCCURRENCE | KIND_HYPOTHESIS => property("finding_id").into_iter().collect(),
+        KIND_EXPOSURE => [property("finding_id"), property("evidence_id")]
+            .into_iter()
+            .flatten()
+            .collect(),
+        KIND_DISPOSITION => property("exposure_id").into_iter().collect(),
+        _ => return Ok(Vec::new()),
+    };
+    let mut references = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        if seen.insert(id.to_string())
+            && let Some(found) = db.get_object(id)?
+        {
+            references.push(found);
+        }
+    }
+    if object.kind == KIND_DISPOSITION {
+        // The supersede chain, as far as it resolves; the rules stop at the
+        // same place.
+        let mut previous = property("supersedes").map(str::to_string);
+        while let Some(id) = previous.take() {
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            let Some(found) = db.get_object(&id)? else {
+                break;
+            };
+            previous = found
+                .properties
+                .get("supersedes")
+                .filter(|id| !id.trim().is_empty())
+                .cloned();
+            references.push(found);
+        }
+    }
+    Ok(references)
+}
+
 fn required<'a>(object: &'a Object, property: &str) -> Result<&'a str, String> {
     object
         .properties
@@ -2071,6 +2125,82 @@ mod tests {
             "internal",
         ));
         assert!(message.contains("confidential"), "{message}");
+    }
+
+    /// An accept-risk disposition planned against an exposure's marking is
+    /// refused when the marking is raised before the write commits; an
+    /// unchanged reference commits (#1941).
+    #[test]
+    fn a_reference_changed_between_plan_and_commit_refuses_the_write() {
+        use crate::sekai::action_object_mutation::{self, ActionObjectMutationError};
+        let runtime = with_exposure();
+        let type_def = runtime
+            .get_governed_action_type(NAMESPACE, ACTION_DISPOSITION_RECORD, PACKAGE_VERSION)
+            .unwrap()
+            .unwrap();
+        let plan = |object_id: &str| {
+            let mut accept = disposition(object_id, DISPOSITION_ACCEPT_RISK, None);
+            accept[crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY] = "internal".into();
+            action_object_mutation::plan(
+                &runtime,
+                &type_def,
+                NAMESPACE,
+                &accept.to_string(),
+                Some(ACTOR),
+                None,
+                2_000,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let apply = |planned, instance: &str| {
+            let (instance_id, lease) =
+                crate::sekai::action_instance::reserve_for_test(&runtime, instance, 2_000);
+            action_object_mutation::apply(
+                &runtime,
+                planned,
+                ACTOR,
+                &crate::sekai::audit::ChangeAttribution::default(),
+                &instance_id,
+                &lease,
+                2_000,
+            )
+        };
+
+        let planned = plan("d-1");
+        assert!(
+            planned
+                .references()
+                .iter()
+                .any(|reference| reference.id == "e-1"),
+            "the exposure is a reference"
+        );
+        let mut raised = runtime.get_object("e-1").unwrap().unwrap();
+        raised.properties.insert(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "confidential".into(),
+        );
+        raised.updated += 1;
+        runtime.update_object(&raised).unwrap();
+        match apply(planned, "ai-stale") {
+            Err(ActionObjectMutationError::FailedPrecondition(message)) => assert!(
+                message.contains("e-1 changed since the Action was planned"),
+                "{message}"
+            ),
+            other => panic!("expected a changed reference, got {other:?}"),
+        }
+        assert!(runtime.get_object("d-1").unwrap().is_none());
+
+        // Planned against the current exposure, the write commits.
+        let mut lowered = runtime.get_object("e-1").unwrap().unwrap();
+        lowered.properties.insert(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "internal".into(),
+        );
+        lowered.updated += 1;
+        runtime.update_object(&lowered).unwrap();
+        apply(plan("d-1"), "ai-fresh").unwrap();
+        assert!(runtime.get_object("d-1").unwrap().is_some());
     }
 
     /// A reopen that admission parks or denies reports nothing reopened,
