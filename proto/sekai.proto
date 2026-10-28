@@ -584,6 +584,54 @@ message RevokeNamespaceExportRequest {
 message RevokeNamespaceExportResponse {
   NamespaceExportGrant grant = 1;
 }
+// A tenant's opt-in to federated aggregate queries for one object type
+// (ADR 0134 §1, #1921). Functions are count, sum and avg.
+message FederatedAggregateAllowance {
+  string namespace = 1;
+  string object_type = 2;
+  repeated string dimensions = 3;
+  repeated string measures = 4;
+  repeated string functions = 5;
+  uint64 min_group_size = 6;
+  // Laplace noise scale on partials; 0 adds none.
+  double noise_scale = 7;
+  repeated string requesters = 8;
+}
+// One entry of an allowance's append-only history.
+message FederatedAggregateAllowanceRecord {
+  FederatedAggregateAllowance allowance = 1;
+  string allowance_digest = 2;
+  string published_by = 3;
+  int64 published_at_ms = 4;
+  string reason = 5;
+  // Empty while the allowance is active.
+  string withdrawn_by = 6;
+  int64 withdrawn_at_ms = 7;
+  string withdrawal_reason = 8;
+}
+message PublishFederatedAggregateAllowanceRequest {
+  FederatedAggregateAllowance allowance = 1;
+  string reason = 2;
+}
+message PublishFederatedAggregateAllowanceResponse {
+  FederatedAggregateAllowanceRecord record = 1;
+}
+message WithdrawFederatedAggregateAllowanceRequest {
+  string namespace = 1;
+  string object_type = 2;
+  string reason = 3;
+}
+message WithdrawFederatedAggregateAllowanceResponse {
+  FederatedAggregateAllowanceRecord record = 1;
+}
+message GetFederatedAggregateAllowanceRequest {
+  string namespace = 1;
+  string object_type = 2;
+}
+message GetFederatedAggregateAllowanceResponse {
+  // The active allowance; NOT_FOUND when the type has none.
+  FederatedAggregateAllowanceRecord record = 1;
+}
 // Streams an object set as CSV or JSON Lines under the caller's read policy.
 message ExportObjectSetRequest {
   ObjectSetDescriptor descriptor = 1;
@@ -4776,6 +4824,10 @@ service SekaiService {
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc EvaluateObjectSet(EvaluateObjectSetRequest) returns (EvaluateObjectSetResponse);
   rpc GrantNamespaceExport(GrantNamespaceExportRequest) returns (GrantNamespaceExportResponse);
+  // Federated aggregate allowances (#1921): namespace admin only.
+  rpc PublishFederatedAggregateAllowance(PublishFederatedAggregateAllowanceRequest) returns (PublishFederatedAggregateAllowanceResponse);
+  rpc WithdrawFederatedAggregateAllowance(WithdrawFederatedAggregateAllowanceRequest) returns (WithdrawFederatedAggregateAllowanceResponse);
+  rpc GetFederatedAggregateAllowance(GetFederatedAggregateAllowanceRequest) returns (GetFederatedAggregateAllowanceResponse);
   rpc RevokeNamespaceExport(RevokeNamespaceExportRequest) returns (RevokeNamespaceExportResponse);
   rpc ExportObjectSet(ExportObjectSetRequest) returns (stream ExportObjectSetChunk);
   rpc GetExportReceipt(GetExportReceiptRequest) returns (GetExportReceiptResponse);

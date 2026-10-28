@@ -67,6 +67,7 @@ pub mod execution_evidence;
 pub mod external_permit;
 pub mod ezu_geo_feed;
 pub mod federated_aggregate;
+pub mod federated_allowance;
 pub mod federation_conflict;
 pub mod federation_network;
 pub mod federation_profile;

@@ -33145,3 +33145,68 @@ async fn site_agent_instances_hide_like_missing_and_refuse_direct_writes() {
     }
     assert!(svc.db.runtime().get_object("line-7").unwrap().is_some());
 }
+
+/// Federated aggregate allowances (#1921): only the namespace's admin
+/// publishes or withdraws one, a refused function is invalid, and a
+/// withdrawn allowance no longer reads as current.
+#[tokio::test]
+async fn federated_allowances_need_namespace_admin() {
+    let svc = service();
+    let allowance = |functions: &[&str]| FederatedAggregateAllowance {
+        namespace: "exp".into(),
+        object_type: "shipment".into(),
+        dimensions: vec!["region".into()],
+        measures: vec!["weight".into()],
+        functions: functions.iter().map(|name| name.to_string()).collect(),
+        min_group_size: 3,
+        noise_scale: 0.0,
+        requesters: vec!["buyer".into()],
+    };
+    let publish = |principal: &'static str, functions: &'static [&'static str]| {
+        svc.publish_federated_aggregate_allowance(with_named_principal(
+            PublishFederatedAggregateAllowanceRequest {
+                allowance: Some(allowance(functions)),
+                reason: "opt in".into(),
+            },
+            principal,
+        ))
+    };
+    let refused = publish("tester", &["count", "sum"]).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let invalid = publish("root", &["count", "min"]).await.unwrap_err();
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+
+    let published = publish("root", &["count", "sum"])
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert!(published.allowance_digest.starts_with("sha256:"));
+    let get = || {
+        svc.get_federated_aggregate_allowance(with_named_principal(
+            GetFederatedAggregateAllowanceRequest {
+                namespace: "exp".into(),
+                object_type: "shipment".into(),
+            },
+            "root",
+        ))
+    };
+    assert_eq!(get().await.unwrap().into_inner().record.unwrap(), published);
+    let withdraw = |principal: &'static str| {
+        svc.withdraw_federated_aggregate_allowance(with_named_principal(
+            WithdrawFederatedAggregateAllowanceRequest {
+                namespace: "exp".into(),
+                object_type: "shipment".into(),
+                reason: "opt out".into(),
+            },
+            principal,
+        ))
+    };
+    assert_eq!(
+        withdraw("tester").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    withdraw("root").await.unwrap();
+    assert_eq!(get().await.unwrap_err().code(), tonic::Code::NotFound);
+}

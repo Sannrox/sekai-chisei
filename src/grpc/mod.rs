@@ -822,6 +822,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             // namespace administration per namespace.
             | "GrantNamespaceExport"
             | "RevokeNamespaceExport"
+            // Federated aggregate allowances (#1921): namespace admin per call.
+            | "PublishFederatedAggregateAllowance"
+            | "WithdrawFederatedAggregateAllowance"
+            | "GetFederatedAggregateAllowance"
             | "ExportObjectSet"
             | "ExportDatasetVersion"
             | "GetExportReceipt"
