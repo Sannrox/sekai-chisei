@@ -539,7 +539,7 @@ pub(super) fn enforce_service_principal_action_type(
     }
 }
 
-pub(super) fn enforce_namespace_tenant_context_for(
+pub(in crate::grpc) fn enforce_namespace_tenant_context_for(
     db: &RuntimeDb,
     tenant_context: Option<&RequestEnterpriseContext>,
     namespace: &str,

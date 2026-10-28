@@ -592,6 +592,11 @@ pub(super) async fn get_operation_receipt(
     req: Request<GetOperationReceiptRequest>,
 ) -> Result<Response<GetOperationReceiptResponse>, Status> {
     let actor = authenticated_actor(&req);
+    // An enterprise (tenant) context gets no administrative inspection, and
+    // learns nothing about receipts outside its namespaces (#1770).
+    let context = enterprise_authenticated_context(&req)?.cloned();
+    let privileged =
+        context.is_none() && matches!(actor.as_str(), "root" | "local" | "chisei-gateway");
     let request = req.into_inner();
     let operation_id = request.operation_id.trim();
     let request_id = request.request_id.trim();
@@ -628,7 +633,6 @@ pub(super) async fn get_operation_receipt(
             }
         }
     } else {
-        let privileged = matches!(actor.as_str(), "root" | "local" | "chisei-gateway");
         if !privileged {
             return Err(Status::permission_denied(
                 "opaque request alias lookup requires administrative inspection access",
@@ -661,9 +665,9 @@ pub(super) async fn get_operation_receipt(
         } else {
             Status::internal(error)
         }
-    })?;
-    let mut receipt = match receipt {
-        Some(receipt) => receipt,
+    })
+    .and_then(|receipt| match receipt {
+        Some(receipt) => Ok(receipt),
         None => {
             if operation_id.is_empty() {
                 return Err(Status::not_found("operation receipt not found"));
@@ -675,7 +679,42 @@ pub(super) async fn get_operation_receipt(
                 .lookup_commit(operation_id)
                 .map_err(Status::unavailable)?
                 .ok_or_else(|| Status::not_found("operation receipt not found"))?;
-            crate::chisei::sekai_commit::hop_projection_receipt(operation_id, &commit)
+            Ok(crate::chisei::sekai_commit::hop_projection_receipt(
+                operation_id,
+                &commit,
+            ))
+        }
+    });
+    let mut receipt = match context.as_ref() {
+        // Fail closed: a failed lookup, another principal's receipt, one
+        // with no namespace, or a namespace the tenant may not read all
+        // answer exactly as a missing id does.
+        Some(context) => receipt
+            .ok()
+            .filter(|receipt| {
+                receipt.initiating_actor == actor
+                    && require_enterprise_namespace_read(
+                        service.sekai_facts.reader(),
+                        context,
+                        &receipt.namespace,
+                    )
+                    .is_ok()
+            })
+            .ok_or_else(|| Status::not_found("operation receipt not found"))?,
+        None => {
+            let receipt = receipt?;
+            if actor != receipt.initiating_actor
+                // The UDS interceptor assigns `local`; local socket access is
+                // the administrative inspection boundary used by sekaictl.
+                // This exception is read-only and is not accepted by mutation
+                // RPCs.
+                && !privileged
+            {
+                return Err(Status::permission_denied(
+                    "operation receipt is not visible to this principal",
+                ));
+            }
+            receipt
         }
     };
     if receipt.operation_class != "sekai_commit_projection"
@@ -683,16 +722,6 @@ pub(super) async fn get_operation_receipt(
         && let Ok(Some(commit)) = lookup.lookup_commit(&receipt.operation_id)
     {
         crate::chisei::sekai_commit::project_commit_handles(&mut receipt, &commit);
-    }
-    if actor != receipt.initiating_actor
-            // The UDS interceptor assigns `local`; local socket access is the
-            // administrative inspection boundary used by sekaictl. This
-            // exception is read-only and is not accepted by mutation RPCs.
-            && !matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
-    {
-        return Err(Status::permission_denied(
-            "operation receipt is not visible to this principal",
-        ));
     }
     // A marked governed Action's receipt needs clearance for the marking, as
     // the instance does (#1706); Sekai decides it, and a denial reads as
@@ -756,9 +785,16 @@ pub(super) async fn get_quality_trend(
     req: Request<GetQualityTrendRequest>,
 ) -> Result<Response<GetQualityTrendResponse>, Status> {
     let actor = authenticated_actor(&req);
+    let context = enterprise_authenticated_context(&req)?.cloned();
     let request = req.into_inner();
     let namespace = canonical_namespace(&request.namespace)?.to_string();
-    require_namespace_access(service.sekai_facts.reader(), &actor, &namespace)?;
+    match context.as_ref() {
+        // A tenant context reads only its tenant's namespaces (#1770).
+        Some(context) => {
+            require_enterprise_namespace_read(service.sekai_facts.reader(), context, &namespace)?
+        }
+        None => require_namespace_access(service.sekai_facts.reader(), &actor, &namespace)?,
+    }
     let report = crate::quality_trend::query_quality_trends_after_access_check(
         service.db.runtime(),
         &namespace,
