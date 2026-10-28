@@ -118,6 +118,7 @@ mod tests {
             input_dataset_id: "in".into(),
             output_dataset_id: format!("out-{transform_id}"),
             profile: ISOLATED_CLASS.into(),
+            code: "SELECT * FROM input".into(),
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             requires,

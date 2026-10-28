@@ -524,6 +524,19 @@ mod tests {
     }
 
     #[test]
+    fn isolated_process_code_participates_in_digest() {
+        let base = isolated_transform("python", "runner:1");
+        let with = |code: &str| {
+            let mut transform = base.clone();
+            transform.isolated_process.as_mut().unwrap().code = code.into();
+            transform.definition_digest.clear();
+            transform.prepare().unwrap().definition_digest
+        };
+        assert_ne!(with("print(1)"), base.definition_digest);
+        assert_ne!(with("print(1)"), with("print(2)"));
+    }
+
+    #[test]
     fn placement_requires_participates_in_digest() {
         let base = isolated_transform("python", "runner:1");
         let with = |pairs: &[(&str, &str)]| {
@@ -678,6 +691,7 @@ mod tests {
                 runtime_image: runtime_image.into(),
                 inputs: Vec::new(),
                 requires: Default::default(),
+                code: String::new(),
             }),
             schedule: None,
             trigger: None,
