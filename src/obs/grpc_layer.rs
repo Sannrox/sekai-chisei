@@ -473,6 +473,7 @@ mod tests {
             }
         }
 
+        let _serialized = crate::obs::tracing_capture_lock();
         let buf = Buf(Arc::new(Mutex::new(Vec::new())));
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -481,6 +482,9 @@ mod tests {
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            // As in the other capture: interest cached before this
+            // subscriber existed would hide its events.
+            tracing::callsite::rebuild_interest_cache();
             super::record_rpc("unknown", "unknown", grpc_code, Duration::from_millis(1));
         });
         String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf8 logs")
