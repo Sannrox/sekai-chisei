@@ -33750,6 +33750,22 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
         "another plane enforces the stored scratch grant"
     );
     read_on_other_plane("alice").await.unwrap();
+    let object = other_plane
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: format!("{}-object", first.scratch_dataset_id),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            object.code(),
+            tonic::Code::PermissionDenied | tonic::Code::NotFound
+        ),
+        "the scratch object stays the caller's on another plane: {object:?}"
+    );
     let again = run("open-in", "k1").await.unwrap().into_inner();
     assert!(again.replayed);
     assert_eq!(again.run.unwrap().run_id, receipt.run_id);

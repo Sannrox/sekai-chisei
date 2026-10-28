@@ -351,16 +351,26 @@ pub(super) fn check_object_acl_with_audit(
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
 ) -> Result<(), Status> {
-    let result = if matches!(
+    let read = matches!(
         operation,
         crate::sekai::object_security::ObjectSecurityOperation::Read
             | crate::sekai::object_security::ObjectSecurityOperation::Traverse
             | crate::sekai::object_security::ObjectSecurityOperation::Query
             | crate::sekai::object_security::ObjectSecurityOperation::Export
-    ) {
-        check_read(security, object_id, principals)
+    );
+    // A scratch output is checked against its stored grants; only its id
+    // shape costs a store read.
+    let scratch = if crate::sekai::adhoc_transform::is_scratch_object_id(object_id) {
+        db.get_object(object_id)
+            .map_err(Status::internal)?
+            .filter(|object| object.kind == crate::sekai::adhoc_transform::SCRATCH_OBJECT_KIND)
     } else {
-        check_write(security, object_id, principals)
+        None
+    };
+    let result = match &scratch {
+        Some(object) => check_object_acl(db, security, object, principals, !read),
+        None if read => check_read(security, object_id, principals),
+        None => check_write(security, object_id, principals),
     };
     if result.is_err() {
         record_delegated_policy_decision(

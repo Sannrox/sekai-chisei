@@ -144,6 +144,22 @@ impl PostgresDb {
         self.run_governed_transform_owned(namespace, transform_id, incremental, now_ms, "", "")
     }
 
+    /// The stored record of an ad-hoc run identity.
+    pub(crate) fn adhoc_transform_record(
+        &self,
+        identity: &str,
+    ) -> Result<Option<crate::sekai::adhoc_transform::AdHocRecord>, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT definition_digest, run_id, dataset_id, expires_at_ms
+                 FROM sekai_adhoc_transform_run WHERE identity = $1",
+                &[&identity],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3))))
+    }
+
     /// See [`crate::db::sekai::SekaiDb::run_adhoc_transform`]; the identity
     /// is serialized by an advisory lock.
     pub fn run_adhoc_transform(

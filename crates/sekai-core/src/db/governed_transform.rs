@@ -444,6 +444,22 @@ impl SekaiDb {
         Ok(run)
     }
 
+    /// The stored record of an ad-hoc run identity.
+    pub(crate) fn adhoc_transform_record(
+        &self,
+        identity: &str,
+    ) -> Result<Option<crate::sekai::adhoc_transform::AdHocRecord>, String> {
+        self.conn()
+            .query_row(
+                "SELECT definition_digest, run_id, dataset_id, expires_at_ms
+                 FROM sekai_adhoc_transform_run WHERE identity = ?1",
+                params![identity],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     /// Runs an ad-hoc definition into its scratch dataset in one
     /// transaction (ADR 0138): a repeated identity returns its run, another
     /// definition under it is refused, and an over-budget output writes

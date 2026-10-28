@@ -2163,6 +2163,23 @@ pub(super) async fn run_adhoc_governed_transform(
     // Read limits per input; the run refuses a row with any other key.
     let column_allowlists =
         authorize_preview_inputs(service, &principals, tenant_context.as_ref(), &transform)?;
+    // A committed identity replays without spending execution quota.
+    if let Some(outcome) =
+        crate::sekai::adhoc_transform::committed(service.db.runtime(), &request, &transform)
+            .map_err(|error| {
+                if error == ADHOC_IDENTITY_CONFLICT {
+                    Status::already_exists(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?
+    {
+        return Ok(Response::new(adhoc_response(
+            service,
+            &principals,
+            outcome,
+        )?));
+    }
     let quota = service.quota_runtime();
     let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
     let held = admit_tenant_transform(
@@ -2227,19 +2244,31 @@ pub(super) async fn run_adhoc_governed_transform(
             ack_transform_usage_pending(service.db.runtime(), &outcome.run.run_id)?;
         }
     }
-    Ok(Response::new(RunAdHocGovernedTransformResponse {
+    Ok(Response::new(adhoc_response(
+        service,
+        &principals,
+        outcome,
+    )?))
+}
+
+fn adhoc_response(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    outcome: crate::sekai::adhoc_transform::AdHocRun,
+) -> Result<RunAdHocGovernedTransformResponse, Status> {
+    Ok(RunAdHocGovernedTransformResponse {
         run: Some(with_run_outcome(
             service,
             &outcome.run,
             to_proto_transform_run(
                 &outcome.run,
-                caller_can_read_run_datasets(service, &principals, &outcome.run),
+                caller_can_read_run_datasets(service, principals, &outcome.run),
             ),
         )?),
         scratch_dataset_id: outcome.scratch_dataset_id,
         expires_at_ms: outcome.expires_at_ms,
         replayed: outcome.replayed,
-    }))
+    })
 }
 
 fn preview_response(

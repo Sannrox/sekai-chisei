@@ -180,6 +180,51 @@ pub fn run(
     }
 }
 
+/// Whether `id` has the shape of a scratch object's id, so access checks
+/// read its stored grants rather than a plane's cache.
+pub fn is_scratch_object_id(id: &str) -> bool {
+    id.strip_prefix("scratch-")
+        .and_then(|rest| rest.strip_suffix("-object"))
+        .is_some_and(|digest| {
+            digest.len() == 32 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+/// The committed run of `request`'s identity, if any; the same identity with
+/// another definition is refused. Read before admitting execution, so a
+/// retry needs no execution quota. [`run`] checks again in its transaction.
+pub fn committed(
+    db: &RuntimeDb,
+    request: &AdHocRequest,
+    transform: &GovernedTransform,
+) -> Result<Option<AdHocRun>, String> {
+    let identity = request.identity();
+    let record = match db {
+        RuntimeDb::Sqlite(store) => store.adhoc_transform_record(&identity),
+        RuntimeDb::Postgres(store) => {
+            crate::db::postgres::off_runtime(|| store.adhoc_transform_record(&identity))
+        }
+    }?;
+    let Some((digest, run_id, scratch_dataset_id, expires_at_ms)) = record else {
+        return Ok(None);
+    };
+    if digest != transform.definition_digest {
+        return Err(ADHOC_IDENTITY_CONFLICT.into());
+    }
+    let run = db
+        .get_governed_transform_run(&run_id)?
+        .ok_or("ad-hoc run not found")?;
+    Ok(Some(AdHocRun {
+        run,
+        scratch_dataset_id,
+        expires_at_ms,
+        replayed: true,
+    }))
+}
+
+/// A stored identity: definition digest, run, scratch dataset, expiry.
+pub(crate) type AdHocRecord = (String, String, String, i64);
+
 /// The scratch object a run's output dataset is bound to.
 pub(crate) fn scratch_object(request: &AdHocRequest, now_ms: i64) -> crate::domain::Object {
     let dataset_id = request.scratch_dataset_id();
@@ -386,6 +431,16 @@ mod tests {
             .query_rows(&first.scratch_dataset_id, &Default::default())
             .unwrap();
         assert_eq!(output.len(), 2);
+
+        let found = committed(db, &first_request, &first_definition)
+            .unwrap()
+            .expect("the identity is committed");
+        assert_eq!(found.run.run_id, first.run.run_id);
+        assert!(
+            committed(db, &ask("unused"), &first_definition)
+                .unwrap()
+                .is_none()
+        );
 
         let grants = db
             .list_grants(&format!("{}-object", first.scratch_dataset_id))
