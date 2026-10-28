@@ -19,8 +19,10 @@ deploy, or authorize invocation. See
 Closed member kinds are `change_set`, `action_type`, `ontology`, and
 `evaluation`. The evidence and finding domain package
 (`pkg:feedback.evidence-finding/v1`, ADR 0095) certifies ontology, Action
-type, and evaluation members from `tests/fixtures/feedback/`. It does not
-package live instances and is not a runtime grant.
+type, and evaluation members from `tests/fixtures/feedback/`. The security
+finding and exposure package (`pkg:security.finding-exposure/v1`, ADR 0135)
+certifies the same member kinds from `tests/fixtures/security/`. Neither
+packages live instances, and neither is a runtime grant.
 
 ## Operator workflow
 

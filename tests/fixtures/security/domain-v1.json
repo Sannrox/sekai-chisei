@@ -1,0 +1,182 @@
+{
+  "version": "sekai.ontology-product/v1",
+  "classes": [
+    {
+      "name": "Finding",
+      "description": "A reported security problem, unique per namespace by problem signature. Repeated reports are occurrences, not new findings.",
+      "mapped_kind": "security_finding",
+      "ensure_kind": true,
+      "kind_description": "Security Finding object kind",
+      "properties": [
+        {
+          "name": "source",
+          "type": "enum",
+          "required": true,
+          "description": "Who reported it: probe, review, scanner, agent, or advisory.",
+          "enum_values": [
+            "probe",
+            "review",
+            "scanner",
+            "agent",
+            "advisory"
+          ]
+        },
+        {
+          "name": "component",
+          "type": "string",
+          "required": true,
+          "description": "Affected component."
+        },
+        {
+          "name": "version_range",
+          "type": "string",
+          "required": true,
+          "description": "Affected version range."
+        },
+        {
+          "name": "problem_signature",
+          "type": "string",
+          "required": true,
+          "description": "Stable signature that identifies the problem; findings with the same signature collapse into one."
+        },
+        {
+          "name": "reported_severity",
+          "type": "string",
+          "required": true,
+          "description": "Severity as reported by the source."
+        },
+        {
+          "name": "evidence_refs",
+          "type": "string",
+          "required": false,
+          "description": "Evidence references retained as a single string value."
+        }
+      ]
+    },
+    {
+      "name": "FindingOccurrence",
+      "description": "One measured observation of a finding. The occurrence id is unique per namespace, so a replayed observation never counts twice.",
+      "mapped_kind": "security_finding_occurrence",
+      "ensure_kind": true,
+      "kind_description": "Security FindingOccurrence object kind",
+      "properties": [
+        {
+          "name": "finding_id",
+          "type": "string",
+          "required": true,
+          "description": "The finding this occurrence observes."
+        },
+        {
+          "name": "occurrence_id",
+          "type": "string",
+          "required": true,
+          "description": "Source identifier of the observation; unique per namespace."
+        },
+        {
+          "name": "observed_at_ms",
+          "type": "int",
+          "required": true,
+          "description": "When the source observed it, in Unix milliseconds."
+        },
+        {
+          "name": "evidence_refs",
+          "type": "string",
+          "required": false,
+          "description": "Evidence references retained as a single string value."
+        }
+      ]
+    },
+    {
+      "name": "SecurityHypothesis",
+      "description": "A proposed explanation, for example from a model. It is not a measured fact and cannot be cited as exposure evidence.",
+      "mapped_kind": "security_hypothesis",
+      "ensure_kind": true,
+      "kind_description": "Security SecurityHypothesis object kind",
+      "properties": [
+        {
+          "name": "finding_id",
+          "type": "string",
+          "required": true,
+          "description": "The finding this hypothesis is about."
+        },
+        {
+          "name": "statement",
+          "type": "string",
+          "required": true,
+          "description": "The proposed explanation."
+        }
+      ]
+    },
+    {
+      "name": "Exposure",
+      "description": "One finding against one deployed target (release and environment), with a verdict and the measured evidence used.",
+      "mapped_kind": "security_exposure",
+      "ensure_kind": true,
+      "kind_description": "Security Exposure object kind",
+      "properties": [
+        {
+          "name": "finding_id",
+          "type": "string",
+          "required": true,
+          "description": "The finding."
+        },
+        {
+          "name": "release",
+          "type": "string",
+          "required": true,
+          "description": "Deployed release of the target."
+        },
+        {
+          "name": "environment",
+          "type": "string",
+          "required": true,
+          "description": "Environment of the target."
+        },
+        {
+          "name": "verdict",
+          "type": "enum",
+          "required": true,
+          "description": "exploitable, not-reachable, mitigated, or unknown.",
+          "enum_values": [
+            "exploitable",
+            "not-reachable",
+            "mitigated",
+            "unknown"
+          ]
+        },
+        {
+          "name": "evidence_id",
+          "type": "string",
+          "required": false,
+          "description": "Measured occurrence the verdict relies on; required unless the verdict is unknown."
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "name": "occurrence_of",
+      "description": "An occurrence observes a finding.",
+      "domain": "FindingOccurrence",
+      "range": "Finding"
+    },
+    {
+      "name": "hypothesizes",
+      "description": "A hypothesis is about a finding.",
+      "domain": "SecurityHypothesis",
+      "range": "Finding"
+    },
+    {
+      "name": "exposes",
+      "description": "An exposure places a finding on a deployed target.",
+      "domain": "Exposure",
+      "range": "Finding"
+    },
+    {
+      "name": "evidenced_by",
+      "description": "An exposure verdict relies on a measured occurrence.",
+      "domain": "Exposure",
+      "range": "FindingOccurrence"
+    }
+  ]
+}

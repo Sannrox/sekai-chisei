@@ -423,6 +423,10 @@ impl SekaiDb {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_objects_observation_external_id
                 ON sekai_objects(namespace, external_id)
                 WHERE kind = 'feedback_observation' AND external_id <> '';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_objects_security_identity
+                ON sekai_objects(namespace, external_id)
+                WHERE kind IN ('security_finding', 'security_finding_occurrence', 'security_exposure')
+                  AND external_id <> '';
             CREATE TABLE IF NOT EXISTS sekai_links (
                 id TEXT PRIMARY KEY,
                 from_id TEXT NOT NULL,
