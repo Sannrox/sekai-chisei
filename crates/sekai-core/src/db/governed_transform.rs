@@ -489,6 +489,21 @@ impl SekaiDb {
                 } else {
                     &dataset_id
                 };
+                // Some tables are created on first use of their feature.
+                let table = statement
+                    .split_whitespace()
+                    .nth(2)
+                    .ok_or("sweep statement names no table")?;
+                let present: bool = tx
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                        params![table],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !present {
+                    continue;
+                }
                 let sql = statement
                     .replace("{dataset}", "?1")
                     .replace("{object}", "?1");

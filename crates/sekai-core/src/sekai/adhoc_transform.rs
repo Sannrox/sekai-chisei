@@ -176,7 +176,8 @@ pub fn run(
 pub const SWEEP_BATCH: i64 = 256;
 
 /// Deletes up to `limit` expired scratch outputs (#1965): their rows,
-/// version snapshots, dataset, scratch object and grant. The run and its
+/// version snapshots, branches, health results, search entries, dataset,
+/// scratch object and grant. The run and its
 /// receipt stay; a replay of a swept identity returns the run with no
 /// scratch dataset. Each output is removed in its own transaction, claimed
 /// by clearing its dataset on the identity record, so planes sweeping at once
@@ -193,6 +194,15 @@ pub fn sweep(db: &RuntimeDb, now_ms: i64, limit: i64) -> Result<Vec<String>, Str
 /// Statements that remove one scratch output; each takes one parameter,
 /// the dataset id (`{dataset}`) or the scratch object id (`{object}`).
 pub(crate) const SWEEP_STATEMENTS: &[&str] = &[
+    "DELETE FROM sekai_dataset_branch_rows WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_dataset_branch_proposals WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_dataset_branches WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_dataset_health_results WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_dataset_health_checks WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_search_dataset_text WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_search_dataset WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_search_object_text WHERE object_id = {object}",
+    "DELETE FROM sekai_search_object WHERE object_id = {object}",
     "DELETE FROM sekai_dataset_rows WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_dataset_versions WHERE dataset_id = {dataset}",
