@@ -146,7 +146,7 @@ mark the Issue unless documented maintainer policy requires it.
    fix changes content, repeat review, commit, and final verification before
    continuing. The PR must carry this immutable candidate evidence.
 3. Publish to the claim branch with **GitHub-verified** commits via
-   `scripts/gh-verified-push.sh` (GraphQL `createCommitOnBranch`), not a plain
+   `bash scripts/gh-verified-push.sh` (GraphQL `createCommitOnBranch`), not a plain
    `git push`, unless the user explicitly asks for git-protocol push:
    - Claim branch (already exists on GitHub):
      `bash scripts/gh-verified-push.sh --branch <type>/<issue> --sync-local`
@@ -178,7 +178,7 @@ mark the Issue unless documented maintainer policy requires it.
 
 1. Wait for required CI and review. Resolve actionable feedback in the same
    branch and rerun affected checks. Re-publish review fixes with
-   `scripts/gh-verified-push.sh` so the PR tip stays Verified.
+   `bash scripts/gh-verified-push.sh` so the PR tip stays Verified.
 2. Recheck that dependencies and repository protections still permit landing.
    Land one lane at a time; wait for a sibling lane's merge to finish and
    recheck `mergeable` before starting yours.
