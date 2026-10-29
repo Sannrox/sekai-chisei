@@ -168,6 +168,17 @@ pub(super) async fn submit_action_instance(
         .and_then(|context| context.device.as_ref())
         .map(|device| device.id.clone())
         .unwrap_or_default();
+    // A turn token submits only while its turn is claimed (ADR 0142), and
+    // its admission commits only while that claim still holds.
+    service.authorize_turn_submission(&req, req.get_ref().namespace.trim())?;
+    let agent_turn = req
+        .extensions()
+        .get::<RuntimeTokenClaims>()
+        .filter(|claims| claims.is_turn())
+        .map(|claims| crate::sekai::action_instance::AgentTurnFence {
+            turn_id: claims.turn_id.clone(),
+            claim_generation: claims.claim_generation,
+        });
     let mut inner = req.into_inner();
     let namespace = inner.namespace.trim().to_string();
     if namespace.is_empty() {
@@ -235,6 +246,7 @@ pub(super) async fn submit_action_instance(
     .unwrap_or_default();
     let namespace_for_gate = namespace.clone();
     let admission_request = ActionInstanceAdmissionRequest {
+        agent_turn,
         namespace,
         type_id: inner.type_id,
         version: inner.version,
@@ -2408,6 +2420,7 @@ pub(super) async fn execute_action_plan(
                   key: &str,
                   expected_revision: &str| {
         let request = ActionInstanceAdmissionRequest {
+            agent_turn: None,
             namespace: inner.namespace.clone(),
             type_id: step.type_id.clone(),
             version: step.version.clone(),

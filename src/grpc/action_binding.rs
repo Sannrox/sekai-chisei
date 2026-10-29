@@ -523,6 +523,7 @@ impl SekaiServiceImpl {
         resource_tenant: &str,
     ) -> Result<(String, String, bool), String> {
         let request = ActionInstanceAdmissionRequest {
+            agent_turn: None,
             namespace: action.namespace.to_string(),
             type_id: action.type_id.to_string(),
             version: action.version.to_string(),

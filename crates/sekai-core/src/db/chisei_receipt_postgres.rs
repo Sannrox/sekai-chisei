@@ -27,13 +27,18 @@ impl PostgresDb {
         lease: &crate::sekai::action_instance::AdmissionLease,
         receipt: &OperationReceipt,
     ) -> Result<bool, String> {
-        self.put_admission_receipt_checked(instance_id, lease, receipt, false)
-            .map(|written| {
-                matches!(
-                    written,
-                    crate::sekai::action_instance::FencedAdmissionWrite::Applied(())
-                )
-            })
+        self.put_admission_receipt_checked(
+            instance_id,
+            lease,
+            receipt,
+            crate::sekai::action_instance::CommitCheck::None,
+        )
+        .map(|written| {
+            matches!(
+                written,
+                crate::sekai::action_instance::FencedAdmissionWrite::Applied(())
+            )
+        })
     }
 
     /// See the SQLite store (#1970).
@@ -42,7 +47,7 @@ impl PostgresDb {
         instance_id: &str,
         lease: &crate::sekai::action_instance::AdmissionLease,
         receipt: &OperationReceipt,
-        check_site_agent: bool,
+        check: crate::sekai::action_instance::CommitCheck,
     ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
         use crate::sekai::action_instance::FencedAdmissionWrite;
         let mut conn = self.connection()?;
@@ -55,13 +60,26 @@ impl PostgresDb {
         )? {
             return Ok(FencedAdmissionWrite::FenceLost);
         }
-        if check_site_agent
-            && let Some(reason) = crate::db::postgres_action_instance::postgres_reservation_refusal(
-                &mut tx,
-                instance_id,
-                None,
-            )?
-        {
+        // A receipt that commits an Action checks its turn's fence (ADR
+        // 0142), and an admitted one its site agent too (#1970).
+        use crate::sekai::action_instance::CommitCheck;
+        let refusal = match check {
+            CommitCheck::SiteAgent => {
+                crate::db::postgres_action_instance::postgres_reservation_refusal(
+                    &mut tx,
+                    instance_id,
+                    None,
+                )?
+            }
+            CommitCheck::TurnFence => {
+                crate::db::postgres_action_instance::postgres_turn_fence_refusal(
+                    &mut tx,
+                    instance_id,
+                )?
+            }
+            CommitCheck::None => None,
+        };
+        if let Some(reason) = refusal {
             crate::db::postgres_action_instance::postgres_deny_reservation(
                 &mut tx,
                 instance_id,
@@ -98,6 +116,16 @@ impl PostgresDb {
             lease,
             true,
         )? {
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
+        // So may the turn's lease have lapsed meanwhile (ADR 0142).
+        if check != CommitCheck::None
+            && crate::db::postgres_action_instance::postgres_turn_fence_refusal(
+                &mut tx,
+                instance_id,
+            )?
+            .is_some()
+        {
             return Ok(FencedAdmissionWrite::FenceLost);
         }
         tx.commit().map_err(|error| error.to_string())?;

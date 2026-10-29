@@ -327,6 +327,7 @@ mod tests {
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         ActionInstanceAdmission::new(db, None).admit(
             ActionInstanceAdmissionRequest {
+                agent_turn: None,
                 namespace: NAMESPACE.into(),
                 type_id: type_id.into(),
                 version: ACTION_VERSION.into(),

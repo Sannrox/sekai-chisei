@@ -156,6 +156,16 @@ pub struct AgentTurn {
 }
 
 impl AgentTurn {
+    /// Whether the turn was acknowledged, completed or failed.
+    pub fn is_acknowledged(&self) -> bool {
+        self.status == COMPLETED || self.status == FAILED
+    }
+
+    /// Whether the turn is claimed and its lease has not lapsed at `now_ms`.
+    pub fn is_live_claim(&self, now_ms: i64) -> bool {
+        self.status == CLAIMED && self.claim_expires_at_ms > now_ms
+    }
+
     fn claimable(&self, now_ms: i64) -> bool {
         self.due_at_ms <= now_ms
             && match self.status.as_str() {

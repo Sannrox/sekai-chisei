@@ -34,25 +34,31 @@ impl SekaiDb {
         lease: &crate::sekai::action_instance::AdmissionLease,
         receipt: &OperationReceipt,
     ) -> Result<bool, String> {
-        self.put_admission_receipt_checked(instance_id, lease, receipt, false)
-            .map(|written| {
-                matches!(
-                    written,
-                    crate::sekai::action_instance::FencedAdmissionWrite::Applied(())
-                )
-            })
+        self.put_admission_receipt_checked(
+            instance_id,
+            lease,
+            receipt,
+            crate::sekai::action_instance::CommitCheck::None,
+        )
+        .map(|written| {
+            matches!(
+                written,
+                crate::sekai::action_instance::FencedAdmissionWrite::Applied(())
+            )
+        })
     }
 
-    /// [`Self::put_admission_receipt`] that, with `check_site_agent`, first
-    /// refuses an Action whose principal's site agent instance froze since
-    /// admission (#1970): in this transaction it marks the reservation
-    /// denied, records no receipt, and answers why.
+    /// [`Self::put_admission_receipt`] that, as `check` asks, first refuses
+    /// an Action whose principal's site agent instance froze since admission
+    /// (#1970) or whose agent turn lost its claim (ADR 0142): in this
+    /// transaction it marks the reservation denied, records no receipt, and
+    /// answers why.
     pub fn put_admission_receipt_checked(
         &self,
         instance_id: &str,
         lease: &crate::sekai::action_instance::AdmissionLease,
         receipt: &OperationReceipt,
-        check_site_agent: bool,
+        check: crate::sekai::action_instance::CommitCheck,
     ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
         use crate::sekai::action_instance::FencedAdmissionWrite;
         let mut conn = self.conn();
@@ -67,10 +73,19 @@ impl SekaiDb {
         )? {
             return Ok(FencedAdmissionWrite::FenceLost);
         }
-        if check_site_agent
-            && let Some(reason) =
+        // A receipt that commits an Action checks its turn's fence (ADR
+        // 0142), and an admitted one its site agent too (#1970).
+        use crate::sekai::action_instance::CommitCheck;
+        let refusal = match check {
+            CommitCheck::SiteAgent => {
                 crate::sekai::action_instance::sqlite_reservation_refusal(&tx, instance_id, None)?
-        {
+            }
+            CommitCheck::TurnFence => {
+                crate::sekai::action_instance::sqlite_turn_fence_refusal(&tx, instance_id)?
+            }
+            CommitCheck::None => None,
+        };
+        if let Some(reason) = refusal {
             crate::sekai::action_instance::sqlite_deny_reservation(&tx, instance_id, &reason)?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(FencedAdmissionWrite::Refused(reason));
@@ -85,6 +100,12 @@ impl SekaiDb {
             rusqlite::params![instance_id],
         )
         .map_err(|error| error.to_string())?;
+        // The turn's lease runs on while the receipt is recorded (ADR 0142).
+        if check != CommitCheck::None
+            && crate::sekai::action_instance::sqlite_turn_fence_refusal(&tx, instance_id)?.is_some()
+        {
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(FencedAdmissionWrite::Applied(()))
     }

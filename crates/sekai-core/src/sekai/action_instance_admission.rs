@@ -88,6 +88,8 @@ pub const RECEIPT_MARKING_ATTRIBUTE: &str = "access_marking";
 
 #[derive(Debug, Clone)]
 pub struct ActionInstanceAdmissionRequest {
+    /// The agent turn whose token submits this Action (ADR 0142).
+    pub agent_turn: Option<crate::sekai::action_instance::AgentTurnFence>,
     pub namespace: String,
     pub type_id: String,
     pub version: String,
@@ -778,6 +780,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         // and compensation are fenced on it (#1930).
         let lease = crate::sekai::action_instance::AdmissionLease::first();
         let instance = ActionInstance {
+            agent_turn: request.agent_turn.clone(),
             instance_id: instance_id.clone(),
             namespace: namespace.clone(),
             type_id: request.type_id,
@@ -2138,9 +2141,18 @@ impl<'a> ActionInstanceAdmission<'a> {
         // decision on a parked instance records its receipt unfenced.
         match (approval, stored.admission_lease.as_ref()) {
             (None, Some(lease)) => {
-                // An admitted Action that writes no object commits here, so
-                // the freeze is checked in the receipt's transaction (#1970).
-                let check = stored.status == STATUS_ADMITTED && applied_object.is_none();
+                // An Action that writes no object commits here: an admitted
+                // one is checked for its site agent's freeze (#1970) and its
+                // turn's claim, a parked one for its turn's claim (ADR 0142).
+                // A denial, or a receipt after the object write committed
+                // under those checks, records as it is.
+                let check = match (stored.status.as_str(), &applied_object) {
+                    (STATUS_ADMITTED, None) => {
+                        crate::sekai::action_instance::CommitCheck::SiteAgent
+                    }
+                    (STATUS_PARKED, None) => crate::sekai::action_instance::CommitCheck::TurnFence,
+                    _ => crate::sekai::action_instance::CommitCheck::None,
+                };
                 match self
                     .db
                     .put_admission_receipt_checked(&stored.instance_id, lease, &receipt, check)
@@ -3271,6 +3283,7 @@ mod tests {
 
     fn request(parameters_json: &str) -> ActionInstanceAdmissionRequest {
         ActionInstanceAdmissionRequest {
+            agent_turn: None,
             namespace: "acme".into(),
             type_id: "dispatch".into(),
             version: "1".into(),
@@ -4190,6 +4203,7 @@ mod tests {
         let admitted = admission
             .admit(
                 ActionInstanceAdmissionRequest {
+                    agent_turn: None,
                     namespace: "acme".into(),
                     type_id: "notify".into(),
                     version: "1".into(),
@@ -4366,6 +4380,7 @@ mod tests {
 
     fn record_request(type_id: &str, parameters_json: &str) -> ActionInstanceAdmissionRequest {
         ActionInstanceAdmissionRequest {
+            agent_turn: None,
             namespace: "acme".into(),
             type_id: type_id.into(),
             version: "1".into(),
@@ -6094,6 +6109,7 @@ mod tests {
         db.put_governed_action_type(record_type("create"), "operator", 1)
             .unwrap();
         let reserved = crate::sekai::action_instance::ActionInstance {
+            agent_turn: None,
             autonomous_envelope_id: String::new(),
             parked_object_digest: String::new(),
             decided_by: String::new(),
