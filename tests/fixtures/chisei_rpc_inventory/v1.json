@@ -170,8 +170,8 @@
         "crates/sekai-types/src/governed_subject_provenance.rs",
         "src/grpc/chisei_service.rs",
         "tests/chisei_governed_subject_provenance_backend_conformance.rs",
-        "crates/sekai-core/src/db/governed_subject_provenance.rs",
-        "crates/sekai-core/src/db/postgres_governed_subject_provenance.rs"
+        "crates/chisei-core/src/chisei_store/governed_subject_provenance.rs",
+        "crates/chisei-core/src/chisei_store/postgres/0027_governed_subject_provenance.sql"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
