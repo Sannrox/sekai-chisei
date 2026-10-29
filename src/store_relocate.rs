@@ -3442,6 +3442,9 @@ mod tests {
             )
             .unwrap();
         }
+        // Historical combined source: Shared infrastructure plus the Chisei
+        // family tables relocate copies and fences.
+        crate::chisei_store::apply_chisei_postgres_schema(&source).unwrap();
         fn insert_limit(
             client: &mut impl postgres::GenericClient,
             scope: &str,
