@@ -19135,6 +19135,7 @@ fn guest_credentials_reach_only_namespace_checked_rpcs() {
         "UpdateObject",
         "DeleteObject",
         "DiscoverCapabilities",
+        "ListSiteAgentInstanceTurns",
     ];
     for (service, protocol) in [
         (
