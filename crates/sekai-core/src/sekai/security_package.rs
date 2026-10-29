@@ -41,6 +41,14 @@
 //!   history and a later registry change cannot rewrite it. Agent disposition precision is
 //!   measured from them ([`crate::sekai::security_precision`]).
 //!
+//! - A `fixed` disposition needs a regression probe (#1989). While a `fixed`
+//!   disposition heads the chain and no probe is bound to it, the exposure
+//!   reads `needs-probe` ([`exposure_state`]). A probe is bound to that
+//!   disposition, not the exposure, so a later disposition decides afresh,
+//!   and it must have failed on the vulnerable revision and passed on the
+//!   fixed one. Running the probe stays with its suite; the binding records
+//!   the results.
+//!
 //! Identities are stamped into `external_id` and enforced at commit by a
 //! partial unique index on `(namespace, external_id)` for these kinds; the
 //! plan-time checks here only give a precise error.
@@ -63,10 +71,12 @@ pub const PACKAGE_ID: &str = "pkg:security.finding-exposure/v1";
 pub const PACKAGE_VERSION: &str = "1";
 /// The current certification. A change to the certified members certifies
 /// the package again under a new id that succeeds the previous one where a
-/// namespace holds it; v1.3 adds the recorder and finding class (#1990).
-pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.3";
+/// namespace holds it; v1.3 adds the recorder and finding class (#1990),
+/// v1.4 regression probes (#1989).
+pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.4";
 /// Certifications this one succeeds, newest first.
 const PREVIOUS_CERTIFICATION_IDS: &[&str] = &[
+    "cert:security.finding-exposure/v1.3",
     "cert:security.finding-exposure/v1.2",
     "cert:security.finding-exposure/v1.1",
     "cert:security.finding-exposure/v1",
@@ -76,6 +86,7 @@ pub const KIND_OCCURRENCE: &str = "security_finding_occurrence";
 pub const KIND_HYPOTHESIS: &str = "security_hypothesis";
 pub const KIND_EXPOSURE: &str = "security_exposure";
 pub const KIND_DISPOSITION: &str = "security_disposition";
+pub const KIND_PROBE: &str = "security_regression_probe";
 
 /// The package's kinds, written only through its Actions.
 pub fn is_package_kind(kind: &str) -> bool {
@@ -85,6 +96,7 @@ pub fn is_package_kind(kind: &str) -> bool {
         KIND_HYPOTHESIS,
         KIND_EXPOSURE,
         KIND_DISPOSITION,
+        KIND_PROBE,
     ]
     .contains(&kind)
 }
@@ -92,6 +104,8 @@ pub const ACTION_DISPOSITION_RECORD: &str = "security.disposition.record";
 pub const ACTION_DISPOSITION_SUPERSEDE: &str = "security.disposition.supersede";
 pub const ACTION_DISPOSITION_REOPEN: &str = "security.disposition.reopen";
 pub const ACTION_EXPOSURE_BASIS: &str = "security.exposure.basis";
+pub const ACTION_PROBE_BIND: &str = "security.probe.bind";
+pub const DISPOSITION_FIXED: &str = "fixed";
 pub const DISPOSITION_ACCEPT_RISK: &str = "accept-risk";
 pub const DISPOSITION_NEEDS_REVIEW: &str = "needs-review";
 /// Validity basis facts an exposure records the current value of.
@@ -428,6 +442,12 @@ pub fn validate_object_write(
             }
             disposition_identity(db, object)?
         }
+        KIND_PROBE => {
+            if db.get_object(&object.id)?.is_some() {
+                return Err("a regression probe binding cannot be changed".into());
+            }
+            validate_probe(db, object)?
+        }
         _ => return Ok(()),
     };
     if !object.external_id.is_empty() && object.external_id != identity {
@@ -562,6 +582,7 @@ fn reference_ids(object: &Object) -> Vec<String> {
             .into_iter()
             .chain(property("supersedes"))
             .collect(),
+        KIND_PROBE => property("disposition_id").into_iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -600,6 +621,10 @@ fn duplicate_message(object: &Object, existing: &Object) -> String {
             "this exposure already has a disposition {}; supersede it instead",
             existing.id
         ),
+        KIND_PROBE => format!(
+            "that disposition already has regression probe {}",
+            existing.id
+        ),
         _ => format!(
             "an exposure for this finding and target already exists as {}",
             existing.id
@@ -628,6 +653,120 @@ fn require_exposure(db: &RuntimeDb, object: &Object) -> Result<Object, String> {
 /// The first disposition of an exposure, or the one successor of a previous
 /// disposition of the same exposure. Either is unique, so the history of an
 /// exposure's dispositions is one chain.
+/// A probe binds to the `fixed` disposition that heads its exposure's chain,
+/// with a failing result on the vulnerable revision and a passing one on the
+/// fixed revision. Stamps the exposure and answers the identity: one probe
+/// per disposition, checked at plan time only. Two concurrent bindings can
+/// both land; either clears `needs-probe`, so a duplicate does no harm.
+fn validate_probe(db: &RuntimeDb, object: &mut Object) -> Result<String, String> {
+    let disposition_id = required(object, "disposition_id")?.to_string();
+    let disposition = db
+        .get_object(&disposition_id)?
+        .filter(|found| found.namespace == object.namespace && found.kind == KIND_DISPOSITION)
+        .ok_or_else(|| format!("disposition {disposition_id} not found in this namespace"))?;
+    if disposition
+        .properties
+        .get("disposition")
+        .map(String::as_str)
+        != Some(DISPOSITION_FIXED)
+    {
+        return Err(format!(
+            "disposition {disposition_id} is not fixed; a regression probe proves a fix"
+        ));
+    }
+    let exposure_id = required(&disposition, "exposure_id")?.to_string();
+    let head = disposition_chain_head(db, &object.namespace, &exposure_id)?;
+    if head.as_ref().map(|head| head.id.as_str()) != Some(disposition_id.as_str()) {
+        return Err(format!(
+            "disposition {disposition_id} is superseded; bind the probe to the current one"
+        ));
+    }
+    required(object, "probe_kind")?;
+    required(object, "probe_ref")?;
+    let vulnerable = required(object, "vulnerable_revision")?;
+    if required(object, "fixed_revision")? == vulnerable {
+        return Err("the vulnerable and fixed revisions must differ".into());
+    }
+    if required(object, "vulnerable_result")? != PROBE_FAIL {
+        return Err(
+            "the probe must fail on the vulnerable revision; one that passes there does not detect the weakness"
+                .into(),
+        );
+    }
+    if required(object, "fixed_result")? != PROBE_PASS {
+        return Err("the probe must pass on the fixed revision".into());
+    }
+    // The binding names the disposition and copies its exposure, so it is
+    // marked at least as high as the disposition; admission then admits
+    // only a caller cleared for that marking.
+    if let Some(needed) = crate::sekai::markings::object_marking_token(&disposition) {
+        let lattice = namespace_lattice(db, &object.namespace)?;
+        let held = crate::sekai::markings::object_marking_token(object).unwrap_or_default();
+        if held.is_empty() || !lattice.dominates(held, needed)? {
+            return Err(format!(
+                "a probe for disposition {disposition_id} needs a marking at least {needed}"
+            ));
+        }
+    }
+    object.properties.insert("exposure_id".into(), exposure_id);
+    Ok(format!("probe:{disposition_id}"))
+}
+
+const PROBE_FAIL: &str = "fail";
+const PROBE_PASS: &str = "pass";
+
+/// Where an exposure stands with its dispositions (#1989).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposureState {
+    /// No disposition yet.
+    Undecided,
+    /// Reopened: a `needs-review` disposition heads the chain.
+    NeedsReview,
+    /// A `fixed` disposition heads the chain and no probe is bound to it.
+    NeedsProbe,
+    /// Decided, and a `fixed` decision has its probe.
+    Decided,
+}
+
+impl ExposureState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Undecided => "undecided",
+            Self::NeedsReview => DISPOSITION_NEEDS_REVIEW,
+            Self::NeedsProbe => "needs-probe",
+            Self::Decided => "decided",
+        }
+    }
+}
+
+/// The state of `exposure_id` in `namespace`, from its chain head.
+pub fn exposure_state(
+    db: &RuntimeDb,
+    namespace: &str,
+    exposure_id: &str,
+) -> Result<ExposureState, String> {
+    let Some(head) = disposition_chain_head(db, namespace, exposure_id)? else {
+        return Ok(ExposureState::Undecided);
+    };
+    Ok(
+        match head.properties.get("disposition").map(String::as_str) {
+            Some(DISPOSITION_NEEDS_REVIEW) => ExposureState::NeedsReview,
+            Some(DISPOSITION_FIXED) => {
+                let bound = db
+                    .find_all_by_external_id(&format!("probe:{}", head.id))?
+                    .into_iter()
+                    .any(|probe| probe.namespace == namespace && probe.kind == KIND_PROBE);
+                if bound {
+                    ExposureState::Decided
+                } else {
+                    ExposureState::NeedsProbe
+                }
+            }
+            _ => ExposureState::Decided,
+        },
+    )
+}
+
 fn disposition_identity(db: &RuntimeDb, object: &Object) -> Result<String, String> {
     let exposure_id = required(object, "exposure_id")?;
     let Some(previous_id) = object.properties.get("supersedes") else {
@@ -2739,5 +2878,163 @@ mod tests {
             head(&runtime).properties["reopened_fact"],
             "dependency_closure_digest"
         );
+    }
+
+    fn probe(object_id: &str, disposition_id: &str, vulnerable: &str, fixed: &str) -> Value {
+        json!({
+            "object_id": object_id,
+            "disposition_id": disposition_id,
+            "probe_kind": "catalogue",
+            "probe_ref": "isolation:cross-tenant-read",
+            "vulnerable_revision": "rev-a",
+            "vulnerable_result": vulnerable,
+            "fixed_revision": "rev-b",
+            "fixed_result": fixed,
+        })
+    }
+
+    fn state_of(runtime: &RuntimeDb) -> ExposureState {
+        exposure_state(runtime, NAMESPACE, "e-1").unwrap()
+    }
+
+    /// A fixed exposure reads needs-probe until a probe that fails on the
+    /// vulnerable revision and passes on the fixed one is bound to its fix;
+    /// one that passes on both is refused (#1989).
+    #[test]
+    fn a_fixed_exposure_needs_a_probe_that_fails_before_the_fix() {
+        let runtime = with_exposure();
+        assert_eq!(state_of(&runtime), ExposureState::Undecided);
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", DISPOSITION_FIXED, None),
+            "d-1",
+        )
+        .unwrap();
+        assert_eq!(state_of(&runtime), ExposureState::NeedsProbe);
+        assert_eq!(state_of(&runtime).as_str(), "needs-probe");
+
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-1", "d-1", "pass", "pass"),
+            "p-passes",
+        ));
+        assert!(
+            message.contains("must fail on the vulnerable revision"),
+            "{message}"
+        );
+        assert!(runtime.get_object("p-1").unwrap().is_none());
+        assert_eq!(state_of(&runtime), ExposureState::NeedsProbe);
+
+        admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-1", "d-1", "fail", "pass"),
+            "p-1",
+        )
+        .unwrap();
+        let bound = runtime.get_object("p-1").unwrap().unwrap();
+        assert_eq!(bound.properties["exposure_id"], "e-1");
+        assert_eq!(state_of(&runtime), ExposureState::Decided);
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-2", "d-1", "fail", "pass"),
+            "p-2",
+        ));
+        assert!(
+            message.contains("already has regression probe p-1"),
+            "{message}"
+        );
+    }
+
+    /// A probe proves only the fix that heads the chain: not another
+    /// disposition, not a superseded fix, and a newer fix needs its own.
+    #[test]
+    fn a_probe_binds_only_to_the_current_fix() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        assert_eq!(state_of(&runtime), ExposureState::Decided);
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-1", "d-1", "fail", "pass"),
+            "p-1",
+        ));
+        assert!(message.contains("is not fixed"), "{message}");
+
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-2", DISPOSITION_FIXED, Some("d-1")),
+            "d-2",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-2", "d-2", "fail", "pass"),
+            "p-2",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-3", DISPOSITION_FIXED, Some("d-2")),
+            "d-3",
+        )
+        .unwrap();
+        assert_eq!(state_of(&runtime), ExposureState::NeedsProbe);
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-3", "d-2", "fail", "pass"),
+            "p-3",
+        ));
+        assert!(message.contains("is superseded"), "{message}");
+        let mut same = probe("p-4", "d-3", "fail", "pass");
+        same["fixed_revision"] = "rev-a".into();
+        let message = failed_precondition(admit(&runtime, ACTION_PROBE_BIND, same, "p-4"));
+        assert!(message.contains("must differ"), "{message}");
+    }
+
+    /// A probe for a marked disposition is marked at least as high, so only
+    /// a caller cleared for that marking binds it.
+    #[test]
+    fn a_probe_is_marked_at_least_as_high_as_its_disposition() {
+        let runtime = with_exposure();
+        let mut fixed = disposition("d-1", DISPOSITION_FIXED, None);
+        fixed["access_marking"] = "confidential".into();
+        admit(&runtime, ACTION_DISPOSITION_RECORD, fixed, "d-1").unwrap();
+
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-1", "d-1", "fail", "pass"),
+            "p-unmarked",
+        ));
+        assert!(message.contains("at least confidential"), "{message}");
+        let mut marked = probe("p-1", "d-1", "fail", "pass");
+        marked["access_marking"] = "confidential".into();
+        assert!(
+            admit_cleared(
+                &runtime,
+                ACTION_PROBE_BIND,
+                marked.clone(),
+                "p-low",
+                "internal"
+            )
+            .is_err()
+        );
+        assert!(runtime.get_object("p-1").unwrap().is_none());
+        admit_cleared(&runtime, ACTION_PROBE_BIND, marked, "p-1", "confidential").unwrap();
+        assert_eq!(state_of(&runtime), ExposureState::Decided);
     }
 }

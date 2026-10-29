@@ -451,6 +451,74 @@
           "object_id"
         ]
       }
+    },
+    {
+      "type_id": "security.probe.bind",
+      "description": "Bind a regression probe to a fixed disposition. The probe must fail on the vulnerable revision and pass on the fixed one; until one is bound the exposure reads needs-probe.",
+      "object_kind": "security_regression_probe",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "disposition_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "probe_kind": {
+            "type": "string",
+            "enum": [
+              "catalogue",
+              "external"
+            ]
+          },
+          "probe_ref": {
+            "type": "string",
+            "minLength": 1
+          },
+          "vulnerable_revision": {
+            "type": "string",
+            "minLength": 1
+          },
+          "vulnerable_result": {
+            "type": "string",
+            "enum": [
+              "fail",
+              "pass"
+            ]
+          },
+          "fixed_revision": {
+            "type": "string",
+            "minLength": 1
+          },
+          "fixed_result": {
+            "type": "string",
+            "enum": [
+              "fail",
+              "pass"
+            ]
+          },
+          "access_marking": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "disposition_id",
+          "probe_kind",
+          "probe_ref",
+          "vulnerable_revision",
+          "vulnerable_result",
+          "fixed_revision",
+          "fixed_result"
+        ]
+      }
     }
   ]
 }

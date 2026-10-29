@@ -98,6 +98,21 @@ written through governed Actions, and no domain-specific core RPC.
    metrics are read by `sekaictl admin autonomy disposition-precision`. The
    certification moves to `cert:security.finding-exposure/v1.3`.
 
+9. **A fix needs a regression probe** (#1989). While a `fixed` disposition
+   heads an exposure's chain and no probe is bound to it, the exposure reads
+   `needs-probe`. `security.probe.bind` binds a `security_regression_probe`
+   to that disposition with the probe's results on the vulnerable and fixed
+   revisions, and is refused unless the probe failed on the first and
+   passed on the second, the revisions differ, and the disposition is the
+   current fixed head. It is marked at least as high as the disposition it
+   names, so only a caller cleared for that marking binds it. The probe names a Chisei isolation catalogue entry or
+   an external test reference; running it stays with its suite. Binding to
+   the disposition rather than the exposure needs no commit fence: if the
+   chain moves on, the new head decides the state. One probe per
+   disposition is checked at plan time only; a concurrent duplicate also
+   clears `needs-probe` and does no harm. The certification moves to
+   `cert:security.finding-exposure/v1.4`.
+
 ## Alternatives considered
 
 - A findings store and domain RPC. Rejected for the same reason as ADR 0095: a
