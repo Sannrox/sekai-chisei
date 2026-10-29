@@ -1,7 +1,7 @@
 //! Shared SQLite/PostgreSQL conformance for Chisei budget limits, reservation,
 //! and idempotent usage events.
 
-use sekai_chisei::db::chisei_budget::ChiseiBudgetBackend;
+use sekai_chisei::chisei_store::ChiseiBudgetBackend;
 use sekai_chisei::db::retention::RetentionPolicyBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::sekai::retention::SubjectErasureRequest;

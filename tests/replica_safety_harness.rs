@@ -2,6 +2,7 @@
 //!
 //! Behavioral pass criteria only: no wall-clock budgets as the sole signal.
 
+use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
 use std::path::Path;

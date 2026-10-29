@@ -8,7 +8,7 @@ use crate::chisei::gunshi_auto::{self, NamespaceAllocationStatus, PromoteRequest
 use crate::chisei::gunshi_policy::{AllocationPolicySnapshot, PolicyEvaluation};
 use crate::chisei::policy::Policy;
 use crate::chisei::policy_dry_run::{self, PolicyDryRunReport};
-use crate::chisei_store::ChiseiStore;
+use crate::chisei_store::{ChiseiRuntimeDb, ChiseiStore};
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{ListFilter, Object};
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};

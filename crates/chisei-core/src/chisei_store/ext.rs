@@ -1,5 +1,6 @@
 //! Extension traits for Chisei methods on Sekai persistence types.
 
+pub use super::budget::BudgetSekaiDbExt;
 pub use super::chisei::{ChiseiSekaiDbExt, ChiseiSekaiDbExt2};
 pub use super::chisei_portfolio::ChiseiPortfolioSekaiDbExt;
 pub use super::data_quality_store::DataQualityStoreSekaiDbExt;
@@ -15,6 +16,7 @@ pub use super::operation_reservation::{
     OperationReservationPostgresDbExt, OperationReservationSekaiDbExt,
 };
 pub use super::policy_shadow::{PolicyShadowPostgresDbExt, PolicyShadowSekaiDbExt};
+pub use super::postgres_budget::BudgetPostgresDbExt;
 pub use super::postgres_chisei_receipts::PostgresChiseiReceiptsPostgresDbExt;
 pub use super::postgres_eval::PostgresEvalPostgresDbExt;
 pub use super::postgres_evaluation_execution::PostgresEvaluationExecutionPostgresDbExt;

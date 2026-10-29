@@ -2,12 +2,34 @@
 //!
 //! Uses the two-replica SQLite harness. Pass criteria are durable outcomes only.
 
+use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::ReplicaSafetyInventory;
 
 use crate::replica_safety_harness::open_replica_pair;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[test]
+fn two_replica_budget_race_has_single_winner() {
+    let inventory = ReplicaSafetyInventory::load().unwrap();
+    inventory.require_authoritative("chisei.budget").unwrap();
+
+    let pair = open_replica_pair();
+    pair.a
+        .budget_set_limit("global", METRIC_TOKENS, 10, "daily")
+        .unwrap();
+
+    let results = pair.race_results(2, |_index, db| {
+        db.budget_check_and_reserve_chain("global", METRIC_TOKENS, 6, 0)
+    });
+    let successes = results.iter().filter(|result| result.is_ok()).count();
+    assert_eq!(successes, 1, "results={results:?}");
+    assert_eq!(
+        pair.b.budget_usage("global", METRIC_TOKENS, 0).unwrap().0,
+        6
+    );
+}
 
 #[test]
 fn concurrent_replicas_cannot_overspend_shared_limit() {

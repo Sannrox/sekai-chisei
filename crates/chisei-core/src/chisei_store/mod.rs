@@ -4,6 +4,8 @@
 //! `crate::chisei`, whose domain code reaches it only through `ChiseiStore`
 //! and its ports (ADR 0083 rule 6).
 
+pub mod budget;
+pub use budget::backend::ChiseiBudgetBackend;
 pub mod chisei;
 pub mod chisei_eval_backend;
 pub mod chisei_external_action;
@@ -28,6 +30,7 @@ pub mod policy_shadow;
 #[cfg(test)]
 mod portfolio_route_test_cases;
 mod ports;
+mod postgres_budget;
 mod postgres_chisei_receipts;
 mod postgres_eval;
 mod postgres_evaluation_execution;

@@ -8,6 +8,7 @@
 //! - Eval/portfolio authoritative state is shared.
 
 use sekai_chisei::chisei::eval::{EvalStore, Suite};
+use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::ReplicaSafetyInventory;
 

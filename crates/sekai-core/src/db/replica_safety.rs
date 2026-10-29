@@ -218,7 +218,6 @@ impl Drop for TwoReplicaSqlite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::chisei_budget::METRIC_TOKENS;
 
     #[test]
     fn inventory_loads_and_lists_required_authoritative_surfaces() {
@@ -255,32 +254,5 @@ mod tests {
             .require_authoritative("not.a.surface")
             .unwrap_err();
         assert!(err.contains("unlisted"));
-    }
-
-    #[test]
-    fn two_replica_budget_race_has_single_winner() {
-        let inventory = ReplicaSafetyInventory::load().unwrap();
-        inventory.require_authoritative("chisei.budget").unwrap();
-
-        let pair = TwoReplicaSqlite::open().expect("open shared sqlite");
-        match pair.a.as_ref() {
-            crate::db::runtime_db::RuntimeDb::Sqlite(db) => {
-                db.apply_chisei_sql_function_tables_for_tests().unwrap()
-            }
-            crate::db::runtime_db::RuntimeDb::Postgres(_) => panic!("sqlite pair"),
-        }
-        pair.a
-            .budget_set_limit("global", METRIC_TOKENS, 10, "daily")
-            .unwrap();
-
-        let results = pair.race_results(2, |_index, db| {
-            db.budget_check_and_reserve_chain("global", METRIC_TOKENS, 6, 0)
-        });
-        let successes = results.iter().filter(|result| result.is_ok()).count();
-        assert_eq!(successes, 1, "results={results:?}");
-        assert_eq!(
-            pair.b.budget_usage("global", METRIC_TOKENS, 0).unwrap().0,
-            6
-        );
     }
 }

@@ -997,6 +997,7 @@ mod tests {
     use crate::test_support::runtime_db::RuntimeDb;
     use crate::test_support::sekai_db::SekaiDb;
     use crate::test_support::sekai_service::SekaiServiceImpl;
+    use sekai_chisei::chisei_store::ChiseiRuntimeDb;
     use sekai_proto::chisei::chisei_service_server::ChiseiServiceServer;
     use sekai_proto::sekai::sekai_service_server::SekaiServiceServer;
     use std::sync::Arc;

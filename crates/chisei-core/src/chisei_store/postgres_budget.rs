@@ -1,9 +1,10 @@
-use crate::db::chisei_budget::{
-    BUDGET_METRICS, BudgetScopeUsage, BudgetTransferRecord, EffectiveLimit, UNLIMITED_PERIOD_TYPE,
-    parent_scope_id, period_start_ms, scope_chain, work_unit_default_scope,
-};
-use crate::db::postgres::PostgresDb;
+use super::budget::EffectiveLimit;
 use postgres::GenericClient;
+use sekai_core::db::chisei_budget::{
+    BUDGET_METRICS, BudgetScopeUsage, BudgetTransferRecord, UNLIMITED_PERIOD_TYPE, parent_scope_id,
+    period_start_ms, scope_chain, work_unit_default_scope,
+};
+use sekai_core::db::postgres::PostgresDb;
 
 /// A scope's own limit, falling back to its parent's work-unit default
 /// (#1862), read in one statement. `$3` is NULL for a scope that is not a
@@ -45,8 +46,198 @@ fn charge_period_type(
     ))
 }
 
-impl PostgresDb {
-    pub fn budget_limits_for_scope(
+pub trait BudgetPostgresDbExt {
+    fn budget_limits_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<(String, String, i64, String)>, String>;
+    fn budget_set_limit(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String>;
+    fn budget_set_limit_scoped(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+        pool_id: &str,
+    ) -> Result<(), String>;
+    /// Sets the limit every `work_unit:` child of `scope_id` without a limit
+    /// of its own gets for `metric` (#1862).
+    fn budget_set_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+    ) -> Result<(), String>;
+    /// Removes `scope_id`'s work-unit default for `metric`. Removing an
+    /// unset default succeeds.
+    fn budget_clear_work_unit_default(&self, scope_id: &str, metric: &str) -> Result<(), String>;
+    fn budget_set_pool_ceiling(
+        &self,
+        pool_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String>;
+    fn budget_check_and_reserve_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+    fn budget_check_and_reserve_chain_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: &str,
+    ) -> Result<(), String>;
+    #[allow(clippy::too_many_arguments)]
+    fn budget_check_and_reserve_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: Option<&str>,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String>;
+    #[allow(clippy::too_many_arguments)]
+    fn budget_check_and_reserve_chain_inner(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: Option<&str>,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String>;
+    fn budget_check_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+    #[allow(clippy::too_many_arguments)]
+    fn budget_check_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+        _partition_simulated: bool,
+    ) -> Result<(), String>;
+    fn budget_assert_home_writable(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        local_site_id: &str,
+    ) -> Result<(), String>;
+    fn budget_adjust_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<(), String>;
+    fn budget_adjust_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+    /// Applies a usage delta once for a stable caller-generated key.
+    fn budget_record_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+    /// [`Self::budget_record_idempotent`] with the home-site pin checked
+    /// under the scope locks, in the debit's transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn budget_record_idempotent_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<bool, String>;
+    fn budget_usage(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64, String), String>;
+    /// Usage of every scope in the chain of `scope_id`, for each metric in
+    /// [`BUDGET_METRICS`], read in one repeatable-read snapshot.
+    fn budget_usage_chain(
+        &self,
+        scope_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<BudgetScopeUsage>, String>;
+    fn budget_namespace_pressure(
+        &self,
+        namespace: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<i32, String>;
+    #[allow(clippy::too_many_arguments)]
+    fn budget_transfer_capacity(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<BudgetTransferRecord, String>;
+    #[allow(clippy::too_many_arguments)]
+    fn budget_record_transfer_refused(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<BudgetTransferRecord, String>;
+    fn budget_get_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<BudgetTransferRecord>, String>;
+}
+
+impl BudgetPostgresDbExt for PostgresDb {
+    fn budget_limits_for_scope(
         &self,
         scope_id: &str,
     ) -> Result<Vec<(String, String, i64, String)>, String> {
@@ -71,7 +262,7 @@ impl PostgresDb {
                     &[&scope, &work_unit_default_scope(&scope)],
                 )
                 .map_err(|error| {
-                    crate::db::postgres::missing_relation_or(error, "chisei_budget_limits")
+                    sekai_core::db::postgres::missing_relation_or(error, "chisei_budget_limits")
                 })?;
             for row in rows {
                 limits.push((
@@ -85,7 +276,7 @@ impl PostgresDb {
         Ok(limits)
     }
 
-    pub fn budget_set_limit(
+    fn budget_set_limit(
         &self,
         scope_id: &str,
         metric: &str,
@@ -95,7 +286,7 @@ impl PostgresDb {
         self.budget_set_limit_scoped(scope_id, metric, max_amount, period_type, "", "")
     }
 
-    pub fn budget_set_limit_scoped(
+    fn budget_set_limit_scoped(
         &self,
         scope_id: &str,
         metric: &str,
@@ -141,7 +332,7 @@ impl PostgresDb {
 
     /// Sets the limit every `work_unit:` child of `scope_id` without a limit
     /// of its own gets for `metric` (#1862).
-    pub fn budget_set_work_unit_default(
+    fn budget_set_work_unit_default(
         &self,
         scope_id: &str,
         metric: &str,
@@ -169,11 +360,7 @@ impl PostgresDb {
 
     /// Removes `scope_id`'s work-unit default for `metric`. Removing an
     /// unset default succeeds.
-    pub fn budget_clear_work_unit_default(
-        &self,
-        scope_id: &str,
-        metric: &str,
-    ) -> Result<(), String> {
+    fn budget_clear_work_unit_default(&self, scope_id: &str, metric: &str) -> Result<(), String> {
         self.connection()?
             .execute(
                 "DELETE FROM chisei_budget_work_unit_defaults WHERE scope_id = $1 AND metric = $2",
@@ -183,7 +370,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn budget_set_pool_ceiling(
+    fn budget_set_pool_ceiling(
         &self,
         pool_id: &str,
         metric: &str,
@@ -213,7 +400,7 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn budget_check_and_reserve_chain(
+    fn budget_check_and_reserve_chain(
         &self,
         scope_id: &str,
         metric: &str,
@@ -225,7 +412,7 @@ impl PostgresDb {
         )
     }
 
-    pub fn budget_check_and_reserve_chain_idempotent(
+    fn budget_check_and_reserve_chain_idempotent(
         &self,
         scope_id: &str,
         metric: &str,
@@ -246,7 +433,7 @@ impl PostgresDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn budget_check_and_reserve_chain_for_site(
+    fn budget_check_and_reserve_chain_for_site(
         &self,
         scope_id: &str,
         metric: &str,
@@ -392,7 +579,7 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    pub fn budget_check_chain(
+    fn budget_check_chain(
         &self,
         scope_id: &str,
         metric: &str,
@@ -403,7 +590,7 @@ impl PostgresDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn budget_check_chain_for_site(
+    fn budget_check_chain_for_site(
         &self,
         scope_id: &str,
         metric: &str,
@@ -447,7 +634,7 @@ impl PostgresDb {
         Ok(())
     }
 
-    pub fn budget_assert_home_writable(
+    fn budget_assert_home_writable(
         &self,
         scope_id: &str,
         metric: &str,
@@ -463,7 +650,7 @@ impl PostgresDb {
         Ok(())
     }
 
-    pub fn budget_adjust_chain_for_site(
+    fn budget_adjust_chain_for_site(
         &self,
         scope_id: &str,
         metric: &str,
@@ -478,7 +665,7 @@ impl PostgresDb {
         self.budget_adjust_chain(scope_id, metric, delta, now_ms)
     }
 
-    pub fn budget_adjust_chain(
+    fn budget_adjust_chain(
         &self,
         scope_id: &str,
         metric: &str,
@@ -494,7 +681,7 @@ impl PostgresDb {
     }
 
     /// Applies a usage delta once for a stable caller-generated key.
-    pub fn budget_record_idempotent(
+    fn budget_record_idempotent(
         &self,
         scope_id: &str,
         metric: &str,
@@ -516,7 +703,7 @@ impl PostgresDb {
     /// [`Self::budget_record_idempotent`] with the home-site pin checked
     /// under the scope locks, in the debit's transaction.
     #[allow(clippy::too_many_arguments)]
-    pub fn budget_record_idempotent_for_site(
+    fn budget_record_idempotent_for_site(
         &self,
         scope_id: &str,
         metric: &str,
@@ -574,16 +761,16 @@ impl PostgresDb {
                 stored.get::<_, i64>(2),
             );
             if stored != (scope_id.to_string(), metric.to_string(), amount) {
-                crate::obs::signals::record_deduplication(
-                    crate::obs::labels::Subsystem::Chisei,
-                    crate::obs::labels::DeduplicationEvent::IdempotencyConflict,
+                sekai_core::obs::signals::record_deduplication(
+                    sekai_core::obs::labels::Subsystem::Chisei,
+                    sekai_core::obs::labels::DeduplicationEvent::IdempotencyConflict,
                 );
                 return Err("idempotency key was already used for different budget usage".into());
             }
             transaction.commit().map_err(|error| error.to_string())?;
-            crate::obs::signals::record_deduplication(
-                crate::obs::labels::Subsystem::Chisei,
-                crate::obs::labels::DeduplicationEvent::IdempotentReplay,
+            sekai_core::obs::signals::record_deduplication(
+                sekai_core::obs::labels::Subsystem::Chisei,
+                sekai_core::obs::labels::DeduplicationEvent::IdempotentReplay,
             );
             return Ok(false);
         }
@@ -627,7 +814,7 @@ impl PostgresDb {
         Ok(true)
     }
 
-    pub fn budget_usage(
+    fn budget_usage(
         &self,
         scope_id: &str,
         metric: &str,
@@ -653,7 +840,7 @@ impl PostgresDb {
 
     /// Usage of every scope in the chain of `scope_id`, for each metric in
     /// [`BUDGET_METRICS`], read in one repeatable-read snapshot.
-    pub fn budget_usage_chain(
+    fn budget_usage_chain(
         &self,
         scope_id: &str,
         now_ms: i64,
@@ -700,7 +887,7 @@ impl PostgresDb {
         Ok(levels)
     }
 
-    pub fn budget_namespace_pressure(
+    fn budget_namespace_pressure(
         &self,
         namespace: &str,
         metric: &str,
@@ -752,63 +939,9 @@ impl PostgresDb {
         }
         Ok(worst)
     }
-}
 
-fn budget_lock_key(metric: &str, scope: &str) -> String {
-    format!("budget:{}:{metric}:{}:{scope}", metric.len(), scope.len())
-}
-
-fn pg_assert_home_pin(scope: &str, home_site_id: &str, local_site_id: &str) -> Result<(), String> {
-    if home_site_id.is_empty() {
-        return Ok(());
-    }
-    if local_site_id.is_empty() {
-        return Err(format!(
-            "budget scope {scope} is home-pinned to {home_site_id} but local site_id is unset"
-        ));
-    }
-    if home_site_id != local_site_id {
-        return Err(format!(
-            "budget scope {scope} is pinned to home site {home_site_id}; local site is {local_site_id}"
-        ));
-    }
-    Ok(())
-}
-
-fn pg_enforce_pool_member_sum(
-    tx: &mut postgres::Transaction<'_>,
-    pool_id: &str,
-    metric: &str,
-) -> Result<(), String> {
-    let ceiling = tx
-        .query_opt(
-            "SELECT max_amount FROM chisei_budget_pools WHERE pool_id = $1 AND metric = $2",
-            &[&pool_id, &metric],
-        )
-        .map_err(|error| error.to_string())?;
-    let Some(ceiling) = ceiling else {
-        return Ok(());
-    };
-    let ceiling: i64 = ceiling.get(0);
-    let sum: i64 = tx
-        .query_one(
-            "SELECT COALESCE(SUM(max_amount), 0) FROM chisei_budget_limits
-             WHERE pool_id = $1 AND metric = $2",
-            &[&pool_id, &metric],
-        )
-        .map_err(|error| error.to_string())?
-        .get(0);
-    if sum > ceiling {
-        return Err(format!(
-            "pool {pool_id} member limits sum {sum} exceeds combined ceiling {ceiling}"
-        ));
-    }
-    Ok(())
-}
-
-impl PostgresDb {
     #[allow(clippy::too_many_arguments)]
-    pub fn budget_transfer_capacity(
+    fn budget_transfer_capacity(
         &self,
         transfer_id: &str,
         metric: &str,
@@ -929,7 +1062,7 @@ impl PostgresDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn budget_record_transfer_refused(
+    fn budget_record_transfer_refused(
         &self,
         transfer_id: &str,
         metric: &str,
@@ -976,7 +1109,7 @@ impl PostgresDb {
         Ok(record)
     }
 
-    pub fn budget_get_transfer(
+    fn budget_get_transfer(
         &self,
         transfer_id: &str,
     ) -> Result<Option<BudgetTransferRecord>, String> {
@@ -1061,6 +1194,58 @@ fn pg_insert_transfer(
     Ok(())
 }
 
+fn budget_lock_key(metric: &str, scope: &str) -> String {
+    format!("budget:{}:{metric}:{}:{scope}", metric.len(), scope.len())
+}
+
+fn pg_assert_home_pin(scope: &str, home_site_id: &str, local_site_id: &str) -> Result<(), String> {
+    if home_site_id.is_empty() {
+        return Ok(());
+    }
+    if local_site_id.is_empty() {
+        return Err(format!(
+            "budget scope {scope} is home-pinned to {home_site_id} but local site_id is unset"
+        ));
+    }
+    if home_site_id != local_site_id {
+        return Err(format!(
+            "budget scope {scope} is pinned to home site {home_site_id}; local site is {local_site_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn pg_enforce_pool_member_sum(
+    tx: &mut postgres::Transaction<'_>,
+    pool_id: &str,
+    metric: &str,
+) -> Result<(), String> {
+    let ceiling = tx
+        .query_opt(
+            "SELECT max_amount FROM chisei_budget_pools WHERE pool_id = $1 AND metric = $2",
+            &[&pool_id, &metric],
+        )
+        .map_err(|error| error.to_string())?;
+    let Some(ceiling) = ceiling else {
+        return Ok(());
+    };
+    let ceiling: i64 = ceiling.get(0);
+    let sum: i64 = tx
+        .query_one(
+            "SELECT COALESCE(SUM(max_amount), 0) FROM chisei_budget_limits
+             WHERE pool_id = $1 AND metric = $2",
+            &[&pool_id, &metric],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    if sum > ceiling {
+        return Err(format!(
+            "pool {pool_id} member limits sum {sum} exceeds combined ceiling {ceiling}"
+        ));
+    }
+    Ok(())
+}
+
 /// Add `delta` to `scope_id` and every ancestor's usage and attribution under
 /// their advisory locks, in the caller's transaction, so a caller can pair it
 /// atomically with another write, such as releasing a reservation (#1902).
@@ -1127,8 +1312,8 @@ mod tests {
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
     fn postgres_budget_limits_for_scope_returns_configured_metrics() {
-        let scratch = crate::db::postgres::ScratchDatabase::create();
-        let db = scratch.connect();
+        let scratch = sekai_core::db::postgres::ScratchDatabase::create();
+        let db = crate::chisei_store::postgres_with_chisei_schema(scratch.connect());
         db.budget_set_limit("tenant:a", "requests", 1, "daily")
             .unwrap();
         let rows = db.budget_limits_for_scope("tenant:a").unwrap();
@@ -1144,9 +1329,9 @@ mod tests {
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
     fn postgres_budget_limits_for_scope_names_a_missing_sekai_plane_table() {
-        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let scratch = sekai_core::db::postgres::ScratchDatabase::create();
         let db = scratch
-            .connect_for_plane(crate::db::schema_plane::SchemaPlane::Sekai)
+            .connect_for_plane(sekai_core::db::schema_plane::SchemaPlane::Sekai)
             .unwrap();
         let error = db.budget_limits_for_scope("tenant:a").unwrap_err();
         assert!(

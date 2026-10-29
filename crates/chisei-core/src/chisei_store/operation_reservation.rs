@@ -189,7 +189,7 @@ impl OperationReservationSekaiDbExt for SekaiDb {
                 .optional()
                 .map_err(|error| error.to_string())?
             };
-            sekai_core::db::chisei_budget::adjust_chain_tx(
+            crate::chisei_store::budget::adjust_chain_tx(
                 &tx,
                 &current.budget_subject,
                 metric,
@@ -362,7 +362,7 @@ impl OperationReservationPostgresDbExt for PostgresDb {
                     .map_err(|error| error.to_string())?
                     .map(|row| row.get(0))
             };
-            sekai_core::db::postgres_budget::adjust_chain_tx(
+            crate::chisei_store::postgres_budget::adjust_chain_tx(
                 &mut transaction,
                 &current.budget_subject,
                 metric,

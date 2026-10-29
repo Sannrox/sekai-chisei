@@ -17,6 +17,7 @@ use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelec
 use crate::chisei_store::ext::*;
 use crate::sekai_principal::SekaiPrincipalRuntimeDbExt;
 use ed25519_dalek::VerifyingKey;
+use sekai_core::db::chisei_budget::{BudgetScopeUsage, BudgetTransferRecord};
 use sekai_core::db::runtime_db::RuntimeDb;
 use sekai_core::sekai::evidence::EvidenceClassification;
 use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
@@ -803,6 +804,204 @@ pub trait ChiseiRuntimeDb {
         &self,
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String>;
+
+    fn budget_adjust_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn budget_check_and_reserve_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    fn budget_check_and_reserve_chain_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: &str,
+    ) -> Result<(), String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_check_and_reserve_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: Option<&str>,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String>;
+
+    fn budget_check_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_check_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String>;
+
+    fn budget_assert_home_writable(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        local_site_id: &str,
+    ) -> Result<(), String>;
+
+    fn budget_adjust_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<(), String>;
+
+    fn budget_set_limit_scoped(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+        pool_id: &str,
+    ) -> Result<(), String>;
+
+    fn budget_set_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+    ) -> Result<(), String>;
+
+    fn budget_clear_work_unit_default(&self, scope_id: &str, metric: &str) -> Result<(), String>;
+
+    fn budget_set_pool_ceiling(
+        &self,
+        pool_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_transfer_capacity(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<BudgetTransferRecord, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_record_transfer_refused(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<BudgetTransferRecord, String>;
+
+    fn budget_get_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<BudgetTransferRecord>, String>;
+
+    fn budget_limits_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<(String, String, i64, String)>, String>;
+
+    fn budget_namespace_pressure(
+        &self,
+        namespace: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<i32, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_record_idempotent_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<bool, String>;
+
+    fn budget_record_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+
+    fn budget_set_limit(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String>;
+
+    fn budget_usage(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64, String), String>;
+
+    fn budget_usage_chain(
+        &self,
+        scope_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<BudgetScopeUsage>, String>;
+
+    /// Test helper used by gateway setup fixtures.
+    #[cfg(feature = "gateway-test-support")]
+    #[doc(hidden)]
+    fn gateway_test_budget_usage(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64, String), String>;
 }
 
 impl ChiseiRuntimeDb for RuntimeDb {
@@ -2918,6 +3117,506 @@ impl ChiseiRuntimeDb for RuntimeDb {
             Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
                 db.list_pending_operation_reservations(limit)
             }),
+        }
+    }
+
+    fn budget_adjust_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_adjust_chain(scope_id, metric, delta, now_ms),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_adjust_chain(scope_id, metric, delta, now_ms)
+            }),
+        }
+    }
+
+    fn budget_check_and_reserve_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_check_and_reserve_chain(scope_id, metric, amount, now_ms),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_check_and_reserve_chain(scope_id, metric, amount, now_ms)
+            }),
+        }
+    }
+
+    fn budget_check_and_reserve_chain_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_check_and_reserve_chain_idempotent(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                idempotency_key,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_check_and_reserve_chain_idempotent(
+                    scope_id,
+                    metric,
+                    amount,
+                    now_ms,
+                    idempotency_key,
+                )
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_check_and_reserve_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: Option<&str>,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_check_and_reserve_chain_for_site(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                idempotency_key,
+                require_home_pin,
+                local_site_id,
+                partition_simulated,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_check_and_reserve_chain_for_site(
+                    scope_id,
+                    metric,
+                    amount,
+                    now_ms,
+                    idempotency_key,
+                    require_home_pin,
+                    local_site_id,
+                    partition_simulated,
+                )
+            }),
+        }
+    }
+
+    fn budget_check_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_check_chain(scope_id, metric, amount, now_ms),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_check_chain(scope_id, metric, amount, now_ms)
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_check_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_check_chain_for_site(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+                partition_simulated,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_check_chain_for_site(
+                    scope_id,
+                    metric,
+                    amount,
+                    now_ms,
+                    require_home_pin,
+                    local_site_id,
+                    partition_simulated,
+                )
+            }),
+        }
+    }
+
+    fn budget_assert_home_writable(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        local_site_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_assert_home_writable(scope_id, metric, local_site_id),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_assert_home_writable(scope_id, metric, local_site_id)
+            }),
+        }
+    }
+
+    fn budget_adjust_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_adjust_chain_for_site(
+                scope_id,
+                metric,
+                delta,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_adjust_chain_for_site(
+                    scope_id,
+                    metric,
+                    delta,
+                    now_ms,
+                    require_home_pin,
+                    local_site_id,
+                )
+            }),
+        }
+    }
+
+    fn budget_set_limit_scoped(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+        pool_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_set_limit_scoped(
+                scope_id,
+                metric,
+                max_amount,
+                period_type,
+                home_site_id,
+                pool_id,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_set_limit_scoped(
+                    scope_id,
+                    metric,
+                    max_amount,
+                    period_type,
+                    home_site_id,
+                    pool_id,
+                )
+            }),
+        }
+    }
+
+    fn budget_set_work_unit_default(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_set_work_unit_default(
+                scope_id,
+                metric,
+                max_amount,
+                period_type,
+                home_site_id,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_set_work_unit_default(
+                    scope_id,
+                    metric,
+                    max_amount,
+                    period_type,
+                    home_site_id,
+                )
+            }),
+        }
+    }
+
+    fn budget_clear_work_unit_default(&self, scope_id: &str, metric: &str) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_clear_work_unit_default(scope_id, metric),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_clear_work_unit_default(scope_id, metric)
+            }),
+        }
+    }
+
+    fn budget_set_pool_ceiling(
+        &self,
+        pool_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.budget_set_pool_ceiling(pool_id, metric, max_amount, period_type)
+            }
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_set_pool_ceiling(pool_id, metric, max_amount, period_type)
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_transfer_capacity(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<BudgetTransferRecord, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_transfer_capacity(
+                transfer_id,
+                metric,
+                from_scope_id,
+                to_scope_id,
+                amount,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_transfer_capacity(
+                    transfer_id,
+                    metric,
+                    from_scope_id,
+                    to_scope_id,
+                    amount,
+                    actor,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_record_transfer_refused(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<BudgetTransferRecord, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_record_transfer_refused(
+                transfer_id,
+                metric,
+                from_scope_id,
+                to_scope_id,
+                amount,
+                actor,
+                reason,
+                now_ms,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_record_transfer_refused(
+                    transfer_id,
+                    metric,
+                    from_scope_id,
+                    to_scope_id,
+                    amount,
+                    actor,
+                    reason,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
+    fn budget_get_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<BudgetTransferRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_get_transfer(transfer_id),
+            Self::Postgres(db) => {
+                sekai_core::db::postgres::off_runtime(|| db.budget_get_transfer(transfer_id))
+            }
+        }
+    }
+
+    fn budget_limits_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<(String, String, i64, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_limits_for_scope(scope_id),
+            Self::Postgres(db) => {
+                sekai_core::db::postgres::off_runtime(|| db.budget_limits_for_scope(scope_id))
+            }
+        }
+    }
+
+    fn budget_namespace_pressure(
+        &self,
+        namespace: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<i32, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_namespace_pressure(namespace, metric, now_ms),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_namespace_pressure(namespace, metric, now_ms)
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn budget_record_idempotent_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_record_idempotent_for_site(
+                scope_id,
+                metric,
+                amount,
+                idempotency_key,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_record_idempotent_for_site(
+                    scope_id,
+                    metric,
+                    amount,
+                    idempotency_key,
+                    now_ms,
+                    require_home_pin,
+                    local_site_id,
+                )
+            }),
+        }
+    }
+
+    fn budget_record_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.budget_record_idempotent(scope_id, metric, amount, idempotency_key, now_ms)
+            }
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_record_idempotent(scope_id, metric, amount, idempotency_key, now_ms)
+            }),
+        }
+    }
+
+    fn budget_set_limit(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_set_limit(scope_id, metric, max_amount, period_type),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.budget_set_limit(scope_id, metric, max_amount, period_type)
+            }),
+        }
+    }
+
+    fn budget_usage(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64, String), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_usage(scope_id, metric, now_ms),
+            Self::Postgres(db) => {
+                sekai_core::db::postgres::off_runtime(|| db.budget_usage(scope_id, metric, now_ms))
+            }
+        }
+    }
+
+    fn budget_usage_chain(
+        &self,
+        scope_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<BudgetScopeUsage>, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_usage_chain(scope_id, now_ms),
+            Self::Postgres(db) => {
+                sekai_core::db::postgres::off_runtime(|| db.budget_usage_chain(scope_id, now_ms))
+            }
+        }
+    }
+
+    /// Test helper used by gateway setup fixtures.
+    #[cfg(feature = "gateway-test-support")]
+    #[doc(hidden)]
+    fn gateway_test_budget_usage(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64, String), String> {
+        match self {
+            Self::Sqlite(db) => db.gateway_test_budget_usage(scope_id, metric, now_ms),
+            Self::Postgres(_) => Err(
+                "gateway_test_budget_usage is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
         }
     }
 }
