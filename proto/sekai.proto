@@ -1270,6 +1270,19 @@ message ListClaimableAgentTurnsRequest {
 message ListClaimableAgentTurnsResponse {
   repeated AgentTurn turns = 1;
 }
+message ListSiteAgentInstanceTurnsRequest {
+  string namespace = 1;
+  string instance_id = 2;
+  int32 limit = 3;
+  // Empty for the newest page; otherwise the previous next_page_token.
+  string page_token = 4;
+}
+message ListSiteAgentInstanceTurnsResponse {
+  // Newest first. A refused admission has status "refused" and no claim;
+  // a refused claim is the turn row with the same status.
+  repeated AgentTurn turns = 1;
+  string next_page_token = 2;
+}
 message ClaimAgentTurnRequest {
   string namespace = 1;
   string runtime_id = 2;
@@ -5048,6 +5061,7 @@ service SekaiService {
   rpc ClaimTransformWork(ClaimTransformWorkRequest) returns (ClaimTransformWorkResponse);
   rpc HeartbeatTransformClaim(HeartbeatTransformClaimRequest) returns (HeartbeatTransformClaimResponse);
   rpc WakeSiteAgentInstance(WakeSiteAgentInstanceRequest) returns (WakeSiteAgentInstanceResponse);
+  rpc ListSiteAgentInstanceTurns(ListSiteAgentInstanceTurnsRequest) returns (ListSiteAgentInstanceTurnsResponse);
   rpc ListClaimableAgentTurns(ListClaimableAgentTurnsRequest) returns (ListClaimableAgentTurnsResponse);
   rpc ClaimAgentTurn(ClaimAgentTurnRequest) returns (ClaimAgentTurnResponse);
   rpc HeartbeatAgentTurnClaim(HeartbeatAgentTurnClaimRequest) returns (HeartbeatAgentTurnClaimResponse);

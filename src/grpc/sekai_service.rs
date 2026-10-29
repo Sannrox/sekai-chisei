@@ -252,6 +252,7 @@ macro_rules! delegate_rpcs {
 impl SekaiService for SekaiServiceImpl {
     delegate_rpcs! {
         wake_site_agent_instance => wake_site_agent_instance_rpc(WakeSiteAgentInstanceRequest) -> WakeSiteAgentInstanceResponse;
+        list_site_agent_instance_turns => list_site_agent_instance_turns_rpc(ListSiteAgentInstanceTurnsRequest) -> ListSiteAgentInstanceTurnsResponse;
         list_claimable_agent_turns => list_claimable_agent_turns_rpc(ListClaimableAgentTurnsRequest) -> ListClaimableAgentTurnsResponse;
         claim_agent_turn => claim_agent_turn_rpc(ClaimAgentTurnRequest) -> ClaimAgentTurnResponse;
         heartbeat_agent_turn_claim => heartbeat_agent_turn_claim_rpc(HeartbeatAgentTurnClaimRequest) -> HeartbeatAgentTurnClaimResponse;

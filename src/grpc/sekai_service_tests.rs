@@ -19135,6 +19135,7 @@ fn guest_credentials_reach_only_namespace_checked_rpcs() {
         "UpdateObject",
         "DeleteObject",
         "DiscoverCapabilities",
+        "ListSiteAgentInstanceTurns",
     ];
     for (service, protocol) in [
         (
@@ -33492,6 +33493,208 @@ async fn agent_turns_wake_claim_and_ack_over_the_wire() {
             receipt.cause_ref.as_str()
         ),
         ("completed", "manual", "req-1")
+    );
+}
+
+/// #2001: an instance's turns and refused wakes, newest first and paged,
+/// hide like a missing instance when the caller cannot read it.
+#[tokio::test]
+async fn site_agent_instance_turns_list_refusals_and_hide_like_missing() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line 7".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("principal_id".to_string(), "agent:line-7".to_string()),
+                ("frozen".to_string(), "false".to_string()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let wake = |request_id: &str| {
+        svc.wake_site_agent_instance(with_named_principal(
+            WakeSiteAgentInstanceRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                request_id: request_id.into(),
+            },
+            "root",
+        ))
+    };
+    let first = wake("req-1").await.unwrap().into_inner().turn.unwrap();
+    let second = wake("req-2").await.unwrap().into_inner().turn.unwrap();
+    let claim = |turn_id: String| {
+        svc.claim_agent_turn(with_named_principal(
+            ClaimAgentTurnRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                turn_id,
+                ttl_ms: 60_000,
+            },
+            "local",
+        ))
+    };
+    for turn_id in [first.turn_id.clone(), second.turn_id.clone()] {
+        let held = claim(turn_id.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .turn
+            .unwrap();
+        svc.ack_agent_turn(with_named_principal(
+            AckAgentTurnRequest {
+                parked_action_instance_id: String::new(),
+                turn_id,
+                runtime_id: "runner-a".into(),
+                claim_generation: held.claim_generation,
+                fencing_token: held.fencing_token,
+                outcome: "completed".into(),
+                reason: "replied".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+    }
+    let mut frozen = svc.db.runtime().get_object("line-7").unwrap().unwrap();
+    frozen.properties.insert("frozen".into(), "true".into());
+    svc.db.runtime().update_object(&frozen).unwrap();
+    assert_eq!(
+        wake("req-3").await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+
+    let listed = svc
+        .list_site_agent_instance_turns(with_named_principal(
+            ListSiteAgentInstanceTurnsRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                limit: 10,
+                page_token: String::new(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.turns.len(), 3);
+    let refused = listed
+        .turns
+        .iter()
+        .find(|turn| turn.status == "refused")
+        .expect("one refused admission");
+    assert_eq!(refused.cause_ref.as_str(), "req-3");
+    assert!(!refused.reason.is_empty());
+    let mut acked: Vec<&str> = listed
+        .turns
+        .iter()
+        .filter(|turn| turn.status != "refused")
+        .map(|turn| turn.turn_id.as_str())
+        .collect();
+    acked.sort();
+    let mut expected = [first.turn_id.as_str(), second.turn_id.as_str()];
+    expected.sort();
+    assert_eq!(acked.as_slice(), expected.as_slice());
+    for window in listed.turns.windows(2) {
+        assert!(
+            (window[0].created_at_ms, window[0].turn_id.as_str())
+                > (window[1].created_at_ms, window[1].turn_id.as_str()),
+            "history is newest first by (created_at_ms, turn_id)"
+        );
+    }
+    assert!(
+        listed
+            .turns
+            .iter()
+            .all(|turn| turn.fencing_token.is_empty()),
+        "operator history does not expose fencing tokens"
+    );
+
+    let mut seen = Vec::new();
+    let mut page_token = String::new();
+    for _ in 0..3 {
+        let page = svc
+            .list_site_agent_instance_turns(with_named_principal(
+                ListSiteAgentInstanceTurnsRequest {
+                    namespace: "ops".into(),
+                    instance_id: "line-7".into(),
+                    limit: 1,
+                    page_token,
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.turns.len(), 1);
+        seen.push(page.turns[0].turn_id.clone());
+        page_token = page.next_page_token;
+    }
+    assert!(!page_token.is_empty());
+    let last = svc
+        .list_site_agent_instance_turns(with_named_principal(
+            ListSiteAgentInstanceTurnsRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                limit: 1,
+                page_token,
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(last.turns.is_empty());
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 3);
+
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-hidden".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "hidden".into(),
+            namespace: "ns".into(),
+            external_id: String::new(),
+            properties: HashMap::from([(
+                crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "restricted".into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let hidden = svc
+        .list_site_agent_instance_turns(with_named_principal(
+            ListSiteAgentInstanceTurnsRequest {
+                namespace: "ns".into(),
+                instance_id: "line-hidden".into(),
+                limit: 10,
+                page_token: String::new(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap_err();
+    let missing = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: "line-404".into(),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (hidden.code(), hidden.message()),
+        (missing.code(), missing.message())
     );
 }
 
