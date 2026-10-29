@@ -288,6 +288,9 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
                 | "PutSyncScope"
                 | "ReadSyncSnapshot"
                 | "ReadSyncDeltas"
+                // Federated aggregates (#1997) write only receipts; the
+                // caller needs read on the requesting namespace.
+                | "FederatedAggregate"
         )
     {
         crate::enterprise::NamespaceAction::Write
@@ -825,6 +828,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "PublishFederatedAggregateAllowance"
             | "WithdrawFederatedAggregateAllowance"
             | "GetFederatedAggregateAllowance"
+            // Federated aggregates (#1997): read on the requesting namespace.
+            | "FederatedAggregate"
             // Manual agent wakes (#1950): namespace admin per call.
             | "WakeSiteAgentInstance"
             | "ExportObjectSet"

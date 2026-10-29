@@ -731,7 +731,7 @@ impl SekaiServiceImpl {
                 layers.push(Vec::new());
                 continue;
             }
-            let mut query = if index == 0 {
+            let query = if index == 0 {
                 crate::sekai::dataset::RowQuery {
                     filters: bound
                         .descriptor
@@ -772,38 +772,14 @@ impl SekaiServiceImpl {
                     properties,
                 )?;
             }
-            let mut visible = Vec::new();
-            loop {
-                meter.charge(0).map_err(map_object_set_error)?;
-                query.limit = (meter.limit.max_rows_scanned - meter.rows)
-                    .saturating_add(1)
-                    .clamp(1, INDEX_SCAN_BATCH_SIZE);
-                let members = self
-                    .db
-                    .runtime()
-                    .list_visible_index_members_projected(
-                        &bound.descriptor.namespace,
-                        &kind,
-                        &query,
-                        if constrained { None } else { Some(needed) },
-                    )
-                    .map_err(Status::internal)?;
-                let scanned = members.len() as i32;
-                meter.charge(scanned).map_err(map_object_set_error)?;
-                for mut member in members {
-                    if let Some(object) =
-                        self.authorized_index_object(&member, authority, status.indexed_at_ms)?
-                    {
-                        member.properties = object.properties.into_iter().collect();
-                        visible.push(member);
-                    }
-                    meter.charge(0).map_err(map_object_set_error)?;
-                }
-                if scanned < query.limit {
-                    break;
-                }
-                query.offset = query.offset.saturating_add(scanned);
-            }
+            let visible = self.scan_index_layer(
+                &bound.descriptor.namespace,
+                &kind,
+                query,
+                if constrained { None } else { Some(needed) },
+                &mut meter,
+                |member| self.authorized_index_object(member, authority, status.indexed_at_ms),
+            )?;
             layers.push(visible);
         }
         self.require_hop_projection_ready(bound, hops)?;
@@ -955,6 +931,58 @@ impl SekaiServiceImpl {
                 })
                 .collect(),
         }))
+    }
+}
+
+impl SekaiServiceImpl {
+    /// Every index member of one kind that `admit` lets through, read in
+    /// batches under `meter`: of `query.limit` members when it is set,
+    /// else of the default batch size. `admit` returns the object as the reader may
+    /// see it, whose properties replace the member's, or `None` to leave
+    /// the member out. Shared by object-set aggregation and federated
+    /// aggregates (#1997), so both scan and authorize one way.
+    pub(super) fn scan_index_layer(
+        &self,
+        namespace: &str,
+        kind: &str,
+        mut query: crate::sekai::dataset::RowQuery,
+        needed: Option<&[String]>,
+        meter: &mut crate::sekai::object_set::CostMeter,
+        mut admit: impl FnMut(
+            &crate::sekai::object_type_index::ObjectTypeIndexMember,
+        ) -> Result<Option<domain::Object>, Status>,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, Status> {
+        let batch = if query.limit > 0 {
+            query.limit
+        } else {
+            INDEX_SCAN_BATCH_SIZE
+        };
+        let mut visible = Vec::new();
+        loop {
+            meter.charge(0).map_err(map_object_set_error)?;
+            query.limit = (meter.limit.max_rows_scanned - meter.rows)
+                .saturating_add(1)
+                .clamp(1, batch);
+            let members = self
+                .db
+                .runtime()
+                .list_visible_index_members_projected(namespace, kind, &query, needed)
+                .map_err(Status::internal)?;
+            let scanned = members.len() as i32;
+            meter.charge(scanned).map_err(map_object_set_error)?;
+            for mut member in members {
+                if let Some(object) = admit(&member)? {
+                    member.properties = object.properties.into_iter().collect();
+                    visible.push(member);
+                }
+                meter.charge(0).map_err(map_object_set_error)?;
+            }
+            if scanned < query.limit {
+                break;
+            }
+            query.offset = query.offset.saturating_add(scanned);
+        }
+        Ok(visible)
     }
 }
 

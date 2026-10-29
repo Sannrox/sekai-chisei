@@ -86,6 +86,7 @@ base64 = "0.23"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }
+rand = { version = "0.8", features = ["std"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 futures-util = "0.3"

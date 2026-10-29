@@ -632,6 +632,65 @@ message GetFederatedAggregateAllowanceResponse {
   // The active allowance; NOT_FOUND when the type has none.
   FederatedAggregateAllowanceRecord record = 1;
 }
+// A federated aggregate (ADR 0134, #1997). Each participating namespace
+// evaluates the query under its own published allowance and returns only
+// group keys and numbers; groups smaller than its minimum size are dropped
+// inside it. Functions are count, sum and avg; min and max are refused.
+message FederatedAggregateMeasure {
+  // count | sum | avg
+  string function = 1;
+  // The measured property; empty for count.
+  string property = 2;
+}
+message FederatedAggregateRequest {
+  // The requesting namespace, as allowances name it. The caller needs read
+  // on it; its identity is never used inside a participating namespace.
+  string requester = 1;
+  // Participating namespaces.
+  repeated string namespaces = 2;
+  string object_type = 3;
+  repeated string dimensions = 4;
+  repeated FederatedAggregateMeasure measures = 5;
+  // Filters on dimensions only (eq, gt, gte, lt, lte).
+  repeated PropertyFilter filters = 6;
+}
+message FederatedAggregateValue {
+  // False when the value is withheld, such as an average over a noisy
+  // count below one.
+  bool present = 1;
+  double value = 2;
+}
+message FederatedAggregateGroup {
+  // Dimension values, in request order.
+  repeated string keys = 1;
+  // One value per measure, in request order.
+  repeated FederatedAggregateValue values = 2;
+}
+message FederatedAggregateExclusion {
+  string namespace = 1;
+  // no_allowance | object_type | dimension | measure | function | requester
+  string reason = 2;
+}
+message FederatedAggregateNoise {
+  string namespace = 1;
+  // laplace
+  string mechanism = 2;
+  double scale = 3;
+}
+message FederatedAggregateResponse {
+  // The receipts' id in the requesting and every participating namespace.
+  string query_id = 1;
+  string query_digest = 2;
+  repeated FederatedAggregateGroup groups = 3;
+  // Groups dropped inside namespaces and on the combined result; counted,
+  // never described.
+  uint64 suppressed_groups = 4;
+  // The minimum group size the combined result was suppressed at.
+  uint64 min_group_size = 5;
+  repeated string contributors = 6;
+  repeated FederatedAggregateExclusion excluded = 7;
+  repeated FederatedAggregateNoise noise = 8;
+}
 // Streams an object set as CSV or JSON Lines under the caller's read policy.
 message ExportObjectSetRequest {
   ObjectSetDescriptor descriptor = 1;
@@ -4928,6 +4987,9 @@ service SekaiService {
   rpc PublishFederatedAggregateAllowance(PublishFederatedAggregateAllowanceRequest) returns (PublishFederatedAggregateAllowanceResponse);
   rpc WithdrawFederatedAggregateAllowance(WithdrawFederatedAggregateAllowanceRequest) returns (WithdrawFederatedAggregateAllowanceResponse);
   rpc GetFederatedAggregateAllowance(GetFederatedAggregateAllowanceRequest) returns (GetFederatedAggregateAllowanceResponse);
+  // Federated aggregates (#1997): read on the requesting namespace; each
+  // participating namespace takes part only under its own allowance.
+  rpc FederatedAggregate(FederatedAggregateRequest) returns (FederatedAggregateResponse);
   rpc RevokeNamespaceExport(RevokeNamespaceExportRequest) returns (RevokeNamespaceExportResponse);
   rpc ExportObjectSet(ExportObjectSetRequest) returns (stream ExportObjectSetChunk);
   rpc GetExportReceipt(GetExportReceiptRequest) returns (GetExportReceiptResponse);
