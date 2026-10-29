@@ -134,11 +134,24 @@ Also preserve state files configured for provider registry lifecycle, gateway
 usage recovery, and durable receipt, usage, and refusal recovery. Test
 restore procedures, not only backup creation.
 
-Audit history is not purged automatically. High-churn SQLite deployments should
-define a retention policy and invoke `purge_old_records` with an explicit
-cutoff. That helper is SQLite-only; on PostgreSQL use the lifecycle-archive
-path (`archive_lifecycle_records`) documented in
-[postgres-sekai-parity.md](postgres-sekai-parity.md).
+Audit history is not purged automatically. Retention archives into tables in
+the operational database ([ADR 0141](decisions/0141-retention-archives-in-database.md)),
+so the archive is backed up and replicated with it; size storage for it.
+`archive_retained_records` moves bounded batches (500 records per dataset per
+transaction) until nothing is left, so an interrupted run resumes; its dry run
+reports the counts without writing. Archived records are keyed by a SHA-256 of
+their dataset and natural key, not by the key itself. Known limit: the hash is
+not keyed, so someone holding the archive can confirm a guessed identifier,
+even after erasure redacted the payload; the store has no erasure secret to
+key it with. Subject erasure reaches archived records by each dataset's
+hot-table rule, related objects and content references included: archived
+LLM calls and task observations the hot rule would delete are removed,
+object changes and content events are rewritten as in the hot tables, and
+attestations of an erased decision are removed. Content events are archived only once a `content_events`
+policy is set. Archive files written by earlier releases are kept as they
+are and verify with `SekaiDb::verify_archive`; nothing is imported from them.
+No operator command runs retention yet (#1987). On PostgreSQL only content
+events are covered so far; see [postgres-sekai-parity.md](postgres-sekai-parity.md).
 
 ## Gateway safeguards
 

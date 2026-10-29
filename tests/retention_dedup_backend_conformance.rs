@@ -315,6 +315,7 @@ fn postgres_test_database() -> PostgresDb {
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_retention_deduplication_conformance() {
+    let _serial = archiving();
     let db = postgres_test_database();
     let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
     exercise_backend(&db, &db, &db, &prefix);
@@ -386,6 +387,7 @@ fn postgres_concurrent_collectors_erase_once() {
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_archive_and_erasure_race_leaves_no_subject_data() {
+    let _serial = archiving();
     let db = Arc::new(postgres_test_database());
     let prefix = format!("archive-erasure-race-{}", uuid::Uuid::new_v4().simple());
     let subject = format!("{prefix}:agent");
@@ -432,4 +434,297 @@ fn postgres_archive_and_erasure_race_leaves_no_subject_data() {
         ..request
     })
     .unwrap();
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+/// Serializes the tests in this file that archive: on PostgreSQL they share
+/// one database, and an archive run takes every aged content event in it.
+static ARCHIVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn archiving() -> std::sync::MutexGuard<'static, ()> {
+    ARCHIVING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// ADR 0141 on any backend: content events past their policy move into the
+/// in-database archive; a dry run counts without writing; a rerun archives
+/// nothing twice; the archive verifies. `exact` is false where other tests
+/// add content events to the same database meanwhile, so counts are bounds.
+fn exercise_retention_archive(
+    dedup: &dyn DeduplicationBackend,
+    retention: &dyn RetentionPolicyBackend,
+    prefix: &str,
+    exact: bool,
+) {
+    let scope = scope(&format!("{prefix}:retention"));
+    dedup
+        .put_scoped_content(&scope, &reference(prefix, "aged"), b"aged content", 100)
+        .unwrap();
+    retention
+        .set_retention_policy(&RetentionPolicy {
+            dataset: "content_events".into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let before = retention.retention_archive_status().unwrap();
+    let dry = retention
+        .archive_retained_records(2 * DAY_MS, true)
+        .unwrap();
+    assert!(dry.dry_run);
+    assert!(dry.content_events_archived > 0, "{dry:?}");
+    assert_eq!(retention.retention_archive_status().unwrap(), before);
+
+    let run = retention
+        .archive_retained_records(2 * DAY_MS, false)
+        .unwrap();
+    assert!(run.content_events_archived >= dry.content_events_archived);
+    assert!(!run.batch_id.is_empty());
+    let again = retention
+        .archive_retained_records(2 * DAY_MS, false)
+        .unwrap();
+    if exact {
+        assert_eq!(run.content_events_archived, dry.content_events_archived);
+        assert_eq!(again.content_events_archived, 0);
+        assert!(again.batch_id.is_empty());
+    }
+    let after = retention.retention_archive_status().unwrap();
+    let count = |status: &sekai_chisei::sekai::retention::ArchiveStatus| {
+        status
+            .records
+            .iter()
+            .find(|(dataset, _)| dataset == "content_events")
+            .map_or(0, |(_, count)| *count)
+    };
+    // Every archived event counted once: no record twice, none lost.
+    assert_eq!(
+        count(&after),
+        count(&before) + i64::from(run.content_events_archived + again.content_events_archived)
+    );
+    let verification = retention.verify_retention_archive().unwrap();
+    assert!(verification.ok, "{}", verification.error);
+}
+
+#[test]
+fn sqlite_retention_archive_conformance() {
+    let db = SekaiDb::new(":memory:").unwrap();
+    exercise_retention_archive(&db, &db, "sqlite", true);
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_retention_archive_conformance() {
+    let _serial = archiving();
+    let db = postgres_test_database();
+    let prefix = format!("pg-archive-{}", uuid::Uuid::new_v4().simple());
+    exercise_retention_archive(&db, &db, &prefix, false);
+}
+
+/// Two replicas running retention at once archive each record once: both
+/// succeed, and the archive grows by exactly what they report.
+fn race_retention(first: Arc<dyn RetentionPolicyBackend>, second: Arc<dyn RetentionPolicyBackend>) {
+    let count = |db: &dyn RetentionPolicyBackend| {
+        db.retention_archive_status()
+            .unwrap()
+            .records
+            .iter()
+            .find(|(dataset, _)| dataset == "content_events")
+            .map_or(0, |(_, count)| *count)
+    };
+    let observer = first.clone();
+    let before = count(&*observer);
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = [first, second].map(|db| {
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            db.archive_retained_records(2 * DAY_MS, false).unwrap()
+        })
+    });
+    barrier.wait();
+    let runs = handles.map(|handle| handle.join().unwrap());
+    let archived: i32 = runs.iter().map(|run| run.content_events_archived).sum();
+    assert!(archived > 0);
+    assert_eq!(count(&*observer), before + i64::from(archived));
+    assert!(observer.verify_retention_archive().unwrap().ok);
+}
+
+fn seed_aged_content(
+    dedup: &dyn DeduplicationBackend,
+    retention: &dyn RetentionPolicyBackend,
+    prefix: &str,
+) {
+    dedup
+        .put_scoped_content(&scope(prefix), &reference(prefix, "race"), b"race", 100)
+        .unwrap();
+    retention
+        .set_retention_policy(&RetentionPolicy {
+            dataset: "content_events".into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+}
+
+#[test]
+fn sqlite_concurrent_retention_runs_archive_once() {
+    let path = std::env::temp_dir().join(format!(
+        "sekai-retention-race-{}-{}.db",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let first = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+    seed_aged_content(&*first, &*first, "sqlite-race");
+    let second = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+    race_retention(first, second);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_concurrent_retention_runs_archive_once() {
+    let _serial = archiving();
+    let db = Arc::new(postgres_test_database());
+    let prefix = format!("pg-archive-race-{}", uuid::Uuid::new_v4().simple());
+    seed_aged_content(&*db, &*db, &prefix);
+    race_retention(db.clone(), db);
+}
+
+/// The archive lives in the database now: subject erasure redacts it too.
+#[test]
+fn sqlite_subject_erasure_redacts_the_retention_archive() {
+    let db = SekaiDb::new(":memory:").unwrap();
+    let prefix = "sqlite-archive-erasure";
+    let subject = format!("{prefix}:agent");
+    let mut aged = reference(prefix, "subject");
+    aged.actor = subject.clone();
+    db.put_scoped_content(&scope(prefix), &aged, b"subject content", 100)
+        .unwrap();
+    seed_aged_content(&db, &db, &format!("{prefix}:other"));
+    let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+    assert!(run.content_events_archived > 0);
+    let archived_mentions = || -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_archive_records WHERE payload LIKE ?1",
+                [format!("%{subject}%")],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert!(archived_mentions() > 0, "the subject was archived");
+    db.erase_subject(&SubjectErasureRequest {
+        subject_kind: "agent".into(),
+        subject: subject.clone(),
+        requested_by: "privacy-operator".into(),
+        reason: "validated request".into(),
+        timestamp: 3 * DAY_MS,
+    })
+    .unwrap();
+    let verification = db.verify_retention_archive().unwrap();
+    assert!(verification.ok, "{}", verification.error);
+    assert_eq!(archived_mentions(), 0);
+}
+
+/// Archived content events follow the hot table's reference rule on every
+/// backend: erasing a work unit tombstones the archived events of its
+/// content references (actor and reason), though no event names it.
+fn exercise_archived_event_erasure(
+    dedup: &dyn DeduplicationBackend,
+    retention: &dyn RetentionPolicyBackend,
+    prefix: &str,
+    archived_events: &dyn Fn(&str) -> Vec<serde_json::Value>,
+) {
+    let subject = reference(prefix, "work");
+    dedup
+        .put_scoped_content(&scope(prefix), &subject, b"work unit content", 100)
+        .unwrap();
+    seed_aged_content(dedup, retention, &format!("{prefix}:other"));
+    retention
+        .archive_retained_records(2 * DAY_MS, false)
+        .unwrap();
+    let before = archived_events(&subject.reference_id);
+    assert!(!before.is_empty(), "the reference's events were archived");
+    assert!(before.iter().all(|event| event["actor"] == subject.actor));
+    let erased = retention
+        .erase_subject(&SubjectErasureRequest {
+            subject_kind: "work_unit".into(),
+            subject: subject.operation_id.clone(),
+            requested_by: "privacy-operator".into(),
+            reason: "validated request".into(),
+            timestamp: 3 * DAY_MS,
+        })
+        .unwrap();
+    let after = archived_events(&subject.reference_id);
+    assert_eq!(after.len(), before.len());
+    for event in after {
+        assert_eq!(event["actor"], erased.subject_hash.as_str(), "{event}");
+        assert_eq!(event["reason"], "subject erasure tombstone", "{event}");
+    }
+    let other = archived_events(&reference(&format!("{prefix}:other"), "race").reference_id);
+    assert!(!other.is_empty());
+    assert!(
+        other
+            .iter()
+            .all(|event| event["reason"] != "subject erasure tombstone")
+    );
+    let verification = retention.verify_retention_archive().unwrap();
+    assert!(verification.ok, "{}", verification.error);
+}
+
+/// The archived content events of `reference_id`, parsed.
+fn events_of(payloads: Vec<String>, reference_id: &str) -> Vec<serde_json::Value> {
+    payloads
+        .iter()
+        .map(|payload| serde_json::from_str::<serde_json::Value>(payload).unwrap())
+        .filter(|event| event["reference_id"] == reference_id)
+        .collect()
+}
+
+#[test]
+fn sqlite_archived_events_follow_the_hot_reference_rule() {
+    let db = SekaiDb::new(":memory:").unwrap();
+    let archived = |reference_id: &str| {
+        let payloads = db
+            .conn()
+            .prepare("SELECT payload FROM sekai_archive_records WHERE dataset='content_events'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        events_of(payloads, reference_id)
+    };
+    exercise_archived_event_erasure(&db, &db, "sqlite-archived-events", &archived);
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_archived_events_follow_the_hot_reference_rule() {
+    let _serial = archiving();
+    let db = postgres_test_database();
+    let prefix = format!("pg-archived-events-{}", uuid::Uuid::new_v4().simple());
+    let archived = |reference_id: &str| {
+        let payloads = db
+            .connection()
+            .unwrap()
+            .query(
+                "SELECT payload FROM sekai_archive_records WHERE dataset='content_events'",
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        events_of(payloads, reference_id)
+    };
+    exercise_archived_event_erasure(&db, &db, &prefix, &archived);
 }
