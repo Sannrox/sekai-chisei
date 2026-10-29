@@ -587,6 +587,7 @@ mod tests {
         let db = RuntimeDb::memory();
         install(&db, NAMESPACE, HUMAN, 1_000).unwrap();
         db.put_service_principal(&ServicePrincipalRegistration {
+            capabilities: Vec::new(),
             principal: AGENT.into(),
             tenant_id: String::new(),
             namespaces: vec![NAMESPACE.into()],

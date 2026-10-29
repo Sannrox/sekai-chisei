@@ -1,6 +1,7 @@
 //! Agent-turn RPCs (ADR 0137, #1950). A manual wake needs administration of
 //! the instance's namespace; workers list, claim, heartbeat and acknowledge
-//! with the same authority as isolated transform work.
+//! as credential admin or as a service principal registered as a turn
+//! worker, and a claim's runtime token acts for its turn (ADR 0142).
 
 use super::*;
 use crate::runtime_token::RuntimeTokenClaims;
@@ -79,7 +80,16 @@ impl SekaiServiceImpl {
         }
         let principals = caller_principals(req);
         require_authenticated(&principals)?;
-        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), req)?;
+        // A registered turn worker (ADR 0142), or credential admin. The
+        // tenant check below keeps a service principal to its namespaces.
+        let turn_worker = service_principal_scope(self.db.runtime(), tenant_context.as_ref())?
+            .is_some_and(|scope| {
+                scope.has_capability(crate::sekai::service_principal::AGENT_TURN_WORKER)
+            });
+        if !turn_worker {
+            require_credential_admin(&principals)?;
+        }
         let namespace = match scope {
             Scope::Namespace(namespace) => namespace.to_string(),
             Scope::Turn(turn_id) | Scope::AckedTurn(turn_id) => {
@@ -90,7 +100,7 @@ impl SekaiServiceImpl {
             }
         };
         check_team_namespace(self.db.runtime(), &principals, &namespace, true)?;
-        if let Some(context) = request_tenant_context(self.db.runtime(), req)?.as_ref() {
+        if let Some(context) = tenant_context.as_ref() {
             enforce_namespace_tenant_context(self.db.runtime(), Some(context), &namespace, true)?;
         }
         Ok(())

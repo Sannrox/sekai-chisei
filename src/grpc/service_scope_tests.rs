@@ -103,6 +103,7 @@ fn plane() -> Plane {
 
 fn registration() -> ServicePrincipalRegistration {
     ServicePrincipalRegistration {
+        capabilities: Vec::new(),
         principal: WORKER.into(),
         tenant_id: "tenant-a".into(),
         namespaces: vec![IN_SCOPE.into()],
@@ -448,4 +449,156 @@ async fn object_above_the_profile_marking_ceiling_is_refused() {
     let request = authenticated(&plane, &token, "GetObject", get("doc-confidential")).unwrap();
     let status = plane.service.get_object(request).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+/// A site agent instance acting as `agent:<namespace>` with one pending
+/// manual turn in `namespace`.
+fn seed_turn(plane: &Plane, namespace: &str) -> String {
+    let db = plane.service.db.runtime();
+    let principal = format!("agent:{namespace}");
+    db.ensure_team_namespace(namespace, &principal, Role::Admin, "root")
+        .unwrap();
+    db.create_object(&crate::domain::Object {
+        id: format!("line-{namespace}"),
+        kind: crate::sekai::site_agent_instance::KIND.into(),
+        name: format!("line-{namespace}"),
+        namespace: namespace.into(),
+        external_id: String::new(),
+        properties: HashMap::from([
+            ("principal_id".to_string(), principal),
+            ("frozen".to_string(), "false".to_string()),
+        ]),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    crate::sekai::agent_turn::admit(
+        db,
+        crate::sekai::agent_turn::Wake {
+            namespace: namespace.into(),
+            instance_id: format!("line-{namespace}"),
+            cause: crate::sekai::agent_turn::Cause::Manual,
+            cause_ref: format!("wake-{namespace}"),
+            due_at_ms: 1,
+        },
+        "root",
+        1,
+    )
+    .unwrap()
+    .turn_id
+}
+
+async fn claim_turn(
+    plane: &Plane,
+    namespace: &str,
+    turn_id: &str,
+) -> Result<crate::grpc::pb::sekai::ClaimAgentTurnResponse, Status> {
+    let request = authenticated(
+        plane,
+        &service_token(plane),
+        "ClaimAgentTurn",
+        crate::grpc::pb::sekai::ClaimAgentTurnRequest {
+            namespace: namespace.into(),
+            runtime_id: "runner-a".into(),
+            turn_id: turn_id.into(),
+            ttl_ms: 60_000,
+        },
+    )?;
+    plane
+        .service
+        .claim_agent_turn(request)
+        .await
+        .map(Response::into_inner)
+}
+
+#[tokio::test]
+async fn a_registered_turn_worker_works_turns_in_its_namespaces_only() {
+    let plane = plane();
+    let in_scope = seed_turn(&plane, IN_SCOPE);
+    let out_of_scope = seed_turn(&plane, OUT_OF_SCOPE);
+
+    // Without the capability a service principal is no turn worker.
+    assert_eq!(
+        claim_turn(&plane, IN_SCOPE, &in_scope)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+
+    plane
+        .service
+        .db
+        .runtime()
+        .put_service_principal(&ServicePrincipalRegistration {
+            capabilities: vec![crate::sekai::service_principal::AGENT_TURN_WORKER.into()],
+            ..registration()
+        })
+        .unwrap()
+        .unwrap();
+    let listed = plane
+        .service
+        .list_claimable_agent_turns(
+            authenticated(
+                &plane,
+                &service_token(&plane),
+                "ListClaimableAgentTurns",
+                crate::grpc::pb::sekai::ListClaimableAgentTurnsRequest {
+                    namespace: IN_SCOPE.into(),
+                    limit: 10,
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .turns;
+    assert_eq!(listed.len(), 1);
+    let claimed = claim_turn(&plane, IN_SCOPE, &in_scope).await.unwrap();
+    let turn = claimed.turn.unwrap();
+    // Its turn token acts as the instance, with the worker as actor.
+    let token = verified_token(&plane, &claimed.runtime_token);
+    assert_eq!(
+        (token.subject.as_str(), token.act.as_deref()),
+        ("agent:a-in", Some(WORKER))
+    );
+    assert!(!token.service_principal);
+    plane
+        .service
+        .ack_agent_turn(
+            authenticated(
+                &plane,
+                &service_token(&plane),
+                "AckAgentTurn",
+                crate::grpc::pb::sekai::AckAgentTurnRequest {
+                    turn_id: in_scope,
+                    runtime_id: turn.claim_owner,
+                    claim_generation: turn.claim_generation,
+                    fencing_token: turn.fencing_token,
+                    outcome: "completed".into(),
+                    reason: String::new(),
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Outside its registered namespaces it is refused.
+    assert_scope_refusal(
+        &claim_turn(&plane, OUT_OF_SCOPE, &out_of_scope)
+            .await
+            .unwrap_err(),
+        "namespace",
+    );
+}
+
+fn verified_token(plane: &Plane, token: &str) -> crate::runtime_token::RuntimeTokenClaims {
+    crate::runtime_token::RuntimeTokenClaims::verify(
+        &plane.authority,
+        token,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap()
 }

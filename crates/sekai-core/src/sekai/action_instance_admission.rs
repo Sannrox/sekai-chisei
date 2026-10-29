@@ -3552,6 +3552,7 @@ mod tests {
         let db = setup();
         db.put_service_principal(
             &crate::sekai::service_principal::ServicePrincipalRegistration {
+                capabilities: Vec::new(),
                 principal: "worker-a".into(),
                 tenant_id: "acme-tenant".into(),
                 namespaces: vec!["acme".into()],

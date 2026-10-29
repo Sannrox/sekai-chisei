@@ -223,6 +223,8 @@ const TRANSFORM_OBJECT_SET_PINS_SCHEMA: &str =
     include_str!("postgres/0134_transform_object_set_pins.sql");
 const TASK_OBSERVATION_RETENTION_SCHEMA: &str =
     include_str!("postgres/0135_task_observation_retention.sql");
+const SERVICE_PRINCIPAL_CAPABILITIES_SCHEMA: &str =
+    include_str!("postgres/0136_service_principal_capabilities.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1058,6 +1060,12 @@ const MIGRATIONS: &[Migration] = &[
         134,
         "task_observation_retention",
         TASK_OBSERVATION_RETENTION_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        135,
+        "service_principal_capabilities",
+        SERVICE_PRINCIPAL_CAPABILITIES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
