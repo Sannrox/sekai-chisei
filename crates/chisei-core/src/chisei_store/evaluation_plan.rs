@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn definitions_are_immutable_and_availability_is_audited_idempotently() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let stored = db
             .put_evaluator_definition(definition(), "operator", 10)
             .unwrap();

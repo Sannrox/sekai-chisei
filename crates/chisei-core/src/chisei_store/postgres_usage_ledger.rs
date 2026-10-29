@@ -141,7 +141,7 @@ mod tests {
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
     fn postgres_project_usage_from_receipt_records_once() {
         let scratch = ScratchDatabase::create();
-        let db = scratch.connect();
+        let db = crate::chisei_store::postgres_with_chisei_schema(scratch.connect());
         let receipt = sample_receipt("run-1");
         db.project_usage_from_receipt("tenant-a", &receipt).unwrap();
         db.project_usage_from_receipt("tenant-a", &receipt).unwrap();

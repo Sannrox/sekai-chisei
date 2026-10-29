@@ -1,5 +1,6 @@
 //! sekaictl admin assurance receipts export/verify commands (#1449).
 
+use crate::chisei_store::ChiseiRuntimeDb;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use sekai_types::receipt_chain::{ReceiptChainBundle, verify_bundle};

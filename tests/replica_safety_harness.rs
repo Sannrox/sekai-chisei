@@ -2,9 +2,16 @@
 //!
 //! Behavioral pass criteria only: no wall-clock budgets as the sole signal.
 
+use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
 use std::path::Path;
+
+pub(crate) fn open_replica_pair() -> TwoReplicaSqlite {
+    let pair = TwoReplicaSqlite::open().expect("shared sqlite pair");
+    sekai_chisei::chisei_store::apply_chisei_schema(pair.a.as_ref());
+    pair
+}
 
 #[test]
 fn inventory_fixture_is_valid_and_evidence_exists() {
@@ -30,7 +37,7 @@ fn two_independent_stores_share_budget_authority() {
     let inventory = ReplicaSafetyInventory::load().unwrap();
     inventory.require_authoritative("chisei.budget").unwrap();
 
-    let pair = TwoReplicaSqlite::open().expect("shared sqlite pair");
+    let pair = open_replica_pair();
     pair.a
         .budget_set_limit("global", METRIC_TOKENS, 10, "daily")
         .unwrap();

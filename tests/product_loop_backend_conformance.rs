@@ -533,10 +533,9 @@ async fn exercise_product_loop(server: &LoopServer) {
 async fn sqlite_runs_the_product_loop() {
     let server = LoopServer::spawn(&Backend::Sqlite);
     exercise_product_loop(&server).await;
-    crate::evidence_backend_conformance::exercise_execution_recording(
-        &RuntimeDb::memory(),
-        "loop-sqlite",
-    );
+    let runtime = RuntimeDb::memory();
+    sekai_chisei::chisei_store::apply_chisei_schema(&runtime);
+    crate::evidence_backend_conformance::exercise_execution_recording(&runtime, "loop-sqlite");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -554,10 +553,9 @@ async fn postgres_runs_the_product_loop() {
     // tokio worker is still driving tasks. Own the pool on a thread that has none.
     let exec = ScratchDatabase::create();
     std::thread::spawn(move || {
-        crate::evidence_backend_conformance::exercise_execution_recording(
-            &RuntimeDb::Postgres(Arc::new(exec.connect(8))),
-            "loop-postgres",
-        );
+        let db = RuntimeDb::Postgres(Arc::new(exec.connect(8)));
+        sekai_chisei::chisei_store::apply_chisei_schema(&db);
+        crate::evidence_backend_conformance::exercise_execution_recording(&db, "loop-postgres");
     })
     .join()
     .expect("execution recording");

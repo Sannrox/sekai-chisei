@@ -1579,6 +1579,7 @@ fn execute_evaluation_plan(
 
 pub fn run() -> Result<Report, String> {
     let db = RuntimeDb::memory();
+    sekai_chisei::chisei_store::apply_chisei_schema(&db);
     let (package, package_digest) = apply_domain_schema(&db)?;
     let source_tree_digest = digest_value(&json!({
         "schema_package": SCHEMA_PACKAGE,

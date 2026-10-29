@@ -1551,14 +1551,21 @@ mod tests {
         )
         .unwrap();
         let _guard = install_test_signer(keys.clone());
-        let db = RuntimeDb::memory();
+        let db = RuntimeDb::memory_for_chisei_sql_functions();
         let plan = generate(&SupplyChain, &spec(SizePreset::Demo)).unwrap();
         apply(&db, &plan).unwrap();
         for action in &plan.actions {
             let receipt = db.get_operation_receipt(&action.request_id).unwrap();
             assert!(receipt.is_some(), "{} has no receipt", action.request_id);
         }
-        let bundle = db.export_receipt_chain("synthetic-demo").unwrap();
+        let bundle = match &db {
+            crate::db::runtime_db::RuntimeDb::Sqlite(sqlite) => {
+                crate::db::receipt_chain::export_receipt_chain(sqlite, "synthetic-demo").unwrap()
+            }
+            crate::db::runtime_db::RuntimeDb::Postgres(_) => {
+                panic!("generated history test is sqlite-only")
+            }
+        };
         assert_eq!(bundle.entries.len(), plan.actions.len());
         verify_bundle(&bundle, &[keys.current_public_key_hex().as_str()])
             .expect("generated history verifies");

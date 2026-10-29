@@ -1,7 +1,7 @@
 //! Shared SQLite/PostgreSQL persistence conformance for resolved evaluation manifests.
 
 use sekai_chisei::chisei::evaluation_manifest::*;
-use sekai_chisei::db::{postgres::PostgresDb, runtime_db::RuntimeDb, sekai::SekaiDb};
+use sekai_chisei::db::{postgres::PostgresDb, runtime_db::RuntimeDb};
 use sekai_chisei::ext::*;
 use std::sync::Arc;
 
@@ -117,11 +117,15 @@ fn sqlite_evaluation_manifest_conformance_and_restart() {
         uuid::Uuid::new_v4().simple()
     ));
     let path = path.to_string_lossy().into_owned();
-    let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&path).unwrap()));
+    let db = RuntimeDb::Sqlite(Arc::new(
+        sekai_chisei::chisei_store::open_sekai_with_chisei_schema(&path),
+    ));
     let digest = exercise(&db, "sqlite-manifest", "document:sqlite");
     drop(db);
 
-    let restarted = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&path).unwrap()));
+    let restarted = RuntimeDb::Sqlite(Arc::new(
+        sekai_chisei::chisei_store::open_sekai_with_chisei_schema(&path),
+    ));
     assert!(
         restarted
             .get_evaluation_manifest(&digest)
@@ -145,7 +149,9 @@ fn postgres() -> RuntimeDb {
     } else {
         PostgresDb::connect(&url, 8).unwrap()
     };
-    RuntimeDb::Postgres(Arc::new(db))
+    let db = RuntimeDb::Postgres(Arc::new(db));
+    sekai_chisei::chisei_store::apply_chisei_schema(&db);
+    db
 }
 
 #[test]

@@ -4,9 +4,12 @@ use crate::chisei::{
     eval, evolve,
     receipt::{OperationReceipt, ReceiptEventKind},
 };
+#[cfg(any(test, feature = "gateway-test-support"))]
+use crate::chisei_store::ChiseiSqliteSchema;
 use crate::chisei_store::chisei_eval_backend::{
     EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS, decode_eval_gate_cases, decode_eval_gate_run,
 };
+use crate::chisei_store::ext::ReceiptChainSekaiDbExt;
 use sekai_core::db::sekai::SekaiDb;
 
 pub trait ChiseiSekaiDbExt {
@@ -1051,7 +1054,7 @@ mod tests {
 
     #[test]
     fn gateway_request_aliases_are_reserved_once_per_scope() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         assert!(
             db.reserve_gateway_request_alias("scope-a", "opaque-1", "request-1", "operation-1")
                 .unwrap()
@@ -1128,7 +1131,7 @@ mod tests {
 
     #[test]
     fn receipt_request_backfill_ignores_malformed_legacy_rows() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         db.conn()
             .execute(
                 "INSERT INTO chisei_operation_receipts
@@ -1276,7 +1279,7 @@ mod tests {
 
     #[test]
     fn windowed_lists_keep_recent_opens_and_drop_stale_opens() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let ttl = sekai_core::db::chisei_receipt::OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS;
         let recent_started = ttl + 100;
         let later_start = recent_started + ttl + 10;
@@ -1318,7 +1321,7 @@ mod tests {
 
     #[test]
     fn update_operation_receipt_skips_write_when_unchanged() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         db.put_operation_receipt(&window_receipt("op-skip", 1, None))
             .unwrap();
         db.conn()
@@ -1349,8 +1352,12 @@ mod tests {
     fn eval_writers_wait_for_active_transactions_and_preserve_outcomes() {
         let path =
             std::env::temp_dir().join(format!("sekai-eval-lock-{}.db", uuid::Uuid::new_v4()));
-        let first = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
-        let second = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let first = Arc::new(crate::chisei_store::open_sekai_with_chisei_schema(
+            path.to_str().unwrap(),
+        ));
+        let second = Arc::new(crate::chisei_store::open_sekai_with_chisei_schema(
+            path.to_str().unwrap(),
+        ));
         let suite = eval::Suite {
             id: "sampling-live".into(),
             name: "initial".into(),
@@ -1438,7 +1445,7 @@ mod tests {
 
     #[test]
     fn gate_reads_fail_closed_on_malformed_suite_or_run_payloads() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let suite = eval::Suite {
             id: "gate-suite".into(),
             name: "gate".into(),

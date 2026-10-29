@@ -391,9 +391,11 @@ mod tests {
     use std::sync::Arc;
 
     fn test_db() -> Arc<RuntimeDb> {
-        Arc::new(RuntimeDb::Sqlite(Arc::new(
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
             SekaiDb::new(":memory:").expect("db"),
-        )))
+        )));
+        crate::chisei_store::apply_chisei_schema(&db);
+        db
     }
 
     fn seed_ns(db: &RuntimeDb, namespace: &str, principal: &str, role: Role) {

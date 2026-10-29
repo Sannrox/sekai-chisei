@@ -1,6 +1,7 @@
 //! SQLite execution index for receipt-authoritative evaluation runs.
 
 use crate::chisei::evaluation_execution::{EXECUTOR_VERSION, EvaluationExecutionIndex};
+use crate::chisei_store::ext::ReceiptChainSekaiDbExt;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sekai_core::db::sekai::SekaiDb;
 use sekai_domain::receipt::OperationReceipt;

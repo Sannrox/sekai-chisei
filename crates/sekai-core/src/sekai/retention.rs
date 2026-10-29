@@ -6077,9 +6077,59 @@ mod tests {
         assert!(db.verify_ledger().unwrap().ok);
     }
 
+    fn seed_budget_chain_usage(
+        conn: &rusqlite::Connection,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+    ) {
+        use crate::db::chisei_budget::{
+            UNLIMITED_PERIOD_TYPE, period_start_ms, scope_chain, work_unit_default_scope,
+        };
+        for scope in scope_chain(scope_id) {
+            let period_type: String = conn
+                .query_row(
+                    "SELECT period_type FROM (
+                       SELECT period_type, 0 AS rank
+                         FROM chisei_budget_limits
+                        WHERE scope_id=?1 AND metric=?2
+                       UNION ALL
+                       SELECT period_type, 1
+                         FROM chisei_budget_work_unit_defaults
+                        WHERE scope_id=?3 AND metric=?2
+                       ORDER BY rank LIMIT 1
+                     )",
+                    params![scope, metric, work_unit_default_scope(&scope)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or_else(|| UNLIMITED_PERIOD_TYPE.to_string());
+            let period_start = period_start_ms(&period_type, now_ms);
+            conn.execute(
+                "INSERT INTO chisei_budget_usage (scope_id, metric, period_start, amount_used)
+                 VALUES (?1, ?2, ?3, MAX(0, ?4))
+                 ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
+                    amount_used = MAX(0, amount_used + ?4)",
+                params![scope, metric, period_start, delta],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chisei_budget_attributions
+                   (source_scope_id,applied_scope_id,metric,period_start,amount_used)
+                 VALUES (?1,?2,?3,?4,MAX(0,?5))
+                 ON CONFLICT(source_scope_id,applied_scope_id,metric,period_start)
+                 DO UPDATE SET amount_used=MAX(0,amount_used+?5)",
+                params![scope_id, scope, metric, period_start, delta],
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn subject_erasure_removes_saved_filters_and_budget_events() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = RuntimeDb::memory_for_chisei_sql_functions();
         db.create_object(&crate::domain::Object {
             id: "agent-object".into(),
             kind: "agent".into(),
@@ -6186,7 +6236,7 @@ mod tests {
 
     #[test]
     fn subject_erasure_spans_stores_and_preserves_verifiable_tombstones() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = RuntimeDb::memory_for_chisei_sql_functions();
         for (id, external_id) in [
             ("agent-object", "agent:erase-agent"),
             ("keep-object", "agent:keep-agent"),
@@ -6444,12 +6494,25 @@ mod tests {
             .unwrap();
         }
         let budget_time = 10 * DAY_MS;
-        db.budget_adjust_chain("project:p/agent:erase-agent", "tokens", 10, budget_time)
-            .unwrap();
-        db.budget_adjust_chain("agent:erase-agent", "tokens", 5, budget_time)
-            .unwrap();
-        db.budget_adjust_chain("project:p/agent:keep-agent", "tokens", 10, budget_time)
-            .unwrap();
+        {
+            let sqlite = db.as_sqlite().expect("sqlite");
+            let conn = sqlite.conn();
+            seed_budget_chain_usage(
+                &conn,
+                "project:p/agent:erase-agent",
+                "tokens",
+                10,
+                budget_time,
+            );
+            seed_budget_chain_usage(&conn, "agent:erase-agent", "tokens", 5, budget_time);
+            seed_budget_chain_usage(
+                &conn,
+                "project:p/agent:keep-agent",
+                "tokens",
+                10,
+                budget_time,
+            );
+        }
         db.as_sqlite()
             .expect("sqlite")
             .conn()

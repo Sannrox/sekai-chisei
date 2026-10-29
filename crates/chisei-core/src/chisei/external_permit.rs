@@ -4,6 +4,7 @@
 //! and redeems those records.
 
 use crate::chisei::external_action::{AuthorizationRecord, REDEMPTION_VERSION};
+use crate::chisei_store::ChiseiSqliteSchema;
 #[cfg(test)]
 use crate::chisei_store::ChiseiStore;
 use ed25519_dalek::{SigningKey, VerifyingKey};

@@ -3,6 +3,7 @@
 //! Chisei decides whether bounded external authority may be granted. It never
 //! executes the action. Permit signing and redemption live in `external_permit`.
 
+use crate::chisei_store::ChiseiSqliteSchema;
 use rusqlite::OptionalExtension;
 use sekai_core::db::sekai::SekaiDb;
 use serde::{Deserialize, Serialize};
@@ -696,7 +697,7 @@ mod tests {
 
     #[test]
     fn authorization_storage_round_trips() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let request = fixture();
         let record = AuthorizationRecord {
             request: request.clone(),
@@ -740,7 +741,7 @@ mod tests {
 
     #[test]
     fn authorization_claims_and_terminal_transitions_are_atomic() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let request = fixture();
         let digest = request.canonical_digest().unwrap();
         assert_eq!(

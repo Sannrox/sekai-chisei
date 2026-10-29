@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn replay_does_not_double_count() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let receipt = sample_receipt("op-1", 42);
         let first = db.project_usage_from_receipt("tenant-a", &receipt).unwrap();
         assert_eq!(first.len(), 2);
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn tenants_are_isolated() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         db.project_usage_from_receipt("tenant-a", &sample_receipt("op-a", 10))
             .unwrap();
         db.project_usage_from_receipt("tenant-b", &sample_receipt("op-b", 99))
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn corrections_are_append_only() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let events = db
             .project_usage_from_receipt("tenant-a", &sample_receipt("op-c", 50))
             .unwrap();
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn export_is_json_lines() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         db.project_usage_from_receipt("tenant-a", &sample_receipt("op-x", 3))
             .unwrap();
         let export = db.export_usage_period("tenant-a", 0, 10_000).unwrap();

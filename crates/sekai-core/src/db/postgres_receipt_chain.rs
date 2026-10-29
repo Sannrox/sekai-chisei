@@ -1,4 +1,7 @@
-//! PostgreSQL persistence for the signed per-namespace receipt chain (#1449).
+//! Dest-pair leftover: PostgreSQL in-tx signed receipt-chain append, redact,
+//! and export helpers. Family DDL lives in chisei-core persist. Shared
+//! receipts and governed transforms append in the same transaction, so this
+//! SQL cannot leave `sekai-core` (ADR 0096).
 
 use postgres::{GenericClient, IsolationLevel};
 
@@ -12,39 +15,39 @@ use sekai_types::receipt_chain::{
     SigningKeySet, authenticate_checkpoint, entry_hash, verify_bundle,
 };
 
-impl PostgresDb {
-    pub fn export_receipt_chain(&self, namespace: &str) -> Result<ReceiptChainBundle, String> {
-        let mut conn = self.connection()?;
-        let mut tx = conn
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .map_err(|error| error.to_string())?;
-        let bundle = load_bundle(&mut tx, namespace)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(bundle)
-    }
+pub fn export_receipt_chain(
+    db: &PostgresDb,
+    namespace: &str,
+) -> Result<ReceiptChainBundle, String> {
+    let mut conn = db.connection()?;
+    let mut tx = conn
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .map_err(|error| error.to_string())?;
+    let bundle = load_bundle(&mut tx, namespace)?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(bundle)
+}
 
-    pub fn append_operation_receipt_chain<C: GenericClient>(
-        &self,
-        client: &mut C,
-        receipt: &OperationReceipt,
-    ) -> Result<(), String> {
-        let Some(keys) = current_signer()? else {
-            return Ok(());
-        };
-        let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
-        append_receipt(
-            client,
-            &keys,
-            &receipt.namespace,
-            kind_for_operation_receipt(receipt),
-            &receipt.operation_id,
-            &receipt_json,
-            receipt.started_at_ms,
-        )
-    }
+pub fn append_operation_receipt_chain<C: GenericClient>(
+    client: &mut C,
+    receipt: &OperationReceipt,
+) -> Result<(), String> {
+    let Some(keys) = current_signer()? else {
+        return Ok(());
+    };
+    let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+    append_receipt(
+        client,
+        &keys,
+        &receipt.namespace,
+        kind_for_operation_receipt(receipt),
+        &receipt.operation_id,
+        &receipt_json,
+        receipt.started_at_ms,
+    )
 }
 
 pub fn append_transform_run_chain<C: GenericClient>(

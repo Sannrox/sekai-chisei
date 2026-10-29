@@ -1,5 +1,6 @@
 //! Extension traits for Chisei methods on Sekai persistence types.
 
+pub use super::budget::BudgetSekaiDbExt;
 pub use super::chisei::{ChiseiSekaiDbExt, ChiseiSekaiDbExt2};
 pub use super::chisei_portfolio::ChiseiPortfolioSekaiDbExt;
 pub use super::data_quality_store::DataQualityStoreSekaiDbExt;
@@ -7,8 +8,15 @@ pub use super::eval_run::{EvalRunPostgresDbExt, EvalRunRuntimeDbExt, EvalRunSeka
 pub use super::evaluation_execution::EvaluationExecutionSekaiDbExt;
 pub use super::evaluation_manifest::EvaluationManifestSekaiDbExt;
 pub use super::evaluation_plan::EvaluationPlanSekaiDbExt;
+pub use super::governed_subject_provenance::{
+    GovernedSubjectProvenancePostgresDbExt, GovernedSubjectProvenanceSekaiDbExt,
+};
 pub use super::learning_change_store::LearningChangeStoreSekaiDbExt;
+pub use super::operation_reservation::{
+    OperationReservationPostgresDbExt, OperationReservationSekaiDbExt,
+};
 pub use super::policy_shadow::{PolicyShadowPostgresDbExt, PolicyShadowSekaiDbExt};
+pub use super::postgres_budget::BudgetPostgresDbExt;
 pub use super::postgres_chisei_receipts::PostgresChiseiReceiptsPostgresDbExt;
 pub use super::postgres_eval::PostgresEvalPostgresDbExt;
 pub use super::postgres_evaluation_execution::PostgresEvaluationExecutionPostgresDbExt;
@@ -20,5 +28,7 @@ pub use super::postgres_kioku::PostgresKiokuPostgresDbExt;
 pub use super::postgres_model_release_evidence::PostgresModelReleaseEvidencePostgresDbExt;
 pub use super::postgres_model_review::PostgresModelReviewPostgresDbExt;
 pub use super::postgres_portfolio::PostgresPortfolioPostgresDbExt;
+pub use super::postgres_receipt_chain::ReceiptChainPostgresDbExt;
 pub use super::postgres_routing_profile::PostgresRoutingProfilePostgresDbExt;
 pub use super::postgres_usage_ledger::PostgresUsageLedgerPostgresDbExt;
+pub use super::receipt_chain::ReceiptChainSekaiDbExt;

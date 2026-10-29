@@ -1,8 +1,10 @@
 //! Which schema families a physical store migrates and will accept rows in.
 //!
-//! [`SchemaPlane::Shared`] keeps the historical dual-schema (in-process
-//! fixtures, relocate source). Sekai and Chisei opens migrate only their
-//! owned families plus the shared decision ledger and the per-store
+//! [`SchemaPlane::Shared`] migrates Sekai families plus the shared decision
+//! ledger and per-store `chisei_operation_receipts` (in-process fixtures,
+//! relocate source). Chisei-owned families are applied by Chisei persistence
+//! when that store opens. Sekai and Chisei opens migrate only their owned
+//! families plus the shared decision ledger and the per-store
 //! `chisei_operation_receipts` table. Receipts are plane-local on every dest
 //! (Combined Split writes admission receipts onto the Sekai dest). Existing
 //! foreign-plane tables stay; populated ones refuse unless a relocate writer
@@ -385,11 +387,20 @@ mod tests {
         let shared = directory.path().join("shared.db");
         let db = crate::db::sekai::SekaiDb::new(shared.to_str().unwrap()).unwrap();
         db.conn()
-            .execute(
-                "INSERT INTO chisei_budget_limits
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS chisei_budget_limits (
+                    scope_id TEXT NOT NULL,
+                    metric TEXT NOT NULL DEFAULT 'tokens',
+                    parent_scope_id TEXT NOT NULL DEFAULT '',
+                    max_amount INTEGER NOT NULL,
+                    period_type TEXT NOT NULL,
+                    home_site_id TEXT NOT NULL DEFAULT '',
+                    pool_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (scope_id, metric)
+                 );
+                 INSERT INTO chisei_budget_limits
                  (scope_id, metric, parent_scope_id, max_amount, period_type, home_site_id, pool_id)
-                 VALUES ('agent:report', 'tokens', '', 1, 'month', '', '')",
-                [],
+                 VALUES ('agent:report', 'tokens', '', 1, 'month', '', '');",
             )
             .unwrap();
         drop(db);
