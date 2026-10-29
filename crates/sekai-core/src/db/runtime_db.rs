@@ -432,6 +432,24 @@ impl RuntimeDb {
         self.put_governed_transform_owned(transform, created_at_ms, "")
     }
 
+    /// See [`crate::db::sekai::SekaiDb::put_governed_transform_read_as`].
+    pub fn put_governed_transform_read_as(
+        &self,
+        transform: &crate::sekai::governed_transform::GovernedTransform,
+        created_at_ms: i64,
+        tenant_id: &str,
+        reader: Option<&str>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.put_governed_transform_read_as(transform, created_at_ms, tenant_id, reader)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_governed_transform_read_as(transform, created_at_ms, tenant_id, reader)
+            }),
+        }
+    }
+
     pub fn put_governed_transform_owned(
         &self,
         transform: &crate::sekai::governed_transform::GovernedTransform,
@@ -481,6 +499,70 @@ impl RuntimeDb {
         now_ms: i64,
     ) -> Result<crate::sekai::governed_transform::TransformRun, String> {
         self.run_governed_transform_owned(namespace, transform_id, incremental, now_ms, "", "")
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::set_transform_reader`].
+    pub fn set_transform_reader(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        principal: &str,
+        definition_digest: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.set_transform_reader(namespace, transform_id, principal, definition_digest)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.set_transform_reader(namespace, transform_id, principal, definition_digest)
+            }),
+        }
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::transform_reader`].
+    pub fn transform_reader(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_reader(namespace, transform_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_reader(namespace, transform_id))
+            }
+        }
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::run_governed_transform_with_object_sets`].
+    pub fn run_governed_transform_with_object_sets(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
+        now_ms: i64,
+        tenant_id: &str,
+        expected_definition_digest: &str,
+    ) -> Result<crate::sekai::governed_transform::TransformRun, String> {
+        match self {
+            Self::Sqlite(db) => db.run_governed_transform_with_object_sets(
+                namespace,
+                transform_id,
+                object_sets,
+                now_ms,
+                tenant_id,
+                expected_definition_digest,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.run_governed_transform_with_object_sets(
+                    namespace,
+                    transform_id,
+                    object_sets,
+                    now_ms,
+                    tenant_id,
+                    expected_definition_digest,
+                )
+            }),
+        }
     }
 
     pub fn run_governed_transform_owned(
@@ -1224,6 +1306,7 @@ impl RuntimeDb {
         now_ms: i64,
         tenant_id: &str,
         column_allowlists: &std::collections::HashMap<String, Vec<String>>,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
     ) -> Result<crate::sekai::governed_transform::PreviewGovernedTransformResult, String> {
         match self {
             Self::Sqlite(db) => db.preview_governed_transform(
@@ -1232,6 +1315,7 @@ impl RuntimeDb {
                 now_ms,
                 tenant_id,
                 column_allowlists,
+                object_sets,
             ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.preview_governed_transform(
@@ -1240,6 +1324,7 @@ impl RuntimeDb {
                     now_ms,
                     tenant_id,
                     column_allowlists,
+                    object_sets,
                 )
             }),
         }

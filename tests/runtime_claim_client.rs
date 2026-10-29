@@ -583,6 +583,7 @@ async fn exercise_adhoc_isolated(db: RuntimeDb, prefix: &str) {
                     column_allowlists: &HashMap::new(),
                     expires_at_ms: i64::MAX,
                     tenant_id: "",
+                    object_sets: &[],
                 },
                 30,
             )

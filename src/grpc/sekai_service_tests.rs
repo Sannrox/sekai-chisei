@@ -33233,6 +33233,78 @@ async fn site_agent_instances_hide_like_missing_and_refuse_direct_writes() {
     assert!(svc.db.runtime().get_object("line-7").unwrap().is_some());
 }
 
+/// Security package objects change only through their Actions, where the
+/// package rules run and the recorder is stamped (ADR 0135, #1990): a direct
+/// create of any package kind is refused, and a direct update or delete of
+/// a disposition touches nothing.
+#[tokio::test]
+async fn security_package_objects_refuse_direct_writes() {
+    let svc = service();
+    for kind in [
+        crate::sekai::security_package::KIND_FINDING,
+        crate::sekai::security_package::KIND_EXPOSURE,
+        crate::sekai::security_package::KIND_DISPOSITION,
+    ] {
+        let created = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(Object {
+                    id: format!("direct-{kind}"),
+                    kind: kind.into(),
+                    name: "direct".into(),
+                    namespace: "ns".into(),
+                    properties: HashMap::from([(
+                        crate::sekai::security_package::PROPERTY_RECORDER_KIND.into(),
+                        crate::sekai::security_package::RECORDER_HUMAN.into(),
+                    )]),
+                    ..Default::default()
+                }),
+                lease_precondition: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(created.code(), tonic::Code::PermissionDenied, "{kind}");
+    }
+    let disposition = domain::Object {
+        id: "d-1".into(),
+        kind: crate::sekai::security_package::KIND_DISPOSITION.into(),
+        name: "d-1".into(),
+        namespace: "ns".into(),
+        external_id: String::new(),
+        properties: HashMap::from([(
+            crate::sekai::security_package::PROPERTY_RECORDER_KIND.into(),
+            crate::sekai::security_package::RECORDER_AGENT.into(),
+        )]),
+        created: 0,
+        updated: 0,
+    };
+    svc.db.runtime().create_object(&disposition).unwrap();
+    let updated = svc
+        .update_object(with_principal(UpdateObjectRequest {
+            object: Some(Object {
+                id: "d-1".into(),
+                kind: crate::sekai::security_package::KIND_DISPOSITION.into(),
+                name: "d-1".into(),
+                namespace: "ns".into(),
+                ..Default::default()
+            }),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(updated.code(), tonic::Code::NotFound);
+    svc.delete_object(with_principal(DeleteObjectRequest {
+        id: "d-1".into(),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+    let kept = svc.db.runtime().get_object("d-1").unwrap().unwrap();
+    assert_eq!(
+        kept.properties[crate::sekai::security_package::PROPERTY_RECORDER_KIND],
+        crate::sekai::security_package::RECORDER_AGENT
+    );
+}
+
 /// Federated aggregate allowances (#1921): only the namespace's admin
 /// publishes or withdraws one, a refused function is invalid, and a
 /// withdrawn allowance no longer reads as current.

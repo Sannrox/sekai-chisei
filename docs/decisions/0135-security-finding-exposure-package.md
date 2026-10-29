@@ -64,6 +64,39 @@ written through governed Actions, and no domain-specific core RPC.
    operator-configured principal (`SEKAI_SECURITY_REOPEN_RUN_AS`), checked
    for namespace write and write freezes like an Action binding's run, and
    keeps each namespace's feed position in a compare-and-set cursor.
+8. **Agent disposition precision is measured, not asserted** (#1990). A
+   disposition records `recorded_by`, the submitting principal,
+   `recorder_kind`, whether it was an agent at that time, and
+   `recorder_revision`, the definition revision of the site agent behind it.
+   All three are stamped when the write is planned, overwriting any caller
+   value, so an agent cannot claim another recorder's history and retiring a
+   principal later does not rewrite it. `recorder_kind` comes from the
+   Action instance's classification at submission, so a write parked for
+   review keeps both its original submitter and how it was classified;
+   admission counts a principal bound to a site agent instance as an agent.
+   `recorder_revision` is read from the instance bindings when the write is
+   planned, outside the commit fence: a parked write granted after its
+   instance moved to a new revision counts toward the new one, and a
+   revision change racing the commit can attribute that one disposition to
+   the revision it replaced. Revision changes are rare operator Actions, and
+   a misattributed disposition only moves evidence between two revisions of
+   the same agent. A principal bound to a site agent instance is an
+   agent whatever its name; instances that share a principal on different
+   revisions stamp `ambiguous`, which no single revision's record absorbs. A
+   measurement as of a time ignores later dispositions. Generic object
+   writes of every package kind are refused, as the package rules and the
+   stamped recorder hold only on the Action path; a streaming write-back
+   plans through the Action rules with no submitter and so records no
+   recorder. An agent's disposition is
+   overturned by a reopen for a changed basis fact or a human supersede with
+   a different disposition, and confirmed by a human supersede with the same
+   one, a reopen for its own expiry, or standing unsuperseded for the settle
+   period. A supersede by another agent resolves nothing. Precision is
+   counted per recorder, revision and finding class (`finding_class` on the
+   finding, `unclassified` when absent) over a trailing window, and a group
+   below the minimum resolved count reads `incomplete` with no rate. The
+   metrics are read by `sekaictl admin autonomy disposition-precision`. The
+   certification moves to `cert:security.finding-exposure/v1.3`.
 
 ## Alternatives considered
 

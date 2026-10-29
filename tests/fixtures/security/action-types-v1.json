@@ -39,6 +39,9 @@
           },
           "evidence_refs": {
             "type": "string"
+          },
+          "finding_class": {
+            "type": "string"
           }
         },
         "required": [
