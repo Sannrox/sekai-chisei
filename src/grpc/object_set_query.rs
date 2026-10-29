@@ -3649,6 +3649,165 @@ mod tests {
         .unwrap();
     }
 
+    /// An isolated run streams the object set its putter reads, matching
+    /// `EvaluateObjectSet` for the same principal, to a labelled worker only.
+    #[tokio::test]
+    async fn isolated_runs_stream_object_set_inputs_to_labelled_workers() {
+        use crate::sekai::dataset::{ColumnDef, Dataset};
+        use crate::sekai::governed_transform::{ISOLATED_CLASS, OBJECT_SET_INPUT_LABEL};
+        let svc = service();
+        let digest = seed_sales_definition(&svc);
+        seed_customers_and_orders(&svc);
+        for id in ["ops-orders", "ops-out"] {
+            svc.db
+                .runtime()
+                .create_dataset(&Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: vec![ColumnDef {
+                        name: "customer".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    }],
+                    object_id: String::new(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                })
+                .unwrap();
+        }
+        let eu = || ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![PropertyFilter {
+                key: "region".into(),
+                op: "eq".into(),
+                value: "eu".into(),
+            }],
+            limit: 100,
+            ..Default::default()
+        };
+        let domain_eu = serde_json::to_string(&crate::sekai::object_set::ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![domain::PropertyFilter {
+                key: "region".into(),
+                op: "eq".into(),
+                value: "eu".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        svc.put_governed_transform(with_named_principal(
+            PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: crate::sekai::governed_transform::CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    transform_id: "iso-sets".into(),
+                    output_dataset_id: "ops-out".into(),
+                    profile: ISOLATED_CLASS.into(),
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    code: "print('ok')".into(),
+                    inputs: vec![
+                        TransformInput {
+                            alias: "orders".into(),
+                            dataset_id: "ops-orders".into(),
+                            object_set: String::new(),
+                        },
+                        TransformInput {
+                            alias: "customers".into(),
+                            dataset_id: String::new(),
+                            object_set: domain_eu,
+                        },
+                    ],
+                    ..GovernedTransform::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let run = svc
+            .run_governed_transform(with_named_principal(
+                RunGovernedTransformRequest {
+                    namespace: "ops".into(),
+                    transform_id: "iso-sets".into(),
+                    incremental: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .run
+            .unwrap();
+        assert!(run.input_versions.contains_key("object-set:customers"));
+
+        let db = svc.db.runtime();
+        db.register_transform_runtime("ops", "plain", &Default::default(), "local", 1)
+            .unwrap();
+        assert!(
+            db.claim_transform_work("ops", "plain", "", 60_000, 2)
+                .unwrap()
+                .is_none()
+        );
+        let labels = std::collections::BTreeMap::from([(
+            OBJECT_SET_INPUT_LABEL.to_string(),
+            "v1".to_string(),
+        )]);
+        db.register_transform_runtime("ops", "sets", &labels, "local", 1)
+            .unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "sets", "", 60_000, 2)
+            .unwrap()
+            .expect("claimable work");
+        let streamed = db
+            .read_transform_run_input(
+                &crate::sekai::governed_transform::WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    ..Default::default()
+                },
+                "customers",
+                "",
+                0,
+                100,
+                3,
+            )
+            .unwrap();
+        let mut streamed: Vec<String> = streamed
+            .iter()
+            .map(|row| row.values["id"].clone())
+            .collect();
+        streamed.sort();
+        let evaluated = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(eu()),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut expected: Vec<String> = evaluated
+            .members
+            .iter()
+            .map(|object| object.id.clone())
+            .collect();
+        expected.sort();
+        assert!(!expected.is_empty());
+        assert_eq!(streamed, expected);
+    }
+
     /// #1977: a transform joins a dataset with an object set read as its
     /// principal; the run pins the set; markings follow; partial access
     /// narrows the rows; no access refuses put, preview and run.

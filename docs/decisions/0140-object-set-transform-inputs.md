@@ -62,7 +62,8 @@ replayed is that consumer.
    `DiscoverCapabilities` reports `sekai.transforms.object-set-inputs`.
 
 Delivery is in layers: the input contract, evaluation and pinning with the
-in-process path; the isolated-process claim path; and replay. The first layer
+in-process path; the isolated-process claim path, where the admitted input
+snapshot keeps the set's rows under its pin key; and replay. The first layer
 reads plain sets (no aggregation or traversal) over unindexed kinds, needs a
 dataset input beside them, and refuses object-set inputs on a definition with
 a schedule or trigger, which runs with no caller to read the set as. The

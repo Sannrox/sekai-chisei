@@ -757,6 +757,7 @@ impl SekaiDb {
                 now_ms,
                 tenant_id,
                 Some(column_allowlists),
+                object_sets,
             )?;
             run.stamp_trigger(TRANSFORM_TRIGGER_ADHOC, &request.session_label);
             persist_transform_run(&tx, &run)?;
@@ -1978,7 +1979,8 @@ fn run_governed_transform_tx(
     if transform.is_isolated_process() {
         // Operator RunGovernedTransform is not the scheduler cap; ticks and
         // change triggers consult can_admit_namespace.
-        let mut run = admit_isolated_process_tx(tx, &transform, now_ms, tenant_id, None)?;
+        let mut run =
+            admit_isolated_process_tx(tx, &transform, now_ms, tenant_id, None, object_sets)?;
         run.stamp_trigger(trigger_cause, trigger_ref);
         persist_transform_run(tx, &run)?;
         clear_pending_for_transform(tx, &transform.namespace, &transform.transform_id)?;
@@ -2109,15 +2111,7 @@ pub(crate) fn run_in_process_tx(
             {
                 break;
             }
-            loaded.push((
-                set.alias.clone(),
-                set.columns.clone(),
-                set.rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| (index as i64 + 1, row.clone()))
-                    .collect(),
-            ));
+            loaded.push((set.alias.clone(), set.columns.clone(), set.records()));
             input_object_tokens.extend(set.marking_tokens.iter().cloned());
         }
     }
@@ -2261,13 +2255,18 @@ fn persist_transform_usage_pending_tx(
     .map_err(|error| error.to_string())
 }
 
+/// Admits an isolated run: its inputs are read now, as a snapshot the
+/// claiming worker streams. Object sets were evaluated by the caller and
+/// follow the datasets in the snapshot under their pin key (ADR 0140).
 fn admit_isolated_process_tx(
     tx: &Transaction<'_>,
     transform: &GovernedTransform,
     now_ms: i64,
     tenant_id: &str,
     column_allowlists: Option<&HashMap<String, Vec<String>>>,
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
 ) -> Result<TransformRun, String> {
+    crate::sekai::object_set_input::require_evaluated(transform, object_sets)?;
     let bindings = transform.input_bindings();
     for (_, dataset_id) in &bindings {
         if !dataset_exists(tx, dataset_id)? {
@@ -2300,6 +2299,15 @@ fn admit_isolated_process_tx(
         let object_id = load_dataset_object_id(tx, dataset_id)?;
         input_object_tokens.push(load_object_marking_token(tx, &object_id)?);
     }
+    for set in object_sets {
+        if let Some(budget) = load_budget.as_mut()
+            && !set.rows.iter().all(|row| budget.charge(row))
+        {
+            return Err(budget.exceeded.unwrap_or_default().into());
+        }
+        loaded.push((set.alias.clone(), set.columns.clone(), set.records()));
+        input_object_tokens.extend(set.marking_tokens.iter().cloned());
+    }
     let lattice = load_lattice(tx, &transform.namespace)?;
     let output_object_id = load_dataset_object_id(tx, &transform.output_dataset_id)?;
     let prior_token = load_object_marking_token(tx, &output_object_id)?;
@@ -2327,6 +2335,9 @@ fn admit_isolated_process_tx(
     run.markings_out = markings_out;
     run.input_partitions = input_receipts_from_loaded(tx, &bindings, &loaded)?;
     run.input_versions = input_version_pins(tx, &bindings, now_ms, true)?;
+    for set in object_sets {
+        run.input_versions.insert(set.pin_key(), set.digest());
+    }
     insert_transform_run(tx, &run)?;
     persist_run_input_snapshot(tx, &run.run_id, &bindings, &loaded)?;
     let spec = transform
@@ -2496,13 +2507,7 @@ fn preview_governed_transform_tx(
     // Object-set inputs, sampled like datasets (ADR 0140).
     if load_budget.exceeded.is_none() {
         for set in object_sets {
-            let records: Vec<DatasetRowRecord> = set
-                .rows
-                .iter()
-                .take(row_cap)
-                .enumerate()
-                .map(|(index, row)| (index as i64 + 1, row.clone()))
-                .collect();
+            let records: Vec<DatasetRowRecord> = set.records().into_iter().take(row_cap).collect();
             if !records.iter().all(|(_, row)| load_budget.charge(row)) {
                 break;
             }
@@ -3272,8 +3277,19 @@ fn persist_run_input_snapshot(
     loaded: &[(String, Vec<String>, Vec<DatasetRowRecord>)],
 ) -> Result<(), String> {
     // Snapshot is the admitted pin: persist the full loaded set, not a stream.
-    for ((alias, dataset_id), (_, _, records)) in bindings.iter().zip(loaded.iter()) {
-        let keys = load_dataset_partition_keys(tx, dataset_id)?;
+    // Datasets come first, one per binding; object sets follow, recorded
+    // under their pin key and unpartitioned (ADR 0140).
+    for (index, (alias, _, records)) in loaded.iter().enumerate() {
+        let (dataset_id, keys) = match bindings.get(index) {
+            Some((_, dataset_id)) => (
+                dataset_id.clone(),
+                load_dataset_partition_keys(tx, dataset_id)?,
+            ),
+            None => (
+                format!("{}{alias}", crate::sekai::object_set_input::PIN_PREFIX),
+                Vec::new(),
+            ),
+        };
         for (row_id, values) in records {
             let values_json = serde_json::to_string(values).map_err(|error| error.to_string())?;
             let partition_key = partition_value(&keys, values);
@@ -8709,6 +8725,95 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.dispatch_status, TRANSFORM_WORK_FAILED);
+    }
+
+    #[test]
+    fn isolated_object_set_inputs_reach_only_labelled_runtimes() {
+        use crate::sekai::governed_transform::{OBJECT_SET_INPUT_LABEL, TransformInput};
+        use crate::sekai::object_set_input::PinnedObjectSet;
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+            .unwrap();
+        let mut transform = isolated_transform();
+        transform.isolated_process.as_mut().unwrap().inputs = vec![
+            TransformInput {
+                alias: "orders".into(),
+                dataset_id: "in".into(),
+                ..Default::default()
+            },
+            TransformInput {
+                alias: "customers".into(),
+                object_set: r#"{"namespace":"sales","kind":"Customer"}"#.into(),
+                ..Default::default()
+            },
+        ];
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        // The plane requires the label itself.
+        assert_eq!(
+            transform.isolated_process.as_ref().unwrap().requires[OBJECT_SET_INPUT_LABEL],
+            "v1"
+        );
+        db.put_governed_transform(&transform, 10).unwrap();
+        let customer = crate::domain::Object {
+            id: "c1".into(),
+            kind: "Customer".into(),
+            name: "North".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        let set = PinnedObjectSet::from_objects("customers", &[], &[customer], &HashMap::new());
+        let run = db
+            .run_governed_transform_with_object_sets(
+                "ops",
+                "iso1",
+                std::slice::from_ref(&set),
+                20,
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(run.input_versions["object-set:customers"], set.digest());
+
+        // A runtime without the label is not offered the work.
+        db.register_transform_runtime("ops", "plain", &BTreeMap::new(), "local", 25)
+            .unwrap();
+        assert!(
+            db.claim_transform_work("ops", "plain", "", 60_000, 30)
+                .unwrap()
+                .is_none()
+        );
+        let labels = BTreeMap::from([(OBJECT_SET_INPUT_LABEL.to_string(), "v1".to_string())]);
+        db.register_transform_runtime("ops", "sets", &labels, "local", 25)
+            .unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "sets", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let customers = db
+            .read_transform_run_input(
+                &WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    ..WriteTransformRunCommand::default()
+                },
+                "customers",
+                "",
+                0,
+                100,
+                40,
+            )
+            .unwrap();
+        assert_eq!(customers.len(), 1);
+        assert_eq!(customers[0].dataset_id, "object-set:customers");
+        assert_eq!(customers[0].values, set.rows[0]);
     }
 
     #[test]

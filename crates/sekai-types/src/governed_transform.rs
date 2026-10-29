@@ -126,6 +126,14 @@ pub struct TransformStep {
     pub columns: Vec<String>,
 }
 
+/// Placement label a runtime registers to be offered isolated work that
+/// reads object-set inputs (ADR 0140).
+pub const OBJECT_SET_INPUT_LABEL: &str = "sekai.input.object-set";
+/// The object-set row format a labelled runtime understands.
+pub const OBJECT_SET_INPUT_LABEL_VALUE: &str = "v1";
+/// Capability reported while the plane serves object-set transform inputs.
+pub const OBJECT_SET_INPUTS_CAPABILITY: &str = "sekai.transforms.object-set-inputs";
+
 /// Prefix of an object-set input's key in a run's `input_versions`; dataset
 /// ids beside object-set inputs, and new datasets, may not use it.
 pub const OBJECT_SET_PIN_PREFIX: &str = "object-set:";
@@ -420,25 +428,27 @@ impl GovernedTransform {
             ));
         }
         if let Some(spec) = self.isolated_process.as_mut() {
-            // Isolated object-set inputs arrive with the claim path (#1978).
-            if spec.inputs.iter().any(TransformInput::is_object_set) {
-                return Err(TransformError::InvalidArgument(
-                    "object-set inputs are not yet available to isolated-process transforms".into(),
-                ));
-            }
             prepare_isolated(&mut self.input_dataset_id, spec, &self.steps)?;
+            // Only a worker that registered it understands object-set rows;
+            // any other never sees the work (ADR 0140).
+            if spec.inputs.iter().any(TransformInput::is_object_set) {
+                match spec.requires.get(OBJECT_SET_INPUT_LABEL) {
+                    Some(value) if value != OBJECT_SET_INPUT_LABEL_VALUE => {
+                        return Err(TransformError::InvalidArgument(format!(
+                            "object-set inputs require {OBJECT_SET_INPUT_LABEL}={OBJECT_SET_INPUT_LABEL_VALUE}"
+                        )));
+                    }
+                    _ => {
+                        spec.requires.insert(
+                            OBJECT_SET_INPUT_LABEL.into(),
+                            OBJECT_SET_INPUT_LABEL_VALUE.into(),
+                        );
+                    }
+                }
+            }
             validate_placement_labels("requires", &spec.requires)?;
         } else if let Some(spec) = self.analytical.as_mut() {
             prepare_analytical(&mut self.input_dataset_id, spec, &self.steps)?;
-            // A schedule or trigger runs with no caller to read the set as.
-            if spec.inputs.iter().any(TransformInput::is_object_set)
-                && (self.schedule.is_some() || self.trigger.is_some())
-            {
-                return Err(TransformError::InvalidArgument(
-                    "object-set inputs need a run principal; schedules and triggers cannot read them"
-                        .into(),
-                ));
-            }
         } else {
             require_token("input_dataset_id", &self.input_dataset_id)?;
             if self.steps.is_empty() {
@@ -446,6 +456,15 @@ impl GovernedTransform {
                     "transform steps required".into(),
                 ));
             }
+        }
+        // A schedule or trigger runs with no caller to read the set as.
+        if !self.object_set_inputs().is_empty()
+            && (self.schedule.is_some() || self.trigger.is_some())
+        {
+            return Err(TransformError::InvalidArgument(
+                "object-set inputs need a run principal; schedules and triggers cannot read them"
+                    .into(),
+            ));
         }
         if self
             .input_bindings()
@@ -737,23 +756,27 @@ fn canonical_object_set(json: &str) -> Result<String, TransformError> {
         .map_err(|_| TransformError::InvalidArgument("object_set is not a descriptor".into()))
 }
 
-fn prepare_analytical(
+/// Normalizes a profile's inputs: the legacy single `input_dataset_id`
+/// becomes one input; otherwise each input reads a dataset or a canonical
+/// object set (ADR 0140), aliases are unique, and `input_dataset_id` names
+/// the first dataset input.
+fn normalize_inputs(
     input_dataset_id: &mut String,
-    spec: &mut AnalyticalSpec,
-    steps: &[TransformStep],
+    inputs: &mut Vec<TransformInput>,
+    profile: &str,
 ) -> Result<(), TransformError> {
-    if spec.inputs.is_empty() {
+    if inputs.is_empty() {
         require_token("input_dataset_id", input_dataset_id)?;
         *input_dataset_id = input_dataset_id.trim().to_string();
-        spec.inputs.push(TransformInput {
+        inputs.push(TransformInput {
             alias: "input".into(),
             dataset_id: input_dataset_id.clone(),
             ..Default::default()
         });
     } else {
         let mut seen = std::collections::BTreeSet::new();
-        let reads_object_sets = spec.inputs.iter().any(TransformInput::is_object_set);
-        for input in spec.inputs.iter_mut() {
+        let reads_object_sets = inputs.iter().any(TransformInput::is_object_set);
+        for input in inputs.iter_mut() {
             input.alias = input.alias.trim().to_string();
             input.dataset_id = input.dataset_id.trim().to_string();
             require_token("input alias", &input.alias)?;
@@ -779,27 +802,35 @@ fn prepare_analytical(
                 ));
             }
         }
-        let first = spec
-            .inputs
+        let first = inputs
             .iter()
             .find(|input| !input.is_object_set())
             .map(|input| input.dataset_id.clone())
             .ok_or_else(|| {
-                TransformError::InvalidArgument(
-                    "an analytical transform reads at least one dataset".into(),
-                )
+                TransformError::InvalidArgument(format!(
+                    "an {profile} transform reads at least one dataset"
+                ))
             })?;
         let trimmed_input = input_dataset_id.trim().to_string();
         if trimmed_input.is_empty() {
             *input_dataset_id = first;
         } else if trimmed_input != first {
-            return Err(TransformError::InvalidArgument(
-                "input_dataset_id must match the first analytical input".into(),
-            ));
+            return Err(TransformError::InvalidArgument(format!(
+                "input_dataset_id must match the first {profile} input"
+            )));
         } else {
             *input_dataset_id = trimmed_input;
         }
     }
+    Ok(())
+}
+
+fn prepare_analytical(
+    input_dataset_id: &mut String,
+    spec: &mut AnalyticalSpec,
+    steps: &[TransformStep],
+) -> Result<(), TransformError> {
+    normalize_inputs(input_dataset_id, &mut spec.inputs, "analytical")?;
     if spec.sql.trim().is_empty() {
         if steps.is_empty() {
             return Err(TransformError::InvalidArgument(
@@ -837,39 +868,7 @@ fn prepare_isolated(
     }
     require_token("engine", &spec.engine)?;
     require_token("runtime_image", &spec.runtime_image)?;
-    if spec.inputs.is_empty() {
-        require_token("input_dataset_id", input_dataset_id)?;
-        *input_dataset_id = input_dataset_id.trim().to_string();
-        spec.inputs.push(TransformInput {
-            alias: "input".into(),
-            dataset_id: input_dataset_id.clone(),
-            ..Default::default()
-        });
-    } else {
-        let mut seen = std::collections::BTreeSet::new();
-        for input in spec.inputs.iter_mut() {
-            input.alias = input.alias.trim().to_string();
-            input.dataset_id = input.dataset_id.trim().to_string();
-            require_token("input alias", &input.alias)?;
-            require_token("input dataset_id", &input.dataset_id)?;
-            if !seen.insert(input.alias.to_ascii_lowercase()) {
-                return Err(TransformError::InvalidArgument(
-                    "isolated_process input aliases must be unique".into(),
-                ));
-            }
-        }
-        let first = spec.inputs[0].dataset_id.clone();
-        let trimmed_input = input_dataset_id.trim().to_string();
-        if trimmed_input.is_empty() {
-            *input_dataset_id = first;
-        } else if trimmed_input != first {
-            return Err(TransformError::InvalidArgument(
-                "input_dataset_id must match the first isolated_process input".into(),
-            ));
-        } else {
-            *input_dataset_id = trimmed_input;
-        }
-    }
+    normalize_inputs(input_dataset_id, &mut spec.inputs, "isolated_process")?;
     Ok(())
 }
 
