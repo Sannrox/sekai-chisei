@@ -151,9 +151,10 @@ attestations of an erased decision are removed. Content events are archived only
 policy is set. Archive files written by earlier releases are kept as they
 are and verify with `SekaiDb::verify_archive`; nothing is imported from them.
 No operator command runs retention yet (#1987). On PostgreSQL decisions,
-attestations, LLM calls, task observations and content events are covered
-(migration 0135 adds the observation `data_class` and `retention_tombstone`
-columns); object changes follow. Audit records are archived only after the
+attestations, object changes, LLM calls, task observations and content
+events are covered (migration 0135 adds the observation `data_class` and
+`retention_tombstone` columns). Object changes follow the dataset-wide
+`audit` policy on both backends. Audit records are archived only after the
 ledger verifies, on both backends; a failed check refuses the whole run and
 names the failure, and `RuntimeDb::verify_ledger` reports it on either
 backend. See

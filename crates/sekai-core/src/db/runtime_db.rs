@@ -8243,9 +8243,9 @@ impl RuntimeDb {
     pub fn record_object_changes(&self, changes: &[ObjectChange]) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.record_object_changes(changes),
-            Self::Postgres(_) => Err(
-                "record_object_changes is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.record_object_changes(changes))
+            }
         }
     }
 
@@ -8414,9 +8414,7 @@ impl RuntimeDb {
     pub fn record_object_change(&self, c: &ObjectChange) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.record_object_change(c),
-            Self::Postgres(_) => Err(
-                "record_object_change is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.record_object_change(c)),
         }
     }
 
