@@ -8,6 +8,7 @@ use sekai_chisei::sekai::service_principal::ServicePrincipalRegistration;
 
 fn registration(principal: &str, namespaces: &[&str], now_ms: i64) -> ServicePrincipalRegistration {
     ServicePrincipalRegistration {
+        capabilities: Vec::new(),
         principal: principal.into(),
         tenant_id: "tenant-a".into(),
         namespaces: namespaces

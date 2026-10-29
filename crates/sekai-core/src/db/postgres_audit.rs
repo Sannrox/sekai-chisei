@@ -10,6 +10,24 @@ pub(crate) const OBJECT_COLUMNS: &str =
     "id, kind, name, namespace, external_id, properties, created, updated";
 
 impl PostgresDb {
+    /// Append one object change as written, as on SQLite.
+    pub fn record_object_change(&self, change: &ObjectChange) -> Result<(), String> {
+        self.record_object_changes(std::slice::from_ref(change))
+    }
+
+    /// Append object changes in one transaction, as on SQLite.
+    pub fn record_object_changes(&self, changes: &[ObjectChange]) -> Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        insert_changes(&mut transaction, changes)?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
         self.create_object_with_authorized_policy(object, actor, None)
     }

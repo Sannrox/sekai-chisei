@@ -5,6 +5,7 @@ use sekai_chisei::db::retention::RetentionPolicyBackend;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::Object;
+use sekai_chisei::sekai::audit::ObjectChange;
 use sekai_chisei::sekai::dataset::Dataset;
 use sekai_chisei::sekai::deduplication::{
     ContentObligations, ContentReferenceRequest, ContentScope, ReconciliationAction,
@@ -1098,4 +1099,327 @@ fn postgres_erasure_removes_retention_baselines() {
     };
     let prefix = format!("pg-baseline-{}", uuid::Uuid::new_v4().simple());
     exercise_baseline_erasure(&RuntimeDb::Postgres(db.clone()), &sql, &prefix);
+}
+
+fn decision(id: &str, timestamp: i64, target_id: &str) -> sekai_chisei::sekai::audit::Decision {
+    sekai_chisei::sekai::audit::Decision {
+        id: id.into(),
+        timestamp,
+        actor: "operator".into(),
+        action: "apply".into(),
+        reason: String::new(),
+        evidence: HashMap::new(),
+        target_id: target_id.into(),
+        outcome: "ok".into(),
+    }
+}
+
+/// The audit ledger on any backend (#1985): an intact ledger verifies with
+/// the same report; decisions past their policy, and their attestations,
+/// are archived and leave the ledger behind an anchor that verification
+/// resumes from; new decisions chain after it; erasure tombstones an
+/// archived decision and drops its attestation. Then a tampered row fails
+/// verification and retention refuses, naming the failure. Needs a database
+/// of its own: it tampers with the ledger.
+fn exercise_audit_retention(db: &RuntimeDb, sql: &Sql<'_>) {
+    let day = DAY_MS;
+    db.record_decision(&decision("d-old", 1, "wu-42")).unwrap();
+    db.record_decision(&decision("d-old-2", 2, "other"))
+        .unwrap();
+    db.record_decision(&decision("d-new", 9 * day, "other"))
+        .unwrap();
+    (sql.exec)(
+        "INSERT INTO sekai_attestations
+         (id,decision_id,policy_kind,policy_scope,policy_version,policy_snapshot,
+          inputs,decision,content_hash,created)
+         VALUES ('a-old','d-old','k','s','v','{}','{}','allow','h',1);",
+    );
+    let intact = db.verify_ledger().unwrap();
+    assert!(intact.ok, "{}", intact.error);
+    assert_eq!(
+        (intact.entries_checked, intact.anchor_seq, intact.head_seq),
+        (3, 0, 3)
+    );
+    db.set_retention_policy(&policy("audit", "", 1)).unwrap();
+
+    let dry = db.archive_retained_records(3 * day, true).unwrap();
+    assert_eq!(dry.audit_archived, 3, "{dry:?}");
+    assert_eq!(sql.count("SELECT id FROM sekai_decisions"), 3);
+    let run = db.archive_retained_records(3 * day, false).unwrap();
+    assert_eq!(run.audit_archived, 3, "two decisions and one attestation");
+    assert_eq!((sql.strings)("SELECT id FROM sekai_decisions"), ["d-new"]);
+    assert_eq!(sql.count("SELECT id FROM sekai_attestations"), 0);
+    let after = db.verify_ledger().unwrap();
+    assert!(after.ok, "{}", after.error);
+    assert_eq!(
+        (
+            after.entries_checked,
+            after.anchor_seq,
+            after.head_seq,
+            after.head_hash
+        ),
+        (1, 2, 3, intact.head_hash.clone())
+    );
+    db.record_decision(&decision("d-later", 10 * day, "other"))
+        .unwrap();
+    assert!(db.verify_ledger().unwrap().ok);
+    assert_eq!(
+        db.archive_retained_records(3 * day, false)
+            .unwrap()
+            .audit_archived,
+        0
+    );
+
+    db.erase_subject(&SubjectErasureRequest {
+        subject_kind: "work_unit".into(),
+        subject: "wu-42".into(),
+        requested_by: "privacy-operator".into(),
+        reason: "validated request".into(),
+        timestamp: 11 * day,
+    })
+    .unwrap();
+    assert_eq!(
+        sql.count("SELECT 1 FROM sekai_archive_records WHERE payload LIKE '%wu-42%'"),
+        0
+    );
+    assert_eq!(
+        sql.count("SELECT 1 FROM sekai_archive_records WHERE dataset='audit.attestations'"),
+        0
+    );
+    assert!(db.verify_retention_archive().unwrap().ok);
+    assert!(db.verify_ledger().unwrap().ok);
+
+    (sql.exec)("UPDATE sekai_decisions SET reason='tampered' WHERE id='d-later';");
+    let tampered = db.verify_ledger().unwrap();
+    assert!(!tampered.ok);
+    assert!(
+        tampered.error.contains("entry hash mismatch"),
+        "{}",
+        tampered.error
+    );
+    let refused = db.archive_retained_records(30 * day, false).unwrap_err();
+    assert!(
+        refused.contains("audit ledger verification failed before retention")
+            && refused.contains("hash"),
+        "{refused}"
+    );
+    // d-new, d-later and the erasure's own decision: nothing purged.
+    assert_eq!(sql.count("SELECT id FROM sekai_decisions"), 3);
+}
+
+#[test]
+fn sqlite_audit_retention_conformance() {
+    let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+    let (exec, strings) = sqlite_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    exercise_audit_retention(&RuntimeDb::Sqlite(db.clone()), &sql);
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_audit_retention_conformance() {
+    let scratch = crate::postgres_scratch::ScratchDatabase::create();
+    let db = Arc::new(scratch.connect(8));
+    let (exec, strings) = postgres_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    exercise_audit_retention(&RuntimeDb::Postgres(db.clone()), &sql);
+}
+
+/// Two replicas archiving the audit ledger at once take turns: every
+/// expired decision is archived once and the ledger still verifies.
+fn race_audit_retention(first: RuntimeDb, second: RuntimeDb, sql: &Sql<'_>) {
+    let backlog = 1_100;
+    for index in 0..backlog {
+        first
+            .record_decision(&decision(&format!("d-{index}"), 1, "other"))
+            .unwrap();
+    }
+    first.set_retention_policy(&policy("audit", "", 1)).unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = [first, second].map(|db| {
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            db.archive_retained_records(2 * DAY_MS, false).unwrap();
+            db
+        })
+    });
+    barrier.wait();
+    let [first, _] = handles.map(|handle| handle.join().unwrap());
+    assert_eq!(sql.count("SELECT id FROM sekai_decisions"), 0);
+    assert_eq!(
+        sql.count("SELECT 1 FROM sekai_archive_records WHERE dataset='audit.decisions'"),
+        backlog
+    );
+    assert!(first.verify_ledger().unwrap().ok);
+    assert!(first.verify_retention_archive().unwrap().ok);
+    first
+        .record_decision(&decision("d-after", 5, "other"))
+        .unwrap();
+    assert!(first.verify_ledger().unwrap().ok, "chains after the anchor");
+}
+
+#[test]
+fn sqlite_concurrent_audit_retention_archives_once() {
+    let path = std::env::temp_dir().join(format!(
+        "sekai-audit-race-{}-{}.db",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let first = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+    let second = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+    {
+        let (exec, strings) = sqlite_sql(&first);
+        let sql = Sql {
+            exec: &exec,
+            strings: &strings,
+        };
+        race_audit_retention(
+            RuntimeDb::Sqlite(first.clone()),
+            RuntimeDb::Sqlite(second),
+            &sql,
+        );
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_concurrent_audit_retention_archives_once() {
+    let scratch = crate::postgres_scratch::ScratchDatabase::create();
+    let db = Arc::new(scratch.connect(8));
+    let (exec, strings) = postgres_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    race_audit_retention(
+        RuntimeDb::Postgres(db.clone()),
+        RuntimeDb::Postgres(Arc::new(scratch.connect(8))),
+        &sql,
+    );
+}
+
+fn object_change(id: &str, object_id: &str, old: &str, new: &str, timestamp: i64) -> ObjectChange {
+    ObjectChange {
+        id: id.into(),
+        object_id: object_id.into(),
+        field: "phone".into(),
+        old_value: old.into(),
+        new_value: new.into(),
+        changed_by: "importer".into(),
+        timestamp,
+        ..ObjectChange::default()
+    }
+}
+
+/// Object changes on any backend (#1986): recorded and listed with the same
+/// semantics; past the dataset-wide audit policy they are archived and leave
+/// the table, a fresh one stays, a dry run writes nothing and a rerun
+/// archives nothing twice; erasing the user an object stands for leaves no
+/// value of its archived changes. Needs a database of its own: the audit
+/// policy is dataset-wide.
+fn exercise_object_change_retention(db: &RuntimeDb, sql: &Sql<'_>) {
+    let now = 3 * DAY_MS;
+    (sql.exec)(
+        "INSERT INTO sekai_objects (id,kind,name,created,updated)
+         VALUES ('obj-7','user','alice',1,1);",
+    );
+    db.record_object_change(&object_change(
+        "c1",
+        "obj-7",
+        "+49 555 0100",
+        "+49 555 0199",
+        1,
+    ))
+    .unwrap();
+    db.record_object_changes(&[
+        object_change("c2", "obj-8", "a", "b", 2),
+        object_change("c3", "obj-8", "b", "c", now - 1_000),
+    ])
+    .unwrap();
+    let listed = db.list_object_changes("obj-8", 10, 0).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        ["c3", "c2"],
+        "newest first"
+    );
+    assert_eq!(listed[1].new_value, "b");
+    db.set_retention_policy(&policy("audit", "", 1)).unwrap();
+    let changes = "SELECT id FROM sekai_object_changes";
+    let archived = |id_like: &str| {
+        sql.count(&format!(
+            "SELECT 1 FROM sekai_archive_records
+             WHERE dataset='audit.object_changes' AND payload LIKE '%{id_like}%'"
+        ))
+    };
+
+    let dry = db.archive_retained_records(now, true).unwrap();
+    assert!(dry.dry_run && dry.audit_archived >= 2, "{dry:?}");
+    assert_eq!(sql.count(changes), 3);
+    let run = db.archive_retained_records(now, false).unwrap();
+    assert!(run.audit_archived >= 2, "{run:?}");
+    assert_eq!((sql.strings)(changes), ["c3"]);
+    assert_eq!((archived("\"c1\""), archived("\"c2\"")), (1, 1));
+    db.archive_retained_records(now, false).unwrap();
+    assert_eq!(archived("\"c"), 2, "nothing archived twice");
+
+    db.erase_subject(&SubjectErasureRequest {
+        subject_kind: "user".into(),
+        subject: "alice".into(),
+        requested_by: "privacy-operator".into(),
+        reason: "validated request".into(),
+        timestamp: now,
+    })
+    .unwrap();
+    assert_eq!(archived("555"), 0);
+    assert_eq!(archived("obj-7"), 0);
+    assert_eq!(archived("\"c2\""), 1, "an unrelated change stays");
+    let verification = db.verify_retention_archive().unwrap();
+    assert!(verification.ok, "{}", verification.error);
+
+    // Object changes share the `audit` policy, so a tampered ledger refuses
+    // their archiving too: the expiring change stays put.
+    (sql.exec)("UPDATE sekai_decisions SET reason='tampered';");
+    let refused = db.archive_retained_records(30 * DAY_MS, false).unwrap_err();
+    assert!(
+        refused.contains("audit ledger verification failed before retention"),
+        "{refused}"
+    );
+    assert_eq!((sql.strings)(changes), ["c3"]);
+}
+
+#[test]
+fn sqlite_object_change_retention_conformance() {
+    let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+    let (exec, strings) = sqlite_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    exercise_object_change_retention(&RuntimeDb::Sqlite(db.clone()), &sql);
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_object_change_retention_conformance() {
+    let scratch = crate::postgres_scratch::ScratchDatabase::create();
+    let db = Arc::new(scratch.connect(8));
+    let (exec, strings) = postgres_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    exercise_object_change_retention(&RuntimeDb::Postgres(db.clone()), &sql);
 }

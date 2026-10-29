@@ -165,6 +165,7 @@ mod tests {
 
     fn registration() -> ServicePrincipalRegistration {
         ServicePrincipalRegistration {
+            capabilities: Vec::new(),
             principal: "worker-a".into(),
             tenant_id: "tenant-a".into(),
             namespaces: vec!["ns-a".into()],

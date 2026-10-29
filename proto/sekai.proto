@@ -3353,7 +3353,8 @@ message ServicePrincipal {
   string tenant_id = 2;
   // Namespaces the principal may address. Required, sorted and unique.
   repeated string namespaces = 3;
-  // Action type ids the principal may run. Required, sorted and unique.
+  // Action type ids the principal may run. Sorted and unique; required unless
+  // the principal holds a capability.
   repeated string action_types = 4;
   // Read-only: the principal profile's classification_ceiling, which is the
   // principal's marking ceiling. Empty when the profile sets none.
@@ -3361,6 +3362,10 @@ message ServicePrincipal {
   string registered_by = 6;
   int64 created_at_ms = 7;
   int64 updated_at_ms = 8;
+  // Capabilities beyond Actions, sorted and unique. `agent_turn_worker`
+  // lists, claims, heartbeats and acks agent turns in the namespaces above
+  // (ADR 0142). With a capability, action_types may be empty.
+  repeated string capabilities = 9;
 }
 message PutServicePrincipalRequest { ServicePrincipal service_principal = 1; }
 message PutServicePrincipalResponse { ServicePrincipal service_principal = 1; }

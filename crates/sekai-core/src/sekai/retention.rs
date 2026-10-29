@@ -313,15 +313,17 @@ fn redact_json_subject(
 }
 
 /// An archived decision tombstoned as the hot ledger tombstones it, with
-/// [`decision_matches_for_erasure`]; `None` when it does not match. Returns
-/// the new payload and the decision's original id. The chain fields stay.
-fn tombstone_archived_decision(
+/// [`decision_matches_for_erasure`] or a backend's own hot rule `also` on the
+/// payload; `None` when neither matches. Returns the new payload and the
+/// decision's original id. The chain fields stay.
+pub(crate) fn tombstone_archived_decision(
     payload: &str,
     kind: &str,
     subject: &str,
     subject_hash: &str,
     erased_at: i64,
     subject_object_ids: &[String],
+    also: &dyn Fn(&serde_json::Value) -> bool,
 ) -> Option<(String, String)> {
     let mut json = serde_json::from_str::<serde_json::Value>(payload).ok()?;
     let text = |field: &str| json[field].as_str().unwrap_or_default().to_string();
@@ -335,7 +337,7 @@ fn tombstone_archived_decision(
         target_id: text("target_id"),
         outcome: text("outcome"),
     };
-    if !decision_matches_for_erasure(&decision, kind, subject, subject_object_ids) {
+    if !decision_matches_for_erasure(&decision, kind, subject, subject_object_ids) && !also(&json) {
         return None;
     }
     let id = if decision_id_matches_subject(&decision.id, kind, subject, subject_object_ids) {
@@ -1327,19 +1329,32 @@ fn expired_audit_prefix(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?
     };
+    Ok(plan_audit_prefix(rows, policies, now, limit))
+}
+
+/// The last `seq` of the expired audit prefix among `rows` (`seq,
+/// timestamp, namespace, data_class` in `seq` order, at most `limit + 1`),
+/// at most `limit` decisions in, and whether the prefix ends within them.
+/// The prefix stops at the first decision its policy still retains.
+pub(crate) fn plan_audit_prefix(
+    rows: Vec<(i64, i64, String, String)>,
+    policies: &[RetentionPolicy],
+    now: i64,
+    limit: usize,
+) -> (Option<i64>, bool) {
     let more = rows.len() > limit;
     let mut prefix_end = None;
     for (seq, timestamp, namespace, data_class) in rows.into_iter().take(limit) {
         let Some(policy) = effective_policy(policies, AUDIT_DATASET, &namespace, &data_class)
         else {
-            return Ok((prefix_end, true));
+            return (prefix_end, true);
         };
         if timestamp >= now - i64::from(policy.retention_days) * DAY_MS {
-            return Ok((prefix_end, true));
+            return (prefix_end, true);
         }
         prefix_end = Some(seq);
     }
-    Ok((prefix_end, !more))
+    (prefix_end, !more)
 }
 
 fn validate_policy(policy: &RetentionPolicy) -> Result<(), String> {
@@ -3242,7 +3257,9 @@ impl SekaiDb {
                 .iter()
                 .any(|policy| policy.dataset == AUDIT_DATASET)
         {
-            verify_decisions_in_transaction(&tx)?;
+            verify_decisions_in_transaction(&tx).map_err(|error| {
+                format!("audit ledger verification failed before retention: {error}")
+            })?;
         }
         cursor.ledger_verified = true;
         let prefix_end = if cursor.audit_done {
@@ -4004,6 +4021,7 @@ fn redact_archived_subject(
                 subject_hash,
                 now_ms,
                 subject_object_ids,
+                &|_| false,
             )
         {
             erased_decisions.insert(original_id);
@@ -5104,6 +5122,7 @@ mod tests {
                 "erasure:x",
                 9,
                 &related,
+                &|_| false,
             );
             assert_eq!(archived.is_some(), hot, "{}", fixture.id);
             assert_eq!(hot, fixture.id != "d-unrelated", "{}", fixture.id);

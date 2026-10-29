@@ -19,12 +19,13 @@ impl PostgresDb {
             .query_opt(
                 "INSERT INTO sekai_service_principals (
                     principal, tenant_id, namespaces_json, action_types_json,
-                    registered_by, created_at_ms, updated_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    registered_by, created_at_ms, updated_at_ms, capabilities_json
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT(principal) DO UPDATE SET
                     tenant_id=excluded.tenant_id,
                     namespaces_json=excluded.namespaces_json,
                     action_types_json=excluded.action_types_json,
+                    capabilities_json=excluded.capabilities_json,
                     registered_by=excluded.registered_by,
                     updated_at_ms=excluded.updated_at_ms
                  WHERE sekai_service_principals.tenant_id=excluded.tenant_id
@@ -37,6 +38,7 @@ impl PostgresDb {
                     &registration.registered_by,
                     &registration.created_at_ms,
                     &registration.updated_at_ms,
+                    &to_json(&registration.capabilities)?,
                 ],
             )
             .map_err(|error| error.to_string())?
@@ -56,7 +58,7 @@ impl PostgresDb {
         self.connection()?
             .query_opt(
                 "SELECT tenant_id, namespaces_json, action_types_json, registered_by,
-                        created_at_ms, updated_at_ms
+                        created_at_ms, updated_at_ms, capabilities_json
                  FROM sekai_service_principals WHERE principal=$1",
                 &[&principal],
             )
@@ -67,6 +69,7 @@ impl PostgresDb {
                     tenant_id: row.get(0),
                     namespaces: from_json(row.get(1))?,
                     action_types: from_json(row.get(2))?,
+                    capabilities: from_json(row.get(6))?,
                     registered_by: row.get(3),
                     created_at_ms: row.get(4),
                     updated_at_ms: row.get(5),
@@ -88,5 +91,32 @@ impl PostgresDb {
             )
             .map(|deleted| deleted > 0)
             .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::postgres::ScratchDatabase;
+    use crate::sekai::service_principal::{AGENT_TURN_WORKER, ServicePrincipalRegistration};
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_keeps_service_principal_capabilities() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        let registration = ServicePrincipalRegistration {
+            principal: "worker-a".into(),
+            tenant_id: "tenant-a".into(),
+            namespaces: vec!["ns-a".into()],
+            action_types: Vec::new(),
+            capabilities: vec![AGENT_TURN_WORKER.into()],
+            registered_by: "root".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        db.put_service_principal(&registration).unwrap().unwrap();
+        let stored = db.get_service_principal("worker-a").unwrap().unwrap();
+        assert_eq!(stored.capabilities, [AGENT_TURN_WORKER]);
+        assert!(stored.action_types.is_empty());
     }
 }
