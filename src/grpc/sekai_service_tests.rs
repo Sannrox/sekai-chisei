@@ -33951,6 +33951,20 @@ async fn working_memory_read_intersects_agent_and_requester() {
         listed(list(None).await.unwrap().into_inner()),
         ["note-mine", "note-open", "note-secret"]
     );
+    let outsider = svc
+        .list_site_agent_working_memory(with_delegated_act(
+            ListSiteAgentWorkingMemoryRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                turn_id: String::new(),
+                limit: 0,
+            },
+            "mallory",
+            Some("bob"),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(outsider.code(), tonic::Code::NotFound);
 
     svc.db
         .runtime()
@@ -34001,7 +34015,8 @@ async fn working_memory_read_intersects_agent_and_requester() {
 }
 
 /// A guest grant's marking ceiling still hides a memory item even when the
-/// instance principal and the requester's sealed profile would both clear it.
+/// instance principal's sealed profile would clear it. Guests are not
+/// admitted at the auth gate; this is the handler ceiling if one reaches it.
 #[tokio::test]
 async fn working_memory_read_keeps_the_guest_ceiling() {
     use crate::sekai::site_agent_memory as memory;
@@ -34024,7 +34039,6 @@ async fn working_memory_read_keeps_the_guest_ceiling() {
         })
         .unwrap();
     sealed_principal_profile(&svc, "svc-line-7", "confidential");
-    pin_guest_profile(&svc, "confidential");
     svc.db
         .runtime()
         .create_object(&crate::domain::Object {
@@ -34068,9 +34082,11 @@ async fn working_memory_read_keeps_the_guest_ceiling() {
             turn_id: String::new(),
             limit: 0,
         },
-        "subject-a",
+        "svc-line-7",
     );
-    req.extensions_mut().insert(guest_context());
+    let mut guest = guest_context();
+    guest.principal.subject = "svc-line-7".into();
+    req.extensions_mut().insert(guest);
     let mut ids = svc
         .list_site_agent_working_memory(req)
         .await
@@ -34082,6 +34098,125 @@ async fn working_memory_read_keeps_the_guest_ceiling() {
         .collect::<Vec<_>>();
     ids.sort();
     assert_eq!(ids, ["note-open"]);
+}
+
+/// Property grants still strip withheld keys. Live `content` is not
+/// exempt from those grants (ADR 0139 is change-history classification).
+#[tokio::test]
+async fn working_memory_read_projects_property_grants() {
+    use crate::sekai::object_security::{
+        OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+        ObjectSecurityPredicate, ObjectSecurityRule, PropertyGrant, PropertyGrantAccess,
+    };
+    use crate::sekai::site_agent_memory as memory;
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("principal_id".into(), "svc-line-7".into())]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "note-open".into(),
+            kind: memory::KIND.into(),
+            name: "note-open".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                (memory::INSTANCE_PROPERTY.into(), "line-7".into()),
+                (memory::CONTENT_PROPERTY.into(), "valve 3 sticks".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let allow_all = |kind: &str, grants: Option<Vec<PropertyGrant>>| ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "ops".into(),
+        kind: kind.into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: grants,
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let instance_revision = svc
+        .db
+        .runtime()
+        .put_object_security_policy(
+            &allow_all(crate::sekai::site_agent_instance::KIND, None),
+            "root",
+            "put-instance-grants",
+            1,
+        )
+        .unwrap();
+    let memory_revision = svc
+        .db
+        .runtime()
+        .put_object_security_policy(
+            &allow_all(
+                memory::KIND,
+                Some(vec![PropertyGrant {
+                    property: memory::INSTANCE_PROPERTY.into(),
+                    access: PropertyGrantAccess::Read,
+                }]),
+            ),
+            "root",
+            "put-memory-grants",
+            1,
+        )
+        .unwrap();
+    svc.db
+        .runtime()
+        .activate_object_security_policies(
+            "ops",
+            &std::collections::BTreeMap::from([
+                (
+                    crate::sekai::site_agent_instance::KIND.into(),
+                    instance_revision.revision_digest,
+                ),
+                (memory::KIND.into(), memory_revision.revision_digest),
+            ]),
+            "root",
+            "activate-memory-grants",
+            2,
+        )
+        .unwrap();
+    let listed = svc
+        .list_site_agent_working_memory(with_delegated_act(
+            ListSiteAgentWorkingMemoryRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                turn_id: String::new(),
+                limit: 0,
+            },
+            "svc-line-7",
+            None,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .items;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0]
+            .properties
+            .get(memory::INSTANCE_PROPERTY)
+            .map(String::as_str),
+        Some("line-7")
+    );
+    assert!(!listed[0].properties.contains_key(memory::CONTENT_PROPERTY));
 }
 
 #[tokio::test]

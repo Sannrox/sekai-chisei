@@ -535,8 +535,9 @@ impl SekaiServiceImpl {
         }))
     }
 
-    /// Live working memory of one instance, returned only when both the
-    /// instance principal and the requester can read each item (#1968).
+    /// Live working memory of one instance. The caller is that instance's
+    /// principal; an item is returned only when that principal and the
+    /// requester can each read it (#1968).
     pub(super) async fn list_site_agent_working_memory_rpc(
         &self,
         req: Request<ListSiteAgentWorkingMemoryRequest>,
@@ -552,7 +553,6 @@ impl SekaiServiceImpl {
             ));
         }
         let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
-        let mut turn_subject = None;
         if let Some(claims) = req.extensions().get::<RuntimeTokenClaims>() {
             let turn_id = if inner.turn_id.trim().is_empty() {
                 claims.turn_id.clone()
@@ -566,7 +566,6 @@ impl SekaiServiceImpl {
             if turn.namespace != namespace || turn.instance_id != instance_id {
                 return Err(Status::not_found("not found"));
             }
-            turn_subject = Some(claims.subject.clone());
         } else {
             enforce_collaboration_namespace(
                 self.db.runtime(),
@@ -606,9 +605,15 @@ impl SekaiServiceImpl {
         if agent.is_empty() {
             return Err(Status::not_found("not found"));
         }
-        // A turn token is bound to its claim's principal. It does not inherit
-        // a later instance principal's clearance.
-        if turn_subject.is_some_and(|subject| subject != agent) {
+        // The calling subject is this instance's principal. A delegated
+        // caller does not inherit another instance principal's clearance.
+        let subject = req
+            .extensions()
+            .get::<crate::enterprise::AuthenticatedContext>()
+            .map(|context| context.principal.subject.clone())
+            .or_else(|| caller_principals(&req).into_iter().next())
+            .unwrap_or_default();
+        if subject != agent {
             return Err(Status::not_found("not found"));
         }
         require_visible_collaboration_read_root(
@@ -642,8 +647,13 @@ impl SekaiServiceImpl {
             if !principal_may_read_memory(self, item.clone(), &requester)? {
                 continue;
             }
-            // Live `content` is the agent-turn payload. Its restricted
+            // Property grants still apply. Live `content`'s restricted
             // classification covers change history, not this read (ADR 0139).
+            let item = match db.project_object_property_grants(item) {
+                Ok(item) => item,
+                Err(error) if error.starts_with("object_security_denied") => continue,
+                Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+            };
             items.push(to_proto_obj(&item));
             if items.len() == limit {
                 break;
@@ -699,7 +709,9 @@ fn collaboration_permits_memory(
 }
 
 /// Whether `principal` may read `object` on its own: namespace, grants,
-/// object-security policy and markings. A hidden item is `false`; a store
+/// object-security policy and markings. `tenant_context` stays `None` so
+/// the check is that principal, not the request's scopes or `act`
+/// (`runtime_object_visible_to`). A hidden item is `false`; a store
 /// outage stays an error.
 fn principal_may_read_memory(
     service: &SekaiServiceImpl,

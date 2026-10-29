@@ -50,10 +50,11 @@ note the person it acts for cannot read.
 5. **Reads intersect the agent and its requester** (#1968). An agent reads its
    memory through an experimental RPC that returns an item only when the
    instance principal and the requester can each read it on their own. The
-   requester is the delegating user (`act`) of the calling token, otherwise
-   the caller. Operators inspect and export memory through the existing
-   object reads and `ExportObjectSet`, which needs the namespace export grant,
-   checks markings per row, and writes a receipt.
+   calling subject is that instance principal. The requester is the
+   delegating user (`act`) of the calling token, otherwise the caller.
+   Operators inspect and export memory through the existing object reads and
+   `ExportObjectSet`, which needs the namespace export grant, checks markings
+   per row, and writes a receipt.
 6. SQLite is the reference store, as for instances (ADR 0136). PostgreSQL
    refuses memory writes until a parity slice.
 
@@ -75,9 +76,9 @@ and again inside the transaction that commits it (#1970), so a freeze or
 principal change committing in between denies the write with a receipt. The
 direct-write guards cover both kinds through one helper.
 `ListSiteAgentWorkingMemory` (#1968) is the experimental agent-turn read:
-an item is returned only when the instance principal and the requester can
-each read it on their own. Operators still inspect and export through
-object reads and `ExportObjectSet`.
+the calling subject is the instance principal, and an item is returned only
+when that principal and the requester can each read it on their own.
+Operators still inspect and export through object reads and `ExportObjectSet`.
 
 ## Validation
 

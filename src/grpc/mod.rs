@@ -773,7 +773,8 @@ fn guest_namespace_rpc(service: &str, method: &str) -> bool {
                 | "DiscoverCapabilities"
                 // Operator read of an instance's turns (#2001): the same
                 // marking as GetObject of the instance.
-                | "ListSiteAgentInstanceTurns"
+                | "ListSiteAgentInstanceTurns" // ListSiteAgentWorkingMemory is an agent-turn read (#1968).
+                                               // Guests inspect memory through GetObject.
         )
 }
 
