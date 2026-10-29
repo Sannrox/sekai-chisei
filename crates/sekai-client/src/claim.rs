@@ -255,8 +255,18 @@ impl AgentTurnFence {
 /// How a worker finished an agent turn; the reason lands on its receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentTurnAck {
-    Completed { reason: String },
-    Failed { reason: String },
+    Completed {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
+    /// The turn's Action awaits approval: the claim ends, and the turn is
+    /// claimable again with its continuation once the Action is decided.
+    Parked {
+        action_instance_id: String,
+        reason: String,
+    },
 }
 
 /// Terminal or park acknowledgement for Action work.
@@ -737,9 +747,13 @@ impl<'a> RuntimeClaimClient<'a> {
         fence: &AgentTurnFence,
         ack: AgentTurnAck,
     ) -> Result<AckAgentTurnResponse, RuntimeClaimError> {
-        let (outcome, reason) = match ack {
-            AgentTurnAck::Completed { reason } => ("completed", reason),
-            AgentTurnAck::Failed { reason } => ("failed", reason),
+        let (outcome, reason, parked_action_instance_id) = match ack {
+            AgentTurnAck::Completed { reason } => ("completed", reason, String::new()),
+            AgentTurnAck::Failed { reason } => ("failed", reason, String::new()),
+            AgentTurnAck::Parked {
+                action_instance_id,
+                reason,
+            } => ("parked", reason, action_instance_id),
         };
         self.unary(
             ACK_AGENT_TURN,
@@ -750,6 +764,7 @@ impl<'a> RuntimeClaimClient<'a> {
                 fencing_token: fence.fencing_token.clone(),
                 outcome: outcome.into(),
                 reason,
+                parked_action_instance_id,
             },
             true,
             true,
