@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
+use sha2::Digest as _;
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{ListFilter, Object};
@@ -241,6 +242,253 @@ fn property<'a>(object: &'a Object, name: &str) -> Option<&'a str> {
         .get(name)
         .map(String::as_str)
         .filter(|value| !value.trim().is_empty())
+}
+
+/// The decision ledger action of an autonomy crossing receipt (#1991).
+pub const ACTION_AUTONOMY_RECEIPT: &str = "security_disposition_autonomy";
+pub const AUTONOMY_PROMOTED: &str = "promoted";
+pub const AUTONOMY_REVIEW: &str = "review";
+
+/// When an agent's dispositions in one class apply without review (#1991).
+/// Package configuration: the same everywhere, read by
+/// `sekaictl admin autonomy disposition-autonomy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AutonomyThresholds {
+    /// Promoted at or above this precision, in basis points.
+    pub min_precision_bps: u32,
+    /// And at or below this overturn rate, in basis points.
+    pub max_overturn_bps: u32,
+    #[serde(skip)]
+    pub window: PrecisionWindow,
+    /// The minimum resolved count; below it a group stays under review.
+    pub min_resolved: u32,
+}
+
+impl AutonomyThresholds {
+    /// 95% precision and at most 5% overturned, over the production window.
+    pub const fn production() -> Self {
+        let window = PrecisionWindow::production();
+        Self {
+            min_precision_bps: 9_500,
+            max_overturn_bps: 500,
+            window,
+            min_resolved: window.min_resolved,
+        }
+    }
+
+    /// Whether `row` earns unreviewed dispositions. An `incomplete` group
+    /// never does.
+    pub fn promotes(&self, row: &DispositionPrecision) -> bool {
+        row.status == STATUS_MEASURED
+            && row
+                .precision_bps
+                .is_some_and(|bps| bps >= self.min_precision_bps)
+            && row
+                .overturn_bps
+                .is_some_and(|bps| bps <= self.max_overturn_bps)
+    }
+}
+
+/// One group's precision and whether it applies dispositions unreviewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DispositionAutonomy {
+    #[serde(flatten)]
+    pub precision: DispositionPrecision,
+    pub promoted: bool,
+}
+
+/// Every agent group's precision against `thresholds`, as of `now_ms`.
+/// Read-only: crossings are recorded when the agent next submits.
+pub fn disposition_autonomy(
+    db: &RuntimeDb,
+    namespace: &str,
+    thresholds: AutonomyThresholds,
+    now_ms: i64,
+) -> Result<Vec<DispositionAutonomy>, String> {
+    Ok(
+        disposition_precision(db, namespace, thresholds.window, now_ms)?
+            .into_iter()
+            .map(|precision| DispositionAutonomy {
+                promoted: thresholds.promotes(&precision),
+                precision,
+            })
+            .collect(),
+    )
+}
+
+/// Whether `principal`'s `type_id` submission with `parameters_json` applies
+/// without review: a disposition record or supersede by an agent whose
+/// group (recorder, revision, finding class) meets the production
+/// thresholds now. Admission calls this for agents only.
+pub fn promotes_disposition(
+    db: &RuntimeDb,
+    namespace: &str,
+    principal: &str,
+    type_id: &str,
+    parameters_json: &str,
+    now_ms: i64,
+) -> Result<bool, String> {
+    promotes_disposition_with(
+        db,
+        namespace,
+        principal,
+        type_id,
+        parameters_json,
+        AutonomyThresholds::production(),
+        now_ms,
+    )
+}
+
+/// [`promotes_disposition`] against `thresholds`. When the group's standing
+/// differs from its last receipt, records the crossing first, and promotes
+/// only once that receipt is durable: an unrecorded promotion parks. Each
+/// crossing's receipt id derives from the group and its position in the
+/// group's history, read before the evidence, so instances racing on one
+/// position record one receipt and a stale one cannot follow a newer one.
+pub fn promotes_disposition_with(
+    db: &RuntimeDb,
+    namespace: &str,
+    principal: &str,
+    type_id: &str,
+    parameters_json: &str,
+    thresholds: AutonomyThresholds,
+    now_ms: i64,
+) -> Result<bool, String> {
+    use crate::sekai::security_package::{ACTION_DISPOSITION_RECORD, ACTION_DISPOSITION_SUPERSEDE};
+    if type_id != ACTION_DISPOSITION_RECORD && type_id != ACTION_DISPOSITION_SUPERSEDE {
+        return Ok(false);
+    }
+    let Some(exposure_id) = serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()
+        .and_then(|parameters| parameters.get("exposure_id")?.as_str().map(str::to_owned))
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    let revision =
+        crate::sekai::site_agent_instance::definition_revision_for(db, namespace, principal)?
+            .unwrap_or_default();
+    let class = finding_class(db, &exposure_id)?;
+    // The history is read before the evidence: the receipt is written at
+    // this position, so a worker whose evidence is older than a receipt
+    // another worker wrote meanwhile collides on its id and parks, instead
+    // of appending a stale standing after it.
+    let target = format!("security-autonomy:{namespace}:{principal}:{revision}:{class}");
+    let history = db.list_decisions(&crate::sekai::audit::DecisionFilter {
+        action: Some(ACTION_AUTONOMY_RECEIPT.into()),
+        target_id: Some(target.clone()),
+        ..Default::default()
+    })?;
+    let row = disposition_precision(db, namespace, thresholds.window, now_ms)?
+        .into_iter()
+        .find(|row| {
+            row.recorded_by == principal
+                && row.recorder_revision == revision
+                && row.finding_class == class
+        })
+        .unwrap_or_else(|| DispositionPrecision {
+            recorded_by: principal.into(),
+            recorder_revision: revision.clone(),
+            finding_class: class.clone(),
+            confirmed: 0,
+            overturned: 0,
+            pending: 0,
+            status: STATUS_INCOMPLETE,
+            precision_bps: None,
+            overturn_bps: None,
+        });
+    let standing = |history: &[crate::sekai::audit::Decision]| {
+        history
+            .iter()
+            .max_by_key(|receipt| sequence(receipt))
+            .is_some_and(|latest| latest.outcome == AUTONOMY_PROMOTED)
+    };
+    let promoted = thresholds.promotes(&row);
+    if promoted == standing(&history) {
+        return Ok(promoted);
+    }
+    // After the highest surviving receipt: retention may purge older ones.
+    let position = history
+        .iter()
+        .map(sequence)
+        .max()
+        .map_or(0, |last| last + 1);
+    let outcome = if promoted {
+        AUTONOMY_PROMOTED
+    } else {
+        AUTONOMY_REVIEW
+    };
+    let receipt = crate::sekai::audit::Decision {
+        id: format!(
+            "security-autonomy:{:x}",
+            sha2::Sha256::digest(format!("{target}\n{position}").as_bytes())
+        ),
+        timestamp: now_ms,
+        actor: "security-autonomy".into(),
+        action: ACTION_AUTONOMY_RECEIPT.into(),
+        reason: format!(
+            "{} crossed the disposition autonomy threshold for {class}",
+            if promoted {
+                "promoted:"
+            } else {
+                "returned to review:"
+            }
+        ),
+        evidence: HashMap::from([
+            ("namespace".into(), namespace.into()),
+            ("recorded_by".into(), principal.into()),
+            ("recorder_revision".into(), revision),
+            ("finding_class".into(), class),
+            ("sequence".into(), position.to_string()),
+            ("status".into(), row.status.into()),
+            ("confirmed".into(), row.confirmed.to_string()),
+            ("overturned".into(), row.overturned.to_string()),
+            (
+                "precision_bps".into(),
+                row.precision_bps
+                    .map(|bps| bps.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "overturn_bps".into(),
+                row.overturn_bps
+                    .map(|bps| bps.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "min_precision_bps".into(),
+                thresholds.min_precision_bps.to_string(),
+            ),
+            (
+                "max_overturn_bps".into(),
+                thresholds.max_overturn_bps.to_string(),
+            ),
+            ("min_resolved".into(), thresholds.min_resolved.to_string()),
+        ]),
+        target_id: target.clone(),
+        outcome: outcome.into(),
+    };
+    if db
+        .record_decisions_idempotently(std::slice::from_ref(&receipt))
+        .is_ok()
+    {
+        return Ok(promoted);
+    }
+    // Another instance recorded this crossing first: its receipt stands.
+    let history = db.list_decisions(&crate::sekai::audit::DecisionFilter {
+        action: Some(ACTION_AUTONOMY_RECEIPT.into()),
+        target_id: Some(target),
+        ..Default::default()
+    })?;
+    Ok(promoted && standing(&history))
+}
+
+fn sequence(receipt: &crate::sekai::audit::Decision) -> u64 {
+    receipt
+        .evidence
+        .get("sequence")
+        .and_then(|position| position.parse().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -595,5 +843,216 @@ mod tests {
         grant(&db, &parked.instance.instance_id, RECORDED);
         let stamped = db.get_object("d-1").unwrap().unwrap();
         assert_eq!(stamped.properties[PROPERTY_RECORDER_KIND], RECORDER_AGENT);
+    }
+
+    fn lenient() -> AutonomyThresholds {
+        AutonomyThresholds {
+            min_precision_bps: 5_000,
+            max_overturn_bps: 5_000,
+            window: window(2),
+            min_resolved: 2,
+        }
+    }
+
+    /// Whether the agent's next disposition on `exposure` applies unreviewed.
+    fn gate(db: &RuntimeDb, exposure: &str, thresholds: AutonomyThresholds, now_ms: i64) -> bool {
+        promotes_disposition_with(
+            db,
+            NAMESPACE,
+            AGENT,
+            ACTION_DISPOSITION_RECORD,
+            &json!({"exposure_id": exposure}).to_string(),
+            thresholds,
+            now_ms,
+        )
+        .unwrap()
+    }
+
+    fn receipts(db: &RuntimeDb) -> Vec<crate::sekai::audit::Decision> {
+        let mut all = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some(ACTION_AUTONOMY_RECEIPT.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        all.sort_by_key(sequence);
+        all
+    }
+
+    /// Promoted on good evidence, returned to review once the overturn rate
+    /// climbs, promoted again when it recovers; each crossing is one
+    /// receipt naming the group, the metrics and the threshold (#1991). The
+    /// agent records everything first; human judgements then arrive over
+    /// days, and the gate is read as of each day.
+    #[test]
+    fn crossings_either_way_are_receipts() {
+        let db = plane("injection", 8);
+        for index in 1..=7 {
+            record(
+                &db,
+                AGENT,
+                &format!("d-{index}"),
+                &format!("e-{index}"),
+                "false-positive",
+            );
+        }
+        let judge = |index: u32, decision: &str, day: i64| {
+            let previous = format!("d-{index}");
+            admit_as(
+                &db,
+                HUMAN,
+                ACTION_DISPOSITION_SUPERSEDE,
+                disposition(
+                    &format!("h-{index}"),
+                    &format!("e-{index}"),
+                    decision,
+                    Some(&previous),
+                ),
+                RECORDED + day * DAY,
+            );
+        };
+        judge(1, "false-positive", 1);
+        judge(2, "false-positive", 1);
+        for index in 3..=5 {
+            judge(index, "fixed", 3);
+        }
+        judge(6, "false-positive", 5);
+        judge(7, "false-positive", 5);
+
+        let at = |day: i64| gate(&db, "e-8", lenient(), RECORDED + day * DAY);
+        assert!(at(2));
+        assert!(at(2), "a standing promotion records nothing");
+        assert!(!at(4));
+        assert!(at(6));
+
+        let history = receipts(&db);
+        let outcomes: Vec<_> = history
+            .iter()
+            .map(|receipt| receipt.outcome.as_str())
+            .collect();
+        assert_eq!(
+            outcomes,
+            [AUTONOMY_PROMOTED, AUTONOMY_REVIEW, AUTONOMY_PROMOTED]
+        );
+        let demoted = &history[1].evidence;
+        assert_eq!(demoted["recorded_by"], AGENT);
+        assert_eq!(demoted["finding_class"], "injection");
+        assert_eq!(demoted["precision_bps"], "4000");
+        assert_eq!(demoted["overturn_bps"], "6000");
+        assert_eq!(demoted["min_precision_bps"], "5000");
+    }
+
+    /// Too little evidence never promotes, however good it is.
+    #[test]
+    fn an_incomplete_agent_is_never_promoted() {
+        let db = plane("", 2);
+        record(&db, AGENT, "d-1", "e-1", "false-positive");
+        supersede(&db, HUMAN, "h-1", "d-1", "false-positive");
+        assert!(!gate(&db, "e-2", lenient(), RECORDED + 2 * DAY));
+        assert!(receipts(&db).is_empty());
+        let rows = disposition_autonomy(&db, NAMESPACE, lenient(), RECORDED + 2 * DAY).unwrap();
+        let [row] = rows.as_slice() else {
+            panic!("{rows:?}")
+        };
+        assert_eq!(row.precision.status, STATUS_INCOMPLETE);
+        assert!(!row.promoted);
+    }
+
+    /// Through admission at the production thresholds: an agent parks until
+    /// twenty settled dispositions earn it, then records directly.
+    #[test]
+    fn a_promoted_agent_records_without_review() {
+        let db = plane("", 21);
+        for index in 1..=20 {
+            record(
+                &db,
+                AGENT,
+                &format!("d-{index}"),
+                &format!("e-{index}"),
+                "false-positive",
+            );
+        }
+        let submit = |now_ms: i64, id: &str| {
+            ActionInstanceAdmission::new(&db, None)
+                .admit(
+                    request(
+                        ACTION_DISPOSITION_RECORD,
+                        &disposition(id, "e-21", "false-positive", None),
+                    ),
+                    AGENT,
+                    now_ms,
+                )
+                .unwrap()
+                .instance
+        };
+        let early = submit(RECORDED + DAY, "d-21");
+        assert_eq!(early.status, "parked");
+        assert_eq!(
+            early.review.queue_id,
+            crate::sekai::security_package::DISPOSITION_REVIEW_QUEUE
+        );
+        assert!(receipts(&db).is_empty());
+
+        let mut later = disposition("d-22", "e-21", "false-positive", None);
+        later["object_id"] = "d-22".into();
+        let settled = RECORDED + 15 * DAY;
+        let admitted = ActionInstanceAdmission::new(&db, None)
+            .admit(request(ACTION_DISPOSITION_RECORD, &later), AGENT, settled)
+            .unwrap()
+            .instance;
+        assert_eq!(admitted.status, "admitted", "{}", admitted.deny_reason);
+        assert!(db.get_object("d-22").unwrap().is_some());
+        assert_eq!(receipts(&db).len(), 1);
+    }
+
+    /// Retention may purge the oldest receipts; the next crossing still
+    /// follows the newest one.
+    #[test]
+    fn a_crossing_follows_the_newest_receipt_after_retention() {
+        let db = plane("", 3);
+        for index in 1..=2 {
+            record(
+                &db,
+                AGENT,
+                &format!("d-{index}"),
+                &format!("e-{index}"),
+                "false-positive",
+            );
+        }
+        for index in 1..=2 {
+            admit_as(
+                &db,
+                HUMAN,
+                ACTION_DISPOSITION_SUPERSEDE,
+                disposition(
+                    &format!("h-{index}"),
+                    &format!("e-{index}"),
+                    if index == 1 {
+                        "false-positive"
+                    } else {
+                        "fixed"
+                    },
+                    Some(&format!("d-{index}")),
+                ),
+                RECORDED + index as i64 * DAY,
+            );
+        }
+        let strict = AutonomyThresholds {
+            min_precision_bps: 10_000,
+            max_overturn_bps: 0,
+            window: window(1),
+            min_resolved: 1,
+        };
+        assert!(gate(&db, "e-3", strict, RECORDED + DAY + DAY / 2));
+        assert!(!gate(&db, "e-3", strict, RECORDED + 3 * DAY));
+        // Purges the ledger prefix up to the second receipt, the first included.
+        db.purge_old_records(RECORDED + 3 * DAY).unwrap();
+        let surviving = receipts(&db);
+        assert_eq!(surviving.iter().map(sequence).collect::<Vec<_>>(), [1]);
+        // One confirmed and one overturned meets the lenient thresholds.
+        assert!(gate(&db, "e-3", lenient(), RECORDED + 3 * DAY));
+        let history = receipts(&db);
+        assert_eq!(history.iter().map(sequence).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(history[1].outcome, AUTONOMY_PROMOTED);
     }
 }

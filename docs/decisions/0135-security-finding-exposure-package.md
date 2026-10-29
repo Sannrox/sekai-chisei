@@ -113,6 +113,37 @@ written through governed Actions, and no domain-specific core RPC.
    clears `needs-probe` and does no harm. The certification moves to
    `cert:security.finding-exposure/v1.4`.
 
+10. **Measured precision decides an agent's disposition autonomy** (#1991).
+    An agent's disposition record or supersede parks for review in the
+    `security.dispositions` queue unless its group (recorder, revision and
+    the exposure's finding class) is promoted: measured, at least 95%
+    precision, at most 5% overturned, over the 90-day window with at least
+    20 resolved dispositions. These thresholds are package configuration,
+    read with `sekaictl admin autonomy disposition-autonomy`. A promoted
+    agent's submission skips only propose-only; a policy that requires
+    approval still parks it. Admission evaluates the group when the agent
+    submits, so a crossing is recorded at its next submission: a decision
+    receipt naming the group, its counts and rates, and the thresholds. The
+    latest receipt is the group's standing. A promotion applies only once
+    its receipt is durable, and a gate that cannot answer keeps the agent
+    under review. Each receipt's id derives from the group and its position
+    in the group's history, which is read before the evidence, so instances
+    racing on one crossing record it once and one working from older
+    evidence cannot follow a newer receipt. Two instances that read the same
+    position with different evidence write one receipt between them; a
+    standing set from the earlier evidence is corrected at the agent's next
+    submission.
+11. **Action types are versioned with their bodies.** A governed Action
+    type's body is immutable per version, so a namespace installed earlier
+    refuses a changed body at the same version. The package registers its
+    types at version 2 (adding `finding_class` and the disposition review
+    queue), next to version 1, which stays for instances and clients that
+    submit it. The reopen pass submits the newest version the namespace
+    holds, so a server running ahead of a namespace's reinstall keeps
+    reopening, and replays an attempt at the version it was first submitted
+    at, so a reopen parked before a reinstall still replays. A test pins the version's bodies so a change cannot land
+    without a new version.
+
 ## Alternatives considered
 
 - A findings store and domain RPC. Rejected for the same reason as ADR 0095: a
