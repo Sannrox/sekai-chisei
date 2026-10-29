@@ -38,6 +38,14 @@ run rebuilds from all rows in that case so the snapshot stays inside the load
 budget. A skipped run reads nothing and carries no pins. A quarantined run
 does not snapshot.
 
+A stored run with object-set inputs keeps the rows it read, keyed by their
+digest, so a replay reads them again under `object-set:<alias>`: the digest
+pinned in `input_versions`, or else the latest stored run's at `as_of_ms`.
+The replay first reads every pinned object again as its caller and is
+refused if one, or a pinned property, is no longer readable. A candidate must
+read the stored definition's object sets. Ad-hoc runs keep no rows and are
+not replayed; shadow runs refuse object-set definitions.
+
 A dataset may declare ordered `partition_keys`. Empty keys keep the
 whole-dataset `sha256-sum-v1:` digest. Partitioned datasets use
 `sha256-partitions-v1:` over a sorted map of partition identity to that

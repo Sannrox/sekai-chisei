@@ -501,6 +501,38 @@ impl RuntimeDb {
         self.run_governed_transform_owned(namespace, transform_id, incremental, now_ms, "", "")
     }
 
+    /// See [`crate::db::sekai::SekaiDb::load_object_set_pin`].
+    pub fn load_object_set_pin(
+        &self,
+        namespace: &str,
+        alias: &str,
+        digest: &str,
+        budget: &mut crate::sekai::governed_transform::InputLoadBudget,
+    ) -> Result<Option<crate::sekai::object_set_input::PinnedObjectSet>, String> {
+        match self {
+            Self::Sqlite(db) => db.load_object_set_pin(namespace, alias, digest, budget),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.load_object_set_pin(namespace, alias, digest, budget)
+            }),
+        }
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::object_set_pin_at`].
+    pub fn object_set_pin_at(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        alias: &str,
+        as_of_ms: i64,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.object_set_pin_at(namespace, transform_id, alias, as_of_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.object_set_pin_at(namespace, transform_id, alias, as_of_ms)
+            }),
+        }
+    }
+
     /// See [`crate::db::sekai::SekaiDb::set_transform_reader`].
     pub fn set_transform_reader(
         &self,

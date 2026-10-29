@@ -217,7 +217,15 @@ impl SekaiDb {
             crate::db::governed_transform::load_transform(&tx, namespace, transform_id)?
                 .ok_or("governed transform not found")?;
         let (run, _) = branch_run_tx(
-            &tx, namespace, &transform, branch, None, actor, tenant, now_ms,
+            &tx,
+            namespace,
+            &transform,
+            branch,
+            None,
+            actor,
+            tenant,
+            now_ms,
+            &[],
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
@@ -241,6 +249,7 @@ impl SekaiDb {
         baseline_version_id: &str,
         definition_digest: &str,
         describe: &crate::sekai::transform_replay::Describe<'_>,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
     ) -> Result<crate::sekai::transform_replay::TransformReplay, String> {
         let mut conn = self.conn();
         let tx = conn
@@ -267,6 +276,7 @@ impl SekaiDb {
             actor,
             tenant,
             now_ms,
+            object_sets,
         )?;
         if !baseline_version_id.is_empty() {
             require_live_version(&tx, &run.output_dataset_id, baseline_version_id)?;
@@ -691,9 +701,11 @@ fn branch_run_tx(
     actor: &str,
     tenant: &str,
     now_ms: i64,
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
 ) -> Result<(DatasetBranchRun, Vec<HashMap<String, String>>), String> {
-    // Branch and caused runs cannot read object sets yet (ADR 0140).
-    crate::sekai::object_set_input::require_evaluated(transform, &[])?;
+    // A branch run reads no object sets; a replay reads the ones its run
+    // pinned, re-authorized by the caller (ADR 0140).
+    crate::sekai::object_set_input::require_evaluated(transform, object_sets)?;
     use crate::db::governed_transform::{
         dataset_exists, list_row_records_after, load_dataset_column_names, load_dataset_object_id,
         load_lattice, load_object_marking_token,
@@ -764,6 +776,30 @@ fn branch_run_tx(
             tx,
             &load_dataset_object_id(tx, &dataset_id)?,
         )?);
+    }
+    // A replay's pinned object sets follow the datasets, read under the
+    // same budget and folded into the markings (ADR 0140).
+    for set in object_sets {
+        if let Some(budget) = budget.as_mut()
+            && !set.rows.iter().all(|row| budget.charge(row))
+        {
+            return Err(format!(
+                "branch run refused: {}",
+                budget.exceeded.unwrap_or_default()
+            ));
+        }
+        if pins.is_some() {
+            read.push(crate::sekai::transform_replay::ReplayInput {
+                alias: set.alias.clone(),
+                dataset_id: set.pin_key(),
+                version_id: set.digest(),
+                rows: set.rows.len() as i64,
+                digest: dataset_branch::rows_digest(&set.rows),
+                columns: set.columns.clone(),
+            });
+        }
+        loaded.push((set.alias.clone(), set.columns.clone(), set.records()));
+        tokens.extend(set.marking_tokens.iter().cloned());
     }
     let output = &transform.output_dataset_id;
     if !dataset_exists(tx, output)? {

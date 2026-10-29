@@ -5546,6 +5546,16 @@ pub(super) async fn replay_governed_transform(
         &input.transform_id,
         &input.definition_json,
     )?;
+    let input_versions: std::collections::BTreeMap<String, String> =
+        input.input_versions.into_iter().collect();
+    // Pinned object sets are read back and re-authorized for the caller.
+    let object_sets = service.replay_object_sets(
+        &admission.stored,
+        &input_versions,
+        input.as_of_ms,
+        &caller_principals(&req),
+        request_tenant_context(service.db.runtime(), &req)?.as_ref(),
+    )?;
     let admission_id = format!(
         "transform-replay:{}:{}:{}",
         input.namespace,
@@ -5553,22 +5563,26 @@ pub(super) async fn replay_governed_transform(
         uuid::Uuid::new_v4()
     );
     let replay = with_transform_quota(service, admission.owner_ctx.as_ref(), admission_id, || {
-        service.db.runtime().replay_governed_transform(
-            &crate::sekai::transform_replay::ReplayTransform {
-                namespace: input.namespace,
-                transform_id: input.transform_id,
-                input_versions: input.input_versions.into_iter().collect(),
-                as_of_ms: input.as_of_ms,
-                definition_json: input.definition_json,
-                baseline_version_id: input.baseline_version_id,
-                key_column: input.key_column,
-                // The definition whose inputs and output were checked.
-                expected_definition_digest: admission.stored.definition_digest.clone(),
-                actor: admission.actor,
-                tenant: admission.tenant,
-            },
-            now_millis(),
-        )
+        service
+            .db
+            .runtime()
+            .replay_governed_transform_with_object_sets(
+                &crate::sekai::transform_replay::ReplayTransform {
+                    namespace: input.namespace,
+                    transform_id: input.transform_id,
+                    input_versions,
+                    as_of_ms: input.as_of_ms,
+                    definition_json: input.definition_json,
+                    baseline_version_id: input.baseline_version_id,
+                    key_column: input.key_column,
+                    // The definition whose inputs and output were checked.
+                    expected_definition_digest: admission.stored.definition_digest.clone(),
+                    actor: admission.actor,
+                    tenant: admission.tenant,
+                },
+                &object_sets,
+                now_millis(),
+            )
     })?;
     Ok(Response::new(ReplayGovernedTransformResponse {
         replay: Some(to_proto_replay(replay)),
