@@ -1091,6 +1091,7 @@ mod tests {
         delegating_actor: Option<&str>,
     ) {
         db.put_action_instance(&ActionInstance {
+            agent_turn: None,
             instance_id: effect.instance_id.clone(),
             namespace: effect.namespace.clone(),
             type_id: "dispatch".into(),
@@ -1233,6 +1234,7 @@ mod tests {
         let db = RuntimeDb::memory();
         let effect = seed_effect_row(&db);
         db.put_action_instance(&ActionInstance {
+            agent_turn: None,
             instance_id: effect.instance_id.clone(),
             namespace: effect.namespace.clone(),
             type_id: "dispatch".into(),
@@ -1321,6 +1323,7 @@ mod tests {
         let db = RuntimeDb::memory();
         let effect = seed_effect_row(&db);
         db.put_action_instance(&ActionInstance {
+            agent_turn: None,
             instance_id: effect.instance_id.clone(),
             namespace: effect.namespace.clone(),
             type_id: "dispatch".into(),
@@ -1465,6 +1468,7 @@ mod tests {
         let db = RuntimeDb::memory();
         let effect = seed_effect_row(&db);
         db.put_action_instance(&ActionInstance {
+            agent_turn: None,
             instance_id: effect.instance_id.clone(),
             namespace: effect.namespace.clone(),
             type_id: "dispatch".into(),
@@ -1531,6 +1535,7 @@ mod tests {
         let db = RuntimeDb::memory();
         let effect = seed_effect_row(&db);
         db.put_action_instance(&ActionInstance {
+            agent_turn: None,
             instance_id: effect.instance_id.clone(),
             namespace: effect.namespace.clone(),
             type_id: "dispatch".into(),

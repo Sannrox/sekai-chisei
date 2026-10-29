@@ -412,6 +412,7 @@ mod tests {
         ActionInstanceAdmission::new(runtime, None)
             .admit(
                 ActionInstanceAdmissionRequest {
+                    agent_turn: None,
                     namespace: NAMESPACE.into(),
                     type_id: type_id.into(),
                     version: ACTION_VERSION.into(),

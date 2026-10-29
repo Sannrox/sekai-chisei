@@ -2315,6 +2315,7 @@ fn seed_claimed_action_of(
     db.put_action_effects(std::slice::from_ref(&effect))
         .unwrap();
     db.put_action_instance(&crate::sekai::action_instance::ActionInstance {
+        agent_turn: None,
         instance_id: format!("{type_id}-instance"),
         namespace: namespace.into(),
         type_id: type_id.into(),

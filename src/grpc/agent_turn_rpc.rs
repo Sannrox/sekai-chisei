@@ -3,6 +3,7 @@
 //! with the same authority as isolated transform work.
 
 use super::*;
+use crate::runtime_token::RuntimeTokenClaims;
 use crate::sekai::agent_turn::{self, Cause, Outcome, TurnError, Wake};
 
 fn turn_status(error: TurnError) -> Status {
@@ -38,10 +39,12 @@ fn to_proto(turn: agent_turn::AgentTurn) -> AgentTurn {
     }
 }
 
-/// What a worker call names: a namespace, or one turn in it.
+/// What a worker call names: a namespace, or one turn in it. An ack may
+/// also name a turn it already acknowledged, so a lost response is retried.
 enum Scope<'a> {
     Namespace(&'a str),
     Turn(&'a str),
+    AckedTurn(&'a str),
 }
 
 impl SekaiServiceImpl {
@@ -54,21 +57,193 @@ impl SekaiServiceImpl {
         req: &Request<T>,
         scope: Scope<'_>,
     ) -> Result<(), Status> {
+        // A turn token is its own authority, for its turn's live claim only.
+        if let Some(claims) = req.extensions().get::<RuntimeTokenClaims>() {
+            let (turn_id, acked) = match scope {
+                Scope::Turn(turn_id) => (turn_id, false),
+                Scope::AckedTurn(turn_id) => (turn_id, true),
+                Scope::Namespace(_) => {
+                    return Err(Status::permission_denied(
+                        "runtime token admits only calls for its claimed turn",
+                    ));
+                }
+            };
+            let turn = agent_turn::get(self.db.runtime(), turn_id)
+                .map_err(turn_status)?
+                .ok_or_else(|| turn_status(TurnError::NotFound))?;
+            // The store replays the same fence and outcome, or refuses.
+            if acked && turn.is_acknowledged() {
+                return self.authorize_acked_turn_token(req, claims, &turn);
+            }
+            return self.authorize_turn_token(req, claims, &turn);
+        }
         let principals = caller_principals(req);
         require_authenticated(&principals)?;
         require_credential_admin(&principals)?;
         let namespace = match scope {
             Scope::Namespace(namespace) => namespace.to_string(),
-            Scope::Turn(turn_id) => agent_turn::get(self.db.runtime(), turn_id)
-                .map_err(turn_status)?
-                .map(|turn| turn.namespace)
-                .ok_or_else(|| turn_status(TurnError::NotFound))?,
+            Scope::Turn(turn_id) | Scope::AckedTurn(turn_id) => {
+                agent_turn::get(self.db.runtime(), turn_id)
+                    .map_err(turn_status)?
+                    .map(|turn| turn.namespace)
+                    .ok_or_else(|| turn_status(TurnError::NotFound))?
+            }
         };
         check_team_namespace(self.db.runtime(), &principals, &namespace, true)?;
         if let Some(context) = request_tenant_context(self.db.runtime(), req)?.as_ref() {
             enforce_namespace_tenant_context(self.db.runtime(), Some(context), &namespace, true)?;
         }
         Ok(())
+    }
+
+    /// A turn token covers `turn` while the turn is claimed at the token's
+    /// generation by its runtime, under the token's tenant (ADR 0142).
+    fn authorize_turn_token<T: 'static>(
+        &self,
+        req: &Request<T>,
+        claims: &RuntimeTokenClaims,
+        turn: &agent_turn::AgentTurn,
+    ) -> Result<(), Status> {
+        let live = turn.is_live_claim(now_millis())
+            && u64::try_from(turn.claim_generation).ok() == Some(claims.claim_generation)
+            && turn.principal_id == claims.subject
+            && claims.covers_turn(
+                &turn.namespace,
+                &turn.turn_id,
+                &turn.claim_owner,
+                claims.claim_generation,
+            );
+        if !live {
+            return Err(Status::permission_denied(
+                "runtime token does not cover this turn's claim",
+            ));
+        }
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            request_tenant_context(self.db.runtime(), req)?.as_ref(),
+            &turn.namespace,
+            true,
+        )
+    }
+
+    /// A turn token retrying the ack of a turn it acknowledged: the turn was
+    /// last claimed at the token's generation by its runtime.
+    fn authorize_acked_turn_token<T: 'static>(
+        &self,
+        req: &Request<T>,
+        claims: &RuntimeTokenClaims,
+        turn: &agent_turn::AgentTurn,
+    ) -> Result<(), Status> {
+        let covered = u64::try_from(turn.claim_generation).ok() == Some(claims.claim_generation)
+            && turn.principal_id == claims.subject
+            && claims.covers_turn(
+                &turn.namespace,
+                &turn.turn_id,
+                &turn.claim_owner,
+                claims.claim_generation,
+            );
+        if !covered {
+            return Err(Status::permission_denied(
+                "runtime token does not cover this turn's claim",
+            ));
+        }
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            request_tenant_context(self.db.runtime(), req)?.as_ref(),
+            &turn.namespace,
+            true,
+        )
+    }
+
+    /// An Action submitted with a turn token is the turn's: the turn must
+    /// still be claimed by the token, in the namespace the Action names.
+    pub(crate) fn authorize_turn_submission<T: 'static>(
+        &self,
+        req: &Request<T>,
+        namespace: &str,
+    ) -> Result<(), Status> {
+        let Some(claims) = req.extensions().get::<RuntimeTokenClaims>() else {
+            return Ok(());
+        };
+        if !claims.is_turn() || claims.namespace != namespace {
+            return Err(Status::permission_denied(
+                "runtime token does not cover this submission",
+            ));
+        }
+        let turn = agent_turn::get(self.db.runtime(), &claims.turn_id)
+            .map_err(turn_status)?
+            .ok_or_else(|| {
+                Status::permission_denied("runtime token does not cover this submission")
+            })?;
+        self.authorize_turn_token(req, claims, &turn)?;
+        // A frozen instance's turn submits nothing, here as at admission.
+        if crate::sekai::site_agent_instance::frozen_instance_for(
+            self.db.runtime(),
+            &turn.namespace,
+            &turn.principal_id,
+        )
+        .map_err(Status::internal)?
+        .is_some()
+        {
+            return Err(Status::failed_precondition("site agent instance is frozen"));
+        }
+        Ok(())
+    }
+
+    /// The turn token for `turn` as claimed by `req`'s caller, or empty
+    /// with zero expiry when the plane has no signing key or the caller has
+    /// no tenant context (ADR 0142).
+    fn turn_token_for<T: 'static>(
+        &self,
+        req: &Request<T>,
+        turn: &agent_turn::AgentTurn,
+        now_ms: i64,
+    ) -> Result<(String, i64), Status> {
+        let tenant_context = request_tenant_context(self.db.runtime(), req)?;
+        let (Some(authority), Some(context)) = (
+            self.runtime_token_authority.as_deref(),
+            tenant_context.as_ref(),
+        ) else {
+            return Ok((String::new(), 0));
+        };
+        let Ok(claim_generation) = u64::try_from(turn.claim_generation) else {
+            return Ok((String::new(), 0));
+        };
+        let binding = crate::runtime_token::TurnBinding {
+            namespace: &turn.namespace,
+            turn_id: &turn.turn_id,
+            principal: &turn.principal_id,
+            runtime_id: &turn.claim_owner,
+            claim_generation,
+            claim_expires_at_ms: turn.claim_expires_at_ms,
+        };
+        let Some(claims) = RuntimeTokenClaims::for_turn(authority, context, binding, now_ms) else {
+            return Ok((String::new(), 0));
+        };
+        let token = claims.sign(authority).map_err(Status::internal)?;
+        Ok((token, claims.expires_at_ms))
+    }
+
+    /// A turn token renewed on heartbeat: the same turn, principal and
+    /// actor, expiring with the renewed claim and never after the authority
+    /// it was first minted with.
+    fn refresh_turn_token(
+        &self,
+        claims: &RuntimeTokenClaims,
+        turn: &agent_turn::AgentTurn,
+        now_ms: i64,
+    ) -> Result<(String, i64), Status> {
+        let Some(authority) = self.runtime_token_authority.as_deref() else {
+            return Ok((String::new(), 0));
+        };
+        let mut renewed = claims.clone();
+        renewed.expires_at_ms = turn
+            .claim_expires_at_ms
+            .min(now_ms.saturating_add(crate::runtime_token::RUNTIME_TOKEN_MAX_LIFETIME_MS))
+            .min(claims.authority_expires_at_ms);
+        renewed.jti = uuid::Uuid::new_v4().to_string();
+        let token = renewed.sign(authority).map_err(Status::internal)?;
+        Ok((token, renewed.expires_at_ms))
     }
 
     pub(super) async fn wake_site_agent_instance_rpc(
@@ -128,18 +303,22 @@ impl SekaiServiceImpl {
         req: Request<ClaimAgentTurnRequest>,
     ) -> Result<Response<ClaimAgentTurnResponse>, Status> {
         self.authorize_turn_worker(&req, Scope::Namespace(&req.get_ref().namespace))?;
-        let inner = req.into_inner();
+        let now = now_millis();
+        let inner = req.get_ref();
         let turn = agent_turn::claim(
             self.db.runtime(),
             &inner.namespace,
             &inner.runtime_id,
             &inner.turn_id,
             inner.ttl_ms,
-            now_millis(),
+            now,
         )
         .map_err(turn_status)?;
+        let (runtime_token, runtime_token_expires_at_ms) = self.turn_token_for(&req, &turn, now)?;
         Ok(Response::new(ClaimAgentTurnResponse {
             turn: Some(to_proto(turn)),
+            runtime_token,
+            runtime_token_expires_at_ms,
         }))
     }
 
@@ -148,7 +327,8 @@ impl SekaiServiceImpl {
         req: Request<HeartbeatAgentTurnClaimRequest>,
     ) -> Result<Response<HeartbeatAgentTurnClaimResponse>, Status> {
         self.authorize_turn_worker(&req, Scope::Turn(&req.get_ref().turn_id))?;
-        let inner = req.into_inner();
+        let now = now_millis();
+        let inner = req.get_ref();
         let turn = agent_turn::heartbeat(
             self.db.runtime(),
             &inner.turn_id,
@@ -156,11 +336,20 @@ impl SekaiServiceImpl {
             inner.claim_generation,
             &inner.fencing_token,
             inner.ttl_ms,
-            now_millis(),
+            now,
         )
         .map_err(turn_status)?;
+        // A heartbeat with a turn token refreshes it as the token's own
+        // claim: its worker stays its actor (ADR 0142).
+        let (runtime_token, runtime_token_expires_at_ms) =
+            match req.extensions().get::<RuntimeTokenClaims>() {
+                Some(claims) => self.refresh_turn_token(claims, &turn, now)?,
+                None => self.turn_token_for(&req, &turn, now)?,
+            };
         Ok(Response::new(HeartbeatAgentTurnClaimResponse {
             turn: Some(to_proto(turn)),
+            runtime_token,
+            runtime_token_expires_at_ms,
         }))
     }
 
@@ -168,7 +357,7 @@ impl SekaiServiceImpl {
         &self,
         req: Request<AckAgentTurnRequest>,
     ) -> Result<Response<AckAgentTurnResponse>, Status> {
-        self.authorize_turn_worker(&req, Scope::Turn(&req.get_ref().turn_id))?;
+        self.authorize_turn_worker(&req, Scope::AckedTurn(&req.get_ref().turn_id))?;
         let inner = req.into_inner();
         let outcome = match inner.outcome.as_str() {
             "completed" => Outcome::Completed,

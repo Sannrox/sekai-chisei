@@ -1263,6 +1263,12 @@ message ClaimAgentTurnRequest {
 }
 message ClaimAgentTurnResponse {
   AgentTurn turn = 1;
+  // Acts as the turn's instance principal for this claim's heartbeat, ack
+  // and Action submissions (ADR 0142). Empty without a signing key or a
+  // tenant context.
+  string runtime_token = 2;
+  // Never later than turn.claim_expires_at_ms. Zero when runtime_token is empty.
+  int64 runtime_token_expires_at_ms = 3;
 }
 message HeartbeatAgentTurnClaimRequest {
   string turn_id = 1;
@@ -1273,6 +1279,12 @@ message HeartbeatAgentTurnClaimRequest {
 }
 message HeartbeatAgentTurnClaimResponse {
   AgentTurn turn = 1;
+  // Acts as the turn's instance principal for this claim's heartbeat, ack
+  // and Action submissions (ADR 0142). Empty without a signing key or a
+  // tenant context.
+  string runtime_token = 2;
+  // Never later than turn.claim_expires_at_ms. Zero when runtime_token is empty.
+  int64 runtime_token_expires_at_ms = 3;
 }
 message AckAgentTurnRequest {
   string turn_id = 1;

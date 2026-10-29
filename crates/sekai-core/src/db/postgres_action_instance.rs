@@ -278,6 +278,12 @@ impl PostgresDb {
             .map(row_to_object)
             .transpose()?;
         let written = object_state_digest(persisted.as_ref())?;
+        // Object locks taken above may have blocked past the turn's lease;
+        // check it again before the marker that would exempt this write from
+        // it. The turn row is then share-locked to commit (ADR 0142).
+        if postgres_turn_fence_refusal(&mut tx, instance_id)?.is_some() {
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
         tx.execute(
             "UPDATE sekai_action_instances
              SET body_json = jsonb_set(
@@ -740,6 +746,9 @@ pub(crate) fn postgres_reservation_refusal<C: postgres::GenericClient>(
     instance_id: &str,
     written: Option<&crate::domain::Object>,
 ) -> Result<Option<String>, String> {
+    if let Some(reason) = postgres_turn_fence_refusal(client, instance_id)? {
+        return Ok(Some(reason));
+    }
     let row = client
         .query_one(
             "SELECT namespace, principal FROM sekai_action_instances WHERE instance_id = $1",
@@ -748,6 +757,45 @@ pub(crate) fn postgres_reservation_refusal<C: postgres::GenericClient>(
         .map_err(|error| error.to_string())?;
     let (namespace, principal): (String, String) = (row.get(0), row.get(1));
     postgres_site_agent_refusal(client, &namespace, &principal, written)
+}
+
+/// See `sqlite_turn_fence_refusal`. The turn row is share-locked, so a
+/// reclaim that bumps its generation waits for this commit.
+pub(crate) fn postgres_turn_fence_refusal<C: postgres::GenericClient>(
+    client: &mut C,
+    instance_id: &str,
+) -> Result<Option<String>, String> {
+    let row = client
+        .query_one(
+            "SELECT body_json::jsonb #>> '{agent_turn,turn_id}',
+                    (body_json::jsonb #>> '{agent_turn,claim_generation}')::BIGINT,
+                    (body_json::jsonb #>> '{admission_lease,write_committed}')::BOOLEAN
+             FROM sekai_action_instances WHERE instance_id = $1",
+            &[&instance_id],
+        )
+        .map_err(|error| error.to_string())?;
+    let (turn_id, turn_generation, write_committed): (Option<String>, Option<i64>, Option<bool>) =
+        (row.get(0), row.get(1), row.get(2));
+    // A write that committed under the fence stays authorized (#1931).
+    let Some(turn_id) = turn_id.filter(|_| write_committed != Some(true)) else {
+        return Ok(None);
+    };
+    let live = client
+        .query_opt(
+            "SELECT 1 FROM sekai_agent_turn
+             WHERE turn_id = $1 AND status = 'claimed' AND claim_generation = $2
+               AND claim_expires_at_ms > $3
+             FOR SHARE",
+            &[
+                &turn_id,
+                &turn_generation.unwrap_or(-1),
+                &crate::sekai::action_instance::lease_clock_ms(),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(live
+        .is_none()
+        .then(|| format!("agent turn {turn_id} is no longer claimed by this submission")))
 }
 
 /// Why a site agent write is refused as it commits (#1970); see the SQLite

@@ -112,6 +112,7 @@ fn seed_action_with_act(db: &RuntimeDb, prefix: &str, delegating_actor: Option<&
     .remove(0);
     effect.effect_id = format!("{prefix}-effect");
     db.put_action_instance(&ActionInstance {
+        agent_turn: None,
         instance_id: effect.instance_id.clone(),
         namespace: effect.namespace.clone(),
         type_id: "dispatch".into(),

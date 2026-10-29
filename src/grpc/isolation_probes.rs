@@ -268,6 +268,7 @@ async fn isolation_probe_1140_only_one_credentialed_subject_decides() {
     let parked = ActionInstanceAdmission::new(db, None)
         .admit(
             ActionInstanceAdmissionRequest {
+                agent_turn: None,
                 namespace: north.namespace.clone(),
                 type_id: action.type_id.clone(),
                 version: "2".into(),

@@ -523,6 +523,7 @@ mod tests {
 
     fn request(type_id: &str, parameters: &Value) -> ActionInstanceAdmissionRequest {
         ActionInstanceAdmissionRequest {
+            agent_turn: None,
             namespace: NAMESPACE.into(),
             type_id: type_id.into(),
             version: PACKAGE_VERSION.into(),
