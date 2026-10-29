@@ -49,6 +49,8 @@ mod object_change_subscription;
 mod object_comment_rpc;
 #[path = "object_mutation_lifecycle.rs"]
 mod object_mutation_lifecycle;
+#[path = "object_set_input.rs"]
+mod object_set_input;
 #[path = "object_set_query.rs"]
 mod object_set_query;
 #[path = "ontology_changelog_rpc.rs"]

@@ -509,6 +509,24 @@ mod tests {
     }
 
     #[test]
+    fn dataset_inputs_keep_their_serialized_form_and_digest() {
+        // Object-set inputs are left out of a dataset input's JSON, so the
+        // bytes a definition digest hashes are unchanged (ADR 0140).
+        let input = TransformInput {
+            alias: "orders".into(),
+            dataset_id: "ops-orders".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&[input]).unwrap(),
+            r#"[{"alias":"orders","dataset_id":"ops-orders"}]"#
+        );
+        let stored: TransformInput =
+            serde_json::from_str(r#"{"alias":"orders","dataset_id":"ops-orders"}"#).unwrap();
+        assert!(!stored.is_object_set());
+    }
+
+    #[test]
     fn empty_placement_requires_keeps_the_earlier_digest_and_json() {
         let transform = isolated_transform("python", "runner:1");
         // Pinned from before placement existed: admitted runs stay valid.
@@ -597,6 +615,7 @@ mod tests {
         transform.isolated_process.as_mut().unwrap().inputs = vec![TransformInput {
             alias: " left ".into(),
             dataset_id: " in ".into(),
+            ..Default::default()
         }];
         transform.input_dataset_id = " in ".into();
         transform.definition_digest.clear();
@@ -992,10 +1011,12 @@ mod tests {
             TransformInput {
                 alias: "Orders".into(),
                 dataset_id: "a".into(),
+                ..Default::default()
             },
             TransformInput {
                 alias: "orders".into(),
                 dataset_id: "b".into(),
+                ..Default::default()
             },
         ]);
         transform.analytical.as_mut().unwrap().sql = "SELECT * FROM \"Orders\"".into();
@@ -1008,6 +1029,7 @@ mod tests {
         let mut transform = analytical_from_bindings(vec![TransformInput {
             alias: "customers".into(),
             dataset_id: "cust".into(),
+            ..Default::default()
         }]);
         transform.analytical.as_mut().unwrap().sql = "SELECT * FROM customers".into();
         let prepared = transform.prepare().unwrap();
@@ -1023,6 +1045,7 @@ mod tests {
         let mut transform = analytical_from_bindings(vec![TransformInput {
             alias: "customers".into(),
             dataset_id: "cust".into(),
+            ..Default::default()
         }]);
         transform.steps = vec![TransformStep {
             kind: "filter".into(),
@@ -1044,10 +1067,12 @@ mod tests {
             TransformInput {
                 alias: "customers".into(),
                 dataset_id: "cust".into(),
+                ..Default::default()
             },
             TransformInput {
                 alias: "orders".into(),
                 dataset_id: "ord".into(),
+                ..Default::default()
             },
         ]);
         transform.steps = vec![TransformStep {
@@ -1070,6 +1095,7 @@ mod tests {
         let mut transform = analytical_from_bindings(vec![TransformInput {
             alias: "customers".into(),
             dataset_id: "cust".into(),
+            ..Default::default()
         }]);
         transform.steps = vec![TransformStep {
             kind: "filter".into(),
@@ -1087,6 +1113,7 @@ mod tests {
         let mut transform = analytical_from_bindings(vec![TransformInput {
             alias: "input".into(),
             dataset_id: "in".into(),
+            ..Default::default()
         }]);
         transform.analytical.as_mut().unwrap().sql =
             "SELECT * FROM input ORDER BY id LIMIT 1".into();
@@ -1100,10 +1127,12 @@ mod tests {
             TransformInput {
                 alias: "source".into(),
                 dataset_id: "in".into(),
+                ..Default::default()
             },
             TransformInput {
                 alias: "prior".into(),
                 dataset_id: "out".into(),
+                ..Default::default()
             },
         ]);
         transform.analytical.as_mut().unwrap().sql =
@@ -1121,6 +1150,7 @@ mod tests {
         let mut transform = analytical_from_bindings(vec![TransformInput {
             alias: "input".into(),
             dataset_id: "in".into(),
+            ..Default::default()
         }]);
         transform.analytical.as_mut().unwrap().sql = "SELECT * FROM input".into();
         transform.analytical.as_mut().unwrap().memory_limit_bytes = u64::MAX;
@@ -1140,10 +1170,12 @@ mod tests {
             TransformInput {
                 alias: "left".into(),
                 dataset_id: "a".into(),
+                ..Default::default()
             },
             TransformInput {
                 alias: "right".into(),
                 dataset_id: "b".into(),
+                ..Default::default()
             },
         ]);
         transform.analytical.as_mut().unwrap().sql = "SELECT * FROM left".into();
@@ -1196,6 +1228,7 @@ mod tests {
         let mut transform = analytical_from_bindings(vec![TransformInput {
             alias: "input".into(),
             dataset_id: "in".into(),
+            ..Default::default()
         }]);
         transform.analytical.as_mut().unwrap().sql = "SELECT * FROM input".into();
         transform.analytical.as_mut().unwrap().memory_limit_bytes = 80;

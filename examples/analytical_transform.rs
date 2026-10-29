@@ -103,10 +103,12 @@ fn main() -> Result<(), String> {
                 TransformInput {
                     alias: "customers".into(),
                     dataset_id: "customers".into(),
+                    ..Default::default()
                 },
                 TransformInput {
                     alias: "orders".into(),
                     dataset_id: "orders".into(),
+                    ..Default::default()
                 },
             ],
             sql: "SELECT c.region AS region, COUNT(*) AS orders, SUM(o.amount) AS total \
