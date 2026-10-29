@@ -5,6 +5,7 @@ use sekai_chisei::db::retention::RetentionPolicyBackend;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::Object;
+use sekai_chisei::sekai::audit::ObjectChange;
 use sekai_chisei::sekai::dataset::Dataset;
 use sekai_chisei::sekai::deduplication::{
     ContentObligations, ContentReferenceRequest, ContentScope, ReconciliationAction,
@@ -1305,4 +1306,120 @@ fn postgres_concurrent_audit_retention_archives_once() {
         RuntimeDb::Postgres(Arc::new(scratch.connect(8))),
         &sql,
     );
+}
+
+fn object_change(id: &str, object_id: &str, old: &str, new: &str, timestamp: i64) -> ObjectChange {
+    ObjectChange {
+        id: id.into(),
+        object_id: object_id.into(),
+        field: "phone".into(),
+        old_value: old.into(),
+        new_value: new.into(),
+        changed_by: "importer".into(),
+        timestamp,
+        ..ObjectChange::default()
+    }
+}
+
+/// Object changes on any backend (#1986): recorded and listed with the same
+/// semantics; past the dataset-wide audit policy they are archived and leave
+/// the table, a fresh one stays, a dry run writes nothing and a rerun
+/// archives nothing twice; erasing the user an object stands for leaves no
+/// value of its archived changes. Needs a database of its own: the audit
+/// policy is dataset-wide.
+fn exercise_object_change_retention(db: &RuntimeDb, sql: &Sql<'_>) {
+    let now = 3 * DAY_MS;
+    (sql.exec)(
+        "INSERT INTO sekai_objects (id,kind,name,created,updated)
+         VALUES ('obj-7','user','alice',1,1);",
+    );
+    db.record_object_change(&object_change(
+        "c1",
+        "obj-7",
+        "+49 555 0100",
+        "+49 555 0199",
+        1,
+    ))
+    .unwrap();
+    db.record_object_changes(&[
+        object_change("c2", "obj-8", "a", "b", 2),
+        object_change("c3", "obj-8", "b", "c", now - 1_000),
+    ])
+    .unwrap();
+    let listed = db.list_object_changes("obj-8", 10, 0).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        ["c3", "c2"],
+        "newest first"
+    );
+    assert_eq!(listed[1].new_value, "b");
+    db.set_retention_policy(&policy("audit", "", 1)).unwrap();
+    let changes = "SELECT id FROM sekai_object_changes";
+    let archived = |id_like: &str| {
+        sql.count(&format!(
+            "SELECT 1 FROM sekai_archive_records
+             WHERE dataset='audit.object_changes' AND payload LIKE '%{id_like}%'"
+        ))
+    };
+
+    let dry = db.archive_retained_records(now, true).unwrap();
+    assert!(dry.dry_run && dry.audit_archived >= 2, "{dry:?}");
+    assert_eq!(sql.count(changes), 3);
+    let run = db.archive_retained_records(now, false).unwrap();
+    assert!(run.audit_archived >= 2, "{run:?}");
+    assert_eq!((sql.strings)(changes), ["c3"]);
+    assert_eq!((archived("\"c1\""), archived("\"c2\"")), (1, 1));
+    db.archive_retained_records(now, false).unwrap();
+    assert_eq!(archived("\"c"), 2, "nothing archived twice");
+
+    db.erase_subject(&SubjectErasureRequest {
+        subject_kind: "user".into(),
+        subject: "alice".into(),
+        requested_by: "privacy-operator".into(),
+        reason: "validated request".into(),
+        timestamp: now,
+    })
+    .unwrap();
+    assert_eq!(archived("555"), 0);
+    assert_eq!(archived("obj-7"), 0);
+    assert_eq!(archived("\"c2\""), 1, "an unrelated change stays");
+    let verification = db.verify_retention_archive().unwrap();
+    assert!(verification.ok, "{}", verification.error);
+
+    // Object changes share the `audit` policy, so a tampered ledger refuses
+    // their archiving too: the expiring change stays put.
+    (sql.exec)("UPDATE sekai_decisions SET reason='tampered';");
+    let refused = db.archive_retained_records(30 * DAY_MS, false).unwrap_err();
+    assert!(
+        refused.contains("audit ledger verification failed before retention"),
+        "{refused}"
+    );
+    assert_eq!((sql.strings)(changes), ["c3"]);
+}
+
+#[test]
+fn sqlite_object_change_retention_conformance() {
+    let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+    let (exec, strings) = sqlite_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    exercise_object_change_retention(&RuntimeDb::Sqlite(db.clone()), &sql);
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_object_change_retention_conformance() {
+    let scratch = crate::postgres_scratch::ScratchDatabase::create();
+    let db = Arc::new(scratch.connect(8));
+    let (exec, strings) = postgres_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    exercise_object_change_retention(&RuntimeDb::Postgres(db.clone()), &sql);
 }

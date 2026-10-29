@@ -73,9 +73,9 @@ retaining obligation. Retention archives into `sekai_archive_*` tables in the sa
 both backends (ADR 0141): `RuntimeDb::archive_retained_records(now, dry_run)`
 moves records past their policy cutoff and removes or redacts them in one
 transaction. SQLite covers decisions, attestations, object changes, LLM calls,
-task observations and content events; PostgreSQL covers all of them but
-object changes, which follow. Both backends archive decisions and their
-attestations only after `RuntimeDb::verify_ledger` passes, and refuse the run
+task observations and content events; PostgreSQL covers all six. Both
+backends archive decisions, attestations and object changes (the `audit`
+policy) only after `RuntimeDb::verify_ledger` passes, and refuse the run
 naming the failure otherwise; on PostgreSQL the check reads one snapshot. Batches on several PostgreSQL replicas take turns under a
 transaction-scoped archive lock, so each record is archived once. `run_retention` and `purge_old_records` remain
 SQLite-only. Selecting `SEKAI_DB_BACKEND=postgres` with Combined dest-pair

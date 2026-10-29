@@ -125,15 +125,16 @@ impl PostgresDb {
             })
             .map(|row| row.get::<_, String>(0))
             .collect();
+        let represented_objects = represented_object_ids(&mut tx, request)?;
         redact_archived_subject(
             &mut tx,
             &ArchiveErasureSubject {
                 kind: &request.subject_kind,
                 subject: &request.subject,
                 hash: &subject_hash,
-                // PostgreSQL's hot rules for the datasets archived here do
-                // not follow related objects; see `postgres_hot_rule_deletes`.
-                object_ids: &[],
+                // The objects that are the subject, as the hot erasure below
+                // finds them: their archived changes keep no value.
+                object_ids: &represented_objects,
                 reference_ids: &archived_reference_ids,
             },
             request.timestamp,
@@ -307,10 +308,10 @@ impl PostgresDb {
     /// transaction and locks the rows it reads, so replicas running at once
     /// take turns batch by batch and archive every record once; a crash
     /// loses only the uncommitted batch, which a rerun redoes. A dry run
-    /// counts everything in one pass and rolls it back. Decisions and their
-    /// attestations go only after the ledger verifies, once per run under
-    /// the ledger lock, and the run refuses naming the failure otherwise.
-    /// Object changes are not archived here yet (#1986).
+    /// counts everything in one pass and rolls it back. Decisions, their
+    /// attestations and object changes (all under the `audit` policy) go
+    /// only after the ledger verifies, once per run under the ledger lock,
+    /// and the run refuses naming the failure otherwise.
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
         if dry_run {
             return self.archive_retained_batch(
@@ -568,6 +569,47 @@ impl PostgresDb {
         let observations_archived = observation_records.len();
         records.extend(observation_records.into_iter().map(ArchiveRecord::from));
 
+        // Object changes follow the dataset-wide audit policy, as on SQLite,
+        // so they pass the same ledger gate above: an `audit` policy means
+        // the ledger was verified in this run before anything moves.
+        // Archived rows leave the table, so each batch reads the oldest.
+        let mut change_ids = Vec::new();
+        if let (false, Some(policy)) = (
+            cursor.object_changes_done,
+            effective_policy(&policies, crate::sekai::retention::AUDIT_DATASET, "", ""),
+        ) {
+            let cutoff = now - i64::from(policy.retention_days) * DAY_MS;
+            let rows = tx
+                .query(
+                    "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp
+                     FROM sekai_object_changes WHERE timestamp<$1
+                     ORDER BY timestamp,id LIMIT $2 FOR UPDATE",
+                    &[&cutoff, &limit],
+                )
+                .map_err(err)?;
+            cursor.object_changes_done = !full(rows.len());
+            for row in rows {
+                let id: String = row.get(0);
+                // The payload SQLite archives for an object change.
+                records.push(ArchiveRecord {
+                    dataset: "audit.object_changes".into(),
+                    source_key: id.clone(),
+                    payload: serde_json::json!({
+                        "id": id, "object_id": row.get::<_, String>(1),
+                        "field": row.get::<_, String>(2),
+                        "old_value": row.get::<_, String>(3),
+                        "new_value": row.get::<_, String>(4),
+                        "changed_by": row.get::<_, String>(5),
+                        "timestamp": row.get::<_, i64>(6),
+                    })
+                    .to_string(),
+                });
+                change_ids.push(id);
+            }
+        } else {
+            cursor.object_changes_done = true;
+        }
+
         // Content events carry no namespace or class: only the dataset-wide
         // policy applies.
         let mut event_ids = Vec::new();
@@ -594,7 +636,7 @@ impl PostgresDb {
         }
 
         let mut run = ArchiveRun {
-            audit_archived,
+            audit_archived: audit_archived + change_ids.len() as i32,
             llm_calls_archived: llm_ids.len() as i32,
             task_observations_archived: observations_archived as i32,
             task_observations_redacted: redacted.len() as i32,
@@ -653,6 +695,10 @@ impl PostgresDb {
         }
         for id in &llm_ids {
             tx.execute("DELETE FROM sekai_dataset_rows WHERE id=$1", &[id])
+                .map_err(err)?;
+        }
+        for id in &change_ids {
+            tx.execute("DELETE FROM sekai_object_changes WHERE id=$1", &[id])
                 .map_err(err)?;
         }
         // A dry run does the once-per-run version work here and rolls it
@@ -867,11 +913,16 @@ struct RetentionCursor {
     retained_components: std::collections::BTreeSet<String>,
     observations_done: bool,
     content_events_done: bool,
+    object_changes_done: bool,
 }
 
 impl RetentionCursor {
     fn done(&self) -> bool {
-        self.audit_done && self.llm_done && self.observations_done && self.content_events_done
+        self.audit_done
+            && self.llm_done
+            && self.observations_done
+            && self.content_events_done
+            && self.object_changes_done
     }
 }
 
@@ -1794,6 +1845,25 @@ fn postgres_hot_rule_deletes(
         }
         _ => false,
     }
+}
+
+/// The objects that are the erasure subject, by the rule the hot erasure
+/// applies to `sekai_objects`: the subject's id, or its name or external id
+/// on an object of the subject's kind.
+fn represented_object_ids(
+    client: &mut impl GenericClient,
+    request: &SubjectErasureRequest,
+) -> Result<Vec<String>, String> {
+    Ok(client
+        .query(
+            "SELECT id FROM sekai_objects
+             WHERE id=$1 OR (kind=$2 AND (external_id=$1 OR name=$1)) ORDER BY id",
+            &[&request.subject, &request.subject_kind],
+        )
+        .map_err(err)?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
 }
 
 /// Whether a content reference, by its `[actor, operation_id,
