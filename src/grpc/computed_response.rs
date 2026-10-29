@@ -92,6 +92,19 @@ impl SekaiServiceImpl {
                 Status::internal(error)
             }
         })?;
+        self.project_for_response(object, &schema, principals, tenant_context)
+    }
+
+    /// The properties of `object` a reader sees, without computing any: its
+    /// property grants, then restricted properties redacted for the request's
+    /// actor and for `principals`.
+    pub(super) fn project_for_response(
+        &self,
+        object: domain::Object,
+        schema: &crate::sekai::schema::SchemaRegistry,
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+    ) -> Result<domain::Object, Status> {
         let mut object = self
             .db
             .runtime()
@@ -106,14 +119,14 @@ impl SekaiServiceImpl {
         if let Some(actor) = tenant_context.and_then(|context| context.act.as_ref()) {
             object = redact_restricted_properties(
                 object,
-                &schema,
+                schema,
                 &self.security,
                 std::slice::from_ref(actor),
             );
         }
         Ok(redact_restricted_properties(
             object,
-            &schema,
+            schema,
             &self.security,
             principals,
         ))

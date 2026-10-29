@@ -914,7 +914,10 @@ message TransformStep {
 }
 message TransformInput {
   string alias = 1;
+  // Empty for an object-set input.
   string dataset_id = 2;
+  // An object-set descriptor as JSON, read as the run's principal (ADR 0140).
+  string object_set = 3;
 }
 message GovernedTransform {
   string contract_version = 1;

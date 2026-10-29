@@ -154,6 +154,12 @@ pub(super) async fn create_dataset(
         .dataset
         .ok_or(Status::invalid_argument("dataset required"))?;
     let parsed = from_proto_dataset(&dataset);
+    if crate::sekai::object_set_input::is_pin_key(&parsed.id) {
+        return Err(Status::invalid_argument(format!(
+            "dataset ids may not start with {}",
+            crate::sekai::object_set_input::PIN_PREFIX
+        )));
+    }
     check_dataset_access(
         service.db.runtime(),
         &service.security,
@@ -2062,10 +2068,23 @@ pub(super) async fn put_governed_transform(
         .and_then(|context| context.tenant.as_ref())
         .map(|tenant| tenant.tenant_id.as_str())
         .unwrap_or("");
+    // Object-set inputs are read as the caller, now to refuse a set they may
+    // not read, and on every run as the principal recorded here (ADR 0140).
+    let object_set_reader = if transform.object_set_inputs().is_empty() {
+        None
+    } else {
+        service.evaluate_object_set_inputs(&transform, &principals, tenant_context.as_ref())?;
+        Some(principals.first().cloned().unwrap_or_default())
+    };
     service
         .db
         .runtime()
-        .put_governed_transform_owned(&transform, now_millis(), owner_tenant)
+        .put_governed_transform_read_as(
+            &transform,
+            now_millis(),
+            owner_tenant,
+            object_set_reader.as_deref(),
+        )
         .map_err(Status::internal)?;
     Ok(Response::new(PutGovernedTransformResponse {
         transform: Some(to_proto_transform(&transform)),
@@ -2169,6 +2188,11 @@ pub(super) async fn run_adhoc_governed_transform(
     // Read limits per input; the run refuses a row with any other key.
     let column_allowlists =
         authorize_preview_inputs(service, &principals, tenant_context.as_ref(), &transform)?;
+    // Object sets read as the caller on every request, a replay included:
+    // the run pins row digests, not members, so a replay returns only while
+    // the caller still reads exactly the rows it pinned (ADR 0140).
+    let object_sets =
+        service.evaluate_object_set_inputs(&transform, &principals, tenant_context.as_ref())?;
     // A committed identity replays without spending execution quota.
     if let Some(outcome) =
         crate::sekai::adhoc_transform::committed(service.db.runtime(), &request, &transform)
@@ -2180,6 +2204,7 @@ pub(super) async fn run_adhoc_governed_transform(
                 }
             })?
     {
+        refuse_changed_object_sets(&object_sets, &outcome.run)?;
         return Ok(Response::new(adhoc_response(
             service,
             &principals,
@@ -2216,6 +2241,7 @@ pub(super) async fn run_adhoc_governed_transform(
             column_allowlists: &column_allowlists,
             expires_at_ms: now.saturating_add(DEFAULT_SCRATCH_RETENTION_MS),
             tenant_id: owner_tenant,
+            object_sets: &object_sets,
         },
         now,
     ) {
@@ -2239,6 +2265,8 @@ pub(super) async fn run_adhoc_governed_transform(
     };
     if outcome.replayed {
         abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+        // The store's own replay, when a concurrent request committed first.
+        refuse_changed_object_sets(&object_sets, &outcome.run)?;
     } else {
         // The store holds the scratch grant; this plane's cache learns it now.
         service.security.add_grant(&scratch_grant(&request, now));
@@ -2269,6 +2297,24 @@ pub(super) async fn run_adhoc_governed_transform(
         &principals,
         outcome,
     )?))
+}
+
+/// A replayed ad-hoc run returns only while each object set the caller reads
+/// now matches the digest the run pinned (ADR 0140).
+fn refuse_changed_object_sets(
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
+    run: &crate::sekai::governed_transform::TransformRun,
+) -> Result<(), Status> {
+    if object_sets
+        .iter()
+        .all(|set| run.input_versions.get(&set.pin_key()) == Some(&set.digest()))
+    {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(
+            "the object sets this run read have changed; use a new idempotency key",
+        ))
+    }
 }
 
 fn adhoc_response(
@@ -2525,6 +2571,8 @@ pub(super) async fn preview_governed_transform(
         .map_err(preview_transform_status)?;
     let column_allowlists =
         authorize_preview_inputs(service, &principals, tenant_context.as_ref(), &transform)?;
+    let object_sets =
+        service.evaluate_object_set_inputs(&transform, &principals, tenant_context.as_ref())?;
     let owner_tenant = tenant_context
         .as_ref()
         .and_then(|context| context.tenant.as_ref())
@@ -2542,6 +2590,7 @@ pub(super) async fn preview_governed_transform(
             now_millis(),
             owner_tenant,
             &column_allowlists,
+            &object_sets,
         )
         .map_err(preview_transform_status)?;
     Ok(Response::new(preview_response(result)))
@@ -2614,14 +2663,61 @@ pub(super) async fn run_governed_transform(
         .and_then(|context| context.tenant.as_ref())
         .map(|tenant| tenant.tenant_id.as_str())
         .unwrap_or("");
-    let run = match service.db.runtime().run_governed_transform_owned(
-        &input.namespace,
-        &input.transform_id,
-        input.incremental,
-        now_millis(),
-        owner_tenant,
-        &transform.definition_digest,
-    ) {
+    // Object-set inputs are read as the principal that put the definition
+    // (ADR 0140); without one recorded the run is refused.
+    let object_sets = if transform.object_set_inputs().is_empty() {
+        None
+    } else {
+        // The putter's authenticated context is not kept, and an enterprise
+        // read needs one; such runs are refused until it can be (ADR 0140).
+        if service.db.runtime().enterprise_extension().is_some() {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            return Err(Status::failed_precondition(
+                "stored runs with object-set inputs need an authenticated reader context; use an ad-hoc run",
+            ));
+        }
+        // The reader recorded with this exact definition, or none.
+        let reader = service
+            .db
+            .runtime()
+            .transform_reader(&input.namespace, &input.transform_id)
+            .map_err(Status::internal)?
+            .filter(|(_, digest)| *digest == transform.definition_digest)
+            .map(|(principal, _)| principal);
+        let Some(reader) = reader else {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            return Err(Status::permission_denied("access denied"));
+        };
+        match service.evaluate_object_set_inputs(&transform, &[reader], None) {
+            Ok(sets) => Some(sets),
+            Err(status) => {
+                abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+                return Err(status);
+            }
+        }
+    };
+    let ran = match &object_sets {
+        Some(sets) => service
+            .db
+            .runtime()
+            .run_governed_transform_with_object_sets(
+                &input.namespace,
+                &input.transform_id,
+                sets,
+                now_millis(),
+                owner_tenant,
+                &transform.definition_digest,
+            ),
+        None => service.db.runtime().run_governed_transform_owned(
+            &input.namespace,
+            &input.transform_id,
+            input.incremental,
+            now_millis(),
+            owner_tenant,
+            &transform.definition_digest,
+        ),
+    };
+    let run = match ran {
         Ok(run) => run,
         Err(error) => {
             abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
@@ -4138,6 +4234,7 @@ fn to_proto_transform(
             .map(|input| TransformInput {
                 alias: input.alias.clone(),
                 dataset_id: input.dataset_id.clone(),
+                object_set: input.object_set.clone(),
             })
             .collect(),
         sql: transform
@@ -4217,6 +4314,7 @@ fn from_proto_analytical(
             .map(|input| crate::sekai::governed_transform::TransformInput {
                 alias: input.alias.clone(),
                 dataset_id: input.dataset_id.clone(),
+                object_set: input.object_set.clone(),
             })
             .collect(),
         sql: proto.sql.clone(),
@@ -4264,6 +4362,7 @@ fn from_proto_isolated(
                 .map(|input| crate::sekai::governed_transform::TransformInput {
                     alias: input.alias.clone(),
                     dataset_id: input.dataset_id.clone(),
+                    object_set: input.object_set.clone(),
                 })
                 .collect(),
             requires: super::transform_placement_rpc::labels_from_proto(
@@ -4286,6 +4385,12 @@ pub(super) fn caller_can_read_run_datasets(
         if run.trigger_cause == crate::sekai::adhoc_transform::TRANSFORM_TRIGGER_ADHOC {
             run.input_versions
                 .keys()
+                // A pin key names an object set unless a dataset, made
+                // before the prefix was reserved, holds that id.
+                .filter(|key| {
+                    !crate::sekai::object_set_input::is_pin_key(key)
+                        || !matches!(service.db.runtime().get_dataset(key), Ok(None))
+                })
                 .cloned()
                 .chain([run.transform_id.clone()])
                 .collect()

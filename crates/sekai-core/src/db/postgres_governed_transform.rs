@@ -51,6 +51,17 @@ impl PostgresDb {
         created_at_ms: i64,
         tenant_id: &str,
     ) -> Result<(), String> {
+        self.put_governed_transform_read_as(transform, created_at_ms, tenant_id, None)
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::put_governed_transform_read_as`].
+    pub fn put_governed_transform_read_as(
+        &self,
+        transform: &GovernedTransform,
+        created_at_ms: i64,
+        tenant_id: &str,
+        reader: Option<&str>,
+    ) -> Result<(), String> {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
@@ -91,6 +102,13 @@ impl PostgresDb {
             &transform.namespace,
             &transform.transform_id,
             tenant_id,
+        )?;
+        write_transform_reader_pg(
+            &mut tx,
+            &transform.namespace,
+            &transform.transform_id,
+            reader,
+            &transform.definition_digest,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
@@ -233,6 +251,7 @@ impl PostgresDb {
             column_allowlists,
             expires_at_ms,
             tenant_id,
+            object_sets,
         } = *submission;
         use crate::sekai::adhoc_transform::{
             ADHOC_IDENTITY_CONFLICT, AdHocRun, TRANSFORM_TRIGGER_ADHOC, scratch_columns,
@@ -358,6 +377,7 @@ impl PostgresDb {
                     stored: false,
                     output_budget: Some(budget),
                     column_allowlists: Some(column_allowlists),
+                    object_sets,
                 },
             )?;
             let output = live_output_rows_pg(&mut tx, &transform.output_dataset_id)?;
@@ -404,6 +424,83 @@ impl PostgresDb {
         tenant_id: &str,
         expected_definition_digest: &str,
     ) -> Result<TransformRun, String> {
+        self.run_stored_transform(
+            namespace,
+            transform_id,
+            incremental,
+            now_ms,
+            tenant_id,
+            expected_definition_digest,
+            &[],
+        )
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::set_transform_reader`].
+    pub fn set_transform_reader(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        principal: &str,
+        definition_digest: &str,
+    ) -> Result<(), String> {
+        write_transform_reader_pg(
+            &mut *self.connection()?,
+            namespace,
+            transform_id,
+            Some(principal),
+            definition_digest,
+        )
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::transform_reader`].
+    pub fn transform_reader(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT principal, definition_digest FROM sekai_transform_reader
+                 WHERE namespace = $1 AND transform_id = $2",
+                &[&namespace, &transform_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| (row.get(0), row.get(1))))
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::run_governed_transform_with_object_sets`].
+    pub fn run_governed_transform_with_object_sets(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
+        now_ms: i64,
+        tenant_id: &str,
+        expected_definition_digest: &str,
+    ) -> Result<TransformRun, String> {
+        self.run_stored_transform(
+            namespace,
+            transform_id,
+            false,
+            now_ms,
+            tenant_id,
+            expected_definition_digest,
+            object_sets,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_stored_transform(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        incremental: bool,
+        now_ms: i64,
+        tenant_id: &str,
+        expected_definition_digest: &str,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
+    ) -> Result<TransformRun, String> {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
@@ -446,6 +543,7 @@ impl PostgresDb {
                 stored: true,
                 output_budget: None,
                 column_allowlists: None,
+                object_sets,
             },
         )?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -1512,7 +1610,9 @@ impl PostgresDb {
         now_ms: i64,
         tenant_id: &str,
         column_allowlists: &HashMap<String, Vec<String>>,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
     ) -> Result<PreviewGovernedTransformResult, String> {
+        crate::sekai::object_set_input::require_evaluated(transform, object_sets)?;
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
@@ -1534,6 +1634,7 @@ impl PostgresDb {
             now_ms,
             tenant_id,
             column_allowlists,
+            object_sets,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(result)
@@ -1659,7 +1760,9 @@ pub(crate) fn run_in_process_tx_pg(
         stored,
         output_budget,
         column_allowlists,
+        object_sets,
     } = *options;
+    crate::sekai::object_set_input::require_evaluated(transform, object_sets)?;
     let namespace = transform.namespace.as_str();
     let transform_id = transform.transform_id.as_str();
     let bindings = transform.input_bindings();
@@ -1711,6 +1814,30 @@ pub(crate) fn run_in_process_tx_pg(
             .is_some_and(|budget| budget.exceeded.is_some())
         {
             break;
+        }
+    }
+    // Object-set inputs follow the datasets, read under the same budget;
+    // none join once the budget is spent (ADR 0140).
+    if load_budget
+        .as_ref()
+        .is_none_or(|budget| budget.exceeded.is_none())
+    {
+        for set in object_sets {
+            if let Some(budget) = load_budget.as_mut()
+                && !set.rows.iter().all(|row| budget.charge(row))
+            {
+                break;
+            }
+            loaded.push((
+                set.alias.clone(),
+                set.columns.clone(),
+                set.rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| (index as i64 + 1, row.clone()))
+                    .collect(),
+            ));
+            input_object_tokens.extend(set.marking_tokens.iter().cloned());
         }
     }
     if let Some(budget) = load_budget.as_mut() {
@@ -1783,6 +1910,9 @@ pub(crate) fn run_in_process_tx_pg(
             let keys = load_dataset_partition_keys_pg(tx, &transform.output_dataset_id)?;
             run.output_digest = dataset_digest(&keys, &live);
         }
+        for set in object_sets {
+            run.input_versions.insert(set.pin_key(), set.digest());
+        }
         insert_transform_run(tx, &run)?;
         record_in_process_finish_pg(tx, &run.run_id, started)?;
         if stored {
@@ -1806,6 +1936,9 @@ pub(crate) fn run_in_process_tx_pg(
         &mut run,
     )?;
     stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
+    for set in object_sets {
+        run.input_versions.insert(set.pin_key(), set.digest());
+    }
     insert_transform_run(tx, &run)?;
     record_in_process_finish_pg(tx, &run.run_id, started)?;
     record_run_output_version_pg(tx, &run.run_id, &transform.output_dataset_id)?;
@@ -2741,6 +2874,7 @@ fn preview_governed_transform_pg(
     now_ms: i64,
     tenant_id: &str,
     column_allowlists: &HashMap<String, Vec<String>>,
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
 ) -> Result<PreviewGovernedTransformResult, String> {
     let bindings = transform.input_bindings();
     let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
@@ -2762,6 +2896,27 @@ fn preview_governed_transform_pg(
         loaded.push((alias.clone(), columns, records));
         if load_budget.exceeded.is_some() {
             break;
+        }
+    }
+    // Object-set inputs, sampled like datasets (ADR 0140).
+    if load_budget.exceeded.is_none() {
+        for set in object_sets {
+            let records: Vec<DatasetRowRecord> = set
+                .rows
+                .iter()
+                .take(row_cap)
+                .enumerate()
+                .map(|(index, row)| (index as i64 + 1, row.clone()))
+                .collect();
+            if !records.iter().all(|(_, row)| load_budget.charge(row)) {
+                break;
+            }
+            inputs.push(PreviewInputStat {
+                alias: set.alias.clone(),
+                dataset_id: set.pin_key(),
+                rows_read: i32::try_from(records.len()).unwrap_or(i32::MAX),
+            });
+            loaded.push((set.alias.clone(), set.columns.clone(), records));
         }
     }
     load_budget.expire_if_past();
@@ -3196,6 +3351,31 @@ fn upsert_transform_work_pg(
             &work.tenant_id,
         ],
     )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Records `reader` for a definition, or clears it when `None`.
+fn write_transform_reader_pg(
+    client: &mut impl postgres::GenericClient,
+    namespace: &str,
+    transform_id: &str,
+    reader: Option<&str>,
+    definition_digest: &str,
+) -> Result<(), String> {
+    match reader {
+        Some(principal) => client.execute(
+            "INSERT INTO sekai_transform_reader (namespace, transform_id, principal, definition_digest)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (namespace, transform_id) DO UPDATE SET
+                principal = EXCLUDED.principal, definition_digest = EXCLUDED.definition_digest",
+            &[&namespace, &transform_id, &principal, &definition_digest],
+        ),
+        None => client.execute(
+            "DELETE FROM sekai_transform_reader WHERE namespace = $1 AND transform_id = $2",
+            &[&namespace, &transform_id],
+        ),
+    }
     .map(|_| ())
     .map_err(|error| error.to_string())
 }
@@ -4623,6 +4803,8 @@ fn run_in_process_pg(
     incremental: bool,
     now_ms: i64,
 ) -> Result<TransformRun, String> {
+    // Branch and caused runs cannot read object sets yet (ADR 0140).
+    crate::sekai::object_set_input::require_evaluated(transform, &[])?;
     let bindings = transform.input_bindings();
     let mut lock_ids: Vec<&str> = bindings.iter().map(|(_, id)| id.as_str()).collect();
     lock_ids.push(transform.output_dataset_id.as_str());
@@ -5419,10 +5601,12 @@ mod tests {
                     TransformInput {
                         alias: "customers".into(),
                         dataset_id: "customers".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "orders".into(),
                         dataset_id: "orders".into(),
+                        ..Default::default()
                     },
                 ],
                 sql: "SELECT c.region AS region, COUNT(*) AS orders, SUM(o.amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region".into(),
@@ -5477,6 +5661,7 @@ mod tests {
                 inputs: vec![TransformInput {
                     alias: "input".into(),
                     dataset_id: "in".into(),
+                    ..Default::default()
                 }],
                 sql: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT n FROM t"
                     .into(),
@@ -6339,10 +6524,12 @@ mod tests {
                     TransformInput {
                         alias: "left".into(),
                         dataset_id: "left".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "right".into(),
                         dataset_id: "right".into(),
+                        ..Default::default()
                     },
                 ],
                 requires: Default::default(),
@@ -6407,6 +6594,46 @@ mod tests {
         }
         .prepare()
         .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_a_run_without_its_evaluated_object_sets_is_refused() {
+        use crate::sekai::governed_transform::{AnalyticalSpec, TransformInput};
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        let transform = GovernedTransform {
+            steps: Vec::new(),
+            analytical: Some(AnalyticalSpec {
+                inputs: vec![
+                    TransformInput {
+                        alias: "orders".into(),
+                        dataset_id: "in".into(),
+                        ..Default::default()
+                    },
+                    TransformInput {
+                        alias: "customers".into(),
+                        object_set: r#"{"namespace":"sales","kind":"Customer"}"#.into(),
+                        ..Default::default()
+                    },
+                ],
+                sql: "SELECT * FROM orders".into(),
+                ..Default::default()
+            }),
+            ..projection("t-os", "in", "out")
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let refused = db
+            .run_governed_transform("ops", "t-os", false, 20)
+            .unwrap_err();
+        assert!(
+            refused.starts_with(crate::sekai::object_set_input::OBJECT_SETS_UNEVALUATED),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -7356,7 +7583,7 @@ mod tests {
         .prepare()
         .unwrap();
         let preview = db
-            .preview_governed_transform(&transform, 256, 20, "", &HashMap::new())
+            .preview_governed_transform(&transform, 256, 20, "", &HashMap::new(), &[])
             .unwrap();
         assert!(
             preview
@@ -7421,7 +7648,7 @@ mod tests {
         .prepare()
         .unwrap();
         let preview = db
-            .preview_governed_transform(&transform, 256, 20, "", &HashMap::new())
+            .preview_governed_transform(&transform, 256, 20, "", &HashMap::new(), &[])
             .unwrap();
         let claimed = db
             .claim_transform_work("ops", "runner-a", &preview.preview_id, 60_000, 30)

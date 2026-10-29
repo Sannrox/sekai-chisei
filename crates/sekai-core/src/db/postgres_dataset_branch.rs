@@ -619,6 +619,8 @@ fn branch_run_pg(
     tenant: &str,
     now_ms: i64,
 ) -> Result<(DatasetBranchRun, Rows), String> {
+    // Branch and caused runs cannot read object sets yet (ADR 0140).
+    crate::sekai::object_set_input::require_evaluated(transform, &[])?;
     use crate::db::postgres_audit::lock_object_lifecycle;
     use crate::db::postgres_governed_transform::{
         load_dataset_column_names, load_dataset_object_id, load_object_marking_token,

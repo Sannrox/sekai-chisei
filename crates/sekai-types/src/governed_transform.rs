@@ -126,10 +126,26 @@ pub struct TransformStep {
     pub columns: Vec<String>,
 }
 
+/// Prefix of an object-set input's key in a run's `input_versions`; dataset
+/// ids beside object-set inputs, and new datasets, may not use it.
+pub const OBJECT_SET_PIN_PREFIX: &str = "object-set:";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TransformInput {
     pub alias: String,
+    /// Empty for an object-set input.
+    #[serde(default)]
     pub dataset_id: String,
+    /// The object-set descriptor an input reads, as canonical JSON (ADR
+    /// 0140). Left out when empty, so dataset inputs keep their digest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub object_set: String,
+}
+
+impl TransformInput {
+    pub fn is_object_set(&self) -> bool {
+        !self.object_set.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -404,10 +420,25 @@ impl GovernedTransform {
             ));
         }
         if let Some(spec) = self.isolated_process.as_mut() {
+            // Isolated object-set inputs arrive with the claim path (#1978).
+            if spec.inputs.iter().any(TransformInput::is_object_set) {
+                return Err(TransformError::InvalidArgument(
+                    "object-set inputs are not yet available to isolated-process transforms".into(),
+                ));
+            }
             prepare_isolated(&mut self.input_dataset_id, spec, &self.steps)?;
             validate_placement_labels("requires", &spec.requires)?;
         } else if let Some(spec) = self.analytical.as_mut() {
             prepare_analytical(&mut self.input_dataset_id, spec, &self.steps)?;
+            // A schedule or trigger runs with no caller to read the set as.
+            if spec.inputs.iter().any(TransformInput::is_object_set)
+                && (self.schedule.is_some() || self.trigger.is_some())
+            {
+                return Err(TransformError::InvalidArgument(
+                    "object-set inputs need a run principal; schedules and triggers cannot read them"
+                        .into(),
+                ));
+            }
         } else {
             require_token("input_dataset_id", &self.input_dataset_id)?;
             if self.steps.is_empty() {
@@ -487,6 +518,23 @@ impl GovernedTransform {
     }
 
     /// Alias + dataset_id pairs the run path must load.
+    /// The dataset inputs as `(alias, dataset_id)`; object-set inputs are
+    /// [`Self::object_set_inputs`].
+    /// The object-set inputs as `(alias, descriptor JSON)` (ADR 0140).
+    pub fn object_set_inputs(&self) -> Vec<(String, String)> {
+        self.analytical
+            .iter()
+            .flat_map(|spec| spec.inputs.iter())
+            .chain(
+                self.isolated_process
+                    .iter()
+                    .flat_map(|spec| spec.inputs.iter()),
+            )
+            .filter(|input| input.is_object_set())
+            .map(|input| (input.alias.clone(), input.object_set.clone()))
+            .collect()
+    }
+
     pub fn input_bindings(&self) -> Vec<(String, String)> {
         if let Some(spec) = &self.isolated_process
             && !spec.inputs.is_empty()
@@ -494,6 +542,7 @@ impl GovernedTransform {
             return spec
                 .inputs
                 .iter()
+                .filter(|input| !input.is_object_set())
                 .map(|input| (input.alias.clone(), input.dataset_id.clone()))
                 .collect();
         }
@@ -503,6 +552,7 @@ impl GovernedTransform {
             return spec
                 .inputs
                 .iter()
+                .filter(|input| !input.is_object_set())
                 .map(|input| (input.alias.clone(), input.dataset_id.clone()))
                 .collect();
         }
@@ -673,6 +723,20 @@ fn graph_cycle_from(node: usize, adj: &[Vec<usize>], state: &mut [u8]) -> bool {
     false
 }
 
+/// An object-set descriptor as canonical JSON: keys in order, so equal
+/// descriptors digest alike.
+fn canonical_object_set(json: &str) -> Result<String, TransformError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| TransformError::InvalidArgument("object_set is not a descriptor".into()))?;
+    if !value.is_object() {
+        return Err(TransformError::InvalidArgument(
+            "object_set is not a descriptor".into(),
+        ));
+    }
+    serde_json::to_string(&value)
+        .map_err(|_| TransformError::InvalidArgument("object_set is not a descriptor".into()))
+}
+
 fn prepare_analytical(
     input_dataset_id: &mut String,
     spec: &mut AnalyticalSpec,
@@ -684,21 +748,47 @@ fn prepare_analytical(
         spec.inputs.push(TransformInput {
             alias: "input".into(),
             dataset_id: input_dataset_id.clone(),
+            ..Default::default()
         });
     } else {
         let mut seen = std::collections::BTreeSet::new();
+        let reads_object_sets = spec.inputs.iter().any(TransformInput::is_object_set);
         for input in spec.inputs.iter_mut() {
             input.alias = input.alias.trim().to_string();
             input.dataset_id = input.dataset_id.trim().to_string();
             require_token("input alias", &input.alias)?;
-            require_token("input dataset_id", &input.dataset_id)?;
+            if input.is_object_set() {
+                if !input.dataset_id.is_empty() {
+                    return Err(TransformError::InvalidArgument(
+                        "an input reads a dataset or an object set, not both".into(),
+                    ));
+                }
+                input.object_set = canonical_object_set(&input.object_set)?;
+            } else {
+                require_token("input dataset_id", &input.dataset_id)?;
+                // A run pins object sets under this prefix, beside its datasets.
+                if reads_object_sets && input.dataset_id.starts_with(OBJECT_SET_PIN_PREFIX) {
+                    return Err(TransformError::InvalidArgument(format!(
+                        "input dataset ids beside object sets may not start with {OBJECT_SET_PIN_PREFIX}"
+                    )));
+                }
+            }
             if !seen.insert(input.alias.to_ascii_lowercase()) {
                 return Err(TransformError::InvalidArgument(
                     "transform input aliases must be unique".into(),
                 ));
             }
         }
-        let first = spec.inputs[0].dataset_id.clone();
+        let first = spec
+            .inputs
+            .iter()
+            .find(|input| !input.is_object_set())
+            .map(|input| input.dataset_id.clone())
+            .ok_or_else(|| {
+                TransformError::InvalidArgument(
+                    "an analytical transform reads at least one dataset".into(),
+                )
+            })?;
         let trimmed_input = input_dataset_id.trim().to_string();
         if trimmed_input.is_empty() {
             *input_dataset_id = first;
@@ -753,6 +843,7 @@ fn prepare_isolated(
         spec.inputs.push(TransformInput {
             alias: "input".into(),
             dataset_id: input_dataset_id.clone(),
+            ..Default::default()
         });
     } else {
         let mut seen = std::collections::BTreeSet::new();
