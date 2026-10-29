@@ -378,6 +378,7 @@ impl SekaiDb {
         self.migrate_action_plans()?;
         self.migrate_export_grants()?;
         self.migrate_federated_allowances()?;
+        self.migrate_federated_receipts()?;
         self.migrate_agent_turns()?;
         self.migrate_agent_wake_cursors()?;
         self.migrate_ontology_health_trends()?;
