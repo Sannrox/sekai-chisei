@@ -221,6 +221,8 @@ const TRANSFORM_READERS_SCHEMA: &str = include_str!("postgres/0132_transform_rea
 const FEDERATED_RECEIPTS_SCHEMA: &str = include_str!("postgres/0133_federated_receipts.sql");
 const TRANSFORM_OBJECT_SET_PINS_SCHEMA: &str =
     include_str!("postgres/0134_transform_object_set_pins.sql");
+const TASK_OBSERVATION_RETENTION_SCHEMA: &str =
+    include_str!("postgres/0135_task_observation_retention.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1050,6 +1052,12 @@ const MIGRATIONS: &[Migration] = &[
         133,
         "transform_object_set_pins",
         TRANSFORM_OBJECT_SET_PINS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        134,
+        "task_observation_retention",
+        TASK_OBSERVATION_RETENTION_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

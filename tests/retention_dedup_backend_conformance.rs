@@ -2,8 +2,10 @@ use sekai_chisei::db::deduplication::DeduplicationBackend;
 use sekai_chisei::db::graph::GraphBackend;
 use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::retention::RetentionPolicyBackend;
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::Object;
+use sekai_chisei::sekai::dataset::Dataset;
 use sekai_chisei::sekai::deduplication::{
     ContentObligations, ContentReferenceRequest, ContentScope, ReconciliationAction,
     ReconciliationCandidate, ReconciliationDisposition, ReconciliationRequest,
@@ -727,4 +729,373 @@ fn postgres_archived_events_follow_the_hot_reference_rule() {
         events_of(payloads, reference_id)
     };
     exercise_archived_event_erasure(&db, &db, &prefix, &archived);
+}
+
+/// Raw SQL against one backend, for fixtures and checks the API does not
+/// cover (task observations have no PostgreSQL writer yet). Statements are
+/// portable and carry no parameters; every value is a fixture literal.
+struct Sql<'a> {
+    exec: &'a dyn Fn(&str),
+    /// The first column of every row, as text.
+    strings: &'a dyn Fn(&str) -> Vec<String>,
+}
+
+impl Sql<'_> {
+    fn count(&self, sql: &str) -> i64 {
+        (self.strings)(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM ({sql}) AS counted"
+        ))[0]
+            .parse()
+            .unwrap()
+    }
+}
+
+fn sqlite_sql(db: &SekaiDb) -> (impl Fn(&str) + '_, impl Fn(&str) -> Vec<String> + '_) {
+    (
+        move |sql: &str| db.conn().execute_batch(sql).unwrap(),
+        move |sql: &str| {
+            db.conn()
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        },
+    )
+}
+
+fn postgres_sql(db: &PostgresDb) -> (impl Fn(&str) + '_, impl Fn(&str) -> Vec<String> + '_) {
+    (
+        move |sql: &str| db.connection().unwrap().batch_execute(sql).unwrap(),
+        move |sql: &str| {
+            db.connection()
+                .unwrap()
+                .query(sql, &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect()
+        },
+    )
+}
+
+fn llm_calls_dataset(db: &RuntimeDb) {
+    // Shared by every test on one PostgreSQL database: it may exist already.
+    let _ = db.create_dataset(&Dataset {
+        id: "llm_calls".into(),
+        name: "calls".into(),
+        columns: Vec::new(),
+        object_id: String::new(),
+        created: 0,
+        partition_keys: Vec::new(),
+    });
+}
+
+fn policy(dataset: &str, namespace: &str, retention_days: i32) -> RetentionPolicy {
+    RetentionPolicy {
+        dataset: dataset.into(),
+        namespace: namespace.into(),
+        data_class: String::new(),
+        retention_days,
+        updated: 1,
+    }
+}
+
+/// Policy-driven retention on any backend (ADR 0141) for LLM calls and task
+/// observations, scoped to `prefix` so other tests' rows are untouched: an
+/// expired call is archived and deleted, a fresh one stays; a component's
+/// expired observations fold into its baseline, and one after a retained row
+/// is redacted in place; a dry run writes nothing; a rerun archives nothing
+/// twice; the archive verifies.
+fn exercise_policy_retention(db: &RuntimeDb, sql: &Sql<'_>, prefix: &str) {
+    let now = 3 * DAY_MS;
+    llm_calls_dataset(db);
+    let call = |name: &str, timestamp_ms: i64| {
+        HashMap::from([
+            ("project".to_string(), prefix.to_string()),
+            ("call".to_string(), format!("{prefix}:{name}")),
+            ("timestamp_ms".to_string(), timestamp_ms.to_string()),
+        ])
+    };
+    db.append_rows(
+        "llm_calls",
+        &[
+            call("old-1", 1_000),
+            call("old-2", 2_000),
+            call("fresh", now - 1_000),
+        ],
+    )
+    .unwrap();
+    let keep = format!("{prefix}:keep");
+    let observation = |request: &str, namespace: &str, component: &str, at: i64, status: &str| {
+        format!(
+            "INSERT INTO sekai_task_observations
+             (request_id,namespace,component_id,model,status,timestamp,packages_json,context_json)
+             VALUES ('{prefix}:{request}','{namespace}','{prefix}:{component}','m','{status}',{at},
+                     '[]','{{}}');"
+        )
+    };
+    (sql.exec)(
+        &[
+            observation("r1", prefix, "folded", 1, "done"),
+            observation("r2", prefix, "folded", 2, "failed"),
+            observation("r3", &keep, "mixed", 1, "done"),
+            observation("r4", prefix, "mixed", 2, "done"),
+        ]
+        .concat(),
+    );
+    for policy in [
+        policy("llm_calls", prefix, 1),
+        policy("task_observations", prefix, 1),
+        policy("task_observations", &keep, 1_000),
+    ] {
+        db.set_retention_policy(&policy).unwrap();
+    }
+    let calls = format!(
+        "SELECT data FROM sekai_dataset_rows WHERE dataset_id='llm_calls' AND data LIKE '%{prefix}:%'"
+    );
+    let observations = format!(
+        "SELECT request_id FROM sekai_task_observations WHERE component_id LIKE '{prefix}:%'"
+    );
+    let archived = |dataset: &str| {
+        sql.count(&format!(
+            "SELECT 1 FROM sekai_archive_records WHERE dataset='{dataset}' AND payload LIKE '%{prefix}:%'"
+        ))
+    };
+
+    let dry = db.archive_retained_records(now, true).unwrap();
+    assert!(dry.dry_run);
+    assert!(
+        dry.llm_calls_archived >= 2 && dry.task_observations_archived >= 3,
+        "{dry:?}"
+    );
+    assert_eq!((sql.count(&calls), sql.count(&observations)), (3, 4));
+    assert_eq!(archived("llm_calls") + archived("task_observations"), 0);
+
+    let run = db.archive_retained_records(now, false).unwrap();
+    assert!(
+        run.llm_calls_archived >= 2 && run.task_observations_redacted >= 1,
+        "{run:?}"
+    );
+    let hot_calls = (sql.strings)(&calls);
+    assert_eq!(hot_calls.len(), 1);
+    assert!(hot_calls[0].contains(&format!("{prefix}:fresh")));
+    assert_eq!(
+        (archived("llm_calls"), archived("task_observations")),
+        (2, 3)
+    );
+    // The folded component keeps only its baseline: two tasks, one done,
+    // one trailing failure.
+    assert_eq!(
+        (sql.strings)(&format!(
+            "SELECT CAST(task_total AS TEXT)||'/'||CAST(task_succeeded AS TEXT)||'/'||
+                    CAST(consecutive_failures AS TEXT)
+             FROM sekai_task_observation_baselines WHERE component_id='{prefix}:folded'"
+        )),
+        ["2/1/1"]
+    );
+    // The mixed component keeps its retained row and a marked tombstone.
+    let mut hot = (sql.strings)(&format!(
+        "SELECT CASE WHEN retention_tombstone THEN 'tombstone:'||request_id ELSE request_id END
+         FROM sekai_task_observations WHERE component_id LIKE '{prefix}:%'"
+    ));
+    hot.sort();
+    assert_eq!(hot.len(), 2, "{hot:?}");
+    assert_eq!(hot[0], format!("{prefix}:r3"));
+    assert!(
+        hot[1].starts_with("tombstone:retention-tombstone:"),
+        "{hot:?}"
+    );
+
+    // A rerun finds nothing of this prefix left to archive.
+    db.archive_retained_records(now, false).unwrap();
+    assert_eq!(
+        (archived("llm_calls"), archived("task_observations")),
+        (2, 3)
+    );
+    assert_eq!(sql.count(&observations), 2);
+    let verification = db.verify_retention_archive().unwrap();
+    assert!(verification.ok, "{}", verification.error);
+}
+
+#[test]
+fn sqlite_policy_retention_conformance() {
+    let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+    let (exec, strings) = sqlite_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    exercise_policy_retention(&RuntimeDb::Sqlite(db.clone()), &sql, "sqlite-policy");
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_policy_retention_conformance() {
+    let _serial = archiving();
+    let db = Arc::new(postgres_test_database());
+    let (exec, strings) = postgres_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    let prefix = format!("pg-policy-{}", uuid::Uuid::new_v4().simple());
+    exercise_policy_retention(&RuntimeDb::Postgres(db.clone()), &sql, &prefix);
+}
+
+/// Two replicas running retention at once over a backlog of several
+/// batches archive every expired call once and leave none in the hot table.
+fn race_policy_retention(first: RuntimeDb, second: RuntimeDb, sql: &Sql<'_>, prefix: &str) {
+    let backlog = 1_200;
+    llm_calls_dataset(&first);
+    first
+        .append_rows(
+            "llm_calls",
+            &(0..backlog)
+                .map(|index| {
+                    HashMap::from([
+                        ("project".to_string(), prefix.to_string()),
+                        ("call".to_string(), format!("{prefix}:{index}")),
+                        ("timestamp_ms".to_string(), "1".to_string()),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    first
+        .set_retention_policy(&policy("llm_calls", prefix, 1))
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = [first, second].map(|db| {
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            db.archive_retained_records(2 * DAY_MS, false).unwrap();
+            db
+        })
+    });
+    barrier.wait();
+    let [first, _] = handles.map(|handle| handle.join().unwrap());
+    assert_eq!(
+        sql.count(&format!(
+            "SELECT 1 FROM sekai_dataset_rows WHERE dataset_id='llm_calls' AND data LIKE '%\"{prefix}\"%'"
+        )),
+        0
+    );
+    assert_eq!(
+        sql.count(&format!(
+            "SELECT 1 FROM sekai_archive_records WHERE dataset='llm_calls' AND payload LIKE '%\"{prefix}\"%'"
+        )),
+        backlog
+    );
+    assert!(first.verify_retention_archive().unwrap().ok);
+}
+
+#[test]
+fn sqlite_concurrent_policy_retention_archives_once() {
+    let path = std::env::temp_dir().join(format!(
+        "sekai-policy-race-{}-{}.db",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let first = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+    let second = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+    {
+        let (exec, strings) = sqlite_sql(&first);
+        let sql = Sql {
+            exec: &exec,
+            strings: &strings,
+        };
+        race_policy_retention(
+            RuntimeDb::Sqlite(first.clone()),
+            RuntimeDb::Sqlite(second),
+            &sql,
+            "sqlite-policy-race",
+        );
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_concurrent_policy_retention_archives_once() {
+    let _serial = archiving();
+    let db = Arc::new(postgres_test_database());
+    let (exec, strings) = postgres_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    let prefix = format!("pg-policy-race-{}", uuid::Uuid::new_v4().simple());
+    race_policy_retention(
+        RuntimeDb::Postgres(db.clone()),
+        RuntimeDb::Postgres(Arc::new(postgres_test_database())),
+        &sql,
+        &prefix,
+    );
+}
+
+/// Erasure reaches what retention leaves of an observation: a component
+/// baseline that names the subject goes, as the observation itself would,
+/// and erasure then completes on every backend.
+fn exercise_baseline_erasure(db: &RuntimeDb, sql: &Sql<'_>, prefix: &str) {
+    let subject = format!("{prefix}-agent");
+    let component = format!("agent:{subject}");
+    (sql.exec)(&format!(
+        "INSERT INTO sekai_task_observations
+         (request_id,namespace,component_id,model,status,timestamp,packages_json,context_json)
+         VALUES ('{prefix}:r1','{prefix}','{component}','m','done',1,'[]','{{}}');"
+    ));
+    db.set_retention_policy(&policy("task_observations", prefix, 1))
+        .unwrap();
+    db.archive_retained_records(3 * DAY_MS, false).unwrap();
+    let baselines = format!(
+        "SELECT component_id FROM sekai_task_observation_baselines WHERE component_id='{component}'"
+    );
+    assert_eq!(sql.count(&baselines), 1, "the observation was folded");
+    db.erase_subject(&SubjectErasureRequest {
+        subject_kind: "agent".into(),
+        subject: subject.clone(),
+        requested_by: "privacy-operator".into(),
+        reason: "validated request".into(),
+        timestamp: 4 * DAY_MS,
+    })
+    .unwrap();
+    assert_eq!(sql.count(&baselines), 0);
+    assert_eq!(
+        sql.count(&format!(
+            "SELECT 1 FROM sekai_archive_records WHERE payload LIKE '%{subject}%'"
+        )),
+        0
+    );
+    let verification = db.verify_retention_archive().unwrap();
+    assert!(verification.ok, "{}", verification.error);
+}
+
+#[test]
+fn sqlite_erasure_removes_retention_baselines() {
+    let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+    let (exec, strings) = sqlite_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    exercise_baseline_erasure(&RuntimeDb::Sqlite(db.clone()), &sql, "sqlite-baseline");
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_erasure_removes_retention_baselines() {
+    let _serial = archiving();
+    let db = Arc::new(postgres_test_database());
+    let (exec, strings) = postgres_sql(&db);
+    let sql = Sql {
+        exec: &exec,
+        strings: &strings,
+    };
+    let prefix = format!("pg-baseline-{}", uuid::Uuid::new_v4().simple());
+    exercise_baseline_erasure(&RuntimeDb::Postgres(db.clone()), &sql, &prefix);
 }
