@@ -745,11 +745,16 @@ impl SekaiDb {
             }
             return Err("idempotency key conflict: same key with different request digest".into());
         }
-        let body_json = serde_json::to_string(instance).map_err(|e| e.to_string())?;
+        let mut stored = instance.clone();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        sqlite_redact_if_forgotten_writer(&tx, &mut stored)?;
+        let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
         let evidence_json =
-            serde_json::to_string(&instance.evidence_submission_ids).map_err(|e| e.to_string())?;
-        let conn = self.conn();
-        match conn.execute(
+            serde_json::to_string(&stored.evidence_submission_ids).map_err(|e| e.to_string())?;
+        match tx.execute(
             "INSERT INTO sekai_action_instances
              (instance_id, namespace, type_id, version, principal, parameters_json,
               request_digest, idempotency_key, operation_id, status, deny_reason,
@@ -757,30 +762,34 @@ impl SekaiDb {
               created_at_ms, decided_at_ms, body_json)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
-                instance.instance_id,
-                instance.namespace,
-                instance.type_id,
-                instance.version,
-                instance.principal,
-                instance.parameters_json,
-                instance.request_digest,
-                instance.idempotency_key,
-                instance.operation_id,
-                instance.status,
-                instance.deny_reason,
+                stored.instance_id,
+                stored.namespace,
+                stored.type_id,
+                stored.version,
+                stored.principal,
+                stored.parameters_json,
+                stored.request_digest,
+                stored.idempotency_key,
+                stored.operation_id,
+                stored.status,
+                stored.deny_reason,
                 evidence_json,
-                instance.policy_decision,
-                instance.budget_decision,
-                instance.created_at_ms,
-                instance.decided_at_ms,
+                stored.policy_decision,
+                stored.budget_decision,
+                stored.created_at_ms,
+                stored.decided_at_ms,
                 body_json,
             ],
         ) {
-            Ok(_) => Ok(instance.clone()),
+            Ok(_) => {
+                tx.commit().map_err(|e| e.to_string())?;
+                Ok(stored)
+            }
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
                 // Race: re-read and apply digest rules.
+                drop(tx);
                 drop(conn);
                 if let Some(existing) = self.get_action_instance_by_idempotency(
                     &instance.namespace,
@@ -816,20 +825,23 @@ impl SekaiDb {
     ) -> Result<ParkedGrantOutcome, String> {
         self.migrate_action_instances()?;
         granted.validate_fields()?;
-        let body_json = serde_json::to_string(granted).map_err(|e| e.to_string())?;
+        let mut stored = granted.clone();
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let status: Option<String> = tx
+        let row: Option<(String, String)> = tx
             .query_row(
-                "SELECT status FROM sekai_action_instances WHERE instance_id = ?1",
+                "SELECT status, parameters_json FROM sekai_action_instances WHERE instance_id = ?1",
                 params![granted.instance_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if status.as_deref() != Some(STATUS_PARKED) {
+        let Some((status, existing_params)) = row else {
+            return Ok(ParkedGrantOutcome::NotParked);
+        };
+        if status != STATUS_PARKED {
             return Ok(ParkedGrantOutcome::NotParked);
         }
         let written = write.map(|write| match write {
@@ -901,29 +913,36 @@ impl SekaiDb {
             ),
             None => None,
         };
+        sqlite_redact_if_forgotten_writer(&tx, &mut stored)?;
+        if sqlite_stored_writer_already_redacted(Some(&existing_params), &stored) {
+            crate::sekai::site_agent_memory::redact_writer_instance(&mut stored);
+        }
+        let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
         let updated = tx
             .execute(
                 "UPDATE sekai_action_instances
              SET status = ?2, deny_reason = ?3, policy_decision = ?4, budget_decision = ?5,
-                 decided_at_ms = ?6, body_json = ?7
+                 decided_at_ms = ?6, body_json = ?7, parameters_json = ?10
              WHERE instance_id = ?1 AND status = ?8
                AND coalesce(json_extract(body_json, '$.review.assignee'), '') = ?9",
                 params![
-                    granted.instance_id,
-                    granted.status,
-                    granted.deny_reason,
-                    granted.policy_decision,
-                    granted.budget_decision,
-                    granted.decided_at_ms,
+                    stored.instance_id,
+                    stored.status,
+                    stored.deny_reason,
+                    stored.policy_decision,
+                    stored.budget_decision,
+                    stored.decided_at_ms,
                     body_json,
                     STATUS_PARKED,
-                    granted.review.assignee,
+                    stored.review.assignee,
+                    stored.parameters_json,
                 ],
             )
             .map_err(|error| error.to_string())?;
         if updated != 1 {
             return Ok(ParkedGrantOutcome::NotParked);
         }
+        sqlite_redact_forgotten_memory_actions(&tx, written)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(ParkedGrantOutcome::Granted { previous })
     }
@@ -943,28 +962,47 @@ impl SekaiDb {
     ) -> Result<bool, String> {
         self.migrate_action_instances()?;
         decided.validate_fields()?;
-        let body_json = serde_json::to_string(decided).map_err(|e| e.to_string())?;
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE sekai_action_instances
+        let mut stored = decided.clone();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing_params: Option<String> = tx
+            .query_row(
+                "SELECT parameters_json FROM sekai_action_instances WHERE instance_id = ?1",
+                params![decided.instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        sqlite_redact_if_forgotten_writer(&tx, &mut stored)?;
+        if sqlite_stored_writer_already_redacted(existing_params.as_deref(), &stored) {
+            crate::sekai::site_agent_memory::redact_writer_instance(&mut stored);
+        }
+        let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE sekai_action_instances
              SET status = ?2, deny_reason = ?3, policy_decision = ?4, budget_decision = ?5,
-                 decided_at_ms = ?6, body_json = ?7
+                 decided_at_ms = ?6, body_json = ?7, parameters_json = ?10
              WHERE instance_id = ?1 AND status = ?8
                AND coalesce(json_extract(body_json, '$.review.assignee'), '') = ?9",
-            params![
-                decided.instance_id,
-                decided.status,
-                decided.deny_reason,
-                decided.policy_decision,
-                decided.budget_decision,
-                decided.decided_at_ms,
-                body_json,
-                expected_status,
-                expected_assignee,
-            ],
-        )
-        .map(|updated| updated == 1)
-        .map_err(|error| error.to_string())
+                params![
+                    stored.instance_id,
+                    stored.status,
+                    stored.deny_reason,
+                    stored.policy_decision,
+                    stored.budget_decision,
+                    stored.decided_at_ms,
+                    body_json,
+                    expected_status,
+                    expected_assignee,
+                    stored.parameters_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(updated == 1)
     }
 
     pub fn delete_action_instance(&self, instance_id: &str) -> Result<(), String> {
@@ -1064,6 +1102,12 @@ impl SekaiDb {
             params![instance_id, written],
         )
         .map_err(|error| error.to_string())?;
+        sqlite_redact_forgotten_memory_actions(
+            &tx,
+            Some(match write {
+                ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+            }),
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(FencedAdmissionWrite::Applied(previous))
     }
@@ -1162,13 +1206,12 @@ impl SekaiDb {
         next: &AdmissionLease,
     ) -> Result<bool, String> {
         self.migrate_action_instances()?;
-        let mut taken = instance.clone();
-        taken.admission_lease = Some(next.clone());
-        let body_json = serde_json::to_string(&taken).map_err(|error| error.to_string())?;
+        let lease_json = serde_json::to_string(next).map_err(|error| error.to_string())?;
         let conn = self.conn();
         let updated = conn
             .execute(
-                "UPDATE sekai_action_instances SET body_json = ?2
+                "UPDATE sekai_action_instances
+                 SET body_json = json_set(body_json, '$.admission_lease', json(?2))
                  WHERE instance_id = ?1
                    AND json_extract(body_json, '$.admission_lease.owner') = ?3
                    AND json_extract(body_json, '$.admission_lease.generation') = ?4
@@ -1178,7 +1221,7 @@ impl SekaiDb {
                    AND status = ?7",
                 params![
                     instance.instance_id,
-                    body_json,
+                    lease_json,
                     expired.owner,
                     i64::try_from(expired.generation).unwrap_or(i64::MAX),
                     lease_clock_ms(),
@@ -1354,6 +1397,177 @@ pub(crate) fn sqlite_turn_fence_refusal(
     Ok(live
         .is_none()
         .then(|| format!("agent turn {turn_id} is no longer claimed by this submission")))
+}
+
+fn sqlite_redact_if_forgotten_writer(
+    tx: &rusqlite::Transaction<'_>,
+    instance: &mut ActionInstance,
+) -> Result<(), String> {
+    if sqlite_writer_target_forgotten(tx, instance)? {
+        crate::sekai::site_agent_memory::redact_writer_instance(instance);
+    }
+    Ok(())
+}
+
+fn sqlite_writer_target_forgotten(
+    tx: &rusqlite::Transaction<'_>,
+    instance: &ActionInstance,
+) -> Result<bool, String> {
+    if !crate::sekai::site_agent_memory::is_writer_action(&instance.type_id) {
+        return Ok(false);
+    }
+    let Some(object_id) =
+        crate::sekai::site_agent_memory::writer_object_id(&instance.parameters_json)
+    else {
+        return Ok(false);
+    };
+    let forgotten: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(properties, '$.forgotten') FROM sekai_objects
+             WHERE id = ?1 AND kind = ?2 AND namespace = ?3",
+            params![
+                object_id,
+                crate::sekai::site_agent_memory::KIND,
+                instance.namespace
+            ],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    Ok(forgotten.as_deref() == Some("true"))
+}
+
+fn sqlite_stored_writer_already_redacted(
+    stored_parameters: Option<&str>,
+    incoming: &ActionInstance,
+) -> bool {
+    crate::sekai::site_agent_memory::stored_writer_already_redacted(stored_parameters, incoming)
+}
+
+/// Empty forgotten memory `content` in writer Action parameters, in this
+/// transaction (#1969). Leaves each stored request digest as it was.
+pub(crate) fn sqlite_redact_forgotten_memory_actions(
+    tx: &rusqlite::Transaction<'_>,
+    written: Option<&crate::domain::Object>,
+) -> Result<(), String> {
+    use crate::sekai::site_agent_memory::{
+        ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE, is_forgotten, redact_writer_instance,
+    };
+    let Some(object) = written.filter(|object| is_forgotten(object)) else {
+        return Ok(());
+    };
+    let mut stmt = tx
+        .prepare(
+            "SELECT instance_id, parameters_json, body_json FROM sekai_action_instances
+             WHERE namespace = ?1
+               AND type_id IN (?2, ?3, ?4)
+               AND json_extract(parameters_json, '$.object_id') = ?5",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(
+            params![
+                object.namespace,
+                ACTION_CREATE,
+                ACTION_UPDATE,
+                ACTION_FORGET,
+                object.id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let (instance_id, parameters_json, body_json) = row.map_err(|error| error.to_string())?;
+        let mut instance: ActionInstance = serde_json::from_str(&body_json)
+            .map_err(|error| format!("corrupt action instance body: {error}"))?;
+        instance.parameters_json = parameters_json;
+        if !redact_writer_instance(&mut instance) {
+            continue;
+        }
+        let parameters_json = instance.parameters_json.clone();
+        let body_json = serde_json::to_string(&instance).map_err(|error| error.to_string())?;
+        updates.push((instance_id, parameters_json, body_json));
+    }
+    drop(stmt);
+    for (instance_id, parameters_json, body_json) in updates {
+        tx.execute(
+            "UPDATE sekai_action_instances
+             SET parameters_json = ?2, body_json = ?3
+             WHERE instance_id = ?1",
+            params![instance_id, parameters_json, body_json],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    sqlite_redact_forgotten_memory_decisions(tx, object)
+}
+
+fn sqlite_redact_forgotten_memory_decisions(
+    tx: &rusqlite::Transaction<'_>,
+    object: &crate::domain::Object,
+) -> Result<(), String> {
+    use crate::sekai::decision_memory::DecisionMemory;
+    use crate::sekai::site_agent_memory::{ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE};
+    let present: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'sekai_action_decision_memory'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if present == 0 {
+        return Ok(());
+    }
+    let mut stmt = tx
+        .prepare(
+            "SELECT memory_id, body_json FROM sekai_action_decision_memory
+             WHERE namespace = ?1 AND type_id IN (?2, ?3, ?4)",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(
+            params![
+                object.namespace,
+                ACTION_CREATE,
+                ACTION_UPDATE,
+                ACTION_FORGET
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let (memory_id, body_json) = row.map_err(|error| error.to_string())?;
+        let mut memory: DecisionMemory = serde_json::from_str(&body_json)
+            .map_err(|error| format!("corrupt decision memory: {error}"))?;
+        let object_id = crate::sekai::site_agent_memory::writer_object_id(&memory.parameters_json)
+            .or_else(|| crate::sekai::site_agent_memory::writer_object_id(&memory.facts_json));
+        if object_id.as_deref() != Some(object.id.as_str()) {
+            continue;
+        }
+        if !crate::sekai::site_agent_memory::redact_decision_memory(&mut memory) {
+            continue;
+        }
+        let body_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
+        updates.push((memory_id, body_json));
+    }
+    drop(stmt);
+    for (memory_id, body_json) in updates {
+        tx.execute(
+            "UPDATE sekai_action_decision_memory SET body_json = ?2 WHERE memory_id = ?1",
+            params![memory_id, body_json],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Why a site agent write by `principal` in `namespace` is refused as it

@@ -11,9 +11,12 @@
 //! Forgetting is an update: Actions have no delete mutation. It empties the
 //! content and sets `forgotten`, and a forgotten item is never written again.
 //! Earlier values stay in the change history under a restricted
-//! (`sensitive`) property classification, readable only by object admins,
-//! and in the parameters of the Actions that wrote them, readable by whoever
-//! may read those Actions. Erasing them is #1969.
+//! (`sensitive`) property classification, readable only by object admins.
+//! Forget also empties `content` in the retained parameters of the Actions
+//! that wrote the item (#1969), leaving each Action's stored request digest
+//! as it was so receipt and digest verification still match the original
+//! submit. Later Action and decision-memory writes that still name a
+//! forgotten item store empty `content` too.
 //!
 //! Working memory is neither Kioku (epistemic memory Chisei derives from
 //! operation outcomes) nor decision memory (precedents of parked reviews).
@@ -233,6 +236,95 @@ pub fn list_live_for_instance(
     Ok(items)
 }
 
+/// Actions whose parameters may hold a memory item's note.
+pub fn is_writer_action(type_id: &str) -> bool {
+    type_id == ACTION_CREATE || type_id == ACTION_UPDATE || type_id == ACTION_FORGET
+}
+
+/// Empty `content` in retained Action parameters. `None` when there is
+/// nothing to redact. Callers keep the stored request digest: this does
+/// not recompute it.
+pub fn redact_content_parameter(parameters_json: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(parameters_json).ok()?;
+    let object = value.as_object_mut()?;
+    let content = object.get(CONTENT_PROPERTY)?.as_str()?;
+    if content.is_empty() {
+        return None;
+    }
+    object.insert(
+        CONTENT_PROPERTY.to_string(),
+        serde_json::Value::String(String::new()),
+    );
+    serde_json::to_string(&value).ok()
+}
+
+/// Object id a writer Action named, if any.
+pub fn writer_object_id(parameters_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()?
+        .get("object_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+/// Empty `content` on a writer Action, including an offline base value.
+/// Keeps the stored request digest.
+pub fn redact_writer_instance(
+    instance: &mut crate::sekai::action_instance::ActionInstance,
+) -> bool {
+    if !is_writer_action(&instance.type_id) {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(redacted) = redact_content_parameter(&instance.parameters_json) {
+        instance.parameters_json = redacted;
+        changed = true;
+    }
+    if let Some(offline) = instance.offline.as_mut()
+        && let Some(Some(content)) = offline.base_properties.get_mut(CONTENT_PROPERTY)
+        && !content.is_empty()
+    {
+        content.clear();
+        changed = true;
+    }
+    changed
+}
+
+/// True when the stored writer row already has empty `content` and
+/// `incoming` still carries a note for the same object. A later
+/// transition must not restore forgotten content from a stale copy.
+pub fn stored_writer_already_redacted(
+    stored_parameters: Option<&str>,
+    incoming: &crate::sekai::action_instance::ActionInstance,
+) -> bool {
+    let Some(stored) = stored_parameters else {
+        return false;
+    };
+    if writer_object_id(stored) != writer_object_id(&incoming.parameters_json) {
+        return false;
+    }
+    redact_content_parameter(stored).is_none()
+        && redact_content_parameter(&incoming.parameters_json).is_some()
+}
+
+/// Empty forgotten notes copied into decision-memory parameters and facts.
+pub fn redact_decision_memory(memory: &mut crate::sekai::decision_memory::DecisionMemory) -> bool {
+    let mut changed = false;
+    for field in [
+        &mut memory.parameters_json,
+        &mut memory.facts_json,
+        &mut memory.conditions_json,
+    ] {
+        if let Some(redacted) = redact_content_parameter(field) {
+            *field = redacted;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Memory rules on a governed object write, submitted by `submitter`.
 /// Other kinds pass through.
 pub fn validate_object_write(
@@ -309,7 +401,10 @@ pub fn validate_object_write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sekai::action_instance::{STATUS_ADMITTED, STATUS_DENIED};
+    use crate::sekai::action_instance::{
+        ActionInstance, AdmissionLease, STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED,
+        compute_request_digest, lease_clock_ms,
+    };
     use crate::sekai::action_instance_admission::{
         ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionOutcome,
         ActionInstanceAdmissionRequest,
@@ -468,6 +563,440 @@ mod tests {
         assert!(crate::sekai::schema::is_restricted_property_classification(
             &content.classification
         ));
+    }
+
+    #[test]
+    fn redact_content_parameter_empties_only_nonempty_content() {
+        assert_eq!(
+            redact_content_parameter(r#"{"object_id":"note-1","content":"secret"}"#)
+                .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+                .and_then(|value| value
+                    .get(CONTENT_PROPERTY)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)),
+            Some(String::new())
+        );
+        assert_eq!(
+            redact_content_parameter(r#"{"object_id":"note-1","content":""}"#),
+            None
+        );
+        assert_eq!(redact_content_parameter(r#"{"object_id":"note-1"}"#), None);
+        assert!(is_writer_action(ACTION_CREATE));
+        assert!(is_writer_action(ACTION_UPDATE));
+        assert!(is_writer_action(ACTION_FORGET));
+        assert!(!is_writer_action("site.ping"));
+    }
+
+    /// Forget empties retained writer-Action parameters so a reader of those
+    /// Actions cannot recover the note, and keeps the original request digest.
+    #[test]
+    fn forgetting_redacts_writer_action_content_and_keeps_the_digest() {
+        let db = setup();
+        let created = admit(
+            &db,
+            ACTION_CREATE,
+            json!({"object_id": "note-1", "instance_id": "line-7", "content": "valve 3 sticks"}),
+            "create",
+            AGENT,
+        )
+        .unwrap();
+        admit(
+            &db,
+            ACTION_UPDATE,
+            json!({"object_id": "note-1", "content": "valve 3 still sticks"}),
+            "update",
+            AGENT,
+        )
+        .unwrap();
+        let original = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        let original_digest = original.request_digest.clone();
+        let original_params = original.parameters_json.clone();
+        assert!(
+            original_params.contains("valve 3 sticks"),
+            "{}",
+            original_params
+        );
+
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+
+        let stored = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        let content = serde_json::from_str::<Value>(&stored.parameters_json)
+            .unwrap()
+            .get(CONTENT_PROPERTY)
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_string();
+        assert_eq!(content, "");
+        assert!(
+            !stored.parameters_json.contains("valve 3 sticks"),
+            "{}",
+            stored.parameters_json
+        );
+        assert_eq!(stored.request_digest, original_digest);
+        let from_redacted = compute_request_digest(
+            &stored.namespace,
+            &stored.type_id,
+            &stored.version,
+            &stored.parameters_json,
+            &stored.evidence_submission_ids,
+        )
+        .unwrap();
+        assert_ne!(from_redacted, stored.request_digest);
+        assert_eq!(
+            compute_request_digest(
+                &stored.namespace,
+                &stored.type_id,
+                &stored.version,
+                &original_params,
+                &stored.evidence_submission_ids,
+            )
+            .unwrap(),
+            stored.request_digest
+        );
+
+        let updated = db
+            .get_action_instance_by_idempotency(NAMESPACE, "update")
+            .unwrap()
+            .unwrap();
+        let updated_content = serde_json::from_str::<Value>(&updated.parameters_json)
+            .unwrap()
+            .get(CONTENT_PROPERTY)
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_string();
+        assert_eq!(updated_content, "");
+        assert!(
+            !updated.parameters_json.contains("still sticks"),
+            "{}",
+            updated.parameters_json
+        );
+
+        let listed = db.list_action_instances(NAMESPACE, None, None, 50).unwrap();
+        assert!(
+            listed.iter().all(|instance| {
+                serde_json::from_str::<Value>(&instance.parameters_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get(CONTENT_PROPERTY)
+                            .and_then(Value::as_str)
+                            .map(|content| content.is_empty())
+                    })
+                    .unwrap_or(true)
+            }),
+            "{listed:?}"
+        );
+    }
+
+    fn decision_row(id: &str, note: &str) -> crate::sekai::decision_memory::DecisionMemory {
+        let parameters = json!({"object_id": "note-1", "content": note}).to_string();
+        crate::sekai::decision_memory::DecisionMemory {
+            memory_id: id.into(),
+            namespace: NAMESPACE.into(),
+            type_id: ACTION_UPDATE.into(),
+            version: ACTION_VERSION.into(),
+            instance_id: id.into(),
+            outcome: "grant".into(),
+            reason: "ok".into(),
+            conditions_json: String::new(),
+            facts_json: parameters.clone(),
+            decided_by: "operator".into(),
+            decided_at_ms: 10,
+            superseded: false,
+            parameters_json: parameters,
+        }
+    }
+
+    #[test]
+    fn forgetting_redacts_decision_memory_facts() {
+        let db = setup();
+        remember(&db, "create", AGENT).unwrap();
+        db.put_decision_memory(&decision_row("decided", "valve 3 sticks"))
+            .unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        let stored = db.get_decision_memory("decided").unwrap().unwrap();
+        for field in [&stored.parameters_json, &stored.facts_json] {
+            let content = serde_json::from_str::<Value>(field)
+                .unwrap()
+                .get(CONTENT_PROPERTY)
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+                .to_string();
+            assert_eq!(content, "", "{field}");
+            assert!(!field.contains("valve 3 sticks"), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_late_decision_memory_write_cannot_restore_forgotten_content() {
+        let db = setup();
+        remember(&db, "create", AGENT).unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        db.put_decision_memory(&decision_row("late", "valve 3 sticks"))
+            .unwrap();
+        let stored = db.get_decision_memory("late").unwrap().unwrap();
+        for field in [&stored.parameters_json, &stored.facts_json] {
+            let content = serde_json::from_str::<Value>(field)
+                .unwrap()
+                .get(CONTENT_PROPERTY)
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+                .to_string();
+            assert_eq!(content, "", "{field}");
+            assert!(!field.contains("valve 3 sticks"), "{field}");
+        }
+    }
+
+    fn writer_action(
+        instance_id: &str,
+        type_id: &str,
+        key: &str,
+        content: &str,
+        status: &str,
+    ) -> ActionInstance {
+        let parameters_json = json!({"object_id": "note-1", "content": content}).to_string();
+        let request_digest =
+            compute_request_digest(NAMESPACE, type_id, ACTION_VERSION, &parameters_json, &[])
+                .unwrap();
+        ActionInstance {
+            agent_turn: None,
+            autonomous_envelope_id: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
+            review: Default::default(),
+            agent_action: false,
+            admission_tenant: String::new(),
+            resource_tenant: String::new(),
+            instance_id: instance_id.into(),
+            namespace: NAMESPACE.into(),
+            type_id: type_id.into(),
+            version: ACTION_VERSION.into(),
+            principal: AGENT.into(),
+            delegating_actor: None,
+            parameters_json,
+            request_digest,
+            idempotency_key: key.into(),
+            operation_id: instance_id.into(),
+            status: status.into(),
+            deny_reason: String::new(),
+            evidence_submission_ids: vec![],
+            policy_decision: "allow".into(),
+            budget_decision: "allow".into(),
+            created_at_ms: 10,
+            decided_at_ms: 10,
+            system_one_fill_json: String::new(),
+            marking: String::new(),
+            conflict: None,
+            approval: None,
+            offline: None,
+            admission_lease: None,
+            admission_ontology_digest: None,
+            admission_budget_already_reserved: false,
+        }
+    }
+
+    fn stored_content(instance: &ActionInstance) -> String {
+        serde_json::from_str::<Value>(&instance.parameters_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get(CONTENT_PROPERTY)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "missing".into())
+    }
+
+    /// A denied writer stored after forget keeps empty content and the
+    /// original request digest.
+    #[test]
+    fn a_late_action_instance_write_cannot_restore_forgotten_content() {
+        let db = setup();
+        remember(&db, "create", AGENT).unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        let mut original = writer_action(
+            "late",
+            ACTION_UPDATE,
+            "late",
+            "valve 3 sticks",
+            STATUS_DENIED,
+        );
+        original.offline = Some(crate::sekai::offline_action::OfflineSubmission {
+            prepared_at_ms: 5,
+            base_updated_ms: 1,
+            base_properties: [(CONTENT_PROPERTY.into(), Some("valve 3 sticks".into()))].into(),
+            lease_id: String::new(),
+            device_id: String::new(),
+        });
+        let digest = original.request_digest.clone();
+        let stored = db.put_action_instance(&original).unwrap();
+        assert_eq!(stored_content(&stored), "");
+        assert!(
+            !stored.parameters_json.contains("valve 3 sticks"),
+            "{}",
+            stored.parameters_json
+        );
+        assert_eq!(
+            stored
+                .offline
+                .as_ref()
+                .and_then(|offline| offline.base_properties.get(CONTENT_PROPERTY).cloned())
+                .flatten()
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(stored.request_digest, digest);
+        let loaded = db.get_action_instance("late").unwrap().unwrap();
+        assert_eq!(stored_content(&loaded), "");
+        assert_eq!(loaded.request_digest, digest);
+    }
+
+    /// Denying a parked update after forget does not write the original
+    /// note back into the stored Action body.
+    #[test]
+    fn a_parked_transition_cannot_restore_forgotten_content() {
+        let db = setup();
+        remember(&db, "create", AGENT).unwrap();
+        let mut parked = writer_action(
+            "parked-update",
+            ACTION_UPDATE,
+            "parked-update",
+            "valve 3 still sticks",
+            STATUS_PARKED,
+        );
+        parked.offline = Some(crate::sekai::offline_action::OfflineSubmission {
+            prepared_at_ms: 5,
+            base_updated_ms: 1,
+            base_properties: [(CONTENT_PROPERTY.into(), Some("valve 3 still sticks".into()))]
+                .into(),
+            lease_id: String::new(),
+            device_id: String::new(),
+        });
+        db.put_action_instance(&parked).unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        let after_forget = db.get_action_instance("parked-update").unwrap().unwrap();
+        assert_eq!(stored_content(&after_forget), "");
+        assert_eq!(
+            after_forget
+                .offline
+                .as_ref()
+                .and_then(|offline| offline.base_properties.get(CONTENT_PROPERTY).cloned())
+                .flatten()
+                .as_deref(),
+            Some("")
+        );
+        let mut denied = parked.clone();
+        denied.status = STATUS_DENIED.into();
+        denied.deny_reason = "no".into();
+        assert!(db.decide_parked_action_instance(&denied).unwrap());
+        let stored = db.get_action_instance("parked-update").unwrap().unwrap();
+        assert_eq!(stored.status, STATUS_DENIED);
+        assert_eq!(stored_content(&stored), "");
+        assert!(
+            !stored.parameters_json.contains("still sticks"),
+            "{}",
+            stored.parameters_json
+        );
+        assert_eq!(
+            stored
+                .offline
+                .as_ref()
+                .and_then(|offline| offline.base_properties.get(CONTENT_PROPERTY).cloned())
+                .flatten()
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(stored.request_digest, parked.request_digest);
+    }
+
+    /// Taking over an abandoned reservation after forget keeps empty
+    /// content: the takeover writes only the new lease.
+    #[test]
+    fn takeover_cannot_restore_forgotten_content() {
+        let db = setup();
+        remember(&db, "create", AGENT).unwrap();
+        let mut reserved = writer_action(
+            "reserved",
+            ACTION_UPDATE,
+            "reserved",
+            "valve 3 sticks",
+            STATUS_ADMITTED,
+        );
+        reserved.admission_lease = Some(AdmissionLease {
+            owner: "worker".into(),
+            generation: 1,
+            expires_at_ms: lease_clock_ms() - 1,
+            write_committed: Some(false),
+            receipt_recorded: Some(false),
+            written_object_digest: None,
+            follow_ups_recorded: None,
+            decision_follow_ups_recorded: None,
+            decision_budget_reserved: None,
+        });
+        db.put_action_instance(&reserved).unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        let expired = reserved.admission_lease.clone().unwrap();
+        assert!(
+            db.take_over_admission(&reserved, &expired, &expired.succeeding())
+                .unwrap()
+        );
+        let taken = db.get_action_instance("reserved").unwrap().unwrap();
+        assert_eq!(stored_content(&taken), "");
+        assert!(
+            !taken.parameters_json.contains("valve 3 sticks"),
+            "{}",
+            taken.parameters_json
+        );
+        assert!(taken.admission_lease.unwrap().generation > 1);
     }
 
     #[test]

@@ -90,29 +90,19 @@ impl SekaiDb {
 
     pub fn put_decision_memory(&self, memory: &DecisionMemory) -> Result<(), String> {
         self.migrate_decision_memory()?;
-        let body = serde_json::to_string(memory).map_err(|error| error.to_string())?;
-        self.conn()
-            .execute(
-                "INSERT INTO sekai_action_decision_memory
-                 (memory_id, namespace, type_id, instance_id, decided_at_ms, body_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(memory_id) DO UPDATE SET
-                    namespace = excluded.namespace,
-                    type_id = excluded.type_id,
-                    instance_id = excluded.instance_id,
-                    decided_at_ms = excluded.decided_at_ms,
-                    body_json = excluded.body_json",
-                params![
-                    memory.memory_id,
-                    memory.namespace,
-                    memory.type_id,
-                    memory.instance_id,
-                    memory.decided_at_ms,
-                    body,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let mut stored = memory.clone();
+        if crate::sekai::site_agent_memory::is_writer_action(&stored.type_id) {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            if sqlite_target_is_forgotten(&tx, &stored)? {
+                crate::sekai::site_agent_memory::redact_decision_memory(&mut stored);
+            }
+            insert_decision_memory(&tx, &stored)?;
+            return tx.commit().map_err(|error| error.to_string());
+        }
+        insert_decision_memory(&self.conn(), &stored)
     }
 
     pub fn list_decision_memory(
@@ -180,6 +170,61 @@ impl SekaiDb {
         self.put_decision_memory(&memory)?;
         Ok(true)
     }
+}
+
+fn insert_decision_memory(
+    conn: &rusqlite::Connection,
+    memory: &DecisionMemory,
+) -> Result<(), String> {
+    let body = serde_json::to_string(memory).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO sekai_action_decision_memory
+         (memory_id, namespace, type_id, instance_id, decided_at_ms, body_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(memory_id) DO UPDATE SET
+            namespace = excluded.namespace,
+            type_id = excluded.type_id,
+            instance_id = excluded.instance_id,
+            decided_at_ms = excluded.decided_at_ms,
+            body_json = excluded.body_json",
+        params![
+            memory.memory_id,
+            memory.namespace,
+            memory.type_id,
+            memory.instance_id,
+            memory.decided_at_ms,
+            body,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn sqlite_target_is_forgotten(
+    tx: &rusqlite::Transaction<'_>,
+    memory: &DecisionMemory,
+) -> Result<bool, String> {
+    let Some(object_id) =
+        crate::sekai::site_agent_memory::writer_object_id(&memory.parameters_json)
+            .or_else(|| crate::sekai::site_agent_memory::writer_object_id(&memory.facts_json))
+    else {
+        return Ok(false);
+    };
+    let forgotten: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(properties, '$.forgotten') FROM sekai_objects
+             WHERE id = ?1 AND kind = ?2 AND namespace = ?3",
+            params![
+                object_id,
+                crate::sekai::site_agent_memory::KIND,
+                memory.namespace
+            ],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    Ok(forgotten.as_deref() == Some("true"))
 }
 
 pub const MAX_PRECEDENTS: usize = 20;
