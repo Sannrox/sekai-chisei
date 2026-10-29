@@ -68,6 +68,12 @@ impl PinnedObjectSet {
         }
     }
 
+    /// The rows as input records, numbered from 1 in id order, as runs and
+    /// input snapshots carry them.
+    pub fn records(&self) -> Vec<(i64, HashMap<String, String>)> {
+        (1i64..).zip(self.rows.iter().cloned()).collect()
+    }
+
     /// The key this set's pin is recorded under in `input_versions`.
     pub fn pin_key(&self) -> String {
         format!("{PIN_PREFIX}{}", self.alias)
