@@ -11,12 +11,45 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SQLITE_ONLY_SURFACES_CONTRACT: &str = "sekai.sqlite-only-surfaces/v1";
 pub const SQLITE_ONLY_SURFACES_JSON: &str =
     include_str!("../tests/fixtures/sqlite_only_surfaces/v1.json");
+macro_rules! runtime_db_file {
+    ($name:literal) => {
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/crates/sekai-core/src/db/",
+            $name
+        ))
+    };
+}
+
 /// `RuntimeDb` source: Sekai methods plus the Chisei-typed methods in `chisei_store`.
 pub const RUNTIME_DB_SRC: &str = concat!(
-    include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/crates/sekai-core/src/db/runtime_db.rs"
-    )),
+    runtime_db_file!("runtime_db.rs"),
+    runtime_db_file!("runtime_db_objects.rs"),
+    runtime_db_file!("runtime_db_object_security.rs"),
+    runtime_db_file!("runtime_db_source_sync.rs"),
+    runtime_db_file!("runtime_db_transforms.rs"),
+    runtime_db_file!("runtime_db_actions.rs"),
+    runtime_db_file!("runtime_db_definitions.rs"),
+    runtime_db_file!("runtime_db_coordination.rs"),
+    runtime_db_file!("runtime_db_datasets.rs"),
+    runtime_db_file!("runtime_db_evidence.rs"),
+    runtime_db_file!("runtime_db_ontology.rs"),
+    runtime_db_file!("runtime_db_functions.rs"),
+    runtime_db_file!("runtime_db_federation.rs"),
+    runtime_db_file!("runtime_db_ezu_geo_feed.rs"),
+    runtime_db_file!("runtime_db_workflow.rs"),
+    runtime_db_file!("runtime_db_connector.rs"),
+    runtime_db_file!("runtime_db_warehouse.rs"),
+    runtime_db_file!("runtime_db_lakehouse.rs"),
+    runtime_db_file!("runtime_db_model_platform.rs"),
+    runtime_db_file!("runtime_db_autonomy.rs"),
+    runtime_db_file!("runtime_db_open_table.rs"),
+    runtime_db_file!("runtime_db_event_stream.rs"),
+    runtime_db_file!("runtime_db_documents.rs"),
+    runtime_db_file!("runtime_db_packages.rs"),
+    runtime_db_file!("runtime_db_images.rs"),
+    runtime_db_file!("runtime_db_retention.rs"),
+    runtime_db_file!("runtime_db_receipts.rs"),
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/crates/chisei-core/src/chisei_store/runtime.rs"
