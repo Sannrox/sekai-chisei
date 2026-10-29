@@ -16,7 +16,6 @@ pub mod source_batch_auth_counters {
     }
 }
 
-use crate::db::chisei_operation_reservation::OperationReservation;
 use crate::db::definition_branch::DefinitionBranchBackend;
 use crate::db::object_sync::ObjectSyncBackend;
 use crate::domain::{Direction, Link, ListFilter, Object};
@@ -2476,56 +2475,6 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.export_receipt_chain(namespace),
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.export_receipt_chain(namespace))
-            }
-        }
-    }
-
-    pub fn get_operation_reservation(
-        &self,
-        namespace: &str,
-        operation_id: &str,
-    ) -> Result<Option<OperationReservation>, String> {
-        match self {
-            Self::Sqlite(db) => db.get_operation_reservation(namespace, operation_id),
-            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.get_operation_reservation(namespace, operation_id)
-            }),
-        }
-    }
-
-    pub fn put_operation_reservation(
-        &self,
-        reservation: &OperationReservation,
-    ) -> Result<OperationReservation, String> {
-        match self {
-            Self::Sqlite(db) => db.put_operation_reservation(reservation),
-            Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.put_operation_reservation(reservation))
-            }
-        }
-    }
-
-    pub fn settle_pending_reservation(
-        &self,
-        next: &OperationReservation,
-        refund_metric: Option<&str>,
-    ) -> Result<Option<OperationReservation>, String> {
-        match self {
-            Self::Sqlite(db) => db.settle_pending_reservation(next, refund_metric),
-            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.settle_pending_reservation(next, refund_metric)
-            }),
-        }
-    }
-
-    pub fn list_pending_operation_reservations(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<OperationReservation>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_pending_operation_reservations(limit),
-            Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.list_pending_operation_reservations(limit))
             }
         }
     }

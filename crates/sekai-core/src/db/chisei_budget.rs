@@ -1394,7 +1394,7 @@ impl ChiseiBudgetBackend for crate::db::postgres::PostgresDb {
 /// Add `delta` to `scope_id` and every ancestor's usage and attribution, in
 /// the caller's write transaction, so a caller can pair it atomically with
 /// another write, such as releasing a reservation (#1902).
-pub(crate) fn adjust_chain_tx(
+pub fn adjust_chain_tx(
     tx: &rusqlite::Transaction<'_>,
     scope_id: &str,
     metric: &str,

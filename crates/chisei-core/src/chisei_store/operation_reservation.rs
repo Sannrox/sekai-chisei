@@ -1,9 +1,8 @@
 //! Chisei-owned admission reservations keyed by `(namespace, operation_id)`.
 
 use rusqlite::{OptionalExtension, params};
-
-use crate::db::postgres::PostgresDb;
-use crate::db::sekai::SekaiDb;
+use sekai_core::db::postgres::PostgresDb;
+use sekai_core::db::sekai::SekaiDb;
 
 pub const RESERVATION_PENDING: &str = "pending";
 pub const RESERVATION_FINALIZED: &str = "finalized";
@@ -35,8 +34,7 @@ impl OperationReservation {
     }
 }
 
-#[allow(dead_code)]
-pub trait ChiseiOperationReservationBackend {
+pub trait OperationReservationSekaiDbExt {
     fn get_operation_reservation(
         &self,
         namespace: &str,
@@ -46,46 +44,24 @@ pub trait ChiseiOperationReservationBackend {
         &self,
         reservation: &OperationReservation,
     ) -> Result<OperationReservation, String>;
+    /// Move a pending reservation to `next`'s status and Sekai commit with no
+    /// usage and, when `refund_metric` is given, give its usage back along the
+    /// budget chain in the period it was charged in, in one write transaction. Returns the stored row, or `None` when the row is absent
+    /// or already left `pending`, so racing callers refund once and a crash
+    /// leaves both writes or neither (#1902).
+    fn settle_pending_reservation(
+        &self,
+        next: &OperationReservation,
+        refund_metric: Option<&str>,
+    ) -> Result<Option<OperationReservation>, String>;
     fn list_pending_operation_reservations(
         &self,
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String>;
 }
 
-macro_rules! forward_reservation {
-    ($target:ty) => {
-        fn get_operation_reservation(
-            &self,
-            namespace: &str,
-            operation_id: &str,
-        ) -> Result<Option<OperationReservation>, String> {
-            <$target>::get_operation_reservation(self, namespace, operation_id)
-        }
-        fn put_operation_reservation(
-            &self,
-            reservation: &OperationReservation,
-        ) -> Result<OperationReservation, String> {
-            <$target>::put_operation_reservation(self, reservation)
-        }
-        fn list_pending_operation_reservations(
-            &self,
-            limit: usize,
-        ) -> Result<Vec<OperationReservation>, String> {
-            <$target>::list_pending_operation_reservations(self, limit)
-        }
-    };
-}
-
-impl ChiseiOperationReservationBackend for SekaiDb {
-    forward_reservation!(SekaiDb);
-}
-
-impl ChiseiOperationReservationBackend for PostgresDb {
-    forward_reservation!(PostgresDb);
-}
-
-impl SekaiDb {
-    pub fn get_operation_reservation(
+impl OperationReservationSekaiDbExt for SekaiDb {
+    fn get_operation_reservation(
         &self,
         namespace: &str,
         operation_id: &str,
@@ -98,13 +74,13 @@ impl SekaiDb {
              FROM chisei_operation_reservations
              WHERE namespace=?1 AND operation_id=?2",
             params![namespace, operation_id],
-            row_to_reservation,
+            sqlite_row_to_reservation,
         )
         .optional()
         .map_err(|error| error.to_string())
     }
 
-    pub fn put_operation_reservation(
+    fn put_operation_reservation(
         &self,
         reservation: &OperationReservation,
     ) -> Result<OperationReservation, String> {
@@ -147,12 +123,7 @@ impl SekaiDb {
         Ok(reservation.clone())
     }
 
-    /// Move a pending reservation to `next`'s status and Sekai commit with no
-    /// usage and, when `refund_metric` is given, give its usage back along the
-    /// budget chain in the period it was charged in, in one write transaction. Returns the stored row, or `None` when the row is absent
-    /// or already left `pending`, so racing callers refund once and a crash
-    /// leaves both writes or neither (#1902).
-    pub fn settle_pending_reservation(
+    fn settle_pending_reservation(
         &self,
         next: &OperationReservation,
         refund_metric: Option<&str>,
@@ -171,7 +142,7 @@ impl SekaiDb {
                  FROM chisei_operation_reservations
                  WHERE namespace=?1 AND operation_id=?2",
                 params![namespace, operation_id],
-                row_to_reservation,
+                sqlite_row_to_reservation,
             )
             .optional()
             .map_err(|error| error.to_string())?;
@@ -218,7 +189,7 @@ impl SekaiDb {
                 .optional()
                 .map_err(|error| error.to_string())?
             };
-            crate::db::chisei_budget::adjust_chain_tx(
+            sekai_core::db::chisei_budget::adjust_chain_tx(
                 &tx,
                 &current.budget_subject,
                 metric,
@@ -237,7 +208,7 @@ impl SekaiDb {
         }))
     }
 
-    pub fn list_pending_operation_reservations(
+    fn list_pending_operation_reservations(
         &self,
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String> {
@@ -256,7 +227,7 @@ impl SekaiDb {
         let rows = statement
             .query_map(
                 params![RESERVATION_PENDING, limit.min(1_000) as i64],
-                row_to_reservation,
+                sqlite_row_to_reservation,
             )
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -264,7 +235,9 @@ impl SekaiDb {
     }
 }
 
-fn row_to_reservation(row: &rusqlite::Row<'_>) -> Result<OperationReservation, rusqlite::Error> {
+fn sqlite_row_to_reservation(
+    row: &rusqlite::Row<'_>,
+) -> Result<OperationReservation, rusqlite::Error> {
     Ok(OperationReservation {
         namespace: row.get(0)?,
         operation_id: row.get(1)?,
@@ -282,7 +255,216 @@ fn row_to_reservation(row: &rusqlite::Row<'_>) -> Result<OperationReservation, r
     })
 }
 
-pub fn validate_reservation(reservation: &OperationReservation) -> Result<(), String> {
+pub trait OperationReservationPostgresDbExt {
+    fn get_operation_reservation(
+        &self,
+        namespace: &str,
+        operation_id: &str,
+    ) -> Result<Option<OperationReservation>, String>;
+    fn put_operation_reservation(
+        &self,
+        reservation: &OperationReservation,
+    ) -> Result<OperationReservation, String>;
+    fn settle_pending_reservation(
+        &self,
+        next: &OperationReservation,
+        refund_metric: Option<&str>,
+    ) -> Result<Option<OperationReservation>, String>;
+    fn list_pending_operation_reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<OperationReservation>, String>;
+}
+
+impl OperationReservationPostgresDbExt for PostgresDb {
+    fn get_operation_reservation(
+        &self,
+        namespace: &str,
+        operation_id: &str,
+    ) -> Result<Option<OperationReservation>, String> {
+        let row = self
+            .connection()?
+            .query_opt(
+                "SELECT namespace, operation_id, request_digest, status, actor,
+                        budget_subject, incurred_usage, sekai_instance_id, sekai_status,
+                        created_at_ms, updated_at_ms, expires_at_ms, charge_key
+                 FROM chisei_operation_reservations
+                 WHERE namespace=$1 AND operation_id=$2",
+                &[&namespace, &operation_id],
+            )
+            .map_err(|error| error.to_string())?;
+        row.map(postgres_row_to_reservation).transpose()
+    }
+
+    fn settle_pending_reservation(
+        &self,
+        next: &OperationReservation,
+        refund_metric: Option<&str>,
+    ) -> Result<Option<OperationReservation>, String> {
+        validate_reservation(next)?;
+        let (namespace, operation_id) = (next.namespace.as_str(), next.operation_id.as_str());
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let current = transaction
+            .query_opt(
+                "SELECT namespace, operation_id, request_digest, status, actor,
+                        budget_subject, incurred_usage, sekai_instance_id, sekai_status,
+                        created_at_ms, updated_at_ms, expires_at_ms, charge_key
+                 FROM chisei_operation_reservations
+                 WHERE namespace=$1 AND operation_id=$2
+                 FOR UPDATE",
+                &[&namespace, &operation_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(postgres_row_to_reservation)
+            .transpose()?;
+        // Fenced to the caller's acquisition: a stale caller must not settle
+        // a later acquisition of the same operation. `next` carries the
+        // snapshot's charge key and expiry, which identify it.
+        let Some(current) = current.filter(|row| {
+            row.is_pending()
+                && row.charge_key == next.charge_key
+                && row.expires_at_ms == next.expires_at_ms
+        }) else {
+            return Ok(None);
+        };
+        transaction
+            .execute(
+                "UPDATE chisei_operation_reservations
+                 SET status=$3, incurred_usage=0, sekai_instance_id=$4, sekai_status=$5,
+                     updated_at_ms=$6
+                 WHERE namespace=$1 AND operation_id=$2",
+                &[
+                    &namespace,
+                    &operation_id,
+                    &next.status,
+                    &next.sekai_instance_id,
+                    &next.sekai_status,
+                    &next.updated_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(metric) = refund_metric
+            && current.incurred_usage > 0
+        {
+            // The charge's own idempotency event dates it.
+            let charged_at: Option<i64> = if current.charge_key.is_empty() {
+                None
+            } else {
+                transaction
+                    .query_opt(
+                        "SELECT created_at FROM chisei_budget_usage_events
+                         WHERE idempotency_key=$1 AND scope_id=$2 AND metric=$3",
+                        &[&current.charge_key, &current.budget_subject, &metric],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .map(|row| row.get(0))
+            };
+            sekai_core::db::postgres_budget::adjust_chain_tx(
+                &mut transaction,
+                &current.budget_subject,
+                metric,
+                -current.incurred_usage,
+                charged_at.unwrap_or(current.updated_at_ms),
+            )?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(Some(OperationReservation {
+            status: next.status.clone(),
+            incurred_usage: 0,
+            sekai_instance_id: next.sekai_instance_id.clone(),
+            sekai_status: next.sekai_status.clone(),
+            updated_at_ms: next.updated_at_ms,
+            ..current
+        }))
+    }
+
+    fn put_operation_reservation(
+        &self,
+        reservation: &OperationReservation,
+    ) -> Result<OperationReservation, String> {
+        validate_reservation(reservation)?;
+        self.connection()?
+            .execute(
+                "INSERT INTO chisei_operation_reservations(
+                    namespace, operation_id, request_digest, status, actor,
+                    budget_subject, incurred_usage, sekai_instance_id, sekai_status,
+                    created_at_ms, updated_at_ms, expires_at_ms, charge_key
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 ON CONFLICT (namespace, operation_id) DO UPDATE SET
+                    request_digest=EXCLUDED.request_digest,
+                    status=EXCLUDED.status,
+                    actor=EXCLUDED.actor,
+                    budget_subject=EXCLUDED.budget_subject,
+                    incurred_usage=EXCLUDED.incurred_usage,
+                    sekai_instance_id=EXCLUDED.sekai_instance_id,
+                    sekai_status=EXCLUDED.sekai_status,
+                    updated_at_ms=EXCLUDED.updated_at_ms,
+                    expires_at_ms=EXCLUDED.expires_at_ms,
+                    charge_key=EXCLUDED.charge_key",
+                &[
+                    &reservation.namespace,
+                    &reservation.operation_id,
+                    &reservation.request_digest,
+                    &reservation.status,
+                    &reservation.actor,
+                    &reservation.budget_subject,
+                    &reservation.incurred_usage,
+                    &reservation.sekai_instance_id,
+                    &reservation.sekai_status,
+                    &reservation.created_at_ms,
+                    &reservation.updated_at_ms,
+                    &reservation.expires_at_ms,
+                    &reservation.charge_key,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(reservation.clone())
+    }
+
+    fn list_pending_operation_reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<OperationReservation>, String> {
+        let limit = i64::try_from(limit.min(1_000)).unwrap_or(1_000);
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT namespace, operation_id, request_digest, status, actor,
+                        budget_subject, incurred_usage, sekai_instance_id, sekai_status,
+                        created_at_ms, updated_at_ms, expires_at_ms, charge_key
+                 FROM chisei_operation_reservations
+                 WHERE status=$1
+                 ORDER BY created_at_ms ASC
+                 LIMIT $2",
+                &[&RESERVATION_PENDING, &limit],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.into_iter().map(postgres_row_to_reservation).collect()
+    }
+}
+
+fn postgres_row_to_reservation(row: postgres::Row) -> Result<OperationReservation, String> {
+    Ok(OperationReservation {
+        namespace: row.get(0),
+        operation_id: row.get(1),
+        request_digest: row.get(2),
+        status: row.get(3),
+        actor: row.get(4),
+        budget_subject: row.get(5),
+        incurred_usage: row.get(6),
+        sekai_instance_id: row.get(7),
+        sekai_status: row.get(8),
+        created_at_ms: row.get(9),
+        updated_at_ms: row.get(10),
+        expires_at_ms: row.get(11),
+        charge_key: row.get(12),
+    })
+}
+
+fn validate_reservation(reservation: &OperationReservation) -> Result<(), String> {
     if reservation.namespace.trim().is_empty() {
         return Err("namespace required".into());
     }
@@ -301,7 +483,9 @@ pub fn validate_reservation(reservation: &OperationReservation) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::runtime_db::RuntimeDb;
+    use crate::chisei_store::ChiseiRuntimeDb;
+    use sekai_core::db::runtime_db::RuntimeDb;
+    use std::sync::Arc;
 
     fn reservation(operation_id: &str, status: &str) -> OperationReservation {
         OperationReservation {
@@ -353,14 +537,18 @@ mod tests {
 
     #[test]
     fn sqlite_release_applies_once() {
-        release_applies_once(&RuntimeDb::memory_for_chisei_sql_functions(), "op-once");
+        let db = RuntimeDb::Sqlite(Arc::new(
+            crate::chisei_store::memory_sekai_with_chisei_schema(),
+        ));
+        release_applies_once(&db, "op-once");
     }
 
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
     fn postgres_release_applies_once() {
-        let scratch = crate::db::postgres::ScratchDatabase::create();
-        let db = RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        let scratch = sekai_core::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+        crate::chisei_store::apply_chisei_schema(&db);
         release_applies_once(&db, "op-once");
     }
 }

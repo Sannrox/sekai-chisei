@@ -23,6 +23,8 @@ use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEven
 use sekai_types::governed_subject_provenance::ExportRecord;
 use sekai_types::principal::PrincipalContext;
 
+use super::operation_reservation::OperationReservation;
+
 fn verify_evaluation_manifest(
     manifest: crate::chisei::evaluation_manifest::ResolvedEvaluationManifest,
 ) -> Result<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest, String> {
@@ -779,6 +781,28 @@ pub trait ChiseiRuntimeDb {
         actor: &str,
         export_id: &str,
     ) -> Result<Option<ExportRecord>, String>;
+
+    fn get_operation_reservation(
+        &self,
+        namespace: &str,
+        operation_id: &str,
+    ) -> Result<Option<OperationReservation>, String>;
+
+    fn put_operation_reservation(
+        &self,
+        reservation: &OperationReservation,
+    ) -> Result<OperationReservation, String>;
+
+    fn settle_pending_reservation(
+        &self,
+        next: &OperationReservation,
+        refund_metric: Option<&str>,
+    ) -> Result<Option<OperationReservation>, String>;
+
+    fn list_pending_operation_reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<OperationReservation>, String>;
 }
 
 impl ChiseiRuntimeDb for RuntimeDb {
@@ -2843,6 +2867,56 @@ impl ChiseiRuntimeDb for RuntimeDb {
             Self::Sqlite(db) => db.get_governed_subject_provenance_export(actor, export_id),
             Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
                 db.get_governed_subject_provenance_export(actor, export_id)
+            }),
+        }
+    }
+
+    fn get_operation_reservation(
+        &self,
+        namespace: &str,
+        operation_id: &str,
+    ) -> Result<Option<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_operation_reservation(namespace, operation_id),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.get_operation_reservation(namespace, operation_id)
+            }),
+        }
+    }
+
+    fn put_operation_reservation(
+        &self,
+        reservation: &OperationReservation,
+    ) -> Result<OperationReservation, String> {
+        match self {
+            Self::Sqlite(db) => db.put_operation_reservation(reservation),
+            Self::Postgres(db) => {
+                sekai_core::db::postgres::off_runtime(|| db.put_operation_reservation(reservation))
+            }
+        }
+    }
+
+    fn settle_pending_reservation(
+        &self,
+        next: &OperationReservation,
+        refund_metric: Option<&str>,
+    ) -> Result<Option<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.settle_pending_reservation(next, refund_metric),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.settle_pending_reservation(next, refund_metric)
+            }),
+        }
+    }
+
+    fn list_pending_operation_reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_pending_operation_reservations(limit),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.list_pending_operation_reservations(limit)
             }),
         }
     }

@@ -11,6 +11,9 @@ pub use super::governed_subject_provenance::{
     GovernedSubjectProvenancePostgresDbExt, GovernedSubjectProvenanceSekaiDbExt,
 };
 pub use super::learning_change_store::LearningChangeStoreSekaiDbExt;
+pub use super::operation_reservation::{
+    OperationReservationPostgresDbExt, OperationReservationSekaiDbExt,
+};
 pub use super::policy_shadow::{PolicyShadowPostgresDbExt, PolicyShadowSekaiDbExt};
 pub use super::postgres_chisei_receipts::PostgresChiseiReceiptsPostgresDbExt;
 pub use super::postgres_eval::PostgresEvalPostgresDbExt;

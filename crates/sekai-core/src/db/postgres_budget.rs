@@ -1064,7 +1064,7 @@ fn pg_insert_transfer(
 /// Add `delta` to `scope_id` and every ancestor's usage and attribution under
 /// their advisory locks, in the caller's transaction, so a caller can pair it
 /// atomically with another write, such as releasing a reservation (#1902).
-pub(crate) fn adjust_chain_tx(
+pub fn adjust_chain_tx(
     transaction: &mut postgres::Transaction<'_>,
     scope_id: &str,
     metric: &str,

@@ -23,6 +23,7 @@ pub mod ext;
 pub mod governed_subject_provenance;
 mod handle;
 mod learning_change_store;
+pub mod operation_reservation;
 pub mod policy_shadow;
 #[cfg(test)]
 mod portfolio_route_test_cases;
@@ -62,6 +63,9 @@ pub fn postgres_with_chisei_schema(
 #[cfg(test)]
 pub use handle::paired_memory;
 pub use handle::{ChiseiStore, split_shared_runtime};
+pub use operation_reservation::{
+    OperationReservation, RESERVATION_FINALIZED, RESERVATION_PENDING, RESERVATION_RELEASED,
+};
 pub use ports::{
     ChiseiBudgetStore, ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiEvalStore,
     ChiseiEvaluationStore, ChiseiEvolveStore, ChiseiExternalActionStore, ChiseiGatewayStore,

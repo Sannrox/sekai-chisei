@@ -12,6 +12,7 @@ use ed25519_dalek::VerifyingKey;
 
 use super::ChiseiRuntimeDb;
 use super::ChiseiStore;
+use super::OperationReservation;
 use crate::chisei::eval;
 use crate::chisei::evaluation_execution::EvaluationExecutionIndex;
 use crate::chisei::external_action::{
@@ -28,7 +29,6 @@ use crate::chisei::kioku::{
     MemoryRetrievalRequest, MemoryValidation, RetrievedMemory,
 };
 use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
-use sekai_core::db::chisei_operation_reservation::OperationReservation;
 use sekai_core::sekai::audit::{Decision, DecisionFilter};
 use sekai_core::sekai::evidence::EvidenceClassification;
 use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent};
