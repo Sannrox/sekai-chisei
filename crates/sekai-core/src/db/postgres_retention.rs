@@ -1,15 +1,16 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::audit::Decision;
 use crate::sekai::retention::{
+    AUDIT_DATASET, CONTENT_EVENTS_DATASET, DAY_MS, LLM_CALLS_DATASET, ObservationPlan,
+    RETENTION_BATCH_SIZE, RETENTION_TOMBSTONE_CONTEXT, RetainedObservation, effective_policy,
+    fold_observation_baseline, llm_call_expired, plan_audit_prefix, plan_observation_retention,
+};
+use crate::sekai::retention::{
     ArchiveErasureSubject, ArchivedErasure, CONTENT_EVENT_ERASED_REASON, erase_archived_record,
+    tombstone_archived_decision,
 };
 use crate::sekai::retention::{
     ArchiveRun, ArchiveVerification, RetentionPolicy, SubjectErasureRequest, SubjectErasureResult,
-};
-use crate::sekai::retention::{
-    CONTENT_EVENTS_DATASET, DAY_MS, LLM_CALLS_DATASET, ObservationPlan, RETENTION_BATCH_SIZE,
-    RETENTION_TOMBSTONE_CONTEXT, RetainedObservation, effective_policy, fold_observation_baseline,
-    llm_call_expired, plan_observation_retention,
 };
 use crate::sekai::retention::{
     legacy_redact_subject_value as redact_subject_value,
@@ -306,8 +307,10 @@ impl PostgresDb {
     /// transaction and locks the rows it reads, so replicas running at once
     /// take turns batch by batch and archive every record once; a crash
     /// loses only the uncommitted batch, which a rerun redoes. A dry run
-    /// counts everything in one pass and rolls it back. Audit records and
-    /// object changes are not archived here yet (#1985, #1986).
+    /// counts everything in one pass and rolls it back. Decisions and their
+    /// attestations go only after the ledger verifies, once per run under
+    /// the ledger lock, and the run refuses naming the failure otherwise.
+    /// Object changes are not archived here yet (#1986).
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
         if dry_run {
             return self.archive_retained_batch(
@@ -370,9 +373,118 @@ impl PostgresDb {
             &[],
         )
         .map_err(err)?;
+        let audit_policy = policies
+            .iter()
+            .any(|policy| policy.dataset == AUDIT_DATASET);
+        if audit_policy && !cursor.audit_done {
+            // The ledger lock every decision writer takes, before the rows
+            // lock as in erasure: the ledger cannot move under this batch.
+            tx.query_one("SELECT pg_advisory_xact_lock(25012)", &[])
+                .map_err(err)?;
+        }
         crate::db::postgres::lock_dataset_rows(&mut tx, LLM_CALLS_DATASET)?;
         let full = |rows: usize| i64::try_from(rows).unwrap_or(i64::MAX) >= limit;
         let mut records = Vec::<ArchiveRecord>::new();
+
+        // Audit records go only after the ledger verifies, once per run, in
+        // this batch's transaction; a failure refuses the whole run.
+        if audit_policy && !cursor.ledger_verified {
+            let verification = crate::db::postgres_decision::verify_ledger_in(&mut tx)?;
+            if !verification.ok {
+                return Err(format!(
+                    "audit ledger verification failed before retention: {}",
+                    verification.error
+                ));
+            }
+            cursor.ledger_verified = true;
+        }
+        let mut audit_archived = 0;
+        let mut prefix_end = None;
+        if audit_policy && !cursor.audit_done {
+            let rows = tx
+                .query(
+                    "SELECT seq,timestamp,evidence FROM sekai_decisions
+                     ORDER BY seq LIMIT $1",
+                    &[&limit.saturating_add(1)],
+                )
+                .map_err(err)?
+                .into_iter()
+                .map(|row| {
+                    let evidence = serde_json::from_str(row.get(2)).unwrap_or_default();
+                    let (namespace, data_class) =
+                        crate::sekai::ledger::lifecycle_scope_from_evidence(&evidence);
+                    (row.get(0), row.get(1), namespace, data_class)
+                })
+                .collect::<Vec<_>>();
+            let (end, done) = plan_audit_prefix(
+                rows,
+                &policies,
+                now,
+                usize::try_from(limit).unwrap_or(usize::MAX),
+            );
+            cursor.audit_done = done;
+            prefix_end = end;
+        } else {
+            cursor.audit_done = true;
+        }
+        if let Some(prefix_end) = prefix_end {
+            for row in tx
+                .query(
+                    "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,
+                            seq,prev_hash,entry_hash
+                     FROM sekai_decisions WHERE seq <= $1 ORDER BY seq FOR UPDATE",
+                    &[&prefix_end],
+                )
+                .map_err(err)?
+            {
+                let evidence: String = row.get(5);
+                let (namespace, data_class) = crate::sekai::ledger::lifecycle_scope_from_evidence(
+                    &serde_json::from_str(&evidence).unwrap_or_default(),
+                );
+                // The payload SQLite archives for a decision.
+                records.push(ArchiveRecord {
+                    dataset: "audit.decisions".into(),
+                    source_key: row.get(0),
+                    payload: serde_json::json!({
+                        "id": row.get::<_, String>(0), "timestamp": row.get::<_, i64>(1),
+                        "actor": row.get::<_, String>(2), "action": row.get::<_, String>(3),
+                        "reason": row.get::<_, String>(4), "evidence": evidence,
+                        "target_id": row.get::<_, String>(6), "outcome": row.get::<_, String>(7),
+                        "seq": row.get::<_, i64>(8), "prev_hash": row.get::<_, String>(9),
+                        "entry_hash": row.get::<_, String>(10),
+                        "namespace": namespace, "data_class": data_class,
+                    })
+                    .to_string(),
+                });
+                audit_archived += 1;
+            }
+            for row in tx
+                .query(
+                    "SELECT a.id,a.decision_id,a.policy_kind,a.policy_scope,a.policy_version,
+                            a.policy_snapshot,a.inputs,a.decision,a.content_hash,a.created
+                     FROM sekai_attestations a JOIN sekai_decisions d ON d.id=a.decision_id
+                     WHERE d.seq <= $1 ORDER BY a.id FOR UPDATE OF a",
+                    &[&prefix_end],
+                )
+                .map_err(err)?
+            {
+                records.push(ArchiveRecord {
+                    dataset: "audit.attestations".into(),
+                    source_key: row.get(0),
+                    payload: serde_json::json!({
+                        "id": row.get::<_, String>(0), "decision_id": row.get::<_, String>(1),
+                        "policy_kind": row.get::<_, String>(2),
+                        "policy_scope": row.get::<_, String>(3),
+                        "policy_version": row.get::<_, String>(4),
+                        "policy_snapshot": row.get::<_, String>(5),
+                        "inputs": row.get::<_, String>(6), "decision": row.get::<_, String>(7),
+                        "content_hash": row.get::<_, String>(8), "created": row.get::<_, i64>(9),
+                    })
+                    .to_string(),
+                });
+                audit_archived += 1;
+            }
+        }
 
         let mut llm_ids = Vec::new();
         if !cursor.llm_done {
@@ -482,6 +594,7 @@ impl PostgresDb {
         }
 
         let mut run = ArchiveRun {
+            audit_archived,
             llm_calls_archived: llm_ids.len() as i32,
             task_observations_archived: observations_archived as i32,
             task_observations_redacted: redacted.len() as i32,
@@ -495,6 +608,45 @@ impl PostgresDb {
         }
         (run.batch_id, run.content_hash) = write_archive_batch(&mut tx, now, records)?;
         run.batches = 1;
+        if let Some(prefix_end) = prefix_end {
+            // As on SQLite: the archived prefix leaves the ledger and its last
+            // entry becomes the anchor later verification resumes from.
+            let anchor_hash: String = tx
+                .query_one(
+                    "SELECT entry_hash FROM sekai_decisions WHERE seq=$1",
+                    &[&prefix_end],
+                )
+                .map_err(err)?
+                .get(0);
+            tx.execute(
+                "DELETE FROM sekai_attestations WHERE decision_id IN
+                 (SELECT id FROM sekai_decisions WHERE seq <= $1)",
+                &[&prefix_end],
+            )
+            .map_err(err)?;
+            tx.execute(
+                "DELETE FROM sekai_decisions WHERE seq <= $1",
+                &[&prefix_end],
+            )
+            .map_err(err)?;
+            let audit_cutoff = effective_policy(&policies, AUDIT_DATASET, "", "")
+                .map_or(now, |policy| {
+                    now - i64::from(policy.retention_days) * DAY_MS
+                });
+            tx.execute(
+                "INSERT INTO sekai_ledger_anchors (seq,entry_hash,reason,created)
+                 VALUES($1,$2,$3,$4)
+                 ON CONFLICT(seq) DO UPDATE SET entry_hash=excluded.entry_hash,
+                   reason=excluded.reason,created=excluded.created",
+                &[
+                    &prefix_end,
+                    &anchor_hash,
+                    &format!("archived before {audit_cutoff}"),
+                    &now,
+                ],
+            )
+            .map_err(err)?;
+        }
         for id in &event_ids {
             tx.execute("DELETE FROM sekai_content_events WHERE id=$1", &[id])
                 .map_err(err)?;
@@ -704,6 +856,8 @@ impl PostgresDb {
 /// last key read.
 #[derive(Debug, Default)]
 struct RetentionCursor {
+    ledger_verified: bool,
+    audit_done: bool,
     llm_after: i64,
     llm_done: bool,
     /// `(component_id, timestamp, request_id)` of the last observation read.
@@ -717,7 +871,7 @@ struct RetentionCursor {
 
 impl RetentionCursor {
     fn done(&self) -> bool {
-        self.llm_done && self.observations_done && self.content_events_done
+        self.audit_done && self.llm_done && self.observations_done && self.content_events_done
     }
 }
 
@@ -922,21 +1076,7 @@ fn append_subject_erasure_decision(
     request: &SubjectErasureRequest,
     result: &SubjectErasureResult,
 ) -> Result<(), String> {
-    let head = client
-        .query_opt(
-            "SELECT seq,entry_hash FROM sekai_decisions
-             WHERE seq IS NOT NULL ORDER BY seq DESC LIMIT 1 FOR UPDATE",
-            &[],
-        )
-        .map_err(err)?;
-    let (head_seq, head_hash) = head
-        .map(|row| {
-            (
-                row.get::<_, i64>(0),
-                row.get::<_, Option<String>>(1).unwrap_or_default(),
-            )
-        })
-        .unwrap_or((0, String::new()));
+    let (head_seq, head_hash) = crate::db::postgres_decision::chain_head(client)?;
     let evidence = std::collections::HashMap::from([
         ("subject_kind".into(), request.subject_kind.clone()),
         ("subject_hash".into(), result.subject_hash.clone()),
@@ -1695,15 +1835,57 @@ fn redact_archived_subject(
             &[],
         )
         .map_err(err)?;
+    // Archived decisions tombstone by the shared ledger rule or by this
+    // backend's hot rule (`tombstone_decisions`); the attestations of a
+    // tombstoned decision go, as in the hot table.
+    let mut erased_decisions = std::collections::BTreeSet::new();
+    let mut tombstoned = std::collections::BTreeMap::new();
+    for row in &rows {
+        if row.get::<_, &str>(0) != "audit.decisions" {
+            continue;
+        }
+        let pg_hot_rule = |json: &serde_json::Value| {
+            ["actor", "reason", "target_id", "evidence"]
+                .iter()
+                .any(|field| {
+                    json[field].as_str().is_some_and(|value| {
+                        value == subject.subject
+                            || value_mentions_subject(value, subject.kind, subject.subject)
+                    })
+                })
+        };
+        if let Some((redacted, original_id)) = tombstone_archived_decision(
+            row.get(2),
+            subject.kind,
+            subject.subject,
+            subject.hash,
+            now_ms,
+            subject.object_ids,
+            &pg_hot_rule,
+        ) {
+            erased_decisions.insert(original_id);
+            tombstoned.insert(row.get::<_, String>(1), redacted);
+        }
+    }
     let mut touched_batches = std::collections::BTreeSet::new();
     for row in rows {
         let dataset: String = row.get(0);
         let source_key: String = row.get(1);
         let payload: String = row.get(2);
-        let erasure = if postgres_hot_rule_deletes(&dataset, &payload, subject) {
-            ArchivedErasure::Delete
-        } else {
-            erase_archived_record(&dataset, &payload, subject)
+        let erasure = match dataset.as_str() {
+            "audit.decisions" => tombstoned
+                .remove(&source_key)
+                .map_or(ArchivedErasure::Keep, ArchivedErasure::Rewrite),
+            "audit.attestations"
+                if serde_json::from_str::<serde_json::Value>(&payload)
+                    .ok()
+                    .and_then(|json| json["decision_id"].as_str().map(str::to_string))
+                    .is_some_and(|id| erased_decisions.contains(&id)) =>
+            {
+                ArchivedErasure::Delete
+            }
+            _ if postgres_hot_rule_deletes(&dataset, &payload, subject) => ArchivedErasure::Delete,
+            _ => erase_archived_record(&dataset, &payload, subject),
         };
         let redacted_payload = match erasure {
             ArchivedErasure::Keep => continue,

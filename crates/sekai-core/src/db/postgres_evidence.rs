@@ -1499,16 +1499,7 @@ fn insert_projection_decision(
 ) -> Result<(), String> {
     tx.query_one("SELECT pg_advisory_xact_lock(25012)", &[])
         .map_err(|error| error.to_string())?;
-    let head = tx
-        .query_opt(
-            "SELECT seq,entry_hash FROM sekai_decisions
-             WHERE seq IS NOT NULL ORDER BY seq DESC LIMIT 1 FOR UPDATE",
-            &[],
-        )
-        .map_err(|error| error.to_string())?;
-    let (head_seq, head_hash) = head
-        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
-        .unwrap_or((0, String::new()));
+    let (head_seq, head_hash) = crate::db::postgres_decision::chain_head(tx)?;
     let sequence = head_seq + 1;
     let evidence = serde_json::to_string(&decision.evidence).map_err(|error| error.to_string())?;
     let hash = crate::sekai::ledger::entry_hash(sequence, &head_hash, decision, &evidence);

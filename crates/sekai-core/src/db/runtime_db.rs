@@ -6930,9 +6930,7 @@ impl RuntimeDb {
     pub fn verify_ledger(&self) -> Result<LedgerVerification, String> {
         match self {
             Self::Sqlite(db) => db.verify_ledger(),
-            Self::Postgres(_) => {
-                Err("verify_ledger is unavailable on the PostgreSQL community runtime".into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.verify_ledger()),
         }
     }
 
