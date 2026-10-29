@@ -1604,6 +1604,7 @@ mod tests {
         seed_admitted_instance(&db, &effect, None);
         db.put_service_principal(
             &crate::sekai::service_principal::ServicePrincipalRegistration {
+                capabilities: Vec::new(),
                 principal: "runtime".into(),
                 tenant_id: "acme-tenant".into(),
                 namespaces: vec!["acme".into()],

@@ -449,6 +449,7 @@ mod tests {
         assert!(!actor_is_agent(&db, "worker-a", None, false).unwrap());
         db.put_service_principal(
             &crate::sekai::service_principal::ServicePrincipalRegistration {
+                capabilities: Vec::new(),
                 principal: "worker-a".into(),
                 tenant_id: String::new(),
                 namespaces: vec!["ops".into()],

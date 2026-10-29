@@ -19,7 +19,27 @@ impl SekaiDb {
                     updated_at_ms INTEGER NOT NULL
                 );",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // Capabilities (ADR 0142), added in place on an existing table.
+        let has_capabilities: bool = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('sekai_service_principals')
+                 WHERE name = 'capabilities_json'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_capabilities {
+            self.conn()
+                .execute(
+                    "ALTER TABLE sekai_service_principals
+                     ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Insert or replace a registration; an update keeps `created_at_ms`.
@@ -36,12 +56,13 @@ impl SekaiDb {
             .query_row(
                 "INSERT INTO sekai_service_principals (
                     principal, tenant_id, namespaces_json, action_types_json,
-                    registered_by, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    registered_by, created_at_ms, updated_at_ms, capabilities_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(principal) DO UPDATE SET
                     tenant_id=excluded.tenant_id,
                     namespaces_json=excluded.namespaces_json,
                     action_types_json=excluded.action_types_json,
+                    capabilities_json=excluded.capabilities_json,
                     registered_by=excluded.registered_by,
                     updated_at_ms=excluded.updated_at_ms
                  WHERE sekai_service_principals.tenant_id=excluded.tenant_id
@@ -54,6 +75,7 @@ impl SekaiDb {
                     registration.registered_by,
                     registration.created_at_ms,
                     registration.updated_at_ms,
+                    to_json(&registration.capabilities)?,
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -75,29 +97,38 @@ impl SekaiDb {
             .conn()
             .query_row(
                 "SELECT tenant_id, namespaces_json, action_types_json, registered_by,
-                        created_at_ms, updated_at_ms
+                        created_at_ms, updated_at_ms, capabilities_json
                  FROM sekai_service_principals WHERE principal=?1",
                 params![principal],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ),
                         row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| error.to_string())?;
         row.map(
-            |(tenant_id, namespaces, action_types, registered_by, created_at_ms, updated_at_ms)| {
+            |(
+                (tenant_id, namespaces, action_types, registered_by),
+                created_at_ms,
+                updated_at_ms,
+                capabilities,
+            )| {
                 Ok(ServicePrincipalRegistration {
                     principal: principal.into(),
                     tenant_id,
                     namespaces: from_json(&namespaces)?,
                     action_types: from_json(&action_types)?,
+                    capabilities: from_json(&capabilities)?,
                     registered_by,
                     created_at_ms,
                     updated_at_ms,

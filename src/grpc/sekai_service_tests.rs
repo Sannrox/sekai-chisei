@@ -26082,6 +26082,7 @@ async fn write_freeze_blocks_source_batch_when_registered_tenant_is_frozen() {
         .runtime()
         .put_service_principal(
             &crate::sekai::service_principal::ServicePrincipalRegistration {
+                capabilities: Vec::new(),
                 principal: producer.into(),
                 tenant_id: "acme-tenant".into(),
                 namespaces: vec![namespace.into()],
@@ -26288,6 +26289,7 @@ fn write_freeze_blocks_object_write_when_registered_tenant_is_frozen() {
     let db = RuntimeDb::memory();
     db.put_service_principal(
         &crate::sekai::service_principal::ServicePrincipalRegistration {
+            capabilities: Vec::new(),
             principal: "worker-a".into(),
             tenant_id: "acme-tenant".into(),
             namespaces: vec!["ops".into()],

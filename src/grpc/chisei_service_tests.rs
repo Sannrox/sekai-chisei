@@ -14477,6 +14477,7 @@ async fn service_principal_reads_follow_its_live_registration_scope() {
     let mut fixture = TenantReadFixture::new("svc-a", &[("in-a", "ns-a"), ("in-a2", "ns-a2")]);
     let register = |fixture: &TenantReadFixture, namespace: &str| {
         let registration = crate::sekai::service_principal::ServicePrincipalRegistration {
+            capabilities: Vec::new(),
             principal: "svc-a".into(),
             tenant_id: "tenant-a".into(),
             namespaces: vec![namespace.into()],

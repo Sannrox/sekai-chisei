@@ -113,6 +113,12 @@ turn is denied with a receipt instead of writing. A heartbeat made with the toke
 it for the same principal and worker. The agent-turn worker RPCs are available
 to tenant-scoped credentials under the same checks.
 
+Turn workers authenticate as credential admin (`root`, `local`) or as a
+service principal whose registration lists the capability `agent_turn_worker`
+(ADR 0142, #2006). Such a principal lists, claims, heartbeats and acks turns
+in its registered namespaces only, and needs no Action types of its own: it
+submits Actions only with a turn's token, as the turn's instance principal.
+
 ## Service principals
 
 Administrators (`root`, `local`, or an admin grant on `service_principals`)
@@ -124,7 +130,9 @@ tenant-less caller can only create tenant-less registrations. Every listed
 namespace must pass the caller's tenant check. The marking ceiling is the
 principal profile's `classification_ceiling`, reported read-only. Built-in
 principals cannot be registered, and registrations never hold a secret: the
-identity extension issues credentials.
+identity extension issues credentials. A registration may also list `capabilities`
+beyond Actions; `agent_turn_worker` is the only one, and with it
+`action_types` may be empty.
 
 `IssueServicePrincipalToken` (#1510) is the client-credentials call: the
 identity-extension issuance hook verifies the secret for a registered

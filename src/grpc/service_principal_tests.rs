@@ -239,3 +239,37 @@ async fn registration_outside_the_caller_tenant_is_refused() {
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
 }
+
+#[tokio::test]
+async fn a_turn_worker_registers_with_its_capability_and_no_action_types() {
+    let service = service(false);
+    let mut registration = put("", &["ns-a"]);
+    let principal = registration.service_principal.as_mut().unwrap();
+    principal.action_types.clear();
+    principal.capabilities = vec![crate::sekai::service_principal::AGENT_TURN_WORKER.into()];
+    service
+        .put_service_principal(request(registration, "tenant-admin", None))
+        .await
+        .unwrap();
+    let stored = service
+        .get_service_principal(request(get(), "tenant-admin", None))
+        .await
+        .unwrap()
+        .into_inner()
+        .service_principal
+        .unwrap();
+    assert_eq!(stored.capabilities, ["agent_turn_worker"]);
+    assert!(stored.action_types.is_empty());
+
+    // An unknown capability is refused.
+    let mut unknown = put("", &["ns-a"]);
+    unknown.service_principal.as_mut().unwrap().capabilities = vec!["admin".into()];
+    assert_eq!(
+        service
+            .put_service_principal(request(unknown, "tenant-admin", None))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+}
