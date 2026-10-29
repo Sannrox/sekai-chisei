@@ -74,7 +74,10 @@ wired into boot. The freeze and ownership checks run when a write is planned
 and again inside the transaction that commits it (#1970), so a freeze or
 principal change committing in between denies the write with a receipt. The
 direct-write guards cover both kinds through one helper.
-Until #1968 lands, agents have no dedicated read path.
+`ListSiteAgentWorkingMemory` (#1968) is the experimental agent-turn read:
+an item is returned only when the instance principal and the requester can
+each read it on their own. Operators still inspect and export through
+object reads and `ExportObjectSet`.
 
 ## Validation
 
@@ -86,4 +89,14 @@ Crate tests cover:
   with `content` restricted;
 - a frozen instance writing no memory, also for a write parked before the
   freeze;
-- an item keeping its marking when a lower one is submitted.
+- an item keeping its marking when a lower one is submitted;
+- listing live items of one instance, omitting forgotten items and other
+  instances.
+
+gRPC tests cover:
+
+- an agent acting for a requester without clearance not receiving a marked
+  item, while the same agent acting for a cleared requester does, with
+  forgotten items omitted and a hidden instance looking missing;
+- export of memory items requiring the namespace export grant and omitting
+  items above the exporter's clearance.

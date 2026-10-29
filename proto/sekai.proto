@@ -1332,6 +1332,25 @@ message AckAgentTurnRequest {
 message AckAgentTurnResponse {
   AgentTurn turn = 1;
 }
+// Experimental (#1968). Live (not forgotten) working memory of one site
+// agent instance, for an agent turn. An item is returned only when the
+// instance principal and the requester can each read it on their own.
+// The requester is the delegating user (`act`) of the calling token, or
+// the caller when the token is not delegated. A hidden item looks the
+// same as a missing one. Operators inspect and export through GetObject,
+// ListObjects and ExportObjectSet; this RPC adds no export surface.
+message ListSiteAgentWorkingMemoryRequest {
+  string namespace = 1;
+  string instance_id = 2;
+  // The turn this read is for. Required when the caller presents a turn
+  // token; otherwise optional and, when set, must name a turn of this
+  // instance in this namespace.
+  string turn_id = 3;
+  int32 limit = 4;
+}
+message ListSiteAgentWorkingMemoryResponse {
+  repeated Object items = 1;
+}
 message TransformRunInputRow {
   string alias = 1;
   string dataset_id = 2;
@@ -5066,6 +5085,7 @@ service SekaiService {
   rpc ClaimAgentTurn(ClaimAgentTurnRequest) returns (ClaimAgentTurnResponse);
   rpc HeartbeatAgentTurnClaim(HeartbeatAgentTurnClaimRequest) returns (HeartbeatAgentTurnClaimResponse);
   rpc AckAgentTurn(AckAgentTurnRequest) returns (AckAgentTurnResponse);
+  rpc ListSiteAgentWorkingMemory(ListSiteAgentWorkingMemoryRequest) returns (ListSiteAgentWorkingMemoryResponse);
   rpc ReadTransformRunInputs(ReadTransformRunInputsRequest) returns (stream ReadTransformRunInputsResponse);
   rpc WriteTransformRunResult(WriteTransformRunResultRequest) returns (WriteTransformRunResultResponse);
   rpc ApplyStreamingTransformBatch(ApplyStreamingTransformBatchRequest) returns (ApplyStreamingTransformBatchResponse);

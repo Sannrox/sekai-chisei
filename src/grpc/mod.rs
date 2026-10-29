@@ -908,6 +908,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ClaimAgentTurn"
             | "HeartbeatAgentTurnClaim"
             | "AckAgentTurn"
+            // Dual-principal working-memory read (#1968): the handler
+            // scopes it to the instance and, with a turn token, that turn.
+            | "ListSiteAgentWorkingMemory"
             | "PutServicePrincipal"
             | "GetServicePrincipal"
             | "DeleteServicePrincipal"

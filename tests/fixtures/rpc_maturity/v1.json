@@ -843,6 +843,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ListSiteAgentWorkingMemory",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "HeartbeatTransformClaim",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",

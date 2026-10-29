@@ -1357,6 +1357,22 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ListSiteAgentWorkingMemory",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/site_agent_memory.rs",
+        "docs/decisions/0139-site-agent-working-memory.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "HeartbeatTransformClaim",
       "kind": "persistent",
       "surfaces": [

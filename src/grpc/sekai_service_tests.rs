@@ -31880,6 +31880,115 @@ async fn an_export_needs_its_grant_and_streams_only_what_a_read_shows() {
     assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
 }
 
+/// #1968: operators export memory through ExportObjectSet. The namespace
+/// export grant is required, and items above the exporter's clearance
+/// are omitted.
+#[tokio::test]
+async fn exporting_working_memory_needs_the_grant_and_omits_above_clearance() {
+    use crate::sekai::site_agent_memory as memory;
+    use futures_util::StreamExt;
+    let svc = service();
+    let member = definition_branch_domain::DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: memory::KIND.into(),
+        definition_json: format!(r#"{{"name":"{}"}}"#, memory::KIND),
+        member_digest: String::new(),
+    }
+    .prepare("mem-exp")
+    .unwrap();
+    let revision = definition_branch_domain::prepare_revision(
+        "mem-exp",
+        "",
+        [definition_branch_domain::DefinitionRevisionMember {
+            member_kind: member.member_kind.clone(),
+            member_id: member.member_id.clone(),
+            member_digest: member.member_digest.clone(),
+        }],
+        true,
+        "root",
+        1,
+    )
+    .unwrap();
+    let RuntimeDb::Sqlite(db) = svc.db.runtime() else {
+        panic!("test service must use SQLite");
+    };
+    db.seed_published_definition_revision(&revision, &[member])
+        .unwrap();
+    let digest = published_digest(&svc, "mem-exp").await;
+    let note = |id: &str, marking: Option<&str>| {
+        let mut properties = HashMap::from([
+            (memory::INSTANCE_PROPERTY.into(), "line-7".into()),
+            (memory::CONTENT_PROPERTY.into(), format!("body-{id}")),
+        ]);
+        if let Some(marking) = marking {
+            properties.insert(
+                crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                marking.into(),
+            );
+        }
+        crate::domain::Object {
+            id: id.into(),
+            kind: memory::KIND.into(),
+            name: id.into(),
+            namespace: "mem-exp".into(),
+            external_id: String::new(),
+            properties,
+            created: 1,
+            updated: 1,
+        }
+    };
+    svc.db
+        .runtime()
+        .create_object(&note("note-open", None))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&note("note-secret", Some("restricted")))
+        .unwrap();
+    let request = ExportObjectSetRequest {
+        descriptor: Some(ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "mem-exp".into(),
+            kind: memory::KIND.into(),
+            definition_digest: digest,
+            ..Default::default()
+        }),
+        properties: vec!["content".into()],
+        format: "csv".into(),
+    };
+    let refused = svc
+        .export_object_set(with_named_principal(request.clone(), "tester"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "mem-exp".into(),
+            principal: "tester".into(),
+            reason: "memory inspect".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .export_object_set(with_named_principal(request, "tester"))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let data =
+        String::from_utf8(chunks.iter().flat_map(|chunk| chunk.data.clone()).collect()).unwrap();
+    assert!(data.contains("note-open"), "{data}");
+    assert!(data.contains("body-note-open"), "{data}");
+    assert!(!data.contains("note-secret"), "{data}");
+    assert!(!data.contains("body-note-secret"), "{data}");
+}
+
 async fn collect_export(
     svc: &SekaiServiceImpl,
     request: ExportObjectSetRequest,
@@ -33696,6 +33805,283 @@ async fn site_agent_instance_turns_list_refusals_and_hide_like_missing() {
         (hidden.code(), hidden.message()),
         (missing.code(), missing.message())
     );
+}
+
+fn sealed_principal_profile(svc: &SekaiServiceImpl, principal: &str, ceiling: &str) {
+    let id = format!("principal-{principal}");
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: id.clone(),
+            kind: crate::sekai::markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: principal.into(),
+            namespace: "ops".into(),
+            external_id: crate::sekai::markings::principal_profile_external_id(principal),
+            properties: HashMap::from([
+                (
+                    crate::sekai::markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    ceiling.into(),
+                ),
+                (
+                    crate::sekai::markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    grant_object_role(svc, &id, "root", security::Role::Admin);
+}
+
+fn with_delegated_act<T>(payload: T, subject: &str, act: Option<&str>) -> Request<T> {
+    let mut req = Request::new(payload);
+    let mut context = crate::enterprise::AuthenticatedContext::machine(
+        crate::enterprise::AuthenticatedPrincipal {
+            subject: subject.into(),
+            credential_id: "agent-cred".into(),
+        },
+    );
+    context.act = act.map(str::to_string);
+    req.extensions_mut().insert(context);
+    req
+}
+
+/// #1968: an agent acting for a requester without clearance does not
+/// receive a marked item; the same agent acting for a cleared requester
+/// does. Forgotten items stay out. A hidden instance looks missing.
+#[tokio::test]
+async fn working_memory_read_intersects_agent_and_requester() {
+    use crate::sekai::site_agent_memory as memory;
+    let svc = service();
+    memory::install(svc.db.runtime(), "ops", "root", 1).unwrap();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("principal_id".into(), "svc-line-7".into())]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    sealed_principal_profile(&svc, "svc-line-7", "confidential");
+    sealed_principal_profile(&svc, "bob", "confidential");
+    let note = |id: &str, content: &str, marking: Option<&str>, forgotten: bool| {
+        let mut properties = HashMap::from([
+            (memory::INSTANCE_PROPERTY.into(), "line-7".into()),
+            (memory::CONTENT_PROPERTY.into(), content.into()),
+        ]);
+        if let Some(marking) = marking {
+            properties.insert(
+                crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                marking.into(),
+            );
+        }
+        if forgotten {
+            properties.insert(memory::FORGOTTEN_PROPERTY.into(), "true".into());
+        }
+        crate::domain::Object {
+            id: id.into(),
+            kind: memory::KIND.into(),
+            name: id.into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties,
+            created: 1,
+            updated: 1,
+        }
+    };
+    svc.db
+        .runtime()
+        .create_object(&note("note-open", "valve 3 sticks", None, false))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&note(
+            "note-secret",
+            "clearance only",
+            Some("confidential"),
+            false,
+        ))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&note("note-gone", "", None, true))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&note("note-mine", "agent only", None, false))
+        .unwrap();
+    grant_object_role(&svc, "note-mine", "svc-line-7", security::Role::Viewer);
+
+    let list = |act: Option<&str>| {
+        svc.list_site_agent_working_memory(with_delegated_act(
+            ListSiteAgentWorkingMemoryRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                turn_id: String::new(),
+                limit: 0,
+            },
+            "svc-line-7",
+            act,
+        ))
+    };
+    let listed = |resp: ListSiteAgentWorkingMemoryResponse| {
+        let mut ids = resp
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        listed(list(Some("alice")).await.unwrap().into_inner()),
+        ["note-open"]
+    );
+    assert_eq!(
+        listed(list(Some("bob")).await.unwrap().into_inner()),
+        ["note-open", "note-secret"]
+    );
+    assert_eq!(
+        listed(list(None).await.unwrap().into_inner()),
+        ["note-mine", "note-open", "note-secret"]
+    );
+
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-hidden".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-hidden".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("principal_id".into(), "svc-line-7".into()),
+                (
+                    crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let hidden = svc
+        .list_site_agent_working_memory(with_delegated_act(
+            ListSiteAgentWorkingMemoryRequest {
+                namespace: "ops".into(),
+                instance_id: "line-hidden".into(),
+                turn_id: String::new(),
+                limit: 0,
+            },
+            "svc-line-7",
+            Some("alice"),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::NotFound);
+    let missing = svc
+        .list_site_agent_working_memory(with_named_principal(
+            ListSiteAgentWorkingMemoryRequest {
+                namespace: "ops".into(),
+                instance_id: "no-such".into(),
+                turn_id: String::new(),
+                limit: 0,
+            },
+            "svc-line-7",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+/// A guest grant's marking ceiling still hides a memory item even when the
+/// instance principal and the requester's sealed profile would both clear it.
+#[tokio::test]
+async fn working_memory_read_keeps_the_guest_ceiling() {
+    use crate::sekai::site_agent_memory as memory;
+    let svc = guest_service(Arc::new(GuestSharedExtension::granting(
+        crate::enterprise::SpaceRole::Viewer,
+        "internal",
+    )));
+    memory::install(svc.db.runtime(), "shared", "root", 1).unwrap();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "shared".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("principal_id".into(), "svc-line-7".into())]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    sealed_principal_profile(&svc, "svc-line-7", "confidential");
+    pin_guest_profile(&svc, "confidential");
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "note-open".into(),
+            kind: memory::KIND.into(),
+            name: "note-open".into(),
+            namespace: "shared".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                (memory::INSTANCE_PROPERTY.into(), "line-7".into()),
+                (memory::CONTENT_PROPERTY.into(), "open".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "note-secret".into(),
+            kind: memory::KIND.into(),
+            name: "note-secret".into(),
+            namespace: "shared".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                (memory::INSTANCE_PROPERTY.into(), "line-7".into()),
+                (memory::CONTENT_PROPERTY.into(), "secret".into()),
+                (
+                    crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "confidential".into(),
+                ),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let mut req = with_named_principal(
+        ListSiteAgentWorkingMemoryRequest {
+            namespace: "shared".into(),
+            instance_id: "line-7".into(),
+            turn_id: String::new(),
+            limit: 0,
+        },
+        "subject-a",
+    );
+    req.extensions_mut().insert(guest_context());
+    let mut ids = svc
+        .list_site_agent_working_memory(req)
+        .await
+        .unwrap()
+        .into_inner()
+        .items
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, ["note-open"]);
 }
 
 #[tokio::test]

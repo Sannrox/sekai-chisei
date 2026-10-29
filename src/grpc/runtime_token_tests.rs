@@ -482,11 +482,13 @@ async fn a_turn_claim_returns_a_token_acting_as_the_instance() {
         (turn_id.as_str(), "")
     );
 
-    // Admitted only for the turn's follow-up calls and its submissions.
+    // Admitted only for the turn's follow-up calls, its submissions, and
+    // the dual-principal read of its instance's live working memory.
     for method in [
         "HeartbeatAgentTurnClaim",
         "AckAgentTurn",
         "SubmitActionInstance",
+        "ListSiteAgentWorkingMemory",
     ] {
         assert!(
             authenticate(&plane, &claimed.runtime_token, method).is_ok(),
@@ -539,6 +541,35 @@ async fn a_turn_claim_returns_a_token_acting_as_the_instance() {
         ("agent:line-a", Some(TURN_WORKER))
     );
     assert_ne!(renewed_claims.jti, claims.jti);
+}
+
+#[tokio::test]
+async fn a_turn_token_does_not_inherit_a_changed_instance_principal() {
+    let plane = plane();
+    let turn_id = seed_turn(&plane, "a");
+    let claimed = claim_turn(&plane, "a", &turn_id).await;
+    let db = plane.service.db.runtime();
+    let mut instance = db.get_object("line-a").unwrap().unwrap();
+    instance
+        .properties
+        .insert("principal_id".into(), "agent:line-b".into());
+    db.update_object(&instance).unwrap();
+    let err = plane
+        .service
+        .list_site_agent_working_memory(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "ListSiteAgentWorkingMemory",
+            crate::grpc::pb::sekai::ListSiteAgentWorkingMemoryRequest {
+                namespace: "ns-a".into(),
+                instance_id: "line-a".into(),
+                turn_id,
+                limit: 0,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
 }
 
 #[tokio::test]

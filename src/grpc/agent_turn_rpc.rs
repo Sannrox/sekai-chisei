@@ -534,4 +534,196 @@ impl SekaiServiceImpl {
             turn: Some(to_proto(turn)),
         }))
     }
+
+    /// Live working memory of one instance, returned only when both the
+    /// instance principal and the requester can read each item (#1968).
+    pub(super) async fn list_site_agent_working_memory_rpc(
+        &self,
+        req: Request<ListSiteAgentWorkingMemoryRequest>,
+    ) -> Result<Response<ListSiteAgentWorkingMemoryResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.get_ref();
+        let namespace = inner.namespace.trim();
+        let instance_id = inner.instance_id.trim();
+        if namespace.is_empty() || instance_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "namespace and instance_id are required",
+            ));
+        }
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let mut turn_subject = None;
+        if let Some(claims) = req.extensions().get::<RuntimeTokenClaims>() {
+            let turn_id = if inner.turn_id.trim().is_empty() {
+                claims.turn_id.clone()
+            } else {
+                inner.turn_id.trim().to_string()
+            };
+            self.authorize_turn_worker(&req, Scope::Turn(&turn_id))?;
+            let turn = agent_turn::get(self.db.runtime(), &turn_id)
+                .map_err(turn_status)?
+                .ok_or_else(|| turn_status(TurnError::NotFound))?;
+            if turn.namespace != namespace || turn.instance_id != instance_id {
+                return Err(Status::not_found("not found"));
+            }
+            turn_subject = Some(claims.subject.clone());
+        } else {
+            enforce_collaboration_namespace(
+                self.db.runtime(),
+                tenant_context.as_ref(),
+                namespace,
+                false,
+            )?;
+            let named = inner.turn_id.trim();
+            if !named.is_empty() {
+                let turn = agent_turn::get(self.db.runtime(), named)
+                    .map_err(turn_status)?
+                    .ok_or_else(|| Status::not_found("not found"))?;
+                if turn.namespace != namespace || turn.instance_id != instance_id {
+                    return Err(Status::not_found("not found"));
+                }
+            }
+        }
+        let requester = requester_principal(&req);
+        let db = self.db.runtime();
+        let instance = db
+            .get_object(instance_id)
+            .map_err(Status::internal)?
+            .filter(|object| {
+                object.kind == crate::sekai::site_agent_instance::KIND
+                    && object.namespace == namespace
+            });
+        let Some(instance) = instance else {
+            return Err(Status::not_found("not found"));
+        };
+        let agent = instance
+            .properties
+            .get("principal_id")
+            .map(String::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if agent.is_empty() {
+            return Err(Status::not_found("not found"));
+        }
+        // A turn token is bound to its claim's principal. It does not inherit
+        // a later instance principal's clearance.
+        if turn_subject.is_some_and(|subject| subject != agent) {
+            return Err(Status::not_found("not found"));
+        }
+        require_visible_collaboration_read_root(
+            db,
+            &self.security,
+            instance,
+            std::slice::from_ref(&requester),
+            tenant_context.as_ref(),
+            &format!("list_site_agent_working_memory:{instance_id}"),
+            None,
+        )
+        .map_err(hide_read_root_as_missing)?;
+        let limit = if inner.limit <= 0 {
+            crate::domain::DEFAULT_LIST_LIMIT
+        } else {
+            inner.limit.min(crate::domain::MAX_LIST_LIMIT)
+        } as usize;
+        let live =
+            crate::sekai::site_agent_memory::list_live_for_instance(db, namespace, instance_id)
+                .map_err(Status::internal)?;
+        let mut items = Vec::new();
+        for item in live {
+            // Guest ceiling and shared-space kind/marking are request-shaped;
+            // they sit on top of the independent principal checks (#1968).
+            if !collaboration_permits_memory(db, tenant_context.as_ref(), &item)? {
+                continue;
+            }
+            if !principal_may_read_memory(self, item.clone(), &agent)? {
+                continue;
+            }
+            if !principal_may_read_memory(self, item.clone(), &requester)? {
+                continue;
+            }
+            // Live `content` is the agent-turn payload. Its restricted
+            // classification covers change history, not this read (ADR 0139).
+            items.push(to_proto_obj(&item));
+            if items.len() == limit {
+                break;
+            }
+        }
+        Ok(Response::new(ListSiteAgentWorkingMemoryResponse { items }))
+    }
+}
+
+/// The person the calling token acts for: `act`, else the caller.
+fn requester_principal<T: 'static>(req: &Request<T>) -> String {
+    if let Some(context) = req
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+    {
+        return context
+            .act
+            .as_deref()
+            .map(str::trim)
+            .filter(|act| !act.is_empty())
+            .unwrap_or(context.principal.subject.as_str())
+            .to_string();
+    }
+    caller_principals(req)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "anonymous".into())
+}
+
+/// Guest ceiling and shared-space kind/marking for this request. Independent
+/// of either principal; a hidden item is `false`, a store outage stays an
+/// error.
+fn collaboration_permits_memory(
+    db: &RuntimeDb,
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    object: &crate::domain::Object,
+) -> Result<bool, Status> {
+    match collaboration_object_permitted(
+        db,
+        tenant_context,
+        object,
+        crate::enterprise::NamespaceAction::Read,
+    ) {
+        Ok(permitted) => Ok(permitted),
+        Err(status)
+            if status.code() == tonic::Code::Internal
+                || status.code() == tonic::Code::Unavailable =>
+        {
+            Err(status)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// Whether `principal` may read `object` on its own: namespace, grants,
+/// object-security policy and markings. A hidden item is `false`; a store
+/// outage stays an error.
+fn principal_may_read_memory(
+    service: &SekaiServiceImpl,
+    object: crate::domain::Object,
+    principal: &str,
+) -> Result<bool, Status> {
+    let object_id = object.id.clone();
+    let principals = [principal.to_string()];
+    match require_visible_object_contents(
+        service.db.runtime(),
+        &service.security,
+        object,
+        &principals,
+        None,
+        &format!("list_site_agent_working_memory:{object_id}"),
+        None,
+    ) {
+        Ok(_) => Ok(true),
+        Err(status)
+            if status.code() == tonic::Code::Internal
+                || status.code() == tonic::Code::Unavailable =>
+        {
+            Err(status)
+        }
+        Err(_) => Ok(false),
+    }
 }
