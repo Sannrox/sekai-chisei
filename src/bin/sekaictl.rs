@@ -169,6 +169,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "store" => {
             sekai_chisei::store_relocate::run_store_command(args.into_iter().skip(1).collect())
         }
+        "retention" => {
+            sekai_chisei::retention_cli::run_retention_command(args.into_iter().skip(1).collect())
+        }
         "sync" => {
             sekai_chisei::source_webhook_cli::run_sync_command(args.into_iter().skip(1).collect())
                 .await
@@ -548,6 +551,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("model-release-evidence"), _) => ("model-release-evidence", 2),
         (Some("autonomy"), _) => ("autonomy", 2),
         (Some("store"), _) => ("store", 2),
+        (Some("retention"), _) => ("retention", 2),
         _ => return Err("unknown admin command".to_string()),
     };
 
@@ -786,7 +790,12 @@ fn print_admin_usage() {
          Store:\n\
            sekaictl admin store relocate ...\n\
            sekaictl admin store restamp ...\n\
-           sekaictl admin store migrate-object-log ..."
+           sekaictl admin store migrate-object-log ...\n\
+         \n\
+         Retention:\n\
+           sekaictl admin retention status\n\
+           sekaictl admin retention dry-run\n\
+           sekaictl admin retention run"
     );
 }
 
@@ -838,6 +847,7 @@ fn expert_usage(command: &str) -> Option<String> {
         }
         "autonomy" => Some(sekai_chisei::autonomous_envelope_cli::usage().to_string()),
         "store" => Some(sekai_chisei::store_relocate::usage().to_string()),
+        "retention" => Some(sekai_chisei::retention_cli::usage().to_string()),
         _ => None,
     }
 }

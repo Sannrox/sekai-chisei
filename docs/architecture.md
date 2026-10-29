@@ -77,8 +77,10 @@ task observations and content events; PostgreSQL covers all six. Both
 backends archive decisions, attestations and object changes (the `audit`
 policy) only after `RuntimeDb::verify_ledger` passes, and refuse the run
 naming the failure otherwise; on PostgreSQL the check reads one snapshot. Batches on several PostgreSQL replicas take turns under a
-transaction-scoped archive lock, so each record is archived once. `run_retention` and `purge_old_records` remain
-SQLite-only. Selecting `SEKAI_DB_BACKEND=postgres` with Combined dest-pair
+transaction-scoped archive lock, so each record is archived once. A plane-owned
+tick on every Sekai instance calls that entry point on a one-minute interval
+(ADR 0129); `sekaictl admin retention status | dry-run | run` uses it too.
+`run_retention` and `purge_old_records` remain SQLite-only. Selecting `SEKAI_DB_BACKEND=postgres` with Combined dest-pair
 `SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` activates these reusable surfaces as the community
 runtime backend; it still does not add tenant, OIDC, OAuth, or identity
 capabilities.
